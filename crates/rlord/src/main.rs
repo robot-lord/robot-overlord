@@ -190,7 +190,15 @@ fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Tui) {
         Command::Tui => {
             let cfg = Config::load()?;
-            let _ = tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings());
+            if let Ok(conflicts) = tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings())
+            {
+                for c in conflicts {
+                    eprintln!(
+                        "rlord: nav key {} skipped (already bound to: {})",
+                        c.key, c.bound_to
+                    );
+                }
+            }
             rlord_tui::run(cfg)
         }
         Command::Config(ConfigCmd::Init) => {
@@ -216,9 +224,18 @@ fn main() -> Result<()> {
         Command::Tmux(TmuxCmd::Bind) => {
             let cfg = Config::load()?;
             let b = cfg.tmux.bindings();
-            tmux::bind_nav_keys(&methods::rlord_bin(), &b)?;
+            let conflicts = tmux::bind_nav_keys(&methods::rlord_bin(), &b)?;
             for (k, v) in &b {
-                println!("{k:<6} → rlord nav {v}");
+                match conflicts.iter().find(|c| c.key == *k) {
+                    Some(c) => println!("{k:<6} SKIPPED — already bound to: {}", c.bound_to),
+                    None => println!("{k:<6} → rlord nav {v}"),
+                }
+            }
+            if !conflicts.is_empty() {
+                println!(
+                    "edit [tmux] in {} to pick other keys",
+                    paths::config_path().display()
+                );
             }
             Ok(())
         }

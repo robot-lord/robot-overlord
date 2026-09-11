@@ -136,23 +136,68 @@ pub fn kill_session(name: &str) -> Result<()> {
 
 const HOME_OPTION: &str = "@rlord_home";
 
+/// A requested navigation key that rlord refused to take over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyConflict {
+    pub key: String,
+    pub bound_to: String,
+}
+
 /// Install `key → run-shell "<bin> nav <verb>"` in the root key table for each
-/// enabled binding. Idempotent (rebinding a key replaces it). Errors are
-/// returned but callers usually just log them — a missing tmux server at
-/// daemon start is normal.
-pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<()> {
-    // Drop bindings from a previous config first, so changing a key in
-    // config.toml doesn't leave the old key bound as well.
+/// enabled binding, and remove rlord bindings left over from a previous
+/// config. These keys are global to the tmux server, so a key that is the
+/// user's prefix or already bound to something that isn't ours is **skipped**
+/// and reported, never overridden. Idempotent.
+pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConflict>> {
     for key in installed_nav_keys()? {
         if !bindings.iter().any(|(k, _)| *k == key) {
             let _ = run(&["unbind-key", "-n", &key]);
         }
     }
+    let prefix = run(&["show-options", "-gv", "prefix"]).unwrap_or_default();
+    let root = root_bindings()?;
+    let mut conflicts = Vec::new();
     for (key, verb) in bindings {
+        if *key == prefix {
+            conflicts.push(KeyConflict {
+                key: key.to_string(),
+                bound_to: "your tmux prefix".into(),
+            });
+            continue;
+        }
+        if let Some(cmd) = root.get(*key).filter(|c| !c.contains("rlord nav ")) {
+            conflicts.push(KeyConflict {
+                key: key.to_string(),
+                bound_to: cmd.clone(),
+            });
+            continue;
+        }
         let cmd = format!("{} nav {verb}", shell_quote(bin));
         run(&["bind-key", "-n", key, "run-shell", "-b", &cmd])?;
     }
-    Ok(())
+    Ok(conflicts)
+}
+
+/// `key → command` for every root-table binding on the server.
+fn root_bindings() -> Result<std::collections::HashMap<String, String>> {
+    let out = match run(&["list-keys", "-T", "root"]) {
+        Ok(o) => o,
+        Err(_) => return Ok(Default::default()), // no server
+    };
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            // bind-key [-r] -T root <key> <command...>
+            let mut parts = l
+                .split_whitespace()
+                .skip(1)
+                .skip_while(|p| p.starts_with('-'));
+            let (Some(_root), Some(key)) = (parts.next(), parts.next()) else {
+                return None;
+            };
+            Some((key.to_string(), parts.collect::<Vec<_>>().join(" ")))
+        })
+        .collect())
 }
 
 /// Remove every rlord navigation binding, whatever key it is on.

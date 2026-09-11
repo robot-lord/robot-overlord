@@ -84,7 +84,7 @@ impl Default for TmuxKeys {
     fn default() -> Self {
         TmuxKeys {
             back: "M-d".into(),
-            next: "M-f".into(),
+            next: "M-g".into(),
             prev: "M-s".into(),
         }
     }
@@ -178,11 +178,13 @@ cancel = "esc"
 
 # Global tmux bindings rlord installs (root key table, tmux key syntax) so they
 # work from inside any agent pane. Set a key to "" to disable it.
-# Defaults are three adjacent left-hand home-row keys: Option/Alt + s d f.
+# Defaults are left-hand home-row keys: Option/Alt + s d g (prev / home / next).
 # (On macOS make Option send Alt — kitty: `macos_option_as_alt both`.)
+# rlord will not override your tmux prefix or a key you already bind in the
+# root table; it warns and skips that key instead.
 [tmux]
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
-next = "M-f"    # cycle to the next live session
+next = "M-g"    # cycle to the next live session
 prev = "M-s"    # cycle to the previous live session
 "##;
 

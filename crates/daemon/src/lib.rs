@@ -39,8 +39,14 @@ impl Daemon {
     /// every session launch.
     pub fn bind_nav_keys(&self) {
         let bindings = self.config.tmux.bindings();
-        if let Err(e) = tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
-            tracing::debug!(error = %e, "nav keys not bound (no tmux server yet?)");
+        match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
+            Ok(conflicts) => {
+                for c in conflicts {
+                    tracing::warn!(key = %c.key, bound_to = %c.bound_to,
+                        "nav key skipped: already taken — change [tmux] in config.toml");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "nav keys not bound (no tmux server yet?)"),
         }
     }
 

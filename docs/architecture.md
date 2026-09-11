@@ -397,7 +397,7 @@ remembering tmux session names:
   `switch-client`s there, or `detach-client`s when there is no home (the
   outside-tmux case). Verified 2026-09-11 with a scripted PTY against a live tmux 3.6
   server: a root binding + `run-shell` moves the pressing client.
-- **Next / previous session** (default `M-f` / `M-s`) — `rlord nav next|prev`
+- **Next / previous session** (default `M-g` / `M-s`) — `rlord nav next|prev`
   asks the daemon for the live list in the TUI's order and switches to the
   neighbour, so you can tour agents without going home each time.
 
