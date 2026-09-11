@@ -37,6 +37,7 @@ pub struct Keys {
     pub pin: String,
     pub toggle_archived: String,
     pub sort: String,
+    pub reverse_sort: String,
     pub filter: String,
     pub toggle_log: String,
     pub cancel: String,
@@ -60,6 +61,7 @@ impl Default for Keys {
             pin: "p".into(),
             toggle_archived: "a".into(),
             sort: "o".into(),
+            reverse_sort: "O".into(),
             filter: "/".into(),
             toggle_log: "l".into(),
             cancel: "esc".into(),
@@ -84,8 +86,8 @@ impl Default for TmuxKeys {
     fn default() -> Self {
         TmuxKeys {
             back: "M-d".into(),
-            next: "M-g".into(),
-            prev: "M-s".into(),
+            next: String::new(),
+            prev: String::new(),
         }
     }
 }
@@ -113,6 +115,8 @@ pub struct Config {
     pub list_width_pct: u16,
     /// How often the pane preview re-captures, in milliseconds.
     pub preview_refresh_ms: u64,
+    /// Digits 1–9 attach straight to the Nth listed session.
+    pub jump_digits: bool,
     pub keys: Keys,
     pub tmux: TmuxKeys,
 }
@@ -123,6 +127,7 @@ impl Default for Config {
             layout: Layout::Side,
             list_width_pct: 50,
             preview_refresh_ms: 500,
+            jump_digits: true,
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
         }
@@ -153,6 +158,7 @@ const DEFAULT_TOML: &str = r##"# Robot Overlord configuration. Every key is opti
 layout = "side"
 list_width_pct = 50
 preview_refresh_ms = 500
+jump_digits = true      # 1-9 attach to the Nth listed session
 
 # TUI keys. A character ("q", "R"), a named key ("enter", "esc", "tab", "up",
 # "down", "space", "backspace", "f1".."f12"), optionally "ctrl-"/"alt-" prefixed.
@@ -172,20 +178,23 @@ rename = "R"
 pin = "p"
 toggle_archived = "a"
 sort = "o"
+reverse_sort = "O"
 filter = "/"
 toggle_log = "l"
 cancel = "esc"
 
 # Global tmux bindings rlord installs (root key table, tmux key syntax) so they
 # work from inside any agent pane. Set a key to "" to disable it.
-# Defaults are left-hand home-row keys: Option/Alt + s d g (prev / home / next).
+# `back` is the one you press constantly: Option/Alt + d, a home-row key.
 # (On macOS make Option send Alt — kitty: `macos_option_as_alt both`.)
+# next/prev cycle through live sessions in list order; off by default because
+# jumping by search (`/` + Enter) or digit is usually what you actually want.
 # rlord will not override your tmux prefix or a key you already bind in the
 # root table; it warns and skips that key instead.
 [tmux]
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
-next = "M-g"    # cycle to the next live session
-prev = "M-s"    # cycle to the previous live session
+next = ""       # e.g. "M-g"
+prev = ""       # e.g. "M-s"
 "##;
 
 #[cfg(test)]
@@ -209,8 +218,6 @@ mod tests {
         assert_eq!(c.layout, Layout::Stack);
         assert_eq!(c.keys.quit, "Q");
         assert_eq!(c.keys.attach, "enter");
-        let b = c.tmux.bindings();
-        assert_eq!(b.len(), 2);
-        assert!(b.iter().all(|(_, v)| *v != "home"));
+        assert!(c.tmux.bindings().is_empty()); // back disabled, next/prev off by default
     }
 }

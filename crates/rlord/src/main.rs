@@ -28,8 +28,11 @@ enum Command {
     Daemon,
     /// Check daemon liveness
     Ping,
-    /// List sessions
+    /// List sessions. QUERY uses the search syntax: free words match
+    /// name/project/group/tag; `status:waiting` `tag:wip` `proj:x` `agent:x`
+    /// `group:x` `sort:user` set filters.
     Ls {
+        query: Vec<String>,
         /// Show only archived sessions
         #[arg(long, conflicts_with = "all")]
         archived: bool,
@@ -51,6 +54,9 @@ enum Command {
         /// Sort: activity (default), user, state, created, name
         #[arg(long, default_value = "activity")]
         sort: String,
+        /// Reverse the sort order
+        #[arg(long)]
+        reverse: bool,
         /// Raw JSON output
         #[arg(long)]
         json: bool,
@@ -258,6 +264,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Ls {
+            query,
             archived,
             all,
             status,
@@ -265,6 +272,7 @@ fn main() -> Result<()> {
             project,
             name,
             sort,
+            reverse,
             json,
         } => {
             let archived_mode = if archived {
@@ -274,11 +282,27 @@ fn main() -> Result<()> {
             } else {
                 "live"
             };
+            let mut q = rlord_core::db::SessionQuery {
+                status: status
+                    .iter()
+                    .map(|s| rlord_core::db::normalize_status(s))
+                    .collect(),
+                tag,
+                project,
+                name,
+                sort: rlord_core::db::SortMode::parse(&sort)
+                    .with_context(|| format!("unknown sort '{sort}'"))?,
+                reverse,
+                ..Default::default()
+            };
+            q.apply_search_text(&query.join(" "));
             let r = call(
                 "session.list",
                 json!({
-                    "archived": archived_mode, "status": status, "tag": tag,
-                    "project": project, "name": name, "sort": sort,
+                    "archived": archived_mode, "status": q.status, "tag": q.tag,
+                    "agent": q.agent, "project": q.project, "name": q.name,
+                    "group": q.group, "search": q.search, "sort": q.sort.label(),
+                    "reverse": q.reverse,
                 }),
             )?;
             if json {
@@ -440,14 +464,18 @@ fn run_daemon() -> Result<()> {
         let daemon = Daemon::new(db, Config::load()?);
         daemon.startup()?;
         let listener = Daemon::bind(&paths::socket_path())?;
-        tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), "rlordd starting");
-        tokio::select! {
+        let pidfile = paths::pid_path();
+        std::fs::write(&pidfile, std::process::id().to_string())?;
+        tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), pid = std::process::id(), "rlordd starting");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let r = tokio::select! {
             r = daemon.serve(listener) => r,
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
-                Ok(())
-            }
-        }
+            _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = term.recv() => Ok(()),
+        };
+        tracing::info!("shutting down");
+        let _ = std::fs::remove_file(&pidfile);
+        r
     })
 }
 

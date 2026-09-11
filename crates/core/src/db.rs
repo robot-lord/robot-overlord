@@ -55,6 +55,16 @@ pub enum SortMode {
 }
 
 impl SortMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "activity" | "agent" => SortMode::Activity,
+            "user" => SortMode::User,
+            "state" | "status" => SortMode::State,
+            "created" | "age" => SortMode::Created,
+            "name" => SortMode::Name,
+            _ => return None,
+        })
+    }
     pub fn label(self) -> &'static str {
         match self {
             SortMode::Activity => "activity",
@@ -87,7 +97,54 @@ pub struct SessionQuery {
     pub project: Option<String>,
     /// Substring match on name.
     pub name: Option<String>,
+    /// Prefix match on group_path.
+    pub group: Option<String>,
+    /// Free text: matches name, project, group, or any tag.
+    pub search: Option<String>,
     pub sort: SortMode,
+    pub reverse: bool,
+}
+
+impl SessionQuery {
+    /// Apply a rich search string: `tag:wip status:waiting,idle proj:wait2
+    /// agent:claude group:work sort:user free words…`. Tokens set the typed
+    /// filters; everything else becomes the free-text `search`.
+    pub fn apply_search_text(&mut self, text: &str) {
+        let mut free: Vec<&str> = Vec::new();
+        for tok in text.split_whitespace() {
+            match tok.split_once(':') {
+                Some(("tag" | "t", v)) if !v.is_empty() => self.tag = Some(v.to_string()),
+                Some(("status" | "st" | "s", v)) if !v.is_empty() => {
+                    self.status = v.split(',').map(normalize_status).collect();
+                }
+                Some(("agent" | "a", v)) if !v.is_empty() => self.agent = Some(v.to_string()),
+                Some(("proj" | "project" | "p", v)) if !v.is_empty() => {
+                    self.project = Some(v.to_string())
+                }
+                Some(("group" | "g", v)) if !v.is_empty() => self.group = Some(v.to_string()),
+                Some(("sort" | "o", v)) if !v.is_empty() => {
+                    if let Some(m) = SortMode::parse(v) {
+                        self.sort = m;
+                    }
+                }
+                _ => free.push(tok),
+            }
+        }
+        self.search = if free.is_empty() {
+            None
+        } else {
+            Some(free.join(" "))
+        };
+    }
+}
+
+/// Accept friendly status spellings (`waiting` → `waiting_input`).
+pub fn normalize_status(s: &str) -> String {
+    match s.trim() {
+        "waiting" | "wait" | "input" => "waiting_input".to_string(),
+        "run" | "busy" => "working".to_string(),
+        other => other.to_string(),
+    }
 }
 
 pub struct Db {
@@ -241,18 +298,45 @@ impl Db {
             conds.push("name LIKE '%' || ? || '%'".into());
             args.push(n.clone());
         }
+        if let Some(g) = &q.group {
+            conds.push("group_path LIKE ? || '%'".into());
+            args.push(g.clone());
+        }
+        if let Some(text) = &q.search {
+            // Every word must match somewhere (name/project/group/tag).
+            for word in text.split_whitespace() {
+                conds.push(
+                    "(name LIKE '%' || ? || '%' OR project_path LIKE '%' || ? || '%' \
+                      OR group_path LIKE '%' || ? || '%' \
+                      OR EXISTS (SELECT 1 FROM tags t WHERE t.session_id = sessions.id \
+                                 AND t.tag LIKE '%' || ? || '%'))"
+                        .into(),
+                );
+                for _ in 0..4 {
+                    args.push(word.to_string());
+                }
+            }
+        }
         let where_clause = if conds.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", conds.join(" AND "))
         };
-        let order = match q.sort {
-            SortMode::Activity => "COALESCE(last_agent_msg_at, last_user_msg_at, created_at) DESC",
-            SortMode::User => "COALESCE(last_user_msg_at, created_at) DESC",
-            SortMode::State => "COALESCE(last_state_change_at, created_at) DESC",
-            SortMode::Created => "created_at DESC",
-            SortMode::Name => "name COLLATE NOCASE ASC",
+        let (expr, natural) = match q.sort {
+            SortMode::Activity => (
+                "COALESCE(last_agent_msg_at, last_user_msg_at, created_at)",
+                "DESC",
+            ),
+            SortMode::User => ("COALESCE(last_user_msg_at, created_at)", "DESC"),
+            SortMode::State => ("COALESCE(last_state_change_at, created_at)", "DESC"),
+            SortMode::Created => ("created_at", "DESC"),
+            SortMode::Name => ("name COLLATE NOCASE", "ASC"),
         };
+        let dir = match (natural, q.reverse) {
+            ("DESC", false) | ("ASC", true) => "DESC",
+            _ => "ASC",
+        };
+        let order = format!("{expr} {dir}");
         let sql = format!(
             "SELECT {SESSION_COLS} FROM sessions {where_clause} \
              ORDER BY pinned DESC, {order}"
@@ -606,6 +690,55 @@ mod tests {
         db.rename("01bbb", "beta-renamed").unwrap();
         let s = db.resolve_ref("beta-renamed").unwrap();
         assert!(s.name_locked);
+    }
+
+    #[test]
+    fn rich_search_text() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "alpha");
+        mk(&db, "01bbb", "beta");
+        db.add_tag("01aaa", "wip").unwrap();
+        db.set_status("01bbb", Status::WaitingInput, 1).unwrap();
+        db.set_group("01bbb", "work/backend").unwrap();
+
+        let mut q = SessionQuery::default();
+        q.apply_search_text("tag:wip");
+        assert_eq!(db.sessions(&q).unwrap()[0].id, "01aaa");
+
+        let mut q = SessionQuery::default();
+        q.apply_search_text("status:waiting");
+        assert_eq!(q.status, ["waiting_input"]);
+        assert_eq!(db.sessions(&q).unwrap()[0].id, "01bbb");
+
+        let mut q = SessionQuery::default();
+        q.apply_search_text("group:work sort:name");
+        assert_eq!(q.sort, SortMode::Name);
+        assert_eq!(db.sessions(&q).unwrap().len(), 1);
+
+        // Free text matches tags and project too; every word must match.
+        let mut q = SessionQuery::default();
+        q.apply_search_text("wip /tmp");
+        assert_eq!(q.search.as_deref(), Some("wip /tmp"));
+        assert_eq!(db.sessions(&q).unwrap().len(), 1);
+        let mut q = SessionQuery::default();
+        q.apply_search_text("zzz");
+        assert!(db.sessions(&q).unwrap().is_empty());
+
+        // Reverse flips the order.
+        let fwd = db
+            .sessions(&SessionQuery {
+                sort: SortMode::Name,
+                ..Default::default()
+            })
+            .unwrap();
+        let rev = db
+            .sessions(&SessionQuery {
+                sort: SortMode::Name,
+                reverse: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(fwd[0].id, rev[1].id);
     }
 
     #[test]

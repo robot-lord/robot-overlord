@@ -16,7 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
 use rlord_core::config::{Config, Keys, Layout};
-use rlord_core::db::SortMode;
+use rlord_core::db::{SessionQuery, SortMode};
 use rlord_core::paths;
 use rlord_core::timefmt::{fmt_ts, rel_age};
 use rlord_core::tmux;
@@ -78,6 +78,7 @@ struct App {
     table: TableState,
     show_archived: bool,
     sort: SortMode,
+    reverse: bool,
     filter: String,
     mode: Mode,
     preview: Preview,
@@ -97,6 +98,7 @@ impl App {
             table: TableState::default().with_selected(0),
             show_archived: false,
             sort: SortMode::Activity,
+            reverse: false,
             filter: String::new(),
             mode: Mode::Normal,
             preview: Preview::Pane,
@@ -117,12 +119,28 @@ impl App {
         }
     }
 
-    fn refresh(&mut self) {
-        let q = json!({
+    fn query(&self) -> Value {
+        let mut q = SessionQuery {
+            sort: self.sort,
+            reverse: self.reverse,
+            ..Default::default()
+        };
+        q.apply_search_text(&self.filter);
+        json!({
             "archived": if self.show_archived { "only" } else { "live" },
-            "sort": self.sort.label(),
-            "name": if self.filter.is_empty() { None } else { Some(self.filter.clone()) },
-        });
+            "sort": q.sort.label(),
+            "reverse": q.reverse,
+            "status": q.status,
+            "tag": q.tag,
+            "agent": q.agent,
+            "project": q.project,
+            "group": q.group,
+            "search": q.search,
+        })
+    }
+
+    fn refresh(&mut self) {
+        let q = self.query();
         if let Some(v) = self.call("session.list", q) {
             self.sessions = v.as_array().cloned().unwrap_or_default();
             let n = self.sessions.len();
@@ -219,10 +237,14 @@ impl App {
                                 return Ok(());
                             }
                         }
-                        Mode::Filter(buf) => self.handle_input(k.code, buf, InputKind::Filter),
-                        Mode::Rename(buf) => self.handle_input(k.code, buf, InputKind::Rename),
+                        Mode::Filter(buf) => {
+                            self.handle_input(k, buf, InputKind::Filter, terminal)?
+                        }
+                        Mode::Rename(buf) => {
+                            self.handle_input(k, buf, InputKind::Rename, terminal)?
+                        }
                         Mode::NewSession(buf) => {
-                            self.handle_input(k.code, buf, InputKind::NewSession)
+                            self.handle_input(k, buf, InputKind::NewSession, terminal)?
                         }
                     }
                 }
@@ -245,6 +267,18 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         let n = self.sessions.len();
+        if self.config.jump_digits {
+            if let KeyCode::Char(c @ '1'..='9') = k.code {
+                if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT {
+                    let i = c as usize - '1' as usize;
+                    if i < n {
+                        self.table.select(Some(i));
+                        self.attach(terminal)?;
+                    }
+                    return Ok(false);
+                }
+            }
+        }
         let Some(action) = self.keys.action(&k) else {
             return Ok(false);
         };
@@ -298,6 +332,10 @@ impl App {
                 self.sort = self.sort.next();
                 self.dirty = true;
             }
+            Action::ReverseSort => {
+                self.reverse = !self.reverse;
+                self.dirty = true;
+            }
             Action::ToggleLog => {
                 self.preview = match self.preview {
                     Preview::Pane => Preview::Log,
@@ -342,14 +380,47 @@ impl App {
         }
     }
 
-    fn handle_input(&mut self, code: KeyCode, mut buf: String, kind: InputKind) {
+    fn handle_input(
+        &mut self,
+        k: ratatui::crossterm::event::KeyEvent,
+        mut buf: String,
+        kind: InputKind,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
+        let code = k.code;
         match code {
-            KeyCode::Esc => {}
-            KeyCode::Enter => match kind {
-                InputKind::Filter => {
-                    self.filter = buf;
+            KeyCode::Esc => {
+                if kind == InputKind::Filter {
+                    self.filter.clear();
                     self.dirty = true;
                 }
+            }
+            // Filter mode: Enter is the jump; Tab keeps the filter.
+            KeyCode::Enter if kind == InputKind::Filter => {
+                self.filter = buf;
+                self.refresh();
+                self.attach(terminal)?;
+            }
+            KeyCode::Tab if kind == InputKind::Filter => {
+                self.filter = buf;
+                self.dirty = true;
+            }
+            KeyCode::Up | KeyCode::Down if kind == InputKind::Filter => {
+                let n = self.sessions.len();
+                if n > 0 {
+                    let i = self.table.selected().unwrap_or(0);
+                    let j = if code == KeyCode::Down {
+                        (i + 1).min(n - 1)
+                    } else {
+                        i.saturating_sub(1)
+                    };
+                    self.table.select(Some(j));
+                    self.refresh_preview();
+                }
+                self.mode = kind.mode(buf);
+            }
+            KeyCode::Enter => match kind {
+                InputKind::Filter => unreachable!(),
                 InputKind::Rename => {
                     if let Some(id) = self.selected_id() {
                         if !buf.trim().is_empty()
@@ -372,19 +443,25 @@ impl App {
             },
             KeyCode::Backspace => {
                 buf.pop();
+                if kind == InputKind::Filter {
+                    self.filter = buf.clone();
+                    self.dirty = true;
+                }
                 self.mode = kind.mode(buf);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 buf.push(c);
                 if kind == InputKind::Filter {
-                    // Live filtering as you type.
+                    // Live filtering as you type; selection snaps to the top match.
                     self.filter = buf.clone();
+                    self.table.select(Some(0));
                     self.dirty = true;
                 }
                 self.mode = kind.mode(buf);
             }
             _ => self.mode = kind.mode(buf),
         }
+        Ok(())
     }
 
     /// Leave the TUI, hand the terminal to tmux, come back when it detaches.
@@ -460,8 +537,9 @@ impl App {
         let show_tags = width >= 72;
         let name_w = if width >= 60 { 26 } else { 18 };
 
-        let mut header = vec!["", "NAME", "STATUS", "AGENT", "USER"];
+        let mut header = vec!["#", "", "NAME", "STATUS", "AGENT", "USER"];
         let mut widths = vec![
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(name_w),
             Constraint::Length(13),
@@ -482,10 +560,17 @@ impl App {
         let rows: Vec<Row> = self
             .sessions
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
                 let status = get("status");
                 let mut cells = vec![
+                    Cell::from(if i < 9 {
+                        ((b'1' + i as u8) as char).to_string()
+                    } else {
+                        String::new()
+                    })
+                    .dim(),
                     Cell::from(if s["pinned"].as_bool().unwrap_or(false) {
                         "*"
                     } else {
@@ -515,13 +600,14 @@ impl App {
             })
             .collect();
         let title = format!(
-            " {} sessions · sort: {}{}{} ",
+            " {} sessions · sort: {}{}{}{} ",
             if self.show_archived {
                 "archived"
             } else {
                 "live"
             },
             self.sort.label(),
+            if self.reverse { "↑" } else { "" },
             if self.filter.is_empty() {
                 String::new()
             } else {
@@ -568,7 +654,9 @@ impl App {
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let prompt = match &self.mode {
             Mode::Normal => None,
-            Mode::Filter(b) => Some(format!("filter: {b}▏")),
+            Mode::Filter(b) => Some(format!(
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:/tag:/proj:)"
+            )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::NewSession(b) => Some(format!("new session in: {b}▏")),
         };
@@ -642,6 +730,7 @@ enum Action {
     Pin,
     ToggleArchived,
     Sort,
+    ReverseSort,
     Filter,
     ToggleLog,
     Cancel,
@@ -756,6 +845,7 @@ impl KeyMap {
             (Action::Pin, &k.pin),
             (Action::ToggleArchived, &k.toggle_archived),
             (Action::Sort, &k.sort),
+            (Action::ReverseSort, &k.reverse_sort),
             (Action::Filter, &k.filter),
             (Action::ToggleLog, &k.toggle_log),
             (Action::Cancel, &k.cancel),
@@ -797,7 +887,8 @@ impl KeyMap {
             (Action::Pin, "pin"),
             (Action::ToggleArchived, "archived"),
             (Action::Sort, "sort"),
-            (Action::Filter, "filter"),
+            (Action::ReverseSort, "reverse"),
+            (Action::Filter, "search"),
             (Action::ToggleLog, "log"),
             (Action::Quit, "quit"),
         ]

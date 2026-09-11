@@ -397,9 +397,16 @@ remembering tmux session names:
   `switch-client`s there, or `detach-client`s when there is no home (the
   outside-tmux case). Verified 2026-09-11 with a scripted PTY against a live tmux 3.6
   server: a root binding + `run-shell` moves the pressing client.
-- **Next / previous session** (default `M-g` / `M-s`) — `rlord nav next|prev`
-  asks the daemon for the live list in the TUI's order and switches to the
-  neighbour, so you can tour agents without going home each time.
+- **Jumping** is done from the TUI, not by cycling: `/` opens a search box
+  (rich syntax below) that filters as you type; `Enter` attaches to the top
+  match, `Tab` keeps the filter and returns to the list, digits `1`–`9`
+  attach to the Nth listed session. Cycling bindings (`rlord nav next|prev`)
+  exist but are **off by default** — a fleet has no meaningful linear order,
+  so prev/next tends to disorient rather than help.
+- **Search syntax** (TUI `/` box and `rlord ls <query>`): free words match
+  name, project, group, or tag (every word must match); tokens
+  `status:waiting,idle` `tag:wip` `proj:wait2` `agent:claude` `group:work`
+  `sort:user` set the typed filters. `o` cycles sorts, `O` reverses.
 
 The bindings are installed by the daemon at startup and whenever it creates a
 tmux session (idempotent), and by the TUI at launch; `rlord tmux unbind`

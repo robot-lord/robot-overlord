@@ -26,6 +26,10 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("daemon.sock")
 }
 
+pub fn pid_path() -> PathBuf {
+    runtime_dir().join("daemon.pid")
+}
+
 pub fn db_path() -> PathBuf {
     data_dir().join("state.db")
 }

@@ -72,9 +72,15 @@ For a persistent daemon, install `deploy/robot-overlord.service` (systemd user u
 
 The TUI is the hub. `enter` on a session switches your tmux client into its
 pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
-TUI and **Option-S / Option-G** cycle through live sessions — left-hand
-home-row keys, because you press these constantly. rlord never overrides
-your tmux prefix or a root-table key you already bind; it warns and skips. (macOS: make
+TUI — a home-row key, because you press it constantly. rlord never overrides
+your tmux prefix or a root-table key you already bind; it warns and skips.
+
+Jumping is search-driven, not cycling: `/` filters as you type and `Enter`
+attaches to the top match (`Tab` keeps the filter, ↑/↓ move within matches);
+digits `1`–`9` attach to the Nth listed session. The search box and
+`rlord ls <query>` share one syntax — free words match name/project/group/tag,
+and `status:waiting` `tag:wip` `proj:wait2` `agent:claude` `group:work`
+`sort:user` set typed filters. `o` cycles sorts, `O` reverses. (macOS: make
 Option send Alt, e.g. kitty `macos_option_as_alt both`.) Those three are tmux root-table
 bindings that rlord installs on your tmux server (`rlord tmux bind|unbind`);
 if you attached from outside tmux, Option-D detaches instead.
