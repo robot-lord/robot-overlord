@@ -44,14 +44,20 @@ matter to us:
 - Phone-first control and always-on AI mediation loops.
 - Support for every agent CLI in existence.
 
-## Open questions
+## Shape (decided)
 
-- **Language:** Rust (probable).
-- **Frontend:** mirror another tool's tmux/terminal approach vs. a GUI. Depends
-  heavily on what the agent-integration research says is possible/necessary.
+- **Rust**, terminal-first (TUI), **tmux** as the process substrate.
+- A resident daemon (`overlordd`) owns all state and behavior; CLI, TUI, and a
+  **first-class MCP server** are thin clients over one Unix-socket API — this
+  is the fix for other-tool's cold-start CLI sluggishness.
+
+See `docs/architecture.md` for the full plan and phased milestones.
 
 ## Docs
 
+- `docs/architecture.md` — the architecture plan: components, data model,
+  adapter contract, status engine, messaging design, MCP tool surface, and
+  the phase-by-phase build plan.
 - `docs/research-other-tool.md` — baseline research: how another tool actually
   works, which of its features are its own machinery vs. delegation to agent
   CLIs, and what that implies for our design.
