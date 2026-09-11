@@ -222,20 +222,64 @@ conversation data into software-land costs parsing, not capture:
   terminal output is ANSI redraw soup; the JSONL is the semantic record.
   (Pane capture stays only as a status-detection fallback.)
 
-Daemon pipeline: watch each live session's transcript (fsnotify + hook-event
-triggers) → incremental parse of appended lines → normalized `transcript_msgs`
-rows in our SQLite with an **FTS5 index** (full-text search across the fleet,
-filterable by session/agent/project/time — this also powers `get_context`).
+### Storage split: metadata in SQLite, text on disk
 
-**Durability caveat that makes our archive feature load-bearing**: Claude Code
-prunes old transcripts (`cleanupPeriodDays`, default ~30 days), and Codex
-homes can be wiped per-account. Archiving a session in AI Overlord therefore
-**copies its transcript into our own store** (`$XDG_DATA_HOME/ai-overlord/
-transcripts/`), so archived context outlives the agent CLI's retention policy
-and remains searchable forever. Two caveats to engineer for: the formats are
-internal and version-drifting (parse defensively, keep the raw file verbatim
-alongside the normalized rows), and files get large (append-offset tracking,
-never full re-reads on the hot path).
+Deliberate decision (not an accident of implementation): **transcript text
+never lives in SQLite.** SQLite holds metadata and linking only — which
+sessions exist, where their transcript files are, byte offsets ingested, time
+ranges covered, agent/project/tags — everything needed to *scope and map*
+a search, nothing needed to *perform* one.
+
+The text itself lives as plain files:
+
+```
+$XDG_DATA_HOME/ai-overlord/transcripts/<session-ulid>/
+  raw.jsonl        # verbatim copy of the agent CLI's file (fidelity; replayable)
+  transcript.md    # rendered plaintext: one speaker-labelled turn per block,
+                   #   [ts] prefixes, tool calls one-line summarized
+  meta.json        # denormalized snapshot of the SQLite row (self-describing dir)
+```
+
+Search is **ripgrep-class file search over the `transcript.md` files**, not an
+FTS index. Why this wins here:
+
+- **Scale is on grep's side.** A heavy session is ~0.5 MB of JSONL; even years
+  of daily use lands in low-GB territory, which rg chews through in tens to
+  hundreds of ms warm. FTS5 would buy ranking we don't need at the cost of an
+  index to build, sync, and migrate — roughly doubling storage and adding the
+  classic index-drift failure mode.
+- **The content is code-shaped.** FTS tokenizers mangle identifiers, paths,
+  and error strings; regex search is exactly right for "find where we hit
+  `ECONNRESET` in the myapp worker".
+- **Plain files stay legible.** The user can `rg`/`less` the archive directly,
+  back it up, sync it, and it outlives any schema decision. The rendered form
+  doubles as a human-readable artifact of the session, not just search fodder.
+- **Raw JSONL is grep-hostile** (one escaped mega-line per message), which is
+  the whole reason for the rendered `transcript.md`. That render is the *only*
+  normalization we commit to — anything cleverer (entity extraction, embedding
+  indexes) is explicitly deferred until proven necessary.
+
+Daemon pipeline: watch each live session's transcript (fsnotify + hook-event
+triggers) → append-parse new lines (offset-tracked, never full re-reads) →
+append rendered turns to `transcript.md` and update derived metadata. Live
+sessions and archived sessions thus have identical on-disk shape; **archiving
+just stops the tail and marks the row** — the copy already exists.
+
+One search function serves everyone: query + metadata filters (project, agent,
+tag, time range, archived?) → SQLite narrows the file set → rg (`--json`) over
+those files → hits mapped back to session + timestamp. Exposed as
+`overlord search` (human CLI, plus a TUI view), and as the MCP tool
+`search_history(query, filters)` so a session can be told "go find how we
+solved X in an old conversation" — with `get_context` fetching the surrounding
+turns of any hit. Same code path, three doors.
+
+**Durability caveat that makes the store load-bearing**: Claude Code prunes
+old transcripts (`cleanupPeriodDays`, default ~30 days), and Codex homes can
+be wiped per-account. Our mirror is therefore the durable record — context
+outlives the agent CLI's retention policy. Engineering caveats: the JSONL
+formats are internal and version-drifting (parse defensively; when a line
+doesn't parse, still preserve it in `raw.jsonl` and emit a marker turn in the
+render so nothing silently vanishes).
 
 ## Inter-session messaging
 
@@ -285,6 +329,9 @@ Tools (v1):
 - `get_context(id, {last_message | recent_activity | transcript_tail})` —
   "go get context from that other agent" without a round-trip through the
   agent itself: served from transcript read-back and the event log.
+- `search_history(query, filters?)` — rg-backed search across all sessions'
+  rendered transcripts (live + archived); hits carry session + timestamp and
+  feed straight into `get_context`.
 - `send_message(to, body, kind?, wait?)` — mailbox send; `wait` long-polls
   for a `reply` up to a timeout.
 - `check_messages()` / `ack_message(id)` — the pull channel.
@@ -352,9 +399,10 @@ Each phase ends runnable and used-for-real (dogfood from phase 2 onward).
   attach, archive view). *Acceptance: daily-drive replaces other-tool for
   Claude work.*
 - **Phase 3 — MCP + messaging + transcripts**: MCP server + stdio shim +
-  identity; mailbox with the three delivery channels; transcript ingestion +
-  FTS5 search + archive-copies-transcript; `get_context` served from the
-  transcript store; `report_done`; the skill snippet. *Acceptance: from one Claude session, list the fleet, read another
+  identity; mailbox with the three delivery channels; transcript mirror
+  (raw + rendered) + rg-backed `overlord search` / `search_history`;
+  `get_context` served from the transcript store; `report_done`; the skill
+  snippet. *Acceptance: from one Claude session, list the fleet, read another
   session's context, task it, and receive its completion — without any Bash
   round-trips or conductor session.*
 - **Phase 4 — Codex adapter**: notify install, resume gates, fork fallback,
