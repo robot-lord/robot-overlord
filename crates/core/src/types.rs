@@ -42,6 +42,8 @@ pub struct Session {
     pub last_user_msg_at: Option<i64>,
     pub last_agent_msg_at: Option<i64>,
     pub last_state_change_at: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 pub fn now_ms() -> i64 {

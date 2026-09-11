@@ -16,11 +16,19 @@ use rpc::{Request, Response};
 
 pub struct Daemon {
     db: Mutex<Db>,
+    /// Coarse change signal: any successful mutation broadcasts one tick;
+    /// subscribers refetch what they display. Fine-grained events can come
+    /// later without changing the wire shape.
+    changes: tokio::sync::broadcast::Sender<()>,
 }
 
 impl Daemon {
     pub fn new(db: Db) -> Arc<Self> {
-        Arc::new(Daemon { db: Mutex::new(db) })
+        let (changes, _) = tokio::sync::broadcast::channel(64);
+        Arc::new(Daemon {
+            db: Mutex::new(db),
+            changes,
+        })
     }
 
     /// Startup housekeeping: drain spooled hook events, then reconcile
@@ -77,6 +85,31 @@ impl Daemon {
             if line.trim().is_empty() {
                 continue;
             }
+            // A subscription takes over the connection: ack, then push a
+            // notify line on every change until the client hangs up.
+            if let Ok(req) = serde_json::from_str::<Request>(&line) {
+                if req.method == "events.subscribe" {
+                    let ack = Response::ok(req.id, json!({"subscribed": true}));
+                    let mut out = serde_json::to_vec(&ack)?;
+                    out.push(b'\n');
+                    write_half.write_all(&out).await?;
+                    let mut rx = self.changes.subscribe();
+                    loop {
+                        match rx.recv().await {
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if write_half
+                                    .write_all(b"{\"notify\":\"changed\"}\n")
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(()); // client gone
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                    }
+                }
+            }
             let resp = match serde_json::from_str::<Request>(&line) {
                 Ok(req) => {
                     let daemon = self.clone();
@@ -113,25 +146,27 @@ impl Daemon {
         if method == "ping" {
             return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION")}));
         }
+        let mutating = !matches!(method, "session.list" | "session.get" | "session.log");
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
-            "session.list" => {
-                let include_archived = params
-                    .get("archived")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                db.list_sessions(include_archived)
-                    .and_then(|s| Ok(serde_json::to_value(s)?))
-            }
+            "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &params),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),
             "session.stop" => methods::session_stop(&db, &params),
             "session.archive" => methods::session_archive(&db, &params),
+            "session.unarchive" => methods::session_unarchive(&db, &params),
+            "session.rename" => methods::session_rename(&db, &params),
+            "session.tag" => methods::session_tag(&db, &params),
+            "session.pin" => methods::session_pin(&db, &params),
+            "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => methods::hook_emit(&db, &params),
             _ => return Err(MethodError::NotFound),
         };
+        if mutating && r.is_ok() {
+            let _ = self.changes.send(());
+        }
         r.map_err(MethodError::Internal)
     }
 }

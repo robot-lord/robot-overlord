@@ -5,9 +5,79 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use overlord_core::agents::claude;
-use overlord_core::db::{Db, NewSession};
+use overlord_core::db::{Db, NewSession, SessionQuery};
 use overlord_core::tmux;
 use overlord_core::types::{new_id, now_ms, Status};
+
+pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
+    let q: SessionQuery =
+        serde_json::from_value(params.clone()).context("invalid session query")?;
+    Ok(serde_json::to_value(db.sessions(&q)?)?)
+}
+
+pub fn session_unarchive(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    db.set_archived(&s.id, None)?;
+    db.insert_event(&s.id, now_ms(), "unarchived", "{}")?;
+    Ok(json!({"unarchived": s.id}))
+}
+
+pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let name = p_str(params, "name")?;
+    if name.trim().is_empty() {
+        bail!("name must not be empty");
+    }
+    let old = s.name.clone();
+    db.rename(&s.id, name.trim())?;
+    db.insert_event(
+        &s.id,
+        now_ms(),
+        "renamed",
+        &json!({"from": old, "to": name.trim()}).to_string(),
+    )?;
+    Ok(json!({"renamed": s.id, "name": name.trim()}))
+}
+
+pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let as_list = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for t in as_list("add") {
+        db.add_tag(&s.id, &t)?;
+    }
+    for t in as_list("remove") {
+        db.remove_tag(&s.id, &t)?;
+    }
+    Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+pub fn session_pin(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let pinned = params
+        .get("pinned")
+        .and_then(Value::as_bool)
+        .context("missing bool param 'pinned'")?;
+    db.set_pinned(&s.id, pinned)?;
+    Ok(json!({"id": s.id, "pinned": pinned}))
+}
+
+pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let group = p_str(params, "group")?;
+    db.set_group(&s.id, group)?;
+    Ok(json!({"id": s.id, "group": group}))
+}
 
 fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
     params

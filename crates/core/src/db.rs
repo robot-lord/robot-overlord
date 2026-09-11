@@ -31,6 +31,65 @@ pub struct EventRow {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchivedMode {
+    #[default]
+    Live,
+    Only,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortMode {
+    /// Most recent agent activity first (the default).
+    #[default]
+    Activity,
+    /// Most recent user prompt first.
+    User,
+    /// Most recent status change first.
+    State,
+    Created,
+    Name,
+}
+
+impl SortMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Activity => "activity",
+            SortMode::User => "user",
+            SortMode::State => "state",
+            SortMode::Created => "created",
+            SortMode::Name => "name",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Activity => SortMode::User,
+            SortMode::User => SortMode::State,
+            SortMode::State => SortMode::Created,
+            SortMode::Created => SortMode::Name,
+            SortMode::Name => SortMode::Activity,
+        }
+    }
+}
+
+/// The one query object shared by CLI, TUI, and (later) MCP.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SessionQuery {
+    pub archived: ArchivedMode,
+    pub status: Vec<String>,
+    pub agent: Option<String>,
+    pub tag: Option<String>,
+    /// Substring match on project_path.
+    pub project: Option<String>,
+    /// Substring match on name.
+    pub name: Option<String>,
+    pub sort: SortMode,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -99,7 +158,8 @@ impl Db {
         Ok(())
     }
 
-    /// Resolve a user-supplied ref: exact id, exact name, then unique id prefix.
+    /// Resolve a user-supplied ref: exact id, exact name, unique id prefix,
+    /// then unique name prefix.
     pub fn resolve_ref(&self, r: &str) -> Result<Session> {
         if let Some(s) = self.get_session_where("id = ?1", r)? {
             return Ok(s);
@@ -112,9 +172,15 @@ impl Db {
         }
         let by_prefix: Vec<Session> = self.query_sessions("id LIKE ?1 || '%'", r)?;
         match by_prefix.len() {
-            1 => Ok(by_prefix.into_iter().next().unwrap()),
-            0 => bail!("no session matches '{r}'"),
+            1 => return Ok(by_prefix.into_iter().next().unwrap()),
+            0 => {}
             n => bail!("id prefix '{r}' is ambiguous ({n} sessions)"),
+        }
+        let by_name_prefix: Vec<Session> = self.query_sessions("name LIKE ?1 || '%'", r)?;
+        match by_name_prefix.len() {
+            1 => Ok(by_name_prefix.into_iter().next().unwrap()),
+            0 => bail!("no session matches '{r}'"),
+            n => bail!("name prefix '{r}' is ambiguous ({n} sessions)"),
         }
     }
 
@@ -126,22 +192,140 @@ impl Db {
         let sql = format!("SELECT {SESSION_COLS} FROM sessions WHERE {cond}");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([arg], row_to_session)?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
+        self.attach_tags(&mut sessions)?;
+        Ok(sessions)
     }
 
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<Session>> {
-        let where_clause = if include_archived {
-            ""
+        self.sessions(&SessionQuery {
+            archived: if include_archived {
+                ArchivedMode::All
+            } else {
+                ArchivedMode::Live
+            },
+            ..Default::default()
+        })
+    }
+
+    /// The one list/sort/filter path (pinned sessions always float first).
+    pub fn sessions(&self, q: &SessionQuery) -> Result<Vec<Session>> {
+        let mut conds: Vec<String> = Vec::new();
+        let mut args: Vec<String> = Vec::new();
+        match q.archived {
+            ArchivedMode::Live => conds.push("archived_at IS NULL".into()),
+            ArchivedMode::Only => conds.push("archived_at IS NOT NULL".into()),
+            ArchivedMode::All => {}
+        }
+        if !q.status.is_empty() {
+            let ph = vec!["?"; q.status.len()].join(",");
+            conds.push(format!("status IN ({ph})"));
+            args.extend(q.status.iter().cloned());
+        }
+        if let Some(a) = &q.agent {
+            conds.push("agent = ?".into());
+            args.push(a.clone());
+        }
+        if let Some(t) = &q.tag {
+            conds.push(
+                "EXISTS (SELECT 1 FROM tags t WHERE t.session_id = sessions.id AND t.tag = ?)"
+                    .into(),
+            );
+            args.push(t.clone());
+        }
+        if let Some(p) = &q.project {
+            conds.push("project_path LIKE '%' || ? || '%'".into());
+            args.push(p.clone());
+        }
+        if let Some(n) = &q.name {
+            conds.push("name LIKE '%' || ? || '%'".into());
+            args.push(n.clone());
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
         } else {
-            "WHERE archived_at IS NULL"
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let order = match q.sort {
+            SortMode::Activity => "COALESCE(last_agent_msg_at, last_user_msg_at, created_at) DESC",
+            SortMode::User => "COALESCE(last_user_msg_at, created_at) DESC",
+            SortMode::State => "COALESCE(last_state_change_at, created_at) DESC",
+            SortMode::Created => "created_at DESC",
+            SortMode::Name => "name COLLATE NOCASE ASC",
         };
         let sql = format!(
             "SELECT {SESSION_COLS} FROM sessions {where_clause} \
-             ORDER BY pinned DESC, COALESCE(last_agent_msg_at, created_at) DESC"
+             ORDER BY pinned DESC, {order}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], row_to_session)?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_session)?;
+        let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
+        self.attach_tags(&mut sessions)?;
+        Ok(sessions)
+    }
+
+    fn attach_tags(&self, sessions: &mut [Session]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, tag FROM tags ORDER BY tag")?;
+        let mut by_session: std::collections::HashMap<String, Vec<String>> = Default::default();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (sid, tag) = row?;
+            by_session.entry(sid).or_default().push(tag);
+        }
+        for s in sessions {
+            if let Some(t) = by_session.remove(&s.id) {
+                s.tags = t;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- meta-context mutations ----
+
+    /// Rename; an explicit rename locks the name against agent-side sync.
+    pub fn rename(&self, id: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET name = ?2, name_locked = 1 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+            params![id, pinned as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_group(&self, id: &str, group_path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET group_path = ?2 WHERE id = ?1",
+            params![id, group_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_tag(&self, id: &str, tag: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (session_id, tag) VALUES (?1, ?2)",
+            params![id, tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tag(&self, id: &str, tag: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM tags WHERE session_id = ?1 AND tag = ?2",
+            params![id, tag],
+        )?;
+        Ok(())
     }
 
     pub fn launch_spec(&self, id: &str) -> Result<String> {
@@ -264,6 +448,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_user_msg_at: r.get(13)?,
         last_agent_msg_at: r.get(14)?,
         last_state_change_at: r.get(15)?,
+        tags: Vec::new(),
     })
 }
 
@@ -353,6 +538,74 @@ mod tests {
         db.set_archived("01aaa", Some(4000)).unwrap();
         assert!(db.list_sessions(false).unwrap().is_empty());
         assert_eq!(db.list_sessions(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn query_filters_and_sorts() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "alpha");
+        mk(&db, "01bbb", "beta");
+        mk(&db, "01ccc", "gamma");
+        db.touch_last_agent_msg("01aaa", 5000).unwrap();
+        db.touch_last_agent_msg("01bbb", 9000).unwrap();
+        db.set_pinned("01ccc", true).unwrap();
+        db.add_tag("01aaa", "wip").unwrap();
+        db.add_tag("01aaa", "backend").unwrap();
+        db.set_status("01bbb", Status::WaitingInput, 1).unwrap();
+
+        // Pinned floats first; then activity order.
+        let all = db.sessions(&SessionQuery::default()).unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["01ccc", "01bbb", "01aaa"]);
+        assert_eq!(all[2].tags, ["backend", "wip"]);
+
+        // Tag filter.
+        let tagged = db
+            .sessions(&SessionQuery {
+                tag: Some("wip".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].id, "01aaa");
+
+        // Status filter.
+        let waiting = db
+            .sessions(&SessionQuery {
+                status: vec!["waiting_input".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, "01bbb");
+
+        // Name sort.
+        let named = db
+            .sessions(&SessionQuery {
+                sort: SortMode::Name,
+                ..Default::default()
+            })
+            .unwrap();
+        // gamma is pinned so still first; then alpha, beta.
+        let ids: Vec<&str> = named.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["01ccc", "01aaa", "01bbb"]);
+
+        // Archived views.
+        db.set_archived("01aaa", Some(1)).unwrap();
+        assert_eq!(db.sessions(&SessionQuery::default()).unwrap().len(), 2);
+        let only = db
+            .sessions(&SessionQuery {
+                archived: ArchivedMode::Only,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].id, "01aaa");
+
+        // Rename locks the name.
+        db.rename("01bbb", "beta-renamed").unwrap();
+        let s = db.resolve_ref("beta-renamed").unwrap();
+        assert!(s.name_locked);
     }
 
     #[test]

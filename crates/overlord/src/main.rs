@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use overlord_core::timefmt::{fmt_ts, rel_age};
 use overlord_core::{agents::claude, paths};
 use overlord_daemon::{client_call, methods, spool_hook_event, Daemon};
 
@@ -15,20 +16,40 @@ use overlord_daemon::{client_call, methods, spool_hook_event, Daemon};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Interactive session dashboard (the default when no subcommand is given)
+    Tui,
     /// Run the daemon in the foreground (use the systemd unit for real deployments)
     Daemon,
     /// Check daemon liveness
     Ping,
     /// List sessions
     Ls {
-        /// Include archived sessions
-        #[arg(long)]
+        /// Show only archived sessions
+        #[arg(long, conflicts_with = "all")]
         archived: bool,
+        /// Show live and archived sessions
+        #[arg(long)]
+        all: bool,
+        /// Filter by status (comma-separated: working,idle,waiting_input,stopped,error,starting)
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<String>,
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+        /// Filter by project path substring
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by name substring
+        #[arg(long)]
+        name: Option<String>,
+        /// Sort: activity (default), user, state, created, name
+        #[arg(long, default_value = "activity")]
+        sort: String,
         /// Raw JSON output
         #[arg(long)]
         json: bool,
@@ -50,13 +71,52 @@ enum Command {
         attach: bool,
     },
     /// Attach the terminal to a session (ref = id, id prefix, or name)
-    Attach { r#ref: String },
+    Attach {
+        r#ref: String,
+    },
     /// Restart a session, resuming its conversation
-    Restart { r#ref: String },
+    Restart {
+        r#ref: String,
+    },
     /// Stop a session (keeps it resumable)
-    Stop { r#ref: String },
+    Stop {
+        r#ref: String,
+    },
     /// Archive a session (stops it and hides it from the default list)
-    Archive { r#ref: String },
+    Archive {
+        r#ref: String,
+    },
+    /// Bring an archived session back to the live list (stopped, resumable)
+    Unarchive {
+        r#ref: String,
+    },
+    /// Rename a session (locks the name against agent-side renames)
+    Rename {
+        r#ref: String,
+        name: String,
+    },
+    /// Add tags to a session
+    Tag {
+        r#ref: String,
+        tags: Vec<String>,
+    },
+    /// Remove tags from a session
+    Untag {
+        r#ref: String,
+        tags: Vec<String>,
+    },
+    /// Pin a session to the top of every list
+    Pin {
+        r#ref: String,
+    },
+    Unpin {
+        r#ref: String,
+    },
+    /// Set a session's group path (e.g. `work/backend`)
+    Group {
+        r#ref: String,
+        group: String,
+    },
     /// Show a session's event log
     Log {
         r#ref: String,
@@ -91,7 +151,8 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
+    match Cli::parse().command.unwrap_or(Command::Tui) {
+        Command::Tui => overlord_tui::run(),
         Command::Daemon => run_daemon(),
         Command::Ping => {
             let r = call("ping", Value::Null)?;
@@ -101,8 +162,30 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Ls { archived, json } => {
-            let r = call("session.list", json!({"archived": archived}))?;
+        Command::Ls {
+            archived,
+            all,
+            status,
+            tag,
+            project,
+            name,
+            sort,
+            json,
+        } => {
+            let archived_mode = if archived {
+                "only"
+            } else if all {
+                "all"
+            } else {
+                "live"
+            };
+            let r = call(
+                "session.list",
+                json!({
+                    "archived": archived_mode, "status": status, "tag": tag,
+                    "project": project, "name": name, "sort": sort,
+                }),
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
             } else {
@@ -170,6 +253,45 @@ fn main() -> Result<()> {
             println!("archived {}", r["archived"].as_str().unwrap_or("?"));
             Ok(())
         }
+        Command::Unarchive { r#ref } => {
+            let r = call("session.unarchive", json!({"ref": r#ref}))?;
+            println!("unarchived {}", r["unarchived"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Command::Rename { r#ref, name } => {
+            let r = call("session.rename", json!({"ref": r#ref, "name": name}))?;
+            println!(
+                "renamed {} → {}",
+                r["renamed"].as_str().unwrap_or("?"),
+                name
+            );
+            Ok(())
+        }
+        Command::Tag { r#ref, tags } => {
+            let r = call("session.tag", json!({"ref": r#ref, "add": tags}))?;
+            println!("tags: {}", tags_of(&r));
+            Ok(())
+        }
+        Command::Untag { r#ref, tags } => {
+            let r = call("session.tag", json!({"ref": r#ref, "remove": tags}))?;
+            println!("tags: {}", tags_of(&r));
+            Ok(())
+        }
+        Command::Pin { r#ref } => {
+            call("session.pin", json!({"ref": r#ref, "pinned": true}))?;
+            println!("pinned");
+            Ok(())
+        }
+        Command::Unpin { r#ref } => {
+            call("session.pin", json!({"ref": r#ref, "pinned": false}))?;
+            println!("unpinned");
+            Ok(())
+        }
+        Command::Group { r#ref, group } => {
+            call("session.group", json!({"ref": r#ref, "group": group}))?;
+            println!("group set to {group}");
+            Ok(())
+        }
         Command::Log { r#ref, limit } => {
             let r = call("session.log", json!({"ref": r#ref, "limit": limit}))?;
             for e in r.as_array().map(|v| v.as_slice()).unwrap_or_default() {
@@ -202,6 +324,18 @@ fn main() -> Result<()> {
 
 fn call(method: &str, params: Value) -> Result<Value> {
     client_call(&paths::socket_path(), method, params)
+}
+
+fn tags_of(session: &Value) -> String {
+    let t: Vec<&str> = session["tags"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if t.is_empty() {
+        "(none)".to_string()
+    } else {
+        t.join(", ")
+    }
 }
 
 fn run_daemon() -> Result<()> {
@@ -259,25 +393,6 @@ fn attach_tmux(tmux_name: &str) -> Result<()> {
     Err(err).context("exec tmux failed")
 }
 
-fn fmt_ts(ms: i64) -> String {
-    // Local-enough display without a chrono dependency: UTC HH:MM:SS + date.
-    let secs = ms / 1000;
-    let days = secs / 86400;
-    let (h, m, s) = ((secs % 86400) / 3600, (secs % 3600) / 60, secs % 60);
-    // Civil date from days since epoch (Howard Hinnant's algorithm).
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
-}
-
 fn compact(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
@@ -296,26 +411,36 @@ fn print_session_table(list: &Value) {
         return;
     }
     println!(
-        "{:<8} {:<24} {:<8} {:<13} {:<19} PROJECT",
-        "ID", "NAME", "AGENT", "STATUS", "LAST AGENT MSG"
+        "{:<8} {:<24} {:<13} {:>6} {:>6}  {:<16} PROJECT",
+        "ID", "NAME", "STATUS", "AGENT", "USER", "TAGS"
     );
     for s in rows {
         let get = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("-");
         let id = get("id");
-        let short_id = &id[..id.len().min(6)];
-        let last = s
-            .get("last_agent_msg_at")
-            .and_then(Value::as_i64)
-            .map(fmt_ts)
-            .unwrap_or_else(|| "-".to_string());
+        let pin = if s["pinned"].as_bool().unwrap_or(false) {
+            "*"
+        } else {
+            " "
+        };
         println!(
-            "{:<8} {:<24} {:<8} {:<13} {:<19} {}",
-            short_id,
-            get("name"),
-            get("agent"),
+            "{:<8}{}{:<24} {:<13} {:>6} {:>6}  {:<16} {}",
+            &id[..id.len().min(6)],
+            pin,
+            truncate(get("name"), 23),
             get("status"),
-            last,
+            rel_age(s["last_agent_msg_at"].as_i64()),
+            rel_age(s["last_user_msg_at"].as_i64()),
+            truncate(&tags_of(s).replace("(none)", ""), 16),
             get("project_path")
         );
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }

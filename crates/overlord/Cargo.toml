@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 overlord-core = { path = "../core" }
 overlord-daemon = { path = "../daemon" }
+overlord-tui = { path = "../tui" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

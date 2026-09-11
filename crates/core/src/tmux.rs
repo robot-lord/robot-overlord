@@ -119,6 +119,12 @@ pub fn respawn_pane(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// Visible contents of the session's pane (for previews).
+pub fn capture_pane(name: &str) -> Result<String> {
+    let (_, pane_id) = window_pane_ids(name)?;
+    run(&["capture-pane", "-p", "-t", &pane_id])
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     if has_session(name) {
         run(&["kill-session", "-t", &exact(name)])?;
