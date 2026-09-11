@@ -53,18 +53,20 @@ matter to us:
 
 See `docs/architecture.md` for the full plan and phased milestones.
 
-## Quickstart (phase 1)
+## Quickstart
 
 ```bash
-cargo build --workspace
-./target/debug/rlord claude install-hooks   # merge-adds hooks to ~/.claude/settings.json
-./target/debug/rlord daemon &               # or install the systemd unit (deploy/)
+scripts/dev-daemon.sh                        # build + (re)start the daemon (dev loop)
+./target/debug/rlord claude install-hooks    # merge-adds hooks to ~/.claude/settings.json
+rlord                                        # TUI dashboard (default command)
 rlord new --project ~/src/myrepo "first prompt"   # launch a Claude session in tmux
-rlord ls                                    # live status via Claude hooks
-rlord attach <ref>                          # ref = id, id prefix, or name
-rlord stop <ref> && rlord restart <ref>  # resume with full conversation context
-rlord log <ref>                             # per-session event history
+rlord ls --sort user --tag wip               # query: status/tag/project/name filters, 5 sorts
+rlord attach <ref>                           # ref = id, id prefix, name, or name prefix
+rlord stop <ref> && rlord restart <ref>      # resume with full conversation context
+rlord rename/tag/untag/pin/archive/log <ref> # meta-context
 ```
+
+For a persistent daemon, install `deploy/robot-overlord.service` (systemd user unit).
 
 Sessions survive reboots: the minted Claude session id lives in SQLite, so
 `rlord restart` brings the conversation back via `claude --resume` even
