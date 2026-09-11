@@ -201,6 +201,42 @@ Same three-tier degradation the research validated, implemented once:
 Every status transition is an `events` row and a push to subscribers; that is
 what makes the TUI live and `last_state_change_at` trustworthy.
 
+## Transcript store (raw conversation data)
+
+Both target CLIs already persist **complete structured transcripts as local
+JSONL** — the very files their own resume features replay — so getting raw
+conversation data into software-land costs parsing, not capture:
+
+- **Claude Code**: `~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl`.
+  Typed records (`user`, `assistant`, `system`, `attachment`, …), each with
+  `uuid` + `parentUuid` (the conversation is a DAG — forks and subagent
+  sidechains included, flagged `isSidechain`), ISO `timestamp`, `cwd`,
+  `gitBranch`, `sessionId`, CLI `version`; assistant records embed the full
+  API message (text + `tool_use` blocks) plus per-message token usage.
+  Because we mint the session UUID, the path is **deterministic at launch** —
+  no discovery needed. Hooks also hand us `transcript_path` in every payload.
+- **Codex**: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` —
+  the rollout `codex resume` replays, complete by construction; includes
+  cwd/workdir and is attributable to our session via the bound id.
+- tmux `pipe-pane` raw capture is deliberately **not** the mechanism —
+  terminal output is ANSI redraw soup; the JSONL is the semantic record.
+  (Pane capture stays only as a status-detection fallback.)
+
+Daemon pipeline: watch each live session's transcript (fsnotify + hook-event
+triggers) → incremental parse of appended lines → normalized `transcript_msgs`
+rows in our SQLite with an **FTS5 index** (full-text search across the fleet,
+filterable by session/agent/project/time — this also powers `get_context`).
+
+**Durability caveat that makes our archive feature load-bearing**: Claude Code
+prunes old transcripts (`cleanupPeriodDays`, default ~30 days), and Codex
+homes can be wiped per-account. Archiving a session in AI Overlord therefore
+**copies its transcript into our own store** (`$XDG_DATA_HOME/ai-overlord/
+transcripts/`), so archived context outlives the agent CLI's retention policy
+and remains searchable forever. Two caveats to engineer for: the formats are
+internal and version-drifting (parse defensively, keep the raw file verbatim
+alongside the normalized rows), and files get large (append-offset tracking,
+never full re-reads on the hot path).
+
 ## Inter-session messaging
 
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,
@@ -315,9 +351,10 @@ Each phase ends runnable and used-for-real (dogfood from phase 2 onward).
   archive, query object across CLI, TUI v1 (list, live status, sort/filter,
   attach, archive view). *Acceptance: daily-drive replaces other-tool for
   Claude work.*
-- **Phase 3 — MCP + messaging**: MCP server + stdio shim + identity; mailbox
-  with the three delivery channels; `get_context`; `report_done`; the skill
-  snippet. *Acceptance: from one Claude session, list the fleet, read another
+- **Phase 3 — MCP + messaging + transcripts**: MCP server + stdio shim +
+  identity; mailbox with the three delivery channels; transcript ingestion +
+  FTS5 search + archive-copies-transcript; `get_context` served from the
+  transcript store; `report_done`; the skill snippet. *Acceptance: from one Claude session, list the fleet, read another
   session's context, task it, and receive its completion — without any Bash
   round-trips or conductor session.*
 - **Phase 4 — Codex adapter**: notify install, resume gates, fork fallback,
