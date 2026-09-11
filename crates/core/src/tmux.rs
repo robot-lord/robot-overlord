@@ -141,6 +141,13 @@ const HOME_OPTION: &str = "@rlord_home";
 /// returned but callers usually just log them — a missing tmux server at
 /// daemon start is normal.
 pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<()> {
+    // Drop bindings from a previous config first, so changing a key in
+    // config.toml doesn't leave the old key bound as well.
+    for key in installed_nav_keys()? {
+        if !bindings.iter().any(|(k, _)| *k == key) {
+            let _ = run(&["unbind-key", "-n", &key]);
+        }
+    }
     for (key, verb) in bindings {
         let cmd = format!("{} nav {verb}", shell_quote(bin));
         run(&["bind-key", "-n", key, "run-shell", "-b", &cmd])?;
@@ -148,12 +155,28 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<()> {
     Ok(())
 }
 
+/// Remove every rlord navigation binding, whatever key it is on.
 pub fn unbind_nav_keys(bindings: &[(&str, &str)]) -> Result<()> {
-    for (key, _) in bindings {
+    let mut keys = installed_nav_keys()?;
+    keys.extend(bindings.iter().map(|(k, _)| k.to_string()));
+    for key in keys {
         // Unbinding a key that isn't bound is not an error worth surfacing.
-        let _ = run(&["unbind-key", "-n", key]);
+        let _ = run(&["unbind-key", "-n", &key]);
     }
     Ok(())
+}
+
+/// Root-table keys currently bound to `rlord nav ...` on this server.
+fn installed_nav_keys() -> Result<Vec<String>> {
+    let out = match run(&["list-keys", "-T", "root"]) {
+        Ok(o) => o,
+        Err(_) => return Ok(vec![]), // no server: nothing installed
+    };
+    Ok(out
+        .lines()
+        .filter(|l| l.contains("rlord nav "))
+        .filter_map(|l| l.split_whitespace().nth(3).map(str::to_string))
+        .collect())
 }
 
 /// Record where the TUI lives so `nav home` can find it. Empty = "no home;

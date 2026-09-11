@@ -391,13 +391,13 @@ remembering tmux session names:
 - **Enter a session** (`attach` key in the TUI): inside tmux this is
   `switch-client`, so the TUI keeps running in its own pane; outside tmux the
   TUI suspends and runs `tmux attach` as a child until you come back.
-- **Back to rlord** — a *server-wide root-table tmux binding* (default `C-q`)
+- **Back to rlord** — a *server-wide root-table tmux binding* (default `M-d`, Option-D on a Mac)
   that runs `rlord nav home`. The TUI records its own tmux session in the
   global option `@rlord_home` whenever you enter a session; `nav home`
   `switch-client`s there, or `detach-client`s when there is no home (the
   outside-tmux case). Verified 2026-09-11 with a scripted PTY against a live tmux 3.6
   server: a root binding + `run-shell` moves the pressing client.
-- **Next / previous session** (default `M-]` / `M-[`) — `rlord nav next|prev`
+- **Next / previous session** (default `M-f` / `M-s`) — `rlord nav next|prev`
   asks the daemon for the live list in the TUI's order and switches to the
   neighbour, so you can tour agents without going home each time.
 

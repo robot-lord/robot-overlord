@@ -71,10 +71,12 @@ For a persistent daemon, install `deploy/robot-overlord.service` (systemd user u
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its
-pane; from inside **any** agent pane, **`C-q`** brings you back to the TUI and
-**`M-]` / `M-[`** cycle through live sessions. Those three are tmux root-table
+pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
+TUI and **Option-F / Option-S** cycle through live sessions — three adjacent
+left-hand home-row keys, because you press these constantly. (macOS: make
+Option send Alt, e.g. kitty `macos_option_as_alt both`.) Those three are tmux root-table
 bindings that rlord installs on your tmux server (`rlord tmux bind|unbind`);
-if you attached from outside tmux, `C-q` detaches instead.
+if you attached from outside tmux, Option-D detaches instead.
 
 Everything is configurable in `~/.config/robot-overlord/config.toml`
 (`rlord config init` writes a commented template; `rlord config show` prints

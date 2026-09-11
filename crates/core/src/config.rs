@@ -73,6 +73,7 @@ impl Default for Keys {
 #[serde(default)]
 pub struct TmuxKeys {
     /// Jump back to the rlord TUI (or detach, if you attached from outside tmux).
+    /// Default `M-d`: Option/Alt + a home-row key, since this is pressed constantly.
     pub back: String,
     /// Cycle to the next / previous live session without going home.
     pub next: String,
@@ -82,9 +83,9 @@ pub struct TmuxKeys {
 impl Default for TmuxKeys {
     fn default() -> Self {
         TmuxKeys {
-            back: "C-q".into(),
-            next: "M-]".into(),
-            prev: "M-[".into(),
+            back: "M-d".into(),
+            next: "M-f".into(),
+            prev: "M-s".into(),
         }
     }
 }
@@ -177,10 +178,12 @@ cancel = "esc"
 
 # Global tmux bindings rlord installs (root key table, tmux key syntax) so they
 # work from inside any agent pane. Set a key to "" to disable it.
+# Defaults are three adjacent left-hand home-row keys: Option/Alt + s d f.
+# (On macOS make Option send Alt — kitty: `macos_option_as_alt both`.)
 [tmux]
-back = "C-q"    # back to the rlord TUI (or detach if you attached from outside tmux)
-next = "M-]"    # cycle to the next live session
-prev = "M-["    # cycle to the previous live session
+back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
+next = "M-f"    # cycle to the next live session
+prev = "M-s"    # cycle to the previous live session
 "##;
 
 #[cfg(test)]
@@ -191,7 +194,7 @@ mod tests {
     fn template_parses_to_defaults() {
         let c: Config = toml::from_str(&Config::default_toml()).unwrap();
         assert_eq!(c.keys.quit, Keys::default().quit);
-        assert_eq!(c.tmux.back, "C-q");
+        assert_eq!(c.tmux.back, "M-d");
         assert_eq!(c.layout, Layout::Side);
         assert_eq!(c.preview_refresh_ms, 500);
     }
