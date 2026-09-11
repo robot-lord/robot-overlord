@@ -383,6 +383,39 @@ preview pane (control-mode capture stream), attach on Enter, message compose.
 Deliberately thin — no business logic; if the TUI dies the fleet doesn't care.
 (This is the anti-`home.go` rule: the daemon owns behavior, clients own pixels.)
 
+## Navigation between rlord and agent panes
+
+The TUI is the hub; agent sessions are spokes. Moving around never requires
+remembering tmux session names:
+
+- **Enter a session** (`attach` key in the TUI): inside tmux this is
+  `switch-client`, so the TUI keeps running in its own pane; outside tmux the
+  TUI suspends and runs `tmux attach` as a child until you come back.
+- **Back to rlord** — a *server-wide root-table tmux binding* (default `C-q`)
+  that runs `rlord nav home`. The TUI records its own tmux session in the
+  global option `@rlord_home` whenever you enter a session; `nav home`
+  `switch-client`s there, or `detach-client`s when there is no home (the
+  outside-tmux case). Verified 2026-09-11 with a scripted PTY against a live tmux 3.6
+  server: a root binding + `run-shell` moves the pressing client.
+- **Next / previous session** (default `M-]` / `M-[`) — `rlord nav next|prev`
+  asks the daemon for the live list in the TUI's order and switches to the
+  neighbour, so you can tour agents without going home each time.
+
+The bindings are installed by the daemon at startup and whenever it creates a
+tmux session (idempotent), and by the TUI at launch; `rlord tmux unbind`
+removes them. They live in the root table because tmux key tables are
+per-client, not per-session — the cost is that these keys are global on your
+tmux server, so each is configurable and can be set to `""` to disable.
+
+## Configuration
+
+`$XDG_CONFIG_HOME/robot-overlord/config.toml` (`rlord config init` writes a
+commented template equal to the defaults; `rlord config show` prints the
+effective config). Missing keys take defaults; a malformed file is an error,
+never silently ignored. Sections: `layout` (`side` = list left / preview
+right, `stack`), `list_width_pct`, `preview_refresh_ms`, `[keys]` (every TUI
+action), `[tmux]` (the three navigation bindings).
+
 ## Naming
 
 - Default name: the project directory basename + short discriminator (not

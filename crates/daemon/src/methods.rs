@@ -86,7 +86,7 @@ fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string param '{key}'"))
 }
 
-fn rlord_bin() -> String {
+pub fn rlord_bin() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))

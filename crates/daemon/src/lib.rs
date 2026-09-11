@@ -10,12 +10,14 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use rlord_core::config::Config;
 use rlord_core::db::Db;
-use rlord_core::paths;
+use rlord_core::{paths, tmux};
 use rpc::{Request, Response};
 
 pub struct Daemon {
     db: Mutex<Db>,
+    config: Config,
     /// Coarse change signal: any successful mutation broadcasts one tick;
     /// subscribers refetch what they display. Fine-grained events can come
     /// later without changing the wire shape.
@@ -23,12 +25,23 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(db: Db) -> Arc<Self> {
+    pub fn new(db: Db, config: Config) -> Arc<Self> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
         Arc::new(Daemon {
             db: Mutex::new(db),
+            config,
             changes,
         })
+    }
+
+    /// Install the navigation bindings on the tmux server. Best-effort: no
+    /// server yet (nothing running) is normal at daemon start; we retry on
+    /// every session launch.
+    pub fn bind_nav_keys(&self) {
+        let bindings = self.config.tmux.bindings();
+        if let Err(e) = tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
+            tracing::debug!(error = %e, "nav keys not bound (no tmux server yet?)");
+        }
     }
 
     /// Startup housekeeping: drain spooled hook events, then reconcile
@@ -40,7 +53,10 @@ impl Daemon {
                 tracing::warn!(error = %e, "spooled hook event failed");
             }
         }
-        methods::reconcile(&db)
+        methods::reconcile(&db)?;
+        drop(db);
+        self.bind_nav_keys();
+        Ok(())
     }
 
     /// Bind the socket (0700 dir, 0600 socket — the socket IS the auth boundary).
@@ -166,6 +182,9 @@ impl Daemon {
         };
         if mutating && r.is_ok() {
             let _ = self.changes.send(());
+            if method == "session.new" {
+                self.bind_nav_keys();
+            }
         }
         r.map_err(MethodError::Internal)
     }
@@ -248,7 +267,7 @@ mod tests {
     async fn ping_and_list_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
-        let daemon = Daemon::new(Db::open_in_memory().unwrap());
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         let listener = Daemon::bind(&sock).unwrap();
         let server = tokio::spawn(daemon.serve(listener));
 
@@ -273,7 +292,7 @@ mod tests {
     async fn hook_emit_updates_status_and_timestamps() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
-        let daemon = Daemon::new(Db::open_in_memory().unwrap());
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         {
             let db = daemon.db.lock().unwrap();
             db.insert_session(&rlord_core::db::NewSession {

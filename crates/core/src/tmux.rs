@@ -132,6 +132,63 @@ pub fn kill_session(name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- navigation: server-wide root-table bindings + the "home" pointer ----
+
+const HOME_OPTION: &str = "@rlord_home";
+
+/// Install `key → run-shell "<bin> nav <verb>"` in the root key table for each
+/// enabled binding. Idempotent (rebinding a key replaces it). Errors are
+/// returned but callers usually just log them — a missing tmux server at
+/// daemon start is normal.
+pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<()> {
+    for (key, verb) in bindings {
+        let cmd = format!("{} nav {verb}", shell_quote(bin));
+        run(&["bind-key", "-n", key, "run-shell", "-b", &cmd])?;
+    }
+    Ok(())
+}
+
+pub fn unbind_nav_keys(bindings: &[(&str, &str)]) -> Result<()> {
+    for (key, _) in bindings {
+        // Unbinding a key that isn't bound is not an error worth surfacing.
+        let _ = run(&["unbind-key", "-n", key]);
+    }
+    Ok(())
+}
+
+/// Record where the TUI lives so `nav home` can find it. Empty = "no home;
+/// detach instead" (the TUI sets this when it attaches from outside tmux).
+pub fn set_home(session: &str) -> Result<()> {
+    run(&["set-option", "-g", HOME_OPTION, session])?;
+    Ok(())
+}
+
+pub fn home() -> Option<String> {
+    run(&["show-options", "-gqv", HOME_OPTION])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Session of the pane this process runs in (valid inside tmux / run-shell).
+pub fn current_session() -> Option<String> {
+    if std::env::var_os("TMUX").is_none() && std::env::var_os("TMUX_PANE").is_none() {
+        return None;
+    }
+    run(&["display-message", "-p", "#{session_name}"])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+pub fn switch_client(session: &str) -> Result<()> {
+    run(&["switch-client", "-t", &exact(session)])?;
+    Ok(())
+}
+
+pub fn detach_client() -> Result<()> {
+    run(&["detach-client"])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

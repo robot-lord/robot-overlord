@@ -29,3 +29,12 @@ pub fn socket_path() -> PathBuf {
 pub fn db_path() -> PathBuf {
     data_dir().join("state.db")
 }
+
+/// User config: `$XDG_CONFIG_HOME/robot-overlord/config.toml` or `~/.config/...`.
+pub fn config_path() -> PathBuf {
+    env_dir("XDG_CONFIG_HOME")
+        .or_else(|| env_dir("HOME").map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("robot-overlord")
+        .join("config.toml")
+}

@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use rlord_core::config::Config;
 use rlord_core::timefmt::{fmt_ts, rel_age};
-use rlord_core::{agents::claude, paths};
+use rlord_core::{agents::claude, paths, tmux};
 use rlord_daemon::{client_call, methods, spool_hook_event, Daemon};
 
 #[derive(Parser)]
@@ -123,12 +124,47 @@ enum Command {
         #[arg(long, short = 'n', default_value = "50")]
         limit: i64,
     },
+    /// Configuration file management
+    #[command(subcommand)]
+    Config(ConfigCmd),
+    /// Manage the tmux navigation key bindings rlord installs
+    #[command(subcommand)]
+    Tmux(TmuxCmd),
+    /// Navigation target of the tmux bindings (invoked by tmux run-shell)
+    #[command(subcommand, hide = true)]
+    Nav(NavCmd),
     /// Plumbing invoked by agent hook systems (fast path; never fails loudly)
     #[command(subcommand, hide = true)]
     Hook(HookCmd),
     /// Claude Code integration management
     #[command(subcommand)]
     Claude(ClaudeCmd),
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Write a commented default config (refuses to overwrite an existing one)
+    Init,
+    /// Print the config file path
+    Path,
+    /// Print the effective configuration
+    Show,
+}
+
+#[derive(Subcommand)]
+enum TmuxCmd {
+    /// (Re)install the navigation bindings on the current tmux server
+    Bind,
+    /// Remove the navigation bindings
+    Unbind,
+}
+
+#[derive(Subcommand)]
+enum NavCmd {
+    /// Back to the rlord TUI, or detach when attached from outside tmux
+    Home,
+    Next,
+    Prev,
 }
 
 #[derive(Subcommand)]
@@ -152,7 +188,49 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command.unwrap_or(Command::Tui) {
-        Command::Tui => rlord_tui::run(),
+        Command::Tui => {
+            let cfg = Config::load()?;
+            let _ = tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings());
+            rlord_tui::run(cfg)
+        }
+        Command::Config(ConfigCmd::Init) => {
+            let path = paths::config_path();
+            if path.exists() {
+                anyhow::bail!("{} already exists", path.display());
+            }
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, Config::default_toml())?;
+            println!("wrote {}", path.display());
+            Ok(())
+        }
+        Command::Config(ConfigCmd::Path) => {
+            println!("{}", paths::config_path().display());
+            Ok(())
+        }
+        Command::Config(ConfigCmd::Show) => {
+            print!("{}", toml::to_string_pretty(&Config::load()?)?);
+            Ok(())
+        }
+        Command::Tmux(TmuxCmd::Bind) => {
+            let cfg = Config::load()?;
+            let b = cfg.tmux.bindings();
+            tmux::bind_nav_keys(&methods::rlord_bin(), &b)?;
+            for (k, v) in &b {
+                println!("{k:<6} → rlord nav {v}");
+            }
+            Ok(())
+        }
+        Command::Tmux(TmuxCmd::Unbind) => {
+            let cfg = Config::load()?;
+            tmux::unbind_nav_keys(&cfg.tmux.bindings())?;
+            println!("navigation bindings removed");
+            Ok(())
+        }
+        Command::Nav(NavCmd::Home) => nav_home(),
+        Command::Nav(NavCmd::Next) => nav_step(1),
+        Command::Nav(NavCmd::Prev) => nav_step(-1),
         Command::Daemon => run_daemon(),
         Command::Ping => {
             let r = call("ping", Value::Null)?;
@@ -342,7 +420,7 @@ fn run_daemon() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
-        let daemon = Daemon::new(db);
+        let daemon = Daemon::new(db, Config::load()?);
         daemon.startup()?;
         let listener = Daemon::bind(&paths::socket_path())?;
         tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), "rlordd starting");
@@ -375,6 +453,38 @@ fn hook_emit(agent: &str) -> Result<()> {
         spool_hook_event(&params).ok();
     }
     Ok(())
+}
+
+/// `nav home`: switch this client to the TUI's session, or detach when the
+/// TUI isn't inside tmux (no home recorded / home gone).
+fn nav_home() -> Result<()> {
+    match tmux::home() {
+        Some(h) if tmux::has_session(&h) => tmux::switch_client(&h),
+        _ => tmux::detach_client(),
+    }
+}
+
+/// `nav next|prev`: move to the neighbouring live session in list order.
+fn nav_step(dir: i64) -> Result<()> {
+    let list = call("session.list", json!({"archived": "live"}))?;
+    let live: Vec<String> = list
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|s| s["status"] != "stopped")
+                .filter_map(|s| s["tmux_session"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if live.is_empty() {
+        return Ok(());
+    }
+    let cur = tmux::current_session().unwrap_or_default();
+    let target = match live.iter().position(|s| *s == cur) {
+        Some(i) => &live[(i as i64 + dir).rem_euclid(live.len() as i64) as usize],
+        None => &live[0],
+    };
+    tmux::switch_client(target)
 }
 
 fn attach_tmux(tmux_name: &str) -> Result<()> {

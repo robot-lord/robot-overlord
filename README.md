@@ -68,6 +68,20 @@ rlord rename/tag/untag/pin/archive/log <ref> # meta-context
 
 For a persistent daemon, install `deploy/robot-overlord.service` (systemd user unit).
 
+## Navigation and keys
+
+The TUI is the hub. `enter` on a session switches your tmux client into its
+pane; from inside **any** agent pane, **`C-q`** brings you back to the TUI and
+**`M-]` / `M-[`** cycle through live sessions. Those three are tmux root-table
+bindings that rlord installs on your tmux server (`rlord tmux bind|unbind`);
+if you attached from outside tmux, `C-q` detaches instead.
+
+Everything is configurable in `~/.config/robot-overlord/config.toml`
+(`rlord config init` writes a commented template; `rlord config show` prints
+the effective values): the layout (`side` — list left, live preview right — or
+`stack`), the preview refresh rate, every TUI key under `[keys]`, and the tmux
+bindings under `[tmux]` (set one to `""` to disable it).
+
 Sessions survive reboots: the minted Claude session id lives in SQLite, so
 `rlord restart` brings the conversation back via `claude --resume` even
 after the tmux server is gone.
