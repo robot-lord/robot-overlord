@@ -276,10 +276,34 @@ turns of any hit. Same code path, three doors.
 **Durability caveat that makes the store load-bearing**: Claude Code prunes
 old transcripts (`cleanupPeriodDays`, default ~30 days), and Codex homes can
 be wiped per-account. Our mirror is therefore the durable record — context
-outlives the agent CLI's retention policy. Engineering caveats: the JSONL
-formats are internal and version-drifting (parse defensively; when a line
-doesn't parse, still preserve it in `raw.jsonl` and emit a marker turn in the
-render so nothing silently vanishes).
+outlives the agent CLI's retention policy.
+
+### Parsing & schema drift
+
+The JSONL formats are internal to the agent CLIs and drift across versions.
+The design absorbs that instead of fighting it:
+
+1. **Raw is the source of truth; the render is a cache.** `transcript.md` is
+   a pure function of `raw.jsonl`, stamped with a `render_version`. A parser
+   fix or a new dialect means `overlord render --stale` regenerates renders —
+   no data was ever at risk, because we never parse-then-discard.
+2. **Dialect cascade, not one struct.** Each line parses to loose JSON first,
+   then typed extractors are tried newest-dialect-first (keyed on record
+   `type`, observed fields, and the CLI `version` field when present). All
+   dialects emit one common `Turn` IR that the renderer and search mapping
+   consume. Supporting a new CLI version = add a dialect; old dialects stay,
+   so historical archives always re-render.
+3. **Tolerant by construction.** Extractors ignore unknown fields and accept
+   missing optional ones (serde defaults). A line no dialect claims is still
+   preserved verbatim in `raw.jsonl` and rendered as an explicit
+   `[unparsed record]` marker turn — nothing silently vanishes.
+4. **Corpus-pinned tests.** A fixtures directory holds sanitized real
+   transcript samples per CLI version with golden-render tests. The drift
+   workflow is mechanical: new CLI version misbehaves → capture fixture →
+   extend/add dialect → goldens prove old versions still render byte-stable.
+5. **Visibility.** Per-file unparsed-line counts are tracked in metadata and
+   surfaced by `overlord doctor`, so drift is noticed when it starts, not
+   when a search comes back mysteriously empty.
 
 ## Inter-session messaging
 
