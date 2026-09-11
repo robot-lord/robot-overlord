@@ -53,6 +53,23 @@ matter to us:
 
 See `docs/architecture.md` for the full plan and phased milestones.
 
+## Quickstart (phase 1)
+
+```bash
+cargo build --workspace
+./target/debug/overlord claude install-hooks   # merge-adds hooks to ~/.claude/settings.json
+./target/debug/overlord daemon &               # or install the systemd unit (deploy/)
+overlord new --project ~/src/myrepo "first prompt"   # launch a Claude session in tmux
+overlord ls                                    # live status via Claude hooks
+overlord attach <ref>                          # ref = id, id prefix, or name
+overlord stop <ref> && overlord restart <ref>  # resume with full conversation context
+overlord log <ref>                             # per-session event history
+```
+
+Sessions survive reboots: the minted Claude session id lives in SQLite, so
+`overlord restart` brings the conversation back via `claude --resume` even
+after the tmux server is gone.
+
 ## Docs
 
 - `docs/architecture.md` — the architecture plan: components, data model,

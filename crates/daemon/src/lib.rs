@@ -1,3 +1,4 @@
+pub mod methods;
 pub mod rpc;
 
 use std::os::unix::fs::PermissionsExt;
@@ -10,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use overlord_core::db::Db;
+use overlord_core::paths;
 use rpc::{Request, Response};
 
 pub struct Daemon {
@@ -19,6 +21,18 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(db: Db) -> Arc<Self> {
         Arc::new(Daemon { db: Mutex::new(db) })
+    }
+
+    /// Startup housekeeping: drain spooled hook events, then reconcile
+    /// DB state against the live tmux server.
+    pub fn startup(&self) -> Result<()> {
+        let db = self.db.lock().expect("db mutex poisoned");
+        for params in drain_spool()? {
+            if let Err(e) = methods::hook_emit(&db, &params) {
+                tracing::warn!(error = %e, "spooled hook event failed");
+            }
+        }
+        methods::reconcile(&db)
     }
 
     /// Bind the socket (0700 dir, 0600 socket — the socket IS the auth boundary).
@@ -64,7 +78,12 @@ impl Daemon {
                 continue;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
-                Ok(req) => self.dispatch(req),
+                Ok(req) => {
+                    let daemon = self.clone();
+                    tokio::task::spawn_blocking(move || daemon.dispatch(req))
+                        .await
+                        .context("dispatch task panicked")?
+                }
                 Err(e) => Response::err(0, rpc::ERR_BAD_REQUEST, format!("bad request: {e}")),
             };
             let mut out = serde_json::to_vec(&resp)?;
@@ -84,30 +103,36 @@ impl Daemon {
                 format!("no such method: {}", req.method),
             ),
             Err(MethodError::Internal(e)) => {
-                tracing::error!(method = %req.method, error = %e, "method failed");
+                tracing::warn!(method = %req.method, error = %e, "method failed");
                 Response::err(id, rpc::ERR_INTERNAL, e.to_string())
             }
         }
     }
 
     fn call(&self, method: &str, params: Value) -> std::result::Result<Value, MethodError> {
-        match method {
-            "ping" => Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION")})),
+        if method == "ping" {
+            return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION")}));
+        }
+        let db = self.db.lock().expect("db mutex poisoned");
+        let r = match method {
             "session.list" => {
                 let include_archived = params
                     .get("archived")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let sessions = self
-                    .db
-                    .lock()
-                    .expect("db mutex poisoned")
-                    .list_sessions(include_archived)
-                    .map_err(MethodError::Internal)?;
-                Ok(serde_json::to_value(sessions).map_err(|e| MethodError::Internal(e.into()))?)
+                db.list_sessions(include_archived)
+                    .and_then(|s| Ok(serde_json::to_value(s)?))
             }
-            _ => Err(MethodError::NotFound),
-        }
+            "session.new" => methods::session_new(&db, &params),
+            "session.get" => methods::session_get(&db, &params),
+            "session.restart" => methods::session_restart(&db, &params),
+            "session.stop" => methods::session_stop(&db, &params),
+            "session.archive" => methods::session_archive(&db, &params),
+            "session.log" => methods::session_log(&db, &params),
+            "hook.emit" => methods::hook_emit(&db, &params),
+            _ => return Err(MethodError::NotFound),
+        };
+        r.map_err(MethodError::Internal)
     }
 }
 
@@ -141,11 +166,50 @@ pub fn client_call(socket_path: &PathBuf, method: &str, params: Value) -> Result
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
+// ---- hook spool: hook evidence must never be lost to a down daemon ----
+
+fn spool_path() -> PathBuf {
+    paths::data_dir().join("spool/hooks.jsonl")
+}
+
+/// Append a hook.emit params object to the spool (used by `overlord hook emit`
+/// when the daemon is unreachable).
+pub fn spool_hook_event(params: &Value) -> Result<()> {
+    let path = spool_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{params}")?;
+    Ok(())
+}
+
+fn drain_spool() -> Result<Vec<Value>> {
+    let path = spool_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(vec![]);
+    };
+    let events: Vec<Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if !events.is_empty() {
+        tracing::info!(count = events.len(), "draining spooled hook events");
+    }
+    std::fs::remove_file(&path).ok();
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn ping_and_list_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
@@ -166,6 +230,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(list, json!([]));
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_emit_updates_status_and_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let daemon = Daemon::new(Db::open_in_memory().unwrap());
+        {
+            let db = daemon.db.lock().unwrap();
+            db.insert_session(&overlord_core::db::NewSession {
+                id: "01test",
+                name: "t",
+                agent: "claude",
+                agent_session: Some("uuid-1"),
+                project_path: "/tmp",
+                tmux_session: "ovl_01test",
+                launch_spec: "{}",
+                created_at: 1,
+            })
+            .unwrap();
+        }
+        let listener = Daemon::bind(&sock).unwrap();
+        let server = tokio::spawn(daemon.clone().serve(listener));
+
+        let call = |method: &'static str, params: Value| {
+            let sock = sock.clone();
+            tokio::task::spawn_blocking(move || client_call(&sock, method, params).unwrap())
+        };
+        call(
+            "hook.emit",
+            json!({"instance": "01test", "agent": "claude", "event": "UserPromptSubmit",
+                   "payload": {"session_id": "uuid-1", "transcript_path": "/tmp/t.jsonl"}}),
+        )
+        .await
+        .unwrap();
+        let s = call("session.get", json!({"ref": "01test"})).await.unwrap();
+        assert_eq!(s["status"], "working");
+        assert!(s["last_user_msg_at"].is_i64());
+        assert_eq!(s["agent_session_trust"], "hook"); // minted id confirmed
+
+        call(
+            "hook.emit",
+            json!({"instance": "01test", "agent": "claude", "event": "Stop",
+                   "payload": {"session_id": "uuid-1"}}),
+        )
+        .await
+        .unwrap();
+        let s = call("session.get", json!({"ref": "01test"})).await.unwrap();
+        assert_eq!(s["status"], "idle");
+        assert!(s["last_agent_msg_at"].is_i64());
+
+        let log = call("session.log", json!({"ref": "01test"})).await.unwrap();
+        let kinds: Vec<&str> = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["prompt_submitted", "agent_stopped"]);
 
         server.abort();
     }

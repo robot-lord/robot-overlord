@@ -31,6 +31,7 @@ pub struct Session {
     pub name_locked: bool,
     pub agent: String,
     pub agent_session: Option<String>,
+    pub agent_session_trust: String,
     pub project_path: String,
     pub tmux_session: Option<String>,
     pub status: Status,
