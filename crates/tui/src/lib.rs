@@ -15,11 +15,11 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use ratatui::{DefaultTerminal, Frame};
 use serde_json::{json, Value};
 
-use overlord_core::db::SortMode;
-use overlord_core::paths;
-use overlord_core::timefmt::{fmt_ts, rel_age};
-use overlord_core::tmux;
-use overlord_daemon::client_call;
+use rlord_core::db::SortMode;
+use rlord_core::paths;
+use rlord_core::timefmt::{fmt_ts, rel_age};
+use rlord_core::tmux;
+use rlord_daemon::client_call;
 
 pub fn run() -> Result<()> {
     // Fail fast with a readable error before touching the terminal.

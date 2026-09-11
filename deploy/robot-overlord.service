@@ -1,0 +1,20 @@
+# systemd user unit for the Robot Overlord daemon.
+# Install:
+#   cargo install --path crates/rlord
+#   mkdir -p ~/.config/systemd/user && cp deploy/robot-overlord.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now robot-overlord
+# `loginctl enable-linger $USER` if it should run without an active login session.
+
+[Unit]
+Description=Robot Overlord daemon (rlordd)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/rlord daemon
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

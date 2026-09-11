@@ -1,5 +1,5 @@
-//! tmux supervision: one tmux session per overlord session, one window, one
-//! pane. Session names are `ovl_<ulid>` — derived from the immutable id, never
+//! tmux supervision: one tmux session per rlord session, one window, one
+//! pane. Session names are `rlord_<ulid>` — derived from the immutable id, never
 //! the display name. `remain-on-exit` is set so an exited agent leaves a dead
 //! pane (restartable in place via `respawn-pane -k`) instead of tearing the
 //! tmux session down.
@@ -21,7 +21,7 @@ fn exact(name: &str) -> String {
 fn tmux_cmd() -> Command {
     let mut c = Command::new("tmux");
     // Tests point this at a private server socket; unset = the default server.
-    if let Ok(sock) = std::env::var("OVERLORD_TMUX_SOCKET") {
+    if let Ok(sock) = std::env::var("RLORD_TMUX_SOCKET") {
         if !sock.is_empty() {
             c.args(["-L", &sock]);
         }
@@ -45,7 +45,7 @@ fn run(args: &[&str]) -> Result<String> {
 }
 
 pub fn session_name(session_id: &str) -> String {
-    format!("ovl_{session_id}")
+    format!("rlord_{session_id}")
 }
 
 pub fn has_session(name: &str) -> bool {
@@ -147,28 +147,25 @@ mod tests {
     #[test]
     fn pane_command_shape() {
         let cmd = pane_command(
-            &[("OVERLORD_SESSION_ID".into(), "abc".into())],
+            &[("RLORD_SESSION_ID".into(), "abc".into())],
             &["claude".into(), "--session-id".into(), "u-1".into()],
         );
-        assert_eq!(
-            cmd,
-            "exec env OVERLORD_SESSION_ID=abc claude --session-id u-1"
-        );
+        assert_eq!(cmd, "exec env RLORD_SESSION_ID=abc claude --session-id u-1");
     }
 
     /// Real-tmux integration test of the actual module functions, on a
-    /// private server socket. Gated: `OVERLORD_TMUX_TESTS=1 cargo test`.
+    /// private server socket. Gated: `RLORD_TMUX_TESTS=1 cargo test`.
     /// Serialized with a lock in case tests ever share the socket env.
     #[test]
     fn tmux_lifecycle_on_private_server() {
-        if std::env::var("OVERLORD_TMUX_TESTS").as_deref() != Ok("1") {
+        if std::env::var("RLORD_TMUX_TESTS").as_deref() != Ok("1") {
             return;
         }
         // Safety: test process only; the daemon never sets this.
-        std::env::set_var("OVERLORD_TMUX_SOCKET", "ovl-test");
+        std::env::set_var("RLORD_TMUX_SOCKET", "rlord-test");
         let _ = tmux_cmd().args(["kill-server"]).output();
 
-        let name = "ovl_testsess";
+        let name = "rlord_testsess";
         new_session(name, "/tmp", "sleep 30").unwrap();
         assert!(has_session(name));
         let (w, p) = window_pane_ids(name).unwrap();

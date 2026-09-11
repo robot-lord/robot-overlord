@@ -1,18 +1,18 @@
 [package]
-name = "overlord"
+name = "rlord"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "overlord"
+name = "rlord"
 path = "src/main.rs"
 
 [dependencies]
-overlord-core = { path = "../core" }
-overlord-daemon = { path = "../daemon" }
-overlord-tui = { path = "../tui" }
+rlord-core = { path = "../core" }
+rlord-daemon = { path = "../daemon" }
+rlord-tui = { path = "../tui" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

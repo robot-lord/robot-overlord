@@ -1,12 +1,12 @@
 [package]
-name = "overlord-daemon"
+name = "rlord-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-overlord-core = { path = "../core" }
+rlord-core = { path = "../core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/tui", "crates/overlord"]
+members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ayersb/ai-overlord"
+repository = "https://github.com/ayersb/robot-overlord"
 
 [workspace.dependencies]
 anyhow = "1"

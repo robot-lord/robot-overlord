@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use overlord_core::db::Db;
-use overlord_core::paths;
+use rlord_core::db::Db;
+use rlord_core::paths;
 use rpc::{Request, Response};
 
 pub struct Daemon {
@@ -181,7 +181,7 @@ pub fn client_call(socket_path: &PathBuf, method: &str, params: Value) -> Result
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path).with_context(|| {
         format!(
-            "connecting to daemon at {} (is `overlord daemon` running?)",
+            "connecting to daemon at {} (is `rlord daemon` running?)",
             socket_path.display()
         )
     })?;
@@ -207,7 +207,7 @@ fn spool_path() -> PathBuf {
     paths::data_dir().join("spool/hooks.jsonl")
 }
 
-/// Append a hook.emit params object to the spool (used by `overlord hook emit`
+/// Append a hook.emit params object to the spool (used by `rlord hook emit`
 /// when the daemon is unreachable).
 pub fn spool_hook_event(params: &Value) -> Result<()> {
     let path = spool_path();
@@ -276,13 +276,13 @@ mod tests {
         let daemon = Daemon::new(Db::open_in_memory().unwrap());
         {
             let db = daemon.db.lock().unwrap();
-            db.insert_session(&overlord_core::db::NewSession {
+            db.insert_session(&rlord_core::db::NewSession {
                 id: "01test",
                 name: "t",
                 agent: "claude",
                 agent_session: Some("uuid-1"),
                 project_path: "/tmp",
-                tmux_session: "ovl_01test",
+                tmux_session: "rlord_01test",
                 launch_spec: "{}",
                 created_at: 1,
             })

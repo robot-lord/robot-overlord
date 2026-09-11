@@ -474,7 +474,7 @@ mod tests {
             agent: "claude",
             agent_session: Some("uuid-1"),
             project_path: "/tmp/p",
-            tmux_session: &format!("ovl_{id}"),
+            tmux_session: &format!("rlord_{id}"),
             launch_spec: "{}",
             created_at: 1000,
         })

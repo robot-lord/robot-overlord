@@ -1,6 +1,6 @@
 //! Claude Code adapter.
 //!
-//! Identity model (see docs/architecture.md): overlord MINTS the Claude
+//! Identity model (see docs/architecture.md): rlord MINTS the Claude
 //! session UUID and launches with `--session-id <uuid>`, so the transcript
 //! path is known from second one and `--resume <uuid>` is always attributable.
 //! Ids scavenged from disk scans are never allowed to authorize a resume.
@@ -130,16 +130,30 @@ pub fn install_hooks(settings_path: &Path, hook_cmd: &str) -> Result<bool> {
         if !arr.is_array() {
             bail!("settings.json hooks.{event} is not an array; refusing to modify");
         }
-        let already = arr.as_array().unwrap().iter().any(|entry| {
-            entry["hooks"].as_array().is_some_and(|hs| {
-                hs.iter().any(|h| {
-                    h["command"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("overlord") && c.contains("hook emit"))
-                })
-            })
-        });
-        if !already {
+        // Our entry is any command of the form `<path> hook emit ...` from a
+        // current or former binary name. If it exists with a stale path
+        // (moved/renamed binary), fix it in place; otherwise append.
+        // ("overlord", the pre-rename binary, also contains "rlord".)
+        let is_ours = |h: &Value| {
+            h["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("hook emit") && c.contains("rlord"))
+        };
+        let mut found = false;
+        for entry in arr.as_array_mut().unwrap().iter_mut() {
+            if let Some(hs) = entry["hooks"].as_array_mut() {
+                for h in hs.iter_mut() {
+                    if is_ours(h) {
+                        found = true;
+                        if h["command"].as_str() != Some(hook_cmd) {
+                            h["command"] = json!(hook_cmd);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !found {
             arr.as_array_mut()
                 .unwrap()
                 .push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
@@ -150,11 +164,11 @@ pub fn install_hooks(settings_path: &Path, hook_cmd: &str) -> Result<bool> {
         if let Some(dir) = settings_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let backup = settings_path.with_extension("json.pre-overlord.bak");
+        let backup = settings_path.with_extension("json.pre-rlord.bak");
         if settings_path.exists() && !backup.exists() {
             std::fs::copy(settings_path, &backup)?;
         }
-        let tmp = settings_path.with_extension("json.overlord-tmp");
+        let tmp = settings_path.with_extension("json.rlord-tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(&root)? + "\n")?;
         std::fs::rename(&tmp, settings_path)?;
     }
@@ -201,13 +215,13 @@ mod tests {
             r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"other-tool hook-handler"}]}]}}"#,
         )
         .unwrap();
-        assert!(install_hooks(&path, "/bin/overlord hook emit claude").unwrap());
-        assert!(!install_hooks(&path, "/bin/overlord hook emit claude").unwrap());
+        assert!(install_hooks(&path, "/bin/rlord hook emit claude").unwrap());
+        assert!(!install_hooks(&path, "/bin/rlord hook emit claude").unwrap());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "opus"); // untouched
         let stop = v["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2); // other-tool entry preserved, ours appended
         assert!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len() == 1);
-        assert!(path.with_extension("json.pre-overlord.bak").exists());
+        assert!(path.with_extension("json.pre-rlord.bak").exists());
     }
 }

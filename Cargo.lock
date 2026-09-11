@@ -555,60 +555,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "overlord"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "overlord-core",
- "overlord-daemon",
- "overlord-tui",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "overlord-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
- "ulid",
- "uuid",
-]
-
-[[package]]
-name = "overlord-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "overlord-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "overlord-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "overlord-core",
- "overlord-daemon",
- "ratatui",
- "serde_json",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,6 +709,60 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rlord"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rlord-core",
+ "rlord-daemon",
+ "rlord-tui",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rlord-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
+name = "rlord-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rlord-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rlord-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ratatui",
+ "rlord-core",
+ "rlord-daemon",
+ "serde_json",
+]
 
 [[package]]
 name = "rusqlite"

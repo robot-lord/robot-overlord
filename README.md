@@ -1,4 +1,4 @@
-# AI Overlord
+# Robot Overlord
 
 Session management and orchestration for AI coding agents — a ground-up
 replacement for the parts of [another tool](https://github.com)
@@ -47,7 +47,7 @@ matter to us:
 ## Shape (decided)
 
 - **Rust**, terminal-first (TUI), **tmux** as the process substrate.
-- A resident daemon (`overlordd`) owns all state and behavior; CLI, TUI, and a
+- A resident daemon (`rlordd`) owns all state and behavior; CLI, TUI, and a
   **first-class MCP server** are thin clients over one Unix-socket API — this
   is the fix for other-tool's cold-start CLI sluggishness.
 
@@ -57,17 +57,17 @@ See `docs/architecture.md` for the full plan and phased milestones.
 
 ```bash
 cargo build --workspace
-./target/debug/overlord claude install-hooks   # merge-adds hooks to ~/.claude/settings.json
-./target/debug/overlord daemon &               # or install the systemd unit (deploy/)
-overlord new --project ~/src/myrepo "first prompt"   # launch a Claude session in tmux
-overlord ls                                    # live status via Claude hooks
-overlord attach <ref>                          # ref = id, id prefix, or name
-overlord stop <ref> && overlord restart <ref>  # resume with full conversation context
-overlord log <ref>                             # per-session event history
+./target/debug/rlord claude install-hooks   # merge-adds hooks to ~/.claude/settings.json
+./target/debug/rlord daemon &               # or install the systemd unit (deploy/)
+rlord new --project ~/src/myrepo "first prompt"   # launch a Claude session in tmux
+rlord ls                                    # live status via Claude hooks
+rlord attach <ref>                          # ref = id, id prefix, or name
+rlord stop <ref> && rlord restart <ref>  # resume with full conversation context
+rlord log <ref>                             # per-session event history
 ```
 
 Sessions survive reboots: the minted Claude session id lives in SQLite, so
-`overlord restart` brings the conversation back via `claude --resume` even
+`rlord restart` brings the conversation back via `claude --resume` even
 after the tmux server is gone.
 
 ## Docs

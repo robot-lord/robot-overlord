@@ -4,10 +4,10 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use overlord_core::agents::claude;
-use overlord_core::db::{Db, NewSession, SessionQuery};
-use overlord_core::tmux;
-use overlord_core::types::{new_id, now_ms, Status};
+use rlord_core::agents::claude;
+use rlord_core::db::{Db, NewSession, SessionQuery};
+use rlord_core::tmux;
+use rlord_core::types::{new_id, now_ms, Status};
 
 pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
     let q: SessionQuery =
@@ -86,15 +86,15 @@ fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string param '{key}'"))
 }
 
-fn overlord_bin() -> String {
+fn rlord_bin() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| "overlord".to_string())
+        .unwrap_or_else(|| "rlord".to_string())
 }
 
 fn pane_env(session_id: &str) -> Vec<(String, String)> {
-    vec![("OVERLORD_SESSION_ID".to_string(), session_id.to_string())]
+    vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())]
 }
 
 pub fn session_new(db: &Db, params: &Value) -> Result<Value> {
@@ -223,7 +223,7 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.list_events(&s.id, limit)?)?)
 }
 
-/// Ingest one agent hook event (from `overlord hook emit`, live or spooled).
+/// Ingest one agent hook event (from `rlord hook emit`, live or spooled).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
     let instance = p_str(params, "instance")?;
     let agent = p_str(params, "agent")?;
@@ -303,5 +303,5 @@ pub fn reconcile(db: &Db) -> Result<()> {
 /// The hook command installed into Claude settings: absolute path, so hooks
 /// work regardless of PATH.
 pub fn hook_command() -> String {
-    format!("{} hook emit claude", overlord_bin())
+    format!("{} hook emit claude", rlord_bin())
 }

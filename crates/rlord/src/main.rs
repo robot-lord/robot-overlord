@@ -4,15 +4,15 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
-use overlord_core::timefmt::{fmt_ts, rel_age};
-use overlord_core::{agents::claude, paths};
-use overlord_daemon::{client_call, methods, spool_hook_event, Daemon};
+use rlord_core::timefmt::{fmt_ts, rel_age};
+use rlord_core::{agents::claude, paths};
+use rlord_daemon::{client_call, methods, spool_hook_event, Daemon};
 
 #[derive(Parser)]
 #[command(
-    name = "overlord",
+    name = "rlord",
     version,
-    about = "AI Overlord — session management for AI coding agents"
+    about = "Robot Overlord — session management for AI coding agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -139,7 +139,7 @@ enum HookCmd {
 
 #[derive(Subcommand)]
 enum ClaudeCmd {
-    /// Install overlord's hook handler into Claude Code's settings.json
+    /// Install rlord's hook handler into Claude Code's settings.json
     InstallHooks,
 }
 
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command.unwrap_or(Command::Tui) {
-        Command::Tui => overlord_tui::run(),
+        Command::Tui => rlord_tui::run(),
         Command::Daemon => run_daemon(),
         Command::Ping => {
             let r = call("ping", Value::Null)?;
@@ -227,7 +227,7 @@ fn main() -> Result<()> {
                 .context("session has no tmux session")?;
             if s["status"] == "stopped" {
                 anyhow::bail!(
-                    "session is stopped; `overlord restart {}` first",
+                    "session is stopped; `rlord restart {}` first",
                     s["id"].as_str().unwrap_or("?")
                 );
             }
@@ -341,11 +341,11 @@ fn tags_of(session: &Value) -> String {
 fn run_daemon() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let db = overlord_core::db::Db::open(&paths::db_path())?;
+        let db = rlord_core::db::Db::open(&paths::db_path())?;
         let daemon = Daemon::new(db);
         daemon.startup()?;
         let listener = Daemon::bind(&paths::socket_path())?;
-        tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), "overlordd starting");
+        tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), "rlordd starting");
         tokio::select! {
             r = daemon.serve(listener) => r,
             _ = tokio::signal::ctrl_c() => {
@@ -359,8 +359,8 @@ fn run_daemon() -> Result<()> {
 /// Fast path for agent hooks: read payload from stdin, forward to the daemon,
 /// spool on failure. Exits 0 in all cases — a hook must never break the agent.
 fn hook_emit(agent: &str) -> Result<()> {
-    let Ok(instance) = std::env::var("OVERLORD_SESSION_ID") else {
-        return Ok(()); // not an overlord-managed session
+    let Ok(instance) = std::env::var("RLORD_SESSION_ID") else {
+        return Ok(()); // not an rlord-managed session
     };
     let mut raw = String::new();
     std::io::stdin().take(1 << 20).read_to_string(&mut raw).ok();
