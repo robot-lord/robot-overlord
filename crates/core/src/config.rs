@@ -107,6 +107,57 @@ impl TmuxKeys {
     }
 }
 
+/// Defaults applied to every session created through rlord (TUI or CLI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionDefaults {
+    /// Coding tool. Only `claude` today.
+    pub agent: String,
+    /// Model passed to the agent (`--model`). Empty = the agent's own default.
+    pub model: String,
+    /// Choices offered by the model picker.
+    pub models: Vec<String>,
+    /// Create each new session in its own git worktree under `workspace_dir`.
+    pub workspace: bool,
+    /// Directory (relative to the repo root) that holds session worktrees.
+    pub workspace_dir: String,
+    /// Repo preselected in the new-session form. Empty = the current directory.
+    pub default_repo: String,
+}
+
+impl Default for SessionDefaults {
+    fn default() -> Self {
+        SessionDefaults {
+            agent: "claude".into(),
+            model: "opus".into(),
+            models: vec!["opus".into(), "sonnet".into(), "haiku".into()],
+            workspace: true,
+            workspace_dir: ".worktrees".into(),
+            default_repo: String::new(),
+        }
+    }
+}
+
+impl SessionDefaults {
+    /// `default_repo` with `~` expanded; None when unset.
+    pub fn default_repo_path(&self) -> Option<String> {
+        let r = self.default_repo.trim();
+        if r.is_empty() {
+            return None;
+        }
+        Some(expand_tilde(r))
+    }
+}
+
+pub fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return format!("{}/{rest}", home.to_string_lossy());
+        }
+    }
+    p.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -117,6 +168,7 @@ pub struct Config {
     pub preview_refresh_ms: u64,
     /// Digits 1–9 attach straight to the Nth listed session.
     pub jump_digits: bool,
+    pub session: SessionDefaults,
     pub keys: Keys,
     pub tmux: TmuxKeys,
 }
@@ -128,6 +180,7 @@ impl Default for Config {
             list_width_pct: 50,
             preview_refresh_ms: 500,
             jump_digits: true,
+            session: SessionDefaults::default(),
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
         }
@@ -159,6 +212,15 @@ layout = "side"
 list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
+
+# Defaults for every session you create (TUI form or `rlord new`).
+[session]
+agent = "claude"
+model = "opus"                  # passed as --model; "" = the agent's default
+models = ["opus", "sonnet", "haiku"]   # model picker choices
+workspace = true                # each session gets its own git worktree...
+workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
+default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 
 # TUI keys. A character ("q", "R"), a named key ("enter", "esc", "tab", "up",
 # "down", "space", "backspace", "f1".."f12"), optionally "ctrl-"/"alt-" prefixed.
@@ -208,6 +270,8 @@ mod tests {
         assert_eq!(c.tmux.back, "M-d");
         assert_eq!(c.layout, Layout::Side);
         assert_eq!(c.preview_refresh_ms, 500);
+        assert!(c.session.workspace);
+        assert_eq!(c.session.workspace_dir, ".worktrees");
     }
 
     #[test]

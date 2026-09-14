@@ -5,9 +5,32 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::agents::claude;
+use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
-use rlord_core::tmux;
 use rlord_core::types::{new_id, now_ms, Status};
+use rlord_core::{git, tmux};
+
+/// Known repos for the picker: the configured default first (even if never
+/// used), then most-recently-used.
+pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
+    let default = cfg.session.default_repo_path();
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(d) = &default {
+        out.push(json!({"path": d, "default": true, "last_used_at": null}));
+    }
+    for r in db.list_repos()? {
+        if default.as_deref() == Some(r.path.as_str()) {
+            out[0]["last_used_at"] = json!(r.last_used_at);
+            continue;
+        }
+        out.push(json!({"path": r.path, "default": false, "last_used_at": r.last_used_at}));
+    }
+    Ok(Value::Array(out))
+}
+
+pub fn session_defaults(cfg: &Config) -> Result<Value> {
+    Ok(serde_json::to_value(&cfg.session)?)
+}
 
 pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
     let q: SessionQuery =
@@ -97,60 +120,108 @@ fn pane_env(session_id: &str) -> Vec<(String, String)> {
     vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())]
 }
 
-pub fn session_new(db: &Db, params: &Value) -> Result<Value> {
-    let agent = params
-        .get("agent")
-        .and_then(Value::as_str)
-        .unwrap_or("claude");
+pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+    let p_opt = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    let agent = p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone());
     if agent != "claude" {
-        bail!("agent '{agent}' not supported yet (phase 1 is claude-only)");
+        bail!("agent '{agent}' not supported yet (claude only)");
     }
-    let project =
-        std::fs::canonicalize(p_str(params, "project")?).context("project path does not exist")?;
-    let project = project
-        .to_str()
-        .context("non-utf8 project path")?
-        .to_string();
-    let prompt = params.get("prompt").and_then(Value::as_str);
+    let model = p_opt("model").or_else(|| {
+        let m = cfg.session.model.trim();
+        (!m.is_empty()).then(|| m.to_string())
+    });
+    let prompt = p_opt("prompt");
+
+    // Where the session lives: an explicit repo, an explicit plain folder,
+    // or the configured default repo.
+    let (repo, project): (Option<String>, String) = if let Some(r) = p_opt("repo") {
+        let r = expand_tilde(&r);
+        let root =
+            git::main_repo_root(&r).with_context(|| format!("{r} is not a git repository"))?;
+        (Some(root.clone()), root)
+    } else if let Some(p) = p_opt("project") {
+        let p = std::fs::canonicalize(expand_tilde(&p)).context("project path does not exist")?;
+        let p = p.to_str().context("non-utf8 project path")?.to_string();
+        (git::main_repo_root(&p), p)
+    } else if let Some(d) = cfg.session.default_repo_path() {
+        let root = git::main_repo_root(&d)
+            .with_context(|| format!("default_repo {d} is not a git repository"))?;
+        (Some(root.clone()), root)
+    } else {
+        bail!("no repo or project given and no default_repo configured");
+    };
 
     let id = new_id();
-    let name = match params.get("name").and_then(Value::as_str) {
-        Some(n) => n.to_string(),
-        None => {
-            let base = std::path::Path::new(&project)
-                .file_name()
-                .and_then(|b| b.to_str())
-                .unwrap_or("session");
-            format!("{}-{}", base, &id[id.len() - 4..])
+    let name = p_opt("name").unwrap_or_else(|| {
+        let base = std::path::Path::new(&project)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .unwrap_or("session");
+        format!("{}-{}", base, &id[id.len() - 4..])
+    });
+
+    // Workspace: a dedicated worktree, on by default, only when there's a repo.
+    let want_ws = params
+        .get("workspace")
+        .and_then(Value::as_bool)
+        .unwrap_or(cfg.session.workspace);
+    let (project_path, workspace_path, branch) = match (&repo, want_ws) {
+        (Some(repo), true) => {
+            let branch = p_opt("branch").unwrap_or_else(|| git::sanitize_branch(&name));
+            let dir = git::workspace_path(repo, &cfg.session.workspace_dir, &branch);
+            git::ensure_excluded(repo, &cfg.session.workspace_dir)?;
+            git::worktree_add(repo, &branch, &dir)?;
+            let dir = dir.to_string_lossy().into_owned();
+            (dir.clone(), Some(dir), Some(branch))
         }
+        _ => (project, None, None),
     };
+
     let claude_sid = claude::mint_session_id();
-    let argv = claude::launch_argv(&claude_sid, prompt);
+    let argv = claude::launch_argv(&claude_sid, prompt.as_deref(), model.as_deref());
     let tmux_name = tmux::session_name(&id);
-    let launch_spec = json!({"argv_base": ["claude"], "prompt": prompt}).to_string();
+    let launch_spec = json!({"agent": agent, "model": model, "prompt": prompt}).to_string();
     let now = now_ms();
 
     db.insert_session(&NewSession {
         id: &id,
         name: &name,
-        agent,
+        agent: &agent,
         agent_session: Some(&claude_sid),
-        project_path: &project,
+        project_path: &project_path,
         tmux_session: &tmux_name,
         launch_spec: &launch_spec,
         created_at: now,
+        repo_path: repo.as_deref(),
+        workspace_path: workspace_path.as_deref(),
+        branch: branch.as_deref(),
     })?;
+    if let Some(r) = &repo {
+        db.touch_repo(r, now)?;
+    }
     db.upsert_transcript_source(
         &id,
-        claude::transcript_path(&project, &claude_sid)
+        claude::transcript_path(&project_path, &claude_sid)
             .to_str()
             .unwrap_or(""),
     )?;
 
     let cmd = tmux::pane_command(&pane_env(&id), &argv);
-    tmux::new_session(&tmux_name, &project, &cmd)?;
-    db.insert_event(&id, now, "launched", &json!({"argv": argv}).to_string())?;
-    tracing::info!(session = %id, name = %name, "launched claude session");
+    tmux::new_session(&tmux_name, &project_path, &cmd)?;
+    db.insert_event(
+        &id,
+        now,
+        "launched",
+        &json!({"argv": argv, "workspace": workspace_path, "branch": branch}).to_string(),
+    )?;
+    tracing::info!(session = %id, name = %name, workspace = ?workspace_path, "launched claude session");
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
@@ -170,7 +241,17 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .agent_session
         .as_deref()
         .context("session has no agent session id; cannot resume")?;
-    let argv = claude::resume_argv(sid, &s.agent_session_trust, &s.project_path)?;
+    let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
+    let model = spec
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let argv = claude::resume_argv(
+        sid,
+        &s.agent_session_trust,
+        &s.project_path,
+        model.as_deref(),
+    )?;
     let tmux_name = s
         .tmux_session
         .clone()

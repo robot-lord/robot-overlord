@@ -423,6 +423,25 @@ never silently ignored. Sections: `layout` (`side` = list left / preview
 right, `stack`), `list_width_pct`, `preview_refresh_ms`, `[keys]` (every TUI
 action), `[tmux]` (the three navigation bindings).
 
+## Session creation
+
+Creation is the most-used flow, so it has its own defaults (`[session]` in
+config: agent, model + picker list, workspace on/off, `workspace_dir`,
+`default_repo`) and its own state: the `repos` table remembers every git repo
+a session was created in (last used, use count) so the picker can order
+**default first, then most-recently-used**.
+
+A session's location is one of: a **repo** (default) — resolved to the main
+repository root even from inside a worktree, so all workspaces nest under one
+`<repo>/.worktrees/`; or a **plain folder** (no repo, no workspace; the folder
+picker with fuzzy search is a later addition). With `workspace = true` the
+daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
+(existing branch → checkout; dirname = branch with `/`→`-`, other-tool's
+convention), excludes the dir via `.git/info/exclude`, and launches the agent
+*inside the worktree*. `sessions` records `repo_path`, `workspace_path`,
+`branch`; the model is kept in `launch_spec` so restarts resume with the same
+`--model`.
+
 ## Naming
 
 - Default name: the project directory basename + short discriminator (not

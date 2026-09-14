@@ -46,12 +46,20 @@ pub fn transcript_path(project_path: &str, session_uuid: &str) -> PathBuf {
         .join(format!("{session_uuid}.jsonl"))
 }
 
-pub fn launch_argv(session_uuid: &str, first_prompt: Option<&str>) -> Vec<String> {
+pub fn launch_argv(
+    session_uuid: &str,
+    first_prompt: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "claude".to_string(),
         "--session-id".to_string(),
         session_uuid.to_string(),
     ];
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        argv.push("--model".to_string());
+        argv.push(m.trim().to_string());
+    }
     if let Some(p) = first_prompt {
         argv.push(p.to_string());
     }
@@ -61,7 +69,12 @@ pub fn launch_argv(session_uuid: &str, first_prompt: Option<&str>) -> Vec<String
 /// Resume argv. `--resume` only when a transcript actually exists (a resume of
 /// a conversation Claude never wrote errors out); otherwise re-declare the id
 /// so the *next* restart can resume. Scavenged ids never resume.
-pub fn resume_argv(session_uuid: &str, trust: &str, project_path: &str) -> Result<Vec<String>> {
+pub fn resume_argv(
+    session_uuid: &str,
+    trust: &str,
+    project_path: &str,
+    model: Option<&str>,
+) -> Result<Vec<String>> {
     if trust == "scavenged" {
         bail!("refusing to resume a scavenged session id (untrusted attribution)");
     }
@@ -70,11 +83,16 @@ pub fn resume_argv(session_uuid: &str, trust: &str, project_path: &str) -> Resul
     } else {
         "--session-id"
     };
-    Ok(vec![
+    let mut argv = vec![
         "claude".to_string(),
         flag.to_string(),
         session_uuid.to_string(),
-    ])
+    ];
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        argv.push("--model".to_string());
+        argv.push(m.trim().to_string());
+    }
+    Ok(argv)
 }
 
 /// Map a Claude hook event to (event kind for our log, optional new status).
@@ -193,17 +211,20 @@ mod tests {
 
     #[test]
     fn launch_and_resume_argv() {
-        let argv = launch_argv("u-1", Some("hello"));
+        let argv = launch_argv("u-1", Some("hello"), None);
         assert_eq!(argv, ["claude", "--session-id", "u-1", "hello"]);
+        let argv = launch_argv("u-1", None, Some("opus"));
+        assert_eq!(argv, ["claude", "--session-id", "u-1", "--model", "opus"]);
         // No transcript on disk for this fake id → re-declare, don't resume.
         let argv = resume_argv(
             "00000000-0000-0000-0000-000000000000",
             "minted",
             "/nonexistent",
+            None,
         )
         .unwrap();
         assert_eq!(argv[1], "--session-id");
-        assert!(resume_argv("u-1", "scavenged", "/tmp").is_err());
+        assert!(resume_argv("u-1", "scavenged", "/tmp", None).is_err());
     }
 
     #[test]

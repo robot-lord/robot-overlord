@@ -6,11 +6,15 @@ use rusqlite::{params, Connection};
 use crate::types::{Session, Status};
 
 /// Embedded, ordered migrations. `user_version` tracks how many have run.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_repos_workspaces.sql"),
+];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
-     last_user_msg_at, last_agent_msg_at, last_state_change_at";
+     last_user_msg_at, last_agent_msg_at, last_state_change_at, \
+     repo_path, workspace_path, branch";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -21,6 +25,16 @@ pub struct NewSession<'a> {
     pub tmux_session: &'a str,
     pub launch_spec: &'a str,
     pub created_at: i64,
+    pub repo_path: Option<&'a str>,
+    pub workspace_path: Option<&'a str>,
+    pub branch: Option<&'a str>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RepoRow {
+    pub path: String,
+    pub last_used_at: i64,
+    pub use_count: i64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -199,8 +213,9 @@ impl Db {
     pub fn insert_session(&self, s: &NewSession) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sessions (id, name, agent, agent_session, project_path, tmux_session, \
-                                   status, launch_spec, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?8)",
+                                   status, launch_spec, created_at, repo_path, workspace_path, \
+                                   branch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?8, ?9, ?10, ?11)",
             params![
                 s.id,
                 s.name,
@@ -209,7 +224,10 @@ impl Db {
                 s.project_path,
                 s.tmux_session,
                 s.launch_spec,
-                s.created_at
+                s.created_at,
+                s.repo_path,
+                s.workspace_path,
+                s.branch
             ],
         )?;
         Ok(())
@@ -473,6 +491,33 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ---- repos ----
+
+    pub fn touch_repo(&self, path: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO repos (path, last_used_at, use_count) VALUES (?1, ?2, 1) \
+             ON CONFLICT(path) DO UPDATE SET last_used_at = excluded.last_used_at, \
+                                             use_count = use_count + 1",
+            params![path, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Known repos, most recently used first.
+    pub fn list_repos(&self) -> Result<Vec<RepoRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, last_used_at, use_count FROM repos ORDER BY last_used_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RepoRow {
+                path: r.get(0)?,
+                last_used_at: r.get(1)?,
+                use_count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     // ---- events ----
 
     pub fn insert_event(&self, session_id: &str, ts: i64, kind: &str, payload: &str) -> Result<()> {
@@ -532,6 +577,9 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_user_msg_at: r.get(13)?,
         last_agent_msg_at: r.get(14)?,
         last_state_change_at: r.get(15)?,
+        repo_path: r.get(16)?,
+        workspace_path: r.get(17)?,
+        branch: r.get(18)?,
         tags: Vec::new(),
     })
 }
@@ -561,6 +609,9 @@ mod tests {
             tmux_session: &format!("rlord_{id}"),
             launch_spec: "{}",
             created_at: 1000,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
         })
         .unwrap();
     }
@@ -568,8 +619,15 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
-        for table in ["sessions", "tags", "events", "messages", "transcripts"] {
+        assert_eq!(db.schema_version().unwrap(), 2);
+        for table in [
+            "sessions",
+            "tags",
+            "events",
+            "messages",
+            "transcripts",
+            "repos",
+        ] {
             let n: i64 = db
                 .conn
                 .query_row(
@@ -589,7 +647,19 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn repos_are_mru_ordered() {
+        let db = Db::open_in_memory().unwrap();
+        db.touch_repo("/a", 100).unwrap();
+        db.touch_repo("/b", 200).unwrap();
+        db.touch_repo("/a", 300).unwrap();
+        let r = db.list_repos().unwrap();
+        assert_eq!(r[0].path, "/a");
+        assert_eq!(r[0].use_count, 2);
+        assert_eq!(r[1].path, "/b");
     }
 
     #[test]

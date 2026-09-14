@@ -68,6 +68,25 @@ rlord rename/tag/untag/pin/archive/log <ref> # meta-context
 
 For a persistent daemon, install `deploy/robot-overlord.service` (systemd user unit).
 
+## Creating sessions
+
+Every session is created with the defaults under `[session]` in your config:
+the coding tool (`claude`), the **model** (`--model`, default `opus`; the
+picker offers `models`), and **workspace = true** — each session gets its own
+git worktree at `<repo>/.worktrees/<branch>` (other-tool's layout; the dir is
+`workspace_dir`, excluded via `.git/info/exclude`, never touching your
+`.gitignore`). Set `default_repo` and the form opens on it.
+
+In the TUI, `n` opens the form with the repo preselected (your default repo,
+else the repo around the current directory). `Enter` launches straight away;
+`j`/`↓` on the repo line drops into the repo list — default first (★), then
+every repo you've used, most recent first — plus "other repo path…" and
+"no repo — plain folder…". `Tab`/`↑↓` move between fields (name, model,
+workspace toggle, branch — auto-derived from the name until you edit it —
+first prompt). From the CLI: `rlord new [--repo R | --project DIR]
+[--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
+`rlord repos` lists known repos.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its

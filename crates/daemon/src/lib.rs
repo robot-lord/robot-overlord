@@ -168,11 +168,16 @@ impl Daemon {
         if method == "ping" {
             return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION")}));
         }
-        let mutating = !matches!(method, "session.list" | "session.get" | "session.log");
+        let mutating = !matches!(
+            method,
+            "session.list" | "session.get" | "session.log" | "repo.list" | "session.defaults"
+        );
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
-            "session.new" => methods::session_new(&db, &params),
+            "session.new" => methods::session_new(&db, &self.config, &params),
+            "repo.list" => methods::repo_list(&db, &self.config),
+            "session.defaults" => methods::session_defaults(&self.config),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),
             "session.stop" => methods::session_stop(&db, &params),
@@ -310,6 +315,9 @@ mod tests {
                 tmux_session: "rlord_01test",
                 launch_spec: "{}",
                 created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
             })
             .unwrap();
         }

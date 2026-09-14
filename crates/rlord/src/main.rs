@@ -61,22 +61,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Create and launch a new agent session
+    /// Create and launch a new agent session (defaults from [session] in config)
     New {
         /// First prompt to hand the agent (optional)
         prompt: Vec<String>,
-        #[arg(long, default_value = "claude")]
-        agent: String,
-        /// Project directory (default: current directory)
+        /// Git repo to work in (default: the repo containing the current
+        /// directory, else the configured default_repo)
+        #[arg(long, conflicts_with = "project")]
+        repo: Option<String>,
+        /// Plain folder, no repo/workspace
         #[arg(long)]
         project: Option<String>,
-        /// Display name (default: derived from the project dir)
+        /// Don't create a dedicated worktree (work directly in the repo)
+        #[arg(long)]
+        no_workspace: bool,
+        /// Branch / workspace name (default: derived from the session name)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Model passed to the agent (default: [session].model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Display name (default: <repo>-<id suffix>)
         #[arg(long)]
         name: Option<String>,
         /// Attach immediately after launch
         #[arg(long, short = 'a')]
         attach: bool,
     },
+    /// List git repos rlord has used, most recent first
+    Repos,
     /// Attach the terminal to a session (ref = id, id prefix, or name)
     Attach {
         r#ref: String,
@@ -314,28 +327,71 @@ fn main() -> Result<()> {
         }
         Command::New {
             prompt,
-            agent,
+            repo,
             project,
+            no_workspace,
+            branch,
+            model,
             name,
             attach,
         } => {
-            let project = match project {
-                Some(p) => p,
-                None => std::env::current_dir()?.to_string_lossy().into_owned(),
-            };
             let prompt = if prompt.is_empty() {
                 None
             } else {
                 Some(prompt.join(" "))
             };
+            // No location given: the repo around cwd, else a plain cwd folder
+            // when no default_repo is configured (the daemon applies that).
+            let (repo, project) = match (repo, project) {
+                (None, None) => {
+                    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+                    match rlord_core::git::main_repo_root(&cwd) {
+                        Some(root) => (Some(root), None),
+                        None if Config::load()?.session.default_repo_path().is_some() => {
+                            (None, None)
+                        }
+                        None => (None, Some(cwd)),
+                    }
+                }
+                other => other,
+            };
             let r = call(
                 "session.new",
-                json!({"agent": agent, "project": project, "name": name, "prompt": prompt}),
+                json!({
+                    "repo": repo, "project": project, "name": name, "prompt": prompt,
+                    "branch": branch, "model": model,
+                    "workspace": if no_workspace { Some(false) } else { None },
+                }),
             )?;
             let id = r["id"].as_str().unwrap_or("?");
-            println!("launched {} ({})", r["name"].as_str().unwrap_or("?"), id);
+            match r["workspace_path"].as_str() {
+                Some(ws) => println!(
+                    "launched {} ({}) in workspace {} [{}]",
+                    r["name"].as_str().unwrap_or("?"),
+                    id,
+                    ws,
+                    r["branch"].as_str().unwrap_or("?")
+                ),
+                None => println!("launched {} ({})", r["name"].as_str().unwrap_or("?"), id),
+            }
             if attach {
                 attach_tmux(r["tmux_session"].as_str().context("no tmux session")?)?;
+            }
+            Ok(())
+        }
+        Command::Repos => {
+            let r = call("repo.list", Value::Null)?;
+            for repo in r.as_array().map(|v| v.as_slice()).unwrap_or_default() {
+                println!(
+                    "{} {:<6} {}",
+                    if repo["default"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        " "
+                    },
+                    rel_age(repo["last_used_at"].as_i64()),
+                    repo["path"].as_str().unwrap_or("?")
+                );
             }
             Ok(())
         }

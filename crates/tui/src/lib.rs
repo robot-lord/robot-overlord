@@ -13,6 +13,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+
+mod newform;
+use newform::NewForm;
 use serde_json::{json, Value};
 
 use rlord_core::config::{Config, Keys, Layout};
@@ -67,7 +70,7 @@ enum Mode {
     Normal,
     Filter(String),
     Rename(String),
-    NewSession(String),
+    NewSession(Box<NewForm>),
 }
 
 struct App {
@@ -243,8 +246,10 @@ impl App {
                         Mode::Rename(buf) => {
                             self.handle_input(k, buf, InputKind::Rename, terminal)?
                         }
-                        Mode::NewSession(buf) => {
-                            self.handle_input(k, buf, InputKind::NewSession, terminal)?
+                        Mode::NewSession(form) => {
+                            if let Some(form) = self.handle_form(k, form)? {
+                                self.mode = Mode::NewSession(form);
+                            }
                         }
                     }
                 }
@@ -350,12 +355,7 @@ impl App {
                     self.mode = Mode::Rename(cur);
                 }
             }
-            Action::New => {
-                let cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.mode = Mode::NewSession(cwd);
-            }
+            Action::New => self.open_new_form(),
             Action::Cancel => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
@@ -432,13 +432,6 @@ impl App {
                         }
                         self.dirty = true;
                     }
-                }
-                InputKind::NewSession => {
-                    if let Some(v) = self.call("session.new", json!({"project": buf.trim()})) {
-                        self.status_line =
-                            format!("launched {}", v["name"].as_str().unwrap_or("?"));
-                    }
-                    self.dirty = true;
                 }
             },
             KeyCode::Backspace => {
@@ -528,6 +521,9 @@ impl App {
         self.draw_list(f, list_area);
         self.draw_preview(f, preview_area);
         self.draw_footer(f, footer_area);
+        if let Mode::NewSession(form) = &self.mode {
+            self.draw_form(f, form);
+        }
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -658,7 +654,7 @@ impl App {
                 "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:/tag:/proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
-            Mode::NewSession(b) => Some(format!("new session in: {b}▏")),
+            Mode::NewSession(_) => Some("new session — see form".to_string()),
         };
         let line1 = match prompt {
             Some(p) => Line::from(Span::styled(p, Style::default().fg(Color::Yellow))),
@@ -682,7 +678,6 @@ impl App {
 enum InputKind {
     Filter,
     Rename,
-    NewSession,
 }
 
 impl InputKind {
@@ -690,7 +685,6 @@ impl InputKind {
         match self {
             InputKind::Filter => Mode::Filter(buf),
             InputKind::Rename => Mode::Rename(buf),
-            InputKind::NewSession => Mode::NewSession(buf),
         }
     }
 }
