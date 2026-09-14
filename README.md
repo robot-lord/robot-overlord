@@ -80,8 +80,10 @@ git worktree at `<repo>/.worktrees/<branch>` (other-tool's layout; the dir is
 In the TUI, `n` opens the form with the repo preselected (your default repo,
 else the repo around the current directory). `Enter` launches straight away;
 `j`/`↓` on the repo line drops into the repo list — default first (★), then
-every repo you've used, most recent first — plus "other repo path…" and
-"no repo — plain folder…". `Tab`/`↑↓` move between fields (name, model,
+every repo you've used, most recent first — plus "find another repo…" (a
+filter-as-you-type finder over every git repo under `repo_roots`, default
+`["~"]` to depth 3, MRU first; a typed path that is a repo is offered too)
+and "no repo — plain folder…". `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;

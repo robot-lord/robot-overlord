@@ -19,6 +19,9 @@ pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
         out.push(json!({"path": d, "default": true, "last_used_at": null}));
     }
     for r in db.list_repos()? {
+        if !std::path::Path::new(&r.path).is_dir() {
+            continue; // deleted since; don't offer a dead path
+        }
         if default.as_deref() == Some(r.path.as_str()) {
             out[0]["last_used_at"] = json!(r.last_used_at);
             continue;
@@ -26,6 +29,32 @@ pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
         out.push(json!({"path": r.path, "default": false, "last_used_at": r.last_used_at}));
     }
     Ok(Value::Array(out))
+}
+
+/// Everything the repo finder can offer: known repos (MRU, default first)
+/// followed by repos discovered under `repo_roots`, deduplicated.
+pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
+    let mut out = repo_list(db, cfg)?;
+    let known: std::collections::HashSet<String> = out
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["path"].as_str().map(str::to_string))
+        .collect();
+    for p in scanned {
+        if !known.contains(&p) {
+            out.as_array_mut()
+                .unwrap()
+                .push(json!({"path": p, "default": false, "last_used_at": null}));
+        }
+    }
+    let roots: Vec<String> = cfg
+        .session
+        .repo_roots
+        .iter()
+        .map(|r| expand_tilde(r))
+        .collect();
+    Ok(json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth}))
 }
 
 pub fn session_defaults(cfg: &Config) -> Result<Value> {

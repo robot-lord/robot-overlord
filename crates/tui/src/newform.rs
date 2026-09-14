@@ -58,8 +58,78 @@ enum PickerKind {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextPrompt {
-    OtherRepo,
     Folder,
+}
+
+/// The repo finder: every known + discovered repo, filtered as you type.
+struct Finder {
+    query: String,
+    all: Vec<Value>,
+    roots: Vec<String>,
+    state: ListState,
+}
+
+impl Finder {
+    /// Case-insensitive match: every query word must appear in the path.
+    fn matches(&self) -> Vec<&Value> {
+        let words: Vec<String> = self
+            .query
+            .split_whitespace()
+            .map(|w| w.to_lowercase())
+            .collect();
+        self.all
+            .iter()
+            .filter(|r| {
+                let p = r["path"].as_str().unwrap_or("").to_lowercase();
+                words.iter().all(|w| p.contains(w.as_str()))
+            })
+            .collect()
+    }
+
+    /// The typed text itself, when it names a git repo not in the list.
+    fn typed_repo(&self) -> Option<String> {
+        let t = rlord_core::config::expand_tilde(self.query.trim());
+        if t.is_empty() || !std::path::Path::new(&t).is_dir() {
+            return None;
+        }
+        let root = rlord_core::git::main_repo_root(&t)?;
+        if self
+            .all
+            .iter()
+            .any(|r| r["path"].as_str() == Some(root.as_str()))
+        {
+            return None;
+        }
+        Some(root)
+    }
+
+    /// Rows shown: the typed path (if a repo) first, then matches.
+    fn rows(&self) -> Vec<(String, String)> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut rows = Vec::new();
+        if let Some(t) = self.typed_repo() {
+            rows.push((
+                t.clone(),
+                format!(
+                    "↳ {}  (typed path)",
+                    shorten(&t.replacen(&home, "~", 1), 50)
+                ),
+            ));
+        }
+        for r in self.matches() {
+            let p = r["path"].as_str().unwrap_or("?").to_string();
+            let label = shorten(&p.replacen(&home, "~", 1), 52);
+            let tag = if r["default"].as_bool().unwrap_or(false) {
+                "  ★ default".to_string()
+            } else if let Some(t) = r["last_used_at"].as_i64() {
+                format!("  ({})", rel_age(Some(t)))
+            } else {
+                String::new()
+            };
+            rows.push((p, format!("{label}{tag}")));
+        }
+        rows
+    }
 }
 
 pub(crate) struct NewForm {
@@ -74,6 +144,7 @@ pub(crate) struct NewForm {
     repos: Vec<Value>,
     models: Vec<String>,
     picker: Option<(PickerKind, Vec<String>, ListState)>,
+    finder: Option<Finder>,
     text_prompt: Option<(TextPrompt, String)>,
     error: Option<String>,
 }
@@ -142,6 +213,7 @@ impl App {
             repos,
             models,
             picker: None,
+            finder: None,
             text_prompt: None,
             error: None,
         }));
@@ -161,13 +233,6 @@ impl App {
                 KeyCode::Enter => {
                     let path = rlord_core::config::expand_tilde(buf.trim());
                     match kind {
-                        TextPrompt::OtherRepo => match rlord_core::git::main_repo_root(&path) {
-                            Some(root) => {
-                                f.location = Location::Repo(root);
-                                f.error = None;
-                            }
-                            None => f.error = Some(format!("{path} is not a git repository")),
-                        },
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
                                 f.location = Location::Folder(path);
@@ -188,6 +253,63 @@ impl App {
                     f.text_prompt = Some((kind, buf));
                 }
                 _ => f.text_prompt = Some((kind, buf)),
+            }
+            return Ok(Some(f));
+        }
+        // --- the repo finder is open ---
+        if let Some(mut finder) = f.finder.take() {
+            let n = finder.rows().len();
+            let i = finder
+                .state
+                .selected()
+                .unwrap_or(0)
+                .min(n.saturating_sub(1));
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match code {
+                KeyCode::Esc => {}
+                KeyCode::Down | KeyCode::Tab => {
+                    finder
+                        .state
+                        .select(Some(if n == 0 { 0 } else { (i + 1) % n }));
+                    f.finder = Some(finder);
+                }
+                KeyCode::Char('n') if ctrl => {
+                    finder
+                        .state
+                        .select(Some(if n == 0 { 0 } else { (i + 1) % n }));
+                    f.finder = Some(finder);
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    finder
+                        .state
+                        .select(Some(if n == 0 { 0 } else { (i + n - 1) % n }));
+                    f.finder = Some(finder);
+                }
+                KeyCode::Char('p') if ctrl => {
+                    finder
+                        .state
+                        .select(Some(if n == 0 { 0 } else { (i + n - 1) % n }));
+                    f.finder = Some(finder);
+                }
+                KeyCode::Enter => {
+                    if let Some((path, _)) = finder.rows().get(i) {
+                        f.location = Location::Repo(path.clone());
+                        f.error = None;
+                    } else {
+                        f.finder = Some(finder); // nothing to pick; stay
+                    }
+                }
+                KeyCode::Backspace => {
+                    finder.query.pop();
+                    finder.state.select(Some(0));
+                    f.finder = Some(finder);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    finder.query.push(c);
+                    finder.state.select(Some(0));
+                    f.finder = Some(finder);
+                }
+                _ => f.finder = Some(finder),
             }
             return Ok(Some(f));
         }
@@ -215,7 +337,7 @@ impl App {
                     }
                     PickerKind::Repo => {
                         if items[i] == OTHER_REPO {
-                            f.text_prompt = Some((TextPrompt::OtherRepo, String::new()));
+                            self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else {
@@ -337,6 +459,24 @@ impl App {
         f.picker = Some((kind, items, ListState::default().with_selected(Some(sel))));
     }
 
+    fn open_finder(&mut self, f: &mut NewForm) {
+        let v = self.call("repo.find", Value::Null).unwrap_or(json!({}));
+        f.finder = Some(Finder {
+            query: String::new(),
+            all: v["repos"].as_array().cloned().unwrap_or_default(),
+            roots: v["roots"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            state: ListState::default().with_selected(Some(0)),
+        });
+    }
+
     fn submit_form(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
         let mut params = json!({
             "name": if f.name.trim().is_empty() { None } else { Some(f.name.trim()) },
@@ -382,6 +522,43 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        if let Some(finder) = &form.finder {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let [q_area, list_area] =
+                RLayout::vertical([Constraint::Length(2), Constraint::Min(3)]).areas(inner);
+            let rows = finder.rows();
+            let roots = finder
+                .roots
+                .iter()
+                .map(|r| r.replacen(&home, "~", 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let hint = if rows.is_empty() {
+                format!("no repos match — scanned {roots} (config: [session] repo_roots) · or type a repo path")
+            } else {
+                format!("{} repos · ↑↓/tab move · enter pick · esc back", rows.len())
+            };
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!("find repo: {}▏", finder.query),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled(hint, Style::default().fg(Color::Gray))),
+                ]),
+                q_area,
+            );
+            let list = List::new(rows.iter().map(|(_, label)| ListItem::new(label.as_str())))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▶ ");
+            let mut st = finder.state.clone();
+            f.render_stateful_widget(list, list_area, &mut st);
+            return;
+        }
         if let Some((kind, items, state)) = &form.picker {
             let title = match kind {
                 PickerKind::Repo => " select repo  (j/k · enter · esc) ",
@@ -471,7 +648,6 @@ impl App {
         }
         if let Some((kind, buf)) = &form.text_prompt {
             let label = match kind {
-                TextPrompt::OtherRepo => "repo path",
                 TextPrompt::Folder => "folder (no repo)",
             };
             lines.push(Line::from(Span::styled(
@@ -483,7 +659,7 @@ impl App {
     }
 }
 
-const OTHER_REPO: &str = "  other repo path…";
+const OTHER_REPO: &str = "  find another repo…";
 const NO_REPO: &str = "  no repo — plain folder…";
 
 /// Keep the tail of a long path (the part that identifies it).

@@ -123,6 +123,9 @@ pub struct SessionDefaults {
     pub workspace_dir: String,
     /// Repo preselected in the new-session form. Empty = the current directory.
     pub default_repo: String,
+    /// Directories scanned (to `repo_scan_depth`) by the repo finder.
+    pub repo_roots: Vec<String>,
+    pub repo_scan_depth: u8,
 }
 
 impl Default for SessionDefaults {
@@ -134,6 +137,8 @@ impl Default for SessionDefaults {
             workspace: true,
             workspace_dir: ".worktrees".into(),
             default_repo: String::new(),
+            repo_roots: vec!["~".into()],
+            repo_scan_depth: 3,
         }
     }
 }
@@ -150,10 +155,15 @@ impl SessionDefaults {
 }
 
 pub fn expand_tilde(p: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return p.to_string();
+    };
+    let home = home.to_string_lossy();
+    if p == "~" {
+        return home.into_owned();
+    }
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{rest}", home.to_string_lossy());
-        }
+        return format!("{home}/{rest}");
     }
     p.to_string()
 }
@@ -221,6 +231,8 @@ models = ["opus", "sonnet", "haiku"]   # model picker choices
 workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
+repo_roots = ["~"]              # where the repo finder looks for git repos...
+repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
 
 # TUI keys. A character ("q", "R"), a named key ("enter", "esc", "tab", "up",
 # "down", "space", "backspace", "f1".."f12"), optionally "ctrl-"/"alt-" prefixed.
@@ -262,6 +274,15 @@ prev = ""       # e.g. "M-s"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tilde_expansion() {
+        std::env::set_var("HOME", "/h");
+        assert_eq!(expand_tilde("~"), "/h");
+        assert_eq!(expand_tilde("~/ko"), "/h/ko");
+        assert_eq!(expand_tilde("/abs"), "/abs");
+        assert_eq!(expand_tilde("~user"), "~user");
+    }
 
     #[test]
     fn template_parses_to_defaults() {

@@ -18,6 +18,8 @@ use rpc::{Request, Response};
 pub struct Daemon {
     db: Mutex<Db>,
     config: Config,
+    /// Repo-finder scan cache (the scan walks the home dir; a minute is plenty).
+    repo_scan: Mutex<Option<(std::time::Instant, Vec<String>)>>,
     /// Coarse change signal: any successful mutation broadcasts one tick;
     /// subscribers refetch what they display. Fine-grained events can come
     /// later without changing the wire shape.
@@ -30,8 +32,25 @@ impl Daemon {
         Arc::new(Daemon {
             db: Mutex::new(db),
             config,
+            repo_scan: Mutex::new(None),
             changes,
         })
+    }
+
+    /// Git repos under the configured roots, cached for 60s.
+    fn scanned_repos(&self) -> Vec<String> {
+        let mut cache = self.repo_scan.lock().expect("scan mutex poisoned");
+        if let Some((at, v)) = &*cache {
+            if at.elapsed() < std::time::Duration::from_secs(60) {
+                return v.clone();
+            }
+        }
+        let v = rlord_core::git::find_repos(
+            &self.config.session.repo_roots,
+            self.config.session.repo_scan_depth,
+        );
+        *cache = Some((std::time::Instant::now(), v.clone()));
+        v
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -170,13 +189,22 @@ impl Daemon {
         }
         let mutating = !matches!(
             method,
-            "session.list" | "session.get" | "session.log" | "repo.list" | "session.defaults"
+            "session.list"
+                | "session.get"
+                | "session.log"
+                | "repo.list"
+                | "repo.find"
+                | "session.defaults"
         );
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config, &params),
             "repo.list" => methods::repo_list(&db, &self.config),
+            "repo.find" => {
+                let scanned = self.scanned_repos();
+                methods::repo_find(&db, &self.config, scanned)
+            }
             "session.defaults" => methods::session_defaults(&self.config),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),

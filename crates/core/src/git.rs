@@ -140,6 +140,66 @@ pub fn ensure_excluded(repo: &str, workspace_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Directories never descended into when scanning for repos: hidden dirs
+/// (including our own `.worktrees`) and the usual dependency/build trees.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+    "__pycache__",
+    "Library",
+    "snap",
+    "go",
+    "dist",
+    "build",
+];
+
+/// Git repositories under `roots`, up to `depth` levels down. A repo is a
+/// directory containing `.git`. We keep descending below a repo: a dotfiles
+/// repo in `$HOME` must not hide everything under it, and vendored/nested
+/// repos are real repos too (worktrees live under hidden dirs and are
+/// skipped). Sorted, deduplicated.
+pub fn find_repos(roots: &[String], depth: u8) -> Vec<String> {
+    let mut found = Vec::new();
+    for root in roots {
+        let root = crate::config::expand_tilde(root);
+        let Ok(root) = std::fs::canonicalize(&root) else {
+            continue;
+        };
+        walk(&root, depth, &mut found);
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn walk(dir: &Path, depth: u8, out: &mut Vec<String>) {
+    if dir.join(".git").exists() {
+        out.push(dir.to_string_lossy().into_owned());
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
+        // Don't follow symlinks: loops and duplicates aren't worth it.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            walk(&entry.path(), depth - 1, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +211,36 @@ mod tests {
         assert_eq!(sanitize_branch("feature/x y"), "feature/x-y");
         assert_eq!(sanitize_branch("   "), "session");
         assert_eq!(workspace_dirname("feature/x-y"), "feature-x-y");
+    }
+
+    #[test]
+    fn find_repos_scans_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |rel: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
+            p
+        };
+        // The scan root is itself a repo (a dotfiles home) — must not stop there.
+        git(&["-C", dir.path().to_str().unwrap(), "init", "-q"]).unwrap();
+        let a = mk("ko/alpha");
+        let b = mk("code/deep/beta");
+        mk("node_modules/skipped");
+        mk("ko/.hidden/skipped");
+        mk("too/deep/for/depth/gamma");
+        let roots = vec![dir.path().to_string_lossy().into_owned()];
+        let found = find_repos(&roots, 3);
+        let canon = |p: &std::path::Path| {
+            std::fs::canonicalize(p)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(found.contains(&canon(&a)));
+        assert!(found.contains(&canon(&b)));
+        assert!(found.contains(&canon(dir.path())));
+        assert_eq!(found.len(), 3, "{found:?}");
     }
 
     #[test]
