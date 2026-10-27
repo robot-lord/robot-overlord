@@ -196,7 +196,7 @@ impl Default for Config {
             list_width_pct: 50,
             preview_refresh_ms: 500,
             jump_digits: true,
-            details_height: 9,
+            details_height: 12,
             session: SessionDefaults::default(),
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
@@ -229,7 +229,7 @@ layout = "side"
 list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
-details_height = 9      # rows for the details pane under the preview
+details_height = 12     # rows for the details pane under the preview
 
 # Defaults for every session you create (TUI form or `rlord new`).
 [session]

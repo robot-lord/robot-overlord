@@ -89,6 +89,8 @@ struct App {
     preview: Preview,
     preview_text: String,
     preview_rich: Option<Text<'static>>,
+    /// Sub-agents of the selected session (refreshed with the preview).
+    agents: Vec<Value>,
     status_line: String,
     dirty: bool,
     last_preview: Instant,
@@ -110,6 +112,7 @@ impl App {
             preview: Preview::Pane,
             preview_text: String::new(),
             preview_rich: None,
+            agents: Vec::new(),
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
@@ -173,8 +176,17 @@ impl App {
         self.last_preview = Instant::now();
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
+            self.agents.clear();
             return;
         };
+        self.agents = client_call(
+            &paths::socket_path(),
+            "session.subagents",
+            json!({"ref": s["id"].as_str().unwrap_or("")}),
+        )
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
         self.preview_rich = None;
         self.preview_text = match self.preview {
             Preview::Pane => {
@@ -693,7 +705,16 @@ impl App {
                         " "
                     }),
                     Cell::from(get("name")),
-                    Cell::from(Span::styled(status.clone(), status_style(&status))),
+                    Cell::from(Line::from(vec![
+                        Span::styled(status.clone(), status_style(&status)),
+                        Span::styled(
+                            match s["agents_running"].as_i64().unwrap_or(0) {
+                                0 => String::new(),
+                                n => format!(" ⚙{n}"),
+                            },
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ])),
                     Cell::from(rel_age(s["last_agent_msg_at"].as_i64())),
                     Cell::from(rel_age(s["last_user_msg_at"].as_i64())),
                 ];
@@ -865,6 +886,59 @@ impl App {
                 Span::styled(desc.to_string(), Style::default().fg(Color::Yellow))
             },
         ]));
+        if !self.agents.is_empty() {
+            let running = self
+                .agents
+                .iter()
+                .filter(|a| a["finished_at"].is_null())
+                .count();
+            lines.push(Line::from(vec![
+                key("agents"),
+                Span::styled(
+                    format!("{} total · {} running", self.agents.len(), running),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]));
+            // Most recent first; the card has limited rows.
+            for a in self.agents.iter().rev().take(4) {
+                let started = a["started_at"].as_i64();
+                let finished = a["finished_at"].as_i64();
+                let (state, style) = match (started, finished) {
+                    (Some(st), Some(fi)) => (
+                        format!("done {}s", ((fi - st) as f64 / 1000.0).round()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    (Some(st), None) => (
+                        format!("running {}", rel_age(Some(st))),
+                        Style::default().fg(Color::Green),
+                    ),
+                    _ => ("?".into(), Style::default()),
+                };
+                let result = a["result"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+                lines.push(Line::from(vec![
+                    Span::raw("       ⚙ "),
+                    Span::styled(
+                        a["agent_type"].as_str().unwrap_or("?").to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" {} · ", a["description"].as_str().unwrap_or(""))),
+                    Span::styled(state, style),
+                    Span::styled(
+                        if result.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ↳ {result}")
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
         let notes = s["notes"].as_str().unwrap_or("");
         if !notes.is_empty() {
             lines.push(Line::from(key("notes")));

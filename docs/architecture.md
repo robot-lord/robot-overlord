@@ -305,6 +305,27 @@ The design absorbs that instead of fighting it:
    surfaced by `rlord doctor`, so drift is noticed when it starts, not
    when a search comes back mysteriously empty.
 
+## Sub-agent tracking (verified 2026-10-27)
+
+Claude Code exposes sub-agents outside the pane, and rlord consumes all of it:
+
+- **Hooks** `SubagentStart` (`agent_id`, `agent_type`, `prompt_id`) and
+  `SubagentStop` (`agent_id`, `agent_type`, `agent_transcript_path`,
+  `last_assistant_message` = the result, `background_tasks` roster, `effort`)
+  fire for interactive sessions via `settings.json` — confirmed with a probe.
+- **Disk**: `<project>/<session uuid>/subagents/agent-<id>.meta.json`
+  (`agentType`, `description`, `toolUseId`, `spawnDepth`, `requestShape`,
+  `finished`) and `agent-<id>.jsonl` (full transcript, `isSidechain`,
+  `agentId`, per-message usage). Claude's internal helper agents (title /
+  suggestion generators) have an empty `agent_type` and no meta file — they
+  are filtered out.
+
+`subagents` table rows are upsert-merged from both sources (hooks for
+latency, disk for description/tool-use id/backfill); `sessions` carry
+`agents_running`/`agents_total`. Surfaces: TUI details card + `⚙N` in the
+list, `rlord agents`, `rlord show`. Sub-agent transcripts will join the
+transcript store so `rlord search` covers them.
+
 ## Inter-session messaging
 
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,

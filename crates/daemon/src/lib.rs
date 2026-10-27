@@ -194,6 +194,7 @@ impl Daemon {
                 | "session.log"
                 | "repo.list"
                 | "repo.find"
+                | "session.subagents"
                 | "session.defaults"
         );
         let db = self.db.lock().expect("db mutex poisoned");
@@ -218,6 +219,7 @@ impl Daemon {
             "session.notes" => methods::session_notes(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
+            "session.subagents" => methods::session_subagents(&db, &params),
             "hook.emit" => methods::hook_emit(&db, &params),
             _ => return Err(MethodError::NotFound),
         };

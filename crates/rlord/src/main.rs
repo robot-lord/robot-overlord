@@ -154,6 +154,10 @@ enum Command {
     Show {
         r#ref: String,
     },
+    /// List the sub-agents a session has spawned
+    Agents {
+        r#ref: String,
+    },
     /// Show a session's event log
     Log {
         r#ref: String,
@@ -524,6 +528,11 @@ fn main() -> Result<()> {
             println!("notes saved");
             Ok(())
         }
+        Command::Agents { r#ref } => {
+            let r = call("session.subagents", json!({"ref": r#ref}))?;
+            print_agents(&r);
+            Ok(())
+        }
         Command::Show { r#ref } => {
             let s = call("session.get", json!({"ref": r#ref}))?;
             let g = |k: &str| s[k].as_str().unwrap_or("-").to_string();
@@ -553,6 +562,11 @@ fn main() -> Result<()> {
                 for l in notes.lines() {
                     println!("    {l}");
                 }
+            }
+            let agents = call("session.subagents", json!({"ref": g("id")}))?;
+            if agents.as_array().is_some_and(|a| !a.is_empty()) {
+                println!("  agents");
+                print_agents(&agents);
             }
             Ok(())
         }
@@ -691,6 +705,44 @@ fn attach_tmux(tmux_name: &str) -> Result<()> {
             .exec()
     };
     Err(err).context("exec tmux failed")
+}
+
+fn print_agents(list: &Value) {
+    let Some(rows) = list.as_array() else {
+        return;
+    };
+    if rows.is_empty() {
+        println!("no sub-agents");
+        return;
+    }
+    for a in rows {
+        let started = a["started_at"].as_i64();
+        let finished = a["finished_at"].as_i64();
+        let state = match (started, finished) {
+            (Some(s), Some(f)) => format!("done in {}s", ((f - s) as f64 / 1000.0).round()),
+            (Some(s), None) => format!("running {}", rel_age(Some(s))),
+            _ => "unknown".into(),
+        };
+        println!(
+            "    {:<14} {:<40} {:<14} {:>6} tok  {}",
+            a["agent_type"].as_str().unwrap_or("?"),
+            truncate(a["description"].as_str().unwrap_or(""), 40),
+            state,
+            a["output_tokens"].as_i64().unwrap_or(0) + a["input_tokens"].as_i64().unwrap_or(0),
+            if a["background"].as_bool().unwrap_or(false) {
+                "bg"
+            } else {
+                ""
+            }
+        );
+        let result = a["result"].as_str().unwrap_or("").trim();
+        if !result.is_empty() {
+            println!(
+                "      ↳ {}",
+                truncate(result.lines().next().unwrap_or(""), 100)
+            );
+        }
+    }
 }
 
 fn compact(v: &Value) -> String {

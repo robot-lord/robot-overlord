@@ -101,6 +101,14 @@ free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
 `rlord show <ref>` prints the same card. The list always wins on space: it
 keeps its width and the preview drops out first when the terminal is narrow.
 
+**Sub-agents** are tracked from outside the pane: Claude Code's `SubagentStart`
+/ `SubagentStop` hooks plus the per-agent `meta.json` and transcript Claude
+writes under `~/.claude/projects/<slug>/<session>/subagents/`. The details
+card lists each one (type, description, running/done + duration, result line,
+tokens); the session list shows `⚙N` while any are running; `rlord agents
+<ref>` prints them. Sessions that ran before the hooks existed are backfilled
+from disk on first view.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its

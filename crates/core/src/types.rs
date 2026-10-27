@@ -53,6 +53,11 @@ pub struct Session {
     pub model: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Sub-agent counts (filled by list/get).
+    #[serde(default)]
+    pub agents_running: i64,
+    #[serde(default)]
+    pub agents_total: i64,
 }
 
 pub fn now_ms() -> i64 {
@@ -64,4 +69,21 @@ pub fn now_ms() -> i64 {
 
 pub fn new_id() -> String {
     ulid::Ulid::new().to_string().to_lowercase()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subagent {
+    pub agent_id: String,
+    pub session_id: String,
+    pub agent_type: String,
+    pub description: String,
+    pub tool_use_id: Option<String>,
+    pub spawn_depth: i64,
+    pub background: bool,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub transcript_path: Option<String>,
+    pub result: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }

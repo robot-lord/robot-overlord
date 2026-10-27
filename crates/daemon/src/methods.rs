@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use rlord_core::agents::claude;
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
-use rlord_core::types::{new_id, now_ms, Status};
+use rlord_core::types::{new_id, now_ms, Status, Subagent};
 use rlord_core::{git, tmux};
 
 /// Known repos for the picker: the configured default first (even if never
@@ -429,8 +429,12 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         if let Some(st) = status {
             db.set_status(&s.id, st, now)?;
         }
-        // Keep the log light: store the event name, not the full payload.
-        db.insert_event(&s.id, now, kind, &json!({"hook": event}).to_string())?;
+        if kind.starts_with("subagent_") {
+            ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
+        } else {
+            // Keep the log light: the event name only.
+            db.insert_event(&s.id, now, kind, &json!({"hook": event}).to_string())?;
+        }
     } else {
         db.insert_event(
             &s.id,
@@ -440,6 +444,91 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         )?;
     }
     Ok(json!({"ok": true}))
+}
+
+/// SubagentStart/SubagentStop → `subagents` rows. Claude's internal helper
+/// agents (empty agent_type, no meta.json) are ignored. The on-disk meta file
+/// supplies the description/tool-use id the hook payload lacks.
+fn ingest_subagent_hook(
+    db: &Db,
+    session_id: &str,
+    kind: &str,
+    payload: &Value,
+    now: i64,
+) -> Result<()> {
+    let agent_id = payload["agent_id"].as_str().unwrap_or("").to_string();
+    if agent_id.is_empty() {
+        return Ok(());
+    }
+    let agent_type = payload["agent_type"].as_str().unwrap_or("").to_string();
+    let source = db.transcript_source(session_id)?;
+    let from_disk = source
+        .as_deref()
+        .map(|src| claude::scan_subagents(session_id, src))
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| a.agent_id == agent_id);
+    if agent_type.is_empty() && from_disk.is_none() && !db.subagent_exists(&agent_id)? {
+        return Ok(()); // internal helper (title/suggestion generators)
+    }
+    let mut a = from_disk.unwrap_or(Subagent {
+        agent_id: agent_id.clone(),
+        session_id: session_id.to_string(),
+        agent_type: agent_type.clone(),
+        description: String::new(),
+        tool_use_id: None,
+        spawn_depth: 1,
+        background: false,
+        started_at: None,
+        finished_at: None,
+        transcript_path: None,
+        result: String::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    if !agent_type.is_empty() {
+        a.agent_type = agent_type;
+    }
+    match kind {
+        "subagent_started" => {
+            a.started_at = Some(a.started_at.unwrap_or(now));
+            a.finished_at = None;
+        }
+        _ => {
+            a.finished_at = Some(now);
+            if let Some(tp) = payload["agent_transcript_path"].as_str() {
+                a.transcript_path = Some(tp.to_string());
+                if let Some((i, o, _, _)) = claude::transcript_stats(std::path::Path::new(tp)) {
+                    a.input_tokens = i;
+                    a.output_tokens = o;
+                }
+            }
+            if let Some(r) = payload["last_assistant_message"].as_str() {
+                a.result = r.chars().take(4000).collect();
+            }
+        }
+    }
+    db.upsert_subagent(&a)?;
+    db.insert_event(
+        session_id,
+        now,
+        kind,
+        &json!({"agent_id": a.agent_id, "agent_type": a.agent_type, "description": a.description})
+            .to_string(),
+    )?;
+    Ok(())
+}
+
+/// Sub-agents of a session: backfill from disk (for sessions that ran before
+/// hooks existed, or missed events), then return the merged rows.
+pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    if let Some(src) = db.transcript_source(&s.id)? {
+        for a in claude::scan_subagents(&s.id, &src) {
+            db.upsert_subagent(&a)?;
+        }
+    }
+    Ok(serde_json::to_value(db.subagents(&s.id)?)?)
 }
 
 /// Startup reconcile: sessions marked running whose tmux is gone are stopped

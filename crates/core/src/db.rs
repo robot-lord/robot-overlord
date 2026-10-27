@@ -3,13 +3,14 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::types::{Session, Status};
+use crate::types::{Session, Status, Subagent};
 
 /// Embedded, ordered migrations. `user_version` tracks how many have run.
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_repos_workspaces.sql"),
     include_str!("../migrations/0003_description_notes.sql"),
+    include_str!("../migrations/0004_subagents.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
@@ -270,6 +271,7 @@ impl Db {
         let rows = stmt.query_map([arg], row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
+        self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
     }
 
@@ -364,7 +366,35 @@ impl Db {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
+        self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
+    }
+
+    fn attach_agent_counts(&self, sessions: &mut [Session]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, SUM(finished_at IS NULL), COUNT(*) FROM subagents GROUP BY session_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let counts: std::collections::HashMap<String, (i64, i64)> = rows
+            .filter_map(|r| r.ok())
+            .map(|(id, running, total)| (id, (running, total)))
+            .collect();
+        for s in sessions {
+            if let Some((running, total)) = counts.get(&s.id) {
+                s.agents_running = *running;
+                s.agents_total = *total;
+            }
+        }
+        Ok(())
     }
 
     fn attach_tags(&self, sessions: &mut [Session]) -> Result<()> {
@@ -535,6 +565,94 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // ---- subagents ----
+
+    /// Insert or update a sub-agent; only provided (Some / non-empty) fields
+    /// overwrite, so hook and disk sources can each contribute what they know.
+    pub fn upsert_subagent(&self, a: &Subagent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO subagents (agent_id, session_id, agent_type, description, tool_use_id, \
+                                    spawn_depth, background, started_at, finished_at, \
+                                    transcript_path, result, input_tokens, output_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+               agent_type = CASE WHEN excluded.agent_type != '' THEN excluded.agent_type ELSE agent_type END, \
+               description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END, \
+               tool_use_id = COALESCE(excluded.tool_use_id, tool_use_id), \
+               spawn_depth = MAX(spawn_depth, excluded.spawn_depth), \
+               background = MAX(background, excluded.background), \
+               started_at = COALESCE(started_at, excluded.started_at), \
+               finished_at = COALESCE(excluded.finished_at, finished_at), \
+               transcript_path = COALESCE(excluded.transcript_path, transcript_path), \
+               result = CASE WHEN excluded.result != '' THEN excluded.result ELSE result END, \
+               input_tokens = MAX(input_tokens, excluded.input_tokens), \
+               output_tokens = MAX(output_tokens, excluded.output_tokens)",
+            params![
+                a.agent_id,
+                a.session_id,
+                a.agent_type,
+                a.description,
+                a.tool_use_id,
+                a.spawn_depth,
+                a.background as i64,
+                a.started_at,
+                a.finished_at,
+                a.transcript_path,
+                a.result,
+                a.input_tokens,
+                a.output_tokens
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn subagents(&self, session_id: &str) -> Result<Vec<Subagent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id, session_id, agent_type, description, tool_use_id, spawn_depth, \
+                    background, started_at, finished_at, transcript_path, result, \
+                    input_tokens, output_tokens \
+             FROM subagents WHERE session_id = ?1 ORDER BY started_at, agent_id",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok(Subagent {
+                agent_id: r.get(0)?,
+                session_id: r.get(1)?,
+                agent_type: r.get(2)?,
+                description: r.get(3)?,
+                tool_use_id: r.get(4)?,
+                spawn_depth: r.get(5)?,
+                background: r.get::<_, i64>(6)? != 0,
+                started_at: r.get(7)?,
+                finished_at: r.get(8)?,
+                transcript_path: r.get(9)?,
+                result: r.get(10)?,
+                input_tokens: r.get(11)?,
+                output_tokens: r.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn subagent_exists(&self, agent_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM subagents WHERE agent_id = ?1",
+            [agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn transcript_source(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT source_path FROM transcripts WHERE session_id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
     // ---- events ----
 
     pub fn insert_event(&self, session_id: &str, ts: i64, kind: &str, payload: &str) -> Result<()> {
@@ -594,6 +712,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_user_msg_at: r.get(13)?,
         last_agent_msg_at: r.get(14)?,
         last_state_change_at: r.get(15)?,
+        agents_running: 0,
+        agents_total: 0,
         repo_path: r.get(16)?,
         workspace_path: r.get(17)?,
         branch: r.get(18)?,
@@ -642,7 +762,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         for table in [
             "sessions",
             "tags",
@@ -670,7 +790,54 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
+    }
+
+    #[test]
+    fn subagent_upsert_merges_sources() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "alpha");
+        let base = Subagent {
+            agent_id: "a1".into(),
+            session_id: "01aaa".into(),
+            agent_type: "Explore".into(),
+            description: String::new(),
+            tool_use_id: None,
+            spawn_depth: 1,
+            background: false,
+            started_at: Some(100),
+            finished_at: None,
+            transcript_path: None,
+            result: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        db.upsert_subagent(&base).unwrap(); // hook start
+        db.upsert_subagent(&Subagent {
+            description: "Find X".into(),
+            tool_use_id: Some("toolu_1".into()),
+            background: true,
+            started_at: None,
+            ..base.clone()
+        })
+        .unwrap(); // meta.json
+        let s = db.resolve_ref("alpha").unwrap();
+        assert_eq!((s.agents_running, s.agents_total), (1, 1));
+        db.upsert_subagent(&Subagent {
+            finished_at: Some(500),
+            result: "/path".into(),
+            output_tokens: 260,
+            ..base.clone()
+        })
+        .unwrap(); // hook stop
+        let a = &db.subagents("01aaa").unwrap()[0];
+        assert_eq!(a.description, "Find X");
+        assert_eq!(a.started_at, Some(100));
+        assert_eq!(a.finished_at, Some(500));
+        assert!(a.background);
+        assert_eq!(a.output_tokens, 260);
+        let s = db.resolve_ref("alpha").unwrap();
+        assert_eq!((s.agents_running, s.agents_total), (0, 1));
     }
 
     #[test]
