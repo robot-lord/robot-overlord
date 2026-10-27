@@ -119,10 +119,16 @@ pub fn respawn_pane(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     Ok(())
 }
 
-/// Visible contents of the session's pane (for previews).
+/// Visible contents of the session's pane (for previews), plain text.
 pub fn capture_pane(name: &str) -> Result<String> {
     let (_, pane_id) = window_pane_ids(name)?;
     run(&["capture-pane", "-p", "-t", &pane_id])
+}
+
+/// Same, with ANSI colour/attribute escapes preserved (`-e`).
+pub fn capture_pane_ansi(name: &str) -> Result<String> {
+    let (_, pane_id) = window_pane_ids(name)?;
+    run(&["capture-pane", "-p", "-e", "-t", &pane_id])
 }
 
 pub fn kill_session(name: &str) -> Result<()> {

@@ -40,6 +40,8 @@ pub struct Keys {
     pub reverse_sort: String,
     pub filter: String,
     pub toggle_log: String,
+    pub describe: String,
+    pub notes: String,
     pub cancel: String,
 }
 
@@ -64,6 +66,8 @@ impl Default for Keys {
             reverse_sort: "O".into(),
             filter: "/".into(),
             toggle_log: "l".into(),
+            describe: "D".into(),
+            notes: "E".into(),
             cancel: "esc".into(),
         }
     }
@@ -178,6 +182,8 @@ pub struct Config {
     pub preview_refresh_ms: u64,
     /// Digits 1–9 attach straight to the Nth listed session.
     pub jump_digits: bool,
+    /// Height of the details pane under the preview (rows).
+    pub details_height: u16,
     pub session: SessionDefaults,
     pub keys: Keys,
     pub tmux: TmuxKeys,
@@ -190,6 +196,7 @@ impl Default for Config {
             list_width_pct: 50,
             preview_refresh_ms: 500,
             jump_digits: true,
+            details_height: 9,
             session: SessionDefaults::default(),
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
@@ -222,6 +229,7 @@ layout = "side"
 list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
+details_height = 9      # rows for the details pane under the preview
 
 # Defaults for every session you create (TUI form or `rlord new`).
 [session]
@@ -255,6 +263,8 @@ sort = "o"
 reverse_sort = "O"
 filter = "/"
 toggle_log = "l"
+describe = "D"          # edit the one-line description
+notes = "E"             # edit notes in $EDITOR
 cancel = "esc"
 
 # Global tmux bindings rlord installs (root key table, tmux key syntax) so they

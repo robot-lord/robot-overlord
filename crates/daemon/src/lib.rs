@@ -214,6 +214,8 @@ impl Daemon {
             "session.rename" => methods::session_rename(&db, &params),
             "session.tag" => methods::session_tag(&db, &params),
             "session.pin" => methods::session_pin(&db, &params),
+            "session.describe" => methods::session_describe(&db, &params),
+            "session.notes" => methods::session_notes(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => methods::hook_emit(&db, &params),

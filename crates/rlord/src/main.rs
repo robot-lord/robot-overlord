@@ -137,6 +137,23 @@ enum Command {
         r#ref: String,
         group: String,
     },
+    /// Set a session's one-line description
+    Describe {
+        r#ref: String,
+        text: Vec<String>,
+    },
+    /// Edit a session's notes in $EDITOR (or set them with --set / --file)
+    Notes {
+        r#ref: String,
+        #[arg(long, conflicts_with = "file")]
+        set: Option<String>,
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Show everything known about a session
+    Show {
+        r#ref: String,
+    },
     /// Show a session's event log
     Log {
         r#ref: String,
@@ -465,6 +482,78 @@ fn main() -> Result<()> {
         Command::Group { r#ref, group } => {
             call("session.group", json!({"ref": r#ref, "group": group}))?;
             println!("group set to {group}");
+            Ok(())
+        }
+        Command::Describe { r#ref, text } => {
+            let text = text.join(" ");
+            call(
+                "session.describe",
+                json!({"ref": r#ref, "description": text}),
+            )?;
+            println!("description set");
+            Ok(())
+        }
+        Command::Notes { r#ref, set, file } => {
+            let s = call("session.get", json!({"ref": r#ref}))?;
+            let id = s["id"].as_str().unwrap_or("").to_string();
+            let notes = match (set, file) {
+                (Some(t), _) => t,
+                (None, Some(f)) => std::fs::read_to_string(f)?,
+                (None, None) => {
+                    let current = s["notes"].as_str().unwrap_or("").to_string();
+                    let path = std::env::temp_dir().join(format!("rlord-notes-{id}.md"));
+                    std::fs::write(&path, &current)?;
+                    let editor = std::env::var("VISUAL")
+                        .or_else(|_| std::env::var("EDITOR"))
+                        .unwrap_or_else(|_| "vi".into());
+                    let st = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("{editor} \"$1\""))
+                        .arg("rlord")
+                        .arg(&path)
+                        .status()?;
+                    if !st.success() {
+                        anyhow::bail!("editor exited with {st}; notes not saved");
+                    }
+                    let new = std::fs::read_to_string(&path)?;
+                    let _ = std::fs::remove_file(&path);
+                    new
+                }
+            };
+            call("session.notes", json!({"ref": id, "notes": notes}))?;
+            println!("notes saved");
+            Ok(())
+        }
+        Command::Show { r#ref } => {
+            let s = call("session.get", json!({"ref": r#ref}))?;
+            let g = |k: &str| s[k].as_str().unwrap_or("-").to_string();
+            let t = |k: &str| {
+                s[k].as_i64()
+                    .map(|v| format!("{} ({})", fmt_ts(v), rel_age(Some(v))))
+                    .unwrap_or_else(|| "-".into())
+            };
+            println!("{} ({})", g("name"), g("id"));
+            println!(
+                "  agent      {} · model {} · status {}",
+                g("agent"),
+                g("model"),
+                g("status")
+            );
+            println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
+            println!("  dir        {}", g("project_path"));
+            println!("  created    {}", t("created_at"));
+            println!("  user msg   {}", t("last_user_msg_at"));
+            println!("  agent msg  {}", t("last_agent_msg_at"));
+            println!("  state      {}", t("last_state_change_at"));
+            println!("  tags       {}   group {}", tags_of(&s), g("group_path"));
+            println!("  desc       {}", g("description"));
+            let notes = s["notes"].as_str().unwrap_or("");
+            if !notes.is_empty() {
+                println!("  notes");
+                for l in notes.lines() {
+                    println!("    {l}");
+                }
+            }
             Ok(())
         }
         Command::Log { r#ref, limit } => {

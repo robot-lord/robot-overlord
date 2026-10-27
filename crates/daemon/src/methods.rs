@@ -114,6 +114,36 @@ pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 
+pub fn session_describe(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let d = params
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    db.set_description(&s.id, d)?;
+    db.insert_event(
+        &s.id,
+        now_ms(),
+        "described",
+        &json!({"description": d}).to_string(),
+    )?;
+    Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let n = params.get("notes").and_then(Value::as_str).unwrap_or("");
+    db.set_notes(&s.id, n.trim_end())?;
+    db.insert_event(
+        &s.id,
+        now_ms(),
+        "notes_edited",
+        &json!({"bytes": n.len()}).to_string(),
+    )?;
+    Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
 pub fn session_pin(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     let pinned = params

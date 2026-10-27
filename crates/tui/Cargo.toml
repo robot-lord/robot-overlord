@@ -11,3 +11,4 @@ rlord-daemon = { path = "../daemon" }
 anyhow.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
+ansi-to-tui.workspace = true

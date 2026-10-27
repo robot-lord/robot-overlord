@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 ulid = "1"
 ratatui = "0.29"
+ansi-to-tui = "7"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 thiserror = "2"

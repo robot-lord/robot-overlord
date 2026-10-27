@@ -90,6 +90,17 @@ first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
 `rlord repos` lists known repos.
 
+## The right-hand side: preview + details
+
+The preview is the session's live pane, in colour (captured with ANSI
+attributes), refreshed every `preview_refresh_ms`; `l` swaps it for the event
+log. Under it sits the **details** card — agent/model/status, repo and branch,
+working dir, the four timestamps, tags and group — plus two fields you write:
+a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
+free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
+`rlord show <ref>` prints the same card. The list always wins on space: it
+keeps its width and the preview drops out first when the terminal is narrow.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its

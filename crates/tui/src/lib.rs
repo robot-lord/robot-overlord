@@ -6,11 +6,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout as RLayout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
@@ -70,6 +71,7 @@ enum Mode {
     Normal,
     Filter(String),
     Rename(String),
+    Describe(String),
     NewSession(Box<NewForm>),
 }
 
@@ -86,6 +88,7 @@ struct App {
     mode: Mode,
     preview: Preview,
     preview_text: String,
+    preview_rich: Option<Text<'static>>,
     status_line: String,
     dirty: bool,
     last_preview: Instant,
@@ -106,6 +109,7 @@ impl App {
             mode: Mode::Normal,
             preview: Preview::Pane,
             preview_text: String::new(),
+            preview_rich: None,
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
@@ -171,13 +175,40 @@ impl App {
             self.preview_text.clear();
             return;
         };
+        self.preview_rich = None;
         self.preview_text = match self.preview {
             Preview::Pane => {
                 let running = s["status"] != "stopped";
                 match s["tmux_session"].as_str() {
-                    Some(name) if running => tmux::capture_pane(name)
-                        .map(|t| t.trim_end().to_string())
-                        .unwrap_or_else(|e| format!("(no pane: {e})")),
+                    Some(name) if running => match tmux::capture_pane_ansi(name) {
+                        Ok(raw) => {
+                            // A detached window keeps its last client's size
+                            // (often huge), so the pane's tail is blank rows:
+                            // drop those and show the last rows with content.
+                            let raw = raw.trim_end().to_string();
+                            // Also collapse runs of blank rows: TUIs pin a
+                            // footer to the bottom of a tall pane, leaving a
+                            // void between content and footer.
+                            self.preview_rich = raw.as_bytes().into_text().ok().map(|t| {
+                                let blank = |l: &Line| {
+                                    l.spans.iter().all(|sp| sp.content.trim().is_empty())
+                                };
+                                let mut out: Vec<Line> = Vec::with_capacity(t.lines.len());
+                                for l in t.lines {
+                                    if blank(&l) && out.last().is_some_and(blank) {
+                                        continue;
+                                    }
+                                    out.push(l);
+                                }
+                                while out.last().is_some_and(blank) {
+                                    out.pop();
+                                }
+                                Text::from(out)
+                            });
+                            raw
+                        }
+                        Err(e) => format!("(no pane: {e})"),
+                    },
                     _ => "(session stopped — press r to restart)".to_string(),
                 }
             }
@@ -245,6 +276,9 @@ impl App {
                         }
                         Mode::Rename(buf) => {
                             self.handle_input(k, buf, InputKind::Rename, terminal)?
+                        }
+                        Mode::Describe(buf) => {
+                            self.handle_input(k, buf, InputKind::Describe, terminal)?
                         }
                         Mode::NewSession(form) => {
                             if let Some(form) = self.handle_form(k, form)? {
@@ -355,6 +389,13 @@ impl App {
                     self.mode = Mode::Rename(cur);
                 }
             }
+            Action::Describe => {
+                if let Some(s) = self.selected() {
+                    let cur = s["description"].as_str().unwrap_or("").to_string();
+                    self.mode = Mode::Describe(cur);
+                }
+            }
+            Action::Notes => self.edit_notes(terminal)?,
             Action::New => self.open_new_form(),
             Action::Cancel => {
                 if !self.filter.is_empty() {
@@ -433,6 +474,20 @@ impl App {
                         self.dirty = true;
                     }
                 }
+                InputKind::Describe => {
+                    if let Some(id) = self.selected_id() {
+                        if self
+                            .call(
+                                "session.describe",
+                                json!({"ref": id, "description": buf.trim()}),
+                            )
+                            .is_some()
+                        {
+                            self.status_line = "description saved".into();
+                        }
+                        self.dirty = true;
+                    }
+                }
             },
             KeyCode::Backspace => {
                 buf.pop();
@@ -454,6 +509,47 @@ impl App {
             }
             _ => self.mode = kind.mode(buf),
         }
+        Ok(())
+    }
+
+    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
+    fn edit_notes(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let Some(s) = self.selected().cloned() else {
+            return Ok(());
+        };
+        let id = s["id"].as_str().unwrap_or("").to_string();
+        let current = s["notes"].as_str().unwrap_or("").to_string();
+        let dir = std::env::temp_dir().join("rlord-notes");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{id}.md"));
+        std::fs::write(&path, &current)?;
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into());
+        ratatui::restore();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("rlord")
+            .arg(&path)
+            .status();
+        *terminal = ratatui::init();
+        terminal.clear()?;
+        match status {
+            Ok(st) if st.success() => {
+                let new = std::fs::read_to_string(&path).unwrap_or_default();
+                if new.trim_end() != current.trim_end() {
+                    self.call("session.notes", json!({"ref": id, "notes": new}));
+                    self.status_line = "notes saved".into();
+                } else {
+                    self.status_line = "notes unchanged".into();
+                }
+            }
+            Ok(_) => self.status_line = "editor exited with error; notes not saved".into(),
+            Err(e) => self.status_line = format!("could not run editor '{editor}': {e}"),
+        }
+        let _ = std::fs::remove_file(&path);
+        self.dirty = true;
         Ok(())
     }
 
@@ -502,24 +598,48 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let [main_area, footer_area] =
             RLayout::vertical([Constraint::Min(5), Constraint::Length(2)]).areas(f.area());
-        let (list_area, preview_area) = match self.config.layout {
+        let (list_area, right) = match self.config.layout {
             Layout::Side => {
-                let pct = self.config.list_width_pct.clamp(20, 80);
-                let [l, p] = RLayout::horizontal([
-                    Constraint::Percentage(pct),
-                    Constraint::Percentage(100 - pct),
-                ])
-                .areas(main_area);
-                (l, p)
+                // The list is what this view is for: it gets its width first
+                // (configured share, but never below what its columns need);
+                // the preview takes the remainder and simply drops out when
+                // that remainder is too small to be useful.
+                let pct = self.config.list_width_pct.clamp(20, 80) as u32;
+                let want = (main_area.width as u32 * pct / 100) as u16;
+                let list_w = want.max(60).min(main_area.width);
+                let rest = main_area.width - list_w;
+                if rest >= 32 {
+                    let [l, r] =
+                        RLayout::horizontal([Constraint::Length(list_w), Constraint::Min(1)])
+                            .areas(main_area);
+                    (l, Some(r))
+                } else {
+                    (main_area, None)
+                }
             }
             Layout::Stack => {
-                let [l, p] = RLayout::vertical([Constraint::Percentage(55), Constraint::Min(5)])
-                    .areas(main_area);
-                (l, p)
+                if main_area.height >= 16 {
+                    let [l, r] =
+                        RLayout::vertical([Constraint::Percentage(50), Constraint::Min(6)])
+                            .areas(main_area);
+                    (l, Some(r))
+                } else {
+                    (main_area, None)
+                }
             }
         };
         self.draw_list(f, list_area);
-        self.draw_preview(f, preview_area);
+        if let Some(right) = right {
+            let details_h = self.config.details_height.clamp(4, 20);
+            if right.height >= details_h + 6 {
+                let [p, d] = RLayout::vertical([Constraint::Min(4), Constraint::Length(details_h)])
+                    .areas(right);
+                self.draw_preview(f, p);
+                self.draw_details(f, d);
+            } else {
+                self.draw_preview(f, right);
+            }
+        }
         self.draw_footer(f, footer_area);
         if let Mode::NewSession(form) = &self.mode {
             self.draw_form(f, form);
@@ -638,13 +758,126 @@ impl App {
         };
         // Show the tail that fits: the bottom of a pane is what matters.
         let inner_h = area.height.saturating_sub(2) as usize;
-        let lines: Vec<&str> = self.preview_text.lines().collect();
-        let start = lines.len().saturating_sub(inner_h);
-        let text: Vec<Line> = lines[start..].iter().map(|l| Line::raw(*l)).collect();
-        let p = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false });
+        let text: Text = match &self.preview_rich {
+            Some(rich) if self.preview == Preview::Pane => {
+                let start = rich.lines.len().saturating_sub(inner_h);
+                Text::from(rich.lines[start..].to_vec())
+            }
+            _ => {
+                let lines: Vec<&str> = self.preview_text.lines().collect();
+                let start = lines.len().saturating_sub(inner_h);
+                Text::from(
+                    lines[start..]
+                        .iter()
+                        .map(|l| Line::raw(*l))
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
         f.render_widget(p, area);
+    }
+
+    /// The control-layer card: everything we know about the session that
+    /// isn't the live pane, plus the human-authored description and notes.
+    fn draw_details(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            " details  ({}: describe · {}: notes) ",
+            self.keys.label(Action::Describe),
+            self.keys.label(Action::Notes)
+        ));
+        let Some(s) = self.selected() else {
+            f.render_widget(block, area);
+            return;
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let tilde = |p: &str| p.replacen(&home, "~", 1);
+        let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
+        let key = |k: &str| Span::styled(format!("{k:<7}"), Style::default().fg(Color::DarkGray));
+        let status = get("status");
+        let tags = s["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(get("name"), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::raw(get("agent")),
+                Span::raw(" · "),
+                Span::raw(s["model"].as_str().unwrap_or("default model").to_string()),
+                Span::raw(" · "),
+                Span::styled(status.clone(), status_style(&status)),
+                Span::raw(format!("  id {}", get("id"))),
+            ]),
+            Line::from(vec![
+                key("repo"),
+                Span::raw(
+                    s["repo_path"]
+                        .as_str()
+                        .map(tilde)
+                        .unwrap_or_else(|| "(none)".into()),
+                ),
+                Span::raw(
+                    s["branch"]
+                        .as_str()
+                        .map(|b| format!("  branch {b}"))
+                        .unwrap_or_default(),
+                ),
+            ]),
+            Line::from(vec![key("dir"), Span::raw(tilde(&get("project_path")))]),
+            Line::from(vec![
+                key("when"),
+                Span::raw(format!(
+                    "created {} · user msg {} · agent msg {} · state {}",
+                    rel_age(s["created_at"].as_i64()),
+                    rel_age(s["last_user_msg_at"].as_i64()),
+                    rel_age(s["last_agent_msg_at"].as_i64()),
+                    rel_age(s["last_state_change_at"].as_i64()),
+                )),
+            ]),
+            Line::from(vec![
+                key("tags"),
+                Span::raw(if tags.is_empty() { "-".into() } else { tags }),
+                Span::raw(
+                    s["group_path"]
+                        .as_str()
+                        .filter(|g| !g.is_empty())
+                        .map(|g| format!("   group {g}"))
+                        .unwrap_or_default(),
+                ),
+            ]),
+        ];
+        let desc = s["description"].as_str().unwrap_or("");
+        lines.push(Line::from(vec![
+            key("desc"),
+            if desc.is_empty() {
+                Span::styled(
+                    format!("(none — {} to add)", self.keys.label(Action::Describe)),
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::styled(desc.to_string(), Style::default().fg(Color::Yellow))
+            },
+        ]));
+        let notes = s["notes"].as_str().unwrap_or("");
+        if !notes.is_empty() {
+            lines.push(Line::from(key("notes")));
+            for l in notes.lines() {
+                lines.push(Line::raw(format!("       {l}")));
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -654,6 +887,7 @@ impl App {
                 "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:/tag:/proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
+            Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),
             Mode::NewSession(_) => Some("new session — see form".to_string()),
         };
         let line1 = match prompt {
@@ -678,6 +912,7 @@ impl App {
 enum InputKind {
     Filter,
     Rename,
+    Describe,
 }
 
 impl InputKind {
@@ -685,6 +920,7 @@ impl InputKind {
         match self {
             InputKind::Filter => Mode::Filter(buf),
             InputKind::Rename => Mode::Rename(buf),
+            InputKind::Describe => Mode::Describe(buf),
         }
     }
 }
@@ -727,6 +963,8 @@ enum Action {
     ReverseSort,
     Filter,
     ToggleLog,
+    Describe,
+    Notes,
     Cancel,
 }
 
@@ -842,6 +1080,8 @@ impl KeyMap {
             (Action::ReverseSort, &k.reverse_sort),
             (Action::Filter, &k.filter),
             (Action::ToggleLog, &k.toggle_log),
+            (Action::Describe, &k.describe),
+            (Action::Notes, &k.notes),
             (Action::Cancel, &k.cancel),
         ];
         let mut bindings = Vec::with_capacity(specs.len());
@@ -884,6 +1124,8 @@ impl KeyMap {
             (Action::ReverseSort, "reverse"),
             (Action::Filter, "search"),
             (Action::ToggleLog, "log"),
+            (Action::Describe, "describe"),
+            (Action::Notes, "notes"),
             (Action::Quit, "quit"),
         ]
         .into_iter()
@@ -907,5 +1149,27 @@ mod tests {
         assert!(KeyBinding::parse("alt-tab").unwrap().alt);
         assert!(KeyBinding::parse("bogus-key").is_err());
         assert!(KeyMap::from_config(&Keys::default()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use ansi_to_tui::IntoText;
+    use ratatui::style::Color;
+
+    #[test]
+    fn captured_ansi_parses_to_styled_spans() {
+        let raw = b"\x1b[38;5;174m \xe2\x96\x90\x1b[48;5;16m\xe2\x96\x9b\x1b[39m\x1b[49m   \x1b[1mClaude Code\x1b[0m v2\n\x1b[2mdim line\x1b[0m\n";
+        let text = raw.as_slice().into_text().expect("parse");
+        assert_eq!(text.lines.len(), 2);
+        let first = &text.lines[0];
+        assert!(first
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Indexed(174))));
+        assert!(first.spans.iter().any(|s| s
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)));
     }
 }

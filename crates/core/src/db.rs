@@ -9,12 +9,13 @@ use crate::types::{Session, Status};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_repos_workspaces.sql"),
+    include_str!("../migrations/0003_description_notes.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
-     repo_path, workspace_path, branch";
+     repo_path, workspace_path, branch, description, notes, launch_spec";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -414,6 +415,22 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_description(&self, id: &str, description: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET description = ?2 WHERE id = ?1",
+            params![id, description],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_notes(&self, id: &str, notes: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET notes = ?2 WHERE id = ?1",
+            params![id, notes],
+        )?;
+        Ok(())
+    }
+
     pub fn add_tag(&self, id: &str, tag: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO tags (session_id, tag) VALUES (?1, ?2)",
@@ -580,6 +597,12 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         repo_path: r.get(16)?,
         workspace_path: r.get(17)?,
         branch: r.get(18)?,
+        description: r.get(19)?,
+        notes: r.get(20)?,
+        model: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(21)?)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .filter(|m| !m.is_empty()),
         tags: Vec::new(),
     })
 }
@@ -619,7 +642,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
         for table in [
             "sessions",
             "tags",
@@ -647,7 +670,20 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
+    }
+
+    #[test]
+    fn description_and_notes() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "alpha");
+        db.set_description("01aaa", "fixing the digest job")
+            .unwrap();
+        db.set_notes("01aaa", "line one\nline two").unwrap();
+        let s = db.resolve_ref("alpha").unwrap();
+        assert_eq!(s.description, "fixing the digest job");
+        assert_eq!(s.notes.lines().count(), 2);
+        assert_eq!(s.model, None); // launch_spec "{}"
     }
 
     #[test]

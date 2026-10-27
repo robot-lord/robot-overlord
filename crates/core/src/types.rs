@@ -46,6 +46,12 @@ pub struct Session {
     pub workspace_path: Option<String>,
     pub branch: Option<String>,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Model from launch_spec, when one was pinned.
+    pub model: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
