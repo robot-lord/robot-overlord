@@ -138,10 +138,31 @@ fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing string param '{key}'"))
 }
 
+/// Absolute path used for hook commands and tmux bindings. Prefers the path
+/// we were invoked through when it is a PATH entry or symlink that resolves to
+/// this executable (e.g. `~/.local/bin/rlord` → `target/debug/rlord`): that
+/// path stays valid across rebuilds, repo moves, and `cargo install`.
 pub fn rlord_bin() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
+    let exe = std::env::current_exe().ok();
+    let real = exe.as_ref().and_then(|e| std::fs::canonicalize(e).ok());
+    if let Some(arg0) = std::env::args_os().next() {
+        let arg0 = std::path::PathBuf::from(arg0);
+        let candidate = if arg0.components().count() == 1 {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|d| d.join(&arg0))
+                    .find(|c| c.is_file())
+            })
+        } else {
+            Some(arg0)
+        };
+        if let (Some(c), Some(real)) = (candidate, &real) {
+            if c.is_absolute() && std::fs::canonicalize(&c).ok().as_ref() == Some(real) {
+                return c.to_string_lossy().into_owned();
+            }
+        }
+    }
+    exe.and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "rlord".to_string())
 }
 

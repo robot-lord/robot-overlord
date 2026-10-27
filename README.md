@@ -56,6 +56,7 @@ See `docs/architecture.md` for the full plan and phased milestones.
 ## Quickstart
 
 ```bash
+ln -sfn "$PWD/target/debug/rlord" ~/.local/bin/rlord   # dev install: tracks every build
 scripts/dev-daemon.sh                        # build + (re)start the daemon (dev loop)
 ./target/debug/rlord claude install-hooks    # merge-adds hooks to ~/.claude/settings.json
 rlord                                        # TUI dashboard (default command)

@@ -14,7 +14,7 @@ else
   # No usable pidfile: find a process whose argv is exactly `rlord daemon`
   # (never a substring match — that would catch the shell running this script).
   for d in /proc/[0-9]*; do
-    if [[ "$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" == *"/rlord daemon " ]]; then
+    if [[ "$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" == *"rlord daemon " ]]; then
       old=${d#/proc/}; break
     fi
   done
@@ -25,8 +25,14 @@ if [[ -n "$old" ]]; then
   kill -0 "$old" 2>/dev/null && { echo "old daemon $old did not exit" >&2; exit 1; }
 fi
 
+# Launch through the PATH symlink when it points at this build, so the paths
+# the daemon embeds in hooks/tmux bindings are the stable ones.
+bin=./target/debug/rlord
+if linked=$(command -v rlord 2>/dev/null) && [[ "$(readlink -f "$linked")" == "$(readlink -f "$bin")" ]]; then
+  bin=$linked
+fi
 log=${RLORD_LOG:-/tmp/rlordd.log}
-nohup ./target/debug/rlord daemon >>"$log" 2>&1 &
+nohup "$bin" daemon >>"$log" 2>&1 &
 for _ in $(seq 1 30); do [[ -f "$pidfile" ]] && break; sleep 0.1; done
 new=$(cat "$pidfile" 2>/dev/null || true)
 [[ -n "$new" && "$new" != "${old:-}" ]] || { echo "daemon failed to start (see $log)" >&2; tail -3 "$log" >&2; exit 1; }
