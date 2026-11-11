@@ -106,7 +106,8 @@ risks signing breakage). Every PR merged to `main` ships as a new release.
   `rlord-v<version>-aarch64-apple-darwin.tar.gz`, and creates tag
   `v<version>`. It refuses a dirty tree, an unpushed HEAD, or an existing
   tag. If the tag exists, the PR forgot the version bump.
-- Installing on another Mac: see "Installing a release" in `README.md`.
+- Installing on another Mac: see "Installing on a Mac" in `README.md`
+  (`scripts/update.sh` the first time, then `rlord update`).
 
 ## Other rules
 
