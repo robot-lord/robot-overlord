@@ -187,9 +187,9 @@ pub(crate) struct NewForm {
     repo_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
-    /// Reopened by the overlord: hints the user didn't pick hold its resolved
-    /// values (shown as such, sent as "your earlier pick"), not defaults.
-    resolved: bool,
+    /// Reopened by the overlord: the hints it set that the user hadn't picked
+    /// (its resolved values: shown as such, sent as "your earlier pick").
+    resolved: Vec<&'static str>,
     /// Reopened by the overlord with corrected hints: submitting confirms
     /// them. `changed` names the hints it updated; `note` says why.
     confirmed: bool,
@@ -278,17 +278,25 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        // The user's own earlier picks stay theirs; the rest are the
-        // overlord's resolved values (not defaults).
-        let picked = |k: &str| {
-            p["chosen"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|c| c == k))
-        };
+        // The user's own picks (as the overlord reports them) stay theirs,
+        // unless the overlord changed that hint; hints it set otherwise are
+        // its resolved values; anything it didn't set is still a default.
+        let has =
+            |list: &str, k: &str| p[list].as_array().is_some_and(|a| a.iter().any(|c| c == k));
+        let picked = |k: &str| has("user_picked", k) && !has("changed", k);
         self.repo_chosen = picked("repo");
         self.model_chosen = picked("model");
         self.workspace_chosen = picked("worktree");
-        self.resolved = true;
+        let set = [
+            ("repo", get("repo").is_some() || get("project").is_some()),
+            ("model", get("model").is_some()),
+            ("worktree", p["workspace"].is_boolean()),
+        ];
+        self.resolved = set
+            .into_iter()
+            .filter(|(k, given)| *given && !picked(k))
+            .map(|(k, _)| k)
+            .collect();
         self.confirmed = true;
         self.changed = p["changed"]
             .as_array()
@@ -398,7 +406,7 @@ impl App {
             repo_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
-            resolved: false,
+            resolved: Vec::new(),
             confirmed: false,
             changed: Vec::new(),
             note: None,
@@ -426,8 +434,9 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
-                                f.repo_chosen = true;
                                 if !matches!(&f.location, Location::Folder(p) if *p == path) {
+                                    f.repo_chosen = true;
+                                    f.resolved.retain(|k| *k != "repo");
                                     f.description_changed();
                                 }
                                 f.location = Location::Folder(path);
@@ -488,8 +497,9 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
-                        f.repo_chosen = true;
                         if !matches!(&f.location, Location::Repo(p) if p == path) {
+                            f.repo_chosen = true;
+                            f.resolved.retain(|k| *k != "repo");
                             f.description_changed();
                         }
                         f.location = Location::Repo(path.clone());
@@ -528,13 +538,15 @@ impl App {
                 }
                 KeyCode::Enter => match kind {
                     PickerKind::Model => {
-                        f.model_chosen = true;
                         let picked = if items[i] == "(agent default)" {
                             String::new()
                         } else {
                             items[i].clone()
                         };
+                        // A real change only (re-picking keeps provenance).
                         if picked != f.model {
+                            f.model_chosen = true;
+                            f.resolved.retain(|k| *k != "model");
                             f.description_changed();
                         }
                         f.model = picked;
@@ -547,16 +559,18 @@ impl App {
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
-                            f.repo_chosen = true;
                             if !matches!(f.location, Location::Auto) {
+                                f.repo_chosen = true;
+                                f.resolved.retain(|k| *k != "repo");
                                 f.description_changed();
                             }
                             f.location = Location::Auto;
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
-                            f.repo_chosen = true;
                             if !matches!(&f.location, Location::Repo(p) if *p == path) {
+                                f.repo_chosen = true;
+                                f.resolved.retain(|k| *k != "repo");
                                 f.description_changed();
                             }
                             f.location = Location::Repo(path);
@@ -622,6 +636,7 @@ impl App {
                 Field::Workspace => {
                     f.workspace = !f.workspace;
                     f.workspace_chosen = true;
+                    f.resolved.retain(|k| *k != "worktree");
                     f.description_changed();
                 }
                 Field::Launch => return self.submit_form(f),
@@ -630,6 +645,7 @@ impl App {
             KeyCode::Char(' ') if field == Field::Workspace => {
                 f.workspace = !f.workspace;
                 f.workspace_chosen = true;
+                f.resolved.retain(|k| *k != "worktree");
                 f.description_changed();
             }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
@@ -779,14 +795,7 @@ impl App {
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
             // The overlord's resolved values the user left as they were.
-            "resolved": if f.resolved {
-                [("repo", f.repo_chosen), ("model", f.model_chosen), ("worktree", f.workspace_chosen)]
-                    .into_iter()
-                    .filter_map(|(k, c)| (!c).then_some(k))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![]
-            },
+            "resolved": f.resolved,
             "confirmed": f.confirmed,
         });
         match &f.location {
@@ -1199,7 +1208,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             spans.push(Span::styled("  ✦ updated", accent));
         } else if !chosen && !value.starts_with("overlord picks") {
             spans.push(Span::styled(
-                if form.resolved {
+                if form.resolved.contains(&key) {
                     "  · overlord's pick"
                 } else {
                     "  · default"
@@ -1412,6 +1421,16 @@ mod tests {
         assert!(repo_line.contains("updated"), "{repo_line}");
         assert!(out.contains("Launch"));
         assert!(f.confirmed && f.current() == Field::Launch);
+
+        // Provenance: the user's own pick stays theirs unless the overlord
+        // changed it; hints the overlord set are its picks; unset ones are
+        // still defaults.
+        f.prefill_confirm(&json!({
+            "description": "x", "repo": "/r/a", "model": "opus",
+            "user_picked": ["model", "repo"], "changed": ["repo"], "note": "n",
+        }));
+        assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
+        assert_eq!(f.resolved, ["repo"]);
     }
 
     #[test]

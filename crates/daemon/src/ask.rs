@@ -73,9 +73,6 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
-    // What the user picked themselves: a form the overlord reopens keeps it.
-    d.db()
-        .kv_set("last_request_chosen", &params["chosen"].to_string())?;
     let r = send_to(d, &overlord::MASTERMIND, &text)?;
     // Delivered: it answers any form the mastermind had reopened.
     d.db().kv_set("confirm_pending", "0")?;
@@ -242,6 +239,11 @@ mod tests {
         assert!(m.contains("- tags: web, wip (picked by the user)\n"));
         assert!(m.ends_with("description:\nfix the login flake\n\nkeep the retry count at 3"));
         assert!(format_request(&json!({"description": "  "})).is_err());
+        let r = format_request(&json!({"description": "x", "repo": "/r", "model": "opus",
+                                        "chosen": ["model"], "resolved": ["repo"]}))
+        .unwrap();
+        assert!(r.contains("- repo: /r (your earlier pick)\n"), "{r}");
+        assert!(r.contains("- model: opus (picked by the user)\n"), "{r}");
         let c = format_request(&json!({"description": "x", "confirmed": true})).unwrap();
         assert!(c.contains("confirmed: yes\n") && c.contains("- repo: (you choose"));
     }

@@ -108,6 +108,8 @@ pub fn tools() -> Value {
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
                             "description": "Hints you changed from what the user sent"},
+                "user_picked": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
+                                "description": "Hints the request marked 'picked by the user' (they stay the user's)"},
                 "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),
             }), &["description", "changed", "note"]),
         tool("create_session",

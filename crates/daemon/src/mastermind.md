@@ -63,7 +63,8 @@ something else, and don't launch what the hints say either:
 
 - `confirmed: no` and the description contradicts a hint: call
   `confirm_new_session` with their description verbatim, every hint as you
-  would launch it, `changed` naming the ones you changed, and a one-line
+  would launch it, `changed` naming the ones you changed, `user_picked`
+  naming the hints the request marked `picked by the user`, and a one-line
   `note` ("Updated to match your description: repo is myapp"). Then
   stop and reply in one line that you're waiting for them to confirm.
   Defaults the description doesn't contradict stay as they are.
