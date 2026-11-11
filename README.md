@@ -75,26 +75,60 @@ one; hooks spool events until a daemon is up. To have launchd own the daemon
 instead (started at login), run `scripts/install-launchd.sh` (`uninstall`
 removes it); rlord then starts and restarts it through launchd.
 
-## Installing a release (macOS, Apple Silicon)
+## Installing on a Mac (no compiling)
 
-Releases are built locally and uploaded to GitHub — no CI. To cut one: bump
-`[workspace.package] version` in `Cargo.toml`, commit, push, then run
-`scripts/release.sh` (tags `v<version>` and uploads
-`rlord-v<version>-aarch64-apple-darwin.tar.gz`).
+Releases are prebuilt for Apple Silicon and attached to GitHub releases. The
+repo is private, so downloads go through the GitHub CLI.
 
-To install or upgrade on another Mac (the repo is private, so `gh` must be
-logged in to an account with access — `gh auth login`):
+**First install**
+
+1. Install the tools rlord drives, and log in to GitHub with an account that
+   can see this repo:
+
+   ```bash
+   brew install tmux gh
+   gh auth login
+   ```
+
+   Claude Code must be installed too (`claude` on your PATH).
+2. Install rlord from a checkout of this repo. The script downloads the
+   latest release and installs it to `~/.local/bin/rlord`:
+
+   ```bash
+   git clone https://github.com/ayersb/robot-overlord && cd robot-overlord
+   scripts/update.sh
+   ```
+
+   If it says `~/.local/bin` is not on your PATH, add
+   `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new
+   terminal.
+3. Let rlord see what Claude sessions are doing (adds hooks to
+   `~/.claude/settings.json`, keeping what's there):
+
+   ```bash
+   rlord claude install-hooks
+   ```
+4. Run `rlord`. The list opens, and the daemon starts by itself.
+5. Optional:
+   - Bring over sessions from before: ask the overlord (Option-O) to "import
+     my sessions from the last month". See [Bringing in existing
+     sessions](#bringing-in-existing-sessions).
+   - `rlord tmux import` to use your own tmux config in agent sessions.
+
+**Updating**
 
 ```bash
-d=$(mktemp -d) && gh release download -R ayersb/robot-overlord \
-  -p '*-aarch64-apple-darwin.tar.gz' -D "$d" \
-  && tar -xzf "$d"/*.tar.gz -C "$d" && "$d"/rlord-*/install.sh
+rlord update        # latest release; `rlord update v0.4.0` pins one
+rlord reset         # reload an open rlord on the new version
 ```
 
-That fetches the latest release (put a tag such as `v0.1.0` after `download`
-to pin one) and installs to `~/.local/bin/rlord`. On a first install, run
-`rlord claude install-hooks` once; upgrades need nothing else — the next
-`rlord` command restarts the daemon on the new binary.
+`rlord update` does what `scripts/update.sh` does, so you don't need the
+checkout once rlord is installed. It does nothing if you're already on the
+latest release. Running agent sessions keep running through an update.
+
+**Releasing** (from the dev machine): bump `[workspace.package] version` in
+`Cargo.toml` in the PR. After it merges, run `scripts/release.sh` on `main`.
+It builds, signs, tags `v<version>` and uploads the release. See CLAUDE.md.
 
 ## The overlord
 

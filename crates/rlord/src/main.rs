@@ -211,6 +211,15 @@ enum Command {
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
+    /// Install the latest release from GitHub (needs `gh` logged in; no
+    /// compiling). Same as scripts/update.sh.
+    Update {
+        /// Release tag to install, e.g. v0.4.0 (default: latest)
+        tag: Option<String>,
+        /// Reinstall even if already on that version; replace a dev symlink
+        #[arg(long)]
+        force: bool,
+    },
     /// Unstick rlord: restart the daemon, close overlays, resync session
     /// state, reload rlord's tmux config and key bindings, restart the list.
     /// Agent sessions keep running.
@@ -408,6 +417,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Mcp => mcp_stdio(),
+        Command::Update { tag, force } => update(tag, force),
         Command::Reset { hard, yes } => reset(hard, yes),
         Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Overlord(OverlordCmd::Open) => {
@@ -1032,6 +1042,23 @@ fn clip_line(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
     }
+}
+
+/// scripts/update.sh, compiled in so updating needs no checkout.
+const UPDATE_SH: &str = include_str!("../../../scripts/update.sh");
+
+fn update(tag: Option<String>, force: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(UPDATE_SH).arg("rlord-update");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.args(tag);
+    let st = cmd.status().context("running bash")?;
+    if !st.success() {
+        anyhow::bail!("update failed");
+    }
+    Ok(())
 }
 
 fn call(method: &str, params: Value) -> Result<Value> {
