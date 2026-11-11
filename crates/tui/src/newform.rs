@@ -296,9 +296,9 @@ impl NewForm {
             .unwrap_or(0);
     }
 
-    /// The description changed after the overlord reopened the form with
-    /// corrected hints: its confirmation no longer holds, so it goes back to
-    /// be checked against the hints again.
+    /// The description or a hint changed after the overlord reopened the
+    /// form with corrected hints: its confirmation no longer holds, so it goes
+    /// back to be checked against the hints again.
     fn description_changed(&mut self) {
         if self.confirmed {
             self.confirmed = false;
@@ -473,6 +473,7 @@ impl App {
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
                         f.repo_chosen = true;
+                        f.description_changed();
                         f.location = Location::Repo(path.clone());
                         f.error = None;
                     } else {
@@ -510,6 +511,7 @@ impl App {
                 KeyCode::Enter => match kind {
                     PickerKind::Model => {
                         f.model_chosen = true;
+                        f.description_changed();
                         f.model = if items[i] == "(agent default)" {
                             String::new()
                         } else {
@@ -518,6 +520,7 @@ impl App {
                     }
                     PickerKind::Repo => {
                         f.repo_chosen = true;
+                        f.description_changed();
                         if items[i] == OTHER_REPO {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
@@ -546,13 +549,15 @@ impl App {
         if shift_enter || (ctrl && code == KeyCode::Char('s')) {
             return self.submit_form(f);
         }
-        // ctrl-e: edit the description (or the manual form's prompt) in
-        // $EDITOR, e.g. your vim; it comes back into the box.
+        // ctrl-e (the overlord form): edit the description in $EDITOR, e.g.
+        // your vim; it comes back into the box.
         if ctrl && code == KeyCode::Char('e') && f.kind == FormKind::Overlord {
             match edit_in_editor(terminal, "new-session.md", &f.prompt)? {
                 Ok(text) => {
                     let text = text.trim_end().to_string();
-                    if text != f.prompt {
+                    // (Trailing whitespace isn't a change: quitting the
+                    // editor without edits keeps a confirmation.)
+                    if text != f.prompt.trim_end() {
                         f.prompt = text;
                         f.description_changed();
                     }
@@ -588,6 +593,7 @@ impl App {
                 Field::Workspace => {
                     f.workspace = !f.workspace;
                     f.workspace_chosen = true;
+                    f.description_changed();
                 }
                 Field::Launch => return self.submit_form(f),
                 _ => next(&mut f),
@@ -595,6 +601,7 @@ impl App {
             KeyCode::Char(' ') if field == Field::Workspace => {
                 f.workspace = !f.workspace;
                 f.workspace_chosen = true;
+                f.description_changed();
             }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
             KeyCode::Backspace if field.is_text() => match field {
@@ -614,6 +621,7 @@ impl App {
                 }
                 Field::Tags => {
                     f.tags.pop();
+                    f.description_changed();
                 }
                 _ => {}
             },
@@ -633,7 +641,10 @@ impl App {
                         f.prompt.push(c);
                         f.description_changed();
                     }
-                    Field::Tags => f.tags.push(c),
+                    Field::Tags => {
+                        f.tags.push(c);
+                        f.description_changed();
+                    }
                     _ => {}
                 }
             }
@@ -1056,10 +1067,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         form.prompt,
         if focus(Field::Prompt) { "▏" } else { "" }
     );
-    let wrapped: usize = text
-        .split('\n')
-        .map(|l| (l.chars().count().max(1)).div_ceil(width))
-        .sum();
+    let wrapped: usize = text.split('\n').map(|l| wrapped_rows(l, width)).sum();
     let box_h = (wrapped as u16 + 2).clamp(5, 12);
 
     let [head_area, label_area, box_area, rest] = RLayout::vertical([
@@ -1250,6 +1258,30 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     f.render_widget(Paragraph::new(lines), rest);
 }
 
+/// Rows a line takes when wrapped at word boundaries to `width` columns (as
+/// the description box wraps), counting wide characters as two.
+fn wrapped_rows(line: &str, width: usize) -> usize {
+    let w = |t: &str| Span::raw(t.to_string()).width();
+    let (mut rows, mut col) = (1usize, 0usize);
+    for word in line.split(' ') {
+        let ww = w(word);
+        let need = if col == 0 { ww } else { ww + 1 };
+        if col > 0 && col + need > width {
+            rows += 1;
+            col = 0;
+        }
+        // A word longer than the line breaks across rows.
+        let ww_rows = ww.max(1).div_ceil(width.max(1));
+        if ww > width {
+            rows += ww_rows - 1;
+            col = ww - (ww_rows - 1) * width;
+        } else {
+            col += if col == 0 { ww } else { ww + 1 };
+        }
+    }
+    rows
+}
+
 const OTHER_REPO: &str = "  find another repo…";
 const NO_REPO: &str = "  no repo — plain folder…";
 const AUTO_REPO: &str = "  let the overlord pick (from the description)";
@@ -1340,5 +1372,15 @@ mod tests {
         assert!(repo_line.contains("updated"), "{repo_line}");
         assert!(out.contains("Launch"));
         assert!(f.confirmed && f.current() == Field::Launch);
+    }
+
+    #[test]
+    fn wrapped_rows_counts_word_wrapping() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("aaaa bbbb", 10), 1);
+        // "aaaa bbbb cc" is 12 wide: "cc" moves to the next row.
+        assert_eq!(wrapped_rows("aaaa bbbb cc", 10), 2);
+        // A word too long for a row breaks across rows.
+        assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
     }
 }
