@@ -769,14 +769,11 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 80, 24), " New session "),
-            FormKind::Manual => (
-                centered(f.area(), 74, 16),
-                " new session, manual  (tab/↑↓ move · enter: pick/launch · esc) ",
-            ),
+            FormKind::Overlord => (centered(f.area(), 82, 24), "New session"),
+            FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
         };
         f.render_widget(Clear, area);
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = theme::modal(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -800,36 +797,30 @@ impl App {
                 Paragraph::new(vec![
                     Line::from(Span::styled(
                         format!("find repo: {}▏", finder.query),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme::YELLOW),
                     )),
-                    Line::from(Span::styled(hint, Style::default().fg(Color::Gray))),
+                    Line::from(Span::styled(hint, Style::default().fg(theme::MUTED))),
                 ]),
                 q_area,
             );
             let list = List::new(rows.iter().map(|(_, label)| ListItem::new(label.as_str())))
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("▶ ");
+                .highlight_style(theme::selected())
+                .highlight_symbol(theme::SELECT_BAR);
             let mut st = finder.state.clone();
             f.render_stateful_widget(list, list_area, &mut st);
             return;
         }
         if let Some((kind, items, state)) = &form.picker {
             let title = match kind {
-                PickerKind::Repo => " select repo  (j/k · enter · esc) ",
-                PickerKind::Model => " select model  (j/k · enter · esc) ",
+                PickerKind::Repo => " Repo ",
+                PickerKind::Model => " Model ",
             };
             let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("▶ ");
+                .block(theme::panel(title, true).title_bottom(
+                    Line::from(" j/k move · enter pick · esc back ").style(theme::faint()),
+                ))
+                .highlight_style(theme::selected())
+                .highlight_symbol(theme::SELECT_BAR);
             let mut st = state.clone();
             f.render_stateful_widget(list, inner, &mut st);
             return;
@@ -880,7 +871,7 @@ impl App {
             };
             let style = if focused {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::YELLOW)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -903,7 +894,7 @@ impl App {
                         } else {
                             format!("  {label}  ")
                         },
-                        style.fg(Color::Green),
+                        style.fg(theme::GREEN),
                     ),
                 ])
             } else if *field == Field::Prompt && form.kind == FormKind::Overlord {
@@ -938,7 +929,7 @@ impl App {
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {e}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::RED),
             )));
         }
         if let Some((kind, buf)) = &form.text_prompt {
@@ -947,7 +938,7 @@ impl App {
             };
             lines.push(Line::from(Span::styled(
                 format!("{label}: {buf}▏   (enter · esc)"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::YELLOW),
             )));
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -957,9 +948,9 @@ impl App {
 /// The overlord form: a description box up top (the part that matters),
 /// then the optional hints, visibly secondary, then send.
 fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let gray = Style::default().fg(Color::Gray);
-    let accent = Style::default().fg(Color::Cyan);
+    let dim = theme::faint();
+    let gray = theme::muted();
+    let accent = Style::default().fg(theme::ACCENT);
     let focus = |fld: Field| form.current() == fld;
     // Text width inside the box: margins, borders and padding.
     let width = inner.width.saturating_sub(8).max(10) as usize;
@@ -1015,7 +1006,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     .areas(inner);
     f.render_widget(Paragraph::new(head), head_area);
     let label_style = if focus(Field::Prompt) {
-        Style::default().fg(Color::Yellow).bold()
+        Style::default().fg(theme::YELLOW).bold()
     } else {
         Style::default().bold()
     };
@@ -1032,7 +1023,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         ..box_area
     };
     let border = if focus(Field::Prompt) {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::YELLOW)
     } else {
         dim
     };
@@ -1074,7 +1065,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         let focused = focus(fld);
         let changed = form.changed.iter().any(|c| c == key);
         let label_style = if focused {
-            Style::default().fg(Color::Yellow).bold()
+            Style::default().fg(theme::YELLOW).bold()
         } else {
             gray
         };
@@ -1147,9 +1138,9 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         Span::styled(
             send,
             if send_focused {
-                Style::default().fg(Color::Black).bg(Color::Green).bold()
+                Style::default().fg(Color::Black).bg(theme::GREEN).bold()
             } else {
-                Style::default().fg(Color::Green).bold()
+                Style::default().fg(theme::GREEN).bold()
             },
         ),
     ]));
@@ -1170,7 +1161,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     if let Some(e) = &form.error {
         lines.push(Line::from(Span::styled(
             format!("  error: {e}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::RED),
         )));
     }
     if let Some((kind, buf)) = &form.text_prompt {
@@ -1179,7 +1170,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         };
         lines.push(Line::from(Span::styled(
             format!("  {label}: {buf}▏   (enter · esc)"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::YELLOW),
         )));
     }
     f.render_widget(Paragraph::new(lines), rest);

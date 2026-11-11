@@ -143,7 +143,9 @@ impl App {
                 self.group_focus = true;
                 return true;
             }
-            KeyCode::Right if self.group_focus => {
+            // `l` mirrors `h`: into the highlighted group (on the group list
+            // it means that, not the log toggle it is elsewhere).
+            KeyCode::Right | KeyCode::Char('l') if self.group_focus => {
                 self.group_focus = self.sessions.is_empty();
                 return true;
             }
@@ -178,75 +180,85 @@ impl App {
         true
     }
 
-    /// Tab bar + filter bar (two lines over the whole screen).
+    /// Header: brand and tabs, then the view (search, sort, live/archived).
     pub(crate) fn draw_bars(&self, f: &mut Frame, area: Rect) {
-        let tab = |t: Tab, count: String| {
-            let label = format!(" {} {count} ", t.label());
-            if self.tab == t {
-                Span::styled(
-                    label,
-                    Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-                )
-            } else {
-                Span::styled(label, Style::default().fg(Color::Gray))
-            }
+        let tab = |t: Tab, count: usize| -> [Span<'static>; 2] {
+            let active = self.tab == t;
+            let label = Span::styled(
+                format!(" {} ", t.label()),
+                if active {
+                    Style::default().fg(theme::TEXT).bg(theme::CHIP).bold()
+                } else {
+                    theme::muted()
+                },
+            );
+            let n = Span::styled(
+                format!("{count} "),
+                if active {
+                    Style::default().fg(theme::ACCENT).bg(theme::CHIP)
+                } else {
+                    theme::faint()
+                },
+            );
+            [label, n]
         };
-        let n_sessions = self.all.len();
-        let tabs = Line::from(vec![
-            tab(Tab::Sessions, n_sessions.to_string()),
-            Span::raw(" "),
-            tab(Tab::Groups, self.groups_count().to_string()),
+        // Small, quiet keycaps: the key that changes each setting.
+        let key = |a: Action| {
             Span::styled(
-                format!("   {} switch", self.keys.label(Action::SwitchTab)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        let dim = Style::default().fg(Color::DarkGray);
-        let filter = if self.filter.trim().is_empty() {
-            Span::styled("none", dim)
-        } else {
-            Span::styled(
-                self.filter.clone(),
-                Style::default().fg(Color::Yellow).bold(),
+                format!(" {} ", self.keys.label(a)),
+                Style::default().fg(theme::MUTED).bg(theme::CHIP),
             )
         };
-        let mut bar = vec![
-            Span::raw(" filter: "),
-            filter,
-            Span::raw("   sort: "),
+        let mut top = vec![
             Span::styled(
-                format!(
-                    "{}{}",
-                    self.sort.label(),
-                    if self.reverse { " ↑" } else { "" }
-                ),
-                Style::default().bold(),
+                " ◆ rlord ",
+                Style::default().fg(Color::Black).bg(theme::ACCENT).bold(),
             ),
-            Span::raw("   showing: "),
-            Span::styled(
-                if self.show_archived {
-                    "archived"
-                } else {
-                    "live"
-                },
-                if self.show_archived {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default().bold()
-                },
-            ),
+            Span::raw("  "),
         ];
-        let mut hint = format!("   {} search", self.keys.label(Action::Filter));
-        if !self.filter.is_empty() {
-            hint.push_str(&format!(" · {} clear", self.keys.label(Action::Cancel)));
+        top.extend(tab(Tab::Sessions, self.all.len()));
+        top.push(Span::raw(" "));
+        top.extend(tab(Tab::Groups, self.groups_count()));
+        top.push(Span::raw("  "));
+        top.push(key(Action::SwitchTab));
+
+        let mut view = vec![Span::raw(" "), Span::styled("⌕ ", theme::muted())];
+        if self.filter.trim().is_empty() {
+            view.push(Span::styled("search", theme::faint()));
+        } else {
+            view.push(Span::styled(
+                self.filter.clone(),
+                Style::default().fg(theme::YELLOW).bold(),
+            ));
+            view.push(Span::raw(" "));
+            view.push(key(Action::Cancel));
+            view.push(Span::styled(" clear", theme::faint()));
         }
-        hint.push_str(&format!(
-            " · {} sort · {} archived",
-            self.keys.label(Action::Sort),
-            self.keys.label(Action::ToggleArchived)
+        view.push(Span::raw(" "));
+        view.push(key(Action::Filter));
+        view.push(Span::styled("    ⇅ ", theme::muted()));
+        view.push(Span::styled(
+            format!(
+                "{}{}",
+                self.sort.label(),
+                if self.reverse { " ↑" } else { "" }
+            ),
+            Style::default().fg(theme::TEXT),
         ));
-        bar.push(Span::styled(hint, dim));
-        f.render_widget(Paragraph::new(vec![tabs, Line::from(bar)]), area);
+        view.push(Span::raw(" "));
+        view.push(key(Action::Sort));
+        view.push(Span::styled("    ◷ ", theme::muted()));
+        view.push(if self.show_archived {
+            Span::styled("archived", Style::default().fg(theme::YELLOW).bold())
+        } else {
+            Span::styled("live", Style::default().fg(theme::TEXT))
+        });
+        view.push(Span::raw(" "));
+        view.push(key(Action::ToggleArchived));
+        f.render_widget(
+            Paragraph::new(vec![Line::from(top), Line::from(view)]),
+            area,
+        );
     }
 
     fn groups_count(&self) -> usize {
@@ -261,35 +273,35 @@ impl App {
         let col_w = self
             .groups
             .iter()
-            .map(|(t, _)| group_label(t).chars().count() + 6)
+            // label + space + 2-digit count + borders, padding and the
+            // selection bar (2 + 2 + 2).
+            .map(|(t, _)| group_label(t).chars().count() + 9)
             .max()
             .unwrap_or(12)
-            .clamp(16, 28) as u16;
+            .clamp(18, 30) as u16;
         let [left, right] =
             RLayout::horizontal([Constraint::Length(col_w), Constraint::Min(20)]).areas(area);
-        let focus = Style::default().fg(Color::Cyan);
         let items: Vec<ListItem> = self
             .groups
             .iter()
             .map(|(t, n)| {
                 let label = group_label(t);
-                let pad = (col_w as usize).saturating_sub(label.chars().count() + 7);
+                let pad = (col_w as usize)
+                    .saturating_sub(label.chars().count() + 8)
+                    .max(1);
                 let style = if t == UNTAGGED {
-                    Style::default().fg(Color::DarkGray).italic()
+                    theme::faint().italic()
                 } else {
-                    Style::default()
+                    Style::default().fg(theme::tag_color(t))
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(label, style),
                     Span::raw(" ".repeat(pad)),
-                    Span::styled(format!("{n:>2}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{n:>2}"), theme::faint()),
                 ]))
             })
             .collect();
-        let mut block = Block::default().borders(Borders::ALL).title(" groups ");
-        if self.group_focus {
-            block = block.border_style(focus);
-        }
+        let block = theme::panel(theme::title("Groups"), self.group_focus);
         if items.is_empty() {
             let msg = vec![
                 Line::from(""),
@@ -303,16 +315,17 @@ impl App {
         } else {
             let list = List::new(items)
                 .block(block)
-                .highlight_style(
-                    Style::default()
-                        .bg(if self.group_focus {
-                            Color::DarkGray
-                        } else {
-                            Color::Reset
-                        })
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol(if self.group_focus { "▶" } else { "›" });
+                .highlight_style(if self.group_focus {
+                    theme::selected()
+                } else {
+                    Style::default().bold()
+                })
+                .highlight_symbol(if self.group_focus {
+                    theme::SELECT_BAR
+                } else {
+                    "› "
+                })
+                .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
             f.render_stateful_widget(list, left, &mut self.group_state);
         }
         self.draw_list(f, right);
@@ -322,26 +335,17 @@ impl App {
     pub(crate) fn list_title(&self) -> String {
         match self.tab {
             Tab::Sessions => format!(
-                " {} · {} ",
+                " {}  {} ",
                 if self.show_archived {
-                    "archived sessions"
+                    "Archived"
                 } else {
-                    "all sessions"
+                    "Sessions"
                 },
                 self.all.len()
             ),
             Tab::Groups => match &self.group_sel {
-                Some(g) => format!(
-                    " {} · {}{} ",
-                    group_label(g),
-                    self.sessions.len(),
-                    if self.group_focus {
-                        "  (→ to open)"
-                    } else {
-                        ""
-                    }
-                ),
-                None => " no sessions ".into(),
+                Some(g) => format!(" {}  {} ", group_label(g), self.sessions.len()),
+                None => " No sessions ".into(),
             },
         }
     }
@@ -388,6 +392,15 @@ mod back_tests {
             let action = app.keys.action(&k);
             assert!(app.handle_groups_key(&k, action), "{code:?}");
             assert!(app.group_focus, "{code:?} should return to the group list");
+        }
+        // `l` (and →) go into the highlighted group when it has sessions.
+        app.sessions = vec![json!({"name": "a"})];
+        for code in [KeyCode::Char('l'), KeyCode::Right] {
+            app.group_focus = true;
+            let k = KeyEvent::new(code, KeyModifiers::NONE);
+            let action = app.keys.action(&k);
+            assert!(app.handle_groups_key(&k, action), "{code:?}");
+            assert!(!app.group_focus, "{code:?} should enter the group");
         }
     }
 }
