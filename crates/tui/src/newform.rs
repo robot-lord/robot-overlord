@@ -659,15 +659,21 @@ impl App {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
                 Field::Workspace => {
-                    f.workspace = !f.workspace;
-                    f.mark_picked("worktree", true);
+                    // A plain folder has no worktree to toggle.
+                    if !matches!(f.location, Location::Folder(_)) {
+                        f.workspace = !f.workspace;
+                        f.mark_picked("worktree", true);
+                    }
                 }
                 Field::Launch => return self.submit_form(f),
                 _ => next(&mut f),
             },
             KeyCode::Char(' ') if field == Field::Workspace => {
-                f.workspace = !f.workspace;
-                f.mark_picked("worktree", true);
+                // A plain folder has no worktree to toggle.
+                if !matches!(f.location, Location::Folder(_)) {
+                    f.workspace = !f.workspace;
+                    f.mark_picked("worktree", true);
+                }
             }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
             KeyCode::Backspace if field.is_text() => match field {

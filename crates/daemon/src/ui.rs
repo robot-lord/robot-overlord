@@ -395,39 +395,13 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
 }
 
 /// Which hints on a reopened form are the user's own picks and which the
-/// overlord's, worked out by rlord from the request it last delivered (its
+/// overlord's, worked out by rlord from the request the form answers (its
 /// hint values and labels), never relayed by the model. A hint the overlord
-/// left out that the user (or an earlier round) had set keeps that value. The
-/// TUI shows the result as is: `chosen` (the user's), `resolved` (the
+/// leaves out is a default again. The TUI shows the result as is: `chosen` (the user's), `resolved` (the
 /// overlord's), anything else is a default.
 fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
     use crate::ask::in_list;
     const FOLDER: &str = " (plain folder, not a repo)";
-    let kept = |k: &str| in_list(prev, "chosen", k) || in_list(prev, "resolved", k);
-    // Fill in what the overlord omitted but someone had settled.
-    let has_location = prefill.contains_key("repo") || prefill.contains_key("project");
-    if !has_location && kept("repo") {
-        if let Some(r) = prev["repo"].as_str() {
-            match r.strip_suffix(FOLDER) {
-                Some(f) => {
-                    prefill.insert("project".into(), json!(f));
-                }
-                None if rlord_core::git::main_repo_root(r).is_some() => {
-                    prefill.insert("repo".into(), json!(r));
-                }
-                None => {}
-            }
-        }
-    }
-    for (k, field) in [
-        ("model", "model"),
-        ("worktree", "workspace"),
-        ("tags", "tags"),
-    ] {
-        if !prefill.contains_key(field) && kept(k) && !prev[field].is_null() {
-            prefill.insert(field.into(), prev[field].clone());
-        }
-    }
     let folder = prefill.contains_key("project") && !prefill.contains_key("repo");
     let value = |k: &str| -> Option<Value> {
         match k {
@@ -503,7 +477,12 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             prefill.insert(k.into(), params[k].clone());
         }
     }
-    let provenance = crate::ask::current_provenance(d)?;
+    // The request this form answers (none for one the mastermind starts
+    // itself): its hints' labels come from it.
+    let provenance = match params["request"].as_str().filter(|r| !r.trim().is_empty()) {
+        Some(r) => crate::ask::provenance_of(d, r)?,
+        None => Value::Null,
+    };
     apply_provenance(&mut prefill, &provenance);
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
@@ -525,20 +504,22 @@ mod provenance_tests {
     }
 
     #[test]
-    fn labels_come_from_the_last_request() {
+    fn labels_come_from_the_request_answered() {
         let prev = json!({"chosen": ["model"], "resolved": ["repo"],
                           "repo": "/r/web", "model": "opus", "workspace": true, "tags": []});
-        // Round two: it changes only the worktree and omits the rest.
+        // Round two: it changes only the worktree and omits the rest: those
+        // are defaults again (it was told to send every hint).
         let p = run(
             json!({"workspace": false, "changed": ["worktree"]}),
             prev.clone(),
         );
-        assert_eq!(
-            p["model"], "opus",
-            "the user's pick is kept, though omitted"
-        );
-        assert_eq!(p["chosen"], json!(["model"]));
+        assert!(p["model"].is_null());
+        assert_eq!(p["chosen"], json!([]));
         assert_eq!(p["resolved"], json!(["worktree"]));
+        // A user's pick it sends back with another value, unlisted, is its.
+        let p = run(json!({"model": "sonnet", "changed": []}), prev.clone());
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["model"]));
         // A value it fills in for a default, without saying so, is its pick.
         let p = run(
             json!({"model": "opus", "tags": ["web"], "changed": []}),
