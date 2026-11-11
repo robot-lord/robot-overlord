@@ -1020,21 +1020,7 @@ impl App {
                             Style::default().fg(theme::OVERLORD),
                         ),
                     ])),
-                    // Last update: any message either way or status change.
-                    Cell::from(Span::styled(
-                        rel_age(
-                            [
-                                "last_agent_msg_at",
-                                "last_user_msg_at",
-                                "last_state_change_at",
-                                "created_at",
-                            ]
-                            .iter()
-                            .filter_map(|k| s[*k].as_i64())
-                            .max(),
-                        ),
-                        theme::muted(),
-                    )),
+                    Cell::from(Span::styled(rel_age(updated_at(s)), theme::muted())),
                 ];
                 if show_tags {
                     let tags = s["tags"]
@@ -1143,6 +1129,13 @@ impl App {
                 Span::styled(get("name"), Style::default().fg(theme::TEXT).bold()),
                 Span::raw("   "),
                 theme::status_chip(&status),
+                Span::styled(
+                    match updated_at(s) {
+                        Some(t) => format!("  ·  updated {} ago", rel_age(Some(t))),
+                        None => String::new(),
+                    },
+                    theme::muted(),
+                ),
             ]),
             if desc.is_empty() {
                 Line::from(Span::styled(
@@ -1412,6 +1405,20 @@ fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
             .flat_map(|(k, label)| keycap(&k, label, Cap::Context)),
     );
     Line::from(spans)
+}
+
+/// When a session last changed: its latest message either way or status
+/// change (creation, failing all of those). The list's "Updated" column.
+fn updated_at(s: &Value) -> Option<i64> {
+    [
+        "last_agent_msg_at",
+        "last_user_msg_at",
+        "last_state_change_at",
+        "created_at",
+    ]
+    .iter()
+    .filter_map(|k| s[*k].as_i64())
+    .max()
 }
 
 /// A dialog's row of key hints, indented to match its text.
