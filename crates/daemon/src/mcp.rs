@@ -111,7 +111,7 @@ pub fn tools() -> Value {
                 "user_picked": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
                                 "description": "Hints the request marked 'picked by the user' (they stay the user's)"},
                 "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),
-            }), &["description", "changed", "note", "user_picked"]),
+            }), &["description", "changed", "note"]),
         tool("create_session",
             "Create and launch a new agent session immediately.",
             create_props, &[]),

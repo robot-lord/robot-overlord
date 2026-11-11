@@ -190,6 +190,8 @@ pub(crate) struct NewForm {
     /// Reopened by the overlord: the hints it set that the user hadn't picked
     /// (its resolved values: shown as such, sent as "your earlier pick").
     resolved: Vec<&'static str>,
+    /// Opened by the overlord (confirm_new_session), not by the user.
+    reopened: bool,
     /// Reopened by the overlord with corrected hints: submitting confirms
     /// them. `changed` names the hints it updated; `note` says why.
     confirmed: bool,
@@ -294,10 +296,13 @@ impl NewForm {
         self.repo_chosen = picked("repo");
         self.model_chosen = picked("model");
         self.workspace_chosen = picked("worktree");
+        // The overlord's picks are the hints it changed; a value it merely
+        // sent back unchanged is still a default.
         self.resolved = ["repo", "model", "worktree"]
             .into_iter()
-            .filter(|k| given(k) && !picked(k))
+            .filter(|k| given(k) && has("changed", k) && !picked(k))
             .collect();
+        self.reopened = true;
         self.confirmed = true;
         self.changed = p["changed"]
             .as_array()
@@ -321,8 +326,7 @@ impl NewForm {
     /// overlord reopened only a real change is, and it drops the overlord's
     /// label and confirmation.
     fn mark_picked(&mut self, key: &'static str, changed: bool) {
-        let reopened = self.confirmed || !self.resolved.is_empty();
-        if changed || !reopened {
+        if changed || !self.reopened {
             match key {
                 "repo" => self.repo_chosen = true,
                 "model" => self.model_chosen = true,
@@ -427,6 +431,7 @@ impl App {
             model_chosen: false,
             workspace_chosen: false,
             resolved: Vec::new(),
+            reopened: false,
             confirmed: false,
             changed: Vec::new(),
             note: None,
@@ -459,9 +464,10 @@ impl App {
                                     !matches!(&f.location, Location::Folder(p) if *p == path),
                                 );
                                 f.location = Location::Folder(path);
-                                // A plain folder has no worktree: not the
-                                // overlord's pick any more.
+                                // A plain folder has no worktree: neither the
+                                // overlord's pick nor the user's any more.
                                 f.resolved.retain(|k| *k != "worktree");
+                                f.workspace_chosen = false;
                                 f.workspace = false;
                                 f.error = None;
                             } else {
@@ -941,7 +947,14 @@ impl App {
         }
 
         if form.kind == FormKind::Overlord {
-            let overlord_key = self.keys.label(Action::Overlord);
+            // The overlord's key from anywhere (tmux); the list's own key if
+            // that one is turned off.
+            let k = &self.config.tmux.overlord;
+            let overlord_key = if k.trim().is_empty() {
+                self.keys.label(Action::Overlord)
+            } else {
+                tmux::key_label(k)
+            };
             draw_describe_form(f, inner, form, &overlord_key);
             return;
         }
@@ -1438,7 +1451,7 @@ mod tests {
             "user_picked": ["model", "repo"], "changed": ["repo"], "note": "n",
         }));
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
-        assert_eq!(f.resolved, ["repo"]);
+        assert_eq!(f.resolved, ["repo"], "only the hint it changed");
     }
 
     #[test]

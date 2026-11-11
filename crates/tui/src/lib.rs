@@ -1561,13 +1561,26 @@ fn edit_in_editor(
     // File errors are the user's to see (the caller keeps its text), not a
     // reason to quit the TUI.
     // Created fresh (never through an existing file or symlink).
+    // A stale file left by a crashed TUI with the same pid: take the next name.
+    let mut path = path;
     let opened = std::fs::create_dir_all(&dir).and_then(|_| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut tries = 0;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => {
+                    tries += 1;
+                    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    path = dir.join(format!("{}-{n}-{file}", std::process::id()));
+                }
+                r => break r,
+            }
+        }
     });
     let written = match opened {
         Ok(mut f) => {
