@@ -66,6 +66,16 @@ pub fn muted() -> Style {
     Style::default().fg(muted_c())
 }
 
+/// The logo's colours, the same in every theme: (crown: dark gold, robot:
+/// dark red, eyes: light gold).
+pub fn logo() -> (Color, Color, Color) {
+    (
+        Color::Rgb(201, 150, 24),
+        Color::Rgb(150, 28, 36),
+        Color::Rgb(255, 214, 102),
+    )
+}
+
 pub fn faint() -> Style {
     Style::default().fg(faint_c())
 }

@@ -44,6 +44,7 @@ pub fn tools() -> Value {
     });
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
+    create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks");
     json!([
         tool("list_sessions",
             "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). The overlord itself is not listed.",
@@ -140,6 +141,14 @@ pub fn tools() -> Value {
         tool("rename_group",
             "Rename a group (tag) on every session that has it; merges into an existing group of the new name.",
             json!({"from": s("Current tag"), "to": s("New tag (one word)")}), &["from", "to"]),
+        tool("remote_control",
+            "Remote Control: continue a Claude Code session from the Claude app or claude.ai while it keeps running here. `on` true/false turns it on or off: remembered across restarts, and a running session is restarted (conversation resumed) with or without it. If the session has work going, nothing changes and the answer is `needs_confirm` with what a restart would interrupt: ask the user, then call again with `restart`. Without `on` it reports state, url and whether this machine can use it at all (and why not).",
+            json!({
+                "session": s(&format!("{SESSION_REF}; omit for every session with it on")),
+                "on": b("Turn it on (true) or off (false); omit to just report"),
+                "restart": {"type": "string", "enum": ["now", "when_idle"],
+                            "description": "After needs_confirm, the user's pick: restart now (interrupting), or as soon as its work is done"},
+            }), &[]),
         tool("set_group_order",
             "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
             json!({"order": {"type": "array", "items": {"type": "string"}, "description": "Tags, most important first; [] clears"}}),
@@ -207,6 +216,8 @@ fn summarize(s: &Value) -> Value {
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
         "subagents_running": s["agents_running"],
+        // Remote Control: on / connecting / failed / … (absent when off).
+        "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
     })
 }
 
@@ -228,6 +239,10 @@ fn summarize_candidate(c: &Value) -> Value {
         row["maybe_open_elsewhere"] = json!(true);
     }
     row
+}
+
+fn params_wants_remote(args: &Value) -> bool {
+    args.get("remote_control").and_then(Value::as_bool) == Some(true)
 }
 
 /// Copy whitelisted session-creation fields.
@@ -361,8 +376,25 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             d.rpc("ui.confirm_new_session", Value::Object(p))
         }
         "create_session" => {
-            let s = d.rpc("session.new", new_session_params(args))?;
+            // Remote Control from launch (the flag), when this machine can
+            // have it; otherwise the session launches anyway, with a note.
+            let mut params = new_session_params(args);
+            let mut remote_note = None;
+            if args.get("remote_control").and_then(Value::as_bool) == Some(true) {
+                let a = d.rpc("remote.availability", json!({"force": true}))?;
+                if a["available"] == true {
+                    params["remote_control"] = json!(true);
+                } else {
+                    remote_note = Some(json!({"state": "unavailable", "reason": a["reason"]}));
+                }
+            }
+            let s = d.rpc("session.new", params)?;
             let mut out = summarize(&s);
+            if let Some(n) = remote_note {
+                out["remote"] = n;
+            } else if params_wants_remote(args) {
+                out["remote"] = json!("connects as it starts");
+            }
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The session exists either way; a failed switch is a note,
                 // not a failed launch.
@@ -404,6 +436,17 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
         }
         "list_groups" => d.rpc("tag.list", json!({})),
+        "remote_control" => match (
+            arg_str(args, "session"),
+            args.get("on").and_then(Value::as_bool),
+        ) {
+            (Some(r), Some(on)) => d.rpc(
+                "remote.set",
+                json!({"ref": r, "on": on, "restart": arg_str(args, "restart")}),
+            ),
+            (r, None) => d.rpc("remote.status", json!({"ref": r})),
+            (None, Some(_)) => bail!("which session? (pass `session`)"),
+        },
         "set_group_order" => d.rpc(
             "tag.order",
             json!({"order": args.get("order").cloned().unwrap_or(json!([]))}),

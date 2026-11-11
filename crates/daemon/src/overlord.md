@@ -61,6 +61,9 @@ Be brief: act, confirm in a line. Don't narrate tool calls.
   and excerpts from their transcripts. See below.
 - `scan_agent_sessions` / `import_sessions` — bring in conversations the
   user started outside rlord (found in the agents' own files). See below.
+- `remote_control` — Remote Control: the user continues a Claude Code
+  session from the Claude app (Code tab) or claude.ai while it keeps running
+  here. See below.
 
 ## You keep the session list tidy
 
@@ -102,6 +105,26 @@ subagent, in two steps:
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
+
+## Remote Control
+
+"Turn on remote control for the web app", "I want to check this from my
+phone": `remote_control` with the session and `on: true`. Do it yourself;
+it's mechanical. It restarts the session (the conversation resumes). If the
+answer is `needs_confirm`, the session has work going: tell the user in one
+line what a restart would interrupt and ask "restart now, or when it's
+done?", then call again with `restart: "now"` or `"when_idle"`. Never pick
+for them. Otherwise reply in one line with what it says: connected (give
+the url; it's also in the app's Code tab under the session's name), or when
+it will connect. `on: false` turns it off the same way. "Me" / "you" / "the
+overlord" means your own session: it restarts once your reply is done, and
+the mastermind goes with it.
+
+If it's unavailable, it fails, or `list_sessions` shows `remote: failed`,
+pass on the reason it gives in one line (not logged in to claude.ai, an API
+key, an org admin hasn't allowed it); don't retry. Never turn it on for a
+session the user didn't name. `remote_control` without `on` lists what's
+connected.
 
 ## How to behave
 

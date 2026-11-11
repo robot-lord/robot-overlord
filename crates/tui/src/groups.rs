@@ -249,25 +249,19 @@ impl App {
 
     /// Header: brand and tabs, then the view (search, sort, live/archived).
     pub(crate) fn draw_bars(&self, f: &mut Frame, area: Rect) {
-        let tab = |t: Tab, count: usize| -> [Span<'static>; 2] {
+        let tab = |t: Tab| -> Span<'static> {
             let active = self.tab == t;
-            let label = Span::styled(
+            Span::styled(
                 format!(" {} ", t.label()),
                 if active {
-                    Style::default().fg(theme::text()).bg(theme::chip()).bold()
+                    Style::default()
+                        .fg(theme::accent())
+                        .bg(theme::chip())
+                        .bold()
                 } else {
                     theme::muted()
                 },
-            );
-            let n = Span::styled(
-                format!("{count} "),
-                if active {
-                    Style::default().fg(theme::accent()).bg(theme::chip())
-                } else {
-                    theme::faint()
-                },
-            );
-            [label, n]
+            )
         };
         // Small, quiet keycaps: the key that changes each setting.
         let key = |a: Action| {
@@ -276,20 +270,34 @@ impl App {
                 Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
-        let mut top = vec![
-            Span::styled(
-                " ◆ rlord ",
-                Style::default()
-                    .fg(theme::on_accent())
-                    .bg(theme::accent())
-                    .bold(),
-            ),
-            Span::raw("  "),
+        // The logo: a stern robot (dark red, heavy outline) with a crown
+        // (dark gold) set into its head, four rows tall. No name beside it: the logo is the brand.
+        let (crown, robot, eye) = theme::logo();
+        let red = Style::default().fg(robot);
+        let eyes = Style::default().fg(eye);
+        let logo = [
+            vec![
+                Span::styled(" ┏", red),
+                Span::styled("▲▲▲", Style::default().fg(crown)),
+                Span::styled("┓", red),
+            ],
+            vec![
+                Span::styled(" ┃", red),
+                Span::styled("▾ ▾", eyes),
+                Span::styled("┃", red),
+            ],
+            vec![
+                Span::styled(" ┃ ", red),
+                Span::styled("▬", eyes),
+                Span::styled(" ┃", red),
+            ],
+            vec![Span::styled(" ┗━━━┛", red)],
         ];
-        top.extend(tab(Tab::Sessions, self.all.len()));
-        top.push(Span::raw(" "));
-        top.extend(tab(Tab::Groups, self.groups_count()));
-        top.push(Span::raw("  "));
+        // Beside the face, centred on it: the tabs (row 2) and the view
+        // (row 3).
+        let gap = Span::raw("    ");
+        let mut top = vec![tab(Tab::Sessions), Span::raw("  "), tab(Tab::Groups)];
+        top.push(Span::raw("     "));
         top.push(key(Action::SwitchTab));
         // The step keys (H / L), unless the user's own bindings took them.
         let steps: Vec<Action> = [Action::SessionsTab, Action::GroupsTab]
@@ -320,7 +328,7 @@ impl App {
         }
         view.push(Span::raw(" "));
         view.push(key(Action::Filter));
-        view.push(Span::styled("    ⇅ ", theme::muted()));
+        view.push(Span::styled("      ⇅ ", theme::muted()));
         view.push(Span::styled(
             format!(
                 "{}{}",
@@ -331,7 +339,7 @@ impl App {
         ));
         view.push(Span::raw(" "));
         view.push(key(Action::Sort));
-        view.push(Span::styled("    ◷ ", theme::muted()));
+        view.push(Span::styled("      ◷ ", theme::muted()));
         view.push(if self.show_archived {
             Span::styled("archived", Style::default().fg(theme::yellow()).bold())
         } else {
@@ -339,17 +347,21 @@ impl App {
         });
         view.push(Span::raw(" "));
         view.push(key(Action::ToggleArchived));
+        let [l0, l1, l2, l3] = logo;
+        let beside = |mut l: Vec<Span<'static>>, rest: Vec<Span<'static>>| {
+            l.push(gap.clone());
+            l.extend(rest);
+            Line::from(l)
+        };
         f.render_widget(
-            Paragraph::new(vec![Line::from(top), Line::from(view)]),
+            Paragraph::new(vec![
+                Line::from(l0),
+                beside(l1, top),
+                beside(l2, view),
+                Line::from(l3),
+            ]),
             area,
         );
-    }
-
-    fn groups_count(&self) -> usize {
-        group_list(&self.all, &[])
-            .iter()
-            .filter(|(t, _)| t != UNTAGGED)
-            .count()
     }
 
     /// The groups tab: group column + the selected group's sessions.

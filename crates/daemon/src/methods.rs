@@ -214,6 +214,23 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
     Ok(json!({"id": s.id, "group": group}))
 }
 
+/// A session's agent flags from its launch spec: the adapter flags it was
+/// created with, plus `--remote-control <name>` while Remote Control is on
+/// (so every start, resume and fresh start reconnects it). Turned off, it
+/// stays off with a settings override: `--resume` would otherwise reconnect
+/// a conversation that was last connected.
+pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
+    let mut a = str_list(spec, "extra_args");
+    if let Some(n) = spec["remote_control"].as_str().filter(|n| !n.is_empty()) {
+        a.push("--remote-control".into());
+        a.push(n.to_string());
+    } else if spec["remote_control_off"] == true {
+        a.push("--settings".into());
+        a.push(r#"{"disableRemoteControl":true}"#.into());
+    }
+    a
+}
+
 /// A string-array param (missing / wrong type = empty).
 pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
     params
@@ -336,20 +353,28 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // fixed tmux name.
     let extra_args = str_list(params, "extra_args");
     let role = p_opt("role").unwrap_or_default();
+    // Remote Control from the start (the caller checked it's available).
+    let remote = params["remote_control"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| crate::remote::remote_name(&name, &role));
+    let mut spec = json!({"agent": agent, "model": model, "prompt": prompt,
+                          "extra_args": extra_args});
+    if let Some(n) = &remote {
+        spec["remote_control"] = json!(n);
+    }
     let claude_sid = claude::mint_session_id();
     let argv = claude::launch_argv(
         &claude_sid,
         prompt.as_deref(),
         model.as_deref(),
-        &extra_args,
+        &spec_args(&spec),
     );
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => mint_tmux_name(db),
     };
-    let launch_spec = json!({"agent": agent, "model": model, "prompt": prompt,
-                             "extra_args": extra_args})
-    .to_string();
+    let launch_spec = spec.to_string();
     let now = now_ms();
 
     db.insert_session(&NewSession {
@@ -554,13 +579,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let extra_args = str_list(&spec, "extra_args");
     let argv = claude::resume_argv(
         sid,
         &s.agent_session_trust,
         &s.project_path,
         model.as_deref(),
-        &extra_args,
+        &spec_args(&spec),
     )?;
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
@@ -599,9 +623,8 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     }
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
-    let extra_args = str_list(&spec, "extra_args");
     let sid = claude::mint_session_id();
-    let argv = claude::launch_argv(&sid, None, model, &extra_args);
+    let argv = claude::launch_argv(&sid, None, model, &spec_args(&spec));
     let tmux_name = s
         .tmux_session
         .clone()
@@ -842,6 +865,19 @@ pub fn hook_command() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn remote_control_flags_follow_the_spec() {
+        let on = json!({"extra_args": ["--x"], "remote_control": "web"});
+        assert_eq!(spec_args(&on), ["--x", "--remote-control", "web"]);
+        let off = json!({"remote_control_off": true});
+        assert_eq!(
+            spec_args(&off),
+            ["--settings", r#"{"disableRemoteControl":true}"#]
+        );
+        assert!(spec_args(&json!({})).is_empty());
+    }
+
     use super::*;
 
     #[test]

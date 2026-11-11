@@ -152,6 +152,21 @@ enum Command {
         #[arg(long)]
         file: Option<String>,
     },
+    /// Remote Control: continue a Claude Code session from the Claude app or
+    /// claude.ai. `rlord remote` lists what's connected (and whether this
+    /// machine can use it); `rlord remote <session> on|off` turns it on or
+    /// off (remembered across restarts).
+    Remote {
+        r#ref: Option<String>,
+        /// on / off
+        state: Option<String>,
+        /// Restart now even if the session has work going
+        #[arg(long, conflicts_with = "when_idle")]
+        now: bool,
+        /// Restart as soon as its work is done
+        #[arg(long)]
+        when_idle: bool,
+    },
     /// Show everything known about a session
     Show {
         r#ref: String,
@@ -757,6 +772,83 @@ fn main() -> Result<()> {
             print_agents(&r);
             Ok(())
         }
+        Command::Remote {
+            r#ref,
+            state,
+            now,
+            when_idle,
+        } => {
+            let print = |name: &str, r: &Value| {
+                let st = r["state"].as_str().unwrap_or("off");
+                let extra = r["url"]
+                    .as_str()
+                    .or(r["reason"].as_str())
+                    .map(|x| format!("  {x}"))
+                    .unwrap_or_default();
+                println!("{name:<28} {st}{extra}");
+            };
+            let avail = |a: &Value| {
+                if a["available"] == false {
+                    println!(
+                        "Remote Control isn't available here: {}",
+                        a["reason"].as_str().unwrap_or("unknown")
+                    );
+                } else if let Some(n) = a["note"].as_str() {
+                    println!("note: {n}");
+                }
+            };
+            match (r#ref, state.as_deref()) {
+                (Some(r), Some(s @ ("on" | "off"))) => {
+                    let restart = if now {
+                        json!("now")
+                    } else if when_idle {
+                        json!("when_idle")
+                    } else {
+                        Value::Null
+                    };
+                    let v = call(
+                        "remote.set",
+                        json!({"ref": r, "on": s == "on", "restart": restart}),
+                    )?;
+                    if v["needs_confirm"] == true {
+                        let why: Vec<&str> = v["work_going"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(Value::as_str).collect())
+                            .unwrap_or_default();
+                        println!(
+                            "{} has work going: {}. Restarting it would interrupt that.",
+                            v["name"].as_str().unwrap_or("it"),
+                            why.join("; ")
+                        );
+                        println!("Run again with --now, or --when-idle to restart once it's done.");
+                        return Ok(());
+                    }
+                    print(v["name"].as_str().unwrap_or("?"), &v["remote"]);
+                    if let Some(n) = v["note"].as_str().filter(|n| !n.is_empty()) {
+                        println!("{n}");
+                    }
+                }
+                (_, Some(other)) => {
+                    anyhow::bail!("usage: rlord remote [session] [on|off] (got '{other}')")
+                }
+                (r, None) => {
+                    let v = call("remote.status", json!({"ref": r, "force": true}))?;
+                    avail(&v["availability"]);
+                    match v["sessions"].as_array() {
+                        Some(list) if list.is_empty() => {
+                            println!("no session has Remote Control on")
+                        }
+                        Some(list) => {
+                            for x in list {
+                                print(x["name"].as_str().unwrap_or("?"), &x["remote"]);
+                            }
+                        }
+                        None => print(v["name"].as_str().unwrap_or("?"), &v["remote"]),
+                    }
+                }
+            }
+            Ok(())
+        }
         Command::Show { r#ref } => {
             let s = call("session.get", json!({"ref": r#ref}))?;
             let g = |k: &str| s[k].as_str().unwrap_or("-").to_string();
@@ -1132,6 +1224,7 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::warm::start(&daemon);
         // Restart an idle mastermind on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
+        rlord_daemon::remote::start(&daemon);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;

@@ -117,6 +117,7 @@ enum Mode {
     NewSession(Box<NewForm>),
     OverlordSetup(Box<overlord::Setup>),
     OverlordUpgrade(Box<overlord::Upgrade>),
+    RemoteOffer(Box<overlord::RemoteOffer>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
 }
@@ -488,6 +489,7 @@ impl App {
                         }
                         Mode::OverlordSetup(s) => self.handle_setup(k, s),
                         Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
+                        Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
                         Mode::ConfirmQuit => {
                             if matches!(
                                 k.code,
@@ -978,7 +980,8 @@ impl App {
             f.render_widget(Block::default().style(theme::base()), f.area());
         }
         let [bars_area, main_area, footer_area] = RLayout::vertical([
-            Constraint::Length(2),
+            // The header: tabs, then the view, beside the 4-row logo.
+            Constraint::Length(4),
             Constraint::Min(5),
             Constraint::Length(2),
         ])
@@ -1034,6 +1037,7 @@ impl App {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
+            Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             _ => {}
         }
@@ -1102,6 +1106,9 @@ impl App {
                         // Its sub-agents are still loading (warm-up): the
                         // status is known, the agent counts aren't yet.
                         Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
+                        // Remote Control: connected, connecting, or wanted
+                        // but not to be had.
+                        remote_chip(&s["remote"]),
                         Span::styled(
                             match s["agents_running"].as_i64().unwrap_or(0) {
                                 0 => String::new(),
@@ -1309,6 +1316,35 @@ impl App {
                 ),
             ]),
         ];
+        if let Some(st) = s["remote"]["state"].as_str() {
+            let (text, style) = match st {
+                "on" => (
+                    format!(
+                        "on · {}",
+                        s["remote"]["url"].as_str().unwrap_or("in the Claude app")
+                    ),
+                    Style::default().fg(theme::green()),
+                ),
+                "connecting" => ("connecting…".into(), theme::muted()),
+                "pending" => (
+                    format!(
+                        "on · {}",
+                        s["remote"]["reason"].as_str().unwrap_or("needs a restart")
+                    ),
+                    theme::muted(),
+                ),
+                "disconnecting" => ("off · disconnects at its restart".into(), theme::muted()),
+                "stopped" => ("on · connects when it starts".into(), theme::muted()),
+                other => (
+                    format!(
+                        "{other}: {}",
+                        s["remote"]["reason"].as_str().unwrap_or("unknown")
+                    ),
+                    Style::default().fg(theme::red()),
+                ),
+            };
+            lines.push(Line::from(vec![key("remote"), Span::styled(text, style)]));
+        }
         if s["loading"] == true {
             lines.push(Line::from(vec![
                 key("agents"),
@@ -1401,7 +1437,7 @@ impl App {
             Mode::ConfirmQuit => {
                 Some("quit rlord?  y / enter: quit · any other key: stay".to_string())
             }
-            Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) => {
+            Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
         };
@@ -1542,6 +1578,21 @@ fn updated_at(s: &Value) -> Option<i64> {
     .iter()
     .filter_map(|k| s[*k].as_i64())
     .max()
+}
+
+/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
+/// wanted but failing or unavailable (red); nothing when off.
+fn remote_chip(r: &Value) -> Span<'static> {
+    match r["state"].as_str() {
+        Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
+        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
+            Span::styled(" ⇄", theme::faint())
+        }
+        Some("failed") | Some("unavailable") => {
+            Span::styled(" ⇄", Style::default().fg(theme::red()))
+        }
+        _ => Span::raw(""),
+    }
 }
 
 /// Edit `text` in the user's `$VISUAL` / `$EDITOR` (vi if unset): the TUI
@@ -2075,7 +2126,7 @@ mod tests {
             println!("{}", out.join("\n"));
         }
         let all = out.join("\n");
-        assert!(all.contains("◆ rlord") && all.contains("● working") && all.contains("#wip"));
+        assert!(all.contains("┏▲▲▲┓") && all.contains("● working") && all.contains("#wip"));
 
         // The groups tab: group column focused.
         app.tab = Tab::Groups;
