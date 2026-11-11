@@ -67,8 +67,34 @@ rlord stop <ref> && rlord restart <ref>      # resume with full conversation con
 rlord rename/tag/untag/pin/archive/log <ref> # meta-context
 ```
 
-For a persistent daemon, run `scripts/install-launchd.sh` (launchd user agent;
-`uninstall` removes it). `scripts/dev-daemon.sh` then restarts it via launchd.
+You never need to start the daemon by hand: like tmux, the first `rlord`
+command (or the TUI) that finds no daemon starts one in the background
+(logging to `~/Library/Logs/rlordd.log`), and a daemon from an older build
+is restarted on the current binary. `rlord ping` and agent hooks never start
+one; hooks spool events until a daemon is up. To have launchd own the daemon
+instead (started at login), run `scripts/install-launchd.sh` (`uninstall`
+removes it); rlord then starts and restarts it through launchd.
+
+## Installing a release (macOS, Apple Silicon)
+
+Releases are built locally and uploaded to GitHub — no CI. To cut one: bump
+`[workspace.package] version` in `Cargo.toml`, commit, push, then run
+`scripts/release.sh` (tags `v<version>` and uploads
+`rlord-v<version>-aarch64-apple-darwin.tar.gz`).
+
+To install or upgrade on another Mac (the repo is private, so `gh` must be
+logged in to an account with access — `gh auth login`):
+
+```bash
+d=$(mktemp -d) && gh release download -R ayersb/robot-overlord \
+  -p '*-aarch64-apple-darwin.tar.gz' -D "$d" \
+  && tar -xzf "$d"/*.tar.gz -C "$d" && "$d"/rlord-*/install.sh
+```
+
+That fetches the latest release (put a tag such as `v0.1.0` after `download`
+to pin one) and installs to `~/.local/bin/rlord`. On a first install, run
+`rlord claude install-hooks` once; upgrades need nothing else — the next
+`rlord` command restarts the daemon on the new binary.
 
 ## The overlord
 
