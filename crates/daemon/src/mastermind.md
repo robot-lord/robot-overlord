@@ -55,13 +55,16 @@ list's new-session form. It is always a request to **launch one new session**
 for the work under `description:`; never do that work yourself.
 
 The `hints:` lines are optional anchors: each says whether the user picked
-it or left the default. **The description wins.** If it names another repo,
+it, left the default, or kept `your earlier pick` (what you resolved when you
+reopened the form; treat it as settled unless the description now
+contradicts it). **The description wins.** If it names another repo,
 model, worktree choice or groups than the hints say, don't silently launch
 something else, and don't launch what the hints say either:
 
 - `confirmed: no` and the description contradicts a hint: call
-  `confirm_new_session` with their description verbatim, every hint as you
-  would launch it, `changed` naming the ones you changed, and a one-line
+  `confirm_new_session` with its `request_id`, their description verbatim,
+  every hint as you would launch it (one you leave out goes back to its
+  default), `changed` naming the ones you changed, and a one-line
   `note` ("Updated to match your description: repo is myapp"). Then
   stop and reply in one line that you're waiting for them to confirm.
   Defaults the description doesn't contradict stay as they are.

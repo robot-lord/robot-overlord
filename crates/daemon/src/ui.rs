@@ -394,6 +394,88 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))
 }
 
+/// Which hints on a reopened form are the user's own picks and which the
+/// overlord's, worked out by rlord from the request the form answers (its
+/// hint values and labels), never relayed by the model. A hint the overlord
+/// leaves out is a default again. The TUI shows the result as is: `chosen` (the user's), `resolved` (the
+/// overlord's), anything else is a default.
+fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
+    use crate::ask::in_list;
+    const FOLDER: &str = " (plain folder, not a repo)";
+    let folder = prefill.contains_key("project") && !prefill.contains_key("repo");
+    let value = |k: &str| -> Option<Value> {
+        match k {
+            "repo" => prefill.get("repo").cloned().or_else(|| {
+                prefill
+                    .get("project")
+                    .map(|f| json!(format!("{}{FOLDER}", f.as_str().unwrap_or(""))))
+            }),
+            "model" => prefill.get("model").cloned(),
+            // A plain folder has no worktree to pick.
+            "worktree" => prefill.get("workspace").cloned().filter(|_| !folder),
+            _ => prefill.get("tags").cloned(),
+        }
+    };
+    // Compared loosely: a trailing slash, tag order or a '#' is no change.
+    let norm = |k: &str, v: Option<&Value>| -> Option<Value> {
+        let v = v?.clone();
+        Some(match (k, &v) {
+            // The same place however it's spelled: a repo by its main root
+            // (a worktree or symlink of it is the same repo), a folder by
+            // its real path.
+            ("repo", Value::String(r)) => match r.strip_suffix(FOLDER) {
+                Some(f) => {
+                    let f = f.trim_end_matches('/');
+                    let real = std::fs::canonicalize(f)
+                        .ok()
+                        .and_then(|p| p.to_str().map(str::to_string))
+                        .unwrap_or_else(|| f.to_string());
+                    json!(format!("{real}{FOLDER}"))
+                }
+                None => {
+                    let r = r.trim_end_matches('/');
+                    json!(rlord_core::git::main_repo_root(r).unwrap_or_else(|| r.to_string()))
+                }
+            },
+            ("tags", Value::Array(a)) => {
+                let mut t: Vec<String> = a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|t| t.trim_start_matches('#').to_string())
+                    .collect();
+                t.sort();
+                json!(t)
+            }
+            _ => v,
+        })
+    };
+    // A plain folder forced the worktree off: that value was nobody's
+    // choice, so it can't make a later one look like a default.
+    let prev_folder = prev["repo"].as_str().is_some_and(|r| r.ends_with(FOLDER));
+    let prev_value = |k: &str| match k {
+        "worktree" if prev_folder => None,
+        "worktree" => norm(k, prev.get("workspace")),
+        _ => norm(k, prev.get(k)),
+    };
+    let mut chosen = Vec::new();
+    let mut resolved = Vec::new();
+    for k in ["repo", "model", "worktree", "tags"] {
+        let Some(v) = value(k) else { continue };
+        let changed = prefill
+            .get("changed")
+            .is_some_and(|c| c.as_array().is_some_and(|a| a.iter().any(|x| x == k)));
+        // The user's pick only while it still holds the value they sent.
+        let same = prev_value(k) == norm(k, Some(&v));
+        if in_list(prev, "chosen", k) && !changed && same {
+            chosen.push(k);
+        } else if changed || in_list(prev, "resolved", k) || !same {
+            resolved.push(k);
+        }
+    }
+    prefill.insert("chosen".into(), json!(chosen));
+    prefill.insert("resolved".into(), json!(resolved));
+}
+
 /// Reopen the list's describe-a-session form (`n`) with the overlord's
 /// corrections, for the user to confirm: their description, the hints as the
 /// overlord would launch them, which hints it changed and a one-line note.
@@ -421,11 +503,34 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             bail!("{r} is not a git repository (use find_repos)");
         }
     }
+    // "" is the agent default: a model the overlord reset, not one it left out.
+    if params["model"]
+        .as_str()
+        .is_some_and(|m| m.trim().is_empty())
+    {
+        prefill.insert("model".into(), json!(""));
+    }
     for k in ["workspace", "tags", "changed"] {
         if !params[k].is_null() {
             prefill.insert(k.into(), params[k].clone());
         }
     }
+    // The request this form answers (none for one the mastermind starts
+    // itself): its hints' labels come from it.
+    let provenance = match params["request_id"]
+        .as_str()
+        .filter(|r| !r.trim().is_empty())
+    {
+        Some(r) => {
+            let v = crate::ask::provenance_of(d, r)?;
+            if v.is_null() {
+                bail!("unknown request id '{r}': pass the `request_id:` from the new-session request you're answering, or omit it");
+            }
+            v
+        }
+        None => Value::Null,
+    };
+    apply_provenance(&mut prefill, &provenance);
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
         .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;
@@ -433,4 +538,52 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
     show_list(d)?;
     Ok(json!({"shown": prefill,
               "note": "the form is open on the user's screen; nothing is launched until they send it back (confirmed: yes)"}))
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn run(prefill: Value, prev: Value) -> Value {
+        let mut m = prefill.as_object().unwrap().clone();
+        apply_provenance(&mut m, &prev);
+        Value::Object(m)
+    }
+
+    #[test]
+    fn labels_come_from_the_request_answered() {
+        let prev = json!({"chosen": ["model"], "resolved": ["repo"],
+                          "repo": "/r/web", "model": "opus", "workspace": true, "tags": []});
+        // Round two: it changes only the worktree and omits the rest: those
+        // are defaults again (it was told to send every hint).
+        let p = run(
+            json!({"workspace": false, "changed": ["worktree"]}),
+            prev.clone(),
+        );
+        assert!(p["model"].is_null());
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["worktree"]));
+        // A user's pick it sends back with another value, unlisted, is its.
+        let p = run(json!({"model": "sonnet", "changed": []}), prev.clone());
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["model"]));
+        // A value it fills in for a default, without saying so, is its pick.
+        let p = run(
+            json!({"model": "opus", "tags": ["web"], "changed": []}),
+            prev,
+        );
+        assert_eq!(p["chosen"], json!(["model"]));
+        assert_eq!(p["resolved"], json!(["tags"]));
+        // No request in play (a hand-off): whatever it sends is its pick.
+        let p = run(json!({"model": "sonnet", "changed": []}), Value::Null);
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["model"]));
+        // A plain folder carries no worktree pick.
+        let p = run(
+            json!({"project": "/tmp", "workspace": true, "changed": ["repo"]}),
+            json!({"chosen": ["worktree"], "workspace": true}),
+        );
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["repo"]));
+    }
 }

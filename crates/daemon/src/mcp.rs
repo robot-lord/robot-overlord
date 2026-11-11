@@ -101,9 +101,10 @@ pub fn tools() -> Value {
             "Reopen the user's new-session form with your corrections when their description contradicts the hints they sent (or left as defaults): their description verbatim, the hints as you would launch them, which ones you changed and why. Nothing launches until they send it back; that message says `confirmed: yes`.",
             json!({
                 "description": s("The user's description, verbatim"),
-                "repo": s("Repo as you would launch it (omit to leave it to you)"),
+                "request_id": s("The `request_id:` of the new-session request you're answering (omit if none)"),
+                "repo": s("Repo as you would launch it (omit: you choose at launch)"),
                 "project": s("Plain folder instead of a repo"),
-                "model": s("Model as you would launch it"),
+                "model": s("Model as you would launch it (\"\" for the agent default)"),
                 "workspace": b("Own git worktree"),
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
@@ -344,6 +345,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let mut p = Map::new();
             for k in [
                 "description",
+                "request_id",
                 "repo",
                 "project",
                 "model",

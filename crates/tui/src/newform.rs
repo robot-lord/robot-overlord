@@ -187,6 +187,18 @@ pub(crate) struct NewForm {
     repo_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
+    tags_chosen: bool,
+    /// The worktree default, restored when a plain folder (no worktree)
+    /// gives way to a repo again...
+    default_workspace: bool,
+    /// ...unless there was a worktree choice before the folder: (value,
+    /// the user's pick, the overlord's pick), put back on leaving it.
+    before_folder: Option<(bool, bool, bool)>,
+    /// Reopened by the overlord: the hints it set that the user hadn't picked
+    /// (its resolved values: shown as such, sent as "your earlier pick").
+    resolved: Vec<&'static str>,
+    /// Opened by the overlord (confirm_new_session), not by the user.
+    reopened: bool,
     /// Reopened by the overlord with corrected hints: submitting confirms
     /// them. `changed` names the hints it updated; `note` says why.
     confirmed: bool,
@@ -259,8 +271,9 @@ impl NewForm {
             }
             (None, None) => self.location = Location::Auto,
         }
-        if let Some(m) = get("model") {
-            if !self.models.contains(&m) {
+        // "" is the agent default (the overlord reset the model).
+        if let Some(m) = p["model"].as_str().map(|m| m.trim().to_string()) {
+            if !m.is_empty() && !self.models.contains(&m) {
                 self.models.insert(0, m.clone());
             }
             self.model = m;
@@ -268,6 +281,8 @@ impl NewForm {
         if let Some(w) = p["workspace"].as_bool() {
             self.workspace = w && !matches!(self.location, Location::Folder(_));
         }
+        // Only the tags it sent: not the group tab the form opened on.
+        self.tags.clear();
         if let Some(t) = p["tags"].as_array() {
             self.tags = t
                 .iter()
@@ -275,9 +290,26 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        self.repo_chosen = true;
-        self.model_chosen = true;
-        self.workspace_chosen = true;
+        // Whose each hint is, as rlord worked it out from the request it
+        // last delivered: `chosen` the user's, `resolved` the overlord's,
+        // the rest defaults.
+        let keys = ["repo", "model", "worktree", "tags"];
+        let list = |name: &str| -> Vec<&'static str> {
+            keys.into_iter()
+                .filter(|k| {
+                    p[name]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|c| c == *k))
+                })
+                .collect()
+        };
+        let chosen = list("chosen");
+        self.repo_chosen = chosen.contains(&"repo");
+        self.model_chosen = chosen.contains(&"model");
+        self.workspace_chosen = chosen.contains(&"worktree");
+        self.tags_chosen = chosen.contains(&"tags");
+        self.resolved = list("resolved");
+        self.reopened = true;
         self.confirmed = true;
         self.changed = p["changed"]
             .as_array()
@@ -294,6 +326,46 @@ impl NewForm {
             .iter()
             .position(|f| *f == Field::Launch)
             .unwrap_or(0);
+    }
+
+    /// Set the location; leaving a plain folder brings the worktree default
+    /// back (the folder turned it off, the user didn't).
+    fn set_location(&mut self, loc: Location) {
+        let was_folder = matches!(self.location, Location::Folder(_));
+        if was_folder && !matches!(loc, Location::Folder(_)) {
+            match self.before_folder.take() {
+                Some((w, chosen, resolved)) => {
+                    self.workspace = w;
+                    self.workspace_chosen = chosen;
+                    if resolved && !self.resolved.contains(&"worktree") {
+                        self.resolved.push("worktree");
+                    }
+                }
+                None if !self.workspace_chosen => self.workspace = self.default_workspace,
+                None => {}
+            }
+        }
+        self.location = loc;
+    }
+
+    /// The user picked a hint (`repo` / `model` / `worktree` / `tags`). On a fresh form
+    /// any pick is theirs (pinning the default counts); on a form the
+    /// overlord reopened only a real change is, and it drops the overlord's
+    /// label and confirmation.
+    fn mark_picked(&mut self, key: &'static str, changed: bool) {
+        if changed || !self.reopened {
+            match key {
+                "repo" => self.repo_chosen = true,
+                "model" => self.model_chosen = true,
+                "tags" => self.tags_chosen = true,
+                "worktree" => self.workspace_chosen = true,
+                _ => debug_assert!(false, "unknown hint {key}"),
+            }
+        }
+        if changed {
+            self.resolved.retain(|k| *k != key);
+            self.description_changed();
+        }
     }
 
     /// The description or a hint changed after the overlord reopened the
@@ -371,6 +443,7 @@ impl App {
             (groups::Tab::Groups, Some(g)) if g != groups::UNTAGGED => g.clone(),
             _ => String::new(),
         };
+        let from_group = !tags.is_empty();
         self.mode = Mode::NewSession(Box::new(NewForm {
             kind,
             focus: 0,
@@ -378,6 +451,8 @@ impl App {
             name: String::new(),
             model,
             workspace: defaults["workspace"].as_bool().unwrap_or(true),
+            default_workspace: defaults["workspace"].as_bool().unwrap_or(true),
+            before_folder: None,
             branch: String::new(),
             branch_touched: false,
             prompt: String::new(),
@@ -387,6 +462,10 @@ impl App {
             repo_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
+            // Opened from a group: joining it is the user's choice.
+            tags_chosen: from_group,
+            resolved: Vec::new(),
+            reopened: false,
             confirmed: false,
             changed: Vec::new(),
             note: None,
@@ -414,8 +493,25 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
-                                f.location = Location::Folder(path);
-                                f.workspace = false;
+                                let moved =
+                                    !matches!(&f.location, Location::Folder(p) if *p == path);
+                                f.mark_picked("repo", moved);
+                                if moved {
+                                    // Kept for a change of mind back to a repo.
+                                    if !matches!(f.location, Location::Folder(_)) {
+                                        f.before_folder = Some((
+                                            f.workspace,
+                                            f.workspace_chosen,
+                                            f.resolved.contains(&"worktree"),
+                                        ));
+                                    }
+                                    f.location = Location::Folder(path);
+                                    // A plain folder has no worktree: neither
+                                    // the overlord's pick nor the user's.
+                                    f.resolved.retain(|k| *k != "worktree");
+                                    f.workspace_chosen = false;
+                                    f.workspace = false;
+                                }
                                 f.error = None;
                             } else {
                                 f.error = Some(format!("{path} is not a directory"));
@@ -472,9 +568,11 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
-                        f.repo_chosen = true;
-                        f.description_changed();
-                        f.location = Location::Repo(path.clone());
+                        f.mark_picked(
+                            "repo",
+                            !matches!(&f.location, Location::Repo(p) if p == path),
+                        );
+                        f.set_location(Location::Repo(path.clone()));
                         f.error = None;
                     } else {
                         f.finder = Some(finder); // nothing to pick; stay
@@ -510,27 +608,33 @@ impl App {
                 }
                 KeyCode::Enter => match kind {
                     PickerKind::Model => {
-                        f.model_chosen = true;
-                        f.description_changed();
-                        f.model = if items[i] == "(agent default)" {
+                        let picked = if items[i] == "(agent default)" {
                             String::new()
                         } else {
                             items[i].clone()
                         };
+                        // A real change only (re-picking keeps provenance).
+                        f.mark_picked("model", picked != f.model);
+                        f.model = picked;
                     }
                     PickerKind::Repo => {
-                        f.repo_chosen = true;
-                        f.description_changed();
+                        // (Chosen once a repo or folder is actually set, not
+                        // when a sub-prompt opens and may be cancelled.)
                         if items[i] == OTHER_REPO {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
-                            f.location = Location::Auto;
+                            f.mark_picked("repo", !matches!(f.location, Location::Auto));
+                            f.set_location(Location::Auto);
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
-                            f.location = Location::Repo(path);
+                            f.mark_picked(
+                                "repo",
+                                !matches!(&f.location, Location::Repo(p) if *p == path),
+                            );
+                            f.set_location(Location::Repo(path));
                             f.error = None;
                         }
                     }
@@ -552,7 +656,7 @@ impl App {
         // ctrl-e (the overlord form): edit the description in $EDITOR, e.g.
         // your vim; it comes back into the box.
         if ctrl && code == KeyCode::Char('e') && f.kind == FormKind::Overlord {
-            match edit_in_editor(terminal, "new-session.md", &f.prompt)? {
+            match edit_in_editor(terminal, "new-session.md", &f.prompt) {
                 Ok(text) => {
                     let text = text.trim_end().to_string();
                     // (Trailing whitespace isn't a change: quitting the
@@ -591,17 +695,21 @@ impl App {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
                 Field::Workspace => {
-                    f.workspace = !f.workspace;
-                    f.workspace_chosen = true;
-                    f.description_changed();
+                    // A plain folder has no worktree to toggle.
+                    if !matches!(f.location, Location::Folder(_)) {
+                        f.workspace = !f.workspace;
+                        f.mark_picked("worktree", true);
+                    }
                 }
                 Field::Launch => return self.submit_form(f),
                 _ => next(&mut f),
             },
             KeyCode::Char(' ') if field == Field::Workspace => {
-                f.workspace = !f.workspace;
-                f.workspace_chosen = true;
-                f.description_changed();
+                // A plain folder has no worktree to toggle.
+                if !matches!(f.location, Location::Folder(_)) {
+                    f.workspace = !f.workspace;
+                    f.mark_picked("worktree", true);
+                }
             }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
             KeyCode::Backspace if field.is_text() => match field {
@@ -620,8 +728,8 @@ impl App {
                     f.description_changed();
                 }
                 Field::Tags => {
-                    f.tags.pop();
-                    f.description_changed();
+                    let removed = f.tags.pop().is_some();
+                    f.mark_picked("tags", removed);
                 }
                 _ => {}
             },
@@ -643,7 +751,7 @@ impl App {
                     }
                     Field::Tags => {
                         f.tags.push(c);
-                        f.description_changed();
+                        f.mark_picked("tags", true);
                     }
                     _ => {}
                 }
@@ -739,6 +847,7 @@ impl App {
             ("repo", f.repo_chosen),
             ("model", f.model_chosen),
             ("worktree", f.workspace_chosen),
+            ("tags", f.tags_chosen && !f.tags.trim().is_empty()),
         ]
         .into_iter()
         .filter_map(|(k, c)| c.then_some(k))
@@ -749,6 +858,8 @@ impl App {
             "workspace": f.workspace,
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
+            // The overlord's resolved values the user left as they were.
+            "resolved": f.resolved,
             "confirmed": f.confirmed,
         });
         match &f.location {
@@ -828,7 +939,7 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 27), "New session"),
+            FormKind::Overlord => (centered(f.area(), 82, 26), "New session"),
             FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
         };
         f.render_widget(Clear, area);
@@ -886,8 +997,14 @@ impl App {
         }
 
         if form.kind == FormKind::Overlord {
+            // The overlord's key from anywhere (tmux); the list's own key if
+            // that one is turned off.
             let k = &self.config.tmux.overlord;
-            let overlord_key = tmux::key_label(if k.trim().is_empty() { "M-o" } else { k });
+            let overlord_key = if k.trim().is_empty() {
+                self.keys.label(Action::Overlord)
+            } else {
+                tmux::key_label(k)
+            };
             draw_describe_form(f, inner, form, &overlord_key);
             return;
         }
@@ -1014,7 +1131,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     let accent = Style::default().fg(theme::accent());
     let focus = |fld: Field| form.current() == fld;
     // Text width inside the box: margins, borders and padding.
-    let width = inner.width.saturating_sub(8).max(10) as usize;
+    let width = inner.width.saturating_sub(8).max(1) as usize;
 
     // Header: the overlord's note when it reopened the form, else what
     // happens on send.
@@ -1039,23 +1156,19 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             // is to just tell the overlord. Say so, with an example.
             head.push(Line::from(vec![
                 Span::styled("  Tip: ", Style::default().fg(theme::accent()).bold()),
-                Span::styled("you don't need this form. Press ", gray),
+                Span::styled("no form needed: press ", gray),
                 Span::styled(
                     format!(" {overlord_key} "),
                     Style::default().fg(theme::text()).bg(theme::chip()).bold(),
                 ),
-                Span::styled(" and just say it:", gray),
+                Span::styled(" and just say it, e.g.", gray),
             ]));
             head.push(Line::from(Span::styled(
                 "  \"start a session in ai to fix the flaky login tests\"",
                 Style::default().fg(theme::text()).italic(),
             )));
             head.push(Line::from(Span::styled(
-                "  This form sends the same thing (with optional hints) to the overlord's",
-                gray,
-            )));
-            head.push(Line::from(Span::styled(
-                "  mastermind, which names the session, writes its prompt and launches it.",
+                "  This form sends the same to the mastermind, with optional hints.",
                 gray,
             )));
         }
@@ -1165,7 +1278,14 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         if changed {
             spans.push(Span::styled("  ✦ updated", accent));
         } else if !chosen && !value.starts_with("overlord picks") {
-            spans.push(Span::styled("  · default", dim));
+            spans.push(Span::styled(
+                if form.resolved.contains(&key) {
+                    "  · overlord's pick"
+                } else {
+                    "  · default"
+                },
+                dim,
+            ));
         }
         Line::from(spans)
     };
@@ -1202,7 +1322,12 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     } else {
         format!("{}{}", form.tags, if tags_focused { "▏" } else { "" })
     };
-    lines.push(hint(Field::Tags, "tags", tags, !form.tags.is_empty()));
+    lines.push(hint(
+        Field::Tags,
+        "tags",
+        tags,
+        form.tags_chosen && !form.tags.is_empty(),
+    ));
     lines.push(Line::raw(""));
 
     let send_focused = focus(Field::Launch);
@@ -1261,7 +1386,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
 /// Rows a line takes when wrapped at word boundaries to `width` columns (as
 /// the description box wraps), counting wide characters as two.
 fn wrapped_rows(line: &str, width: usize) -> usize {
-    let w = |t: &str| Span::raw(t.to_string()).width();
+    let w = |t: &str| Span::raw(t).width();
     let (mut rows, mut col) = (1usize, 0usize);
     for word in line.split(' ') {
         let ww = w(word);
@@ -1372,6 +1497,17 @@ mod tests {
         assert!(repo_line.contains("updated"), "{repo_line}");
         assert!(out.contains("Launch"));
         assert!(f.confirmed && f.current() == Field::Launch);
+
+        // Provenance: the user's own pick stays theirs unless the overlord
+        // changed it; hints the overlord set are its picks; unset ones are
+        // still defaults.
+        f.prefill_confirm(&json!({
+            "description": "x", "repo": "/r/a", "model": "",
+            "chosen": ["model", "bogus"], "resolved": ["repo"], "changed": ["repo"], "note": "n",
+        }));
+        assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
+        assert_eq!(f.resolved, ["repo"]);
+        assert_eq!(f.model, "", "reset to the agent default");
     }
 
     #[test]
