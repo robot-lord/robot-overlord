@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  # Every PR ships a release (CLAUDE.md), so it must bump the version.
+  # Linux on purpose: this needs only git, and macOS minutes cost 10x.
+  version-bump:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}" HEAD
   check:
     runs-on: macos-latest
     steps:

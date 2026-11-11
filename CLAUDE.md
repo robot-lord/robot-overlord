@@ -84,7 +84,10 @@ risks signing breakage). Every PR merged to `main` ships as a new release.
 
 - **In each PR:** bump `[workspace.package] version` in `Cargo.toml`
   (pre-1.0: patch for fixes, minor for features or breaking changes) and
-  commit the regenerated `Cargo.lock`.
+  commit the regenerated `Cargo.lock`. `scripts/check-version-bump.sh`
+  enforces this: CI runs it on every PR, and `.githooks/pre-push` runs it
+  before pushing a branch (enable once per clone with
+  `git config core.hooksPath .githooks`).
 - **After the PR merges:** release from an up-to-date `main`:
 
   ```bash
