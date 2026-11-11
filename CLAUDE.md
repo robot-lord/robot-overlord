@@ -76,6 +76,28 @@ the user can keep talking to the overlord while it runs.
 - Codex (`.codex/agents/*.toml`) and Gemini (`.gemini/agents/*.md`) have
   their own formats; add those when their adapters land.
 
+## Releases: build locally after every merge to main
+
+Binaries are built on this Mac and uploaded to GitHub Releases. There is no
+release CI (macOS runner minutes cost 10×, and cross-compiling from Linux
+risks signing breakage). Every PR merged to `main` ships as a new release.
+
+- **In each PR:** bump `[workspace.package] version` in `Cargo.toml`
+  (pre-1.0: patch for fixes, minor for features or breaking changes) and
+  commit the regenerated `Cargo.lock`.
+- **After the PR merges:** release from an up-to-date `main`:
+
+  ```bash
+  git checkout main && git pull --ff-only
+  scripts/release.sh
+  ```
+
+  `release.sh` builds `aarch64-apple-darwin`, ad-hoc signs, uploads
+  `rlord-v<version>-aarch64-apple-darwin.tar.gz`, and creates tag
+  `v<version>`. It refuses a dirty tree, an unpushed HEAD, or an existing
+  tag. If the tag exists, the PR forgot the version bump.
+- Installing on another Mac: see "Installing a release" in `README.md`.
+
 ## Other rules
 
 - Don't touch the user's default tmux server in tests or scripts. rlord runs
