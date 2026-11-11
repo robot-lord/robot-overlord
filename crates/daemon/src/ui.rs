@@ -394,6 +394,75 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))
 }
 
+/// Which hints on a reopened form are the user's own picks and which the
+/// overlord's, worked out by rlord from the request it last delivered (its
+/// hint values and labels), never relayed by the model. A hint the overlord
+/// left out that the user (or an earlier round) had set keeps that value. The
+/// TUI shows the result as is: `chosen` (the user's), `resolved` (the
+/// overlord's), anything else is a default.
+fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
+    use crate::ask::in_list;
+    const FOLDER: &str = " (plain folder, not a repo)";
+    let kept = |k: &str| in_list(prev, "chosen", k) || in_list(prev, "resolved", k);
+    // Fill in what the overlord omitted but someone had settled.
+    let has_location = prefill.contains_key("repo") || prefill.contains_key("project");
+    if !has_location && kept("repo") {
+        if let Some(r) = prev["repo"].as_str() {
+            match r.strip_suffix(FOLDER) {
+                Some(f) => {
+                    prefill.insert("project".into(), json!(f));
+                }
+                None if rlord_core::git::main_repo_root(r).is_some() => {
+                    prefill.insert("repo".into(), json!(r));
+                }
+                None => {}
+            }
+        }
+    }
+    for (k, field) in [
+        ("model", "model"),
+        ("worktree", "workspace"),
+        ("tags", "tags"),
+    ] {
+        if !prefill.contains_key(field) && kept(k) && !prev[field].is_null() {
+            prefill.insert(field.into(), prev[field].clone());
+        }
+    }
+    let folder = prefill.contains_key("project") && !prefill.contains_key("repo");
+    let value = |k: &str| -> Option<Value> {
+        match k {
+            "repo" => prefill.get("repo").cloned().or_else(|| {
+                prefill
+                    .get("project")
+                    .map(|f| json!(format!("{}{FOLDER}", f.as_str().unwrap_or(""))))
+            }),
+            "model" => prefill.get("model").cloned(),
+            // A plain folder has no worktree to pick.
+            "worktree" => prefill.get("workspace").cloned().filter(|_| !folder),
+            _ => prefill.get("tags").cloned(),
+        }
+    };
+    let prev_value = |k: &str| match k {
+        "worktree" => prev.get("workspace"),
+        _ => prev.get(k),
+    };
+    let mut chosen = Vec::new();
+    let mut resolved = Vec::new();
+    for k in ["repo", "model", "worktree", "tags"] {
+        let Some(v) = value(k) else { continue };
+        let changed = prefill
+            .get("changed")
+            .is_some_and(|c| c.as_array().is_some_and(|a| a.iter().any(|x| x == k)));
+        if in_list(prev, "chosen", k) && !changed {
+            chosen.push(k);
+        } else if changed || in_list(prev, "resolved", k) || prev_value(k) != Some(&v) {
+            resolved.push(k);
+        }
+    }
+    prefill.insert("chosen".into(), json!(chosen));
+    prefill.insert("resolved".into(), json!(resolved));
+}
+
 /// Reopen the list's describe-a-session form (`n`) with the overlord's
 /// corrections, for the user to confirm: their description, the hints as the
 /// overlord would launch them, which hints it changed and a one-line note.
@@ -433,19 +502,12 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             prefill.insert(k.into(), params[k].clone());
         }
     }
-    // Which hints the user picked and which the overlord resolved, from the
-    // last request rlord delivered (not from the model): they keep their
-    // labels on the reopened form.
     let provenance: Value = d
         .db()
-        .kv_get("request_provenance")?
+        .kv_get(crate::ask::PROVENANCE_KEY)?
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default();
-    for (from, to) in [("chosen", "prev_chosen"), ("resolved", "prev_resolved")] {
-        if provenance[from].is_array() {
-            prefill.insert(to.into(), provenance[from].clone());
-        }
-    }
+    apply_provenance(&mut prefill, &provenance);
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
         .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;
@@ -453,4 +515,50 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
     show_list(d)?;
     Ok(json!({"shown": prefill,
               "note": "the form is open on the user's screen; nothing is launched until they send it back (confirmed: yes)"}))
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn run(prefill: Value, prev: Value) -> Value {
+        let mut m = prefill.as_object().unwrap().clone();
+        apply_provenance(&mut m, &prev);
+        Value::Object(m)
+    }
+
+    #[test]
+    fn labels_come_from_the_last_request() {
+        let prev = json!({"chosen": ["model"], "resolved": ["repo"],
+                          "repo": "/r/web", "model": "opus", "workspace": true, "tags": []});
+        // Round two: it changes only the worktree and omits the rest.
+        let p = run(
+            json!({"workspace": false, "changed": ["worktree"]}),
+            prev.clone(),
+        );
+        assert_eq!(
+            p["model"], "opus",
+            "the user's pick is kept, though omitted"
+        );
+        assert_eq!(p["chosen"], json!(["model"]));
+        assert_eq!(p["resolved"], json!(["worktree"]));
+        // A value it fills in for a default, without saying so, is its pick.
+        let p = run(
+            json!({"model": "opus", "tags": ["web"], "changed": []}),
+            prev,
+        );
+        assert_eq!(p["chosen"], json!(["model"]));
+        assert_eq!(p["resolved"], json!(["tags"]));
+        // No request in play (a hand-off): whatever it sends is its pick.
+        let p = run(json!({"model": "sonnet", "changed": []}), Value::Null);
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["model"]));
+        // A plain folder carries no worktree pick.
+        let p = run(
+            json!({"project": "/tmp", "workspace": true, "changed": ["repo"]}),
+            json!({"chosen": ["worktree"], "workspace": true}),
+        );
+        assert_eq!(p["chosen"], json!([]));
+        assert_eq!(p["resolved"], json!(["repo"]));
+    }
 }

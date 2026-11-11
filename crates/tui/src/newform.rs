@@ -282,32 +282,25 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        // Provenance comes from rlord (`prev_chosen` / `prev_resolved`: the
-        // last request it delivered), not from the model. The user's picks
-        // stay theirs unless the overlord changed that hint; a hint it
-        // changed, or resolved in an earlier round, is its pick; anything
-        // else is still a default.
-        let has =
-            |list: &str, k: &str| p[list].as_array().is_some_and(|a| a.iter().any(|c| c == k));
-        let folder = matches!(self.location, Location::Folder(_));
-        let given = |k: &str| match k {
-            "repo" => get("repo").is_some() || get("project").is_some(),
-            "model" => p["model"].is_string(),
-            // A plain folder has no worktree to pick.
-            "worktree" => p["workspace"].is_boolean() && !folder,
-            _ => p["tags"].is_array(),
+        // Whose each hint is, as rlord worked it out from the request it
+        // last delivered: `chosen` the user's, `resolved` the overlord's,
+        // the rest defaults.
+        let keys = ["repo", "model", "worktree", "tags"];
+        let list = |name: &str| -> Vec<&'static str> {
+            keys.into_iter()
+                .filter(|k| {
+                    p[name]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|c| c == *k))
+                })
+                .collect()
         };
-        // Only a value the overlord sent back can be anyone's pick (a hint
-        // it left out is the form's default).
-        let picked = |k: &str| given(k) && has("prev_chosen", k) && !has("changed", k);
-        self.repo_chosen = picked("repo");
-        self.model_chosen = picked("model");
-        self.workspace_chosen = picked("worktree");
-        self.tags_chosen = picked("tags");
-        self.resolved = ["repo", "model", "worktree", "tags"]
-            .into_iter()
-            .filter(|k| given(k) && (has("changed", k) || has("prev_resolved", k)) && !picked(k))
-            .collect();
+        let chosen = list("chosen");
+        self.repo_chosen = chosen.contains(&"repo");
+        self.model_chosen = chosen.contains(&"model");
+        self.workspace_chosen = chosen.contains(&"worktree");
+        self.tags_chosen = chosen.contains(&"tags");
+        self.resolved = list("resolved");
         self.reopened = true;
         self.confirmed = true;
         self.changed = p["changed"]
@@ -327,7 +320,7 @@ impl NewForm {
             .unwrap_or(0);
     }
 
-    /// The user picked a hint (`repo` / `model` / `worktree`). On a fresh form
+    /// The user picked a hint (`repo` / `model` / `worktree` / `tags`). On a fresh form
     /// any pick is theirs (pinning the default counts); on a form the
     /// overlord reopened only a real change is, and it drops the overlord's
     /// label and confirmation.
@@ -337,7 +330,8 @@ impl NewForm {
                 "repo" => self.repo_chosen = true,
                 "model" => self.model_chosen = true,
                 "tags" => self.tags_chosen = true,
-                _ => self.workspace_chosen = true,
+                "worktree" => self.workspace_chosen = true,
+                _ => debug_assert!(false, "unknown hint {key}"),
             }
         }
         if changed {
@@ -421,6 +415,7 @@ impl App {
             (groups::Tab::Groups, Some(g)) if g != groups::UNTAGGED => g.clone(),
             _ => String::new(),
         };
+        let from_group = !tags.is_empty();
         self.mode = Mode::NewSession(Box::new(NewForm {
             kind,
             focus: 0,
@@ -437,7 +432,8 @@ impl App {
             repo_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
-            tags_chosen: false,
+            // Opened from a group: joining it is the user's choice.
+            tags_chosen: from_group,
             resolved: Vec::new(),
             reopened: false,
             confirmed: false,
@@ -467,16 +463,17 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
-                                f.mark_picked(
-                                    "repo",
-                                    !matches!(&f.location, Location::Folder(p) if *p == path),
-                                );
-                                f.location = Location::Folder(path);
-                                // A plain folder has no worktree: neither the
-                                // overlord's pick nor the user's any more.
-                                f.resolved.retain(|k| *k != "worktree");
-                                f.workspace_chosen = false;
-                                f.workspace = false;
+                                let moved =
+                                    !matches!(&f.location, Location::Folder(p) if *p == path);
+                                f.mark_picked("repo", moved);
+                                if moved {
+                                    f.location = Location::Folder(path);
+                                    // A plain folder has no worktree: neither
+                                    // the overlord's pick nor the user's.
+                                    f.resolved.retain(|k| *k != "worktree");
+                                    f.workspace_chosen = false;
+                                    f.workspace = false;
+                                }
                                 f.error = None;
                             } else {
                                 f.error = Some(format!("{path} is not a directory"));
@@ -687,9 +684,8 @@ impl App {
                     f.description_changed();
                 }
                 Field::Tags => {
-                    f.tags.pop();
-                    f.mark_picked("tags", true);
-                    f.description_changed();
+                    let removed = f.tags.pop().is_some();
+                    f.mark_picked("tags", removed);
                 }
                 _ => {}
             },
@@ -712,7 +708,6 @@ impl App {
                     Field::Tags => {
                         f.tags.push(c);
                         f.mark_picked("tags", true);
-                        f.description_changed();
                     }
                     _ => {}
                 }
@@ -1463,27 +1458,12 @@ mod tests {
         // changed it; hints the overlord set are its picks; unset ones are
         // still defaults.
         f.prefill_confirm(&json!({
-            "description": "x", "repo": "/r/a", "model": "opus",
-            "prev_chosen": ["model", "repo"], "changed": ["repo"], "note": "n",
+            "description": "x", "repo": "/r/a", "model": "",
+            "chosen": ["model", "bogus"], "resolved": ["repo"], "changed": ["repo"], "note": "n",
         }));
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
-        assert_eq!(f.resolved, ["repo"], "only the hint it changed");
-
-        // A second round: what it resolved earlier stays its pick, though it
-        // only changes the model now.
-        f.prefill_confirm(&json!({
-            "description": "x", "repo": "/r/a", "model": "",
-            "prev_resolved": ["repo"], "changed": ["model"], "note": "n",
-        }));
-        assert_eq!(f.resolved, ["repo", "model"]);
+        assert_eq!(f.resolved, ["repo"]);
         assert_eq!(f.model, "", "reset to the agent default");
-
-        // A plain folder: no worktree pick, whatever the request said.
-        f.prefill_confirm(&json!({
-            "description": "x", "project": "/tmp", "workspace": true,
-            "prev_chosen": ["worktree"], "changed": ["repo"], "note": "n",
-        }));
-        assert!(!f.workspace_chosen && !f.workspace);
     }
 
     #[test]

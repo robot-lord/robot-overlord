@@ -68,6 +68,16 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
     Ok(json!({"sent": true}))
 }
 
+/// kv key: the last unconfirmed form request's hints and their provenance.
+pub const PROVENANCE_KEY: &str = "request_provenance";
+
+/// Whether `p[list]` is an array holding `k`.
+pub fn in_list(p: &Value, list: &str, k: &str) -> bool {
+    p.get(list)
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(|c| c == k))
+}
+
 /// `{description, repo?, model?, workspace?, tags?: [..], chosen?: [..],
 /// confirmed?}` from the list's new-session form.
 /// Launching is the mastermind's job: the form goes straight to it.
@@ -77,10 +87,21 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     // Delivered: it answers any form the mastermind had reopened.
     let db = d.db();
     db.kv_set("confirm_pending", "0")?;
-    // Which hints were the user's and which the overlord's, kept here so a
-    // reopened form gets them back from rlord, not from the model.
-    let provenance = json!({"chosen": params["chosen"], "resolved": params["resolved"]});
-    db.kv_set("request_provenance", &provenance.to_string())?;
+    // The hints as sent and whose they were, so a form the mastermind reopens
+    // for this request gets them from rlord, not from the model. A confirmed
+    // request is the last round: nothing will reopen it.
+    let confirmed = params["confirmed"].as_bool().unwrap_or(false);
+    let provenance = if confirmed {
+        String::new()
+    } else {
+        json!({
+            "chosen": params["chosen"], "resolved": params["resolved"],
+            "repo": params["repo"], "model": params["model"],
+            "workspace": params["workspace"], "tags": params["tags"],
+        })
+        .to_string()
+    };
+    db.kv_set(PROVENANCE_KEY, &provenance)?;
     Ok(r)
 }
 
@@ -101,6 +122,8 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
     {
         text.push_str(&format!("\ncontext:\n{c}"));
     }
+    // A new request: whatever form was in play no longer is.
+    d.db().kv_set(PROVENANCE_KEY, "")?;
     // Switch the user first, so they watch the mastermind start and pick
     // the request up (a first start can take a while), then deliver it.
     let note = show_mastermind(d);
@@ -170,18 +193,10 @@ pub fn format_request(p: &Value) -> Result<String> {
             .map(str::trim)
             .filter(|v| !v.is_empty())
     };
-    let chosen = |k: &str| {
-        p.get("chosen")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|c| c == k))
-    };
+    let chosen = |k: &str| in_list(p, "chosen", k);
     // Hints the overlord resolved in an earlier round (a reopened form),
     // which the user then sent on unchanged.
-    let resolved = |k: &str| {
-        p.get("resolved")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|c| c == k))
-    };
+    let resolved = |k: &str| in_list(p, "resolved", k);
     let source = |k: &str| {
         if chosen(k) {
             "picked by the user"
