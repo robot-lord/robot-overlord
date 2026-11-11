@@ -470,7 +470,15 @@ pub fn current_client() -> Option<String> {
 
 /// Open a popup on `client` running `cmd`, without waiting for it to close
 /// (`display-popup` blocks until then). Closes any popup already open there.
-pub fn open_popup(client: &str, width: &str, height: &str, title: &str, cmd: &str) -> Result<()> {
+/// `border` is a tmux style for the popup's border (`fg=#cba6f7`).
+pub fn open_popup(
+    client: &str,
+    width: &str,
+    height: &str,
+    title: &str,
+    border: &str,
+    cmd: &str,
+) -> Result<()> {
     let _ = close_popup(client);
     let mut child = tmux_cmd()
         .args([
@@ -485,7 +493,7 @@ pub fn open_popup(client: &str, width: &str, height: &str, title: &str, cmd: &st
             "-b",
             "rounded",
             "-S",
-            "fg=magenta",
+            border,
             "-T",
             title,
             cmd,

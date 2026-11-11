@@ -282,9 +282,9 @@ impl App {
                 Span::raw("  Model  "),
                 Span::styled(
                     format!("◀ {model} ▶"),
-                    Style::default().bold().fg(Color::Cyan),
+                    Style::default().bold().fg(theme::accent()),
                 ),
-                Span::styled(resolves, Style::default().fg(Color::DarkGray)),
+                Span::styled(resolves, Style::default().fg(theme::faint_c())),
             ]),
             Line::from(""),
             keys_line(&[
@@ -296,15 +296,13 @@ impl App {
         if let Some(e) = &s.error {
             lines.push(Line::from(Span::styled(
                 format!("  {e}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::red()),
             )));
         }
         f.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Magenta))
-                    .title(" ◆ start your overlord "),
+                theme::modal("◆ Start your overlord")
+                    .border_style(Style::default().fg(theme::overlord())),
             ),
             area,
         );
@@ -331,16 +329,13 @@ impl App {
         if let Some(e) = &u.error {
             lines.push(Line::from(Span::styled(
                 format!("  {e}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme::red()),
             )));
         }
         f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(" ◆ overlord model "),
-            ),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(theme::modal("◆ Overlord model")),
             area,
         );
     }

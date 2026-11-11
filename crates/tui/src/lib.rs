@@ -10,7 +10,7 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout as RLayout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -19,6 +19,7 @@ mod groups;
 mod newform;
 mod overlay;
 mod overlord;
+mod theme;
 use groups::Tab;
 use newform::NewForm;
 pub use overlay::run as run_overlay;
@@ -133,6 +134,8 @@ struct App {
     /// Groups tab: (tag, count) column, its selection, and the selected tag
     /// ("" = untagged), kept by name across refreshes.
     groups: Vec<(String, usize)>,
+    /// Favourite groups, in the user's order (daemon `tag.order`).
+    group_order: Vec<String>,
     group_state: ListState,
     group_sel: Option<String>,
     /// Groups tab: keys go to the group column (else to the sessions).
@@ -151,6 +154,10 @@ struct App {
     status_line: String,
     dirty: bool,
     last_preview: Instant,
+    /// The system's appearance last time we looked (theme families follow
+    /// it), and when that was.
+    dark: bool,
+    last_appearance: Instant,
     /// Whether row 0 is the overlord (shown first when not filtering).
     overlord_row: bool,
     /// Session to select once the next refresh lands (set by the overlord).
@@ -169,6 +176,7 @@ impl App {
             all: Vec::new(),
             tab: Tab::Sessions,
             groups: Vec::new(),
+            group_order: Vec::new(),
             group_state: ListState::default(),
             group_sel: None,
             group_focus: false,
@@ -185,6 +193,8 @@ impl App {
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
+            dark: true,
+            last_appearance: Instant::now(),
             overlord_row: false,
             pending_select: None,
             reported_view: Value::Null,
@@ -230,6 +240,17 @@ impl App {
             // where it would only steal the top match — and isn't in groups.
             self.overlord_row = false;
             if self.tab == Tab::Groups {
+                if let Some(o) = self.call("tag.order", json!({})) {
+                    self.group_order = o["order"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
                 self.regroup();
             } else if self.filter.trim().is_empty() && !self.show_archived {
                 if let Some(o) = self
@@ -284,15 +305,7 @@ impl App {
                 ("any key", "stay", Cap::Global),
             ]),
         ];
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(" quit "),
-            ),
-            area,
-        );
+        f.render_widget(Paragraph::new(lines).block(theme::modal("Quit")), area);
     }
 
     fn selected_is_overlord(&self) -> bool {
@@ -396,7 +409,9 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         self.startup();
+        self.apply_theme();
         loop {
+            self.follow_appearance();
             if self.dirty {
                 self.refresh();
             } else if self.last_preview.elapsed()
@@ -903,7 +918,33 @@ impl App {
         Ok(())
     }
 
+    /// Pick the palette for config `theme` and the system's appearance.
+    fn apply_theme(&mut self) {
+        self.dark = rlord_core::themes::system_is_dark();
+        self.last_appearance = Instant::now();
+        theme::set(rlord_core::themes::resolve(&self.config.theme, self.dark));
+    }
+
+    /// Theme families follow the system's light/dark mode: check every few
+    /// seconds, switch when it flips (and recolor the overlord's bar).
+    fn follow_appearance(&mut self) {
+        if !rlord_core::themes::follows_system(&self.config.theme)
+            || self.last_appearance.elapsed() < Duration::from_secs(3)
+        {
+            return;
+        }
+        let was = self.dark;
+        self.apply_theme();
+        if self.dark != was {
+            let _ = self.call("overlord.style", Value::Null);
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame) {
+        // Themes with their own background paint it under everything.
+        if theme::bg().is_some() {
+            f.render_widget(Block::default().style(theme::base()), f.area());
+        }
         let [bars_area, main_area, footer_area] = RLayout::vertical([
             Constraint::Length(2),
             Constraint::Min(5),
@@ -968,12 +1009,12 @@ impl App {
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
         // Drop the wide, least-essential columns first as the list narrows.
-        let width = area.width.saturating_sub(4) as usize; // borders + marker
-        let show_project = width >= 88;
-        let show_tags = width >= 72;
+        let width = area.width.saturating_sub(6) as usize; // borders, padding, marker
+        let show_project = width >= 96;
+        let show_tags = width >= 62;
         let name_w = if width >= 60 { 26 } else { 18 };
 
-        let mut header = vec!["#", "", "NAME", "STATUS", "UPDATED"];
+        let mut header = vec!["", "", "Name", "Status", "Updated"];
         let mut widths = vec![
             Constraint::Length(1),
             Constraint::Length(1),
@@ -982,15 +1023,14 @@ impl App {
             Constraint::Length(8),
         ];
         if show_tags {
-            header.push("TAGS");
-            widths.push(Constraint::Length(16));
+            header.push("Groups");
+            widths.push(Constraint::Length(18));
         }
         if show_project {
-            header.push("PROJECT");
+            header.push("Project");
             widths.push(Constraint::Min(10));
         }
-        let header = Row::new(header)
-            .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
+        let header = Row::new(header).style(theme::muted()).bottom_margin(1);
         let home = std::env::var("HOME").unwrap_or_default();
         let rows: Vec<Row> = self
             .sessions
@@ -1003,55 +1043,39 @@ impl App {
                 let num = i.saturating_sub(usize::from(self.overlord_row));
                 let mut cells = vec![
                     if is_overlord {
-                        Cell::from("◆").fg(Color::Magenta)
+                        Cell::from("◆").fg(theme::overlord())
                     } else {
                         Cell::from(if num < 9 {
                             ((b'1' + num as u8) as char).to_string()
                         } else {
                             String::new()
                         })
-                        .dim()
+                        .fg(theme::faint_c())
                     },
-                    Cell::from(if s["pinned"].as_bool().unwrap_or(false) {
-                        "*"
+                    if s["pinned"].as_bool().unwrap_or(false) && !is_overlord {
+                        Cell::from("★").fg(theme::yellow())
                     } else {
-                        " "
-                    }),
+                        Cell::from(" ")
+                    },
                     Cell::from(get("name")),
                     Cell::from(Line::from(vec![
-                        Span::styled(status.clone(), status_style(&status)),
+                        theme::status_chip(&status),
                         Span::styled(
                             match s["agents_running"].as_i64().unwrap_or(0) {
                                 0 => String::new(),
                                 n => format!(" ⚙{n}"),
                             },
-                            Style::default().fg(Color::Magenta),
+                            Style::default().fg(theme::overlord()),
                         ),
                     ])),
-                    // Last update: any message either way or status change.
-                    Cell::from(rel_age(
-                        [
-                            "last_agent_msg_at",
-                            "last_user_msg_at",
-                            "last_state_change_at",
-                            "created_at",
-                        ]
-                        .iter()
-                        .filter_map(|k| s[*k].as_i64())
-                        .max(),
-                    )),
+                    Cell::from(Span::styled(rel_age(updated_at(s)), theme::muted())),
                 ];
                 if show_tags {
                     let tags = s["tags"]
                         .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        })
+                        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
                         .unwrap_or_default();
-                    cells.push(Cell::from(tags));
+                    cells.push(Cell::from(Line::from(theme::tag_spans(tags))));
                 }
                 if show_project {
                     cells.push(if is_overlord {
@@ -1060,38 +1084,32 @@ impl App {
                             s["model"].as_str().unwrap_or("default model"),
                             self.keys.label(Action::Overlord)
                         ))
-                        .dim()
+                        .fg(theme::faint_c())
                     } else {
-                        Cell::from(get("project_path").replacen(&home, "~", 1)).dim()
+                        Cell::from(get("project_path").replacen(&home, "~", 1)).fg(theme::faint_c())
                     });
                 }
                 let row = Row::new(cells);
                 if is_overlord {
-                    row.style(
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    row.style(Style::default().fg(theme::overlord()).bold())
                 } else {
-                    row
+                    row.style(Style::default().fg(theme::text()))
                 }
             })
             .collect();
-        let mut block = Block::default()
-            .borders(Borders::ALL)
-            .title(self.list_title());
-        if self.tab == Tab::Groups && !self.group_focus {
-            block = block.border_style(Style::default().fg(Color::Cyan));
-        }
+        // The list is the focused pane unless the group column has focus.
+        let focused = !(self.tab == Tab::Groups && self.group_focus);
+        let block = theme::panel(self.list_title(), focused);
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
+            .column_spacing(2)
+            .row_highlight_style(theme::selected())
+            .highlight_symbol(Span::styled(
+                theme::SELECT_BAR,
+                Style::default().fg(theme::accent()),
+            ))
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
         f.render_stateful_widget(table, area, &mut self.table);
     }
 
@@ -1100,10 +1118,18 @@ impl App {
             .selected()
             .and_then(|s| s["name"].as_str())
             .unwrap_or("");
-        let title = match self.preview {
-            Preview::Pane => format!(" {name} · pane (l: log) "),
-            Preview::Log => format!(" {name} · event log (l: pane) "),
+        let log = self.keys.label(Action::ToggleLog);
+        let (what, other) = match self.preview {
+            Preview::Pane => ("live pane", "log"),
+            Preview::Log => ("event log", "pane"),
         };
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(name.to_string(), Style::default().fg(theme::text()).bold()),
+            Span::styled(format!(" · {what} "), theme::muted()),
+        ]);
+        let switch =
+            Line::from(Span::styled(format!(" {log} {other} "), theme::faint())).right_aligned();
         // Show the tail that fits: the bottom of a pane is what matters.
         let inner_h = area.height.saturating_sub(2) as usize;
         let text: Text = match &self.preview_rich {
@@ -1122,18 +1148,14 @@ impl App {
                 )
             }
         };
-        let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title));
-        f.render_widget(p, area);
+        let block = theme::panel(title, false).title(switch);
+        f.render_widget(Paragraph::new(text).block(block), area);
     }
 
     /// The control-layer card: everything we know about the session that
     /// isn't the live pane, plus the human-authored description and notes.
     fn draw_details(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).title(format!(
-            " details  ({}: describe · {}: notes) ",
-            self.keys.label(Action::Describe),
-            self.keys.label(Action::Notes)
-        ));
+        let block = theme::panel(theme::title("Details"), false);
         let Some(s) = self.selected() else {
             f.render_widget(block, area);
             return;
@@ -1141,71 +1163,98 @@ impl App {
         let home = std::env::var("HOME").unwrap_or_default();
         let tilde = |p: &str| p.replacen(&home, "~", 1);
         let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
-        let key = |k: &str| Span::styled(format!("{k:<7}"), Style::default().fg(Color::DarkGray));
+        let key = |k: &str| Span::styled(format!("{k:<10}"), theme::faint());
         let status = get("status");
-        let tags = s["tags"]
+        let tags: Vec<&str> = s["tags"]
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let sep = || Span::styled("  ·  ", theme::faint());
+        let desc = s["description"].as_str().unwrap_or("");
         let mut lines = vec![
+            // Headline: name, status, then the description (what it's doing).
             Line::from(vec![
-                Span::styled(get("name"), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::raw(get("agent")),
-                Span::raw(" · "),
-                Span::raw(s["model"].as_str().unwrap_or("default model").to_string()),
-                Span::raw(" · "),
-                Span::styled(status.clone(), status_style(&status)),
-                Span::raw(format!("  id {}", get("id"))),
+                Span::styled(get("name"), Style::default().fg(theme::text()).bold()),
+                Span::raw("   "),
+                theme::status_chip(&status),
+                Span::styled(
+                    match updated_at(s) {
+                        Some(t) => format!("  ·  updated {} ago", rel_age(Some(t))),
+                        None => String::new(),
+                    },
+                    theme::muted(),
+                ),
             ]),
+            if desc.is_empty() {
+                Line::from(Span::styled(
+                    format!(
+                        "no description — {} to add",
+                        self.keys.label(Action::Describe)
+                    ),
+                    theme::faint().italic(),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    desc.to_string(),
+                    Style::default().fg(theme::yellow()),
+                ))
+            },
+            Line::raw(""),
+            Line::from({
+                let mut v = vec![key("groups")];
+                if tags.is_empty() {
+                    v.push(Span::styled("none", theme::faint()));
+                } else {
+                    v.extend(theme::tag_spans(tags));
+                }
+                v
+            }),
             Line::from(vec![
                 key("repo"),
-                Span::raw(
+                Span::styled(
                     s["repo_path"]
                         .as_str()
                         .map(tilde)
-                        .unwrap_or_else(|| "(none)".into()),
+                        .unwrap_or_else(|| "none".into()),
+                    Style::default().fg(theme::text()),
                 ),
-                Span::raw(
+                Span::styled(
                     s["branch"]
                         .as_str()
-                        .map(|b| format!("  branch {b}"))
+                        .map(|b| format!("  ⎇ {b}"))
                         .unwrap_or_default(),
+                    Style::default().fg(theme::cyan()),
                 ),
             ]),
-            Line::from(vec![key("dir"), Span::raw(tilde(&get("project_path")))]),
             Line::from(vec![
-                key("when"),
-                Span::raw(format!(
-                    "created {} · user msg {} · agent msg {} · state {}",
-                    rel_age(s["created_at"].as_i64()),
-                    rel_age(s["last_user_msg_at"].as_i64()),
-                    rel_age(s["last_agent_msg_at"].as_i64()),
-                    rel_age(s["last_state_change_at"].as_i64()),
-                )),
+                key("folder"),
+                Span::styled(tilde(&get("project_path")), theme::muted()),
             ]),
             Line::from(vec![
-                key("tags"),
-                Span::raw(if tags.is_empty() { "-".into() } else { tags }),
+                key("agent"),
+                Span::styled(get("agent"), Style::default().fg(theme::text())),
+                sep(),
+                Span::styled(
+                    s["model"].as_str().unwrap_or("default model").to_string(),
+                    Style::default().fg(theme::text()),
+                ),
+                sep(),
+                Span::styled(format!("id {}", get("id")), theme::faint()),
+            ]),
+            Line::from(vec![
+                key("activity"),
+                Span::styled(
+                    format!(
+                        "you {} · agent {} · status {} · created {}",
+                        rel_age(s["last_user_msg_at"].as_i64()),
+                        rel_age(s["last_agent_msg_at"].as_i64()),
+                        rel_age(s["last_state_change_at"].as_i64()),
+                        rel_age(s["created_at"].as_i64()),
+                    ),
+                    theme::muted(),
+                ),
             ]),
         ];
-        let desc = s["description"].as_str().unwrap_or("");
-        lines.push(Line::from(vec![
-            key("desc"),
-            if desc.is_empty() {
-                Span::styled(
-                    format!("(none — {} to add)", self.keys.label(Action::Describe)),
-                    Style::default().fg(Color::DarkGray),
-                )
-            } else {
-                Span::styled(desc.to_string(), Style::default().fg(Color::Yellow))
-            },
-        ]));
         if !self.agents.is_empty() {
             let running = self
                 .agents
@@ -1216,7 +1265,7 @@ impl App {
                 key("agents"),
                 Span::styled(
                     format!("{} total · {} running", self.agents.len(), running),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(theme::overlord()),
                 ),
             ]));
             // Most recent first; the card has limited rows.
@@ -1226,11 +1275,11 @@ impl App {
                 let (state, style) = match (started, finished) {
                     (Some(st), Some(fi)) => (
                         format!("done {}s", ((fi - st) as f64 / 1000.0).round()),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::faint_c()),
                     ),
                     (Some(st), None) => (
                         format!("running {}", rel_age(Some(st))),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme::green()),
                     ),
                     _ => ("?".into(), Style::default()),
                 };
@@ -1241,7 +1290,7 @@ impl App {
                     .next()
                     .unwrap_or("");
                 lines.push(Line::from(vec![
-                    Span::raw("       ⚙ "),
+                    Span::styled("        ⚙ ", Style::default().fg(theme::overlord())),
                     Span::styled(
                         a["agent_type"].as_str().unwrap_or("?").to_string(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -1254,16 +1303,17 @@ impl App {
                         } else {
                             format!(" ↳ {result}")
                         },
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::faint_c()),
                     ),
                 ]));
             }
         }
         let notes = s["notes"].as_str().unwrap_or("");
         if !notes.is_empty() {
-            lines.push(Line::from(key("notes")));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("notes", theme::faint())));
             for l in notes.lines() {
-                lines.push(Line::raw(format!("       {l}")));
+                lines.push(Line::from(Span::styled(l.to_string(), theme::muted())));
             }
         }
         f.render_widget(
@@ -1296,16 +1346,41 @@ impl App {
                 Some("overlord — see dialog".to_string())
             }
         };
-        let line2 = Line::from(Span::styled(
-            self.status_line.clone(),
-            Style::default().fg(Color::Gray),
-        ));
+        let line2 = if self.status_line.is_empty() {
+            Line::raw("")
+        } else {
+            Line::from(vec![
+                Span::styled(" › ", Style::default().fg(theme::accent())),
+                Span::styled(self.status_line.clone(), theme::muted()),
+            ])
+        };
         let [line1_area, line2_area] =
             RLayout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
         f.render_widget(Paragraph::new(line2), line2_area);
         if let Some(p) = prompt {
-            let line1 = Line::from(Span::styled(p, Style::default().fg(Color::Yellow)));
-            f.render_widget(Paragraph::new(line1), line1_area);
+            // `label: text   (hints)` → a label chip, the text, dim hints.
+            let (label, rest) = p.split_once(": ").unwrap_or(("", p.as_str()));
+            let (text, hints) = match rest.find("   (") {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let mut spans = Vec::new();
+            if !label.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {label} "),
+                    Style::default()
+                        .fg(theme::on_accent())
+                        .bg(theme::yellow())
+                        .bold(),
+                ));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                text.to_string(),
+                Style::default().fg(theme::text()),
+            ));
+            spans.push(Span::styled(hints.to_string(), theme::faint()));
+            f.render_widget(Paragraph::new(Line::from(spans)), line1_area);
             return;
         }
         // Keys that always work sit on the left; keys for what's highlighted
@@ -1325,6 +1400,19 @@ impl App {
         // Inside a group, say how to get back out.
         if self.tab == Tab::Groups && !self.group_focus {
             ctx.insert(0, (self.keys.label(Action::Cancel), "groups"));
+        }
+        // On the group list: favourite it, and reorder favourites.
+        if self.tab == Tab::Groups && self.group_focus {
+            if let Some(g) = self.group_sel.as_deref().filter(|g| *g != groups::UNTAGGED) {
+                let fav = self.is_favourite(g);
+                ctx.push((
+                    self.keys.label(Action::Pin),
+                    if fav { "unfavourite" } else { "favourite" },
+                ));
+                if fav {
+                    ctx.push(("J/K".into(), "reorder"));
+                }
+            }
         }
         // The divider sits at a fixed column: the right slot is as wide as
         // the longest row-key set, and row keys fill it from the left, so
@@ -1375,12 +1463,26 @@ enum Cap {
 
 /// The footer's right slot: divider, then the row keys as accent keycaps.
 fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
-    let mut spans = vec![Span::raw("│  ").fg(Color::DarkGray)];
+    let mut spans = vec![Span::raw("│  ").fg(theme::border())];
     spans.extend(
         ctx.into_iter()
             .flat_map(|(k, label)| keycap(&k, label, Cap::Context)),
     );
     Line::from(spans)
+}
+
+/// When a session last changed: its latest message either way or status
+/// change (creation, failing all of those). The list's "Updated" column.
+fn updated_at(s: &Value) -> Option<i64> {
+    [
+        "last_agent_msg_at",
+        "last_user_msg_at",
+        "last_state_change_at",
+        "created_at",
+    ]
+    .iter()
+    .filter_map(|k| s[*k].as_i64())
+    .max()
 }
 
 /// A dialog's row of key hints, indented to match its text.
@@ -1395,25 +1497,13 @@ fn keys_line(items: &[(&str, &str, Cap)]) -> Line<'static> {
 /// A key hint as a padded keycap chip, then its label: ` n  new   `.
 fn keycap(k: &str, label: &str, cap: Cap) -> [Span<'static>; 2] {
     let chip = match cap {
-        Cap::Global => Style::default().fg(Color::White).bg(Color::DarkGray),
-        Cap::Context => Style::default().fg(Color::Black).bg(Color::Cyan),
+        Cap::Global => Style::default().fg(theme::text()).bg(theme::chip()),
+        Cap::Context => Style::default().fg(theme::on_accent()).bg(theme::accent()),
     };
     [
         Span::styled(format!(" {k} "), chip.bold()),
-        Span::styled(format!(" {label}  "), Style::default().fg(Color::Gray)),
+        Span::styled(format!(" {label}  "), theme::muted()),
     ]
-}
-
-fn status_style(status: &str) -> Style {
-    let color = match status {
-        "working" => Color::Green,
-        "waiting_input" => Color::Yellow,
-        "idle" => Color::Cyan,
-        "error" => Color::Red,
-        "starting" => Color::Magenta,
-        _ => Color::DarkGray,
-    };
-    Style::default().fg(color)
 }
 
 // ---- configurable keys ----
@@ -1782,6 +1872,85 @@ mod tests {
         (0..width)
             .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
             .collect()
+    }
+
+    /// Renders the whole screen; `SHOW_SCREEN=1 cargo test -p rlord-tui
+    /// whole_screen -- --nocapture` prints it, for eyeballing layout changes.
+    #[test]
+    fn whole_screen_renders() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![
+            json!({"name": "overlord", "role": "overlord", "status": "idle", "agent": "claude",
+                   "model": "opus", "agent_session": "o", "pinned": true, "archived_at": null}),
+            json!({"name": "login-flake", "status": "working", "agent": "claude",
+                   "agent_session": "a", "tags": ["web", "wip"], "pinned": true,
+                   "project_path": "/home/x/src/web/.worktrees/login-flake", "repo_path": "/home/x/src/web",
+                   "branch": "login-flake", "description": "fixing the flaky login test",
+                   "archived_at": null, "agents_running": 2}),
+            json!({"name": "myapp", "status": "waiting_input", "agent": "claude",
+                   "agent_session": "b", "tags": ["myapp"], "project_path": "/home/x/src/myapp",
+                   "archived_at": null}),
+            json!({"name": "infra-bump", "status": "stopped", "agent": "claude",
+                   "agent_session": "c", "tags": [], "project_path": "/home/x/src/infra",
+                   "archived_at": null}),
+        ];
+        app.all = app.sessions.clone();
+        app.overlord_row = true;
+        app.table.select(Some(1));
+        app.status_line = "launched login-flake".into();
+        let (w, h) = (150, 34);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let out: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        if std::env::var_os("SHOW_SCREEN").is_some() {
+            println!("{}", out.join("\n"));
+        }
+        let all = out.join("\n");
+        assert!(all.contains("◆ rlord") && all.contains("● working") && all.contains("#wip"));
+
+        // The groups tab: group column focused.
+        app.tab = Tab::Groups;
+        app.groups = vec![
+            ("web".into(), 1),
+            ("wip".into(), 1),
+            (groups::UNTAGGED.into(), 1),
+        ];
+        app.group_sel = Some("web".into());
+        app.group_focus = true;
+        app.group_state.select(Some(0));
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let out: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        if std::env::var_os("SHOW_SCREEN").is_some() {
+            println!("{}", out[..12].join("\n"));
+        }
+        assert!(out.join("\n").contains("Groups"));
+
+        // Every theme renders; themes with a background paint all of it.
+        for p in rlord_core::themes::THEMES {
+            theme::set(p);
+            term.draw(|f| app.draw(f)).unwrap();
+            if let Some(bg) = p.bg {
+                let corner = &term.backend().buffer()[(w - 1, h - 1)];
+                assert_eq!(corner.bg, theme::color(bg), "{}", p.name);
+            }
+        }
+        theme::set(rlord_core::themes::by_name("rlord-dark").unwrap());
     }
 
     #[test]

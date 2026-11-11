@@ -236,6 +236,9 @@ pub struct Config {
     pub jump_digits: bool,
     /// Height of the details pane under the preview (rows).
     pub details_height: u16,
+    /// Color theme: a family (follows the system's light/dark mode) or one
+    /// variant. See `rlord_core::themes`.
+    pub theme: String,
     pub session: SessionDefaults,
     pub overlord: OverlordConfig,
     pub keys: Keys,
@@ -250,6 +253,7 @@ impl Default for Config {
             preview_refresh_ms: 500,
             jump_digits: true,
             details_height: 12,
+            theme: "rlord".into(),
             session: SessionDefaults::default(),
             overlord: OverlordConfig::default(),
             keys: Keys::default(),
@@ -284,6 +288,14 @@ list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
 details_height = 12     # rows for the details pane under the preview
+
+# Color theme. A family follows your system's light/dark mode:
+#   rlord, catppuccin, tokyonight, gruvbox, solarized
+# or pin one variant: rlord-dark, rlord-light, catppuccin-mocha,
+# catppuccin-latte, tokyonight-night, tokyonight-day, gruvbox-dark,
+# gruvbox-light, solarized-dark, solarized-light, nord, dracula.
+# The named themes need a truecolor terminal (kitty, iTerm2, Ghostty, WezTerm).
+theme = "rlord"
 
 # Defaults for every session you create (TUI form or `rlord new`).
 [session]

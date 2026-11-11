@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use rlord_core::config::Config;
 use rlord_core::db::Db;
+use rlord_core::themes;
 use rlord_core::types::Status;
 use rlord_core::{models, paths, tmux};
 
@@ -87,16 +88,31 @@ fn write_files() -> Result<Vec<String>> {
 /// overlord's model is its own — changed only via `set_model`.
 pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let v = ensure_running(db, cfg, params)?;
-    // Viewed full screen it should be unmistakable — but otherwise look like
-    // any session.
+    style(cfg);
+    Ok(v)
+}
+
+/// The overlord's color in the current theme (tmux spelling).
+pub fn color(cfg: &Config) -> String {
+    themes::resolve(&cfg.theme, themes::system_is_dark())
+        .overlord
+        .tmux()
+}
+
+/// Its tmux bar: viewed full screen it should be unmistakable, otherwise it
+/// looks like any session. Re-run when the theme changes (`overlord.style`).
+pub fn style(cfg: &Config) {
+    let p = themes::resolve(&cfg.theme, themes::system_is_dark());
+    if !tmux::has_session(TMUX_NAME) {
+        return;
+    }
     if let Err(e) = tmux::style_session(
         TMUX_NAME,
-        "bg=magenta,fg=black",
+        &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
         "#[bold] ◆ OVERLORD #[nobold]· ⌥D: list  ",
     ) {
         tracing::debug!(error = %e, "styling overlord session");
     }
-    Ok(v)
 }
 
 fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {

@@ -1,7 +1,7 @@
 //! Which sessions use the user's imported tmux profile (see
 //! `rlord_core::tmux_profile`). Per session: an explicit on/off in the kv
 //! table, else `[tmux] profile` from the config. Never the overlord (it
-//! keeps its own magenta bar) and never the list's home session.
+//! keeps its own lavender bar) and never the list's home session.
 
 use anyhow::Result;
 use serde_json::{json, Value};

@@ -131,7 +131,23 @@ pub fn tag_list(db: &Db) -> Result<Value> {
         .map(|(tag, count)| json!({"tag": tag, "count": count}))
         .collect();
     let untagged = db.untagged_count()?;
-    Ok(json!({"groups": groups, "untagged": untagged}))
+    Ok(json!({"groups": groups, "untagged": untagged, "order": db.group_order()?}))
+}
+
+/// The favourite groups, in order: `{}` reads, `{order: [tags]}` replaces.
+pub fn tag_order(db: &Db, params: &Value) -> Result<Value> {
+    let order = match params.get("order").and_then(Value::as_array) {
+        Some(a) => {
+            let v: Vec<String> = a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            db.set_group_order(&v)?
+        }
+        None => db.group_order()?,
+    };
+    Ok(json!({"order": order}))
 }
 
 /// Rename a group (tag) on every session.

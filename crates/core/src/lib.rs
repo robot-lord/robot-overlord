@@ -6,6 +6,7 @@ pub mod import;
 pub mod models;
 pub mod names;
 pub mod paths;
+pub mod themes;
 pub mod timefmt;
 pub mod tmux;
 pub mod tmux_profile;
