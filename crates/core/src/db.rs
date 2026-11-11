@@ -294,11 +294,16 @@ impl Db {
         self.get_session_where("agent_session = ?1", agent_session)
     }
 
-    /// Every agent conversation id rlord tracks, live or archived.
+    /// Every agent conversation id rlord tracks, live or archived, including
+    /// ones a session moved on from (`/clear` starts a new conversation; the
+    /// hook logs the switch as `agent_session_changed`).
     pub fn agent_session_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT agent_session FROM sessions WHERE agent_session IS NOT NULL")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_session FROM sessions WHERE agent_session IS NOT NULL \
+             UNION SELECT json_extract(payload, '$.from') FROM events \
+             WHERE kind = 'agent_session_changed' \
+               AND json_extract(payload, '$.from') IS NOT NULL",
+        )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }

@@ -428,7 +428,8 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 match d.rpc("session.import", Value::Object(p)) {
                     Ok(s) => {
                         // Imported with its meta-context set: already reviewed.
-                        d.rpc("overlord.mark_reviewed", json!({"sessions": [s["id"]]}))?;
+                        // Best effort: the import itself succeeded either way.
+                        let _ = d.rpc("overlord.mark_reviewed", json!({"sessions": [s["id"]]}));
                         let mut row = json!({"id": id, "session": s["name"],
                                              "archived": !s["archived_at"].is_null()});
                         if !s["warning"].is_null() {

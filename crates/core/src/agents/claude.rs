@@ -327,7 +327,7 @@ pub(crate) fn read_window(path: &Path, from_end: bool) -> Option<String> {
     })
 }
 
-pub(crate) fn clip(s: &str, max: usize) -> String {
+pub fn clip(s: &str, max: usize) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= max {
         s
@@ -438,9 +438,14 @@ pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
             .map(|t| clip(t, 300));
     }
     // One prompt so far: don't repeat it. Claude's `last-prompt` record may
-    // be a truncated copy, so compare without the ellipsis.
+    // be a truncated copy ("…"), so a clipped one matches by prefix; an
+    // unclipped one must match exactly (a short "continue" is a new prompt).
     if let (Some(l), Some(f)) = (&e.last_prompt, &e.first_prompt) {
-        if f.starts_with(l.trim_end_matches('…')) {
+        let same = match l.strip_suffix('…') {
+            Some(clipped) => f.starts_with(clipped),
+            None => l == f,
+        };
+        if same {
             e.last_prompt = None;
         }
     }

@@ -949,7 +949,7 @@ fn import_cmd(
                 rel_age(c["last_active_at"].as_i64()),
                 dir,
                 flags,
-                clip_line(what, 100),
+                claude::clip(what, 100),
             );
         }
         println!(
@@ -998,17 +998,14 @@ fn resolve_conversation(id: &str) -> Result<String> {
     if id.len() == 36 {
         return Ok(id.to_string());
     }
-    // Any age: the listing's window shouldn't decide what a prefix matches.
-    let r = call(
-        "session.import_scan",
-        json!({"since_days": 36500, "limit": 200}),
-    )?;
+    // Matched by prefix in the daemon, at any age: the listing's window and
+    // limit shouldn't decide what a prefix finds.
+    let r = call("session.import_scan", json!({"ids": [id], "limit": 200}))?;
     let hits: Vec<String> = r["candidates"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|c| c["agent_session"].as_str())
-        .filter(|c| c.starts_with(id))
         .map(str::to_string)
         .collect();
     match hits.as_slice() {
@@ -1032,15 +1029,6 @@ fn resolve_conversation(id: &str) -> Result<String> {
             "'{id}' matches {} conversations; use more of the id",
             hits.len()
         ),
-    }
-}
-
-fn clip_line(s: &str, max: usize) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
 

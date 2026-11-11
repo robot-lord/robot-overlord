@@ -2,13 +2,14 @@
 //! track yet (see `rlord_core::import`). Plain code, no AI: the overlord's
 //! `rlord-import` subagent decides which are worth importing.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::import::{scan_claude, ScanOpts};
+use rlord_core::git;
+use rlord_core::import::{add_git_info, scan_claude, ScanOpts};
 use rlord_core::types::now_ms;
 
-use crate::methods::str_list;
+use crate::methods::{self, p_str, str_list};
 use crate::Daemon;
 
 const HOUR_MS: i64 = 3_600_000;
@@ -56,5 +57,41 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
         });
         found.truncate(limit);
     }
+    found.iter_mut().for_each(add_git_info);
     Ok(json!({"count": found.len(), "candidates": found}))
+}
+
+/// `session.import`: import one conversation (`agent_session`: its id) as a
+/// stopped session. Scanning and recreating a worktree run without the DB
+/// lock; only the insert holds it.
+pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
+    let sid = p_str(params, "agent_session")?.trim().to_string();
+    let agent = params["agent"].as_str().unwrap_or("claude");
+    if agent != "claude" {
+        bail!("importing '{agent}' conversations isn't supported yet (claude only)");
+    }
+    if sid.len() != 36 {
+        bail!("give the full conversation id");
+    }
+    if let Some(s) = d.db().session_by_agent_session(&sid)? {
+        bail!("already in rlord as '{}'", s.name);
+    }
+    let opts = ScanOpts {
+        only: vec![sid.clone()],
+        ..Default::default()
+    };
+    let mut c = scan_claude(&opts, &|_| false)
+        .into_iter()
+        .next()
+        .with_context(|| format!("no importable Claude conversation {sid}"))?;
+    add_git_info(&mut c);
+    let mut recreated = false;
+    if !c.dir_exists && c.recreatable && params["recreate_worktree"].as_bool() == Some(true) {
+        if let (Some(repo), Some(branch)) = (&c.repo, &c.branch) {
+            git::worktree_add(repo, branch, std::path::Path::new(&c.cwd))
+                .with_context(|| format!("recreating the worktree at {}", c.cwd))?;
+            recreated = true;
+        }
+    }
+    methods::import_candidate(&d.db(), &c, params, recreated)
 }

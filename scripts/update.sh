@@ -42,7 +42,8 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 gh release download "$tag" -R "$repo" -p '*-aarch64-apple-darwin.tar.gz' -D "$d"
 tar -xzf "$d"/*.tar.gz -C "$d"
-"$d"/rlord-*/install.sh "${force[@]}"
+# ${a[@]+...}: an empty array under `set -u` is an error in macOS's bash 3.2.
+"$d"/rlord-*/install.sh ${force[@]+"${force[@]}"}
 
 # Running daemons restart on the new binary at the next rlord command; an
 # open list keeps running the old one until reset.

@@ -280,7 +280,6 @@ impl Daemon {
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config, &params),
-            "session.import" => methods::session_import(&db, &params),
             "repo.list" => methods::repo_list(&db, &self.config),
             "repo.find" => {
                 let scanned = self.scanned_repos();
@@ -345,6 +344,13 @@ impl Daemon {
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
             "session.import_scan" => import::scan(self, params),
+            "session.import" => {
+                let r = import::import(self, params);
+                if r.is_ok() {
+                    self.changed();
+                }
+                r
+            }
             "overlord.ask" => ask::ask(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),

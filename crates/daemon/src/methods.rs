@@ -374,33 +374,20 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(s)?)
 }
 
-/// Import an agent conversation rlord doesn't track yet (found by
-/// `session.import_scan`) as a stopped session that resumes it.
-pub fn session_import(db: &Db, params: &Value) -> Result<Value> {
-    let sid = p_str(params, "agent_session")?.trim();
-    let agent = params["agent"].as_str().unwrap_or("claude");
-    if agent != "claude" {
-        bail!("importing '{agent}' conversations isn't supported yet (claude only)");
-    }
-    if let Some(s) = db.session_by_agent_session(sid)? {
-        bail!("already in rlord as '{}'", s.name);
-    }
-    let opts = rlord_core::import::ScanOpts {
-        only: vec![sid.to_string()],
-        ..Default::default()
-    };
-    let c = rlord_core::import::scan_claude(&opts, &|_| false)
-        .into_iter()
-        .next()
-        .with_context(|| format!("no importable Claude conversation {sid}"))?;
-    import_candidate(db, &c, params)
-}
-
+/// Add an importable conversation (see `import::import`, which finds it and
+/// recreates its worktree outside the DB lock) as a stopped session that
+/// resumes it. `recreated`: its missing folder was just recreated.
 pub(crate) fn import_candidate(
     db: &Db,
     c: &rlord_core::import::Candidate,
     params: &Value,
+    recreated: bool,
 ) -> Result<Value> {
+    // Checked again here, under the lock: two imports of one conversation
+    // may race through the unlocked scan.
+    if let Some(s) = db.session_by_agent_session(&c.agent_session)? {
+        bail!("already in rlord as '{}'", s.name);
+    }
     let p_opt = |k: &str| {
         params
             .get(k)
@@ -409,15 +396,8 @@ pub(crate) fn import_candidate(
             .filter(|v| !v.is_empty())
     };
     let archive = params["archive"].as_bool().unwrap_or(false);
-    let recreate = params["recreate_worktree"].as_bool().unwrap_or(false);
-    let mut recreated = false;
-    if !c.dir_exists {
-        match (&c.repo, &c.branch) {
-            (Some(repo), Some(branch)) if recreate && c.recreatable => {
-                git::worktree_add(repo, branch, std::path::Path::new(&c.cwd))
-                    .with_context(|| format!("recreating the worktree at {}", c.cwd))?;
-                recreated = true;
-            }
+    if !c.dir_exists && !recreated {
+        match () {
             _ if archive => {} // history only: it can't be resumed
             _ if c.recreatable => bail!(
                 "{} is gone; pass recreate_worktree (branch {} still exists) or archive",
@@ -883,7 +863,7 @@ mod tests {
         let c = candidate("/repo/.worktrees/feat-x", true);
         let p = json!({"name": "login-fix", "description": "fixing login",
                        "tags": ["#web"], "notes": "PR #7"});
-        let out = import_candidate(&db, &c, &p).unwrap();
+        let out = import_candidate(&db, &c, &p, false).unwrap();
         assert!(out["warning"].is_string(), "open elsewhere must warn");
         let s = db.resolve_ref("login-fix").unwrap();
         assert_eq!(s.status, Status::Stopped);
@@ -915,7 +895,7 @@ mod tests {
     fn import_of_a_gone_folder_needs_archive() {
         let db = Db::open_in_memory().unwrap();
         let c = candidate("/nonexistent/rlord-import-test", false);
-        let e = import_candidate(&db, &c, &json!({}))
+        let e = import_candidate(&db, &c, &json!({}), false)
             .unwrap_err()
             .to_string();
         assert!(e.contains("archive"), "{e}");
@@ -923,7 +903,9 @@ mod tests {
             db.agent_session_ids().unwrap().is_empty(),
             "nothing written on refusal"
         );
-        import_candidate(&db, &c, &json!({"archive": true})).unwrap();
+        import_candidate(&db, &c, &json!({"archive": true}), false).unwrap();
+        let again = import_candidate(&db, &c, &json!({"archive": true}), false);
+        assert!(again.unwrap_err().to_string().contains("already in rlord"));
         let s = db
             .session_by_agent_session(&c.agent_session)
             .unwrap()

@@ -62,7 +62,8 @@ pub struct ScanOpts {
     pub since_ms: i64,
     /// Max candidates, most recently active first. 0 = no limit.
     pub limit: usize,
-    /// Only these conversation ids (ignores `since_ms`).
+    /// Only conversations whose id starts with one of these (full ids or
+    /// prefixes; ignores `since_ms`).
     pub only: Vec<String>,
 }
 
@@ -70,7 +71,8 @@ pub struct ScanOpts {
 const RECENT_WRITE: Duration = Duration::from_secs(10 * 60);
 
 /// Scan Claude Code's transcripts. `tracked` says whether rlord already has
-/// a session for a conversation id; those are skipped.
+/// a session for a conversation id; those are skipped. Git details are left
+/// empty: call `add_git_info` on the candidates you keep.
 pub fn scan_claude(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candidate> {
     let projects = claude::config_dir().join("projects");
     let procs = process_commands();
@@ -107,7 +109,7 @@ pub fn scan_claude_in(
             if uuid::Uuid::parse_str(id).is_err() || tracked(id) {
                 continue;
             }
-            if !opts.only.is_empty() && !opts.only.iter().any(|o| o == id) {
+            if !opts.only.is_empty() && !opts.only.iter().any(|o| id.starts_with(o.as_str())) {
                 continue;
             }
             let mtime = f.metadata().and_then(|m| m.modified()).ok().map(ms_epoch);
@@ -192,25 +194,6 @@ fn candidate(
         .map(str::to_string);
 
     let dir_exists = Path::new(&cwd).is_dir();
-    let (repo, worktree, recreatable) = if dir_exists {
-        let repo = git::main_repo_root(&cwd);
-        let canon = std::fs::canonicalize(&cwd)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| cwd.clone());
-        let worktree = repo.as_deref().is_some_and(|r| r != canon);
-        (repo, worktree, false)
-    } else {
-        // The folder is gone (a removed worktree). If an ancestor is still a
-        // repo with the branch, the worktree can come back where it was.
-        let repo = nearest_existing(Path::new(&cwd))
-            .and_then(|p| git::main_repo_root(&p.to_string_lossy()));
-        let recreatable = match (&repo, &branch) {
-            (Some(r), Some(b)) => git::branch_exists(r, b),
-            _ => false,
-        };
-        let worktree = repo.is_some();
-        (repo, worktree, recreatable)
-    };
 
     let recently_written =
         mtime.is_some_and(|m| ms_epoch(SystemTime::now()) - m < RECENT_WRITE.as_millis() as i64);
@@ -220,10 +203,11 @@ fn candidate(
         transcript: path.to_string_lossy().into_owned(),
         cwd,
         dir_exists,
-        repo,
+        // Filled by `add_git_info`, only for the rows a caller keeps.
+        repo: None,
         branch,
-        worktree,
-        recreatable,
+        worktree: false,
+        recreatable: false,
         title: ex.title,
         first_prompt: ex.first_prompt,
         last_prompt: ex.last_prompt,
@@ -234,9 +218,36 @@ fn candidate(
         last_active_at,
         last_user_at: last_of("user"),
         last_agent_at: last_of("assistant"),
-        open_elsewhere: procs.contains(id),
+        open_elsewhere: procs.lines().any(|l| l.contains(id)),
         recently_written,
     })
+}
+
+/// Fill in `repo`, `worktree` and `recreatable` (git subprocesses, so only
+/// for the candidates a caller keeps, not every transcript scanned).
+pub fn add_git_info(c: &mut Candidate) {
+    if c.dir_exists {
+        c.repo = git::main_repo_root(&c.cwd);
+        // A worktree has its own top level; a subfolder of the main checkout
+        // shares the main one.
+        let top = git::repo_root(&c.cwd)
+            .and_then(|t| std::fs::canonicalize(t).ok())
+            .map(|t| t.to_string_lossy().into_owned());
+        c.worktree = matches!((&c.repo, &top), (Some(r), Some(t)) if r != t);
+        c.recreatable = false;
+    } else {
+        // The folder is gone (a removed worktree?). If an ancestor is still
+        // in a repo that has the branch, and no checkout has it (a subfolder
+        // of the main checkout would: its branch is checked out there), the
+        // worktree can come back where it was.
+        c.repo = nearest_existing(Path::new(&c.cwd))
+            .and_then(|p| git::main_repo_root(&p.to_string_lossy()));
+        c.recreatable = match (&c.repo, &c.branch) {
+            (Some(r), Some(b)) => git::branch_exists(r, b) && !git::branch_checked_out(r, b),
+            _ => false,
+        };
+        c.worktree = c.recreatable;
+    }
 }
 
 /// rlord's data dir (the overlord's folder) and the temp dirs.
@@ -258,14 +269,22 @@ fn nearest_existing(p: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Every running process's command line, one per line ("" if `ps` fails).
+/// Every running process's command line, one per line ("" if `ps` fails),
+/// leaving out rlord's own: `rlord import <id>` names the id it imports.
 fn process_commands() -> String {
-    std::process::Command::new("ps")
+    let out = std::process::Command::new("ps")
         .args(["-axo", "command="])
         .stderr(std::process::Stdio::null())
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    out.lines()
+        .filter(|l| {
+            let argv0 = l.split_whitespace().next().unwrap_or("");
+            Path::new(argv0).file_name().is_none_or(|n| n != "rlord")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn ms_epoch(t: SystemTime) -> i64 {
@@ -373,8 +392,9 @@ mod tests {
 
         // Tracked conversations are skipped; `only` ignores the time window.
         assert!(scan_claude_in(&projects, &opts, &|id| id == ID_A, "", &[]).is_empty());
+        // A prefix works too (`rlord import 22222222`).
         let only = ScanOpts {
-            only: vec![ID_B.into()],
+            only: vec![ID_B[..8].into()],
             ..Default::default()
         };
         let found = scan_claude_in(&projects, &only, &|_| false, "", &[]);
@@ -395,5 +415,80 @@ mod tests {
         assert!(p.exists());
         let found = scan_claude_in(&projects, &ScanOpts::default(), &|_| false, "", &[]);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn subfolder_of_main_checkout_is_not_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
+        let sub = repo.join("crates");
+        std::fs::create_dir_all(&sub).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-C", repo.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        git(&["worktree", "add", "-q", "-b", "feat", ".worktrees/feat"]);
+        let wt = repo.join(".worktrees/feat");
+
+        let mut c = Candidate {
+            agent: "claude".into(),
+            agent_session: ID_A.into(),
+            transcript: String::new(),
+            cwd: sub.to_string_lossy().into_owned(),
+            dir_exists: true,
+            repo: None,
+            branch: Some("main".into()),
+            worktree: false,
+            recreatable: false,
+            title: None,
+            first_prompt: None,
+            last_prompt: None,
+            last_reply: None,
+            pr_url: None,
+            entrypoint: None,
+            started_at: None,
+            last_active_at: 0,
+            last_user_at: None,
+            last_agent_at: None,
+            open_elsewhere: false,
+            recently_written: false,
+        };
+        add_git_info(&mut c);
+        assert_eq!(c.repo.as_deref(), repo.to_str());
+        assert!(!c.worktree, "a subfolder of the main checkout");
+
+        c.cwd = wt.to_string_lossy().into_owned();
+        add_git_info(&mut c);
+        assert!(c.worktree);
+
+        // Gone: a deleted subfolder's branch (main) is checked out, so it
+        // can't come back as a worktree; a removed worktree's branch can.
+        c.cwd = sub.join("gone").to_string_lossy().into_owned();
+        c.dir_exists = false;
+        add_git_info(&mut c);
+        assert!(!c.recreatable);
+        git(&["worktree", "remove", ".worktrees/feat"]);
+        c.cwd = wt.to_string_lossy().into_owned();
+        c.branch = Some("feat".into());
+        add_git_info(&mut c);
+        assert!(c.recreatable && c.worktree);
     }
 }
