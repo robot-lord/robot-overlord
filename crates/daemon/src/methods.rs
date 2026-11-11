@@ -74,8 +74,18 @@ pub fn session_unarchive(db: &Db, params: &Value) -> Result<Value> {
     Ok(json!({"unarchived": s.id}))
 }
 
+/// The overlord's row is fixed: always on top, never renamed, grouped,
+/// described, annotated or archived. Its meta-context is its instructions.
+fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
+    if s.role == "overlord" {
+        bail!("the overlord can't be {what}");
+    }
+    Ok(())
+}
+
 pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    refuse_overlord(&s, "renamed")?;
     let name = p_str(params, "name")?;
     if name.trim().is_empty() {
         bail!("name must not be empty");
@@ -98,7 +108,12 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    for t in str_list(params, "add") {
+    let add = str_list(params, "add");
+    // Removing stays allowed, so tags it got before its row was fixed can go.
+    if !add.is_empty() {
+        refuse_overlord(&s, "tagged (it isn't in any group)")?;
+    }
+    for t in add {
         db.add_tag(&s.id, &t)?;
     }
     for t in str_list(params, "remove") {
@@ -132,6 +147,7 @@ pub fn tag_rename(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_describe(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    refuse_overlord(&s, "given a description")?;
     let d = params
         .get("description")
         .and_then(Value::as_str)
@@ -149,6 +165,7 @@ pub fn session_describe(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    refuse_overlord(&s, "given notes")?;
     let n = params.get("notes").and_then(Value::as_str).unwrap_or("");
     db.set_notes(&s.id, n.trim_end())?;
     db.insert_event(
@@ -166,6 +183,10 @@ pub fn session_pin(db: &Db, params: &Value) -> Result<Value> {
         .get("pinned")
         .and_then(Value::as_bool)
         .context("missing bool param 'pinned'")?;
+    // Unpinning stays allowed, to clear a pin from before its row was fixed.
+    if pinned {
+        refuse_overlord(&s, "pinned (it always sits on top)")?;
+    }
     db.set_pinned(&s.id, pinned)?;
     Ok(json!({"id": s.id, "pinned": pinned}))
 }
@@ -452,6 +473,7 @@ pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    refuse_overlord(&s, "archived (stop it instead)")?;
     if let Some(t) = &s.tmux_session {
         tmux::kill_session(t)?;
     }
@@ -643,4 +665,56 @@ pub fn reconcile(db: &Db) -> Result<()> {
 /// work regardless of PATH.
 pub fn hook_command() -> String {
     format!("{} hook emit claude", rlord_bin())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlord_row_is_fixed() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&NewSession {
+            id: "01o",
+            name: "overlord",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp/o",
+            tmux_session: "rlord-test-overlord",
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "overlord",
+        })
+        .unwrap();
+        let r = json!({"ref": "01o"});
+        let with = |k: &str, v: Value| {
+            let mut p = r.clone();
+            p[k] = v;
+            p
+        };
+        // Each guard runs before any side effect (DB write or tmux call).
+        for (what, res) in [
+            ("rename", session_rename(&db, &with("name", json!("boss")))),
+            ("pin", session_pin(&db, &with("pinned", json!(true)))),
+            (
+                "describe",
+                session_describe(&db, &with("description", json!("x"))),
+            ),
+            ("notes", session_notes(&db, &with("notes", json!("x")))),
+            ("tag", session_tag(&db, &with("add", json!(["wip"])))),
+            ("archive", session_archive(&db, &r)),
+        ] {
+            let e = res.expect_err(what).to_string();
+            assert!(e.starts_with("the overlord can't be"), "{what}: {e}");
+        }
+        // Clearing tags or a pin from before the row was fixed still works.
+        session_tag(&db, &with("remove", json!(["wip"]))).unwrap();
+        session_pin(&db, &with("pinned", json!(false))).unwrap();
+        let s = db.resolve_ref("01o").unwrap();
+        assert_eq!(s.name, "overlord");
+        assert!(!s.pinned && s.tags.is_empty() && s.archived_at.is_none());
+    }
 }

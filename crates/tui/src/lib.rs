@@ -279,10 +279,9 @@ impl App {
             Line::from(""),
             Line::from("  Quit rlord? Your sessions keep running.").bold(),
             Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                key("y/enter".into(), "quit"),
-                key("any key".into(), "stay"),
+            keys_line(&[
+                ("y/enter", "quit", Cap::Context),
+                ("any key", "stay", Cap::Global),
             ]),
         ];
         f.render_widget(
@@ -532,8 +531,20 @@ impl App {
             Action::Attach => self.attach(terminal)?,
             Action::Restart => self.action("session.restart", "restarted"),
             Action::Stop => self.action("session.stop", "stopped"),
-            Action::Archive if self.selected_is_overlord() => {
-                self.status_line = "the overlord can't be archived (s stops it)".into();
+            // One rule for the overlord's row, mirrored by `context_legend`
+            // (which never offers these keys for it) and enforced again by
+            // the daemon.
+            Action::Archive
+            | Action::Rename
+            | Action::Pin
+            | Action::Describe
+            | Action::Notes
+            | Action::Tags
+                if self.selected_is_overlord() =>
+            {
+                self.status_line =
+                    "the overlord's row is fixed: it can only be attached, restarted or stopped"
+                        .into();
             }
             Action::Archive => self.action("session.archive", "archived"),
             Action::Overlord => self.show_overlord(),
@@ -584,9 +595,6 @@ impl App {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
             }),
-            Action::Tags if self.selected_is_overlord() => {
-                self.status_line = "the overlord isn't grouped".into();
-            }
             Action::Tags => {
                 if let Some(s) = self.selected() {
                     let cur = s["tags"]
@@ -1288,21 +1296,47 @@ impl App {
                 Some("overlord — see dialog".to_string())
             }
         };
-        let line1 = match prompt {
-            Some(p) => Line::from(Span::styled(p, Style::default().fg(Color::Yellow))),
-            None => Line::from(
-                self.keys
-                    .legend()
-                    .into_iter()
-                    .map(|(k, label)| key(k, label))
-                    .collect::<Vec<_>>(),
-            ),
-        };
         let line2 = Line::from(Span::styled(
             self.status_line.clone(),
             Style::default().fg(Color::Gray),
         ));
-        f.render_widget(Paragraph::new(vec![line1, line2]), area);
+        let [line1_area, line2_area] =
+            RLayout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        f.render_widget(Paragraph::new(line2), line2_area);
+        if let Some(p) = prompt {
+            let line1 = Line::from(Span::styled(p, Style::default().fg(Color::Yellow)));
+            f.render_widget(Paragraph::new(line1), line1_area);
+            return;
+        }
+        // Keys that always work sit on the left; keys for what's highlighted
+        // sit on the right after a divider, and only the ones that apply.
+        let global = Line::from(
+            self.keys
+                .global_legend()
+                .into_iter()
+                .flat_map(|(k, label)| keycap(&k, label, Cap::Global))
+                .collect::<Vec<_>>(),
+        );
+        let ctx = self.keys.labelled(&context_legend(
+            self.tab == Tab::Groups && self.group_focus,
+            self.group_sel.as_deref(),
+            self.selected(),
+        ));
+        // The divider sits at a fixed column: the right slot is as wide as
+        // the longest row-key set, and row keys fill it from the left, so
+        // moving the highlight never shifts it.
+        // Too narrow for both: the global keys keep their full width (quit,
+        // new and the overlord must stay findable) and row keys get the rest.
+        let slot = self.keys.slot_width;
+        let global_w = u16::try_from(global.width()).unwrap_or(u16::MAX);
+        let constraints = if line1_area.width >= global_w.saturating_add(slot) {
+            [Constraint::Min(0), Constraint::Length(slot)]
+        } else {
+            [Constraint::Length(global_w), Constraint::Min(0)]
+        };
+        let [left, right] = RLayout::horizontal(constraints).areas(line1_area);
+        f.render_widget(Paragraph::new(global), left);
+        f.render_widget(Paragraph::new(context_line(ctx)), right);
     }
 }
 
@@ -1327,8 +1361,43 @@ impl InputKind {
     }
 }
 
-fn key(k: String, label: &str) -> Span<'static> {
-    Span::raw(format!("{k}:{label} ")).fg(Color::Cyan)
+/// Keycap colour: neutral for keys that always work, the accent (the
+/// active tab's cyan) for keys acting on the highlighted row.
+#[derive(Clone, Copy)]
+enum Cap {
+    Global,
+    Context,
+}
+
+/// The footer's right slot: divider, then the row keys as accent keycaps.
+fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
+    let mut spans = vec![Span::raw("│  ").fg(Color::DarkGray)];
+    spans.extend(
+        ctx.into_iter()
+            .flat_map(|(k, label)| keycap(&k, label, Cap::Context)),
+    );
+    Line::from(spans)
+}
+
+/// A dialog's row of key hints, indented to match its text.
+fn keys_line(items: &[(&str, &str, Cap)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for &(k, label, cap) in items {
+        spans.extend(keycap(k, label, cap));
+    }
+    Line::from(spans)
+}
+
+/// A key hint as a padded keycap chip, then its label: ` n  new   `.
+fn keycap(k: &str, label: &str, cap: Cap) -> [Span<'static>; 2] {
+    let chip = match cap {
+        Cap::Global => Style::default().fg(Color::White).bg(Color::DarkGray),
+        Cap::Context => Style::default().fg(Color::Black).bg(Color::Cyan),
+    };
+    [
+        Span::styled(format!(" {k} "), chip.bold()),
+        Span::styled(format!(" {label}  "), Style::default().fg(Color::Gray)),
+    ]
 }
 
 fn status_style(status: &str) -> Style {
@@ -1466,6 +1535,8 @@ impl KeyBinding {
 
 struct KeyMap {
     bindings: Vec<(Action, KeyBinding)>,
+    /// Width of the footer's right slot (see `context_slot_width`).
+    slot_width: u16,
 }
 
 impl KeyMap {
@@ -1504,7 +1575,12 @@ impl KeyMap {
         // Arrow keys always work for movement, alongside whatever is configured.
         bindings.push((Action::Up, KeyBinding::parse("up")?));
         bindings.push((Action::Down, KeyBinding::parse("down")?));
-        Ok(KeyMap { bindings })
+        let mut km = KeyMap {
+            bindings,
+            slot_width: 0,
+        };
+        km.slot_width = km.context_slot_width();
+        Ok(km)
     }
 
     fn action(&self, k: &ratatui::crossterm::event::KeyEvent) -> Option<Action> {
@@ -1522,30 +1598,102 @@ impl KeyMap {
             .unwrap_or_default()
     }
 
-    fn legend(&self) -> Vec<(String, &'static str)> {
-        [
+    /// Keys that work whatever is highlighted.
+    fn global_legend(&self) -> Vec<(String, &'static str)> {
+        self.labelled(&[
             (Action::Overlord, "overlord"),
             (Action::SwitchTab, "sessions/groups"),
-            (Action::Attach, "attach"),
             (Action::New, "new"),
             (Action::NewManual, "new (manual)"),
-            (Action::Restart, "restart"),
-            (Action::Stop, "stop"),
-            (Action::Archive, "archive"),
-            (Action::Unarchive, "unarchive"),
-            (Action::Rename, "rename"),
-            (Action::Pin, "pin"),
-            (Action::Tags, "tags"),
             (Action::ReverseSort, "reverse"),
             (Action::ToggleLog, "log"),
-            (Action::Describe, "describe"),
-            (Action::Notes, "notes"),
             (Action::Quit, "quit"),
-        ]
-        .into_iter()
-        .map(|(a, l)| (self.label(a), l))
-        .collect()
+        ])
     }
+
+    /// Width of the footer's right slot: the widest row-key set any row can
+    /// produce. Measured over every row shape (configured keys can make
+    /// either of archive/unarchive or pin/unpin the wider one), once.
+    fn context_slot_width(&self) -> u16 {
+        let mut w = 0;
+        for status in ["working", "stopped"] {
+            for archived in [Value::Null, json!(1)] {
+                for pinned in [false, true] {
+                    let s = json!({"status": status, "agent": "claude", "agent_session": "x",
+                                   "archived_at": archived, "pinned": pinned, "role": ""});
+                    let line = context_line(self.labelled(&context_legend(false, None, Some(&s))));
+                    w = w.max(line.width());
+                }
+            }
+        }
+        u16::try_from(w).unwrap_or(u16::MAX)
+    }
+
+    fn labelled(&self, actions: &[(Action, &'static str)]) -> Vec<(String, &'static str)> {
+        actions.iter().map(|&(a, l)| (self.label(a), l)).collect()
+    }
+}
+
+/// Keys that apply to what's highlighted, in footer order: a group (groups
+/// tab, group column focused) or a session row. Only what the handler would
+/// actually do for that row is listed: archive xor unarchive, stop only
+/// while running, nothing the overlord refuses.
+fn context_legend(
+    group_focus: bool,
+    group: Option<&str>,
+    session: Option<&Value>,
+) -> Vec<(Action, &'static str)> {
+    if group_focus {
+        let mut v = Vec::new();
+        if let Some(g) = group {
+            v.push((Action::Attach, "open"));
+            if g != groups::UNTAGGED {
+                v.push((Action::Rename, "rename group"));
+            }
+        }
+        return v;
+    }
+    let Some(s) = session else {
+        return Vec::new();
+    };
+    let overlord = s["role"] == "overlord";
+    let stopped = s["status"] == "stopped" || s["status"].is_null();
+    let archived = !s["archived_at"].is_null();
+    // Resuming (Enter on a stopped row) and restarting both need a
+    // conversation the agent can resume.
+    let resumable = s["agent"] == "claude" && !s["agent_session"].is_null();
+    let mut v = Vec::new();
+    if !stopped {
+        v.push((Action::Attach, "attach"));
+        if resumable {
+            v.push((Action::Restart, "restart"));
+        }
+        v.push((Action::Stop, "stop"));
+    } else if resumable {
+        v.push((Action::Attach, "resume"));
+    }
+    if overlord {
+        // Its row is fixed: no name, pin, tags, description, notes, archive.
+        return v;
+    }
+    if archived {
+        v.push((Action::Unarchive, "unarchive"));
+    } else {
+        v.push((Action::Archive, "archive"));
+    }
+    v.push((Action::Rename, "rename"));
+    v.push((
+        Action::Pin,
+        if s["pinned"].as_bool().unwrap_or(false) {
+            "unpin"
+        } else {
+            "pin"
+        },
+    ));
+    v.push((Action::Tags, "tags"));
+    v.push((Action::Describe, "describe"));
+    v.push((Action::Notes, "notes"));
+    v
 }
 
 #[cfg(test)]
@@ -1563,6 +1711,118 @@ mod tests {
         assert!(KeyBinding::parse("alt-tab").unwrap().alt);
         assert!(KeyBinding::parse("bogus-key").is_err());
         assert!(KeyMap::from_config(&Keys::default()).is_ok());
+    }
+
+    fn labels(v: &[(Action, &str)]) -> Vec<String> {
+        v.iter().map(|(_, l)| l.to_string()).collect()
+    }
+
+    #[test]
+    fn context_legend_lists_only_what_applies() {
+        let running = json!({"status": "working", "agent": "claude", "agent_session": "x",
+                             "archived_at": null, "pinned": false, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&running))),
+            [
+                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
+                "notes"
+            ]
+        );
+        let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
+                              "archived_at": 1, "pinned": true, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&archived))),
+            [
+                "resume",
+                "unarchive",
+                "rename",
+                "unpin",
+                "tags",
+                "describe",
+                "notes"
+            ]
+        );
+        let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
+                              "archived_at": null, "pinned": false, "role": "overlord"});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&overlord))),
+            ["attach", "restart", "stop"]
+        );
+        // No conversation to resume: Enter and restart would only error.
+        let fresh = json!({"status": "stopped", "agent": "codex", "archived_at": null,
+                           "pinned": false, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&fresh)))[0],
+            "archive"
+        );
+        assert!(context_legend(false, None, None).is_empty());
+        assert_eq!(
+            labels(&context_legend(true, Some("wip"), Some(&running))),
+            ["open", "rename group"]
+        );
+        assert_eq!(
+            labels(&context_legend(true, Some(groups::UNTAGGED), None)),
+            ["open"]
+        );
+    }
+
+    fn footer_row(app: &App, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, 2)).unwrap();
+        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+        (0..width)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn footer_divider_is_fixed_and_lists_only_applicable_keys() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![
+            json!({"status": "stopped", "archived_at": 1, "pinned": false, "role": "",
+                   "agent": "claude", "agent_session": "y"}),
+            json!({"status": "working", "archived_at": null, "pinned": false, "role": "",
+                   "agent": "claude", "agent_session": "x"}),
+        ];
+        let col = |row: &str| row.chars().position(|c| c == '│').expect("divider");
+        app.table.select(Some(0));
+        let archived = footer_row(&app, 240);
+        app.table.select(Some(1));
+        let running = footer_row(&app, 240);
+        app.table.select(None);
+        let none = footer_row(&app, 240);
+        assert_eq!(col(&archived), col(&running), "\n{archived}\n{running}");
+        assert_eq!(col(&archived), col(&none));
+
+        let (left, right) = archived.split_once('│').unwrap();
+        assert!(
+            left.contains(" new ") && left.contains(" quit "),
+            "{archived}"
+        );
+        assert!(
+            right.contains(" unarchive ") && right.contains(" resume "),
+            "{archived}"
+        );
+        assert!(
+            !right.contains(" stop ") && !right.contains(" archive "),
+            "{archived}"
+        );
+        let (_, right) = running.split_once('│').unwrap();
+        assert!(
+            right.contains(" stop ") && right.contains(" archive "),
+            "{running}"
+        );
+        assert!(!right.contains("unarchive"), "{running}");
+
+        // Narrower than both halves: the global keys stay whole.
+        app.table.select(Some(1));
+        let narrow = footer_row(&app, 120);
+        assert!(
+            narrow.contains(" new ") && narrow.contains(" quit ") && narrow.contains(" overlord "),
+            "{narrow}"
+        );
     }
 }
 

@@ -279,11 +279,10 @@ impl App {
                 Span::styled(resolves, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                key("enter".into(), "launch"),
-                key("j/k".into(), "model"),
-                key("esc".into(), "later"),
+            keys_line(&[
+                ("enter", "launch", Cap::Context),
+                ("j/k", "model", Cap::Global),
+                ("esc", "later", Cap::Global),
             ]),
         ];
         if let Some(e) = &s.error {
@@ -318,8 +317,8 @@ impl App {
             )),
             Line::from(format!("  {}", u.note)),
             Line::from(""),
-            Line::from(vec![Span::raw("  "), key("enter".into(), &action)]),
-            Line::from(vec![Span::raw("  "), key("esc".into(), "keep it")]),
+            keys_line(&[("enter", &action, Cap::Context)]),
+            keys_line(&[("esc", "keep it", Cap::Global)]),
         ];
         if let Some(e) = &u.error {
             lines.push(Line::from(Span::styled(
