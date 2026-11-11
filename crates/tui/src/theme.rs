@@ -67,9 +67,13 @@ pub fn muted() -> Style {
 }
 
 /// The logo's colours, the same in every theme: (crown: dark gold, robot:
-/// dark red).
-pub fn logo() -> (Color, Color) {
-    (Color::Rgb(201, 150, 24), Color::Rgb(150, 28, 36))
+/// dark red, eyes: light gold).
+pub fn logo() -> (Color, Color, Color) {
+    (
+        Color::Rgb(201, 150, 24),
+        Color::Rgb(150, 28, 36),
+        Color::Rgb(255, 214, 102),
+    )
 }
 
 pub fn faint() -> Style {
