@@ -15,15 +15,17 @@ jobs:
         with:
           fetch-depth: 0
       - run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}" HEAD
+  # Linux on purpose: nothing here needs macOS, and macOS minutes cost 10x.
+  # Release binaries are built locally (scripts/release.sh), not in CI.
   check:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: brew install tmux
+      - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
