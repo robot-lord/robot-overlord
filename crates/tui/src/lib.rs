@@ -1317,11 +1317,15 @@ impl App {
                 .flat_map(|(k, label)| keycap(&k, label, Cap::Global))
                 .collect::<Vec<_>>(),
         );
-        let ctx = self.keys.labelled(&context_legend(
+        let mut ctx = self.keys.labelled(&context_legend(
             self.tab == Tab::Groups && self.group_focus,
             self.group_sel.as_deref(),
             self.selected(),
         ));
+        // Inside a group, say how to get back out.
+        if self.tab == Tab::Groups && !self.group_focus {
+            ctx.insert(0, (self.keys.label(Action::Cancel), "groups"));
+        }
         // The divider sits at a fixed column: the right slot is as wide as
         // the longest row-key set, and row keys fill it from the left, so
         // moving the highlight never shifts it.
@@ -1626,7 +1630,12 @@ impl KeyMap {
                 }
             }
         }
-        u16::try_from(w).unwrap_or(u16::MAX)
+        // Inside a group the footer also leads with "esc groups".
+        let back: usize = keycap(&self.label(Action::Cancel), "groups", Cap::Context)
+            .iter()
+            .map(|s| s.width())
+            .sum();
+        u16::try_from(w + back).unwrap_or(u16::MAX)
     }
 
     fn labelled(&self, actions: &[(Action, &'static str)]) -> Vec<(String, &'static str)> {
