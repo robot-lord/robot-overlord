@@ -8,6 +8,7 @@ pub mod profile;
 pub mod rpc;
 pub mod triage;
 pub mod ui;
+pub mod warm;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,8 @@ pub struct Daemon {
     /// clear its successor).
     pub(crate) overlay: Mutex<Option<(String, u64)>>,
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
+    /// Background loading of sessions' sub-agent data (see warm.rs).
+    pub(crate) warm: warm::Warm,
 }
 
 impl Daemon {
@@ -60,6 +63,7 @@ impl Daemon {
             tui_subscribers: AtomicUsize::new(0),
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
+            warm: Default::default(),
         })
     }
 
@@ -285,7 +289,6 @@ impl Daemon {
                 | "session.log"
                 | "repo.list"
                 | "repo.find"
-                | "session.subagents"
                 | "session.defaults"
                 | "tag.list"
         ) && !(method == "tag.order" && params.get("order").is_none());
@@ -315,7 +318,6 @@ impl Daemon {
             "session.notes" => methods::session_notes(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
-            "session.subagents" => methods::session_subagents(&db, &params),
             "hook.emit" => {
                 let r = methods::hook_emit(&db, &params);
                 methods::save_cursors(&db);
@@ -324,6 +326,25 @@ impl Daemon {
             _ => return Err(MethodError::NotFound),
         };
         drop(db);
+        // Rows the warm-up hasn't loaded yet say so (the list shows it).
+        let r = match (method, r) {
+            ("session.list", Ok(Value::Array(mut rows))) => {
+                for row in &mut rows {
+                    let id = row["id"].as_str().unwrap_or("");
+                    row["loading"] = json!(self.warm.is_loading(id));
+                }
+                Ok(Value::Array(rows))
+            }
+            (_, r) => r,
+        };
+        if method == "session.unarchive" && r.is_ok() {
+            if let Some(id) = params["ref"]
+                .as_str()
+                .and_then(|r| self.db().resolve_ref(r).ok())
+            {
+                self.warm.enqueue(&id.id);
+            }
+        }
         if mutating && r.is_ok() {
             self.changed();
             if method == "session.new" {
@@ -366,6 +387,7 @@ impl Daemon {
                 .overlord()
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
+            "session.subagents" => warm::session_subagents(self, params),
             "overlord.style" => {
                 overlord::style(&self.config);
                 Ok(json!({"styled": true}))

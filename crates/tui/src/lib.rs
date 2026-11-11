@@ -631,10 +631,8 @@ impl App {
                 }
             }
             Action::Notes => self.edit_notes(terminal)?,
-            Action::SessionsTab => self.switch_tab(Tab::Sessions),
-            // Inside a group, the groups tab's own place is its group list.
-            Action::GroupsTab if self.tab == Tab::Groups => self.group_focus = true,
-            Action::GroupsTab => self.switch_tab(Tab::Groups),
+            Action::SessionsTab => self.tab_step(-1),
+            Action::GroupsTab => self.tab_step(1),
             Action::SwitchTab => self.switch_tab(match self.tab {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
@@ -976,6 +974,18 @@ impl App {
         }
     }
 
+    /// `H` / `L`: one step left / right along sessions tab ⇄ group list ⇄
+    /// inside the highlighted group.
+    pub(crate) fn tab_step(&mut self, dir: i8) {
+        match (self.tab, self.group_focus, dir) {
+            (Tab::Sessions, _, 1) => self.switch_tab(Tab::Groups),
+            (Tab::Groups, true, 1) => self.group_focus = self.sessions.is_empty(),
+            (Tab::Groups, true, -1) => self.switch_tab(Tab::Sessions),
+            (Tab::Groups, false, -1) => self.group_focus = true,
+            _ => {}
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame) {
         // Themes with their own background paint it under everything.
         if theme::bg().is_some() {
@@ -1095,7 +1105,13 @@ impl App {
                     },
                     Cell::from(get("name")),
                     Cell::from(Line::from(vec![
-                        theme::status_chip(&status),
+                        // Not loaded yet (the daemon's warm-up): say so
+                        // rather than show half-known data.
+                        if s["loading"] == true {
+                            Span::styled("◌ loading", theme::faint())
+                        } else {
+                            theme::status_chip(&status)
+                        },
                         Span::styled(
                             match s["agents_running"].as_i64().unwrap_or(0) {
                                 0 => String::new(),
@@ -1295,7 +1311,12 @@ impl App {
                 ),
             ]),
         ];
-        if !self.agents.is_empty() && self.preview_for == self.selected_id() {
+        if s["loading"] == true {
+            lines.push(Line::from(vec![
+                key("agents"),
+                Span::styled("◌ loading sub-agents…", theme::faint()),
+            ]));
+        } else if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
                 .agents
                 .iter()
@@ -1709,10 +1730,20 @@ impl KeyMap {
             (Action::Tags, &k.tags),
             (Action::Cancel, &k.cancel),
         ];
-        let mut bindings = Vec::with_capacity(specs.len());
+        let mut bindings: Vec<(Action, KeyBinding)> = Vec::with_capacity(specs.len());
         for (a, spec) in specs {
             bindings.push((a, KeyBinding::parse(spec)?));
         }
+        // H / L (the tab steps) are newer defaults: a user binding of the
+        // same key to anything else wins, and the step key is dropped.
+        let taken = |b: &KeyBinding, me: Action, all: &[(Action, KeyBinding)]| {
+            all.iter()
+                .any(|(a, o)| *a != me && o.code == b.code && o.ctrl == b.ctrl && o.alt == b.alt)
+        };
+        let snapshot = bindings.clone();
+        bindings.retain(|(a, b)| {
+            !matches!(a, Action::SessionsTab | Action::GroupsTab) || !taken(b, *a, &snapshot)
+        });
         // Arrow keys always work for movement, alongside whatever is configured.
         bindings.push((Action::Up, KeyBinding::parse("up")?));
         bindings.push((Action::Down, KeyBinding::parse("down")?));

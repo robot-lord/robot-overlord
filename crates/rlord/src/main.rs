@@ -1117,6 +1117,8 @@ fn run_daemon() -> Result<()> {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
         let daemon = Daemon::new(db, Config::load()?);
         daemon.startup()?;
+        // Load every live session's sub-agent data in the background.
+        rlord_daemon::warm::start(&daemon);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;

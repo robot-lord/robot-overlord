@@ -50,7 +50,8 @@ pub struct Keys {
     pub overlord: String,
     /// Switch between the sessions tab (flat list) and the groups tab.
     pub switch_tab: String,
-    /// Go to the sessions tab / the groups tab (left / right).
+    /// Step left / right along sessions tab ⇄ group list ⇄ inside a group.
+    /// A user binding of the same key to another action wins.
     pub sessions_tab: String,
     pub groups_tab: String,
     /// Edit the selected session's tags (tags are the groups).
@@ -349,8 +350,8 @@ describe = "D"          # edit the one-line description
 notes = "E"             # edit notes in $EDITOR
 overlord = "M-o"        # show/hide the overlord (same as Option-O everywhere)
 switch_tab = "tab"      # sessions tab (flat list) <-> groups tab (sessions by tag)
-sessions_tab = "H"      # go to the sessions tab (left)
-groups_tab = "L"        # go to the groups tab (right); in a group: its list
+sessions_tab = "H"      # step left:  sessions tab <- group list <- inside a group
+groups_tab = "L"        # step right: sessions tab -> group list -> inside a group
 tags = "#"              # edit the selected session's tags (tags are the groups)
 cancel = "esc"
 

@@ -291,9 +291,20 @@ impl App {
         top.extend(tab(Tab::Groups, self.groups_count()));
         top.push(Span::raw("  "));
         top.push(key(Action::SwitchTab));
-        top.push(Span::styled(" or ", theme::faint()));
-        top.push(key(Action::SessionsTab));
-        top.push(key(Action::GroupsTab));
+        // The step keys (H / L), unless the user's own bindings took them.
+        let steps: Vec<Action> = [Action::SessionsTab, Action::GroupsTab]
+            .into_iter()
+            .filter(|a| !self.keys.label(*a).is_empty())
+            .collect();
+        if !steps.is_empty() {
+            top.push(Span::styled(" or ", theme::faint()));
+            for (i, a) in steps.into_iter().enumerate() {
+                if i > 0 {
+                    top.push(Span::raw(" "));
+                }
+                top.push(key(a));
+            }
+        }
 
         let mut view = vec![Span::raw(" "), Span::styled("⌕ ", theme::muted())];
         if self.filter.trim().is_empty() {
@@ -481,7 +492,26 @@ mod back_tests {
             assert!(app.handle_groups_key(&k, action), "{code:?}");
             assert!(app.group_focus, "{code:?} should return to the group list");
         }
+        // H / L step along sessions tab ⇄ group list ⇄ inside the group.
+        app.sessions = vec![json!({"name": "a"})];
+        app.tab = Tab::Sessions;
+        app.tab_step(1);
+        assert!(
+            app.tab == Tab::Groups && app.group_focus,
+            "L: to the group list"
+        );
+        app.sessions = vec![json!({"name": "a"})];
+        app.tab_step(1);
+        assert!(!app.group_focus, "L again: into the group");
+        app.tab_step(-1);
+        assert!(
+            app.tab == Tab::Groups && app.group_focus,
+            "H: back to the list"
+        );
+        app.tab_step(-1);
+        assert_eq!(app.tab, Tab::Sessions, "H again: the sessions tab");
         // `l` (and →) go into the highlighted group when it has sessions.
+        app.tab = Tab::Groups;
         app.sessions = vec![json!({"name": "a"})];
         for code in [KeyCode::Char('l'), KeyCode::Right] {
             app.group_focus = true;
