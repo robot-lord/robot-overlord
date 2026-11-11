@@ -1,10 +1,14 @@
 //! The new-session forms, as centered modals.
 //!
-//! - `n` — a **request to the overlord**: what you want done (as long as you
-//!   like, including any instructions for the overlord) plus a few defaults
-//!   (repo, model, worktree, tags). Sent as a `[rlord new-session request]`
-//!   message; the overlord names the session, writes its prompt and
-//!   launches it.
+//! - `n` — **describe it to the overlord**: what the session should do (as
+//!   long as you like, including instructions for the overlord), plus
+//!   optional hints (repo, model, worktree, tags). The description wins over
+//!   the hints. Sent as a `[rlord new-session request]` message; the overlord
+//!   names the session, writes its prompt and launches it, or, when the
+//!   description contradicts a hint, reopens this form with the hints
+//!   corrected for the user to confirm (`confirm_new_session`). That
+//!   describe → propose → confirm loop is rlord's standard for config-style
+//!   input (see CLAUDE.md).
 //! - `N` — the **manual form**: launch directly, no overlord involved. Field
 //!   order puts the repo first. `Enter` on a field opens its picker; arrows
 //!   only ever move between fields.
@@ -63,9 +67,10 @@ impl Field {
             Field::Repo => "Repo",
             Field::Name => "Name",
             Field::Model => "Model",
+            Field::Workspace if kind == FormKind::Overlord => "Worktree",
             Field::Workspace => "Workspace",
             Field::Branch => "Branch",
-            Field::Prompt if kind == FormKind::Overlord => "Request",
+            Field::Prompt if kind == FormKind::Overlord => "What should this session do?",
             Field::Prompt => "Prompt",
             Field::Tags => "Tags",
             Field::Launch => "",
@@ -177,6 +182,16 @@ pub(crate) struct NewForm {
     tags: String,
     repos: Vec<Value>,
     models: Vec<String>,
+    /// Overlord form: which hints the user set (vs. defaults), so the
+    /// overlord knows what was a choice.
+    repo_chosen: bool,
+    model_chosen: bool,
+    workspace_chosen: bool,
+    /// Reopened by the overlord with corrected hints: submitting confirms
+    /// them. `changed` names the hints it updated; `note` says why.
+    confirmed: bool,
+    changed: Vec<String>,
+    note: Option<String>,
     picker: Option<(PickerKind, Vec<String>, ListState)>,
     finder: Option<Finder>,
     text_prompt: Option<(TextPrompt, String)>,
@@ -223,6 +238,64 @@ impl NewForm {
             .unwrap_or(0);
     }
 
+    /// The overlord's correction of an overlord-form request: the user's
+    /// description, the hints as the overlord would launch them, which of
+    /// them it changed and why. Submitting confirms it as is.
+    pub(crate) fn prefill_confirm(&mut self, p: &Value) {
+        let get = |k: &str| {
+            p[k].as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(d) = get("description") {
+            self.prompt = d;
+        }
+        match (get("repo"), get("project")) {
+            (Some(r), _) => self.location = Location::Repo(r),
+            (None, Some(d)) => {
+                self.location = Location::Folder(d);
+                self.workspace = false;
+            }
+            (None, None) => self.location = Location::Auto,
+        }
+        if let Some(m) = get("model") {
+            if !self.models.contains(&m) {
+                self.models.insert(0, m.clone());
+            }
+            self.model = m;
+        }
+        if let Some(w) = p["workspace"].as_bool() {
+            self.workspace = w && !matches!(self.location, Location::Folder(_));
+        }
+        if let Some(t) = p["tags"].as_array() {
+            self.tags = t
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        self.repo_chosen = true;
+        self.model_chosen = true;
+        self.workspace_chosen = true;
+        self.confirmed = true;
+        self.changed = p["changed"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.note = get("note");
+        self.focus = self
+            .fields()
+            .iter()
+            .position(|f| *f == Field::Launch)
+            .unwrap_or(0);
+    }
+
     fn fields(&self) -> &'static [Field] {
         match self.kind {
             FormKind::Overlord => &OVERLORD_FIELDS,
@@ -239,7 +312,7 @@ impl NewForm {
         match &self.location {
             Location::Repo(p) => shorten(&p.replacen(&home, "~", 1), 58),
             Location::Folder(p) => format!("{} (no repo)", shorten(&p.replacen(&home, "~", 1), 48)),
-            Location::Auto => "(overlord picks, from the request)".into(),
+            Location::Auto => "overlord picks".into(),
         }
     }
 }
@@ -300,6 +373,12 @@ impl App {
             tags,
             repos,
             models,
+            repo_chosen: false,
+            model_chosen: false,
+            workspace_chosen: false,
+            confirmed: false,
+            changed: Vec::new(),
+            note: None,
             picker: None,
             finder: None,
             text_prompt: None,
@@ -381,6 +460,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
+                        f.repo_chosen = true;
                         f.location = Location::Repo(path.clone());
                         f.error = None;
                     } else {
@@ -417,6 +497,7 @@ impl App {
                 }
                 KeyCode::Enter => match kind {
                     PickerKind::Model => {
+                        f.model_chosen = true;
                         f.model = if items[i] == "(agent default)" {
                             String::new()
                         } else {
@@ -424,6 +505,7 @@ impl App {
                         };
                     }
                     PickerKind::Repo => {
+                        f.repo_chosen = true;
                         if items[i] == OTHER_REPO {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
@@ -469,11 +551,17 @@ impl App {
             KeyCode::Enter => match field {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
-                Field::Workspace => f.workspace = !f.workspace,
+                Field::Workspace => {
+                    f.workspace = !f.workspace;
+                    f.workspace_chosen = true;
+                }
                 Field::Launch => return self.submit_form(f),
                 _ => next(&mut f),
             },
-            KeyCode::Char(' ') if field == Field::Workspace => f.workspace = !f.workspace,
+            KeyCode::Char(' ') if field == Field::Workspace => {
+                f.workspace = !f.workspace;
+                f.workspace_chosen = true;
+            }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
             KeyCode::Backspace if field.is_text() => match field {
                 Field::Name => {
@@ -594,15 +682,25 @@ impl App {
     /// question it asks.
     fn submit_request(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
         if f.prompt.trim().is_empty() {
-            f.error = Some("write a request first".into());
+            f.error = Some("describe what the session should do first".into());
             f.focus = 0;
             return Ok(Some(f));
         }
+        let chosen: Vec<&str> = [
+            ("repo", f.repo_chosen),
+            ("model", f.model_chosen),
+            ("worktree", f.workspace_chosen),
+        ]
+        .into_iter()
+        .filter_map(|(k, c)| c.then_some(k))
+        .collect();
         let mut params = json!({
-            "request": f.prompt,
+            "description": f.prompt,
             "model": f.model,
             "workspace": f.workspace,
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
+            "chosen": chosen,
+            "confirmed": f.confirmed,
         });
         match &f.location {
             Location::Repo(p) => params["repo"] = json!(p),
@@ -614,7 +712,11 @@ impl App {
         }
         match client_call(&paths::socket_path(), "overlord.new_session", params) {
             Ok(_) => {
-                self.status_line = "sent to the overlord".into();
+                self.status_line = if f.confirmed {
+                    "confirmed — the overlord is launching it".into()
+                } else {
+                    "sent to the overlord".into()
+                };
                 self.show_overlord();
                 Ok(None)
             }
@@ -667,10 +769,7 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (
-                centered(f.area(), 78, 24),
-                " new session · via the overlord ",
-            ),
+            FormKind::Overlord => (centered(f.area(), 80, 24), " New session "),
             FormKind::Manual => (
                 centered(f.area(), 74, 16),
                 " new session, manual  (tab/↑↓ move · enter: pick/launch · esc) ",
@@ -736,14 +835,11 @@ impl App {
             return;
         }
 
-        let mut lines: Vec<Line> = Vec::new();
         if form.kind == FormKind::Overlord {
-            lines.push(Line::from(Span::styled(
-                "  Say what you want. The overlord names the session and launches it.",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::raw(""));
+            draw_describe_form(f, inner, form);
+            return;
         }
+        let mut lines: Vec<Line> = Vec::new();
         for (i, field) in form.fields().iter().enumerate() {
             let focused = i == form.focus;
             let marker = if focused { "▶ " } else { "  " };
@@ -839,12 +935,6 @@ impl App {
                 lines.push(Line::raw(""));
             }
         }
-        if form.kind == FormKind::Overlord {
-            lines.push(Line::from(Span::styled(
-                "  shift-enter send · enter: new line, pick · tab/↑↓ move · esc cancel",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {e}"),
@@ -864,9 +954,240 @@ impl App {
     }
 }
 
+/// The overlord form: a description box up top (the part that matters),
+/// then the optional hints, visibly secondary, then send.
+fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let gray = Style::default().fg(Color::Gray);
+    let accent = Style::default().fg(Color::Cyan);
+    let focus = |fld: Field| form.current() == fld;
+    // Text width inside the box: margins, borders and padding.
+    let width = inner.width.saturating_sub(8).max(10) as usize;
+
+    // Header: the overlord's note when it reopened the form, else what
+    // happens on send.
+    let mut head: Vec<Line> = vec![Line::raw("")];
+    match (&form.note, form.confirmed) {
+        (Some(note), _) => {
+            head.push(Line::from(vec![
+                Span::styled("  ✦ ", accent.bold()),
+                Span::styled(note.clone(), accent),
+            ]));
+            head.push(Line::from(Span::styled(
+                "    Check the hints below, then send to launch it as shown.",
+                gray,
+            )));
+        }
+        (None, true) => head.push(Line::from(Span::styled(
+            "  ✦ Updated to match your description. Send to launch it as shown.",
+            accent,
+        ))),
+        (None, false) => {
+            head.push(Line::from(Span::styled(
+                "  Describe it in your own words. The overlord names the session,",
+                gray,
+            )));
+            head.push(Line::from(Span::styled(
+                "  writes its prompt and launches it.",
+                gray,
+            )));
+        }
+    }
+
+    // The description: a bordered box that grows with the text.
+    let text = format!(
+        "{}{}",
+        form.prompt,
+        if focus(Field::Prompt) { "▏" } else { "" }
+    );
+    let wrapped: usize = text
+        .split('\n')
+        .map(|l| (l.chars().count().max(1)).div_ceil(width))
+        .sum();
+    let box_h = (wrapped as u16 + 2).clamp(5, 12);
+
+    let [head_area, label_area, box_area, rest] = RLayout::vertical([
+        Constraint::Length(head.len() as u16 + 1),
+        Constraint::Length(1),
+        Constraint::Length(box_h),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    f.render_widget(Paragraph::new(head), head_area);
+    let label_style = if focus(Field::Prompt) {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().bold()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(Field::Prompt.label(FormKind::Overlord), label_style),
+        ])),
+        label_area,
+    );
+    let box_area = Rect {
+        x: box_area.x + 2,
+        width: box_area.width.saturating_sub(4),
+        ..box_area
+    };
+    let border = if focus(Field::Prompt) {
+        Style::default().fg(Color::Yellow)
+    } else {
+        dim
+    };
+    let body = if form.prompt.is_empty() && !focus(Field::Prompt) {
+        Paragraph::new(Span::styled(
+            "e.g. fix the flaky login test in myapp",
+            dim,
+        ))
+    } else {
+        Paragraph::new(text).wrap(Wrap { trim: false })
+    };
+    f.render_widget(
+        body.block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(border)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        box_area,
+    );
+
+    // Hints: secondary, and say so.
+    let mut lines: Vec<Line> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Optional hints", Style::default().bold()),
+            Span::styled(
+                if form.confirmed {
+                    "  · what the overlord will use"
+                } else {
+                    "  · your description wins if they disagree"
+                },
+                dim,
+            ),
+        ]),
+    ];
+    let hint = |fld: Field, key: &str, value: String, chosen: bool| -> Line<'static> {
+        let focused = focus(fld);
+        let changed = form.changed.iter().any(|c| c == key);
+        let label_style = if focused {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            gray
+        };
+        let value_style = if changed {
+            accent
+        } else if chosen {
+            Style::default()
+        } else {
+            dim
+        };
+        let mut spans = vec![
+            Span::raw(if focused { "  ▶ " } else { "    " }),
+            Span::styled(
+                format!("{:<10}", fld.label(FormKind::Overlord)),
+                label_style,
+            ),
+            Span::styled(value.clone(), value_style),
+        ];
+        if changed {
+            spans.push(Span::styled("  ✦ updated", accent));
+        } else if !chosen && !value.starts_with("overlord picks") {
+            spans.push(Span::styled("  · default", dim));
+        }
+        Line::from(spans)
+    };
+    let auto = matches!(form.location, Location::Auto);
+    lines.push(hint(
+        Field::Repo,
+        "repo",
+        form.location_label(),
+        form.repo_chosen && !auto,
+    ));
+    lines.push(hint(
+        Field::Model,
+        "model",
+        if form.model.is_empty() {
+            "agent default".into()
+        } else {
+            form.model.clone()
+        },
+        form.model_chosen,
+    ));
+    lines.push(hint(
+        Field::Workspace,
+        "worktree",
+        match (&form.location, form.workspace) {
+            (Location::Folder(_), _) => "n/a (no repo)".into(),
+            (_, true) => "yes, its own git worktree".into(),
+            (_, false) => "no, work in the repo directly".into(),
+        },
+        form.workspace_chosen,
+    ));
+    let tags_focused = focus(Field::Tags);
+    let tags = if form.tags.is_empty() && !tags_focused {
+        "overlord picks".to_string()
+    } else {
+        format!("{}{}", form.tags, if tags_focused { "▏" } else { "" })
+    };
+    lines.push(hint(Field::Tags, "tags", tags, !form.tags.is_empty()));
+    lines.push(Line::raw(""));
+
+    let send_focused = focus(Field::Launch);
+    let send = if form.confirmed {
+        " Launch "
+    } else {
+        " Send to overlord "
+    };
+    lines.push(Line::from(vec![
+        Span::raw(if send_focused { "  ▶ " } else { "    " }),
+        Span::styled(
+            send,
+            if send_focused {
+                Style::default().fg(Color::Black).bg(Color::Green).bold()
+            } else {
+                Style::default().fg(Color::Green).bold()
+            },
+        ),
+    ]));
+    lines.push(Line::raw(""));
+    let enter = match form.current() {
+        Field::Prompt => "new line",
+        Field::Repo | Field::Model => "pick",
+        Field::Workspace => "toggle",
+        Field::Launch => "send",
+        _ => "next",
+    };
+    lines.push(keys_line(&[
+        ("shift-enter", "send", Cap::Context),
+        ("enter", enter, Cap::Global),
+        ("tab", "move", Cap::Global),
+        ("esc", "cancel", Cap::Global),
+    ]));
+    if let Some(e) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!("  error: {e}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some((kind, buf)) = &form.text_prompt {
+        let label = match kind {
+            TextPrompt::Folder => "folder (no repo)",
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {label}: {buf}▏   (enter · esc)"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), rest);
+}
+
 const OTHER_REPO: &str = "  find another repo…";
 const NO_REPO: &str = "  no repo — plain folder…";
-const AUTO_REPO: &str = "  let the overlord pick (from the request)";
+const AUTO_REPO: &str = "  let the overlord pick (from the description)";
 
 /// Keep the tail of a long path (the part that identifies it).
 fn shorten(p: &str, max: usize) -> String {
@@ -887,5 +1208,72 @@ pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(app: &App, form: &NewForm) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(90, 30)).unwrap();
+        term.draw(|f| app.draw_form(f, form)).unwrap();
+        let buf = term.backend().buffer();
+        (0..30)
+            .map(|y| {
+                (0..90)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn form(app: &mut App) -> Box<NewForm> {
+        app.open_new_form(FormKind::Overlord);
+        match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        }
+    }
+
+    #[test]
+    fn describe_form_puts_the_description_first_and_hints_second() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = form(&mut app);
+        f.prompt = "fix the flaky login test".into();
+        let out = render(&app, &f);
+        if std::env::var_os("SHOW_FORM").is_some() {
+            println!("{out}");
+        }
+        let at = |s: &str| {
+            out.find(s)
+                .unwrap_or_else(|| panic!("{s:?} missing:\n{out}"))
+        };
+        assert!(at("What should this session do?") < at("Optional hints"));
+        assert!(out.contains("your description wins"));
+        assert!(out.contains("Send to overlord"));
+        assert!(!out.contains("Request"));
+
+        // Reopened by the overlord: its note, updated hints marked.
+        f.prefill_confirm(&json!({
+            "description": "fix the flaky login test in myapp",
+            "repo": "/r/myapp", "model": "opus", "workspace": true,
+            "changed": ["repo"], "note": "Updated to match your description: repo is myapp",
+        }));
+        let out = render(&app, &f);
+        if std::env::var_os("SHOW_FORM").is_some() {
+            println!("{out}");
+        }
+        assert!(out.contains("✦ Updated to match your description: repo is myapp"));
+        let repo_line = out.lines().find(|l| l.contains("/r/myapp")).unwrap();
+        assert!(repo_line.contains("updated"), "{repo_line}");
+        assert!(out.contains("Launch"));
+        assert!(f.confirmed && f.current() == Field::Launch);
     }
 }

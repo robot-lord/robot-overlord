@@ -484,8 +484,13 @@ them.
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's pane (bracketed paste, then Enter), waiting out `starting` after
   a (re)start. `overlord.new_session` formats the list's `n` form as a
-  `[rlord new-session request]` message; `overlord.md` defines what the
-  overlord does with one. `rlord overlord ask` is the CLI.
+  `[rlord new-session request]` message: `confirmed:`, the hints with
+  whether each was picked or defaulted, then the description verbatim;
+  `overlord.md` defines what the overlord does with one. On a contradiction
+  it calls `ui.confirm_new_session`, which reopens the form (TUI
+  `confirm_new_session` command) with corrected hints marked; sending it
+  back says `confirmed: yes`. This describe → propose → confirm loop is the
+  pattern for config-style input (CLAUDE.md). `rlord overlord ask` is the CLI.
 - **Triage** (`daemon/src/triage.rs`): the cheap first pass for the
   overlord's upkeep. `overlord.triage` lists live sessions updated since
   their per-session `reviewed:<id>` kv watermark, with missing-metadata flags

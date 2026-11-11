@@ -91,6 +91,19 @@ pub fn tools() -> Value {
         tool("propose_session",
             "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
             new_session_props, &[]),
+        tool("confirm_new_session",
+            "Reopen the user's new-session form with your corrections when their description contradicts the hints they sent (or left as defaults): their description verbatim, the hints as you would launch them, which ones you changed and why. Nothing launches until they send it back; that message says `confirmed: yes`.",
+            json!({
+                "description": s("The user's description, verbatim"),
+                "repo": s("Repo as you would launch it (omit to leave it to you)"),
+                "project": s("Plain folder instead of a repo"),
+                "model": s("Model as you would launch it"),
+                "workspace": b("Own git worktree"),
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
+                            "description": "Hints you changed from what the user sent"},
+                "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),
+            }), &["description", "changed", "note"]),
         tool("create_session",
             "Create and launch a new agent session immediately.",
             create_props, &[]),
@@ -308,6 +321,24 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         }
         "get_session_defaults" => d.rpc("session.defaults", json!({})),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),
+        "confirm_new_session" => {
+            let mut p = Map::new();
+            for k in [
+                "description",
+                "repo",
+                "project",
+                "model",
+                "workspace",
+                "tags",
+                "changed",
+                "note",
+            ] {
+                if let Some(v) = args.get(k) {
+                    p.insert(k.into(), v.clone());
+                }
+            }
+            d.rpc("ui.confirm_new_session", Value::Object(p))
+        }
         "create_session" => {
             let s = d.rpc("session.new", new_session_params(args))?;
             let mut out = summarize(&s);

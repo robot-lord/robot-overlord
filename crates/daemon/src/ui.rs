@@ -354,3 +354,41 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     show_list(d)?;
     Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))
 }
+
+/// Reopen the list's describe-a-session form (`n`) with the overlord's
+/// corrections, for the user to confirm: their description, the hints as the
+/// overlord would launch them, which hints it changed and a one-line note.
+/// Submitting sends a `confirmed: yes` request back to the overlord.
+pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
+    let description = params["description"]
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .context("missing 'description' (the user's, verbatim)")?;
+    let mut prefill = Map::new();
+    prefill.insert("description".into(), json!(description));
+    for k in ["repo", "project", "model", "note"] {
+        if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            let v = if matches!(k, "repo" | "project") {
+                expand_tilde(v)
+            } else {
+                v.to_string()
+            };
+            prefill.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(r) = prefill.get("repo").and_then(Value::as_str) {
+        if rlord_core::git::main_repo_root(r).is_none() {
+            bail!("{r} is not a git repository (use find_repos)");
+        }
+    }
+    for k in ["workspace", "tags", "changed"] {
+        if !params[k].is_null() {
+            prefill.insert(k.into(), params[k].clone());
+        }
+    }
+    d.ui_cmd(json!({"cmd": "confirm_new_session", "prefill": prefill}));
+    show_list(d)?;
+    Ok(json!({"shown": prefill,
+              "note": "the form is open on the user's screen; nothing is launched until they send it back (confirmed: yes)"}))
+}

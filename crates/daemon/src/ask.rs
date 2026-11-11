@@ -65,51 +65,74 @@ fn send(d: &Daemon, text: &str) -> Result<Value> {
     Ok(json!({"sent": true}))
 }
 
-/// `{request, repo?, model?, workspace?, tags?: [..]}`
+/// `{description, repo?, model?, workspace?, tags?: [..], chosen?: [..],
+/// confirmed?}` from the list's new-session form.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
     send(d, &text)
 }
 
+/// The `[rlord new-session request]` message. Hints say whether the user
+/// picked them or left the default, so the overlord knows what was a choice;
+/// `confirmed: yes` means the user already reviewed the overlord's corrected
+/// hints (`confirm_new_session`) and it should launch with them as given.
 pub fn format_request(p: &Value) -> Result<String> {
-    let request = p
-        .get("request")
+    let description = p
+        .get("description")
+        .or_else(|| p.get("request"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .context("the request is empty")?;
+        .context("the description is empty")?;
     let get = |k: &str| {
         p.get(k)
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
     };
-    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let chosen = |k: &str| {
+        p.get("chosen")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|c| c == k))
+    };
+    let source = |k: &str| {
+        if chosen(k) {
+            "picked by the user"
+        } else {
+            "default"
+        }
+    };
     let tags: Vec<&str> = p
         .get("tags")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+    let confirmed = p.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
+
     let mut m = String::from("[rlord new-session request]\n");
+    m += &format!("confirmed: {}\n", if confirmed { "yes" } else { "no" });
+    m += "hints (optional; the description wins if they disagree):\n";
+    m += &match get("repo") {
+        Some(r) => format!("- repo: {r} ({})\n", source("repo")),
+        None => "- repo: (you choose, from the description)\n".to_string(),
+    };
+    m += &match get("model") {
+        Some(model) => format!("- model: {model} ({})\n", source("model")),
+        None => "- model: (agent default)\n".to_string(),
+    };
+    let wt = p.get("workspace").and_then(Value::as_bool).unwrap_or(true);
     m += &format!(
-        "repo: {}\n",
-        get("repo").unwrap_or("(you choose, from the request)")
+        "- worktree: {} ({})\n",
+        if wt { "yes" } else { "no" },
+        source("worktree")
     );
-    m += &format!("model: {}\n", get("model").unwrap_or("(default)"));
-    m += &format!(
-        "worktree: {}\n",
-        yes_no(p.get("workspace").and_then(Value::as_bool).unwrap_or(true))
-    );
-    m += &format!(
-        "tags: {}\n",
-        if tags.is_empty() {
-            "(you choose)".to_string()
-        } else {
-            tags.join(", ")
-        }
-    );
-    m += "request:\n";
-    m += request;
+    m += &if tags.is_empty() {
+        "- tags: (you choose)\n".to_string()
+    } else {
+        format!("- tags: {} (picked by the user)\n", tags.join(", "))
+    };
+    m += "description:\n";
+    m += description;
     Ok(m)
 }
 
@@ -118,16 +141,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_message_keeps_the_request_verbatim() {
+    fn request_message_keeps_the_description_verbatim() {
         let m = format_request(&json!({
-            "request": "  fix the login flake\n\nkeep the retry count at 3 ",
-            "repo": "/r/web", "tags": ["web", "wip"],
+            "description": "  fix the login flake\n\nkeep the retry count at 3 ",
+            "repo": "/r/web", "model": "opus", "tags": ["web", "wip"],
+            "chosen": ["repo"],
         }))
         .unwrap();
-        assert!(m.starts_with("[rlord new-session request]\n"));
-        assert!(m.contains("repo: /r/web\n"));
-        assert!(m.contains("tags: web, wip\n"));
-        assert!(m.ends_with("request:\nfix the login flake\n\nkeep the retry count at 3"));
-        assert!(format_request(&json!({"request": "  "})).is_err());
+        assert!(m.starts_with("[rlord new-session request]\nconfirmed: no\n"));
+        assert!(m.contains("- repo: /r/web (picked by the user)\n"));
+        assert!(m.contains("- model: opus (default)\n"));
+        assert!(m.contains("- worktree: yes (default)\n"));
+        assert!(m.contains("- tags: web, wip (picked by the user)\n"));
+        assert!(m.ends_with("description:\nfix the login flake\n\nkeep the retry count at 3"));
+        assert!(format_request(&json!({"description": "  "})).is_err());
+        let c = format_request(&json!({"description": "x", "confirmed": true})).unwrap();
+        assert!(c.contains("confirmed: yes\n") && c.contains("- repo: (you choose"));
     }
 }

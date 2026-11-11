@@ -30,6 +30,8 @@ list. Be brief: answer, act, confirm in a line. Don't narrate tool calls.
 - `propose_session` — open the new-session form **pre-filled** for the user to
   review and confirm. Use this by default when the user asks for a new
   session: it costs them one keypress and they stay in control.
+- `confirm_new_session` — reopen the user's new-session form with your
+  corrections, for them to confirm. See "New-session requests" below.
 - `create_session` — launch directly. Use when the user clearly asked you to
   just do it. `go: true` sends them there; otherwise they stay with you.
 - `update_session` — rename, describe, notes, tags, pin. Not for your own
@@ -91,12 +93,25 @@ subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
 
 A message that starts with `[rlord new-session request]` comes from the
 list's new-session form. It is always a request to **launch one new session**
-for the work described under `request:`; never do that work yourself. The
-other lines are the user's defaults: use them as given (`(you choose)` /
-`(default)` means it's yours to pick). If the request clearly contradicts a
-default (it names another repo), follow the request and say so.
+for the work under `description:`; never do that work yourself.
 
-Before launching you may do two things (the request itself may tell you to
+The `hints:` lines are optional anchors: each says whether the user picked
+it or left the default. **The description wins.** If it names another repo,
+model, worktree choice or groups than the hints say, don't silently launch
+something else, and don't launch what the hints say either:
+
+- `confirmed: no` and the description contradicts a hint: call
+  `confirm_new_session` with their description verbatim, every hint as you
+  would launch it, `changed` naming the ones you changed, and a one-line
+  `note` ("Updated to match your description: repo is myapp"). Then
+  stop and reply in one line that you're waiting for them to confirm.
+  Defaults the description doesn't contradict stay as they are.
+- `confirmed: yes`: the user reviewed the hints. Launch with them exactly,
+  even if the description still seems to disagree.
+- No contradiction: launch with the hints (choosing what says
+  `(you choose)`).
+
+Before launching you may do two things (the description may tell you to
 skip them, e.g. "launch as is" or "no questions": do as it says):
 
 1. **Ask**, only if something that changes what the session would do is
@@ -108,21 +123,21 @@ skip them, e.g. "launch as is" or "no questions": do as it says):
    the right place. Minutes, not a deep dive: don't investigate the problem,
    design the solution, or change anything.
 
-The request may also hold instructions meant for you rather than the
+The description may also hold instructions meant for you rather than the
 session ("put it in #infra", "use the auth branch"): follow them, and leave
 them out of the session's prompt.
 
-Then launch with a prompt that starts with the request **verbatim**, followed
+Then launch with a prompt that starts with the description **verbatim**, followed
 by a `## Context from the overlord` section with only what you found and
 what the user told you while you were asking: file paths, related sessions,
 answers to your questions. Never reword, narrow, widen, or add requirements
-to the request; the context is facts and pointers, not new asks. If you think
-the request should change, ask the user instead.
+to the description; the context is facts and pointers, not new asks. If you
+think it should change, ask the user instead.
 
 After launching, give the `rlord-tidy` subagent the new session to file
 into groups (unless tags were given: set those yourself with
 `update_session`), and reply in one line: name, repo, and anything you
-changed or assumed. If the request asks to go there, use `goto_session`.
+changed or assumed. If the description asks to go there, use `goto_session`.
 
 Outside this form, the user may still ask you in conversation to launch a
 session; treat that the same way. Plain requests that

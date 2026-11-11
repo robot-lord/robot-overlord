@@ -76,6 +76,30 @@ the user can keep talking to the overlord while it runs.
 - Codex (`.codex/agents/*.toml`) and Gemini (`.gemini/agents/*.md`) have
   their own formats; add those when their adapters land.
 
+## Input: describe, then confirm
+
+The standard way rlord takes config-style input (a new session today; any
+form with options tomorrow) is a conversation with the overlord, not a
+terminal form to fill in:
+
+1. **Describe.** The user says what they want in their own words. Option
+   fields sit below as *optional hints*: shown with their defaults, visibly
+   secondary, and labelled so the user knows they can skip them.
+2. **The description wins.** The form sends the description plus each hint
+   and whether the user picked it or left the default.
+3. **Propose.** If the description contradicts a hint, the overlord doesn't
+   act on either. It reopens the same form with the hints as it would apply
+   them, marks what it changed, and says why in one line.
+4. **Confirm.** The user checks it, edits if they like, and sends it back
+   marked confirmed. Then the overlord acts exactly as shown.
+
+The user stays in control of every option without having to set any of
+them. A new form or option should follow this loop: a describe field, hint
+fields with defaults, a `confirm_*` MCP tool that reopens the form, and
+`overlord.md` rules for when to use it. Reference implementation: `n` in the
+list (`tui/src/newform.rs`, `confirm_new_session`, `ask::format_request`).
+A manual form (`N`) can exist alongside it for users who want no overlord.
+
 ## Releases: build locally after every merge to main
 
 Binaries are built on this Mac and uploaded to GitHub Releases. There is no
