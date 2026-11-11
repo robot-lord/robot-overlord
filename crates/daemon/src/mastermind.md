@@ -40,10 +40,7 @@ You're long-lived and on an expensive model, so:
   user to review and launch.
 - `confirm_new_session` — reopen the user's new-session form with your
   corrections, for them to confirm. See "New-session requests" below.
-- `create_session` — launch directly. `go: true` sends the user there;
-  `remote_control: true` when the user wants to follow it from the Claude
-  app (pass on any reason it's unavailable, in a line). `remote_control`
-  turns it on or off for an existing session.
+- `create_session` — launch directly. `go: true` sends the user there.
 - `list_sessions` / `get_session` / `read_screen` — what exists, its state and
   meta-context, and what is on a session's screen (for questions about the
   fleet, and to avoid duplicating a session that already exists).
