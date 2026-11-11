@@ -348,6 +348,12 @@ impl Daemon {
                 remote::annotate(self, &mut rows);
                 Ok(Value::Array(rows))
             }
+            ("session.get", Ok(row)) => {
+                let mut rows = [row];
+                remote::annotate(self, &mut rows);
+                let [row] = rows;
+                Ok(row)
+            }
             (_, r) => r,
         };
         if method == "session.unarchive" && r.is_ok() {
@@ -404,10 +410,14 @@ impl Daemon {
             "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
                 .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
-            "overlord.status" => overlord::status(&self.db(), &self.config).map(|mut v| {
-                v["remote"] = remote::offer(self);
-                v
-            }),
+            "overlord.status" => {
+                // The db guard must drop before offer() locks it again.
+                let st = overlord::status(&self.db(), &self.config);
+                st.map(|mut v| {
+                    v["remote"] = remote::offer(self);
+                    v
+                })
+            }
             // Don't offer Remote Control for the overlord again.
             "remote.decline_offer" => self
                 .db()

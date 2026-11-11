@@ -34,6 +34,8 @@ use crate::{overlord, Daemon};
 const TICK: Duration = Duration::from_secs(5);
 /// Between two attempts to connect one session.
 const RETRY: Duration = Duration::from_secs(40);
+/// A process this young may still be connecting from its launch flag.
+const SETTLE_MS: i64 = 30_000;
 /// Attempts before rlord says it didn't connect.
 const TRIES: u32 = 3;
 /// After giving up, try again this much later (a network blip, a fixed org
@@ -179,6 +181,15 @@ fn state_of(
 /// Whether the agent's input line is empty (nothing the user is typing):
 /// the last line that starts with the prompt mark, minus the placeholder.
 fn input_empty(screen: &str) -> bool {
+    // Vim mode's NORMAL: typed text would run as commands.
+    if screen
+        .lines()
+        .rev()
+        .take(4)
+        .any(|l| l.contains("-- NORMAL --"))
+    {
+        return false;
+    }
     let Some(line) = screen.lines().rev().find(|l| l.starts_with('❯')) else {
         return false;
     };
@@ -186,11 +197,32 @@ fn input_empty(screen: &str) -> bool {
     rest.is_empty() || rest.starts_with("Try \"")
 }
 
-/// Type a slash command into an idle session.
+/// The text on the agent's input line (after the prompt mark).
+fn input_line(screen: &str) -> Option<String> {
+    screen
+        .lines()
+        .rev()
+        .find(|l| l.starts_with('❯'))
+        .map(|l| l.trim_start_matches('❯').trim().to_string())
+}
+
+/// Type a slash command into an idle session, and submit it only if the
+/// input line then holds exactly that command: if the user typed meanwhile,
+/// take ours back out and leave theirs alone.
 fn type_command(pane: &str, cmd: &str) -> Result<()> {
     tmux::send_text(pane, cmd)?;
     // Let the command menu settle before submitting.
     std::thread::sleep(Duration::from_millis(400));
+    let line = input_line(&tmux::capture_pane(pane)?).unwrap_or_default();
+    if line != cmd {
+        // Ours is last (theirs came first): backspace it away. Otherwise
+        // theirs follows ours; leave the line for them to fix.
+        if line.ends_with(cmd) {
+            let n = cmd.chars().count().to_string();
+            tmux::send_keys(pane, &["-N", &n, "BSpace"])?;
+        }
+        bail!("the input line changed while typing; not submitted");
+    }
     tmux::send_keys(pane, &["Enter"])
 }
 
@@ -205,6 +237,11 @@ fn disconnect(pane: &str) -> Result<()> {
             break sc;
         }
         if Instant::now() > deadline {
+            // Opened late after all? Close it rather than leave it to
+            // catch the user's keys.
+            if tmux::capture_pane(pane).is_ok_and(|sc| sc.contains(item)) {
+                tmux::send_keys(pane, &["Escape"])?;
+            }
             bail!("the Remote Control panel didn't open");
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -275,8 +312,11 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
             }
         }
         // Only an idle agent with an empty input line takes a command.
+        let now = rlord_core::types::now_ms();
         let ready = |l: &Live| {
             l.status == "idle"
+                // Just started (maybe with the flag): give it time to connect.
+                && now - l.started_at > SETTLE_MS
                 && s.tmux_session
                     .as_deref()
                     .and_then(|p| tmux::capture_pane(p).ok())
@@ -429,6 +469,10 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             }
         }
     }
+    // The user said no for the overlord: don't offer it again.
+    if !on && overlord::is_overlord_role(&s.role) {
+        d.db().kv_set("remote_offer_declined", "1")?;
+    }
     for t in &targets {
         set_wanted(&d.db(), t, on)?;
         let mut tr = d.remote.track.lock().expect("remote mutex");
@@ -494,15 +538,16 @@ pub fn offer(d: &Daemon) -> Value {
     let on = front
         .as_ref()
         .is_some_and(|f| wanted(&db, &f.id).ok().flatten().is_some());
+    let claude = front.as_ref().is_none_or(|f| f.agent == "claude");
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()
         .flatten()
         .is_some_and(|v| v == "1");
     json!({
-        "available": a.available, "reason": a.reason, "note": a.note,
+        "available": a.available && claude, "reason": a.reason, "note": a.note,
         "on": on,
-        "offer": a.available && front.is_some() && !on && !declined,
+        "offer": a.available && claude && front.is_some() && !on && !declined,
     })
 }
 
@@ -531,5 +576,7 @@ mod tests {
         // The last prompt line counts (earlier ones are history).
         assert!(input_empty("❯ /remote-control\n  done\n❯ \n"));
         assert!(!input_empty("no prompt here"));
+        assert!(!input_empty("❯ \n──\n  -- NORMAL -- ⏵⏵ auto mode\n"));
+        assert!(input_empty("❯ \n──\n  -- INSERT -- ⏵⏵ auto mode\n"));
     }
 }

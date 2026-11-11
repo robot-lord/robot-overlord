@@ -120,7 +120,9 @@ impl App {
                 catalog: catalog_of(&st),
                 // On by default where it works: the point is to reach the
                 // overlord from the Claude app.
-                remote: (st["remote"]["available"] == true).then_some(true),
+                remote: (st["remote"]["available"] == true
+                    && st["default_agent"].as_str().is_none_or(|a| a == "claude"))
+                .then_some(true),
                 remote_why: st["remote"]["reason"]
                     .as_str()
                     .or(st["remote"]["note"].as_str())
@@ -197,6 +199,14 @@ impl App {
                            "remote_control": s.remote == Some(true)}),
                 ) {
                     Ok(_) => {
+                        // Off by choice: don't offer it again later.
+                        if s.remote == Some(false) {
+                            let _ = client_call(
+                                &paths::socket_path(),
+                                "remote.decline_offer",
+                                Value::Null,
+                            );
+                        }
                         self.dirty = true;
                         self.show_overlord();
                     }
@@ -565,7 +575,9 @@ impl App {
             KeyCode::Enter => match client_call(
                 &paths::socket_path(),
                 "remote.set",
-                json!({"ref": "overlord", "on": true}),
+                // Don't hold the list up waiting for the link: the list
+                // shows it (⇄) once connected.
+                json!({"ref": "overlord", "on": true, "wait": false}),
             ) {
                 Ok(r) => {
                     self.status_line = match r["remote"]["url"].as_str() {

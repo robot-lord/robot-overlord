@@ -239,6 +239,10 @@ fn summarize_candidate(c: &Value) -> Value {
     row
 }
 
+fn params_wants_remote(args: &Value) -> bool {
+    args.get("remote_control").and_then(Value::as_bool) == Some(true)
+}
+
 /// Copy whitelisted session-creation fields.
 fn new_session_params(args: &Value) -> Value {
     let mut p = Map::new();
@@ -370,18 +374,24 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             d.rpc("ui.confirm_new_session", Value::Object(p))
         }
         "create_session" => {
-            let s = d.rpc("session.new", new_session_params(args))?;
-            let mut out = summarize(&s);
-            // The session exists either way; Remote Control that can't be had
-            // is a note, not a failed launch.
+            // Remote Control from launch (the flag), when this machine can
+            // have it; otherwise the session launches anyway, with a note.
+            let mut params = new_session_params(args);
+            let mut remote_note = None;
             if args.get("remote_control").and_then(Value::as_bool) == Some(true) {
-                out["remote"] = match d.rpc(
-                    "remote.set",
-                    json!({"ref": s["id"], "on": true, "wait": false}),
-                ) {
-                    Ok(v) => v["remote"].clone(),
-                    Err(e) => json!({"state": "unavailable", "reason": format!("{e:#}")}),
-                };
+                let a = d.rpc("remote.availability", json!({"force": true}))?;
+                if a["available"] == true {
+                    params["remote_control"] = json!(true);
+                } else {
+                    remote_note = Some(json!({"state": "unavailable", "reason": a["reason"]}));
+                }
+            }
+            let s = d.rpc("session.new", params)?;
+            let mut out = summarize(&s);
+            if let Some(n) = remote_note {
+                out["remote"] = n;
+            } else if params_wants_remote(args) {
+                out["remote"] = json!("connects as it starts");
             }
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The session exists either way; a failed switch is a note,

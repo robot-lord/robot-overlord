@@ -28,6 +28,8 @@ pub struct Live {
     pub status: String,
     /// Set while Remote Control is connected.
     pub bridge: Option<String>,
+    /// When the process started (ms since the epoch; 0 if unknown).
+    pub started_at: i64,
 }
 
 impl Live {
@@ -78,6 +80,7 @@ pub fn live_sessions_in(dir: &Path) -> HashMap<String, Live> {
                 .as_str()
                 .filter(|b| !b.is_empty())
                 .map(str::to_string),
+            started_at: v["startedAt"].as_i64().unwrap_or(0),
         };
         match out.get(sid) {
             Some((t, _)) if *t >= at => {}

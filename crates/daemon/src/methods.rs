@@ -214,7 +214,6 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
     Ok(json!({"id": s.id, "group": group}))
 }
 
-/// A string-array param (missing / wrong type = empty).
 /// A session's agent flags from its launch spec: the adapter flags it was
 /// created with, plus `--remote-control <name>` while Remote Control is on
 /// (so every start, resume and fresh start reconnects it).
@@ -227,6 +226,7 @@ pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
     a
 }
 
+/// A string-array param (missing / wrong type = empty).
 pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
     params
         .get(key)
