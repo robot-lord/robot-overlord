@@ -379,11 +379,8 @@ impl Daemon {
                 if let Ok(v) = &r {
                     self.changed();
                     self.bind_nav_keys();
-                    // A (re)started overlord is a fresh tmux session: give it
-                    // the user's keys again.
-                    if let Some(id) = v["id"].as_str() {
-                        profile::sync_ref(self, id);
-                    }
+                    // (ensure syncs the seat's tmux keys itself.)
+                    let _ = v;
                 }
                 r
             }

@@ -97,25 +97,26 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
         text.push_str(&format!("\ncontext:\n{c}"));
     }
     send_to(d, &overlord::MASTERMIND, &text)?;
-    // Show the mastermind where the user is looking (the overlay they asked
-    // in, if open).
+    // Switch the user's overlay to the mastermind if they're in one; if
+    // they've moved on, don't pop it up over whatever they're doing now.
     let client = d
         .overlay
         .lock()
         .expect("ui mutex")
         .as_ref()
         .map(|(c, _)| c.clone());
-    let mut p = json!({"seat": overlord::MASTERMIND.key, "show": true});
-    if let Some(c) = client {
-        p["client"] = json!(c);
-    }
+    let Some(client) = client else {
+        return Ok(json!({"handed_off": true,
+            "note": "delivered; the user isn't in the overlay: tell them Option-M (in the overlay) or the list shows the mastermind"}));
+    };
     // The overlord's overlay is about to be replaced (killed before its own
     // cleanup): give its window its size back first.
     let _ = rlord_core::tmux::auto_size_window(overlord::FRONT.tmux);
+    let p = json!({"seat": overlord::MASTERMIND.key, "show": true, "client": client});
     match crate::ui::overlord(d, &p) {
         Ok(_) => Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"})),
         Err(e) => Ok(json!({"handed_off": true,
-            "note": format!("delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M")})),
+            "note": format!("delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M in the overlay")})),
     }
 }
 

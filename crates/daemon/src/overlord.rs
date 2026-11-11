@@ -177,7 +177,12 @@ pub fn color(cfg: &Config) -> String {
 /// looks like any session. Re-run when the theme changes (`overlord.style`).
 pub fn style(cfg: &Config) {
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    let keys = |k: &str| rlord_core::tmux::key_label(if k.trim().is_empty() { "M-d" } else { k });
+    let keys = |k: &str| rlord_core::tmux::key_label(k);
+    let back = if cfg.tmux.back.trim().is_empty() {
+        "M-d"
+    } else {
+        &cfg.tmux.back
+    };
     for (seat, label) in [
         (
             &FRONT,
@@ -189,7 +194,7 @@ pub fn style(cfg: &Config) {
                 } else {
                     format!("{} mastermind · ", keys(&cfg.tmux.mastermind))
                 },
-                keys(&cfg.tmux.back)
+                keys(back)
             ),
         ),
         (
@@ -197,7 +202,7 @@ pub fn style(cfg: &Config) {
             format!(
                 "#[bold] ◆ MASTERMIND #[nobold]· {} overlord · {} list  ",
                 keys(&cfg.tmux.overlord),
-                keys(&cfg.tmux.back)
+                keys(back)
             ),
         ),
     ] {
@@ -243,6 +248,12 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
                 None
             };
             let model = pick("model", chosen.as_deref().unwrap_or(seat.model(cfg)).trim());
+            // Created now, with a model the user chose (or the default): never
+            // "offer the default" back to it.
+            db.kv_set(
+                &format!("default_declined:{}", seat.key),
+                seat.model(cfg).trim(),
+            )?;
             let agent = pick("agent", &cfg.overlord.agent);
             let d = seat.dir();
             methods::session_new(
@@ -359,6 +370,11 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         {
             return Ok(());
         }
+        // Current instructions and flags (effort may have changed).
+        let extra_args = write_files(&MASTERMIND, &d.config)?;
+        let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
+        spec["extra_args"] = json!(extra_args);
+        db.set_launch_spec(&s.id, &spec.to_string())?;
         crate::methods::session_fresh(&db, &json!({"ref": s.id}))?;
         db.kv_set("mastermind_fresh_at", &now.to_string())?;
     }

@@ -185,10 +185,11 @@ fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
 
 impl SeatKeys {
     fn from_config(cfg: &rlord_core::config::Config) -> Self {
-        let or = |k: &str, d: &str| parse_key(if k.trim().is_empty() { d } else { k });
+        // An empty or unreadable key falls back to the default.
+        let or = |k: &str, d: &str| parse_key(k).or_else(|| parse_key(d));
         SeatKeys {
             overlord: or(&cfg.tmux.overlord, "M-o"),
-            mastermind: parse_key(cfg.tmux.mastermind_switch()),
+            mastermind: or(cfg.tmux.mastermind_switch(), "M-m"),
             close: or(&cfg.tmux.back, "M-d"),
         }
     }
