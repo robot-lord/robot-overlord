@@ -119,12 +119,12 @@ repo is private, so downloads go through the GitHub CLI.
 
 ```bash
 rlord update        # latest release; `rlord update v0.4.0` pins one
-rlord reset         # reload an open rlord on the new version
 ```
 
 `rlord update` does what `scripts/update.sh` does, so you don't need the
 checkout once rlord is installed. It does nothing if you're already on the
-latest release. Running agent sessions keep running through an update.
+latest release; after installing a new one it runs `rlord reset`, so the
+open list and daemon move to the new version. Running agent sessions keep running through an update.
 
 **Releasing** (from the dev machine): bump `[workspace.package] version` in
 `Cargo.toml` in the PR. After it merges, run `scripts/release.sh` on `main`.

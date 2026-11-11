@@ -7,7 +7,8 @@
 #
 # `rlord update` runs this same script (compiled into the binary), so after
 # the first install you don't need the checkout. --force reinstalls the same
-# version and replaces a dev symlink at ~/.local/bin/rlord.
+# version and replaces a dev symlink at ~/.local/bin/rlord. After installing a
+# new version it runs `rlord reset` if rlord is running.
 set -euo pipefail
 repo=ayersb/robot-overlord
 force=()
@@ -32,8 +33,23 @@ if [[ -z $tag ]]; then
 fi
 dest=${RLORD_INSTALL_DIR:-$HOME/.local/bin}/rlord
 current=$("$dest" --version 2>/dev/null | awk '{print $2}' || true)
+# Reset a running rlord onto the installed binary; a failed reset doesn't
+# undo the install.
+reset_running() {
+  if "$dest" ping >/dev/null 2>&1; then
+    echo "reloading rlord on the new version…"
+    "$dest" reset || echo "installed, but the reset failed: run \`rlord reset\`" >&2
+  fi
+}
+
 if [[ -n $current && "v$current" == "$tag" && ${#force[@]} -eq 0 ]]; then
   echo "rlord $current is already the latest release"
+  # …but a running daemon may still be an older one (an earlier update
+  # that didn't reset): move it over.
+  running=$("$dest" ping 2>/dev/null | sed -n 's/.*daemon v\([^)]*\)).*/\1/p')
+  if [[ -n $running && $running != "$current" ]]; then
+    reset_running
+  fi
   exit 0
 fi
 echo "rlord ${current:-(not installed)} -> ${tag#v}"
@@ -42,11 +58,10 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 gh release download "$tag" -R "$repo" -p '*-aarch64-apple-darwin.tar.gz' -D "$d"
 tar -xzf "$d"/*.tar.gz -C "$d"
+installer=("$d"/rlord-*/install.sh)
 # ${a[@]+...}: an empty array under `set -u` is an error in macOS's bash 3.2.
-"$d"/rlord-*/install.sh ${force[@]+"${force[@]}"}
+"${installer[0]}" ${force[@]+"${force[@]}"}
 
-# Running daemons restart on the new binary at the next rlord command; an
-# open list keeps running the old one until reset.
-if "$dest" ping >/dev/null 2>&1; then
-  echo "run \`rlord reset\` to reload the open rlord UI on the new version"
-fi
+# A new version was installed: if rlord is running, reset it onto the new
+# binary (daemon, list and tmux config). Agent sessions keep running.
+reset_running

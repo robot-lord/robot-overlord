@@ -212,7 +212,8 @@ enum Command {
     #[command(subcommand)]
     Overlord(OverlordCmd),
     /// Install the latest release from GitHub (needs `gh` logged in; no
-    /// compiling). Same as scripts/update.sh.
+    /// compiling), then reset a running rlord onto it. Same as
+    /// scripts/update.sh.
     Update {
         /// Release tag to install, e.g. v0.4.0 (default: latest)
         tag: Option<String>,

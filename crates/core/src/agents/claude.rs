@@ -459,11 +459,12 @@ pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
 /// file, and each call parses only the bytes appended since. A trailing line
 /// without its newline counts once it parses as complete JSON. A file that
 /// was replaced (new inode) or shrank is read again from the start.
-pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i64>)> {
+pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
     let (len, ino) = (meta.len(), meta.ino());
+    let modified = meta.modified().ok();
     // Copy the cursor out: the (possibly large) read happens unlocked, so one
     // slow file never holds up stats for another.
     let mut c = {
@@ -500,10 +501,24 @@ pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i6
                 c.input += u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
                 c.output += u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
             }
+            // Done when the latest turn is a final reply (no tool call
+            // pending); a tool result or new prompt reopens it.
+            match v["type"].as_str() {
+                // Any final stop reason (end_turn, max_tokens, …); not a
+                // tool call, nor a partial message without one.
+                Some("assistant") => {
+                    c.ended = v["message"]["stop_reason"]
+                        .as_str()
+                        .is_some_and(|r| r != "tool_use")
+                }
+                Some("user") => c.ended = false,
+                _ => {}
+            }
         }
         c.offset += end as u64;
     }
-    let stats = c.stats();
+    let mut stats = c.stats();
+    stats.modified = modified;
     c.used = std::time::Instant::now();
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     cursors.insert(path.to_path_buf(), c);
@@ -519,9 +534,23 @@ pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i6
     Some(stats)
 }
 
+/// What `transcript_stats` knows about a transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranscriptStats {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub first: Option<i64>,
+    pub last: Option<i64>,
+    /// The latest turn is a final reply: the agent finished.
+    pub ended: bool,
+    /// When the file was last written.
+    pub modified: Option<std::time::SystemTime>,
+}
+
 /// How far `transcript_stats` has read a file, and the totals so far.
 #[derive(Clone)]
 struct StatsCursor {
+    ended: bool,
     ino: u64,
     offset: u64,
     input: i64,
@@ -534,6 +563,7 @@ struct StatsCursor {
 impl Default for StatsCursor {
     fn default() -> Self {
         StatsCursor {
+            ended: false,
             ino: 0,
             offset: 0,
             input: 0,
@@ -546,10 +576,21 @@ impl Default for StatsCursor {
 }
 
 impl StatsCursor {
-    fn stats(&self) -> (i64, i64, Option<i64>, Option<i64>) {
-        (self.input, self.output, self.first, self.last)
+    fn stats(&self) -> TranscriptStats {
+        TranscriptStats {
+            input_tokens: self.input,
+            output_tokens: self.output,
+            first: self.first,
+            last: self.last,
+            ended: self.ended,
+            modified: None,
+        }
     }
 }
+
+/// A sub-agent whose transcript hasn't been written for this long has
+/// stopped, whatever its meta file says.
+const AGENT_QUIET: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Transcripts whose read position is remembered (most recently used).
 const STATS_CURSOR_CAP: usize = 1000;
@@ -562,16 +603,19 @@ static STATS_CURSORS: std::sync::LazyLock<
 /// dir (the Agent tool writes one per real sub-agent; Claude's internal
 /// helper agents have none and are deliberately excluded).
 pub fn scan_subagents(session_id: &str, transcript_path: &str) -> Vec<Subagent> {
-    scan_subagents_where(session_id, transcript_path, &|_| true)
+    scan_subagents_where(session_id, transcript_path, true, &|_| true)
 }
 
 /// `scan_subagents` for only the agent ids `want` accepts. Reading a
 /// sub-agent means reading its whole transcript (token totals), so callers
 /// skip the ones they already know are finished: on a long-lived session
 /// that is dozens of multi-MB files, and this runs as the user navigates.
+/// `parent_running`: false when the session has stopped; then none of its
+/// sub-agents can still be running.
 pub fn scan_subagents_where(
     session_id: &str,
     transcript_path: &str,
+    parent_running: bool,
     want: &dyn Fn(&str) -> bool,
 ) -> Vec<Subagent> {
     let dir = subagents_dir(transcript_path);
@@ -598,8 +642,16 @@ pub fn scan_subagents_where(
             continue;
         };
         let jsonl = dir.join(format!("agent-{id}.jsonl"));
-        let stats = transcript_stats(&jsonl);
-        let finished = meta["finished"].as_bool().unwrap_or(false);
+        let stats = transcript_stats(&jsonl).unwrap_or_default();
+        // Claude doesn't always mark an agent finished (older versions,
+        // agents cut off when the session ended), so also: its last turn is
+        // a final reply, or its transcript has gone quiet.
+        let quiet = stats
+            .modified
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|d| d > AGENT_QUIET);
+        let finished =
+            meta["finished"].as_bool().unwrap_or(false) || stats.ended || quiet || !parent_running;
         out.push(Subagent {
             agent_id: id.to_string(),
             session_id: session_id.to_string(),
@@ -608,16 +660,16 @@ pub fn scan_subagents_where(
             tool_use_id: meta["toolUseId"].as_str().map(str::to_string),
             spawn_depth: meta["spawnDepth"].as_i64().unwrap_or(1),
             background: meta["requestShape"].as_str() == Some("background"),
-            started_at: stats.and_then(|s| s.2),
+            started_at: stats.first,
             finished_at: if finished {
-                stats.and_then(|s| s.3)
+                stats.last.or(stats.first)
             } else {
                 None
             },
             transcript_path: jsonl.exists().then(|| jsonl.to_string_lossy().into_owned()),
             result: String::new(),
-            input_tokens: stats.map(|s| s.0).unwrap_or(0),
-            output_tokens: stats.map(|s| s.1).unwrap_or(0),
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
         });
     }
     out
@@ -672,19 +724,23 @@ mod subagent_tests {
             )
         };
         std::fs::write(&p, line("00", 10)).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().0, 10);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 10);
         // Appended: a full line and half of the next.
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
         let next = line("05", 7);
         write!(f, "{}{}", line("02", 5), &next[..10]).unwrap();
-        let (i, o, first, last) = transcript_stats(&p).unwrap();
-        assert_eq!((i, o), (15, 2), "the half line isn't counted yet");
-        assert_eq!(last.unwrap() - first.unwrap(), 2_000);
+        let st = transcript_stats(&p).unwrap();
+        assert_eq!(
+            (st.input_tokens, st.output_tokens),
+            (15, 2),
+            "the half line isn't counted yet"
+        );
+        assert_eq!(st.last.unwrap() - st.first.unwrap(), 2_000);
         write!(f, "{}", &next[10..]).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().0, 22);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 22);
         // Rewritten shorter: read again from the start.
         std::fs::write(&p, line("00", 3)).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().0, 3);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 3);
         // A final record without its newline still counts, once.
         let whole = line("09", 4);
         write!(
@@ -693,8 +749,32 @@ mod subagent_tests {
             whole.trim_end()
         )
         .unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().0, 7);
-        assert_eq!(transcript_stats(&p).unwrap().0, 7);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 7);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 7);
+        assert!(!transcript_stats(&p).unwrap().ended);
+        // A final reply ends it; a later tool result reopens it.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        writeln!(f).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"stop_reason":"end_turn"}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_stats(&p).unwrap().ended);
+        writeln!(f, r#"{{"type":"user","message":{{}}}}"#).unwrap();
+        assert!(!transcript_stats(&p).unwrap().ended);
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"stop_reason":"tool_use"}}}}"#
+        )
+        .unwrap();
+        assert!(!transcript_stats(&p).unwrap().ended);
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"stop_reason":"max_tokens"}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_stats(&p).unwrap().ended);
         // Replaced by a different, longer file: start over.
         let q = dir.path().join("other.jsonl");
         std::fs::write(
@@ -703,7 +783,7 @@ mod subagent_tests {
         )
         .unwrap();
         std::fs::rename(&q, &p).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().0, 3);
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 3);
     }
 
     #[test]
@@ -727,7 +807,7 @@ mod subagent_tests {
         std::fs::write(sub.join("junk.txt"), "x").unwrap();
         // Callers skip agents they already know (finished ones).
         let t = transcript.to_str().unwrap();
-        assert!(scan_subagents_where("s1", t, &|id| id != "a1").is_empty());
+        assert!(scan_subagents_where("s1", t, true, &|id| id != "a1").is_empty());
         let v = scan_subagents("s1", transcript.to_str().unwrap());
         assert_eq!(v.len(), 1);
         let a = &v[0];

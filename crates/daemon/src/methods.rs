@@ -705,7 +705,7 @@ fn ingest_subagent_hook(
     let from_disk = source
         .as_deref()
         // Only this hook's agent, not every sub-agent of the session.
-        .map(|src| claude::scan_subagents_where(session_id, src, &|id| id == agent_id))
+        .map(|src| claude::scan_subagents_where(session_id, src, true, &|id| id == agent_id))
         .unwrap_or_default()
         .into_iter()
         .find(|a| a.agent_id == agent_id);
@@ -739,9 +739,9 @@ fn ingest_subagent_hook(
             a.finished_at = Some(now);
             if let Some(tp) = payload["agent_transcript_path"].as_str() {
                 a.transcript_path = Some(tp.to_string());
-                if let Some((i, o, _, _)) = claude::transcript_stats(std::path::Path::new(tp)) {
-                    a.input_tokens = i;
-                    a.output_tokens = o;
+                if let Some(st) = claude::transcript_stats(std::path::Path::new(tp)) {
+                    a.input_tokens = st.input_tokens;
+                    a.output_tokens = st.output_tokens;
                 }
             }
             if let Some(r) = payload["last_assistant_message"].as_str() {
@@ -771,7 +771,8 @@ pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
         // finished one may still be resumed or get its last lines flushed),
         // but the DB is only written when something changed.
         let mut changed = false;
-        for a in claude::scan_subagents(&s.id, &src) {
+        let running = s.status != Status::Stopped;
+        for a in claude::scan_subagents_where(&s.id, &src, running, &|_| true) {
             let same = known.iter().any(|k| {
                 k.agent_id == a.agent_id
                     && k.input_tokens >= a.input_tokens
@@ -794,6 +795,12 @@ pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
 /// Startup reconcile: sessions marked running whose tmux is gone are stopped
 /// (resumable). Never auto-revives — crash vs. intentional kill is ambiguous.
 pub fn reconcile(db: &Db) -> Result<()> {
+    // Sub-agents left "running" in sessions that have stopped (Claude didn't
+    // record their end): close them.
+    let closed = db.close_open_subagents(None, now_ms())?;
+    if closed > 0 {
+        tracing::info!(closed, "closed sub-agents of stopped sessions");
+    }
     for s in db.running_sessions()? {
         let alive = s
             .tmux_session
