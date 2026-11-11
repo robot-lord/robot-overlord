@@ -84,12 +84,18 @@ pub fn check(agent: &str, configured: Option<&str>, observed: Option<&str>) -> F
         return out;
     };
     let latest_v = parse(&latest).map(|(_, v)| v).unwrap_or_default();
+    // Older only if it differs from the latest within the parts both name:
+    // `claude-opus-5` doesn't say which 5.x, so it isn't called outdated.
+    let older = |v: &Vec<u32>| {
+        v.iter()
+            .zip(&latest_v)
+            .find(|(a, b)| a != b)
+            .is_some_and(|(a, b)| a < b)
+    };
     let pinned_old = cfg
         .as_ref()
-        .is_some_and(|(f, v)| Some(f) == family.as_ref() && !v.is_empty() && *v < latest_v);
-    let observed_old = obs
-        .as_ref()
-        .is_some_and(|(_, v)| !v.is_empty() && *v < latest_v);
+        .is_some_and(|(f, v)| Some(f) == family.as_ref() && older(v));
+    let observed_old = obs.as_ref().is_some_and(|(_, v)| older(v));
     let fam = family.unwrap_or_default();
     if pinned_old {
         out.outdated = true;
@@ -158,6 +164,13 @@ mod tests {
         );
         assert_eq!(parse("opus[1m]"), Some(("opus".into(), vec![])));
         assert_eq!(parse("gpt-5"), None);
+    }
+
+    #[test]
+    fn version_prefix_is_not_outdated() {
+        // `claude-opus-5` doesn't say which 5.x: not called outdated.
+        assert!(!check("claude", Some("claude-opus-5"), None).outdated);
+        assert!(check("claude", Some("claude-opus-4-1"), None).outdated);
     }
 
     #[test]

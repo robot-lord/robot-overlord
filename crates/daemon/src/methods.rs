@@ -115,11 +115,7 @@ pub fn tag_list(db: &Db) -> Result<Value> {
         .into_iter()
         .map(|(tag, count)| json!({"tag": tag, "count": count}))
         .collect();
-    let untagged = db
-        .sessions(&SessionQuery::default())?
-        .iter()
-        .filter(|s| s.tags.is_empty())
-        .count();
+    let untagged = db.untagged_count()?;
     Ok(json!({"groups": groups, "untagged": untagged}))
 }
 
@@ -359,7 +355,9 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 
 /// A fresh `rlord-adjective-noun`, unused in the database and on tmux.
 fn mint_tmux_name(db: &Db) -> String {
-    rlord_core::names::tmux_name(|n| db.tmux_name_taken(n).unwrap_or(true) || tmux::has_session(n))
+    // A DB error counts as free: worst case a duplicate name, which tmux's
+    // own check below still catches. Counting it as taken would loop forever.
+    rlord_core::names::tmux_name(|n| db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
 }
 
 /// Give sessions from before Docker-style names (`rlord_<id>`) a new one,

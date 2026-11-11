@@ -105,9 +105,29 @@ pub fn respawn_plain(session: &str, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a session on the user's default server is one an older rlord
+/// made: `rlord_overlord`, `rlord_<session id>` (26-char lowercase ULID), or
+/// the home session `rlord` while it is actually running rlord. A personal
+/// session that merely has a similar name is left alone.
+fn is_legacy_rlord_session(name: &str, pane_commands: impl FnOnce() -> String) -> bool {
+    if name == "rlord" {
+        return pane_commands().lines().any(|c| c.trim() == "rlord");
+    }
+    match name.strip_prefix("rlord_") {
+        Some("overlord") => true,
+        Some(id) => {
+            id.len() == 26
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// Remove what older rlord versions left on the user's **default** tmux
-/// server: rlord sessions (`rlord`, `rlord_*`) and rlord's root-table key
-/// bindings. Returns the session names killed. Never touches anything else.
+/// server: the sessions it made (see `is_legacy_rlord_session`) and rlord's
+/// root-table key bindings. Returns the session names killed.
 pub fn cleanup_default_server() -> Vec<String> {
     // Only the real install has legacy state there; a test/alternate
     // server must never reach into the user's default tmux.
@@ -128,7 +148,18 @@ pub fn cleanup_default_server() -> Vec<String> {
         .unwrap_or_default()
         .lines()
     {
-        if (name == "rlord" || name.starts_with("rlord_"))
+        let panes = || {
+            tmux(&[
+                "list-panes",
+                "-s",
+                "-t",
+                &exact(name),
+                "-F",
+                "#{pane_current_command}",
+            ])
+            .unwrap_or_default()
+        };
+        if is_legacy_rlord_session(name, panes)
             && tmux(&["kill-session", "-t", &exact(name)]).is_some()
         {
             killed.push(name.to_string());
@@ -878,6 +909,21 @@ mod tests {
             &["claude".into(), "--session-id".into(), "u-1".into()],
         );
         assert_eq!(cmd, "exec env RLORD_SESSION_ID=abc claude --session-id u-1");
+    }
+
+    #[test]
+    fn legacy_cleanup_only_matches_rlord_made_sessions() {
+        let none = || String::new();
+        assert!(is_legacy_rlord_session("rlord_overlord", none));
+        assert!(is_legacy_rlord_session(
+            "rlord_01m73sevvpr2xq5xd773z5abcd",
+            none
+        ));
+        assert!(!is_legacy_rlord_session("rlord_notes", none));
+        assert!(!is_legacy_rlord_session("rlord-rusty-gear", none));
+        assert!(!is_legacy_rlord_session("work", none));
+        assert!(is_legacy_rlord_session("rlord", || "zsh\nrlord\n".into()));
+        assert!(!is_legacy_rlord_session("rlord", || "zsh\nvim\n".into()));
     }
 
     /// Real-tmux integration test of the actual module functions, on a

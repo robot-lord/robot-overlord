@@ -64,7 +64,20 @@ fn flags(s: &Session) -> Vec<&'static str> {
 
 /// `{"all": bool, "limit": n}` → sessions needing review, most recently
 /// updated first. `all` lists every live session regardless of watermark.
-pub fn triage(db: &Db, params: &Value) -> Result<Value> {
+pub fn triage(d: &crate::Daemon, params: &Value) -> Result<Value> {
+    // Gather under the DB lock, read transcripts (file I/O) after it's released.
+    let (mut out, sources) = {
+        let db = d.db();
+        collect(&db, params)?
+    };
+    fill_excerpts(&mut out, &sources);
+    Ok(out)
+}
+
+/// Rows plus each row's transcript path (claude sessions only).
+type Collected = (Value, Vec<Option<String>>);
+
+fn collect(db: &Db, params: &Value) -> Result<Collected> {
     let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
     let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
     let mut live: Vec<Session> = db
@@ -83,11 +96,17 @@ pub fn triage(db: &Db, params: &Value) -> Result<Value> {
         }
     }
     let needing = pending.iter().filter(|(_, _, c)| *c).count();
+    let mut sources = Vec::new();
     let rows: Vec<Value> = pending
         .into_iter()
         .take(limit)
         .map(|(s, reviewed, changed)| {
-            let mut row = json!({
+            sources.push(if s.agent == "claude" {
+                db.transcript_source(&s.id).ok().flatten()
+            } else {
+                None
+            });
+            json!({
                 "id": s.id, "name": s.name, "status": s.status,
                 "dir": s.project_path, "branch": s.branch,
                 "description": s.description, "tags": s.tags,
@@ -96,22 +115,36 @@ pub fn triage(db: &Db, params: &Value) -> Result<Value> {
                 "reviewed": reviewed.map(|r| rel_age(Some(r))),
                 "changed_since_review": changed,
                 "flags": flags(s),
-            });
-            if s.agent == "claude" {
-                if let Ok(Some(src)) = db.transcript_source(&s.id) {
-                    let e = claude::transcript_excerpts(std::path::Path::new(&src));
-                    row["excerpts"] = serde_json::to_value(e).unwrap_or(Value::Null);
-                }
-            }
-            row
+            })
         })
         .collect();
-    Ok(json!({
+    let out = json!({
         "live_sessions": total,
         "needing_review": needing,
         "shown": rows.len(),
         "sessions": rows,
-    }))
+    });
+    Ok((out, sources))
+}
+
+fn fill_excerpts(out: &mut Value, sources: &[Option<String>]) {
+    let Some(rows) = out["sessions"].as_array_mut() else {
+        return;
+    };
+    for (row, src) in rows.iter_mut().zip(sources) {
+        if let Some(src) = src {
+            let e = claude::transcript_excerpts(std::path::Path::new(src));
+            row["excerpts"] = serde_json::to_value(e).unwrap_or(Value::Null);
+        }
+    }
+}
+
+/// `triage` against a bare `Db` (tests).
+#[cfg(test)]
+fn triage_db(db: &Db, params: &Value) -> Result<Value> {
+    let (mut out, sources) = collect(db, params)?;
+    fill_excerpts(&mut out, &sources);
+    Ok(out)
 }
 
 /// Set the watermark on the given session ids (already resolved) to now.
@@ -168,20 +201,20 @@ mod tests {
         })
         .unwrap();
         let s = db.resolve_ref("01web").unwrap();
-        let t = triage(&db, &json!({})).unwrap();
+        let t = triage_db(&db, &json!({})).unwrap();
         assert_eq!(t["needing_review"], 1);
         let flags = t["sessions"][0]["flags"].as_array().unwrap();
         assert!(flags.contains(&json!("untagged")) && flags.contains(&json!("no_description")));
 
         mark_reviewed(&db, &json!({"sessions": [s.id]})).unwrap();
-        assert_eq!(triage(&db, &json!({})).unwrap()["needing_review"], 0);
+        assert_eq!(triage_db(&db, &json!({})).unwrap()["needing_review"], 0);
         // `all` still lists it, marked unchanged.
-        let t = triage(&db, &json!({"all": true})).unwrap();
+        let t = triage_db(&db, &json!({"all": true})).unwrap();
         assert_eq!(t["sessions"][0]["changed_since_review"], false);
 
         // New activity after the review brings it back.
         db.set_status(&s.id, Status::Working, now_ms() + 1000)
             .unwrap();
-        assert_eq!(triage(&db, &json!({})).unwrap()["needing_review"], 1);
+        assert_eq!(triage_db(&db, &json!({})).unwrap()["needing_review"], 1);
     }
 }

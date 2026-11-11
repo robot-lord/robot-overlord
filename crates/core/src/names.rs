@@ -222,10 +222,12 @@ pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
         }
     }
     let base = pick();
-    (2..)
+    // Bounded: if `taken` says yes to everything, give up on uniqueness
+    // rather than spin (the id suffix keeps it distinct in practice).
+    (2..10_000)
         .map(|i| format!("{base}-{i}"))
         .find(|n| !taken(n))
-        .expect("unbounded")
+        .unwrap_or_else(|| format!("{base}-{}", random_u64() % 1_000_000))
 }
 
 #[cfg(test)]

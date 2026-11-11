@@ -532,9 +532,27 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Live, non-overlord sessions with no tags.
+    pub fn untagged_count(&self) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions s WHERE s.archived_at IS NULL AND s.role = '' \
+             AND NOT EXISTS (SELECT 1 FROM tags t WHERE t.session_id = s.id)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
     /// Rename a tag on every session (merging into `to` where it exists).
     /// Returns how many sessions carried it.
     pub fn rename_tag(&self, from: &str, to: &str) -> Result<usize> {
+        if from == to {
+            // Nothing to move; the DELETE below would drop the tag everywhere.
+            return Ok(self.conn.query_row(
+                "SELECT COUNT(*) FROM tags WHERE tag = ?1",
+                [from],
+                |r| r.get::<_, i64>(0),
+            )? as usize);
+        }
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO tags (session_id, tag) \
              SELECT session_id, ?2 FROM tags WHERE tag = ?1",
@@ -857,6 +875,18 @@ mod tests {
             role: "",
         })
         .unwrap();
+    }
+
+    #[test]
+    fn rename_tag_to_itself_keeps_it() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01a", "a");
+        db.add_tag("01a", "web").unwrap();
+        assert_eq!(db.rename_tag("web", "web").unwrap(), 1);
+        assert_eq!(db.tag_counts().unwrap(), vec![("web".to_string(), 1)]);
+        assert_eq!(db.untagged_count().unwrap(), 0);
+        db.rename_tag("web", "frontend").unwrap();
+        assert_eq!(db.tag_counts().unwrap(), vec![("frontend".to_string(), 1)]);
     }
 
     #[test]

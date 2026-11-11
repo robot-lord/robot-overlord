@@ -39,7 +39,11 @@ fn send(d: &Daemon, text: &str) -> Result<Value> {
     if d.db().overlord()?.is_none() {
         bail!("no overlord yet: press Option-O to set one up (or N for the manual form)");
     }
-    overlord::ensure(&d.db(), &d.config, &json!({}))?;
+    let s = overlord::ensure(&d.db(), &d.config, &json!({}))?;
+    let pane = s["tmux_session"]
+        .as_str()
+        .unwrap_or(overlord::TMUX_NAME)
+        .to_string();
     d.changed();
     // A fresh or resumed overlord isn't listening until its SessionStart hook
     // flips it out of `starting`.
@@ -54,10 +58,10 @@ fn send(d: &Daemon, text: &str) -> Result<Value> {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    tmux::paste(overlord::TMUX_NAME, text)?;
+    tmux::paste(&pane, text)?;
     // Let the paste land before submitting it.
     std::thread::sleep(Duration::from_millis(150));
-    tmux::send_keys(overlord::TMUX_NAME, &["Enter"])?;
+    tmux::send_keys(&pane, &["Enter"])?;
     Ok(json!({"sent": true}))
 }
 

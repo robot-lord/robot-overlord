@@ -273,7 +273,6 @@ impl Daemon {
                 | "session.subagents"
                 | "session.defaults"
                 | "tag.list"
-                | "overlord.triage"
         );
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
@@ -293,7 +292,6 @@ impl Daemon {
             "session.rename" => methods::session_rename(&db, &params),
             "session.tag" => methods::session_tag(&db, &params),
             "tag.list" => methods::tag_list(&db),
-            "overlord.triage" => triage::triage(&db, &params),
             "overlord.mark_reviewed" => triage::mark_reviewed(&db, &params),
             "tag.rename" => methods::tag_rename(&db, &params),
             "session.pin" => methods::session_pin(&db, &params),
@@ -344,6 +342,7 @@ impl Daemon {
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
             "overlord.ask" => ask::ask(self, params),
+            "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
                 let r = overlord::set_model(&self.db(), &self.config, params);

@@ -381,7 +381,13 @@ pub fn transcript_excerpts(path: &Path) -> Excerpts {
             .collect()
     };
     let head = read_window(path, false).map(parse).unwrap_or_default();
-    let tail = read_window(path, true).map(parse).unwrap_or_default();
+    // A file that fits in one window was read whole: reuse it as the tail.
+    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= EXCERPT_WINDOW);
+    let tail = if small {
+        head.clone()
+    } else {
+        read_window(path, true).map(parse).unwrap_or_default()
+    };
     let mut e = Excerpts {
         first_prompt: head.iter().find_map(human_prompt).map(|t| clip(&t, 300)),
         ..Default::default()
