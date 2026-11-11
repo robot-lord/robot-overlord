@@ -296,7 +296,7 @@ older versions left on your default tmux server.
 
 ## Sessions and groups
 
-The list has two tabs (`Tab` switches):
+The list has two tabs (`Tab` switches; `H` / `L` go to the left / right one):
 
 - **sessions**: every session, flat.
 - **groups**: **tags are the groups**.

@@ -535,8 +535,13 @@ impl App {
             return Ok(false);
         }
         let Some(action) = action else {
-            if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
-                self.quit_hint();
+            match k.code {
+                KeyCode::Char('q') if k.modifiers.is_empty() => self.quit_hint(),
+                // H / L: the sessions tab / the groups tab (left / right),
+                // besides Tab. Only while not bound to something else.
+                KeyCode::Char('H') => self.switch_tab(Tab::Sessions),
+                KeyCode::Char('L') => self.switch_tab(Tab::Groups),
+                _ => {}
             }
             return Ok(false);
         };
