@@ -221,6 +221,11 @@ pub struct SessionDefaults {
     /// Directories scanned (to `repo_scan_depth`) by the repo finder.
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: u8,
+    /// Claude Code's renderer for rlord's sessions (`--settings
+    /// {"tui": …}`): "default" draws inline, so tmux keeps the scrollback
+    /// (copy-mode scrolling and search work); "fullscreen" keeps it inside
+    /// Claude. "" leaves Claude's own setting.
+    pub claude_tui: String,
 }
 
 impl Default for SessionDefaults {
@@ -234,6 +239,7 @@ impl Default for SessionDefaults {
             default_repo: String::new(),
             repo_roots: vec!["~".into()],
             repo_scan_depth: 3,
+            claude_tui: "default".into(),
         }
     }
 }
@@ -346,6 +352,9 @@ workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 repo_roots = ["~"]              # where the repo finder looks for git repos...
 repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
+claude_tui = "default"          # Claude's renderer here: "default" (inline: tmux
+                                # scrollback and copy-mode search work),
+                                # "fullscreen", or "" for Claude's own setting
 
 # The overlord: a long-running session you talk to in order to drive rlord —
 # launch sessions, search, jump around, set the list's sort/filter. It gets

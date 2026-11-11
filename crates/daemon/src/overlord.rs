@@ -135,10 +135,11 @@ fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
         mcp_path.to_string_lossy().into_owned(),
         // The whole point is a cheap, prompt-free control surface. Read-only
         // file tools are pre-allowed for groundwork (reading a repo's README
-        // or the files a request names); anything that writes or runs
-        // commands still asks.
+        // or the files a request names), and Claude's peer messaging for
+        // passing work to a session; anything that writes or runs commands
+        // still asks.
         "--allowedTools".into(),
-        "mcp__rlord,Read,Grep,Glob".into(),
+        "mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage".into(),
     ];
     let effort = seat.effort(cfg).trim();
     if !effort.is_empty() {

@@ -145,6 +145,7 @@ impl Daemon {
     /// Startup housekeeping: drain spooled hook events, then reconcile
     /// DB state against the live tmux server.
     pub fn startup(&self) -> Result<()> {
+        methods::set_claude_tui(&self.config);
         let db = self.db.lock().expect("db mutex poisoned");
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
