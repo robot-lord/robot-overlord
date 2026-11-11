@@ -137,9 +137,11 @@ session (your tool and model, `opus` by default) that you talk to in order to
 run the fleet. It has rlord's MCP tools, pre-allowed, and they act on the real
 UI you're looking at:
 
-- launch sessions: open the new-session form **pre-filled** for you to confirm
-  (`propose_session`), or create one directly and send you there or not
-  (`create_session`, `go`);
+- launch sessions: describe one with `n` in the list and the overlord launches
+  it. If your description contradicts the optional hints (repo, model,
+  worktree, tags), it reopens the form with them corrected for you to confirm
+  (`confirm_new_session`). It can also open the manual form pre-filled
+  (`propose_session`), or create one directly (`create_session`, `go`);
 - search and jump: switch your terminal to a session (`goto_session`) or to the
   list (`show_list`);
 - shape the list: set the current filter/sort, and save it as the default view

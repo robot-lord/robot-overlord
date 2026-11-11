@@ -363,6 +363,7 @@ impl Daemon {
             }
             "ui.state" => ui::state(self),
             "ui.goto" => ui::goto(self, params),
+            "ui.confirm_new_session" => ui::confirm_new_session(self, params),
             "ui.overlord" => ui::overlord(self, params),
             "admin.reset" => ui::reset(self),
             "tmux.profile" => profile::profile(self, params),

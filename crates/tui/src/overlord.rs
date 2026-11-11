@@ -228,6 +228,14 @@ impl App {
                 self.status_line = "overlord set the view".into();
             }
             Some("overlord_setup") => self.check_overlord(),
+            Some("confirm_new_session") => {
+                self.open_new_form(newform::FormKind::Overlord);
+                if let Mode::NewSession(form) = &mut self.mode {
+                    form.prefill_confirm(&cmd["prefill"]);
+                }
+                self.status_line =
+                    "the overlord updated your new session — check it, then send".into();
+            }
             Some("new_session") => {
                 self.open_new_form(newform::FormKind::Manual);
                 if let Mode::NewSession(form) = &mut self.mode {

@@ -147,6 +147,16 @@ impl App {
                 self.group_focus = self.sessions.is_empty();
                 return true;
             }
+            // Inside a group: esc, h or ← go back to the group list. (`h`
+            // only while it isn't bound to something else.)
+            KeyCode::Char('h') if !self.group_focus && action.is_none() => {
+                self.group_focus = true;
+                return true;
+            }
+            _ if !self.group_focus && action == Some(Action::Cancel) => {
+                self.group_focus = true;
+                return true;
+            }
             _ => {}
         }
         if !self.group_focus {
@@ -358,5 +368,26 @@ mod tests {
         // A session with two tags is in both groups.
         assert!(in_group(&all[0], "web") && in_group(&all[0], "wip"));
         assert!(in_group(&all[2], UNTAGGED) && !in_group(&all[1], UNTAGGED));
+    }
+}
+
+#[cfg(test)]
+mod back_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn esc_h_and_left_leave_a_group() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.tab = Tab::Groups;
+        for code in [KeyCode::Esc, KeyCode::Char('h'), KeyCode::Left] {
+            app.group_focus = false;
+            let k = KeyEvent::new(code, KeyModifiers::NONE);
+            let action = app.keys.action(&k);
+            assert!(app.handle_groups_key(&k, action), "{code:?}");
+            assert!(app.group_focus, "{code:?} should return to the group list");
+        }
     }
 }
