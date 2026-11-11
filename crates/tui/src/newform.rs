@@ -275,6 +275,8 @@ impl NewForm {
         if let Some(w) = p["workspace"].as_bool() {
             self.workspace = w && !matches!(self.location, Location::Folder(_));
         }
+        // Only the tags it sent: not the group tab the form opened on.
+        self.tags.clear();
         if let Some(t) = p["tags"].as_array() {
             self.tags = t
                 .iter()

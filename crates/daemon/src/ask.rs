@@ -69,7 +69,23 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 }
 
 /// kv key: the last unconfirmed form request's hints and their provenance.
+/// Cleared by a launch or a confirmed request; ignored after an hour.
 pub const PROVENANCE_KEY: &str = "request_provenance";
+
+/// The provenance of the form request still in play, if any.
+pub fn current_provenance(d: &Daemon) -> Result<Value> {
+    let v: Value = d
+        .db()
+        .kv_get(PROVENANCE_KEY)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    let at = v["at"].as_i64().unwrap_or(0);
+    Ok(if rlord_core::types::now_ms() - at < 60 * 60_000 {
+        v
+    } else {
+        Value::Null
+    })
+}
 
 /// Whether `p[list]` is an array holding `k`.
 pub fn in_list(p: &Value, list: &str, k: &str) -> bool {
@@ -83,25 +99,33 @@ pub fn in_list(p: &Value, list: &str, k: &str) -> bool {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
-    let r = send_to(d, &overlord::MASTERMIND, &text)?;
-    // Delivered: it answers any form the mastermind had reopened.
-    let db = d.db();
-    db.kv_set("confirm_pending", "0")?;
     // The hints as sent and whose they were, so a form the mastermind reopens
-    // for this request gets them from rlord, not from the model. A confirmed
+    // for this request gets them from rlord, not from the model. Written
+    // before delivery (the mastermind may answer at once). A confirmed
     // request is the last round: nothing will reopen it.
     let confirmed = params["confirmed"].as_bool().unwrap_or(false);
     let provenance = if confirmed {
         String::new()
     } else {
         json!({
+            "at": rlord_core::types::now_ms(),
             "chosen": params["chosen"], "resolved": params["resolved"],
             "repo": params["repo"], "model": params["model"],
             "workspace": params["workspace"], "tags": params["tags"],
         })
         .to_string()
     };
-    db.kv_set(PROVENANCE_KEY, &provenance)?;
+    d.db().kv_set(PROVENANCE_KEY, &provenance)?;
+    let r = match send_to(d, &overlord::MASTERMIND, &text) {
+        Ok(r) => r,
+        Err(e) => {
+            // Never delivered: nothing will answer it.
+            let _ = d.db().kv_set(PROVENANCE_KEY, "");
+            return Err(e);
+        }
+    };
+    // Delivered: it answers any form the mastermind had reopened.
+    d.db().kv_set("confirm_pending", "0")?;
     Ok(r)
 }
 
@@ -122,8 +146,6 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
     {
         text.push_str(&format!("\ncontext:\n{c}"));
     }
-    // A new request: whatever form was in play no longer is.
-    d.db().kv_set(PROVENANCE_KEY, "")?;
     // Switch the user first, so they watch the mastermind start and pick
     // the request up (a first start can take a while), then deliver it.
     let note = show_mastermind(d);

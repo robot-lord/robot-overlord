@@ -360,6 +360,8 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         }
         "create_session" => {
             let s = d.rpc("session.new", new_session_params(args))?;
+            // Launched: the form request in play (if any) is answered.
+            let _ = d.db().kv_set(crate::ask::PROVENANCE_KEY, "");
             let mut out = summarize(&s);
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The session exists either way; a failed switch is a note,

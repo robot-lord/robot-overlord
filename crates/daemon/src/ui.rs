@@ -453,7 +453,8 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
         let changed = prefill
             .get("changed")
             .is_some_and(|c| c.as_array().is_some_and(|a| a.iter().any(|x| x == k)));
-        if in_list(prev, "chosen", k) && !changed {
+        // The user's pick only while it still holds the value they sent.
+        if in_list(prev, "chosen", k) && !changed && prev_value(k) == Some(&v) {
             chosen.push(k);
         } else if changed || in_list(prev, "resolved", k) || prev_value(k) != Some(&v) {
             resolved.push(k);
@@ -502,11 +503,7 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             prefill.insert(k.into(), params[k].clone());
         }
     }
-    let provenance: Value = d
-        .db()
-        .kv_get(crate::ask::PROVENANCE_KEY)?
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default();
+    let provenance = crate::ask::current_provenance(d)?;
     apply_provenance(&mut prefill, &provenance);
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
