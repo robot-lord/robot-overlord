@@ -477,6 +477,18 @@ pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i6
 /// dir (the Agent tool writes one per real sub-agent; Claude's internal
 /// helper agents have none and are deliberately excluded).
 pub fn scan_subagents(session_id: &str, transcript_path: &str) -> Vec<Subagent> {
+    scan_subagents_where(session_id, transcript_path, &|_| true)
+}
+
+/// `scan_subagents` for only the agent ids `want` accepts. Reading a
+/// sub-agent means reading its whole transcript (token totals), so callers
+/// skip the ones they already know are finished: on a long-lived session
+/// that is dozens of multi-MB files, and this runs as the user navigates.
+pub fn scan_subagents_where(
+    session_id: &str,
+    transcript_path: &str,
+    want: &dyn Fn(&str) -> bool,
+) -> Vec<Subagent> {
     let dir = subagents_dir(transcript_path);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
@@ -490,6 +502,9 @@ pub fn scan_subagents(session_id: &str, transcript_path: &str) -> Vec<Subagent> 
         else {
             continue;
         };
+        if !want(id) {
+            continue;
+        }
         let Ok(meta) = std::fs::read_to_string(e.path())
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -580,6 +595,9 @@ mod subagent_tests {
         )
         .unwrap();
         std::fs::write(sub.join("junk.txt"), "x").unwrap();
+        // Callers skip agents they already know (finished ones).
+        let t = transcript.to_str().unwrap();
+        assert!(scan_subagents_where("s1", t, &|id| id != "a1").is_empty());
         let v = scan_subagents("s1", transcript.to_str().unwrap());
         assert_eq!(v.len(), 1);
         let a = &v[0];

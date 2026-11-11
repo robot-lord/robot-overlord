@@ -704,7 +704,8 @@ fn ingest_subagent_hook(
     let source = db.transcript_source(session_id)?;
     let from_disk = source
         .as_deref()
-        .map(|src| claude::scan_subagents(session_id, src))
+        // Only this hook's agent, not every sub-agent of the session.
+        .map(|src| claude::scan_subagents_where(session_id, src, &|id| id == agent_id))
         .unwrap_or_default()
         .into_iter()
         .find(|a| a.agent_id == agent_id);
@@ -764,7 +765,14 @@ fn ingest_subagent_hook(
 pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     if let Some(src) = db.transcript_source(&s.id)? {
-        for a in claude::scan_subagents(&s.id, &src) {
+        // Finished sub-agents never change: only re-read the rest.
+        let done: std::collections::HashSet<String> = db
+            .subagents(&s.id)?
+            .into_iter()
+            .filter(|a| a.finished_at.is_some())
+            .map(|a| a.agent_id)
+            .collect();
+        for a in claude::scan_subagents_where(&s.id, &src, &|id| !done.contains(id)) {
             db.upsert_subagent(&a)?;
         }
     }
