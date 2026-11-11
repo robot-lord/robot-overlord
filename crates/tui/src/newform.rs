@@ -296,6 +296,17 @@ impl NewForm {
             .unwrap_or(0);
     }
 
+    /// The description changed after the overlord reopened the form with
+    /// corrected hints: its confirmation no longer holds, so it goes back to
+    /// be checked against the hints again.
+    fn description_changed(&mut self) {
+        if self.confirmed {
+            self.confirmed = false;
+            self.changed.clear();
+            self.note = None;
+        }
+    }
+
     fn fields(&self) -> &'static [Field] {
         match self.kind {
             FormKind::Overlord => &OVERLORD_FIELDS,
@@ -537,10 +548,14 @@ impl App {
         }
         // ctrl-e: edit the description (or the manual form's prompt) in
         // $EDITOR, e.g. your vim; it comes back into the box.
-        if ctrl && code == KeyCode::Char('e') && f.fields().contains(&Field::Prompt) {
+        if ctrl && code == KeyCode::Char('e') && f.kind == FormKind::Overlord {
             match edit_in_editor(terminal, "new-session.md", &f.prompt)? {
                 Ok(text) => {
-                    f.prompt = text.trim_end().to_string();
+                    let text = text.trim_end().to_string();
+                    if text != f.prompt {
+                        f.prompt = text;
+                        f.description_changed();
+                    }
                     f.error = None;
                 }
                 Err(why) => f.error = Some(why),
@@ -564,7 +579,8 @@ impl App {
             KeyCode::Char('k') if !field.is_text() => prev(&mut f),
             // The request is free text: Enter is a new line (ctrl-s sends).
             KeyCode::Enter if field == Field::Prompt && f.kind == FormKind::Overlord => {
-                f.prompt.push('\n')
+                f.prompt.push('\n');
+                f.description_changed();
             }
             KeyCode::Enter => match field {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
@@ -594,6 +610,7 @@ impl App {
                 }
                 Field::Prompt => {
                     f.prompt.pop();
+                    f.description_changed();
                 }
                 Field::Tags => {
                     f.tags.pop();
@@ -612,7 +629,10 @@ impl App {
                         f.branch.push(c);
                         f.branch_touched = true;
                     }
-                    Field::Prompt => f.prompt.push(c),
+                    Field::Prompt => {
+                        f.prompt.push(c);
+                        f.description_changed();
+                    }
                     Field::Tags => f.tags.push(c),
                     _ => {}
                 }
@@ -855,7 +875,8 @@ impl App {
         }
 
         if form.kind == FormKind::Overlord {
-            let overlord_key = tmux::key_label(&self.config.tmux.overlord);
+            let k = &self.config.tmux.overlord;
+            let overlord_key = tmux::key_label(if k.trim().is_empty() { "M-o" } else { k });
             draw_describe_form(f, inner, form, &overlord_key);
             return;
         }
@@ -1077,7 +1098,12 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             dim,
         ))
     } else {
-        Paragraph::new(text).wrap(Wrap { trim: false })
+        // Longer than the box: keep the end (where you type) in view.
+        let visible = box_h.saturating_sub(2) as usize;
+        let skip = wrapped.saturating_sub(visible) as u16;
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((skip, 0))
     };
     f.render_widget(
         body.block(

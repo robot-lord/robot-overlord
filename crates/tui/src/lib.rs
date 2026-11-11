@@ -1552,10 +1552,16 @@ fn edit_in_editor(
     file: &str,
     text: &str,
 ) -> Result<std::result::Result<String, String>> {
+    // A unique file per edit: several TUIs (clients) may edit at once.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join("rlord-edit");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(file);
-    std::fs::write(&path, text)?;
+    let path = dir.join(format!("{}-{n}-{file}", std::process::id()));
+    // File errors are the user's to see (the caller keeps its text), not a
+    // reason to quit the TUI.
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, text)) {
+        return Ok(Err(format!("could not prepare {}: {e}", path.display())));
+    }
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
@@ -1567,9 +1573,11 @@ fn edit_in_editor(
         .arg(&path)
         .status();
     *terminal = init_terminal();
-    terminal.clear()?;
+    let _ = terminal.clear();
     let r = match status {
-        Ok(st) if st.success() => Ok(std::fs::read_to_string(&path).unwrap_or_default()),
+        // Unreadable afterwards (deleted, renamed): keep the old text.
+        Ok(st) if st.success() => std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read the edited text back: {e}")),
         Ok(_) => Err("editor exited with an error".to_string()),
         Err(e) => Err(format!("could not run editor '{editor}': {e}")),
     };
