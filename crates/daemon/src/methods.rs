@@ -88,30 +88,46 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
         "renamed",
         &json!({"from": old, "to": name.trim()}).to_string(),
     )?;
+    if let Some(t) = s.tmux_session.as_deref().filter(|t| tmux::has_session(t)) {
+        if let Err(e) = tmux::name_agent_window(t, name.trim()) {
+            tracing::debug!(error = %e, "renaming tmux window");
+        }
+    }
     Ok(json!({"renamed": s.id, "name": name.trim()}))
 }
 
 pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    let as_list = |key: &str| -> Vec<String> {
-        params
-            .get(key)
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    for t in as_list("add") {
+    for t in str_list(params, "add") {
         db.add_tag(&s.id, &t)?;
     }
-    for t in as_list("remove") {
+    for t in str_list(params, "remove") {
         db.remove_tag(&s.id, &t)?;
     }
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+/// Tags are rlord's groups: `{groups: [{tag, count}], untagged}` over live
+/// sessions.
+pub fn tag_list(db: &Db) -> Result<Value> {
+    let groups: Vec<Value> = db
+        .tag_counts()?
+        .into_iter()
+        .map(|(tag, count)| json!({"tag": tag, "count": count}))
+        .collect();
+    let untagged = db.untagged_count()?;
+    Ok(json!({"groups": groups, "untagged": untagged}))
+}
+
+/// Rename a group (tag) on every session.
+pub fn tag_rename(db: &Db, params: &Value) -> Result<Value> {
+    let from = p_str(params, "from")?.trim();
+    let to = p_str(params, "to")?.trim();
+    if to.is_empty() || to.contains(char::is_whitespace) {
+        bail!("a tag is one word (no spaces)");
+    }
+    let n = db.rename_tag(from, to)?;
+    Ok(json!({"from": from, "to": to, "sessions": n}))
 }
 
 pub fn session_describe(db: &Db, params: &Value) -> Result<Value> {
@@ -161,7 +177,21 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
     Ok(json!({"id": s.id, "group": group}))
 }
 
-fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
+/// A string-array param (missing / wrong type = empty).
+pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
     params
         .get(key)
         .and_then(Value::as_str)
@@ -264,10 +294,25 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         _ => (project, None, None),
     };
 
+    // Internal-only knobs (the overlord uses them; the MCP surface never
+    // forwards them): adapter flags that must survive restarts, a role, and a
+    // fixed tmux name.
+    let extra_args = str_list(params, "extra_args");
+    let role = p_opt("role").unwrap_or_default();
     let claude_sid = claude::mint_session_id();
-    let argv = claude::launch_argv(&claude_sid, prompt.as_deref(), model.as_deref());
-    let tmux_name = tmux::session_name(&id);
-    let launch_spec = json!({"agent": agent, "model": model, "prompt": prompt}).to_string();
+    let argv = claude::launch_argv(
+        &claude_sid,
+        prompt.as_deref(),
+        model.as_deref(),
+        &extra_args,
+    );
+    let tmux_name = match p_opt("tmux_name") {
+        Some(n) => n,
+        None => mint_tmux_name(db),
+    };
+    let launch_spec = json!({"agent": agent, "model": model, "prompt": prompt,
+                             "extra_args": extra_args})
+    .to_string();
     let now = now_ms();
 
     db.insert_session(&NewSession {
@@ -282,6 +327,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         repo_path: repo.as_deref(),
         workspace_path: workspace_path.as_deref(),
         branch: branch.as_deref(),
+        role: &role,
     })?;
     if let Some(r) = &repo {
         db.touch_repo(r, now)?;
@@ -307,6 +353,38 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(s)?)
 }
 
+/// A fresh `rlord-adjective-noun`, unused in the database and on tmux.
+fn mint_tmux_name(db: &Db) -> String {
+    // A DB error counts as free: worst case a duplicate name, which tmux's
+    // own check below still catches. Counting it as taken would loop forever.
+    rlord_core::names::tmux_name(|n| db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
+}
+
+/// Give sessions from before Docker-style names (`rlord_<id>`) a new one,
+/// renaming the live tmux session in place. Idempotent.
+pub fn rename_legacy_tmux(db: &Db) -> Result<()> {
+    let all = db.sessions(&SessionQuery {
+        archived: rlord_core::db::ArchivedMode::All,
+        ..Default::default()
+    })?;
+    for s in all {
+        let Some(old) = s
+            .tmux_session
+            .as_deref()
+            .filter(|n| n.starts_with("rlord_"))
+        else {
+            continue;
+        };
+        let new = mint_tmux_name(db);
+        if tmux::has_session(old) {
+            tmux::rename_session(old, &new)?;
+        }
+        db.set_tmux_session(&s.id, &new)?;
+        tracing::info!(session = %s.id, from = %old, to = %new, "renamed tmux session");
+    }
+    Ok(())
+}
+
 pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     Ok(serde_json::to_value(s)?)
@@ -326,16 +404,22 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let extra_args = str_list(&spec, "extra_args");
     let argv = claude::resume_argv(
         sid,
         &s.agent_session_trust,
         &s.project_path,
         model.as_deref(),
+        &extra_args,
     )?;
-    let tmux_name = s
-        .tmux_session
-        .clone()
-        .unwrap_or_else(|| tmux::session_name(&s.id));
+    let tmux_name = match s.tmux_session.clone() {
+        Some(n) => n,
+        None => {
+            let n = mint_tmux_name(db);
+            db.set_tmux_session(&s.id, &n)?;
+            n
+        }
+    };
     let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
     let resumed = argv.iter().any(|a| a == "--resume");
     if tmux::has_session(&tmux_name) {
@@ -426,7 +510,12 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
             "agent_stopped" => db.touch_last_agent_msg(&s.id, now)?,
             _ => {}
         }
-        if let Some(st) = status {
+        // A late hook from an agent that is exiting after its session was
+        // stopped (a kill, a reset) must not mark it alive again: a stopped
+        // session only comes back if its tmux session really exists.
+        let revives_dead = s.status == Status::Stopped
+            && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
+        if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }
         if kind.starts_with("subagent_") {

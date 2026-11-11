@@ -41,7 +41,7 @@ first for the evidence behind the choices here.
 ```
 
 One cargo workspace, one installed binary `rlord` with subcommands; the
-daemon is `rlord daemon` (run as a systemd user service). Crates:
+daemon is `rlord daemon` (run as a launchd user agent). Crates:
 
 - `rlord-core` — domain types, state store, event log, status engine,
   mailbox, adapter trait + claude/codex adapters, tmux supervisor.
@@ -404,6 +404,128 @@ preview pane (control-mode capture stream), attach on Enter, message compose.
 Deliberately thin — no business logic; if the TUI dies the fleet doesn't care.
 (This is the anti-`home.go` rule: the daemon owns behavior, clients own pixels.)
 
+## rlord's private tmux server (2026-11-10)
+
+All tmux use goes to a dedicated server, `tmux -L rlord`, started with a
+generated `<data>/tmux.conf`. That config turns the status bar off, sets no
+prefix, unbinds the prefix table, and turns mouse and extended keys on. It
+sources `tmux.local.conf` if present. The only root-table bindings are
+rlord's navigation keys. Every tmux invocation goes through
+`core::tmux::tmux_cmd()`. It adds `-L rlord -f <conf>` and drops an enclosing
+`TMUX` that points at the user's own server (it keeps one pointing at ours,
+which tmux needs to resolve "current client"). `inside_rlord()` (the socket
+in `$TMUX`) decides between switch-client and exec'ing an attach. Started
+from inside the user's tmux, `rlord` nests a client. The overlord's session
+alone turns its status bar on (magenta, `◆ OVERLORD`).
+
+### The user's tmux profile, per session
+
+`rlord tmux import` (`core::tmux_profile`) asks tmux itself what the user's
+config produced:
+
+1. Start a scratch server with the user's config (no `-f`, so tmux finds it).
+   It runs under a symlink mirror of `$HOME` that leaves out the
+   resurrect/continuum plugin directories, so restore plugins can't act.
+   `run` and plugin scripts get the scratch server's `$TMUX`, so they only
+   touch that server.
+2. Start a second scratch server with `-f /dev/null`.
+3. Dump keys and options from both (waiting until plugin loading settles),
+   and sort them:
+   - **Bindings:** every table is copied whole. `root` becomes `rlord-user`,
+     minus rlord's keys, `kill-server` and restore-plugin bindings.
+   - **Options:** `@` options are copied. Server options come only from an
+     allow-list, with the alternate-screen-disabling overrides dropped.
+     Session and window options are kept where they differ from tmux's
+     defaults or from rlord's config.
+4. Apply every line on the clean server, and drop what tmux rejects (e.g.
+   `cursor-colour ''`).
+
+The output files:
+- `tmux.user.conf` (keys and server options) is sourced by the server
+  config. Its bindings are only reachable from sessions using `rlord-user`
+  or a prefix.
+- `tmux.user.{session,window}.conf` are applied per session with
+  `source-file -t`, plus a per-session `after-new-window` hook.
+
+Per session, tmux options do the scoping:
+- `key-table` is a session option, so the list page keeps `root`.
+- A custom key table does not fall back to `root`, so rlord binds its keys
+  in both tables.
+- Turning the profile off unsets every session- and window-local option
+  except rlord's own.
+
+The on/off choice:
+- A per-session choice is stored in `kv` (`tmux_profile:<id>`); otherwise the
+  `[tmux] profile` default applies. The overlord is always off.
+- The daemon applies it on session new/restart, on startup, on reset, and
+  after an import (`tmux.reload`).
+- The agent pane is pinned as `@rlord_pane`, because a user's
+  `split-window -b` lists the new pane first.
+
+`rlord reset` restarts the daemon (via launchd only when launchd's pid is
+ours), then `admin.reset` closes overlays, reconciles, re-sources the config,
+rebinds keys, and respawns the list's pane. `--hard` first kills the server.
+It also removes legacy `rlord`/`rlord_*` sessions and `rlord nav` bindings
+from the user's default server, but only for the real socket.
+
+## The overlord (built 2026-11-10)
+
+The product's primary control surface: a singleton agent session
+(`role = 'overlord'`, fixed tmux name `rlord_overlord`) that the user talks to,
+wired to rlord's MCP server. It lives in `<data>/overlord/`. Each `ensure`
+regenerates that folder's `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` (the same
+standing instructions under each agent's file name: the built-in
+`daemon/src/overlord.md` plus the user's `overlord.md`) and `mcp.json`. These
+are project files, so each agent still loads the user's own global
+instructions too. Its adapter flags (`--mcp-config`,
+`--allowedTools mcp__rlord,Read,Grep,Glob`) ride in `launch_spec.extra_args`, so resume reuses
+them.
+
+- **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
+  overlord's pane (bracketed paste, then Enter), waiting out `starting` after
+  a (re)start. `overlord.new_session` formats the list's `n` form as a
+  `[rlord new-session request]` message; `overlord.md` defines what the
+  overlord does with one. `rlord overlord ask` is the CLI.
+- **Triage** (`daemon/src/triage.rs`): the cheap first pass for the
+  overlord's upkeep. `overlord.triage` lists live sessions updated since
+  their per-session `reviewed:<id>` kv watermark, with missing-metadata flags
+  and transcript excerpts (`claude::transcript_excerpts`, which reads only
+  the head and tail of the file). Overlord edits through `update_session` /
+  `organize`, and `overlord.mark_reviewed`, advance the watermark.
+  The overlord delegates tidy passes to the `rlord-tidy` subagent
+  (`daemon/src/tidy.md`, written to `<data>/overlord/.claude/agents/`), which
+  runs in the background with its own context and a narrow tool list.
+- **MCP**: `rlord mcp` is a hand-rolled stdio JSON-RPC shim that speaks the
+  protocol and forwards `tools/list` / `tools/call` to the daemon methods
+  `mcp.tools` / `mcp.call`. Tools are defined in `daemon/src/mcp.rs` as thin,
+  param-whitelisted mappings onto daemon methods.
+- **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
+  daemon with tmux. It switches the user's client (the most recently
+  active one). TUI state is pushed
+  as typed `{"notify":"ui","cmd":...}` lines on the subscription stream
+  (`set_view`, `new_session` with a prefill). The TUI reports its current view
+  back (`ui.view.report`) so the overlord can see it. A command sent while no
+  TUI is subscribed is parked (30s) for the next TUI. If there is no TUI, the
+  daemon starts one in a `rlord` tmux session ("home").
+- **Overlay**: Option-O (a root-table binding that runs `rlord nav overlord`)
+  asks the daemon (`ui.overlord`, passing the pressing client) to open a
+  `display-popup` on that client running `rlord overlay`. That program is a
+  small renderer: it sizes the overlord's tmux window to the popup, captures
+  pane and cursor every ~40ms, and forwards keys (`send-keys`) and pastes
+  (`paste-buffer -p`). It doesn't use a nested `tmux attach`, which fails
+  inside popups. Inside a popup, keys reach the program rather than tmux's key
+  table, so the program itself treats Option-O as "close". Navigation tools
+  close popups (`display-popup -C`) before moving the user.
+- **tmux locale**: every tmux invocation forces a UTF-8 `LC_CTYPE` when the
+  environment has none. Under launchd there is no `LANG`, and tmux then
+  rewrites tabs and non-ASCII characters in command output to `_`.
+- **Default view** persists in the `kv` table (schema v5).
+- **Model freshness** (`core/src/models.rs`): a hand-maintained per-tool table
+  of the newest model per family, checked against the configured model (alias
+  or pinned id) and the observed model (last assistant turn in the
+  transcript). The observed check catches an alias that resolves to an old
+  model because the agent CLI itself is stale.
+
 ## Navigation between rlord and agent panes
 
 The TUI is the hub; agent sessions are spokes. Moving around never requires
@@ -478,7 +600,7 @@ convention), excludes the dir via `.git/info/exclude`, and launches the agent
 - **Daemon crash/restart**: clients reconnect with backoff; hook `emit` spools
   to disk and is drained on startup; tmux panes are untouched (agents keep
   running — the daemon is an observer/controller, not a parent process).
-- **Reboot**: systemd user service starts daemon → reconcile → sessions marked
+- **Reboot**: launchd user agent starts daemon → reconcile → sessions marked
   resumable → auto-resume policy or one keystroke in the TUI (`R` = restart
   selection / all resumable).
 - **tmux server death**: same as reboot from the daemon's perspective.

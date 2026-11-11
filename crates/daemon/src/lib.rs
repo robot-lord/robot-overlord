@@ -1,9 +1,16 @@
+pub mod ask;
+pub mod mcp;
 pub mod methods;
+pub mod overlord;
+pub mod profile;
 pub mod rpc;
+pub mod triage;
+pub mod ui;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -20,21 +27,70 @@ pub struct Daemon {
     config: Config,
     /// Repo-finder scan cache (the scan walks the home dir; a minute is plenty).
     repo_scan: Mutex<Option<(std::time::Instant, Vec<String>)>>,
-    /// Coarse change signal: any successful mutation broadcasts one tick;
-    /// subscribers refetch what they display. Fine-grained events can come
-    /// later without changing the wire shape.
-    changes: tokio::sync::broadcast::Sender<()>,
+    /// Push stream to subscribers, one JSON line per message:
+    /// `{"notify":"changed"}` — coarse tick, refetch what you display;
+    /// `{"notify":"ui","cmd":{...}}` — a UI command for the TUI (set_view,
+    /// new_session) issued by the overlord.
+    notify: tokio::sync::broadcast::Sender<String>,
+    /// The TUI's current list view, as it last reported it.
+    pub(crate) ui_view: Mutex<Value>,
+    /// Last UI command sent while no TUI was subscribed, replayed to the
+    /// next TUI that starts (if fresh).
+    pending_ui: Mutex<Option<(std::time::Instant, Value)>>,
+    tui_subscribers: AtomicUsize,
+    /// The terminal (tmux client) the overlord overlay is open on, and that
+    /// overlay's token (so a replaced overlay's late "closed" report can't
+    /// clear its successor).
+    pub(crate) overlay: Mutex<Option<(String, u64)>>,
+    pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
     pub fn new(db: Db, config: Config) -> Arc<Self> {
-        let (changes, _) = tokio::sync::broadcast::channel(64);
+        let (notify, _) = tokio::sync::broadcast::channel(64);
         Arc::new(Daemon {
             db: Mutex::new(db),
             config,
             repo_scan: Mutex::new(None),
-            changes,
+            notify,
+            ui_view: Mutex::new(Value::Null),
+            pending_ui: Mutex::new(None),
+            tui_subscribers: AtomicUsize::new(0),
+            overlay: Mutex::new(None),
+            overlay_seq: std::sync::atomic::AtomicU64::new(1),
         })
+    }
+
+    pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
+        self.db.lock().expect("db mutex poisoned")
+    }
+
+    pub(crate) fn changed(&self) {
+        let _ = self.notify.send(r#"{"notify":"changed"}"#.to_string());
+    }
+
+    pub(crate) fn tui_count(&self) -> usize {
+        self.tui_subscribers.load(Ordering::SeqCst)
+    }
+
+    /// Push a UI command to TUIs; park it for the next TUI if none is up.
+    pub(crate) fn ui_cmd(&self, cmd: Value) {
+        if self.tui_count() == 0 {
+            *self.pending_ui.lock().expect("ui mutex") =
+                Some((std::time::Instant::now(), cmd.clone()));
+        }
+        let _ = self
+            .notify
+            .send(json!({"notify": "ui", "cmd": cmd}).to_string());
+    }
+
+    /// Internal call that maps method errors to anyhow (used by the MCP layer).
+    pub(crate) fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        match self.call(method, params) {
+            Ok(v) => Ok(v),
+            Err(MethodError::NotFound) => anyhow::bail!("no such method: {method}"),
+            Err(MethodError::Internal(e)) => Err(e),
+        }
     }
 
     /// Git repos under the configured roots, cached for 60s.
@@ -78,9 +134,13 @@ impl Daemon {
                 tracing::warn!(error = %e, "spooled hook event failed");
             }
         }
+        if let Err(e) = methods::rename_legacy_tmux(&db) {
+            tracing::warn!(error = %e, "renaming legacy tmux sessions");
+        }
         methods::reconcile(&db)?;
         drop(db);
         self.bind_nav_keys();
+        profile::sync_all(self, false);
         Ok(())
     }
 
@@ -134,21 +194,33 @@ impl Daemon {
                     let mut out = serde_json::to_vec(&ack)?;
                     out.push(b'\n');
                     write_half.write_all(&out).await?;
-                    let mut rx = self.changes.subscribe();
-                    loop {
-                        match rx.recv().await {
-                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                if write_half
-                                    .write_all(b"{\"notify\":\"changed\"}\n")
-                                    .await
-                                    .is_err()
-                                {
-                                    return Ok(()); // client gone
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                        }
+                    let mut rx = self.notify.subscribe();
+                    // TUIs identify themselves so the daemon knows whether a
+                    // UI command has anyone to land on.
+                    let is_tui = req.params.get("client").and_then(Value::as_str) == Some("tui");
+                    if is_tui {
+                        self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
                     }
+                    let r = loop {
+                        let line = match rx.recv().await {
+                            Ok(line) => line,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                r#"{"notify":"changed"}"#.to_string()
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break Ok(()),
+                        };
+                        if write_half
+                            .write_all(format!("{line}\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break Ok(()); // client gone
+                        }
+                    };
+                    if is_tui {
+                        self.tui_subscribers.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    return r;
                 }
             }
             let resp = match serde_json::from_str::<Request>(&line) {
@@ -185,7 +257,11 @@ impl Daemon {
 
     fn call(&self, method: &str, params: Value) -> std::result::Result<Value, MethodError> {
         if method == "ping" {
-            return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION")}));
+            return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION"),
+                             "build": build_id()}));
+        }
+        if let Some(r) = self.call_ui(method, &params) {
+            return r.map_err(MethodError::Internal);
         }
         let mutating = !matches!(
             method,
@@ -196,6 +272,7 @@ impl Daemon {
                 | "repo.find"
                 | "session.subagents"
                 | "session.defaults"
+                | "tag.list"
         );
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
@@ -214,6 +291,9 @@ impl Daemon {
             "session.unarchive" => methods::session_unarchive(&db, &params),
             "session.rename" => methods::session_rename(&db, &params),
             "session.tag" => methods::session_tag(&db, &params),
+            "tag.list" => methods::tag_list(&db),
+            "overlord.mark_reviewed" => triage::mark_reviewed(&db, &params),
+            "tag.rename" => methods::tag_rename(&db, &params),
             "session.pin" => methods::session_pin(&db, &params),
             "session.describe" => methods::session_describe(&db, &params),
             "session.notes" => methods::session_notes(&db, &params),
@@ -223,19 +303,121 @@ impl Daemon {
             "hook.emit" => methods::hook_emit(&db, &params),
             _ => return Err(MethodError::NotFound),
         };
+        drop(db);
         if mutating && r.is_ok() {
-            let _ = self.changes.send(());
+            self.changed();
             if method == "session.new" {
                 self.bind_nav_keys();
+            }
+            // A new or respawned tmux session starts on rlord's defaults.
+            let created = match (method, &r) {
+                ("session.new", Ok(v)) => v["id"].as_str().map(str::to_string),
+                ("session.restart", _) => params["ref"].as_str().map(str::to_string),
+                _ => None,
+            };
+            if let Some(id) = created {
+                profile::sync_ref(self, &id);
             }
         }
         r.map_err(MethodError::Internal)
     }
 }
 
+impl Daemon {
+    /// Methods that manage their own locking: the overlord, UI control, and
+    /// the MCP bridge (which re-enters `call`). None = not one of these.
+    fn call_ui(&self, method: &str, params: &Value) -> Option<Result<Value>> {
+        let r = match method {
+            "overlord.ensure" => {
+                let r = overlord::ensure(&self.db(), &self.config, params);
+                if r.is_ok() {
+                    self.changed();
+                    self.bind_nav_keys();
+                }
+                r
+            }
+            "overlord.get" => self
+                .db()
+                .overlord()
+                .and_then(|o| Ok(serde_json::to_value(o)?)),
+            "overlord.status" => overlord::status(&self.db(), &self.config),
+            "overlord.ask" => ask::ask(self, params),
+            "overlord.triage" => triage::triage(self, params),
+            "overlord.new_session" => ask::new_session(self, params),
+            "overlord.set_model" => {
+                let r = overlord::set_model(&self.db(), &self.config, params);
+                if r.is_ok() {
+                    self.changed();
+                }
+                r
+            }
+            "ui.state" => ui::state(self),
+            "ui.goto" => ui::goto(self, params),
+            "ui.overlord" => ui::overlord(self, params),
+            "admin.reset" => ui::reset(self),
+            "tmux.profile" => profile::profile(self, params),
+            "tmux.reload" => profile::reload(self),
+            "ui.overlay.close_on" => ui::close_overlay_on(self, params),
+            "ui.overlay.report" => {
+                // The overlay closed itself (Option-O inside it, or exit).
+                if params.get("open").and_then(Value::as_bool) == Some(false) {
+                    let token = params.get("token").and_then(Value::as_u64);
+                    let mut o = self.overlay.lock().expect("ui mutex");
+                    if o.as_ref().map(|(_, t)| Some(*t)) == Some(token) {
+                        *o = None;
+                    }
+                }
+                Ok(json!({"ok": true}))
+            }
+            "ui.show_list" => ui::show_list(self),
+            "ui.view.set" => ui::set_view(self, params),
+            "ui.view.default" => ui::default_view(self),
+            "ui.view.report" => {
+                *self.ui_view.lock().expect("ui mutex") =
+                    params.get("view").cloned().unwrap_or(Value::Null);
+                Ok(json!({"ok": true}))
+            }
+            "ui.pending" => {
+                let p = self.pending_ui.lock().expect("ui mutex").take();
+                Ok(
+                    p.filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(30))
+                        .map(|(_, cmd)| cmd)
+                        .unwrap_or(Value::Null),
+                )
+            }
+            "ui.propose_session" => ui::propose_session(self, params),
+            "mcp.tools" => Ok(mcp::tools()),
+            "mcp.call" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                tracing::info!(tool = name, caller = ?params.get("caller"), "mcp tool call");
+                mcp::call(self, name, &args)
+            }
+            _ => return None,
+        };
+        Some(r)
+    }
+}
+
 enum MethodError {
     NotFound,
     Internal(anyhow::Error),
+}
+
+/// Identity of the binary this process was started from (its mtime when
+/// first asked): a daemon whose build differs from the CLI's is stale.
+pub fn build_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .and_then(std::fs::metadata)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
 /// Blocking one-shot client used by the CLI: connect, send one request, read one response.
@@ -350,6 +532,7 @@ mod tests {
                 repo_path: None,
                 workspace_path: None,
                 branch: None,
+                role: "",
             })
             .unwrap();
         }

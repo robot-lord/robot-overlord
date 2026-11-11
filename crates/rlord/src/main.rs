@@ -24,7 +24,7 @@ struct Cli {
 enum Command {
     /// Interactive session dashboard (the default when no subcommand is given)
     Tui,
-    /// Run the daemon in the foreground (use the systemd unit for real deployments)
+    /// Run the daemon in the foreground (use the launchd agent for real deployments)
     Daemon,
     /// Check daemon liveness
     Ping,
@@ -52,7 +52,7 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Sort: activity (default), user, state, created, name
-        #[arg(long, default_value = "activity")]
+        #[arg(long, default_value = "updated")]
         sort: String,
         /// Reverse the sort order
         #[arg(long)]
@@ -94,9 +94,11 @@ enum Command {
     Attach {
         r#ref: String,
     },
-    /// Restart a session, resuming its conversation
+    /// Restart one agent session, resuming its conversation
+    /// (to restart rlord itself: `rlord reset`)
     Restart {
-        r#ref: String,
+        /// The session (id, id prefix, or name)
+        r#ref: Option<String>,
     },
     /// Stop a session (keeps it resumable)
     Stop {
@@ -179,6 +181,44 @@ enum Command {
     /// Claude Code integration management
     #[command(subcommand)]
     Claude(ClaudeCmd),
+    /// The overlord: the session you talk to in order to drive rlord
+    #[command(subcommand)]
+    Overlord(OverlordCmd),
+    /// Unstick rlord: restart the daemon, close overlays, resync session
+    /// state, reload rlord's tmux config and key bindings, restart the list.
+    /// Agent sessions keep running.
+    Reset {
+        /// Also kill rlord's whole tmux server and start clean. Every session
+        /// stops — none are lost: Enter in the list resumes each one.
+        #[arg(long)]
+        hard: bool,
+        /// Don't ask for confirmation (--hard)
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// MCP server over stdio (what the overlord's agent connects to)
+    #[command(hide = true)]
+    Mcp,
+    /// The overlord overlay itself (runs inside the tmux popup)
+    #[command(hide = true)]
+    Overlay {
+        #[arg(long)]
+        token: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum OverlordCmd {
+    /// Open rlord with the overlord shown (starts it if needed)
+    Open,
+    /// Show the overlord's state and whether its model is the latest
+    Status,
+    /// Switch the overlord to another model (restarts it; the conversation resumes)
+    Model { model: String },
+    /// Restart the overlord (resumes its conversation)
+    Restart,
+    /// Send the overlord a message, as if typed into it (text, or stdin)
+    Ask { text: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +237,25 @@ enum TmuxCmd {
     Bind,
     /// Remove the navigation bindings
     Unbind,
+    /// Import your tmux config as a profile agent sessions can use (your
+    /// prefix, bindings and status bar, per session; the list and the
+    /// overlord keep rlord's tmux). Re-run after changing your config.
+    Import {
+        /// Show what would be imported; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete the imported profile
+        #[arg(long, conflicts_with = "dry_run")]
+        remove: bool,
+    },
+    /// Show or set whether a session uses your tmux profile
+    Profile {
+        /// on | off | toggle | default (follow `[tmux] profile`); omit to show
+        state: Option<String>,
+        /// Session (default: the one you're in)
+        #[arg(name = "REF")]
+        r#ref: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,6 +264,8 @@ enum NavCmd {
     Home,
     Next,
     Prev,
+    /// Toggle the overlord overlay (Option-O)
+    Overlord,
 }
 
 #[derive(Subcommand)]
@@ -230,6 +291,20 @@ fn main() -> Result<()> {
     match Cli::parse().command.unwrap_or(Command::Tui) {
         Command::Tui => {
             let cfg = Config::load()?;
+            // The TUI always lives in rlord's own tmux server: that is what
+            // lets rlord (and the overlord) move the user between it and
+            // agent sessions. From a plain terminal (or the user's own tmux,
+            // where this nests) open — or rejoin — its home session.
+            if !tmux::inside_rlord() {
+                use std::os::unix::process::CommandExt;
+                ensure_daemon_current();
+                tmux::write_conf()?;
+                let cmd = format!("exec {} tui", tmux::shell_quote(&methods::rlord_bin()));
+                let err = tmux::command()
+                    .args(["new-session", "-A", "-s", "rlord", &cmd])
+                    .exec();
+                return Err(err).context("exec tmux failed");
+            }
             if let Ok(conflicts) = tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings())
             {
                 for c in conflicts {
@@ -279,6 +354,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Tmux(TmuxCmd::Import { dry_run, remove }) => tmux_import(dry_run, remove),
+        Command::Tmux(TmuxCmd::Profile { state, r#ref }) => tmux_profile_cmd(state, r#ref),
         Command::Tmux(TmuxCmd::Unbind) => {
             let cfg = Config::load()?;
             tmux::unbind_nav_keys(&cfg.tmux.bindings())?;
@@ -288,6 +365,85 @@ fn main() -> Result<()> {
         Command::Nav(NavCmd::Home) => nav_home(),
         Command::Nav(NavCmd::Next) => nav_step(1),
         Command::Nav(NavCmd::Prev) => nav_step(-1),
+        Command::Nav(NavCmd::Overlord) => {
+            if let Err(e) = nav_overlord() {
+                let _ = tmux::display_message(&format!("rlord: {e:#}"));
+            }
+            Ok(())
+        }
+        Command::Mcp => mcp_stdio(),
+        Command::Reset { hard, yes } => reset(hard, yes),
+        Command::Overlay { token } => rlord_tui::run_overlay(token),
+        Command::Overlord(OverlordCmd::Open) => {
+            if tmux::inside_rlord() {
+                nav_overlord()
+            } else {
+                // Not in tmux: the overlay needs a tmux terminal to pop up
+                // over, so start (or rejoin) rlord there first.
+                eprintln!("rlord: run `rlord`, then press Option-O (or c)");
+                Ok(())
+            }
+        }
+        Command::Overlord(OverlordCmd::Status) => {
+            let st = call("overlord.status", json!({}))?;
+            if st["exists"] != true {
+                println!(
+                    "no overlord yet — `rlord overlord open` (or start `rlord`) creates one ({} / {})",
+                    st["default_agent"].as_str().unwrap_or("?"),
+                    st["default_model"].as_str().unwrap_or("?")
+                );
+                return Ok(());
+            }
+            let f = &st["freshness"];
+            println!(
+                "overlord {} · {} · model {} (running: {})",
+                st["status"].as_str().unwrap_or("?"),
+                st["agent"].as_str().unwrap_or("?"),
+                st["model"].as_str().unwrap_or("(agent default)"),
+                st["observed_model"].as_str().unwrap_or("not yet observed"),
+            );
+            if f["outdated"] == true {
+                println!(
+                    "  OUTDATED: {} — `rlord overlord model {}`",
+                    f["note"].as_str().unwrap_or(""),
+                    f["suggest"].as_str().unwrap_or("?")
+                );
+            } else if let Some(n) = f["note"].as_str() {
+                println!("  note: {n}");
+            } else if let Some(l) = f["latest"].as_str() {
+                println!(
+                    "  up to date (latest {} is {l})",
+                    f["family"].as_str().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        Command::Overlord(OverlordCmd::Model { model }) => {
+            let s = call("overlord.set_model", json!({"model": model}))?;
+            println!(
+                "overlord now on {} (restarted; conversation resumed)",
+                s["model"].as_str().unwrap_or("the agent default")
+            );
+            Ok(())
+        }
+        Command::Overlord(OverlordCmd::Restart) => {
+            let s = call("overlord.ensure", json!({}))?;
+            call("session.restart", json!({"ref": s["id"]}))?;
+            println!("overlord restarted");
+            Ok(())
+        }
+        Command::Overlord(OverlordCmd::Ask { text }) => {
+            let text = if text.is_empty() {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                text.join(" ")
+            };
+            call("overlord.ask", json!({"text": text}))?;
+            println!("sent to the overlord (Option-O to see it)");
+            Ok(())
+        }
         Command::Daemon => run_daemon(),
         Command::Ping => {
             let r = call("ping", Value::Null)?;
@@ -430,6 +586,12 @@ fn main() -> Result<()> {
             attach_tmux(tmux_name)
         }
         Command::Restart { r#ref } => {
+            let Some(r#ref) = r#ref else {
+                anyhow::bail!(
+                    "`rlord restart <session>` restarts one agent session; \
+                     to restart rlord itself use `rlord reset` (or `rlord reset --hard`)"
+                );
+            };
             let r = call("session.restart", json!({"ref": r#ref}))?;
             println!(
                 "restarted {} ({}) — status {}",
@@ -600,6 +762,73 @@ fn main() -> Result<()> {
     }
 }
 
+fn tmux_import(dry_run: bool, remove: bool) -> Result<()> {
+    use rlord_core::tmux_profile;
+    if remove {
+        tmux_profile::remove()?;
+        tmux::write_conf()?;
+        println!("tmux profile removed");
+    } else {
+        let cfg = Config::load()?;
+        let reserved: Vec<&str> = cfg.tmux.bindings().iter().map(|(k, _)| *k).collect();
+        eprintln!("reading your tmux config on a scratch server…");
+        let p = tmux_profile::import(&reserved)?;
+        print!("{}", p.report.render());
+        if dry_run {
+            println!("(dry run: nothing written)");
+            return Ok(());
+        }
+        tmux_profile::write(&p)?;
+        println!(
+            "wrote {} (report: {})",
+            tmux_profile::keys_path().display(),
+            tmux_profile::report_path().display()
+        );
+    }
+    match call("tmux.reload", json!({})) {
+        Ok(_) => println!("rlord's tmux reloaded; sessions updated"),
+        Err(e) => println!("not applied yet ({e:#}): it applies when rlord's daemon starts"),
+    }
+    Ok(())
+}
+
+fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
+    // One argument that isn't a state is the session: `rlord tmux profile beta`.
+    let (state, r) = match (state, r) {
+        (Some(s), None) if !matches!(s.as_str(), "on" | "off" | "toggle" | "default") => {
+            (None, Some(s))
+        }
+        x => x,
+    };
+    let r = match r {
+        Some(r) => r,
+        // resolve_ref accepts the tmux session name too.
+        None => tmux::current_session()
+            .filter(|s| s.starts_with("rlord-"))
+            .context("not in an rlord session: give a session REF")?,
+    };
+    let mut params = json!({"ref": r});
+    if let Some(s) = &state {
+        params["set"] = json!(s);
+    }
+    let v = call("tmux.profile", params)?;
+    let on = v["on"].as_bool().unwrap_or(false);
+    println!(
+        "{}: your tmux profile {}{}",
+        v["name"].as_str().unwrap_or("?"),
+        if on { "on" } else { "off" },
+        if v["explicit"] == true {
+            ""
+        } else {
+            " (default)"
+        }
+    );
+    if v["imported"] != true {
+        println!("no profile imported yet — run `rlord tmux import`");
+    }
+    Ok(())
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     client_call(&paths::socket_path(), method, params)
 }
@@ -616,9 +845,25 @@ fn tags_of(session: &Value) -> String {
     }
 }
 
+/// Restart the daemon if it runs an older build than this binary (after a
+/// rebuild/upgrade a stale daemon and a new UI disagree about everything).
+fn ensure_daemon_current() {
+    let Ok(p) = call("ping", Value::Null) else {
+        return;
+    };
+    let mine = rlord_daemon::build_id();
+    if p["build"].as_u64() != Some(mine) {
+        eprintln!("rlord: daemon is from an older build; restarting it");
+        if let Err(e) = restart_daemon() {
+            eprintln!("rlord: {e:#}");
+        }
+    }
+}
+
 fn run_daemon() -> Result<()> {
+    rlord_daemon::build_id(); // pin it at startup, before any rebuild
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let r = rt.block_on(async {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
         let daemon = Daemon::new(db, Config::load()?);
         daemon.startup()?;
@@ -635,7 +880,11 @@ fn run_daemon() -> Result<()> {
         tracing::info!("shutting down");
         let _ = std::fs::remove_file(&pidfile);
         r
-    })
+    });
+    // Exit now: don't wait on in-flight blocking work (a stuck tmux call
+    // would otherwise hold a restart hostage).
+    rt.shutdown_timeout(std::time::Duration::from_millis(300));
+    r
 }
 
 /// Fast path for agent hooks: read payload from stdin, forward to the daemon,
@@ -662,10 +911,211 @@ fn hook_emit(agent: &str) -> Result<()> {
 /// `nav home`: switch this client to the TUI's session, or detach when the
 /// TUI isn't inside tmux (no home recorded / home gone).
 fn nav_home() -> Result<()> {
+    // Overlay up on this terminal → Option-D just closes it.
+    if let Some(client) = tmux::current_client() {
+        if call("ui.overlay.close_on", json!({"client": client})).is_ok_and(|r| r["closed"] == true)
+        {
+            return Ok(());
+        }
+    }
     match tmux::home() {
         Some(h) if tmux::has_session(&h) => tmux::switch_client(&h),
         _ => tmux::detach_client(),
     }
+}
+
+/// `nav overlord` (Option-O): in the TUI, toggle the overlord overlay;
+/// anywhere else, bring the user to the TUI with it open.
+fn nav_overlord() -> Result<()> {
+    // Say where the key was pressed (run-shell runs in that client's
+    // context), rather than making the daemon guess which terminal it was.
+    let r = call(
+        "ui.overlord",
+        json!({"client": tmux::current_client(), "from": tmux::current_session()}),
+    )?;
+    if r["overlord"] == "already here" {
+        let _ = tmux::display_message("you're in the overlord · ⌥D: back to the list");
+    }
+    Ok(())
+}
+
+/// `rlord reset [--hard]`.
+fn reset(hard: bool, yes: bool) -> Result<()> {
+    if hard {
+        let running = call("session.list", json!({"archived": "live"}))
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .map(|a| a.iter().filter(|s| s["status"] != "stopped").count());
+        if !yes {
+            use std::io::Write;
+            print!(
+                "This stops {} running session(s) — conversations are kept; Enter in the list \
+                 resumes each. Continue? [y/N] ",
+                running
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "all".into())
+            );
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("aborted");
+                return Ok(());
+            }
+        }
+        tmux::kill_server()?;
+        println!("killed rlord's tmux server");
+        let legacy = tmux::cleanup_default_server();
+        if !legacy.is_empty() {
+            println!(
+                "removed {} old rlord session(s) from your default tmux server",
+                legacy.len()
+            );
+        }
+    }
+    restart_daemon()?;
+    let r = call("admin.reset", json!({}))?;
+    println!(
+        "daemon restarted · {} session(s) running, {} stopped (resumable)",
+        r["running"], r["stopped"]
+    );
+    if hard && !tmux::inside_rlord() {
+        println!("run `rlord` to open it");
+    }
+    Ok(())
+}
+
+/// Restart the daemon: via launchd when its agent is installed, else by
+/// killing the recorded pid and starting a detached `rlord daemon`.
+fn restart_daemon() -> Result<()> {
+    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
+        .trim()
+        .to_string();
+    let target = format!("gui/{uid}/robot-overlord.daemon");
+    // launchd only if its daemon is the one serving *our* socket (its pid is
+    // the one in our pidfile).
+    let ours = std::fs::read_to_string(paths::pid_path())
+        .ok()
+        .map(|p| p.trim().to_string());
+    let launchd = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("pid = ").map(str::to_string))
+        })
+        .is_some_and(|pid| Some(pid) == ours);
+    if launchd {
+        let st = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()?;
+        if !st.success() {
+            anyhow::bail!("launchctl kickstart failed");
+        }
+    } else {
+        if let Ok(pid) = std::fs::read_to_string(paths::pid_path()) {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+            for _ in 0..30 {
+                if !paths::socket_path().exists() || call("ping", Value::Null).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        use std::os::unix::process::CommandExt;
+        let log = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Library/Logs/rlordd.log"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("rlordd.log"));
+        if let Some(d) = log.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)?;
+        std::process::Command::new(methods::rlord_bin())
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(out.try_clone()?)
+            .stderr(out)
+            .process_group(0)
+            .spawn()
+            .context("starting daemon")?;
+    }
+    // Wait for a *new* daemon (the old one may still answer while exiting).
+    let old_pid = ours;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let new_pid = std::fs::read_to_string(paths::pid_path())
+            .ok()
+            .map(|p| p.trim().to_string());
+        if new_pid.is_some() && new_pid != old_pid && call("ping", Value::Null).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("daemon did not come back (see ~/Library/Logs/rlordd.log)")
+}
+
+/// `rlord mcp`: a minimal MCP server over stdio (JSON-RPC, one message per
+/// line). Protocol handling lives here; tools live in the daemon
+/// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
+fn mcp_stdio() -> Result<()> {
+    use std::io::{BufRead, Write};
+    let caller = std::env::var("RLORD_SESSION_ID").ok();
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = msg.get("id").cloned() else {
+            continue; // notification (e.g. notifications/initialized)
+        };
+        let method = msg["method"].as_str().unwrap_or("");
+        let params = msg.get("params").cloned().unwrap_or(json!({}));
+        let result: std::result::Result<Value, (i64, String)> = match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "rlord", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": "Robot Overlord control surface: inspect agent sessions and drive the rlord UI (navigate, set the list view, propose or create sessions).",
+            })),
+            "ping" => Ok(json!({})),
+            "tools/list" => call("mcp.tools", json!({}))
+                .map(|t| json!({"tools": t}))
+                .map_err(|e| (-32603, format!("{e:#}"))),
+            "tools/call" => {
+                let r = call(
+                    "mcp.call",
+                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
+                           "caller": caller}),
+                );
+                Ok(match r {
+                    Ok(v) => json!({"content": [{"type": "text",
+                        "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
+                    Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}],
+                                     "isError": true}),
+                })
+            }
+            other => Err((-32601, format!("method not found: {other}"))),
+        };
+        let resp = match result {
+            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+            Err((code, message)) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+            }
+        };
+        writeln!(out, "{resp}")?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 /// `nav next|prev`: move to the neighbouring live session in list order.
@@ -694,13 +1144,13 @@ fn nav_step(dir: i64) -> Result<()> {
 fn attach_tmux(tmux_name: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let target = format!("={tmux_name}");
-    // Inside tmux already → switch the client instead of nesting.
-    let err = if std::env::var_os("TMUX").is_some() {
-        std::process::Command::new("tmux")
+    // Inside rlord's tmux already → switch the client instead of nesting.
+    let err = if tmux::inside_rlord() {
+        tmux::command()
             .args(["switch-client", "-t", &target])
             .exec()
     } else {
-        std::process::Command::new("tmux")
+        tmux::command()
             .args(["attach-session", "-t", &target])
             .exec()
     };
@@ -763,8 +1213,8 @@ fn print_session_table(list: &Value) {
         return;
     }
     println!(
-        "{:<8} {:<24} {:<13} {:>6} {:>6}  {:<16} PROJECT",
-        "ID", "NAME", "STATUS", "AGENT", "USER", "TAGS"
+        "{:<8} {:<24} {:<13} {:>7}  {:<16} PROJECT",
+        "ID", "NAME", "STATUS", "UPDATED", "TAGS"
     );
     for s in rows {
         let get = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("-");
@@ -775,13 +1225,22 @@ fn print_session_table(list: &Value) {
             " "
         };
         println!(
-            "{:<8}{}{:<24} {:<13} {:>6} {:>6}  {:<16} {}",
+            "{:<8}{}{:<24} {:<13} {:>7}  {:<16} {}",
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
             get("status"),
-            rel_age(s["last_agent_msg_at"].as_i64()),
-            rel_age(s["last_user_msg_at"].as_i64()),
+            rel_age(
+                [
+                    "last_agent_msg_at",
+                    "last_user_msg_at",
+                    "last_state_change_at",
+                    "created_at"
+                ]
+                .iter()
+                .filter_map(|k| s[*k].as_i64())
+                .max()
+            ),
             truncate(&tags_of(s).replace("(none)", ""), 16),
             get("project_path")
         );

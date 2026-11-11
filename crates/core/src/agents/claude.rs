@@ -46,10 +46,13 @@ pub fn transcript_path(project_path: &str, session_uuid: &str) -> PathBuf {
         .join(format!("{session_uuid}.jsonl"))
 }
 
+/// `extra` are adapter flags the session was created with (e.g. the
+/// overlord's `--mcp-config`); they ride in launch_spec so resume reuses them.
 pub fn launch_argv(
     session_uuid: &str,
     first_prompt: Option<&str>,
     model: Option<&str>,
+    extra: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
         "claude".to_string(),
@@ -60,6 +63,7 @@ pub fn launch_argv(
         argv.push("--model".to_string());
         argv.push(m.trim().to_string());
     }
+    argv.extend(extra.iter().cloned());
     if let Some(p) = first_prompt {
         argv.push(p.to_string());
     }
@@ -74,6 +78,7 @@ pub fn resume_argv(
     trust: &str,
     project_path: &str,
     model: Option<&str>,
+    extra: &[String],
 ) -> Result<Vec<String>> {
     if trust == "scavenged" {
         bail!("refusing to resume a scavenged session id (untrusted attribution)");
@@ -92,6 +97,7 @@ pub fn resume_argv(
         argv.push("--model".to_string());
         argv.push(m.trim().to_string());
     }
+    argv.extend(extra.iter().cloned());
     Ok(argv)
 }
 
@@ -215,9 +221,9 @@ mod tests {
 
     #[test]
     fn launch_and_resume_argv() {
-        let argv = launch_argv("u-1", Some("hello"), None);
+        let argv = launch_argv("u-1", Some("hello"), None, &[]);
         assert_eq!(argv, ["claude", "--session-id", "u-1", "hello"]);
-        let argv = launch_argv("u-1", None, Some("opus"));
+        let argv = launch_argv("u-1", None, Some("opus"), &[]);
         assert_eq!(argv, ["claude", "--session-id", "u-1", "--model", "opus"]);
         // No transcript on disk for this fake id → re-declare, don't resume.
         let argv = resume_argv(
@@ -225,10 +231,12 @@ mod tests {
             "minted",
             "/nonexistent",
             None,
+            &["--strict-mcp-config".to_string()],
         )
         .unwrap();
         assert_eq!(argv[1], "--session-id");
-        assert!(resume_argv("u-1", "scavenged", "/tmp", None).is_err());
+        assert_eq!(argv.last().unwrap(), "--strict-mcp-config");
+        assert!(resume_argv("u-1", "scavenged", "/tmp", None, &[]).is_err());
     }
 
     #[test]
@@ -280,6 +288,139 @@ fn parse_iso_ms(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + (sec * 1000.0) as i64)
+}
+
+/// What a session is about, read cheaply from its transcript (no AI): the
+/// prompt that started it, the latest real prompt, the latest reply text,
+/// and the title Claude gave the conversation. For the overlord's triage.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Excerpts {
+    pub first_prompt: Option<String>,
+    pub last_prompt: Option<String>,
+    pub last_reply: Option<String>,
+    pub title: Option<String>,
+}
+
+/// Bytes read from each end of a transcript; they can be many MB.
+const EXCERPT_WINDOW: u64 = 256 * 1024;
+
+fn read_window(path: &Path, from_end: bool) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = if from_end {
+        len.saturating_sub(EXCERPT_WINDOW)
+    } else {
+        0
+    };
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(EXCERPT_WINDOW).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    // A tail window starts mid-line: drop the partial first line.
+    Some(if start > 0 {
+        text.split_once('\n')
+            .map(|(_, r)| r.to_string())
+            .unwrap_or_default()
+    } else {
+        text
+    })
+}
+
+fn clip(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// A prompt the human typed (not tool results, meta, summaries, or command
+/// wrappers like `<command-name>`).
+fn human_prompt(v: &Value) -> Option<String> {
+    if v["type"] != "user"
+        || v["isMeta"] == true
+        || v["isCompactSummary"] == true
+        || v["isVisibleInTranscriptOnly"] == true
+    {
+        return None;
+    }
+    let text = match &v["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter(|x| x["type"] == "text")
+            .filter_map(|x| x["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let t = text.trim();
+    (!t.is_empty() && !t.starts_with('<') && !t.starts_with("Caveat:")).then(|| t.to_string())
+}
+
+fn reply_text(v: &Value) -> Option<String> {
+    if v["type"] != "assistant" {
+        return None;
+    }
+    let t = v["message"]["content"]
+        .as_array()?
+        .iter()
+        .filter(|x| x["type"] == "text")
+        .filter_map(|x| x["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!t.trim().is_empty()).then_some(t)
+}
+
+pub fn transcript_excerpts(path: &Path) -> Excerpts {
+    let parse = |s: String| -> Vec<Value> {
+        s.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let head = read_window(path, false).map(parse).unwrap_or_default();
+    // A file that fits in one window was read whole: reuse it as the tail.
+    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= EXCERPT_WINDOW);
+    let tail = if small {
+        head.clone()
+    } else {
+        read_window(path, true).map(parse).unwrap_or_default()
+    };
+    let mut e = Excerpts {
+        first_prompt: head.iter().find_map(human_prompt).map(|t| clip(&t, 300)),
+        ..Default::default()
+    };
+    for v in tail.iter().rev() {
+        if e.last_prompt.is_none() {
+            e.last_prompt = human_prompt(v).map(|t| clip(&t, 300));
+        }
+        if e.last_reply.is_none() {
+            e.last_reply = reply_text(v).map(|t| clip(&t, 500));
+        }
+        if e.title.is_none() && v["type"] == "custom-title" {
+            e.title = v["customTitle"].as_str().map(str::to_string);
+        }
+        if e.last_prompt.is_some() && e.last_reply.is_some() && e.title.is_some() {
+            break;
+        }
+    }
+    // Long tool-heavy turns push the last typed prompt out of the tail
+    // window; Claude also records it in `last-prompt` entries.
+    if e.last_prompt.is_none() {
+        e.last_prompt = tail
+            .iter()
+            .rev()
+            .filter(|v| v["type"] == "last-prompt")
+            .find_map(|v| v["lastPrompt"].as_str())
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| clip(t, 300));
+    }
+    if e.last_prompt == e.first_prompt {
+        e.last_prompt = None; // one prompt so far: don't repeat it
+    }
+    e
 }
 
 /// Token totals and time span from a sub-agent transcript.
@@ -356,6 +497,31 @@ pub fn scan_subagents(session_id: &str, transcript_path: &str) -> Vec<Subagent> 
 #[cfg(test)]
 mod subagent_tests {
     use super::*;
+
+    #[test]
+    fn excerpts_skip_tool_results_and_wrappers() {
+        let dir = std::env::temp_dir().join(format!("rlord-excerpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        let lines = [
+            json!({"type":"user","message":{"content":"<command-name>/clear</command-name>"}}),
+            json!({"type":"user","message":{"content":"fix the   flaky login test"}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use"}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}),
+            json!({"type":"user","isCompactSummary":true,"message":{"content":"summary"}}),
+            json!({"type":"user","message":{"content":[{"type":"text","text":"now add a retry"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Added retry."}]}}),
+            json!({"type":"custom-title","customTitle":"login-flake"}),
+        ];
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        let e = transcript_excerpts(&p);
+        assert_eq!(e.first_prompt.as_deref(), Some("fix the flaky login test"));
+        assert_eq!(e.last_prompt.as_deref(), Some("now add a retry"));
+        assert_eq!(e.last_reply.as_deref(), Some("Added retry."));
+        assert_eq!(e.title.as_deref(), Some("login-flake"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn iso_to_ms() {
