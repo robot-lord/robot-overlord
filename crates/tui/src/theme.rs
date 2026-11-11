@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 
 pub const ACCENT: Color = Color::Indexed(75); // soft blue
-pub const OVERLORD: Color = Color::Indexed(141); // lavender
+pub const OVERLORD: Color = Color::Indexed(141); // lavender; the tmux bar and overlay border use colour141 too
 pub const GREEN: Color = Color::Indexed(114);
 pub const YELLOW: Color = Color::Indexed(221);
 pub const RED: Color = Color::Indexed(203);

@@ -91,7 +91,7 @@ pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // any session.
     if let Err(e) = tmux::style_session(
         TMUX_NAME,
-        "bg=magenta,fg=black",
+        "bg=colour141,fg=colour16",
         "#[bold] ◆ OVERLORD #[nobold]· ⌥D: list  ",
     ) {
         tracing::debug!(error = %e, "styling overlord session");

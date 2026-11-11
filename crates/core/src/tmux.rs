@@ -485,7 +485,7 @@ pub fn open_popup(client: &str, width: &str, height: &str, title: &str, cmd: &st
             "-b",
             "rounded",
             "-S",
-            "fg=magenta",
+            "fg=colour141",
             "-T",
             title,
             cmd,
