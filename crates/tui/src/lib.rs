@@ -32,8 +32,9 @@ use rlord_core::tmux;
 use rlord_daemon::client_call;
 
 pub fn run(config: Config) -> Result<()> {
-    // Fail fast with a readable error before touching the terminal.
-    client_call(&paths::socket_path(), "ping", Value::Null)?;
+    // Start (or upgrade) the daemon, failing with a readable error before
+    // touching the terminal.
+    rlord_daemon::autostart::ensure_daemon(&paths::socket_path())?;
     let keys = KeyMap::from_config(&config.keys)?;
     let rx = spawn_subscriber();
     let mut terminal = init_terminal();

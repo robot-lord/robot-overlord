@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use rlord_core::config::Config;
 use rlord_core::timefmt::{fmt_ts, rel_age};
 use rlord_core::{agents::claude, paths, tmux};
-use rlord_daemon::{client_call, methods, spool_hook_event, Daemon};
+use rlord_daemon::{autostart, client_call, methods, spool_hook_event, Daemon};
 
 #[derive(Parser)]
 #[command(
@@ -24,9 +24,9 @@ struct Cli {
 enum Command {
     /// Interactive session dashboard (the default when no subcommand is given)
     Tui,
-    /// Run the daemon in the foreground (use the launchd agent for real deployments)
+    /// Run the daemon in the foreground (normally started on demand, or by launchd)
     Daemon,
-    /// Check daemon liveness
+    /// Check daemon liveness (never starts one)
     Ping,
     /// List sessions. QUERY uses the search syntax: free words match
     /// name/project/group/tag; `status:waiting` `tag:wip` `proj:x` `agent:x`
@@ -446,7 +446,7 @@ fn main() -> Result<()> {
         }
         Command::Daemon => run_daemon(),
         Command::Ping => {
-            let r = call("ping", Value::Null)?;
+            let r = client_call(&paths::socket_path(), "ping", Value::Null)?;
             println!(
                 "pong (daemon v{})",
                 r.get("version").and_then(Value::as_str).unwrap_or("?")
@@ -785,7 +785,8 @@ fn tmux_import(dry_run: bool, remove: bool) -> Result<()> {
             tmux_profile::report_path().display()
         );
     }
-    match call("tmux.reload", json!({})) {
+    // No autostart: a daemon that starts later applies the profile itself.
+    match call_running("tmux.reload", json!({})) {
         Ok(_) => println!("rlord's tmux reloaded; sessions updated"),
         Err(e) => println!("not applied yet ({e:#}): it applies when rlord's daemon starts"),
     }
@@ -829,7 +830,21 @@ fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// RPC to the daemon, starting it (or replacing an older-version one) on the
+/// first call of this process.
 fn call(method: &str, params: Value) -> Result<Value> {
+    static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let socket = paths::socket_path();
+    if ENSURED.get().is_none() {
+        autostart::ensure_daemon(&socket)?;
+        ENSURED.set(()).ok();
+    }
+    client_call(&socket, method, params)
+}
+
+/// RPC to an already-running daemon only (never starts one), for callers
+/// that tolerate a missing daemon and mustn't block on starting it.
+fn call_running(method: &str, params: Value) -> Result<Value> {
     client_call(&paths::socket_path(), method, params)
 }
 
@@ -845,23 +860,27 @@ fn tags_of(session: &Value) -> String {
     }
 }
 
-/// Restart the daemon if it runs an older build than this binary (after a
-/// rebuild/upgrade a stale daemon and a new UI disagree about everything).
+/// Start the daemon, or restart it if it runs an older build than this
+/// binary (after a rebuild/upgrade a stale daemon and a new UI disagree
+/// about everything). Not fatal: the TUI retries and reports errors itself.
 fn ensure_daemon_current() {
-    let Ok(p) = call("ping", Value::Null) else {
-        return;
-    };
-    let mine = rlord_daemon::build_id();
-    if p["build"].as_u64() != Some(mine) {
-        eprintln!("rlord: daemon is from an older build; restarting it");
-        if let Err(e) = restart_daemon() {
-            eprintln!("rlord: {e:#}");
-        }
+    if let Err(e) = autostart::ensure_daemon(&paths::socket_path()) {
+        eprintln!("rlord: {e:#}");
     }
 }
 
 fn run_daemon() -> Result<()> {
-    rlord_daemon::build_id(); // pin it at startup, before any rebuild
+    // Pin both at startup, before any rebuild or reinstall.
+    rlord_daemon::build_id();
+    rlord_daemon::exe_id();
+    // One daemon per user: a second one (a lost autostart race, or launchd
+    // starting its job while an autostarted daemon runs) exits 0 quietly, so
+    // launchd's KeepAlive doesn't respawn it in a loop. Checked before the
+    // runtime exists, so a loser doesn't spin up worker threads to exit.
+    let Some(_lock) = autostart::acquire_instance_lock()? else {
+        eprintln!("rlord: another daemon is already running");
+        return Ok(());
+    };
     let rt = tokio::runtime::Runtime::new()?;
     let r = rt.block_on(async {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
@@ -913,7 +932,10 @@ fn hook_emit(agent: &str) -> Result<()> {
 fn nav_home() -> Result<()> {
     // Overlay up on this terminal → Option-D just closes it.
     if let Some(client) = tmux::current_client() {
-        if call("ui.overlay.close_on", json!({"client": client})).is_ok_and(|r| r["closed"] == true)
+        // No autostart: with no daemon there's no overlay, and a key press
+        // must not stall while one starts.
+        if call_running("ui.overlay.close_on", json!({"client": client}))
+            .is_ok_and(|r| r["closed"] == true)
         {
             return Ok(());
         }
@@ -985,78 +1007,9 @@ fn reset(hard: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Restart the daemon: via launchd when its agent is installed, else by
-/// killing the recorded pid and starting a detached `rlord daemon`.
+/// Restart the daemon (via launchd when its agent owns it).
 fn restart_daemon() -> Result<()> {
-    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?
-        .trim()
-        .to_string();
-    let target = format!("gui/{uid}/robot-overlord.daemon");
-    // launchd only if its daemon is the one serving *our* socket (its pid is
-    // the one in our pidfile).
-    let ours = std::fs::read_to_string(paths::pid_path())
-        .ok()
-        .map(|p| p.trim().to_string());
-    let launchd = std::process::Command::new("launchctl")
-        .args(["print", &target])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("pid = ").map(str::to_string))
-        })
-        .is_some_and(|pid| Some(pid) == ours);
-    if launchd {
-        let st = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .status()?;
-        if !st.success() {
-            anyhow::bail!("launchctl kickstart failed");
-        }
-    } else {
-        if let Ok(pid) = std::fs::read_to_string(paths::pid_path()) {
-            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
-            for _ in 0..30 {
-                if !paths::socket_path().exists() || call("ping", Value::Null).is_err() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-        use std::os::unix::process::CommandExt;
-        let log = std::env::var("HOME")
-            .map(|h| std::path::PathBuf::from(h).join("Library/Logs/rlordd.log"))
-            .unwrap_or_else(|_| std::env::temp_dir().join("rlordd.log"));
-        if let Some(d) = log.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let out = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)?;
-        std::process::Command::new(methods::rlord_bin())
-            .arg("daemon")
-            .stdin(std::process::Stdio::null())
-            .stdout(out.try_clone()?)
-            .stderr(out)
-            .process_group(0)
-            .spawn()
-            .context("starting daemon")?;
-    }
-    // Wait for a *new* daemon (the old one may still answer while exiting).
-    let old_pid = ours;
-    for _ in 0..150 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let new_pid = std::fs::read_to_string(paths::pid_path())
-            .ok()
-            .map(|p| p.trim().to_string());
-        if new_pid.is_some() && new_pid != old_pid && call("ping", Value::Null).is_ok() {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("daemon did not come back (see ~/Library/Logs/rlordd.log)")
+    autostart::restart_daemon(&paths::socket_path())
 }
 
 /// `rlord mcp`: a minimal MCP server over stdio (JSON-RPC, one message per
