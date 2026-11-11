@@ -23,6 +23,17 @@ pub(crate) struct Setup {
     row: usize,
     /// family → latest id, for the "→ resolves to" hint.
     catalog: Vec<(String, String)>,
+    /// Remote Control for the overlord: Some(on?) when this machine can
+    /// use it (a third row), None when it can't or isn't known yet.
+    remote: Option<bool>,
+    /// Why it can't, or a caveat when it can.
+    remote_why: Option<String>,
+    error: Option<String>,
+}
+
+/// A one-time offer of Remote Control for an existing overlord.
+pub(crate) struct RemoteOffer {
+    note: Option<String>,
     error: Option<String>,
 }
 
@@ -107,6 +118,13 @@ impl App {
                 row: 0,
                 models,
                 catalog: catalog_of(&st),
+                // On by default where it works: the point is to reach the
+                // overlord from the Claude app.
+                remote: (st["remote"]["available"] == true).then_some(true),
+                remote_why: st["remote"]["reason"]
+                    .as_str()
+                    .or(st["remote"]["note"].as_str())
+                    .map(str::to_string),
                 error: None,
             }));
             return;
@@ -153,6 +171,13 @@ impl App {
                 self.status_line = format!("{seat}: {n}");
             }
         }
+        // Remote Control for the overlord, offered once where it works.
+        if st["remote"]["offer"] == true {
+            self.mode = Mode::RemoteOffer(Box::new(RemoteOffer {
+                note: st["remote"]["note"].as_str().map(str::to_string),
+                error: None,
+            }));
+        }
     }
 
     pub(crate) fn handle_setup(&mut self, k: KeyEvent, mut s: Box<Setup>) {
@@ -168,7 +193,8 @@ impl App {
                 match client_call(
                     &paths::socket_path(),
                     "overlord.ensure",
-                    json!({"agent": s.agent, "model": model(0), "mastermind_model": model(1)}),
+                    json!({"agent": s.agent, "model": model(0), "mastermind_model": model(1),
+                           "remote_control": s.remote == Some(true)}),
                 ) {
                     Ok(_) => {
                         self.dirty = true;
@@ -186,7 +212,14 @@ impl App {
             | KeyCode::Char('j' | 'k')
             | KeyCode::Up
             | KeyCode::Down => {
-                s.row = 1 - s.row;
+                let rows = if s.remote.is_some() { 3 } else { 2 };
+                let back = matches!(k.code, KeyCode::BackTab | KeyCode::Char('k') | KeyCode::Up);
+                s.row = if back { (s.row + rows - 1) % rows } else { (s.row + 1) % rows };
+                self.mode = Mode::OverlordSetup(s);
+            }
+            // The Remote Control row: any of ← → space toggles it.
+            KeyCode::Right | KeyCode::Left | KeyCode::Char('l' | 'h' | ' ') if s.row == 2 => {
+                s.remote = s.remote.map(|on| !on);
                 self.mode = Mode::OverlordSetup(s);
             }
             KeyCode::Right | KeyCode::Char('l') => {
@@ -342,7 +375,7 @@ impl App {
     }
 
     pub(crate) fn draw_setup(&self, f: &mut Frame, s: &Setup) {
-        let area = newform::centered(f.area(), 78, 20);
+        let area = newform::centered(f.area(), 78, 25);
         f.render_widget(Clear, area);
         let keys = |k: &str| tmux::key_label(k);
         let row = |i: usize, name: &str, key: &str, why: [&str; 2]| -> Vec<Line<'static>> {
@@ -408,6 +441,46 @@ impl App {
                 "model, where judgment pays; starts the first time it's needed.",
             ],
         ));
+        match (s.remote, &s.remote_why) {
+            (Some(on), why) => {
+                let focused = s.row == 2;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if focused { "▌ " } else { "  " },
+                        Style::default().fg(theme::accent()),
+                    ),
+                    Span::styled(format!("{:<16}", "⇄ Remote"), Style::default().bold()),
+                    Span::styled(
+                        if on { "◀ on ▶" } else { "◀ off ▶" },
+                        if focused {
+                            Style::default().bold().fg(theme::accent())
+                        } else {
+                            Style::default().fg(theme::text())
+                        },
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "    Talk to the overlord from the Claude app (Code tab) or claude.ai,",
+                    theme::muted(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    away from this terminal.{}",
+                        why.as_deref().map(|w| format!(" Note: {w}.")).unwrap_or_default()
+                    ),
+                    theme::muted(),
+                )));
+                lines.push(Line::from(""));
+            }
+            (None, Some(why)) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  ⇄ Remote Control isn't available here: {why}."),
+                    theme::faint(),
+                )));
+                lines.push(Line::from(""));
+            }
+            (None, None) => {}
+        }
         lines.push(Line::from(Span::styled(
             "  Effort and the defaults live in config.toml under [overlord].",
             theme::faint(),
@@ -470,6 +543,81 @@ impl App {
                 } else {
                     "◆ Overlord model"
                 })),
+            area,
+        );
+    }
+}
+
+impl App {
+    pub(crate) fn handle_remote_offer(&mut self, k: KeyEvent, mut o: Box<RemoteOffer>) {
+        match k.code {
+            KeyCode::Esc => {
+                let _ = client_call(&paths::socket_path(), "remote.decline_offer", Value::Null);
+                self.status_line =
+                    "Remote Control off — ask the overlord to turn it on any time".into();
+            }
+            KeyCode::Enter => match client_call(
+                &paths::socket_path(),
+                "remote.set",
+                json!({"ref": "overlord", "on": true}),
+            ) {
+                Ok(r) => {
+                    self.status_line = match r["remote"]["url"].as_str() {
+                        Some(u) => format!("overlord on Remote Control: {u}"),
+                        None => format!(
+                            "overlord: Remote Control on — {}",
+                            r["note"].as_str().unwrap_or("connecting")
+                        ),
+                    };
+                    self.dirty = true;
+                }
+                Err(e) => {
+                    o.error = Some(format!("{e:#}"));
+                    self.mode = Mode::RemoteOffer(o);
+                }
+            },
+            _ => self.mode = Mode::RemoteOffer(o),
+        }
+    }
+
+    pub(crate) fn draw_remote_offer(&self, f: &mut Frame, o: &RemoteOffer) {
+        let area = newform::centered(f.area(), 72, 12);
+        f.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Reach your overlord from your phone?",
+                Style::default().bold(),
+            )),
+            Line::from(Span::styled(
+                "  Remote Control lets you talk to it from the Claude app (Code tab) or",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  claude.ai while it keeps running here. Any session can have it too:",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  ask the overlord (\"turn on remote control for <session>\").",
+                theme::muted(),
+            )),
+        ];
+        if let Some(n) = &o.note {
+            lines.push(Line::from(Span::styled(format!("  Note: {n}."), theme::faint())));
+        }
+        lines.push(Line::from(""));
+        lines.push(keys_line(&[("enter", "turn it on", Cap::Context)]));
+        lines.push(keys_line(&[("esc", "no thanks (won't ask again)", Cap::Global)]));
+        if let Some(e) = &o.error {
+            lines.push(Line::from(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(theme::red()),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(theme::modal("⇄ Remote Control")),
             area,
         );
     }
