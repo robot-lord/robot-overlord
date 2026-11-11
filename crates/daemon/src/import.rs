@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::git;
-use rlord_core::import::{add_git_info, scan_claude, ScanOpts};
+use rlord_core::import::{add_git_info, explain_claude, scan_claude, ScanOpts};
 use rlord_core::types::now_ms;
 
 use crate::methods::{self, p_str, str_list};
@@ -32,13 +32,35 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
         .split_whitespace()
         .map(str::to_lowercase)
         .collect();
+    let only = str_list(params, "ids");
     let opts = ScanOpts {
         since_ms: now_ms() - window_ms,
-        // Filter by query before limiting, so the limit counts matches.
-        limit: if words.is_empty() { limit } else { 0 },
-        only: str_list(params, "ids"),
+        // Filter by query before limiting, so the limit counts matches; ids
+        // asked for are all looked at.
+        limit: if words.is_empty() && only.is_empty() {
+            limit
+        } else {
+            0
+        },
+        only: only.clone(),
     };
     let mut found = scan_claude(&opts, &|id| tracked.contains(id));
+    // Asked for by id but not importable at all (judged before query and
+    // limit, which only narrow the listing): say why.
+    let rejected: Vec<Value> = opts
+        .only
+        .iter()
+        .filter(|id| {
+            !found
+                .iter()
+                .any(|c| c.agent_session.starts_with(id.as_str()))
+        })
+        .map(|id| {
+            let why =
+                explain_claude(id, &|i| tracked.contains(i)).unwrap_or_else(|| "unknown".into());
+            json!({"id": id, "reason": why})
+        })
+        .collect();
     if !words.is_empty() {
         found.retain(|c| {
             let hay = [
@@ -55,10 +77,10 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
             .to_lowercase();
             words.iter().all(|w| hay.contains(w.as_str()))
         });
-        found.truncate(limit);
     }
+    found.truncate(limit);
     found.iter_mut().for_each(add_git_info);
-    Ok(json!({"count": found.len(), "candidates": found}))
+    Ok(json!({"count": found.len(), "candidates": found, "rejected": rejected}))
 }
 
 /// `session.import`: import one conversation (`agent_session`: its id) as a
@@ -83,7 +105,10 @@ pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
     let mut c = scan_claude(&opts, &|_| false)
         .into_iter()
         .next()
-        .with_context(|| format!("no importable Claude conversation {sid}"))?;
+        .ok_or_else(|| {
+            let why = explain_claude(&sid, &|_| false).unwrap_or_else(|| "unknown".into());
+            anyhow::anyhow!("can't import Claude conversation {sid}: {why}")
+        })?;
     add_git_info(&mut c);
     let mut recreated = false;
     if !c.dir_exists && c.recreatable && params["recreate_worktree"].as_bool() == Some(true) {

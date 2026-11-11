@@ -760,6 +760,14 @@ fn ingest_subagent_hook(
     Ok(())
 }
 
+/// Save transcript read positions that moved (so a restart reads forward).
+pub(crate) fn save_cursors(db: &Db) {
+    let dirty = claude::take_dirty_cursors();
+    if let Err(e) = db.save_transcript_cursors(&dirty) {
+        tracing::warn!(error = %e, "saving transcript read positions");
+    }
+}
+
 /// Sub-agents of a session: backfill from disk (for sessions that ran before
 /// hooks existed, or missed events), then return the merged rows.
 pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
@@ -789,6 +797,7 @@ pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
             known = db.subagents(&s.id)?;
         }
     }
+    save_cursors(db);
     Ok(serde_json::to_value(known)?)
 }
 

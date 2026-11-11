@@ -641,6 +641,128 @@ const PROFILE_ON: &str = "@rlord_profile";
 /// profile is turned off).
 const RLORD_SESSION_OPTS: &[&str] = &[AGENT_PANE, PROFILE_ON];
 
+/// The overlord keeps its own bar, but gets the user's keys: their key
+/// table (root bindings, with rlord's nav keys), prefix, and copy-mode keys.
+/// `on: false` takes them away again.
+pub fn set_profile_keys(name: &str, on: bool) -> Result<()> {
+    let t = format!("{}:", exact(name));
+    if !on {
+        for opt in ["key-table", "prefix", "prefix2"] {
+            let _ = run(&["set-option", "-u", "-t", &t, opt]);
+        }
+        return Ok(());
+    }
+    let session = std::fs::read_to_string(crate::tmux_profile::session_path()).unwrap_or_default();
+    let window = std::fs::read_to_string(crate::tmux_profile::window_path()).unwrap_or_default();
+    for line in session.lines() {
+        if let Some(rest) = line.strip_prefix("set-option ") {
+            let (opt, val) = rest.split_once(' ').unwrap_or((rest, ""));
+            if matches!(opt, "prefix" | "prefix2") {
+                run(&["set-option", "-t", &t, opt, val.trim_matches('"')])?;
+            }
+        }
+    }
+    let mode_keys = window
+        .lines()
+        .find_map(|l| l.strip_prefix("set-option -w mode-keys "))
+        .map(str::trim);
+    if let Some(mk) = mode_keys {
+        for w in run(&["list-windows", "-t", &exact(name), "-F", "#{window_id}"])?.lines() {
+            run(&["set-option", "-w", "-t", w, "mode-keys", mk])?;
+        }
+    }
+    run(&["set-option", "-t", &t, "key-table", PROFILE_TABLE])?;
+    Ok(())
+}
+
+/// Key hints on an agent session's status bar: rlord's own keys (back to
+/// the list, the overlord). With the user's profile on, they lead the
+/// profile's status-right (re-applied after every re-import); without it,
+/// the session gets a slim bar of its own: its name left, the hints right.
+pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
+    let t = format!("{}:", exact(name));
+    if hints.is_empty() {
+        // No rlord keys bound: nothing to show (and no bar of our own).
+        run(&["set-option", "-t", &t, HINTS_OPT, ""])?;
+        if !profile_on {
+            for opt in [
+                "status",
+                "status-style",
+                "status-left",
+                "status-left-length",
+                "status-right",
+                "status-right-length",
+                "window-status-format",
+                "window-status-current-format",
+            ] {
+                let _ = run(&["set-option", "-u", "-t", &t, opt]);
+            }
+        }
+        return Ok(());
+    }
+    run(&[
+        "set-option",
+        "-t",
+        &t,
+        HINTS_OPT,
+        &format!("#[fg=colour245] {hints} #[default]"),
+    ])?;
+    if profile_on {
+        if run(&["show-options", "-v", "-t", &t, "status"])?.trim() == "off" {
+            return Ok(()); // their profile hides the bar: respect it
+        }
+        let right = run(&["show-options", "-v", "-t", &t, "status-right"])?;
+        let right = right.trim_end_matches('\n');
+        if !right.contains(HINTS_REF) {
+            run(&[
+                "set-option",
+                "-t",
+                &t,
+                "status-right",
+                &format!("{HINTS_REF}{right}"),
+            ])?;
+            let len: usize = run(&["show-options", "-v", "-t", &t, "status-right-length"])?
+                .trim()
+                .parse()
+                .unwrap_or(40);
+            let want = (len + hints.chars().count() + 2).to_string();
+            run(&["set-option", "-t", &t, "status-right-length", &want])?;
+        }
+        return Ok(());
+    }
+    for (opt, val) in [
+        ("status", "on"),
+        ("status-style", "bg=default,fg=colour245"),
+        ("status-left", " #S "),
+        ("status-left-length", "40"),
+        ("status-right", HINTS_REF),
+        ("status-right-length", "60"),
+        ("window-status-format", ""),
+        ("window-status-current-format", ""),
+    ] {
+        run(&["set-option", "-t", &t, opt, val])?;
+    }
+    Ok(())
+}
+
+/// Session option holding the styled key hints, and how status-right
+/// refers to it (also how we tell it's already there).
+const HINTS_OPT: &str = "@rlord-hints";
+const HINTS_REF: &str = "#{E:@rlord-hints}";
+
+/// Whether `key` in the root table runs rlord's nav (it's skipped when the
+/// user's own binding already holds it).
+pub fn nav_key_bound(key: &str) -> bool {
+    run(&["list-keys", "-T", "root", key])
+        .map(|o| o.contains("rlord") && o.contains(" nav "))
+        .unwrap_or(false)
+}
+
+/// `M-d` → `⌥d`, `C-x` → `⌃x`: how a tmux key reads on a Mac.
+pub fn key_label(key: &str) -> String {
+    key.replace("M-", "⌥").replace("C-", "⌃").replace("S-", "⇧")
+}
+
 /// Turn the user's imported tmux profile on or off for one session. Only
 /// that session changes: its key table, its options, its windows. Requires
 /// an imported profile to turn on.
@@ -952,6 +1074,27 @@ mod tests {
         let (w, p) = window_pane_ids(name).unwrap();
         assert!(w.starts_with('@') && p.starts_with('%'));
         respawn_pane(name, "/tmp", "sleep 30").unwrap();
+
+        // Key hints: a slim bar of rlord's own without a profile...
+        let opt = |o: &str| run(&["show-options", "-v", "-t", &format!("={name}:"), o]).unwrap();
+        set_hint_bar(name, "⌥d list · ⌥o overlord", false).unwrap();
+        assert_eq!(opt("status").trim(), "on");
+        assert_eq!(opt("status-right").trim(), HINTS_REF);
+        assert!(opt(HINTS_OPT).contains("⌥d list"));
+        // ...and in front of the profile's own status-right, once.
+        run(&[
+            "set-option",
+            "-t",
+            &format!("={name}:"),
+            "status-right",
+            "%H:%M",
+        ])
+        .unwrap();
+        set_hint_bar(name, "⌥d list", true).unwrap();
+        set_hint_bar(name, "⌥d list", true).unwrap();
+        assert_eq!(opt("status-right").trim(), format!("{HINTS_REF}%H:%M"));
+        assert_eq!(key_label("M-d"), "⌥d");
+
         kill_session(name).unwrap();
         assert!(!has_session(name));
 

@@ -118,7 +118,7 @@ pub fn scan_claude_in(
             if opts.only.is_empty() && mtime.is_some_and(|m| m < opts.since_ms) {
                 continue;
             }
-            let Some(c) = candidate(&path, id, &slug, mtime, procs, excluded) else {
+            let Ok(c) = candidate(&path, id, &slug, mtime, procs, excluded) else {
                 continue;
             };
             if opts.only.is_empty() && c.last_active_at < opts.since_ms {
@@ -141,33 +141,59 @@ fn candidate(
     mtime: Option<i64>,
     procs: &str,
     excluded: &[PathBuf],
-) -> Option<Candidate> {
+) -> Result<Candidate, String> {
     let (head, tail) = claude::read_head_tail(path);
     let all = || head.iter().chain(tail.iter());
 
     // `claude --resume` finds a conversation by the folder it runs in, so the
-    // cwd must be the one this transcript's directory is named after.
-    let cwd = all()
+    // cwd must be the one this transcript's directory is named after. Look
+    // in the head and tail first; a long or worktree-hopping session may only
+    // record it elsewhere, so then search the whole file.
+    let cwd = match all()
         .filter_map(|v| v["cwd"].as_str())
-        .find(|c| claude::project_slug(c) == slug)?
-        .to_string();
+        .find(|c| claude::project_slug(c) == slug)
+    {
+        Some(c) => c.to_string(),
+        None => cwd_anywhere(path, slug).ok_or_else(|| {
+            let seen: Vec<&str> = all().filter_map(|v| v["cwd"].as_str()).collect();
+            format!(
+                "no working directory in the transcript matches its folder {slug} \
+                 (claude --resume couldn't find it); saw {:?}",
+                seen.first()
+            )
+        })?,
+    };
     // rlord's own conversations (the overlord, test sandboxes of it) and
     // anything in a temp dir are never the user's work.
-    if cwd.ends_with("/robot-overlord/overlord")
-        || excluded.iter().any(|d| Path::new(&cwd).starts_with(d))
-    {
-        return None;
+    if cwd.ends_with("/robot-overlord/overlord") {
+        return Err("rlord's own overlord conversation".into());
+    }
+    if let Some(d) = excluded.iter().find(|d| Path::new(&cwd).starts_with(d)) {
+        return Err(format!(
+            "runs in {} (rlord data or a temp dir)",
+            d.display()
+        ));
     }
     let entrypoint = all()
         .find_map(|v| v["entrypoint"].as_str())
         .map(str::to_string);
     // Headless runs (`claude -p`, the SDK) are tools, not conversations.
-    if entrypoint.as_deref().is_some_and(|e| e.starts_with("sdk")) {
-        return None;
+    if let Some(e) = entrypoint.as_deref().filter(|e| e.starts_with("sdk")) {
+        return Err(format!(
+            "a headless run (entrypoint {e}), not a conversation"
+        ));
     }
-    let ex = claude::excerpts_from(&head, &tail);
-    // Nothing the user ever typed: an empty or aborted start.
-    ex.first_prompt.as_ref()?;
+    let mut ex = claude::excerpts_from(&head, &tail);
+    // Something the user actually typed. The first prompt can sit past the
+    // head window (big attachments) or follow a slash command, so the latest
+    // one counts too; a session of only commands (/login, /exit) doesn't.
+    let typed = |p: &Option<String>| p.as_deref().is_some_and(|t| !t.starts_with('/'));
+    if !typed(&ex.first_prompt) && !typed(&ex.last_prompt) {
+        return Err("nothing typed in it (an empty start, or only slash commands)".into());
+    }
+    if ex.first_prompt.is_none() {
+        ex.first_prompt = ex.last_prompt.clone();
+    }
 
     let ts = |v: &Value| v["timestamp"].as_str().and_then(claude::parse_iso_ms);
     let exchange =
@@ -178,7 +204,13 @@ fn candidate(
             .filter(|v| v["type"] == kind && v["isMeta"] != true)
             .find_map(ts)
     };
-    let last_active_at = tail.iter().rev().filter(exchange).find_map(ts).or(mtime)?;
+    let last_active_at = tail
+        .iter()
+        .rev()
+        .filter(exchange)
+        .find_map(ts)
+        .or(mtime)
+        .ok_or("no timestamps in the transcript")?;
     let started_at = head.iter().find_map(ts);
     let branch = tail
         .iter()
@@ -197,7 +229,7 @@ fn candidate(
 
     let recently_written =
         mtime.is_some_and(|m| ms_epoch(SystemTime::now()) - m < RECENT_WRITE.as_millis() as i64);
-    Some(Candidate {
+    Ok(Candidate {
         agent: "claude".into(),
         agent_session: id.to_string(),
         transcript: path.to_string_lossy().into_owned(),
@@ -221,6 +253,82 @@ fn candidate(
         open_elsewhere: procs.lines().any(|l| l.contains(id)),
         recently_written,
     })
+}
+
+/// The first `cwd` anywhere in the transcript whose slug is `slug` (only
+/// when the head and tail windows had none). Bounded (the first
+/// `CWD_SEARCH_MAX` bytes) and remembered per (file, size), so a transcript
+/// without one isn't re-read on every scan.
+fn cwd_anywhere(path: &Path, slug: &str) -> Option<String> {
+    use std::io::{BufRead, Read};
+    type Seen = std::collections::HashMap<(PathBuf, u64), Option<String>>;
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> =
+        std::sync::LazyLock::new(Default::default);
+    let len = std::fs::metadata(path).ok()?.len();
+    let key = (path.to_path_buf(), len);
+    if let Some(hit) = SEEN.lock().ok()?.get(&key) {
+        return hit.clone();
+    }
+    let f = std::fs::File::open(path).ok()?;
+    let found = std::io::BufReader::new(f.take(CWD_SEARCH_MAX))
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| l.contains("\"cwd\""))
+        .find_map(|l| {
+            serde_json::from_str::<Value>(&l)
+                .ok()
+                .and_then(|v| v["cwd"].as_str().map(str::to_string))
+                .filter(|c| claude::project_slug(c) == slug)
+        });
+    if let Ok(mut seen) = SEEN.lock() {
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        seen.insert(key, found.clone());
+    }
+    found
+}
+
+const CWD_SEARCH_MAX: u64 = 64 * 1024 * 1024;
+
+/// Why conversation `id` isn't importable (None: it is, or no transcript
+/// by that id exists). For error messages when an import by id fails.
+pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+    let projects = claude::config_dir().join("projects");
+    // Every transcript whose id starts with `id` (a full id or a prefix).
+    let mut hits = Vec::new();
+    for dir in std::fs::read_dir(&projects).ok()?.flatten() {
+        for f in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = f.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".jsonl").filter(|n| n.starts_with(id)) {
+                hits.push((f.path(), stem.to_string(), dir.file_name()));
+            }
+        }
+    }
+    match hits.as_slice() {
+        [] => Some(format!(
+            "no transcript whose id starts with {id} under {}",
+            projects.display()
+        )),
+        [(path, full, slug)] => {
+            if tracked(full) {
+                return Some(
+                    "rlord already tracks it (now or as an earlier conversation of a session)"
+                        .into(),
+                );
+            }
+            let slug = slug.to_string_lossy();
+            candidate(path, full, &slug, None, "", &excluded_dirs()).err()
+        }
+        _ => Some(format!(
+            "{} conversations start with {id}; use more of the id",
+            hits.len()
+        )),
+    }
 }
 
 /// Fill in `repo`, `worktree` and `recreatable` (git subprocesses, so only
@@ -490,5 +598,34 @@ mod tests {
         c.branch = Some("feat".into());
         add_git_info(&mut c);
         assert!(c.recreatable && c.worktree);
+    }
+
+    #[test]
+    fn odd_but_real_conversations_are_importable_and_rejections_say_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let cwd = work.to_str().unwrap();
+        let ts = "2026-11-05T12:00:00.000Z";
+
+        // Starts with a slash command and huge attachments: the typed prompt
+        // is past the head window. Still a conversation.
+        let big = "x".repeat(300 * 1024);
+        let mut lines = vec![
+            json!({"type": "user", "cwd": cwd, "timestamp": ts,
+                   "message": {"content": "<command-name>/init</command-name>"}}),
+            json!({"type": "attachment", "content": big}),
+        ];
+        lines.extend(convo(cwd, "now fix the build", ts));
+        write(&projects, cwd, ID_A, &lines);
+        let found = scan_claude_in(&projects, &ScanOpts::default(), &|_| false, "", &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        // Filed under a folder no cwd in it matches: rejected, with a reason.
+        let p = write(&projects, "/elsewhere", ID_B, &convo(cwd, "hi", ts));
+        let slug = claude::project_slug("/elsewhere");
+        let why = candidate(&p, ID_B, &slug, None, "", &[]).unwrap_err();
+        assert!(why.contains("matches its folder"), "{why}");
     }
 }

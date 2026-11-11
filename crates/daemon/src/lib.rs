@@ -131,11 +131,24 @@ impl Daemon {
     /// DB state against the live tmux server.
     pub fn startup(&self) -> Result<()> {
         let db = self.db.lock().expect("db mutex poisoned");
+        // Read positions saved by the last run: transcripts are read forward
+        // from there, not from the start.
+        {
+            use rlord_core::agents::claude::{seed_cursors, STATS_CURSOR_SEED};
+            if let Err(e) = db.prune_transcript_cursors(5 * STATS_CURSOR_SEED) {
+                tracing::warn!(error = %e, "pruning transcript read positions");
+            }
+            match db.transcript_cursors(STATS_CURSOR_SEED) {
+                Ok(saved) => seed_cursors(saved),
+                Err(e) => tracing::warn!(error = %e, "loading transcript read positions"),
+            }
+        }
         for params in drain_spool()? {
             if let Err(e) = methods::hook_emit(&db, &params) {
                 tracing::warn!(error = %e, "spooled hook event failed");
             }
         }
+        methods::save_cursors(&db);
         if let Err(e) = methods::rename_legacy_tmux(&db) {
             tracing::warn!(error = %e, "renaming legacy tmux sessions");
         }
@@ -303,7 +316,11 @@ impl Daemon {
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "session.subagents" => methods::session_subagents(&db, &params),
-            "hook.emit" => methods::hook_emit(&db, &params),
+            "hook.emit" => {
+                let r = methods::hook_emit(&db, &params);
+                methods::save_cursors(&db);
+                r
+            }
             _ => return Err(MethodError::NotFound),
         };
         drop(db);
@@ -333,9 +350,14 @@ impl Daemon {
         let r = match method {
             "overlord.ensure" => {
                 let r = overlord::ensure(&self.db(), &self.config, params);
-                if r.is_ok() {
+                if let Ok(v) = &r {
                     self.changed();
                     self.bind_nav_keys();
+                    // A (re)started overlord is a fresh tmux session: give it
+                    // the user's keys again.
+                    if let Some(id) = v["id"].as_str() {
+                        profile::sync_ref(self, id);
+                    }
                 }
                 r
             }
@@ -370,7 +392,7 @@ impl Daemon {
             "ui.goto" => ui::goto(self, params),
             "ui.confirm_new_session" => ui::confirm_new_session(self, params),
             "ui.overlord" => ui::overlord(self, params),
-            "admin.reset" => ui::reset(self),
+            "admin.reset" => ui::reset(self, params),
             "tmux.profile" => profile::profile(self, params),
             "tmux.reload" => profile::reload(self),
             "ui.overlay.close_on" => ui::close_overlay_on(self, params),

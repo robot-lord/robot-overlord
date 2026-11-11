@@ -1,7 +1,8 @@
 //! Which sessions use the user's imported tmux profile (see
 //! `rlord_core::tmux_profile`). Per session: an explicit on/off in the kv
-//! table, else `[tmux] profile` from the config. Never the overlord (it
-//! keeps its own lavender bar) and never the list's home session.
+//! table, else `[tmux] profile` from the config. Never the list's home
+//! session; the overlord gets only the user's keys (it keeps its own bar).
+//! Agent sessions also get rlord's key hints on their status bar.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -40,6 +41,13 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     let Some(name) = s.tmux_session.as_deref().filter(|n| tmux::has_session(n)) else {
         return Ok(());
     };
+    // The overlord keeps its own bar but gets the user's keys (copy mode,
+    // prefix, pane moves), when they have a profile.
+    if s.role == overlord::ROLE {
+        tmux::set_profile_keys(name, tmux_profile::exists() && cfg.tmux.profile)?;
+        tmux::name_agent_window(name, &s.name)?;
+        return Ok(());
+    }
     let want = wanted(db, cfg, s)?;
     let on = tmux::profile_on(name);
     if on && (!want || refresh) {
@@ -48,9 +56,22 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     if want && (!on || refresh) {
         tmux::set_profile(name, true)?;
     }
+    // rlord's keys on the session's bar (after the profile: turning it on or
+    // off resets the bar).
+    tmux::set_hint_bar(name, &hints(cfg), want)?;
     // Last: turning the profile off unsets window options, this included.
     tmux::name_agent_window(name, &s.name)?;
     Ok(())
+}
+
+/// `⌥d list · ⌥o overlord`: the configured keys rlord actually bound.
+fn hints(cfg: &Config) -> String {
+    [(&cfg.tmux.back, "list"), (&cfg.tmux.overlord, "overlord")]
+        .into_iter()
+        .filter(|(k, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
+        .map(|(k, what)| format!("{} {what}", tmux::key_label(k)))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 pub fn sync_ref(d: &Daemon, r: &str) {

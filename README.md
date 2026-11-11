@@ -278,6 +278,11 @@ and one session's profile never affects another.
 - `--dry-run` shows the report and writes nothing. `--remove` deletes the
   profile. Re-run the import after you change your config.
 - The profile is on for agent sessions by default (`[tmux] profile`).
+- The overlord keeps its own bar but gets your keys (prefix, root bindings,
+  copy mode) when a profile is imported.
+- Agent sessions show rlord's keys on their status bar (`⌥d list · ⌥o
+  overlord`): in front of your status-right with the profile on, or on a
+  slim bar of their own without it.
 - Per session: `rlord tmux profile on|off|toggle|default [REF]`.
 - rlord tracks the agent's pane, so splits never confuse the preview or
   status.
@@ -334,6 +339,12 @@ one, so it reads right even if your terminal stays dark. Both use the
 256-color palette. The others paint their own background and need a truecolor terminal (kitty,
 iTerm2, Ghostty, WezTerm). The overlord's bar and overlay border take the
 theme's accent color. Restart rlord (`rlord reset`) after changing `theme`.
+
+**Unstick or recount:** `rlord reset` restarts the daemon and reloads the
+list and tmux config (agent sessions keep running). `--rescan` also
+re-reads every sub-agent transcript from the start: rlord saves how far it
+has read each one and reads forward after that, so this is only needed if
+counts look wrong.
 
 ## Navigation and keys
 
