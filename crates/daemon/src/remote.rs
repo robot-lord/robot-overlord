@@ -289,7 +289,17 @@ fn state_of(
         _ if !avail.available => ("unavailable", avail.reason.clone()),
         (Some(_), None) if s.status == Status::Stopped => ("stopped", None),
         // Between a restart's old process and its new one.
-        (Some(_), None) => ("connecting", None),
+        (Some(_), None) if now - s.last_state_change_at.unwrap_or(now) < SETTLE_MS => {
+            ("connecting", None)
+        }
+        // Running, but Claude Code reports no live state for it.
+        (Some(_), None) => (
+            "failed",
+            Some(
+                "Claude Code reports no live state for it (an older version?); update Claude Code"
+                    .into(),
+            ),
+        ),
         (Some((_, at)), Some(l)) if l.started_at < *at => (
             "pending",
             Some(if restart_queued {
@@ -358,10 +368,8 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     }
     // Checked when someone wants it (cached; the keeper's first pass warms
     // it for the setup dialog and the offer).
-    let avail = match d.remote.cached() {
-        Some(a) if wants.is_empty() => a,
-        _ => d.remote.availability(false),
-    };
+    // (Re-checked every RECHECK: a login or plan change shows up.)
+    let avail = d.remote.availability(false);
     let now = rlord_core::types::now_ms();
     let queued: Vec<(String, i64)> = d
         .remote
@@ -383,7 +391,12 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
         // Done once a process started after the request runs (or none
         // does: the next start applies it).
-        let done = l.is_none_or(|l| l.started_at >= asked_at);
+        // No live state while it's stopped: the next start applies it. A
+        // running one without (a file caught mid-write) is checked again.
+        let done = match l {
+            Some(l) => l.started_at >= asked_at,
+            None => s.status == Status::Stopped,
+        };
         let remove = |d: &Daemon| {
             d.remote
                 .restart_when_idle
@@ -543,13 +556,24 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     // What a restart now would interrupt (the overlord's seats never restart
     // now: the overlord is mid-reply while it asks for this).
     let lv = |t: &Session| t.agent_session.as_deref().and_then(|a| live.get(a));
-    let running = |t: &Session| lv(t).is_some();
-    let going: Vec<String> = if seats {
+    // Running: Claude reports it, or its pane is up and it isn't stopped.
+    let running = |t: &Session| {
+        lv(t).is_some()
+            || (t.status != Status::Stopped
+                && t.tmux_session.as_deref().is_some_and(tmux::has_session))
+    };
+    // Whether turning it on/off needs this session restarted at all.
+    let needs_restart = |t: &Session| -> Result<bool> {
+        let before = wanted(&d.db(), &t.id)?.is_some();
+        let connected = lv(t).is_some_and(|l| l.bridge.is_some());
+        Ok(running(t) && !(on && connected) && !(before == on && connected == on))
+    };
+    let going: Vec<String> = if seats || !needs_restart(&s)? {
         Vec::new()
     } else {
         work_going(&s, lv(&s))
     };
-    if running(&s) && !going.is_empty() && mode.is_none() {
+    if !going.is_empty() && mode.is_none() {
         return Ok(json!({
             "session": s.id, "name": s.name, "needs_confirm": true,
             "work_going": going,
