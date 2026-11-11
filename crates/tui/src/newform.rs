@@ -275,9 +275,9 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        self.repo_chosen = true;
-        self.model_chosen = true;
-        self.workspace_chosen = true;
+        // (Not marked as the user's own picks: these are the overlord's.
+        // Confirmed, they launch as shown; if the user edits instead, only the
+        // hints they change count as theirs.)
         self.confirmed = true;
         self.changed = p["changed"]
             .as_array()
@@ -414,6 +414,7 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
+                                f.description_changed();
                                 f.location = Location::Folder(path);
                                 f.workspace = false;
                                 f.error = None;
@@ -473,7 +474,9 @@ impl App {
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
                         f.repo_chosen = true;
-                        f.description_changed();
+                        if !matches!(&f.location, Location::Repo(p) if p == path) {
+                            f.description_changed();
+                        }
                         f.location = Location::Repo(path.clone());
                         f.error = None;
                     } else {
@@ -511,25 +514,33 @@ impl App {
                 KeyCode::Enter => match kind {
                     PickerKind::Model => {
                         f.model_chosen = true;
-                        f.description_changed();
-                        f.model = if items[i] == "(agent default)" {
+                        let picked = if items[i] == "(agent default)" {
                             String::new()
                         } else {
                             items[i].clone()
                         };
+                        if picked != f.model {
+                            f.description_changed();
+                        }
+                        f.model = picked;
                     }
                     PickerKind::Repo => {
                         f.repo_chosen = true;
-                        f.description_changed();
                         if items[i] == OTHER_REPO {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
+                            if !matches!(f.location, Location::Auto) {
+                                f.description_changed();
+                            }
                             f.location = Location::Auto;
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
+                            if !matches!(&f.location, Location::Repo(p) if *p == path) {
+                                f.description_changed();
+                            }
                             f.location = Location::Repo(path);
                             f.error = None;
                         }
@@ -552,7 +563,7 @@ impl App {
         // ctrl-e (the overlord form): edit the description in $EDITOR, e.g.
         // your vim; it comes back into the box.
         if ctrl && code == KeyCode::Char('e') && f.kind == FormKind::Overlord {
-            match edit_in_editor(terminal, "new-session.md", &f.prompt)? {
+            match edit_in_editor(terminal, "new-session.md", &f.prompt) {
                 Ok(text) => {
                     let text = text.trim_end().to_string();
                     // (Trailing whitespace isn't a change: quitting the
@@ -828,7 +839,7 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 27), "New session"),
+            FormKind::Overlord => (centered(f.area(), 82, 25), "New session"),
             FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
         };
         f.render_widget(Clear, area);
@@ -886,8 +897,7 @@ impl App {
         }
 
         if form.kind == FormKind::Overlord {
-            let k = &self.config.tmux.overlord;
-            let overlord_key = tmux::key_label(if k.trim().is_empty() { "M-o" } else { k });
+            let overlord_key = self.keys.label(Action::Overlord);
             draw_describe_form(f, inner, form, &overlord_key);
             return;
         }
@@ -1014,7 +1024,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     let accent = Style::default().fg(theme::accent());
     let focus = |fld: Field| form.current() == fld;
     // Text width inside the box: margins, borders and padding.
-    let width = inner.width.saturating_sub(8).max(10) as usize;
+    let width = inner.width.saturating_sub(8).max(1) as usize;
 
     // Header: the overlord's note when it reopened the form, else what
     // happens on send.
@@ -1039,23 +1049,19 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             // is to just tell the overlord. Say so, with an example.
             head.push(Line::from(vec![
                 Span::styled("  Tip: ", Style::default().fg(theme::accent()).bold()),
-                Span::styled("you don't need this form. Press ", gray),
+                Span::styled("no form needed: press ", gray),
                 Span::styled(
                     format!(" {overlord_key} "),
                     Style::default().fg(theme::text()).bg(theme::chip()).bold(),
                 ),
-                Span::styled(" and just say it:", gray),
+                Span::styled(" and just say it, e.g.", gray),
             ]));
             head.push(Line::from(Span::styled(
                 "  \"start a session in ai to fix the flaky login tests\"",
                 Style::default().fg(theme::text()).italic(),
             )));
             head.push(Line::from(Span::styled(
-                "  This form sends the same thing (with optional hints) to the overlord's",
-                gray,
-            )));
-            head.push(Line::from(Span::styled(
-                "  mastermind, which names the session, writes its prompt and launches it.",
+                "  This form sends the same to the mastermind, with optional hints.",
                 gray,
             )));
         }
@@ -1261,7 +1267,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
 /// Rows a line takes when wrapped at word boundaries to `width` columns (as
 /// the description box wraps), counting wide characters as two.
 fn wrapped_rows(line: &str, width: usize) -> usize {
-    let w = |t: &str| Span::raw(t.to_string()).width();
+    let w = |t: &str| Span::raw(t).width();
     let (mut rows, mut col) = (1usize, 0usize);
     for word in line.split(' ') {
         let ww = w(word);

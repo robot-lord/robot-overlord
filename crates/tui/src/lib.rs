@@ -858,7 +858,7 @@ impl App {
         };
         let id = s["id"].as_str().unwrap_or("").to_string();
         let current = s["notes"].as_str().unwrap_or("").to_string();
-        match edit_in_editor(terminal, &format!("notes-{id}.md"), &current)? {
+        match edit_in_editor(terminal, &format!("notes-{id}.md"), &current) {
             Ok(new) => {
                 if new.trim_end() != current.trim_end() {
                     self.call("session.notes", json!({"ref": id, "notes": new}));
@@ -1551,7 +1551,7 @@ fn edit_in_editor(
     terminal: &mut DefaultTerminal,
     file: &str,
     text: &str,
-) -> Result<std::result::Result<String, String>> {
+) -> std::result::Result<String, String> {
     // A unique file per edit: several TUIs (clients) may edit at once.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1559,8 +1559,17 @@ fn edit_in_editor(
     let path = dir.join(format!("{}-{n}-{file}", std::process::id()));
     // File errors are the user's to see (the caller keeps its text), not a
     // reason to quit the TUI.
-    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, text)) {
-        return Ok(Err(format!("could not prepare {}: {e}", path.display())));
+    // Created fresh (never through an existing file or symlink).
+    let made = std::fs::create_dir_all(&dir).and_then(|_| {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?
+            .write_all(text.as_bytes())
+    });
+    if let Err(e) = made {
+        return Err(format!("could not prepare {}: {e}", path.display()));
     }
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -1582,7 +1591,7 @@ fn edit_in_editor(
         Err(e) => Err(format!("could not run editor '{editor}': {e}")),
     };
     let _ = std::fs::remove_file(&path);
-    Ok(r)
+    r
 }
 
 /// The overlord's rows (overlord, mastermind): fixed, special rows.
