@@ -63,6 +63,8 @@ fn run_loop(
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
     let mut error: Option<String> = None;
+    // An error worth reading (a failed seat switch) stays up a few seconds.
+    let mut hold_error_until = Instant::now();
     let mut last = Instant::now() - Duration::from_secs(1);
     loop {
         let area = terminal.size()?;
@@ -79,7 +81,9 @@ fn run_loop(
                 Ok(f) => {
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
                     cursor = f.cursor_visible.then_some((f.cursor_x, f.cursor_y));
-                    error = None;
+                    if Instant::now() >= hold_error_until {
+                        error = None;
+                    }
                 }
                 Err(e) => error = Some(format!("{e:#}")),
             }
@@ -121,7 +125,8 @@ fn run_loop(
                             Ok(_) => return Ok(()),
                             // Stay, and say why the switch didn't happen.
                             Err(e) => {
-                                error = Some(format!("couldn't switch to the {other}: {e:#}"))
+                                error = Some(format!("couldn't switch to the {other}: {e:#}"));
+                                hold_error_until = Instant::now() + Duration::from_secs(4);
                             }
                         }
                         continue;
