@@ -99,13 +99,16 @@ pub fn live_sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> HashMap<Stri
 }
 
 /// Whether this machine can use Remote Control.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Availability {
     pub available: bool,
     /// Why not (when unavailable), in a line the user can act on.
     pub reason: Option<String>,
     /// A caveat when available (e.g. an org admin must allow it).
     pub note: Option<String>,
+    /// The check itself failed (`claude` didn't answer): worth retrying
+    /// soon rather than trusting for long.
+    pub transient: bool,
 }
 
 impl Availability {
@@ -113,7 +116,7 @@ impl Availability {
         Availability {
             available: false,
             reason: Some(reason.into()),
-            note: None,
+            ..Default::default()
         }
     }
 }
@@ -159,6 +162,7 @@ pub fn assess(auth: &Value, b: &Blockers) -> Availability {
         "team" | "enterprise" => Availability {
             available: true,
             reason: None,
+            transient: false,
             note: Some(
                 "on a Team or Enterprise plan an admin must allow Remote Control (claude.ai/admin-settings/claude-code)"
                     .into(),
@@ -166,8 +170,7 @@ pub fn assess(auth: &Value, b: &Blockers) -> Availability {
         },
         _ => Availability {
             available: true,
-            reason: None,
-            note: None,
+            ..Default::default()
         },
     }
 }
@@ -176,7 +179,12 @@ pub fn assess(auth: &Value, b: &Blockers) -> Availability {
 pub fn check() -> Availability {
     let auth = match auth_status() {
         Ok(v) => v,
-        Err(e) => return Availability::no(e),
+        Err(e) => {
+            return Availability {
+                transient: true,
+                ..Availability::no(e)
+            }
+        }
     };
     assess(&auth, &blockers())
 }
