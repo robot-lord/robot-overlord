@@ -7,7 +7,8 @@
 #
 # `rlord update` runs this same script (compiled into the binary), so after
 # the first install you don't need the checkout. --force reinstalls the same
-# version and replaces a dev symlink at ~/.local/bin/rlord.
+# version and replaces a dev symlink at ~/.local/bin/rlord. After installing a
+# new version it runs `rlord reset` if rlord is running.
 set -euo pipefail
 repo=ayersb/robot-overlord
 force=()
@@ -42,11 +43,14 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 gh release download "$tag" -R "$repo" -p '*-aarch64-apple-darwin.tar.gz' -D "$d"
 tar -xzf "$d"/*.tar.gz -C "$d"
+installer=("$d"/rlord-*/install.sh)
 # ${a[@]+...}: an empty array under `set -u` is an error in macOS's bash 3.2.
-"$d"/rlord-*/install.sh ${force[@]+"${force[@]}"}
+"${installer[0]}" ${force[@]+"${force[@]}"}
 
-# Running daemons restart on the new binary at the next rlord command; an
-# open list keeps running the old one until reset.
+# A new version was installed (an up-to-date one exits above): if rlord is
+# running, reset it onto the new binary — daemon, list and tmux config.
+# Agent sessions keep running.
 if "$dest" ping >/dev/null 2>&1; then
-  echo "run \`rlord reset\` to reload the open rlord UI on the new version"
+  echo "reloading rlord on the new version…"
+  "$dest" reset
 fi
