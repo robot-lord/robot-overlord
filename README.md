@@ -275,10 +275,15 @@ it keeps running on this machine. rlord manages it per session:
   have it too (offered once, and in the first-run setup): then you can talk
   to the overlord from your phone. The mastermind goes with it.
 - **By hand**: `rlord remote` lists what's connected; `rlord remote <session>
-  on|off` turns it on or off.
-- It's remembered: every restart, resume and fresh start reconnects it. A
-  running session connects as soon as it's idle with an empty input line
-  (rlord never types over you). If a connection drops, rlord reconnects it.
+  on|off [--now|--when-idle]` turns it on or off.
+- It's a launch flag, so turning it on or off restarts the session (the
+  conversation resumes); rlord never types into a session. If the session
+  has work going (its turn, sub-agents, a background command, a prompt
+  waiting on you, unsent text), it asks first: restart now, or as soon as the work is done. It's
+  remembered: every later restart, resume and fresh start connects it (or,
+  turned off, keeps it off: a plain resume would reconnect it).
+- A connection that drops (e.g. a long time offline) shows as failed;
+  turning it on again restarts the session to reconnect.
 - The list marks connected sessions with ⇄ (red when it can't connect).
 
 It needs a claude.ai login on a Pro, Max, Team or Enterprise plan, against

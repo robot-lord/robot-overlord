@@ -142,10 +142,12 @@ pub fn tools() -> Value {
             "Rename a group (tag) on every session that has it; merges into an existing group of the new name.",
             json!({"from": s("Current tag"), "to": s("New tag (one word)")}), &["from", "to"]),
         tool("remote_control",
-            "Remote Control: continue a Claude Code session from the Claude app or claude.ai while it keeps running here. `on` true/false turns it on or off (remembered across restarts; a running session connects once it's idle, the answer carries its url); without `on` it reports state, url and whether this machine can use it at all (and why not).",
+            "Remote Control: continue a Claude Code session from the Claude app or claude.ai while it keeps running here. `on` true/false turns it on or off: remembered across restarts, and a running session is restarted (conversation resumed) with or without it. If the session has work going, nothing changes and the answer is `needs_confirm` with what a restart would interrupt: ask the user, then call again with `restart`. Without `on` it reports state, url and whether this machine can use it at all (and why not).",
             json!({
                 "session": s(&format!("{SESSION_REF}; omit for every session with it on")),
                 "on": b("Turn it on (true) or off (false); omit to just report"),
+                "restart": {"type": "string", "enum": ["now", "when_idle"],
+                            "description": "After needs_confirm, the user's pick: restart now (interrupting), or as soon as its work is done"},
             }), &[]),
         tool("set_group_order",
             "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
@@ -438,7 +440,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             arg_str(args, "session"),
             args.get("on").and_then(Value::as_bool),
         ) {
-            (Some(r), Some(on)) => d.rpc("remote.set", json!({"ref": r, "on": on})),
+            (Some(r), Some(on)) => d.rpc(
+                "remote.set",
+                json!({"ref": r, "on": on, "restart": arg_str(args, "restart")}),
+            ),
             (r, None) => d.rpc("remote.status", json!({"ref": r})),
             (None, Some(_)) => bail!("which session? (pass `session`)"),
         },

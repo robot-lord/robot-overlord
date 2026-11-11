@@ -1324,7 +1324,15 @@ impl App {
                     ),
                     Style::default().fg(theme::green()),
                 ),
-                "connecting" => ("connecting (once it's idle)".into(), theme::muted()),
+                "connecting" => ("connecting…".into(), theme::muted()),
+                "pending" => (
+                    format!(
+                        "on · {}",
+                        s["remote"]["reason"].as_str().unwrap_or("needs a restart")
+                    ),
+                    theme::muted(),
+                ),
+                "disconnecting" => ("off · disconnects at its restart".into(), theme::muted()),
                 "stopped" => ("on · connects when it starts".into(), theme::muted()),
                 other => (
                     format!(
@@ -1576,7 +1584,9 @@ fn updated_at(s: &Value) -> Option<i64> {
 fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
-        Some("connecting") | Some("stopped") => Span::styled(" ⇄", theme::faint()),
+        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
+            Span::styled(" ⇄", theme::faint())
+        }
         Some("failed") | Some("unavailable") => {
             Span::styled(" ⇄", Style::default().fg(theme::red()))
         }

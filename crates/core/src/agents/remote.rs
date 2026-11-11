@@ -42,14 +42,14 @@ pub fn url(bridge: &str) -> String {
     format!("https://claude.ai/code/{bridge}")
 }
 
-/// Live state of every Claude Code process with a state file, by
-/// conversation id. Stale files (a crashed process) are the caller's to
-/// filter by pid; when two files claim one conversation, the newest wins.
-pub fn live_sessions() -> HashMap<String, Live> {
-    live_sessions_in(&config_dir().join("sessions"))
+/// Live state of every running Claude Code process with a state file, by
+/// conversation id. `alive(pid)` drops stale files (a crashed process)
+/// first; of two live files claiming one conversation, the newest wins.
+pub fn live_sessions(alive: impl Fn(u32) -> bool) -> HashMap<String, Live> {
+    live_sessions_in(&config_dir().join("sessions"), alive)
 }
 
-pub fn live_sessions_in(dir: &Path) -> HashMap<String, Live> {
+pub fn live_sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> HashMap<String, Live> {
     let mut out: HashMap<String, (i64, Live)> = HashMap::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return HashMap::new();
@@ -72,6 +72,9 @@ pub fn live_sessions_in(dir: &Path) -> HashMap<String, Live> {
         let (Some(sid), Some(pid)) = (v["sessionId"].as_str(), v["pid"].as_u64()) else {
             continue;
         };
+        if !alive(pid as u32) {
+            continue;
+        }
         let at = v["updatedAt"].as_i64().unwrap_or(0);
         let live = Live {
             pid: pid as u32,
@@ -297,10 +300,13 @@ mod tests {
             json!({"pid": 3, "sessionId": "b", "status": "idle"}),
         );
         w("junk.json", json!("nope"));
-        let l = live_sessions_in(d.path());
+        let l = live_sessions_in(d.path(), |_| true);
         assert_eq!(l.len(), 2);
         assert_eq!(l["a"].pid, 1);
         assert_eq!(l["a"].url().unwrap(), "https://claude.ai/code/session_x");
         assert_eq!(l["b"].bridge, None);
+        // A dead process's file never hides the live one.
+        let l = live_sessions_in(d.path(), |pid| pid != 1);
+        assert_eq!(l["a"].pid, 2);
     }
 }

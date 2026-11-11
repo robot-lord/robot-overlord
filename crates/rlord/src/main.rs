@@ -160,6 +160,12 @@ enum Command {
         r#ref: Option<String>,
         /// on / off
         state: Option<String>,
+        /// Restart now even if the session has work going
+        #[arg(long, conflicts_with = "when_idle")]
+        now: bool,
+        /// Restart as soon as its work is done
+        #[arg(long)]
+        when_idle: bool,
     },
     /// Show everything known about a session
     Show {
@@ -766,7 +772,12 @@ fn main() -> Result<()> {
             print_agents(&r);
             Ok(())
         }
-        Command::Remote { r#ref, state } => {
+        Command::Remote {
+            r#ref,
+            state,
+            now,
+            when_idle,
+        } => {
             let print = |name: &str, r: &Value| {
                 let st = r["state"].as_str().unwrap_or("off");
                 let extra = r["url"]
@@ -788,7 +799,30 @@ fn main() -> Result<()> {
             };
             match (r#ref, state.as_deref()) {
                 (Some(r), Some(s @ ("on" | "off"))) => {
-                    let v = call("remote.set", json!({"ref": r, "on": s == "on"}))?;
+                    let restart = if now {
+                        json!("now")
+                    } else if when_idle {
+                        json!("when_idle")
+                    } else {
+                        Value::Null
+                    };
+                    let v = call(
+                        "remote.set",
+                        json!({"ref": r, "on": s == "on", "restart": restart}),
+                    )?;
+                    if v["needs_confirm"] == true {
+                        let why: Vec<&str> = v["work_going"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(Value::as_str).collect())
+                            .unwrap_or_default();
+                        println!(
+                            "{} has work going: {}. Restarting it would interrupt that.",
+                            v["name"].as_str().unwrap_or("it"),
+                            why.join("; ")
+                        );
+                        println!("Run again with --now, or --when-idle to restart once it's done.");
+                        return Ok(());
+                    }
                     print(v["name"].as_str().unwrap_or("?"), &v["remote"]);
                     if let Some(n) = v["note"].as_str().filter(|n| !n.is_empty()) {
                         println!("{n}");

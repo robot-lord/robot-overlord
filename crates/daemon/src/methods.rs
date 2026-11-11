@@ -216,12 +216,17 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
 
 /// A session's agent flags from its launch spec: the adapter flags it was
 /// created with, plus `--remote-control <name>` while Remote Control is on
-/// (so every start, resume and fresh start reconnects it).
+/// (so every start, resume and fresh start reconnects it). Turned off, it
+/// stays off with a settings override: `--resume` would otherwise reconnect
+/// a conversation that was last connected.
 pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
     let mut a = str_list(spec, "extra_args");
     if let Some(n) = spec["remote_control"].as_str().filter(|n| !n.is_empty()) {
         a.push("--remote-control".into());
         a.push(n.to_string());
+    } else if spec["remote_control_off"] == true {
+        a.push("--settings".into());
+        a.push(r#"{"disableRemoteControl":true}"#.into());
     }
     a
 }
@@ -860,6 +865,19 @@ pub fn hook_command() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn remote_control_flags_follow_the_spec() {
+        let on = json!({"extra_args": ["--x"], "remote_control": "web"});
+        assert_eq!(spec_args(&on), ["--x", "--remote-control", "web"]);
+        let off = json!({"remote_control_off": true});
+        assert_eq!(
+            spec_args(&off),
+            ["--settings", r#"{"disableRemoteControl":true}"#]
+        );
+        assert!(spec_args(&json!({})).is_empty());
+    }
+
     use super::*;
 
     #[test]

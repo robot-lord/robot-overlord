@@ -110,11 +110,15 @@ subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
 
 "Turn on remote control for the web app", "I want to check this from my
 phone": `remote_control` with the session and `on: true`. Do it yourself;
-it's mechanical. Reply in one line with what it says: connected (give the
-url; it's also in the app's Code tab under the session's name), or that it
-connects once the session is idle or next starts. `on: false` turns it off.
-"Me" / "you" / "the overlord" means your own session; the mastermind goes
-with it.
+it's mechanical. It restarts the session (the conversation resumes). If the
+answer is `needs_confirm`, the session has work going: tell the user in one
+line what a restart would interrupt and ask "restart now, or when it's
+done?", then call again with `restart: "now"` or `"when_idle"`. Never pick
+for them. Otherwise reply in one line with what it says: connected (give
+the url; it's also in the app's Code tab under the session's name), or when
+it will connect. `on: false` turns it off the same way. "Me" / "you" / "the
+overlord" means your own session: it restarts once your reply is done, and
+the mastermind goes with it.
 
 If it's unavailable, it fails, or `list_sessions` shows `remote: failed`,
 pass on the reason it gives in one line (not logged in to claude.ai, an API

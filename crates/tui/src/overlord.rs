@@ -577,16 +577,13 @@ impl App {
                 "remote.set",
                 // Don't hold the list up waiting for the link: the list
                 // shows it (⇄) once connected.
-                json!({"ref": "overlord", "on": true, "wait": false}),
+                json!({"seat": "overlord", "on": true, "wait": false}),
             ) {
                 Ok(r) => {
-                    self.status_line = match r["remote"]["url"].as_str() {
-                        Some(u) => format!("overlord on Remote Control: {u}"),
-                        None => format!(
-                            "overlord: Remote Control on — {}",
-                            r["note"].as_str().unwrap_or("connecting")
-                        ),
-                    };
+                    self.status_line = format!(
+                        "overlord: Remote Control on — {}",
+                        r["note"].as_str().unwrap_or("connecting")
+                    );
                     self.dirty = true;
                 }
                 Err(e) => {
