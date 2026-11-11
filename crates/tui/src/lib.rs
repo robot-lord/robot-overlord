@@ -279,10 +279,9 @@ impl App {
             Line::from(""),
             Line::from("  Quit rlord? Your sessions keep running.").bold(),
             Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                key("y/enter".into(), "quit"),
-                key("any key".into(), "stay"),
+            keys_line(&[
+                ("y/enter", "quit", Cap::Context),
+                ("any key", "stay", Cap::Global),
             ]),
         ];
         f.render_widget(
@@ -1306,7 +1305,7 @@ impl App {
             self.keys
                 .global_legend()
                 .into_iter()
-                .map(|(k, label)| key(k, label))
+                .flat_map(|(k, label)| keycap(&k, label, Cap::Global))
                 .collect::<Vec<_>>(),
         );
         let ctx = self.keys.labelled(&context_legend(
@@ -1314,18 +1313,14 @@ impl App {
             self.group_sel.as_deref(),
             self.selected(),
         ));
-        if ctx.is_empty() {
-            f.render_widget(Paragraph::new(global), line1_area);
-            return;
-        }
-        let mut spans = vec![Span::raw("│ ").fg(Color::DarkGray)];
-        spans.extend(ctx.into_iter().map(|(k, label)| key(k, label)));
-        let ctx = Line::from(spans);
+        // The divider sits at a fixed column: the right slot is as wide as
+        // the longest row-key set, and row keys fill it from the left, so
+        // moving the highlight never shifts it.
+        let slot = self.keys.context_slot_width();
         let [left, right] =
-            RLayout::horizontal([Constraint::Min(0), Constraint::Length(ctx.width() as u16)])
-                .areas(line1_area);
+            RLayout::horizontal([Constraint::Min(0), Constraint::Length(slot)]).areas(line1_area);
         f.render_widget(Paragraph::new(global), left);
-        f.render_widget(Paragraph::new(ctx), right);
+        f.render_widget(Paragraph::new(context_line(ctx)), right);
     }
 }
 
@@ -1350,8 +1345,43 @@ impl InputKind {
     }
 }
 
-fn key(k: String, label: &str) -> Span<'static> {
-    Span::raw(format!("{k}:{label} ")).fg(Color::Cyan)
+/// Keycap colour: neutral for keys that always work, the accent (the
+/// active tab's cyan) for keys acting on the highlighted row.
+#[derive(Clone, Copy)]
+enum Cap {
+    Global,
+    Context,
+}
+
+/// The footer's right slot: divider, then the row keys as accent keycaps.
+fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
+    let mut spans = vec![Span::raw("│  ").fg(Color::DarkGray)];
+    spans.extend(
+        ctx.into_iter()
+            .flat_map(|(k, label)| keycap(&k, label, Cap::Context)),
+    );
+    Line::from(spans)
+}
+
+/// A dialog's row of key hints, indented to match its text.
+fn keys_line(items: &[(&str, &str, Cap)]) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for &(k, label, cap) in items {
+        spans.extend(keycap(k, label, cap));
+    }
+    Line::from(spans)
+}
+
+/// A key hint as a padded keycap chip, then its label: ` n  new   `.
+fn keycap(k: &str, label: &str, cap: Cap) -> [Span<'static>; 2] {
+    let chip = match cap {
+        Cap::Global => Style::default().fg(Color::White).bg(Color::DarkGray),
+        Cap::Context => Style::default().fg(Color::Black).bg(Color::Cyan),
+    };
+    [
+        Span::styled(format!(" {k} "), chip.bold()),
+        Span::styled(format!(" {label}  "), Style::default().fg(Color::Gray)),
+    ]
 }
 
 fn status_style(status: &str) -> Style {
@@ -1558,6 +1588,16 @@ impl KeyMap {
         ])
     }
 
+    /// Width of the footer's right slot: the widest row-key set any row can
+    /// produce (a running, archived, pinned session lists the most and the
+    /// longest labels).
+    fn context_slot_width(&self) -> u16 {
+        let widest = json!({"status": "working", "agent": "claude", "agent_session": "x",
+                            "archived_at": 1, "pinned": true, "role": ""});
+        let w = context_line(self.labelled(&context_legend(false, None, Some(&widest)))).width();
+        u16::try_from(w).unwrap_or(u16::MAX)
+    }
+
     fn labelled(&self, actions: &[(Action, &'static str)]) -> Vec<(String, &'static str)> {
         actions.iter().map(|&(a, l)| (self.label(a), l)).collect()
     }
@@ -1644,13 +1684,24 @@ mod tests {
                              "archived_at": null, "pinned": false, "role": ""});
         assert_eq!(
             labels(&context_legend(false, None, Some(&running))),
-            ["attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe", "notes"]
+            [
+                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
+                "notes"
+            ]
         );
         let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
                               "archived_at": 1, "pinned": true, "role": ""});
         assert_eq!(
             labels(&context_legend(false, None, Some(&archived))),
-            ["resume", "unarchive", "rename", "unpin", "tags", "describe", "notes"]
+            [
+                "resume",
+                "unarchive",
+                "rename",
+                "unpin",
+                "tags",
+                "describe",
+                "notes"
+            ]
         );
         let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
                               "archived_at": null, "pinned": false, "role": "overlord"});
@@ -1661,29 +1712,61 @@ mod tests {
             labels(&context_legend(true, Some("wip"), Some(&running))),
             ["open", "rename group"]
         );
-        assert_eq!(labels(&context_legend(true, Some(groups::UNTAGGED), None)), ["open"]);
+        assert_eq!(
+            labels(&context_legend(true, Some(groups::UNTAGGED), None)),
+            ["open"]
+        );
+    }
+
+    fn footer_row(app: &App, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut term = ratatui::Terminal::new(TestBackend::new(width, 2)).unwrap();
+        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+        (0..width)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect()
     }
 
     #[test]
-    fn footer_puts_contextual_keys_right_of_a_divider() {
-        use ratatui::backend::TestBackend;
+    fn footer_divider_is_fixed_and_lists_only_applicable_keys() {
         let (_tx, rx) = mpsc::channel();
         let keys = KeyMap::from_config(&Keys::default()).unwrap();
         let mut app = App::new(rx, Config::default(), keys);
-        app.sessions = vec![json!({"status": "stopped", "archived_at": 1, "pinned": false,
-                                   "role": "", "agent": "claude"})];
+        app.sessions = vec![
+            json!({"status": "stopped", "archived_at": 1, "pinned": false, "role": "",
+                   "agent": "claude"}),
+            json!({"status": "working", "archived_at": null, "pinned": false, "role": "",
+                   "agent": "claude", "agent_session": "x"}),
+        ];
+        let col = |row: &str| row.chars().position(|c| c == '│').expect("divider");
         app.table.select(Some(0));
-        let mut term = ratatui::Terminal::new(TestBackend::new(220, 2)).unwrap();
-        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
-        let row: String = (0..220)
-            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
-            .collect();
-        let row = row.trim_end();
-        let (left, right) = row.split_once('│').expect("divider");
-        assert!(left.contains(":new ") && left.contains(":quit "), "{row}");
-        assert!(right.contains(":unarchive ") && right.contains(":resume "), "{row}");
-        assert!(!row.contains(":archive ") && !row.contains(":stop "), "{row}");
-        assert!(row.len() > 200, "contextual keys sit at the right edge: {row}");
+        let archived = footer_row(&app, 240);
+        app.table.select(Some(1));
+        let running = footer_row(&app, 240);
+        app.table.select(None);
+        let none = footer_row(&app, 240);
+        assert_eq!(col(&archived), col(&running), "\n{archived}\n{running}");
+        assert_eq!(col(&archived), col(&none));
+
+        let (left, right) = archived.split_once('│').unwrap();
+        assert!(
+            left.contains(" new ") && left.contains(" quit "),
+            "{archived}"
+        );
+        assert!(
+            right.contains(" unarchive ") && right.contains(" resume "),
+            "{archived}"
+        );
+        assert!(
+            !right.contains(" stop ") && !right.contains(" archive "),
+            "{archived}"
+        );
+        let (_, right) = running.split_once('│').unwrap();
+        assert!(
+            right.contains(" stop ") && right.contains(" archive "),
+            "{running}"
+        );
+        assert!(!right.contains("unarchive"), "{running}");
     }
 }
 
