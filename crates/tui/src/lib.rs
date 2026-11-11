@@ -1107,11 +1107,10 @@ impl App {
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
-                        if s["loading"] == true {
-                            Span::styled("◌ loading", theme::faint())
-                        } else {
-                            theme::status_chip(&status)
-                        },
+                        theme::status_chip(&status),
+                        // Its sub-agents are still loading (warm-up): the
+                        // status is known, the agent counts aren't yet.
+                        Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
                         Span::styled(
                             match s["agents_running"].as_i64().unwrap_or(0) {
                                 0 => String::new(),
@@ -1741,9 +1740,12 @@ impl KeyMap {
                 .any(|(a, o)| *a != me && o.code == b.code && o.ctrl == b.ctrl && o.alt == b.alt)
         };
         let snapshot = bindings.clone();
-        bindings.retain(|(a, b)| {
-            !matches!(a, Action::SessionsTab | Action::GroupsTab) || !taken(b, *a, &snapshot)
-        });
+        let default_step = |a: &Action| {
+            (*a == Action::SessionsTab && k.sessions_tab == "H")
+                || (*a == Action::GroupsTab && k.groups_tab == "L")
+        };
+        // Only the defaults give way; a step key the user set is theirs.
+        bindings.retain(|(a, b)| !default_step(a) || !taken(b, *a, &snapshot));
         // Arrow keys always work for movement, alongside whatever is configured.
         bindings.push((Action::Up, KeyBinding::parse("up")?));
         bindings.push((Action::Down, KeyBinding::parse("down")?));

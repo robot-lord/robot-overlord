@@ -329,20 +329,18 @@ impl Daemon {
         // Rows the warm-up hasn't loaded yet say so (the list shows it).
         let r = match (method, r) {
             ("session.list", Ok(Value::Array(mut rows))) => {
+                let loading = self.warm.loading();
                 for row in &mut rows {
                     let id = row["id"].as_str().unwrap_or("");
-                    row["loading"] = json!(self.warm.is_loading(id));
+                    row["loading"] = json!(loading.contains(id));
                 }
                 Ok(Value::Array(rows))
             }
             (_, r) => r,
         };
         if method == "session.unarchive" && r.is_ok() {
-            if let Some(id) = params["ref"]
-                .as_str()
-                .and_then(|r| self.db().resolve_ref(r).ok())
-            {
-                self.warm.enqueue(&id.id);
+            if let Some(id) = params["ref"].as_str() {
+                warm::enqueue_ref(self, id);
             }
         }
         if mutating && r.is_ok() {
@@ -395,8 +393,12 @@ impl Daemon {
             "session.import_scan" => import::scan(self, params),
             "session.import" => {
                 let r = import::import(self, params);
-                if r.is_ok() {
+                if let Ok(v) = &r {
                     self.changed();
+                    // Imported with history: load it in the background.
+                    if let Some(id) = v["id"].as_str() {
+                        warm::enqueue_ref(self, id);
+                    }
                 }
                 r
             }

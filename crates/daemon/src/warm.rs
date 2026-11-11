@@ -7,7 +7,7 @@
 //! from the DB without touching disk until the worker has done it. Disk
 //! reads happen without the DB lock; only reading and writing rows hold it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -22,14 +22,23 @@ use crate::{methods, Daemon};
 
 #[derive(Default)]
 pub struct Warm {
-    /// Sessions queued and not yet loaded.
-    pending: Mutex<HashSet<String>>,
+    /// Sessions queued and not yet loaded, with how many loads are queued
+    /// (one queued again mid-load stays loading until its last load ends).
+    pending: Mutex<HashMap<String, usize>>,
     queue: Mutex<Option<mpsc::Sender<String>>>,
 }
 
 impl Warm {
     pub fn is_loading(&self, id: &str) -> bool {
-        self.pending.lock().is_ok_and(|p| p.contains(id))
+        self.pending.lock().is_ok_and(|p| p.contains_key(id))
+    }
+
+    /// Every session still loading (one lock, for annotating a list).
+    pub fn loading(&self) -> HashSet<String> {
+        self.pending
+            .lock()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Queue a session for loading (e.g. just unarchived).
@@ -37,7 +46,7 @@ impl Warm {
         let Ok(q) = self.queue.lock() else { return };
         if let Some(tx) = q.as_ref() {
             if let Ok(mut p) = self.pending.lock() {
-                p.insert(id.to_string());
+                *p.entry(id.to_string()).or_default() += 1;
             }
             let _ = tx.send(id.to_string());
         }
@@ -55,7 +64,9 @@ pub fn start(d: &Arc<Daemon>) {
         .map(|s| s.id)
         .collect();
     if let Ok(mut p) = d.warm.pending.lock() {
-        p.extend(ids.iter().cloned());
+        for id in &ids {
+            *p.entry(id.clone()).or_default() += 1;
+        }
     }
     for id in ids {
         let _ = tx.send(id);
@@ -71,12 +82,17 @@ pub fn start(d: &Arc<Daemon>) {
                 tracing::debug!(session = %id, error = %e, "warming session");
             }
             if let Ok(mut p) = d.warm.pending.lock() {
-                p.remove(&id);
+                if let Some(n) = p.get_mut(&id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        p.remove(&id);
+                    }
+                }
             }
             // Tell the list now and then (and when the queue drains), not
-            // after every session.
+            // after every session: each tick makes every TUI refetch.
             let drained = d.warm.pending.lock().is_ok_and(|p| p.is_empty());
-            if drained || since_notify.elapsed() > std::time::Duration::from_millis(500) {
+            if drained || since_notify.elapsed() > std::time::Duration::from_secs(2) {
                 d.changed();
                 since_notify = std::time::Instant::now();
             }
@@ -87,15 +103,14 @@ pub fn start(d: &Arc<Daemon>) {
 /// Bring one session's sub-agents up to date from disk. The transcript
 /// reads run without the DB lock; returns the session's sub-agent rows.
 pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
-    let (s, src, known) = {
+    let (s, src) = {
         let db = d.db();
         let s = db.resolve_ref(r)?;
         let src = db.transcript_source(&s.id)?;
-        let known = db.subagents(&s.id)?;
-        (s, src, known)
+        (s, src)
     };
     let Some(src) = src else {
-        return Ok(known);
+        return d.db().subagents(&s.id);
     };
     // Cheap per call: transcript stats are incremental (only appended bytes
     // are read). Every agent is checked, finished or not (a finished one may
@@ -103,6 +118,9 @@ pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
     let running = s.status != Status::Stopped;
     let scanned = claude::scan_subagents_where(&s.id, &src, running, &|_| true);
     let db = d.db();
+    // Compare with the rows as they are now, not as they were before the
+    // unlocked scan: a hook may have finished an agent meanwhile.
+    let known = db.subagents(&s.id)?;
     apply(&db, &known, &scanned)?;
     methods::save_cursors(&db);
     db.subagents(&s.id)
@@ -136,4 +154,12 @@ pub fn session_subagents(d: &Daemon, params: &Value) -> Result<Value> {
         refresh(d, &id)?
     };
     Ok(serde_json::to_value(rows)?)
+}
+
+/// Queue a session that just became live with history (imported,
+/// unarchived) so its first view doesn't read it all on the spot.
+pub fn enqueue_ref(d: &Daemon, r: &str) {
+    if let Ok(s) = d.db().resolve_ref(r) {
+        d.warm.enqueue(&s.id);
+    }
 }

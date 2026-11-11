@@ -267,6 +267,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let id = s["id"].clone();
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
+            // Right after rlord starts, sub-agent data may still be loading.
+            if d.warm.is_loading(id.as_str().unwrap_or("")) {
+                s["subagents_loading"] = json!(true);
+            }
             Ok(s)
         }
         "read_screen" => {
