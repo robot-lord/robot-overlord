@@ -534,6 +534,13 @@ impl App {
             Action::Archive if self.selected_is_overlord() => {
                 self.status_line = "the overlord can't be archived (s stops it)".into();
             }
+            Action::Rename | Action::Pin | Action::Describe | Action::Notes
+                if self.selected_is_overlord()
+                    && !(self.tab == Tab::Groups && self.group_focus) =>
+            {
+                self.status_line =
+                    "the overlord's row is fixed: no rename, pin, description or notes".into();
+            }
             Action::Archive => self.action("session.archive", "archived"),
             Action::Overlord => self.show_overlord(),
             Action::Unarchive => self.action("session.unarchive", "unarchived"),
@@ -1635,9 +1642,13 @@ fn context_legend(
         }
         v.push((Action::Stop, "stop"));
     }
+    if overlord {
+        // Its row is fixed: no name, pin, tags, description, notes, archive.
+        return v;
+    }
     if archived {
         v.push((Action::Unarchive, "unarchive"));
-    } else if !overlord {
+    } else {
         v.push((Action::Archive, "archive"));
     }
     v.push((Action::Rename, "rename"));
@@ -1649,9 +1660,7 @@ fn context_legend(
             "pin"
         },
     ));
-    if !overlord {
-        v.push((Action::Tags, "tags"));
-    }
+    v.push((Action::Tags, "tags"));
     v.push((Action::Describe, "describe"));
     v.push((Action::Notes, "notes"));
     v
@@ -1705,8 +1714,10 @@ mod tests {
         );
         let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
                               "archived_at": null, "pinned": false, "role": "overlord"});
-        let l = labels(&context_legend(false, None, Some(&overlord)));
-        assert!(!l.contains(&"archive".into()) && !l.contains(&"tags".into()));
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&overlord))),
+            ["attach", "restart", "stop"]
+        );
         assert!(context_legend(false, None, None).is_empty());
         assert_eq!(
             labels(&context_legend(true, Some("wip"), Some(&running))),
