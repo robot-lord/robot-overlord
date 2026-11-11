@@ -608,6 +608,13 @@ pub struct CursorState {
     pub ended: bool,
 }
 
+/// Bump when `transcript_stats` counts differently: saved positions from an
+/// older version are dropped and their transcripts recounted.
+pub const STATS_PARSE_VERSION: i64 = 1;
+
+/// How many saved positions are loaded at startup (the most recent).
+pub const STATS_CURSOR_SEED: usize = STATS_CURSOR_CAP;
+
 /// Load saved positions (daemon start). Files already read this run keep
 /// their in-memory position.
 pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {

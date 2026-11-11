@@ -641,9 +641,6 @@ const PROFILE_ON: &str = "@rlord_profile";
 /// profile is turned off).
 const RLORD_SESSION_OPTS: &[&str] = &[AGENT_PANE, PROFILE_ON];
 
-/// Turn the user's imported tmux profile on or off for one session. Only
-/// that session changes: its key table, its options, its windows. Requires
-/// an imported profile to turn on.
 /// The overlord keeps its own bar, but gets the user's keys: their key
 /// table (root bindings, with rlord's nav keys), prefix, and copy-mode keys.
 /// `on: false` takes them away again.
@@ -684,6 +681,25 @@ pub fn set_profile_keys(name: &str, on: bool) -> Result<()> {
 /// the session gets a slim bar of its own: its name left, the hints right.
 pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
     let t = format!("{}:", exact(name));
+    if hints.is_empty() {
+        // No rlord keys bound: nothing to show (and no bar of our own).
+        run(&["set-option", "-t", &t, HINTS_OPT, ""])?;
+        if !profile_on {
+            for opt in [
+                "status",
+                "status-style",
+                "status-left",
+                "status-left-length",
+                "status-right",
+                "status-right-length",
+                "window-status-format",
+                "window-status-current-format",
+            ] {
+                let _ = run(&["set-option", "-u", "-t", &t, opt]);
+            }
+        }
+        return Ok(());
+    }
     run(&[
         "set-option",
         "-t",
@@ -734,11 +750,22 @@ pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
 const HINTS_OPT: &str = "@rlord-hints";
 const HINTS_REF: &str = "#{E:@rlord-hints}";
 
+/// Whether `key` in the root table runs rlord's nav (it's skipped when the
+/// user's own binding already holds it).
+pub fn nav_key_bound(key: &str) -> bool {
+    run(&["list-keys", "-T", "root", key])
+        .map(|o| o.contains("rlord") && o.contains(" nav "))
+        .unwrap_or(false)
+}
+
 /// `M-d` → `⌥d`, `C-x` → `⌃x`: how a tmux key reads on a Mac.
 pub fn key_label(key: &str) -> String {
     key.replace("M-", "⌥").replace("C-", "⌃").replace("S-", "⇧")
 }
 
+/// Turn the user's imported tmux profile on or off for one session. Only
+/// that session changes: its key table, its options, its windows. Requires
+/// an imported profile to turn on.
 pub fn set_profile(name: &str, on: bool) -> Result<()> {
     let t = format!("{}:", exact(name));
     let windows = || -> Result<Vec<String>> {

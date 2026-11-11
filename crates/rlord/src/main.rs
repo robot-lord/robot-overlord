@@ -1015,11 +1015,9 @@ fn resolve_conversation(id: &str) -> Result<String> {
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.clone()),
-        [] if r["rejected"][0]["reason"].is_string()
-            && !r["rejected"][0]["reason"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("no untracked") =>
+        [] if r["rejected"][0]["reason"]
+            .as_str()
+            .is_some_and(|w| !w.starts_with("rlord already tracks")) =>
         {
             anyhow::bail!(
                 "'{id}' can't be imported: {}",

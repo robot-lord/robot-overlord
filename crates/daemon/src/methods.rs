@@ -760,8 +760,6 @@ fn ingest_subagent_hook(
     Ok(())
 }
 
-/// Sub-agents of a session: backfill from disk (for sessions that ran before
-/// hooks existed, or missed events), then return the merged rows.
 /// Save transcript read positions that moved (so a restart reads forward).
 pub(crate) fn save_cursors(db: &Db) {
     let dirty = claude::take_dirty_cursors();
@@ -770,6 +768,8 @@ pub(crate) fn save_cursors(db: &Db) {
     }
 }
 
+/// Sub-agents of a session: backfill from disk (for sessions that ran before
+/// hooks existed, or missed events), then return the merged rows.
 pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     let mut known = db.subagents(&s.id)?;

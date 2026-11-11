@@ -32,13 +32,35 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
         .split_whitespace()
         .map(str::to_lowercase)
         .collect();
+    let only = str_list(params, "ids");
     let opts = ScanOpts {
         since_ms: now_ms() - window_ms,
-        // Filter by query before limiting, so the limit counts matches.
-        limit: if words.is_empty() { limit } else { 0 },
-        only: str_list(params, "ids"),
+        // Filter by query before limiting, so the limit counts matches; ids
+        // asked for are all looked at.
+        limit: if words.is_empty() && only.is_empty() {
+            limit
+        } else {
+            0
+        },
+        only: only.clone(),
     };
     let mut found = scan_claude(&opts, &|id| tracked.contains(id));
+    // Asked for by id but not importable at all (judged before query and
+    // limit, which only narrow the listing): say why.
+    let rejected: Vec<Value> = opts
+        .only
+        .iter()
+        .filter(|id| {
+            !found
+                .iter()
+                .any(|c| c.agent_session.starts_with(id.as_str()))
+        })
+        .map(|id| {
+            let why =
+                explain_claude(id, &|i| tracked.contains(i)).unwrap_or_else(|| "unknown".into());
+            json!({"id": id, "reason": why})
+        })
+        .collect();
     if !words.is_empty() {
         found.retain(|c| {
             let hay = [
@@ -55,27 +77,9 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
             .to_lowercase();
             words.iter().all(|w| hay.contains(w.as_str()))
         });
-        found.truncate(limit);
     }
+    found.truncate(limit);
     found.iter_mut().for_each(add_git_info);
-    // Asked for by id but not found: say why, so it's not a silent skip.
-    let rejected: Vec<Value> = opts
-        .only
-        .iter()
-        .filter(|id| {
-            !found
-                .iter()
-                .any(|c| c.agent_session.starts_with(id.as_str()))
-        })
-        .map(|id| {
-            let why = if id.len() == 36 {
-                explain_claude(id, &|i| tracked.contains(i))
-            } else {
-                Some("no untracked conversation id starts with this".into())
-            };
-            json!({"id": id, "reason": why.unwrap_or_else(|| "unknown".into())})
-        })
-        .collect();
     Ok(json!({"count": found.len(), "candidates": found, "rejected": rejected}))
 }
 

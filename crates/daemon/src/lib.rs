@@ -133,9 +133,15 @@ impl Daemon {
         let db = self.db.lock().expect("db mutex poisoned");
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
-        match db.transcript_cursors() {
-            Ok(saved) => rlord_core::agents::claude::seed_cursors(saved),
-            Err(e) => tracing::warn!(error = %e, "loading transcript read positions"),
+        {
+            use rlord_core::agents::claude::{seed_cursors, STATS_CURSOR_SEED};
+            if let Err(e) = db.prune_transcript_cursors(5 * STATS_CURSOR_SEED) {
+                tracing::warn!(error = %e, "pruning transcript read positions");
+            }
+            match db.transcript_cursors(STATS_CURSOR_SEED) {
+                Ok(saved) => seed_cursors(saved),
+                Err(e) => tracing::warn!(error = %e, "loading transcript read positions"),
+            }
         }
         for params in drain_spool()? {
             if let Err(e) = methods::hook_emit(&db, &params) {

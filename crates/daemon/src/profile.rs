@@ -45,6 +45,7 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     // prefix, pane moves), when they have a profile.
     if s.role == overlord::ROLE {
         tmux::set_profile_keys(name, tmux_profile::exists() && cfg.tmux.profile)?;
+        tmux::name_agent_window(name, &s.name)?;
         return Ok(());
     }
     let want = wanted(db, cfg, s)?;
@@ -63,16 +64,14 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     Ok(())
 }
 
-/// `⌥d list · ⌥o overlord`, from the configured keys.
+/// `⌥d list · ⌥o overlord`: the configured keys rlord actually bound.
 fn hints(cfg: &Config) -> String {
-    let mut v = Vec::new();
-    if !cfg.tmux.back.trim().is_empty() {
-        v.push(format!("{} list", tmux::key_label(&cfg.tmux.back)));
-    }
-    if !cfg.tmux.overlord.trim().is_empty() {
-        v.push(format!("{} overlord", tmux::key_label(&cfg.tmux.overlord)));
-    }
-    v.join(" · ")
+    [(&cfg.tmux.back, "list"), (&cfg.tmux.overlord, "overlord")]
+        .into_iter()
+        .filter(|(k, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
+        .map(|(k, what)| format!("{} {what}", tmux::key_label(k)))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 pub fn sync_ref(d: &Daemon, r: &str) {

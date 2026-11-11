@@ -8,5 +8,8 @@ CREATE TABLE transcript_cursors (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   first_at      INTEGER,
   last_at       INTEGER,
-  ended         INTEGER NOT NULL DEFAULT 0
+  ended         INTEGER NOT NULL DEFAULT 0,
+  -- claude::STATS_PARSE_VERSION when saved: rows from older counting logic
+  -- are dropped (and recounted) at startup.
+  version       INTEGER NOT NULL DEFAULT 0
 );

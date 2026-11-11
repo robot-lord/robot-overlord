@@ -1,4 +1,4 @@
-use crate::agents::claude::CursorState;
+use crate::agents::claude::{CursorState, STATS_PARSE_VERSION};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -566,12 +566,14 @@ impl Db {
 
     // ---- transcript read positions ----
 
-    pub fn transcript_cursors(&self) -> Result<Vec<(PathBuf, CursorState)>> {
+    /// The most recently saved positions (at most `limit`) of the current
+    /// parse version.
+    pub fn transcript_cursors(&self, limit: usize) -> Result<Vec<(PathBuf, CursorState)>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended \
-             FROM transcript_cursors",
+             FROM transcript_cursors WHERE version = ?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![STATS_PARSE_VERSION, limit as i64], |r| {
             Ok((
                 PathBuf::from(r.get::<_, String>(0)?),
                 CursorState {
@@ -588,7 +590,8 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Save moved positions (one transaction).
+    /// Save moved positions (one transaction). Re-saving moves a row to the
+    /// newest (rowid order is recency).
     pub fn save_transcript_cursors(&self, cursors: &[(PathBuf, CursorState)]) -> Result<()> {
         if cursors.is_empty() {
             return Ok(());
@@ -597,8 +600,9 @@ impl Db {
         for (p, c) in cursors {
             tx.execute(
                 "INSERT OR REPLACE INTO transcript_cursors \
-                   (path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   (path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
+                    version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     p.to_string_lossy(),
                     c.ino as i64,
@@ -607,7 +611,8 @@ impl Db {
                     c.output_tokens,
                     c.first,
                     c.last,
-                    c.ended as i64
+                    c.ended as i64,
+                    STATS_PARSE_VERSION
                 ],
             )?;
         }
@@ -615,14 +620,62 @@ impl Db {
         Ok(())
     }
 
-    /// Forget all read positions and sub-agent token totals, so everything
-    /// is recounted from the transcripts (`rlord reset --rescan`).
-    pub fn clear_transcript_cursors(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM transcript_cursors", [])?;
-        self.conn.execute(
-            "UPDATE subagents SET input_tokens = 0, output_tokens = 0",
-            [],
+    /// Startup upkeep: drop positions from older counting logic (their
+    /// sub-agents get recounted), for transcripts that are gone, and past
+    /// the newest `keep`. Returns how many rows went.
+    pub fn prune_transcript_cursors(&self, keep: usize) -> Result<usize> {
+        let rows: Vec<(String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, version FROM transcript_cursors")?;
+            let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            it.collect::<std::result::Result<_, _>>()?
+        };
+        let mut gone = 0;
+        for (path, version) in rows {
+            let exists = Path::new(&path).exists();
+            if version != STATS_PARSE_VERSION && exists {
+                self.recount_from(&path)?;
+            }
+            if version != STATS_PARSE_VERSION || !exists {
+                gone += self
+                    .conn
+                    .execute("DELETE FROM transcript_cursors WHERE path = ?1", [&path])?;
+            }
+        }
+        gone += self.conn.execute(
+            "DELETE FROM transcript_cursors WHERE rowid NOT IN \
+             (SELECT rowid FROM transcript_cursors ORDER BY rowid DESC LIMIT ?1)",
+            [keep as i64],
         )?;
+        Ok(gone)
+    }
+
+    /// Zero a sub-agent's token totals so the next read of its transcript
+    /// (from the start) sets them (the upsert keeps the larger value).
+    fn recount_from(&self, transcript: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE subagents SET input_tokens = 0, output_tokens = 0 WHERE transcript_path = ?1",
+            [transcript],
+        )?;
+        Ok(())
+    }
+
+    /// Forget all read positions, and zero token totals of sub-agents whose
+    /// transcript still exists, so they're recounted (`rlord reset
+    /// --rescan`). Totals of agents whose transcript is gone are kept.
+    pub fn clear_transcript_cursors(&self) -> Result<()> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT transcript_path FROM subagents WHERE transcript_path IS NOT NULL",
+            )?;
+            let it = stmt.query_map([], |r| r.get(0))?;
+            it.collect::<std::result::Result<_, _>>()?
+        };
+        for p in paths.iter().filter(|p| Path::new(p).exists()) {
+            self.recount_from(p)?;
+        }
+        self.conn.execute("DELETE FROM transcript_cursors", [])?;
         Ok(())
     }
 
@@ -1121,11 +1174,17 @@ mod tests {
         db.save_transcript_cursors(&[(PathBuf::from("/t/a.jsonl"), c.clone())])
             .unwrap();
         assert_eq!(
-            db.transcript_cursors().unwrap(),
-            vec![(PathBuf::from("/t/a.jsonl"), c)]
+            db.transcript_cursors(10).unwrap(),
+            vec![(PathBuf::from("/t/a.jsonl"), c.clone())]
         );
+        // Its file doesn't exist: pruned at startup.
+        assert_eq!(db.prune_transcript_cursors(10).unwrap(), 1);
+        assert!(db.transcript_cursors(10).unwrap().is_empty());
+        // --rescan keeps totals of agents whose transcript is gone.
+        db.save_transcript_cursors(&[(PathBuf::from("/t/b.jsonl"), c)])
+            .unwrap();
         db.clear_transcript_cursors().unwrap();
-        assert!(db.transcript_cursors().unwrap().is_empty());
+        assert!(db.transcript_cursors(10).unwrap().is_empty());
     }
 
     #[test]

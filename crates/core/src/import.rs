@@ -184,16 +184,15 @@ fn candidate(
         ));
     }
     let mut ex = claude::excerpts_from(&head, &tail);
-    // The first typed prompt can sit past the head window (big attachments)
-    // or be a slash command: fall back to the latest prompt or the title.
-    // Only a transcript with no exchange at all isn't a conversation.
-    if ex.first_prompt.is_none() {
-        ex.first_prompt = ex.last_prompt.clone().or_else(|| ex.title.clone());
+    // Something the user actually typed. The first prompt can sit past the
+    // head window (big attachments) or follow a slash command, so the latest
+    // one counts too; a session of only commands (/login, /exit) doesn't.
+    let typed = |p: &Option<String>| p.as_deref().is_some_and(|t| !t.starts_with('/'));
+    if !typed(&ex.first_prompt) && !typed(&ex.last_prompt) {
+        return Err("nothing typed in it (an empty start, or only slash commands)".into());
     }
-    // Something the user sent (not meta lines Claude adds itself).
-    let has_exchange = all().any(|v| v["type"] == "user" && v["isMeta"] != true);
-    if !has_exchange {
-        return Err("no exchange in the transcript (an empty or aborted start)".into());
+    if ex.first_prompt.is_none() {
+        ex.first_prompt = ex.last_prompt.clone();
     }
 
     let ts = |v: &Value| v["timestamp"].as_str().and_then(claude::parse_iso_ms);
@@ -256,47 +255,80 @@ fn candidate(
     })
 }
 
-/// The first `cwd` anywhere in the transcript whose slug is `slug`, read
-/// line by line (only when the head and tail windows didn't have one).
+/// The first `cwd` anywhere in the transcript whose slug is `slug` (only
+/// when the head and tail windows had none). Bounded (the first
+/// `CWD_SEARCH_MAX` bytes) and remembered per (file, size), so a transcript
+/// without one isn't re-read on every scan.
 fn cwd_anywhere(path: &Path, slug: &str) -> Option<String> {
-    use std::io::BufRead;
-    let f = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(f).lines() {
-        let line = line.ok()?;
-        if !line.contains("\"cwd\"") {
-            continue;
-        }
-        if let Some(c) = serde_json::from_str::<Value>(&line)
-            .ok()
-            .and_then(|v| v["cwd"].as_str().map(str::to_string))
-            .filter(|c| claude::project_slug(c) == slug)
-        {
-            return Some(c);
-        }
+    use std::io::{BufRead, Read};
+    type Seen = std::collections::HashMap<(PathBuf, u64), Option<String>>;
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> =
+        std::sync::LazyLock::new(Default::default);
+    let len = std::fs::metadata(path).ok()?.len();
+    let key = (path.to_path_buf(), len);
+    if let Some(hit) = SEEN.lock().ok()?.get(&key) {
+        return hit.clone();
     }
-    None
+    let f = std::fs::File::open(path).ok()?;
+    let found = std::io::BufReader::new(f.take(CWD_SEARCH_MAX))
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| l.contains("\"cwd\""))
+        .find_map(|l| {
+            serde_json::from_str::<Value>(&l)
+                .ok()
+                .and_then(|v| v["cwd"].as_str().map(str::to_string))
+                .filter(|c| claude::project_slug(c) == slug)
+        });
+    if let Ok(mut seen) = SEEN.lock() {
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        seen.insert(key, found.clone());
+    }
+    found
 }
+
+const CWD_SEARCH_MAX: u64 = 64 * 1024 * 1024;
 
 /// Why conversation `id` isn't importable (None: it is, or no transcript
 /// by that id exists). For error messages when an import by id fails.
 pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
     let projects = claude::config_dir().join("projects");
-    if tracked(id) {
-        return Some(
-            "rlord already tracks it (now or as an earlier conversation of a session)".into(),
-        );
-    }
+    // Every transcript whose id starts with `id` (a full id or a prefix).
+    let mut hits = Vec::new();
     for dir in std::fs::read_dir(&projects).ok()?.flatten() {
-        let path = dir.path().join(format!("{id}.jsonl"));
-        if path.is_file() {
-            let slug = dir.file_name().to_string_lossy().into_owned();
-            return candidate(&path, id, &slug, None, "", &excluded_dirs()).err();
+        for f in std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = f.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".jsonl").filter(|n| n.starts_with(id)) {
+                hits.push((f.path(), stem.to_string(), dir.file_name()));
+            }
         }
     }
-    Some(format!(
-        "no transcript named {id}.jsonl under {}",
-        projects.display()
-    ))
+    match hits.as_slice() {
+        [] => Some(format!(
+            "no transcript whose id starts with {id} under {}",
+            projects.display()
+        )),
+        [(path, full, slug)] => {
+            if tracked(full) {
+                return Some(
+                    "rlord already tracks it (now or as an earlier conversation of a session)"
+                        .into(),
+                );
+            }
+            let slug = slug.to_string_lossy();
+            candidate(path, full, &slug, None, "", &excluded_dirs()).err()
+        }
+        _ => Some(format!(
+            "{} conversations start with {id}; use more of the id",
+            hits.len()
+        )),
+    }
 }
 
 /// Fill in `repo`, `worktree` and `recreatable` (git subprocesses, so only
