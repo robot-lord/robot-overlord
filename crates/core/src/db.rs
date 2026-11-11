@@ -659,7 +659,31 @@ impl Db {
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
+        if status == Status::Stopped {
+            // A sub-agent can't outlive its session's agent process.
+            self.close_open_subagents(Some(id), ts)?;
+        }
         Ok(n > 0)
+    }
+
+    /// Mark sub-agents still open as finished, for one stopped session or
+    /// (None) every stopped session. Claude doesn't always record an agent's
+    /// end, and one can't keep running once its session has stopped.
+    pub fn close_open_subagents(&self, session: Option<&str>, ts: i64) -> Result<usize> {
+        let n = match session {
+            Some(id) => self.conn.execute(
+                "UPDATE subagents SET finished_at = MAX(COALESCE(started_at, 0), ?2) \
+                 WHERE finished_at IS NULL AND session_id = ?1",
+                params![id, ts],
+            )?,
+            None => self.conn.execute(
+                "UPDATE subagents SET finished_at = COALESCE(started_at, ?1) \
+                 WHERE finished_at IS NULL \
+                   AND session_id IN (SELECT id FROM sessions WHERE status = 'stopped')",
+                params![ts],
+            )?,
+        };
+        Ok(n)
     }
 
     pub fn set_agent_session(&self, id: &str, agent_session: &str, trust: &str) -> Result<()> {
@@ -953,6 +977,44 @@ mod tests {
         assert_eq!(db.group_order().unwrap(), ["work", "frontend"]);
         db.rename_tag("frontend", "work").unwrap(); // merge: keeps the first place
         assert_eq!(db.group_order().unwrap(), ["work"]);
+    }
+
+    #[test]
+    fn stopping_a_session_closes_its_open_subagents() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01a", "a");
+        db.set_status("01a", Status::Working, 1).unwrap();
+        let mut a = crate::types::Subagent {
+            agent_id: "ag1".into(),
+            session_id: "01a".into(),
+            agent_type: "Explore".into(),
+            description: String::new(),
+            tool_use_id: None,
+            spawn_depth: 1,
+            background: false,
+            started_at: Some(5),
+            finished_at: None,
+            transcript_path: None,
+            result: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        db.upsert_subagent(&a).unwrap();
+        a.agent_id = "ag2".into();
+        a.finished_at = Some(7);
+        db.upsert_subagent(&a).unwrap();
+        db.set_status("01a", Status::Stopped, 100).unwrap();
+        let got: Vec<Option<i64>> = db
+            .subagents("01a")
+            .unwrap()
+            .iter()
+            .map(|a| a.finished_at)
+            .collect();
+        assert!(
+            got.contains(&Some(100)) && got.contains(&Some(7)),
+            "{got:?}"
+        );
+        assert_eq!(db.close_open_subagents(None, 200).unwrap(), 0);
     }
 
     #[test]
