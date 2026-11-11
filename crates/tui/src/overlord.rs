@@ -10,22 +10,32 @@
 use super::*;
 use ratatui::widgets::Clear;
 
-/// First-run setup: everything defaulted, Enter launches.
+/// First-run setup: everything defaulted, Enter launches. Two rows: the
+/// overlord (front desk) and the mastermind, each with its model.
 pub(crate) struct Setup {
     agent: String,
     models: Vec<String>,
-    model_idx: usize,
+    /// Model index per row: [overlord, mastermind].
+    idx: [usize; 2],
+    /// Effort per row (from config; shown, set in config.toml).
+    effort: [String; 2],
+    /// Which row the arrows change.
+    row: usize,
     /// family → latest id, for the "→ resolves to" hint.
     catalog: Vec<(String, String)>,
     error: Option<String>,
 }
 
-/// An existing overlord on an old model.
+/// An existing overlord seat on an old model.
 pub(crate) struct Upgrade {
+    /// `overlord` or `mastermind`.
+    seat: String,
     note: String,
     /// Model to switch to; None when switching can't help (the agent CLI
     /// resolves the alias to an old model — it needs updating instead).
     suggest: Option<String>,
+    /// An offer of the seat's default model: esc means "don't ask again".
+    declinable: bool,
     error: Option<String>,
 }
 
@@ -71,34 +81,77 @@ impl App {
             return;
         };
         if st["exists"] != true {
-            let default = st["default_model"].as_str().unwrap_or("").to_string();
+            let front = st["default_model"].as_str().unwrap_or("").to_string();
+            let mind = st["mastermind"]["default_model"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let mut models: Vec<String> = self.config.session.models.clone();
-            if !default.is_empty() && !models.contains(&default) {
-                models.insert(0, default.clone());
+            for m in [&mind, &front] {
+                if !m.is_empty() && !models.contains(m) {
+                    models.insert(0, m.clone());
+                }
             }
-            let model_idx = models.iter().position(|m| *m == default).unwrap_or(0);
+            let at = |m: &str| models.iter().position(|x| x == m).unwrap_or(0);
+            let idx = [at(&front), at(&mind)];
             self.mode = Mode::OverlordSetup(Box::new(Setup {
                 agent: st["default_agent"].as_str().unwrap_or("claude").to_string(),
+                idx,
+                effort: [
+                    st["default_effort"].as_str().unwrap_or("").to_string(),
+                    st["mastermind"]["default_effort"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+                row: 0,
                 models,
-                model_idx,
                 catalog: catalog_of(&st),
                 error: None,
             }));
             return;
         }
-        let f = &st["freshness"];
-        if f["outdated"] == true {
-            let suggest = f["suggest"]
-                .as_str()
-                .filter(|s| Some(*s) != st["model"].as_str())
-                .map(str::to_string);
-            self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
-                note: f["note"].as_str().unwrap_or("outdated model").to_string(),
-                suggest,
-                error: None,
-            }));
-        } else if let Some(n) = f["note"].as_str() {
-            self.status_line = format!("overlord: {n}");
+        // Either seat on an old model, or on another model than its default:
+        // offer the switch (the overlord first).
+        for (seat, st) in [("overlord", &st), ("mastermind", &st["mastermind"])] {
+            let f = &st["freshness"];
+            if st["exists"] != true {
+                continue;
+            }
+            if let Some(d) = st["suggest_default"].as_str() {
+                self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
+                    seat: seat.into(),
+                    note: format!(
+                        "it runs {}; rlord's default for the {seat} is now {d}{}",
+                        st["model"].as_str().unwrap_or("?"),
+                        if seat == "overlord" {
+                            " (a fast front desk that hands deeper work to the mastermind)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    suggest: Some(d.to_string()),
+                    declinable: true,
+                    error: None,
+                }));
+                return;
+            }
+            if f["outdated"] == true {
+                let suggest = f["suggest"]
+                    .as_str()
+                    .filter(|s| Some(*s) != st["model"].as_str())
+                    .map(str::to_string);
+                self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
+                    seat: seat.into(),
+                    note: f["note"].as_str().unwrap_or("outdated model").to_string(),
+                    suggest,
+                    declinable: false,
+                    error: None,
+                }));
+                return;
+            } else if let Some(n) = f["note"].as_str() {
+                self.status_line = format!("{seat}: {n}");
+            }
         }
     }
 
@@ -111,11 +164,11 @@ impl App {
                 );
             }
             KeyCode::Enter => {
-                let model = s.models.get(s.model_idx).cloned().unwrap_or_default();
+                let model = |i: usize| s.models.get(s.idx[i]).cloned().unwrap_or_default();
                 match client_call(
                     &paths::socket_path(),
                     "overlord.ensure",
-                    json!({"agent": s.agent, "model": model}),
+                    json!({"agent": s.agent, "model": model(0), "mastermind_model": model(1)}),
                 ) {
                     Ok(_) => {
                         self.dirty = true;
@@ -127,15 +180,25 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab | KeyCode::Char('m') => {
+            // Rows: tab / j / k / ↑ / ↓. Model of the row: ← / → / h / l.
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('j' | 'k')
+            | KeyCode::Up
+            | KeyCode::Down => {
+                s.row = 1 - s.row;
+                self.mode = Mode::OverlordSetup(s);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
                 if !s.models.is_empty() {
-                    s.model_idx = (s.model_idx + 1) % s.models.len();
+                    s.idx[s.row] = (s.idx[s.row] + 1) % s.models.len();
                 }
                 self.mode = Mode::OverlordSetup(s);
             }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 if !s.models.is_empty() {
-                    s.model_idx = (s.model_idx + s.models.len() - 1) % s.models.len();
+                    let n = s.models.len();
+                    s.idx[s.row] = (s.idx[s.row] + n - 1) % n;
                 }
                 self.mode = Mode::OverlordSetup(s);
             }
@@ -145,26 +208,39 @@ impl App {
 
     pub(crate) fn handle_upgrade(&mut self, k: KeyEvent, mut u: Box<Upgrade>) {
         match k.code {
-            KeyCode::Esc => self.status_line = "overlord model left as is".into(),
+            KeyCode::Esc => {
+                if u.declinable {
+                    let _ = client_call(
+                        &paths::socket_path(),
+                        "overlord.decline_default",
+                        json!({"seat": u.seat, "model": u.suggest}),
+                    );
+                }
+                self.status_line = format!("{} model left as is", u.seat);
+            }
             KeyCode::Enter => {
                 let r = match &u.suggest {
                     Some(m) => client_call(
                         &paths::socket_path(),
                         "overlord.set_model",
-                        json!({"model": m}),
+                        json!({"model": m, "seat": u.seat}),
                     ),
-                    None => client_call(&paths::socket_path(), "overlord.ensure", json!({}))
-                        .and_then(|s| {
-                            client_call(
-                                &paths::socket_path(),
-                                "session.restart",
-                                json!({"ref": s["id"]}),
-                            )
-                        }),
+                    None => client_call(
+                        &paths::socket_path(),
+                        "overlord.ensure",
+                        json!({"seat": u.seat}),
+                    )
+                    .and_then(|s| {
+                        client_call(
+                            &paths::socket_path(),
+                            "session.restart",
+                            json!({"ref": s["id"]}),
+                        )
+                    }),
                 };
                 match r {
                     Ok(_) => {
-                        self.status_line = "overlord restarted (conversation resumed)".into();
+                        self.status_line = format!("{} restarted (conversation resumed)", u.seat);
                         self.dirty = true;
                     }
                     Err(e) => {
@@ -252,47 +328,97 @@ impl App {
     /// `rlord overlay`); the daemon starts it if needed. No overlord yet →
     /// the setup dialog.
     pub(crate) fn show_overlord(&mut self) {
+        self.show_seat("overlord");
+    }
+
+    /// Open an overlord seat (`overlord` / `mastermind`) over this terminal.
+    pub(crate) fn show_seat(&mut self, seat: &str) {
         let params = json!({
             "client": tmux::current_client(),
             "from": tmux::current_session(),
+            "seat": seat,
         });
         self.call("ui.overlord", params);
     }
 
     pub(crate) fn draw_setup(&self, f: &mut Frame, s: &Setup) {
-        let area = newform::centered(f.area(), 66, 13);
+        let area = newform::centered(f.area(), 78, 20);
         f.render_widget(Clear, area);
-        let model = s.models.get(s.model_idx).cloned().unwrap_or_default();
-        let resolves = s
-            .catalog
-            .iter()
-            .find(|(fam, _)| *fam == model)
-            .map(|(_, id)| format!("  → {id} (latest)"))
-            .unwrap_or_default();
+        let keys = |k: &str| tmux::key_label(k);
+        let row = |i: usize, name: &str, key: &str, why: [&str; 2]| -> Vec<Line<'static>> {
+            let model = s.models.get(s.idx[i]).cloned().unwrap_or_default();
+            let resolves = s
+                .catalog
+                .iter()
+                .find(|(fam, _)| *fam == model)
+                .map(|(_, id)| format!(" → {id}"))
+                .unwrap_or_default();
+            let focused = s.row == i;
+            let effort = if s.effort[i].is_empty() {
+                String::new()
+            } else {
+                format!("  · effort {}", s.effort[i])
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        if focused { "▌ " } else { "  " },
+                        Style::default().fg(theme::accent()),
+                    ),
+                    Span::styled(format!("{name:<12}"), Style::default().bold()),
+                    Span::styled(format!("{key:<4}"), theme::faint()),
+                    Span::styled(
+                        format!("◀ {model} ▶"),
+                        if focused {
+                            Style::default().bold().fg(theme::accent())
+                        } else {
+                            Style::default().fg(theme::text())
+                        },
+                    ),
+                    Span::styled(format!("{resolves}{effort}"), theme::faint()),
+                ]),
+                Line::from(Span::styled(format!("    {}", why[0]), theme::muted())),
+                Line::from(Span::styled(format!("    {}", why[1]), theme::muted())),
+                Line::from(""),
+            ]
+        };
         let mut lines = vec![
             Line::from(""),
-            Line::from("  The overlord is the session you talk to to run rlord:"),
-            Line::from("  launch sessions, search, jump around, set the list view."),
+            Line::from(Span::styled(
+                "  The overlord is how you run rlord. It's two sessions:",
+                Style::default().fg(theme::text()),
+            )),
             Line::from(""),
-            Line::from(vec![
-                Span::raw("  Tool   "),
-                Span::styled(s.agent.clone(), Style::default().bold()),
-            ]),
-            Line::from(vec![
-                Span::raw("  Model  "),
-                Span::styled(
-                    format!("◀ {model} ▶"),
-                    Style::default().bold().fg(theme::accent()),
-                ),
-                Span::styled(resolves, Style::default().fg(theme::faint_c())),
-            ]),
-            Line::from(""),
-            keys_line(&[
-                ("enter", "launch", Cap::Context),
-                ("j/k", "model", Cap::Global),
-                ("esc", "later", Cap::Global),
-            ]),
         ];
+        lines.extend(row(
+            0,
+            "◆ Overlord",
+            &keys(&self.config.tmux.overlord),
+            [
+                "Your quick front desk: finds, jumps, organizes, answers from",
+                "rlord. A fast model so it replies in seconds; it hands the rest on.",
+            ],
+        ));
+        lines.extend(row(
+            1,
+            "↳ Mastermind",
+            &keys(self.config.tmux.mastermind_switch()),
+            [
+                "Launches sessions and takes questions that need thought. A strong",
+                "model, where judgment pays; starts the first time it's needed.",
+            ],
+        ));
+        lines.push(Line::from(Span::styled(
+            "  Effort and the defaults live in config.toml under [overlord].",
+            theme::faint(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(keys_line(&[
+            ("enter", "launch", Cap::Context),
+            ("tab", "row", Cap::Global),
+            ("←/→", "model", Cap::Global),
+            ("esc", "later", Cap::Global),
+        ]));
         if let Some(e) = &s.error {
             lines.push(Line::from(Span::styled(
                 format!("  {e}"),
@@ -318,7 +444,11 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Your overlord is not on the latest model:",
+                if u.seat == "mastermind" {
+                    "  Your mastermind could be on a better model:"
+                } else {
+                    "  Your overlord could be on a better model:"
+                },
                 Style::default().bold(),
             )),
             Line::from(format!("  {}", u.note)),
@@ -335,7 +465,11 @@ impl App {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(theme::modal("◆ Overlord model")),
+                .block(theme::modal(if u.seat == "mastermind" {
+                    "◆ Mastermind model"
+                } else {
+                    "◆ Overlord model"
+                })),
             area,
         );
     }

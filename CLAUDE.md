@@ -7,13 +7,17 @@ main way users drive rlord, and it does most of the upkeep: tagging sessions
 into groups, writing descriptions and notes, organizing the list. It only
 knows what its instructions and tool descriptions tell it.
 
-Its built-in instructions are `crates/daemon/src/overlord.md`. They are
-compiled in and written to the overlord's folder as `CLAUDE.md`, `AGENTS.md`
+The overlord is two sessions: the **overlord** (quick front desk, fast
+model) and the **mastermind** (launches and questions that need thought,
+strong model). Their built-in instructions are
+`crates/daemon/src/overlord.md` and `crates/daemon/src/mastermind.md`. They
+are compiled in and written to each one's folder as `CLAUDE.md`, `AGENTS.md`
 and `GEMINI.md` on every start, with the user's
 `~/.config/robot-overlord/overlord.md` appended.
 
 When a change touches anything the overlord can see or do, update
-`overlord.md` in the same change:
+`overlord.md` and/or `mastermind.md` (whichever seat does it) in the same
+change:
 
 - **New or changed MCP tool** (`crates/daemon/src/mcp.rs`): describe what it's
   for and when to use it. A test fails if a tool isn't mentioned.

@@ -710,21 +710,31 @@ impl App {
             }
             Location::Auto => {}
         }
-        match client_call(&paths::socket_path(), "overlord.new_session", params) {
-            Ok(_) => {
-                self.status_line = if f.confirmed {
-                    "confirmed — the overlord is launching it".into()
-                } else {
-                    "sent to the overlord".into()
-                };
-                self.show_overlord();
-                Ok(None)
-            }
-            Err(e) => {
-                f.error = Some(format!("{e:#}"));
-                Ok(Some(f))
-            }
+        // Sent in the background: a first-time mastermind can take a while
+        // to start, and the list must not freeze meanwhile. Its overlay opens
+        // now, so the user watches it pick the request up.
+        // What can fail fast is checked here, so the form stays open with
+        // the error (no overlord set up yet).
+        let exists = self
+            .call("overlord.status", Value::Null)
+            .is_some_and(|st| st["exists"] == true);
+        if !exists {
+            f.error = Some(format!(
+                "no overlord yet: press {} to set it up (or N for the manual form)",
+                self.keys.label(Action::Overlord)
+            ));
+            return Ok(Some(f));
         }
+        std::thread::spawn(move || {
+            let _ = client_call(&paths::socket_path(), "overlord.new_session", params);
+        });
+        self.status_line = if f.confirmed {
+            "confirmed — the mastermind is launching it".into()
+        } else {
+            "sent to the mastermind".into()
+        };
+        self.show_seat("mastermind");
+        Ok(None)
     }
 
     fn submit_manual(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {

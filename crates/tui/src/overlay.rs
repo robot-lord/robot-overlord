@@ -23,15 +23,16 @@ use serde_json::json;
 use rlord_core::paths;
 use rlord_core::tmux;
 use rlord_daemon::client_call;
-use rlord_daemon::overlord::TMUX_NAME;
+use rlord_daemon::overlord::{self, Seat};
 
 /// Frame interval: how often the overlord's pane is re-captured.
 const FRAME_MS: u64 = 40;
 
 /// `token` identifies this overlay to the daemon (it was minted when the
 /// daemon opened the popup).
-pub fn run(token: Option<u64>) -> Result<()> {
-    let pane = tmux::pane_id(TMUX_NAME)?;
+pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
+    let seat = overlord::seat(seat);
+    let pane = tmux::pane_id(seat.tmux)?;
     let report = |open: bool| {
         let _ = client_call(
             &paths::socket_path(),
@@ -42,26 +43,34 @@ pub fn run(token: Option<u64>) -> Result<()> {
     report(true);
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
-    let r = run_loop(&mut terminal, &pane);
+    let keys = SeatKeys::from_config(&rlord_core::config::Config::load().unwrap_or_default());
+    let r = run_loop(&mut terminal, &pane, seat, &keys);
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     report(false);
     // The window follows clients again once nobody is embedding it.
-    let _ = tmux::auto_size_window(TMUX_NAME);
+    let _ = tmux::auto_size_window(seat.tmux);
     r
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str) -> Result<()> {
+fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    pane: &str,
+    seat: &Seat,
+    keys: &SeatKeys,
+) -> Result<()> {
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
     let mut error: Option<String> = None;
+    // An error worth reading (a failed seat switch) stays up a few seconds.
+    let mut hold_error_until = Instant::now();
     let mut last = Instant::now() - Duration::from_secs(1);
     loop {
         let area = terminal.size()?;
         if (area.width, area.height) != size && area.width > 0 && area.height > 0 {
             size = (area.width, area.height);
-            if let Err(e) = tmux::resize_window(TMUX_NAME, size.0, size.1) {
+            if let Err(e) = tmux::resize_window(seat.tmux, size.0, size.1) {
                 error = Some(format!("{e:#}"));
             }
             last = Instant::now() - Duration::from_secs(1);
@@ -72,7 +81,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str) -> Result<()> {
                 Ok(f) => {
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
                     cursor = f.cursor_visible.then_some((f.cursor_x, f.cursor_y));
-                    error = None;
+                    if Instant::now() >= hold_error_until {
+                        error = None;
+                    }
                 }
                 Err(e) => error = Some(format!("{e:#}")),
             }
@@ -97,8 +108,30 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str) -> Result<()> {
         }
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
-                if is_close(&k) {
-                    return Ok(());
+                match keys.seat_key(&k) {
+                    // This seat's key (or Option-D) closes the overlay.
+                    Some(s) if s == seat.key || s == "close" => return Ok(()),
+                    // The other seat's key switches to it (the daemon opens
+                    // its overlay in place of this one).
+                    Some(other) => {
+                        // Hand this seat's window its size back first: the
+                        // new overlay replaces (kills) this one.
+                        let _ = tmux::auto_size_window(seat.tmux);
+                        match client_call(
+                            &paths::socket_path(),
+                            "ui.overlord",
+                            json!({"seat": other, "show": true}),
+                        ) {
+                            Ok(_) => return Ok(()),
+                            // Stay, and say why the switch didn't happen.
+                            Err(e) => {
+                                error = Some(format!("couldn't switch to the {other}: {e:#}"));
+                                hold_error_until = Instant::now() + Duration::from_secs(4);
+                            }
+                        }
+                        continue;
+                    }
+                    None => {}
                 }
                 let r = match tmux_key(&k) {
                     Some(TmuxKey::Text(t)) => tmux::send_text(pane, &t),
@@ -122,8 +155,64 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str) -> Result<()> {
 }
 
 /// Option-O (the key that opened it) or Option-D (the "back" key) closes it.
-fn is_close(k: &KeyEvent) -> bool {
-    k.modifiers.contains(KeyModifiers::ALT) && matches!(k.code, KeyCode::Char('o' | 'd'))
+/// The overlay's own keys, from the configured tmux keys: the overlord's
+/// (Option-O), the mastermind's (Option-M) and back (Option-D, closes).
+/// Inside a popup, keys reach this program, not tmux's key table.
+struct SeatKeys {
+    overlord: Option<(bool, bool, char)>,
+    mastermind: Option<(bool, bool, char)>,
+    close: Option<(bool, bool, char)>,
+}
+
+/// A tmux key spec (`M-o`, `C-g`, `M-C-x`) as (alt, ctrl, char).
+fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
+    let (mut alt, mut ctrl, mut rest) = (false, false, spec.trim());
+    loop {
+        if let Some(r) = rest.strip_prefix("M-") {
+            alt = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("C-") {
+            ctrl = true;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    let mut chars = rest.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some((alt, ctrl, c))
+}
+
+impl SeatKeys {
+    fn from_config(cfg: &rlord_core::config::Config) -> Self {
+        // An empty or unreadable key falls back to the default.
+        let or = |k: &str, d: &str| parse_key(k).or_else(|| parse_key(d));
+        SeatKeys {
+            overlord: or(&cfg.tmux.overlord, "M-o"),
+            mastermind: or(cfg.tmux.mastermind_switch(), "M-m"),
+            close: or(&cfg.tmux.back, "M-d"),
+        }
+    }
+
+    fn seat_key(&self, k: &KeyEvent) -> Option<&'static str> {
+        let KeyCode::Char(c) = k.code else {
+            return None;
+        };
+        let got = (
+            k.modifiers.contains(KeyModifiers::ALT),
+            k.modifiers.contains(KeyModifiers::CONTROL),
+            c,
+        );
+        if self.overlord == Some(got) {
+            Some(overlord::FRONT.key)
+        } else if self.mastermind == Some(got) {
+            Some(overlord::MASTERMIND.key)
+        } else if self.close == Some(got) {
+            Some("close")
+        } else {
+            None
+        }
+    }
 }
 
 enum TmuxKey {
@@ -211,11 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn option_o_closes() {
-        assert!(is_close(&ev(KeyCode::Char('o'), KeyModifiers::ALT)));
-        assert!(is_close(&ev(KeyCode::Char('d'), KeyModifiers::ALT)));
-        assert!(!is_close(&ev(KeyCode::Char('d'), KeyModifiers::NONE)));
-        assert!(!is_close(&ev(KeyCode::Char('o'), KeyModifiers::NONE)));
-        assert!(!is_close(&ev(KeyCode::Esc, KeyModifiers::NONE)));
+    fn option_keys_pick_the_seat_or_close() {
+        let keys = SeatKeys::from_config(&rlord_core::config::Config::default());
+        let k = |c, m| keys.seat_key(&ev(KeyCode::Char(c), m));
+        assert_eq!(k('o', KeyModifiers::ALT), Some("overlord"));
+        assert_eq!(k('m', KeyModifiers::ALT), Some("mastermind"));
+        assert_eq!(k('d', KeyModifiers::ALT), Some("close"));
+        assert_eq!(k('o', KeyModifiers::NONE), None);
+        assert_eq!(keys.seat_key(&ev(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(parse_key("M-C-x"), Some((true, true, 'x')));
+        assert_eq!(parse_key("M-xy"), None);
     }
 }

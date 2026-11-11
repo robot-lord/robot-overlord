@@ -50,6 +50,10 @@ pub struct Keys {
     pub overlord: String,
     /// Switch between the sessions tab (flat list) and the groups tab.
     pub switch_tab: String,
+    /// Step left / right along sessions tab ⇄ group list ⇄ inside a group.
+    /// A user binding of the same key to another action wins.
+    pub sessions_tab: String,
+    pub groups_tab: String,
     /// Edit the selected session's tags (tags are the groups).
     pub tags: String,
     pub cancel: String,
@@ -81,6 +85,8 @@ impl Default for Keys {
             notes: "E".into(),
             overlord: "M-o".into(),
             switch_tab: "tab".into(),
+            sessions_tab: "H".into(),
+            groups_tab: "L".into(),
             tags: "#".into(),
             cancel: "esc".into(),
         }
@@ -101,6 +107,11 @@ pub struct TmuxKeys {
     /// From any pane: jump to rlord with the overlord overlay open; in rlord:
     /// toggle the overlay.
     pub overlord: String,
+    /// The same for the mastermind (the overlord's second, deeper session),
+    /// from any pane. Off by default (it would take the key from every agent
+    /// session); inside the overlord's overlay, `mastermind_switch()` always
+    /// flips between the two.
+    pub mastermind: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
@@ -114,12 +125,23 @@ impl Default for TmuxKeys {
             next: String::new(),
             prev: String::new(),
             overlord: "M-o".into(),
+            mastermind: String::new(),
             profile: true,
         }
     }
 }
 
 impl TmuxKeys {
+    /// The key that switches the overlay to the mastermind: the configured
+    /// global key, else `M-m` (inside the overlay only).
+    pub fn mastermind_switch(&self) -> &str {
+        if self.mastermind.trim().is_empty() {
+            "M-m"
+        } else {
+            &self.mastermind
+        }
+    }
+
     /// (key, nav verb) pairs for every enabled binding.
     pub fn bindings(&self) -> Vec<(&str, &'static str)> {
         [
@@ -127,6 +149,7 @@ impl TmuxKeys {
             (&self.next, "next"),
             (&self.prev, "prev"),
             (&self.overlord, "overlord"),
+            (&self.mastermind, "mastermind"),
         ]
         .into_iter()
         .filter(|(k, _)| !k.trim().is_empty())
@@ -142,8 +165,20 @@ impl TmuxKeys {
 pub struct OverlordConfig {
     /// Coding tool. Only `claude` today.
     pub agent: String,
-    /// Model for the overlord. Empty = the agent's own default.
+    /// Model for the overlord: the quick front desk you summon with ⌥O.
+    /// It does mechanical work itself and hands anything that needs thought
+    /// to the mastermind, so a fast model fits. Empty = the agent's default.
     pub model: String,
+    /// Its effort level (`low`..`max`; empty = the agent's default).
+    pub effort: String,
+    /// Model for the mastermind: the second overlord session that launches
+    /// sessions and takes one-off questions — where judgment pays.
+    pub mastermind_model: String,
+    pub mastermind_effort: String,
+    /// Restart an idle mastermind on a fresh conversation after this many
+    /// minutes without activity (while you're not looking at it), so its
+    /// context doesn't keep growing. 0 = never.
+    pub mastermind_fresh_after_mins: u64,
     /// Size of the overlord overlay in the TUI: `90%` of the screen, or a
     /// cell count.
     #[serde(alias = "popup_width")]
@@ -156,7 +191,11 @@ impl Default for OverlordConfig {
     fn default() -> Self {
         OverlordConfig {
             agent: "claude".into(),
-            model: "opus".into(),
+            model: "sonnet".into(),
+            effort: "low".into(),
+            mastermind_model: "opus".into(),
+            mastermind_effort: "medium".into(),
+            mastermind_fresh_after_mins: 15,
             width: "90%".into(),
             height: "85%".into(),
         }
@@ -312,9 +351,18 @@ repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
 # launch sessions, search, jump around, set the list's sort/filter. It gets
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
+# The overlord is two sessions. The overlord (Option-O) is a quick front
+# desk: it navigates, organizes and answers from rlord's tools itself, and
+# hands anything that needs thought to the mastermind (Option-M), which
+# launches sessions and takes one-off questions. Fast model up front, a
+# strong one behind.
 [overlord]
 agent = "claude"
-model = "opus"
+model = "sonnet"
+effort = "low"
+mastermind_model = "opus"
+mastermind_effort = "medium"
+mastermind_fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
 
@@ -344,6 +392,8 @@ describe = "D"          # edit the one-line description
 notes = "E"             # edit notes in $EDITOR
 overlord = "M-o"        # show/hide the overlord (same as Option-O everywhere)
 switch_tab = "tab"      # sessions tab (flat list) <-> groups tab (sessions by tag)
+sessions_tab = "H"      # step left:  sessions tab <- group list <- inside a group
+groups_tab = "L"        # step right: sessions tab -> group list -> inside a group
 tags = "#"              # edit the selected session's tags (tags are the groups)
 cancel = "esc"
 
@@ -356,7 +406,9 @@ cancel = "esc"
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
 next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
-overlord = "M-o" # from any pane: back to rlord with the overlord open
+overlord = "M-o" # from any pane: the overlord (quick front desk) over it
+mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
+                  # overlord's overlay, Option-M always switches to it)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 "##;
 
@@ -382,7 +434,12 @@ mod tests {
         assert_eq!(c.preview_refresh_ms, 500);
         assert!(c.session.workspace);
         assert_eq!(c.session.workspace_dir, ".worktrees");
-        assert_eq!(c.overlord.model, "opus");
+        assert_eq!(c.overlord.model, "sonnet");
+        assert_eq!(c.overlord.effort, "low");
+        assert_eq!(c.overlord.mastermind_model, "opus");
+        assert_eq!(c.overlord.mastermind_effort, "medium");
+        assert_eq!(c.tmux.mastermind, "");
+        assert_eq!(c.tmux.mastermind_switch(), "M-m");
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
     }
@@ -395,7 +452,7 @@ mod tests {
         assert_eq!(c.layout, Layout::Stack);
         assert_eq!(c.keys.quit, "Q");
         assert_eq!(c.keys.attach, "enter");
-        // back disabled, next/prev off by default; only the overlord key remains
+        // back disabled, next/prev/mastermind off by default; the overlord remains
         assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
     }
 }

@@ -245,6 +245,9 @@ enum Command {
     Overlay {
         #[arg(long)]
         token: Option<u64>,
+        /// Which overlord seat to show: overlord (default) or mastermind
+        #[arg(long, default_value = "overlord")]
+        seat: String,
     },
 }
 
@@ -307,6 +310,8 @@ enum NavCmd {
     Prev,
     /// Toggle the overlord overlay (Option-O)
     Overlord,
+    /// Toggle the mastermind overlay (Option-M)
+    Mastermind,
 }
 
 #[derive(Subcommand)]
@@ -415,8 +420,14 @@ fn main() -> Result<()> {
         Command::Nav(NavCmd::Home) => nav_home(),
         Command::Nav(NavCmd::Next) => nav_step(1),
         Command::Nav(NavCmd::Prev) => nav_step(-1),
+        Command::Nav(NavCmd::Mastermind) => {
+            if let Err(e) = nav_overlord("mastermind") {
+                let _ = tmux::display_message(&format!("rlord: {e:#}"));
+            }
+            Ok(())
+        }
         Command::Nav(NavCmd::Overlord) => {
-            if let Err(e) = nav_overlord() {
+            if let Err(e) = nav_overlord("overlord") {
                 let _ = tmux::display_message(&format!("rlord: {e:#}"));
             }
             Ok(())
@@ -424,10 +435,10 @@ fn main() -> Result<()> {
         Command::Mcp => mcp_stdio(),
         Command::Update { tag, force } => update(tag, force),
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
-        Command::Overlay { token } => rlord_tui::run_overlay(token),
+        Command::Overlay { token, seat } => rlord_tui::run_overlay(token, &seat),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
-                nav_overlord()
+                nav_overlord("overlord")
             } else {
                 // Not in tmux: the overlay needs a tmux terminal to pop up
                 // over, so start (or rejoin) rlord there first.
@@ -1117,6 +1128,10 @@ fn run_daemon() -> Result<()> {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
         let daemon = Daemon::new(db, Config::load()?);
         daemon.startup()?;
+        // Load every live session's sub-agent data in the background.
+        rlord_daemon::warm::start(&daemon);
+        // Restart an idle mastermind on a fresh conversation (context hygiene).
+        rlord_daemon::overlord::start_fresh_keeper(&daemon);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;
@@ -1179,15 +1194,18 @@ fn nav_home() -> Result<()> {
 
 /// `nav overlord` (Option-O): in the TUI, toggle the overlord overlay;
 /// anywhere else, bring the user to the TUI with it open.
-fn nav_overlord() -> Result<()> {
+/// Option-O / Option-M: show that overlord seat over this terminal.
+fn nav_overlord(seat: &str) -> Result<()> {
     // Say where the key was pressed (run-shell runs in that client's
     // context), rather than making the daemon guess which terminal it was.
     let r = call(
         "ui.overlord",
-        json!({"client": tmux::current_client(), "from": tmux::current_session()}),
+        json!({"client": tmux::current_client(), "from": tmux::current_session(), "seat": seat}),
     )?;
     if r["overlord"] == "already here" {
-        let _ = tmux::display_message("you're in the overlord · ⌥D: back to the list");
+        let back = Config::load().map(|c| c.tmux.back).unwrap_or_default();
+        let back = tmux::key_label(if back.trim().is_empty() { "M-d" } else { &back });
+        let _ = tmux::display_message(&format!("you're in the {seat} · {back}: back to the list"));
     }
     Ok(())
 }

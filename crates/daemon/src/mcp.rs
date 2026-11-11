@@ -88,6 +88,12 @@ pub fn tools() -> Value {
         tool("get_session_defaults",
             "The defaults new sessions get (agent, model, model choices, workspace, default repo).",
             json!({}), &[]),
+        tool("hand_off",
+            "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
+            json!({
+                "request": s("The user's words, verbatim"),
+                "context": s("What the mastermind needs from your conversation (it sees none of it): earlier messages, sessions mentioned, what you already found"),
+            }), &["request"]),
         tool("propose_session",
             "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
             new_session_props, &[]),
@@ -267,6 +273,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let id = s["id"].clone();
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
+            // Right after rlord starts, sub-agent data may still be loading.
+            if d.warm.is_loading(id.as_str().unwrap_or("")) {
+                s["subagents_loading"] = json!(true);
+            }
             Ok(s)
         }
         "read_screen" => {
@@ -324,6 +334,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(json!({"repos": repos}))
         }
         "get_session_defaults" => d.rpc("session.defaults", json!({})),
+        "hand_off" => d.rpc(
+            "overlord.hand_off",
+            json!({"request": arg_str(args, "request").context("missing 'request'")?,
+                   "context": arg_str(args, "context").unwrap_or("")}),
+        ),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),
         "confirm_new_session" => {
             let mut p = Map::new();
@@ -495,7 +510,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 other => bail!("unknown action {other:?}"),
             };
             let s = d.rpc("session.get", json!({"ref": r}))?;
-            if s["role"] == "overlord" && method != "session.restart" {
+            if crate::overlord::is_overlord_role(s["role"].as_str().unwrap_or(""))
+                && method != "session.restart"
+            {
                 bail!("the overlord can't stop or archive itself");
             }
             d.rpc(method, json!({"ref": s["id"]}))

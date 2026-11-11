@@ -28,7 +28,9 @@ EOF
   exit 1
 fi
 
-lock_ver=$(git show "$rev:Cargo.lock" | awk '/^name = "rlord"$/{getline; gsub(/version = |"/, ""); print; exit}')
+# awk reads to the end (no early `exit`): stopping early SIGPIPEs `git show`,
+# which `pipefail` turns into a failure (exit 141) once Cargo.lock is large.
+lock_ver=$(git show "$rev:Cargo.lock" | awk '/^name = "rlord"$/ && !done {getline; gsub(/version = |"/, ""); print; done=1}')
 if [[ "$lock_ver" != "$new_ver" ]]; then
   echo "version-bump: Cargo.lock has rlord $lock_ver, Cargo.toml has $new_ver — run cargo build and commit Cargo.lock" >&2
   exit 1

@@ -8,6 +8,7 @@ pub mod profile;
 pub mod rpc;
 pub mod triage;
 pub mod ui;
+pub mod warm;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,13 @@ pub struct Daemon {
     /// clear its successor).
     pub(crate) overlay: Mutex<Option<(String, u64)>>,
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
+    /// Which overlord seat the open overlay shows (`overlord`/`mastermind`).
+    pub(crate) overlay_seat: Mutex<&'static str>,
+    /// Held while text is pasted into the mastermind, and while an idle one
+    /// is restarted fresh: the two must not overlap.
+    pub(crate) mastermind_send: Mutex<()>,
+    /// Background loading of sessions' sub-agent data (see warm.rs).
+    pub(crate) warm: warm::Warm,
 }
 
 impl Daemon {
@@ -60,6 +68,9 @@ impl Daemon {
             tui_subscribers: AtomicUsize::new(0),
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
+            overlay_seat: Mutex::new(overlord::FRONT.key),
+            mastermind_send: Mutex::new(()),
+            warm: Default::default(),
         })
     }
 
@@ -285,7 +296,6 @@ impl Daemon {
                 | "session.log"
                 | "repo.list"
                 | "repo.find"
-                | "session.subagents"
                 | "session.defaults"
                 | "tag.list"
         ) && !(method == "tag.order" && params.get("order").is_none());
@@ -315,7 +325,6 @@ impl Daemon {
             "session.notes" => methods::session_notes(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
-            "session.subagents" => methods::session_subagents(&db, &params),
             "hook.emit" => {
                 let r = methods::hook_emit(&db, &params);
                 methods::save_cursors(&db);
@@ -324,6 +333,23 @@ impl Daemon {
             _ => return Err(MethodError::NotFound),
         };
         drop(db);
+        // Rows the warm-up hasn't loaded yet say so (the list shows it).
+        let r = match (method, r) {
+            ("session.list", Ok(Value::Array(mut rows))) => {
+                let loading = self.warm.loading();
+                for row in &mut rows {
+                    let id = row["id"].as_str().unwrap_or("");
+                    row["loading"] = json!(loading.contains(id));
+                }
+                Ok(Value::Array(rows))
+            }
+            (_, r) => r,
+        };
+        if method == "session.unarchive" && r.is_ok() {
+            if let Some(id) = params["ref"].as_str() {
+                warm::enqueue_ref(self, id);
+            }
+        }
         if mutating && r.is_ok() {
             self.changed();
             if method == "session.new" {
@@ -350,22 +376,39 @@ impl Daemon {
         let r = match method {
             "overlord.ensure" => {
                 let r = overlord::ensure(&self.db(), &self.config, params);
-                if let Ok(v) = &r {
+                // (ensure syncs the seat's tmux keys itself.)
+                if r.is_ok() {
                     self.changed();
                     self.bind_nav_keys();
-                    // A (re)started overlord is a fresh tmux session: give it
-                    // the user's keys again.
-                    if let Some(id) = v["id"].as_str() {
-                        profile::sync_ref(self, id);
-                    }
                 }
                 r
             }
-            "overlord.get" => self
-                .db()
-                .overlord()
+            // `seat: "all"`: both seats' sessions (those that exist), in order.
+            "overlord.get" if params["seat"] == "all" => {
+                let db = self.db();
+                overlord::SEATS
+                    .iter()
+                    .map(|seat| seat.session(&db))
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|v| {
+                        Ok(serde_json::to_value(
+                            v.into_iter().flatten().collect::<Vec<_>>(),
+                        )?)
+                    })
+            }
+            "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
+                .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
+            // Don't offer this seat's default model again (the user said no).
+            "overlord.decline_default" => {
+                let seat = overlord::seat(params["seat"].as_str().unwrap_or("overlord"));
+                let m = params["model"].as_str().unwrap_or("");
+                self.db()
+                    .kv_set(&format!("default_declined:{}", seat.key), m)
+                    .map(|_| json!({"declined": m}))
+            }
+            "session.subagents" => warm::session_subagents(self, params),
             "overlord.style" => {
                 overlord::style(&self.config);
                 Ok(json!({"styled": true}))
@@ -373,12 +416,17 @@ impl Daemon {
             "session.import_scan" => import::scan(self, params),
             "session.import" => {
                 let r = import::import(self, params);
-                if r.is_ok() {
+                if let Ok(v) = &r {
                     self.changed();
+                    // Imported with history: load it in the background.
+                    if let Some(id) = v["id"].as_str() {
+                        warm::enqueue_ref(self, id);
+                    }
                 }
                 r
             }
             "overlord.ask" => ask::ask(self, params),
+            "overlord.hand_off" => ask::hand_off(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
@@ -429,6 +477,20 @@ impl Daemon {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 tracing::info!(tool = name, caller = ?params.get("caller"), "mcp tool call");
+                // The mastermind does the work handed to it; it can't hand
+                // off to itself.
+                if name == "hand_off" {
+                    let caller = params["caller"].as_str().unwrap_or("");
+                    let is_mastermind = self
+                        .db()
+                        .resolve_ref(caller)
+                        .is_ok_and(|s| s.role == overlord::MASTERMIND.key);
+                    if is_mastermind {
+                        return Some(Err(anyhow::anyhow!(
+                            "you are the mastermind: do it yourself (hand_off is the overlord's)"
+                        )));
+                    }
+                }
                 mcp::call(self, name, &args)
             }
             _ => return None,
