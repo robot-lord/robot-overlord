@@ -154,10 +154,19 @@ struct App {
     status_line: String,
     dirty: bool,
     last_preview: Instant,
-    /// The system's appearance last time we looked (theme families follow
-    /// it), and when that was.
+    /// The highlight moved: refresh the preview once keys pause (moving
+    /// itself must never wait on tmux or the daemon).
+    preview_due: Option<Instant>,
+    /// Which session the preview and sub-agents were loaded for: while the
+    /// highlight moves they belong to another row and aren't shown.
+    preview_for: Option<String>,
+    /// The appearance watcher thread is running.
+    watching_appearance: bool,
+    /// The system's appearance as last applied (theme families follow it).
     dark: bool,
-    last_appearance: Instant,
+    /// Latest appearance from the watcher thread (asking macOS spawns a
+    /// process, which the draw loop must never wait on).
+    system_dark: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether row 0 is the overlord (shown first when not filtering).
     overlord_row: bool,
     /// Session to select once the next refresh lands (set by the overlord).
@@ -193,8 +202,11 @@ impl App {
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
+            preview_due: None,
+            preview_for: None,
+            watching_appearance: false,
             dark: true,
-            last_appearance: Instant::now(),
+            system_dark: Default::default(),
             overlord_row: false,
             pending_select: None,
             reported_view: Value::Null,
@@ -322,8 +334,16 @@ impl App {
             .map(str::to_string)
     }
 
+    /// The highlight moved: redraw now, load its preview and details when
+    /// the keys pause.
+    pub(crate) fn preview_soon(&mut self) {
+        self.preview_due = Some(Instant::now() + PREVIEW_SETTLE);
+    }
+
     fn refresh_preview(&mut self) {
         self.last_preview = Instant::now();
+        self.preview_due = None;
+        self.preview_for = self.selected_id();
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
@@ -414,14 +434,19 @@ impl App {
             self.follow_appearance();
             if self.dirty {
                 self.refresh();
-            } else if self.last_preview.elapsed()
-                > Duration::from_millis(self.config.preview_refresh_ms)
+            } else if self.preview_due.is_some_and(|t| Instant::now() >= t)
+                || (self.preview_due.is_none()
+                    && self.last_preview.elapsed()
+                        > Duration::from_millis(self.config.preview_refresh_ms))
             {
                 self.refresh_preview();
             }
             terminal.draw(|f| self.draw(f))?;
 
-            let tick = Duration::from_millis(self.config.preview_refresh_ms.clamp(50, 250));
+            let mut tick = Duration::from_millis(self.config.preview_refresh_ms.clamp(50, 250));
+            if let Some(due) = self.preview_due {
+                tick = tick.min(due.saturating_duration_since(Instant::now()));
+            }
             if event::poll(tick)? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind != KeyEventKind::Press {
@@ -521,26 +546,26 @@ impl App {
                 if n > 0 {
                     let i = self.table.selected().unwrap_or(0);
                     self.table.select(Some((i + 1).min(n - 1)));
-                    self.refresh_preview();
+                    self.preview_soon();
                 }
             }
             Action::Up => {
                 if n > 0 {
                     let i = self.table.selected().unwrap_or(0);
                     self.table.select(Some(i.saturating_sub(1)));
-                    self.refresh_preview();
+                    self.preview_soon();
                 }
             }
             Action::Top => {
                 if n > 0 {
                     self.table.select(Some(0));
-                    self.refresh_preview();
+                    self.preview_soon();
                 }
             }
             Action::Bottom => {
                 if n > 0 {
                     self.table.select(Some(n - 1));
-                    self.refresh_preview();
+                    self.preview_soon();
                 }
             }
             Action::Attach => self.attach(terminal)?,
@@ -685,7 +710,7 @@ impl App {
                         i.saturating_sub(1)
                     };
                     self.table.select(Some(j));
-                    self.refresh_preview();
+                    self.preview_soon();
                 }
                 self.mode = kind.mode(buf);
             }
@@ -920,22 +945,29 @@ impl App {
 
     /// Pick the palette for config `theme` and the system's appearance.
     fn apply_theme(&mut self) {
+        use std::sync::atomic::Ordering;
         self.dark = rlord_core::themes::system_is_dark();
-        self.last_appearance = Instant::now();
+        self.system_dark.store(self.dark, Ordering::Relaxed);
         theme::set(rlord_core::themes::resolve(&self.config.theme, self.dark));
+        // Theme families follow the system: a thread re-checks every few
+        // seconds; the loop just reads what it found.
+        if rlord_core::themes::follows_system(&self.config.theme) && !self.watching_appearance {
+            self.watching_appearance = true;
+            let flag = self.system_dark.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(3));
+                flag.store(rlord_core::themes::system_is_dark(), Ordering::Relaxed);
+            });
+        }
     }
 
-    /// Theme families follow the system's light/dark mode: check every few
-    /// seconds, switch when it flips (and recolor the overlord's bar).
+    /// Switch palettes when the system's appearance flipped (and recolor the
+    /// overlord's bar).
     fn follow_appearance(&mut self) {
-        if !rlord_core::themes::follows_system(&self.config.theme)
-            || self.last_appearance.elapsed() < Duration::from_secs(3)
-        {
-            return;
-        }
-        let was = self.dark;
-        self.apply_theme();
-        if self.dark != was {
+        let now = self.system_dark.load(std::sync::atomic::Ordering::Relaxed);
+        if now != self.dark {
+            self.dark = now;
+            theme::set(rlord_core::themes::resolve(&self.config.theme, now));
             let _ = self.call("overlord.style", Value::Null);
         }
     }
@@ -1132,7 +1164,11 @@ impl App {
             Line::from(Span::styled(format!(" {log} {other} "), theme::faint())).right_aligned();
         // Show the tail that fits: the bottom of a pane is what matters.
         let inner_h = area.height.saturating_sub(2) as usize;
+        // Loaded for another row (the highlight is moving): show nothing
+        // rather than the wrong session's screen.
+        let current = self.preview_for == self.selected_id();
         let text: Text = match &self.preview_rich {
+            _ if !current => Text::from(Span::styled("…", theme::faint())),
             Some(rich) if self.preview == Preview::Pane => {
                 let start = rich.lines.len().saturating_sub(inner_h);
                 Text::from(rich.lines[start..].to_vec())
@@ -1255,7 +1291,7 @@ impl App {
                 ),
             ]),
         ];
-        if !self.agents.is_empty() {
+        if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
                 .agents
                 .iter()
@@ -1484,6 +1520,9 @@ fn updated_at(s: &Value) -> Option<i64> {
     .filter_map(|k| s[*k].as_i64())
     .max()
 }
+
+/// How long the highlight must rest before its preview loads.
+const PREVIEW_SETTLE: Duration = Duration::from_millis(80);
 
 /// A dialog's row of key hints, indented to match its text.
 fn keys_line(items: &[(&str, &str, Cap)]) -> Line<'static> {

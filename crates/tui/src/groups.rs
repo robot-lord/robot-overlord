@@ -192,7 +192,7 @@ impl App {
         } else {
             Some(0)
         });
-        self.refresh_preview();
+        self.preview_soon();
     }
 
     /// Keys that mean something different on the groups tab. Returns true

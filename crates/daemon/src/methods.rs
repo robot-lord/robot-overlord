@@ -704,7 +704,8 @@ fn ingest_subagent_hook(
     let source = db.transcript_source(session_id)?;
     let from_disk = source
         .as_deref()
-        .map(|src| claude::scan_subagents(session_id, src))
+        // Only this hook's agent, not every sub-agent of the session.
+        .map(|src| claude::scan_subagents_where(session_id, src, &|id| id == agent_id))
         .unwrap_or_default()
         .into_iter()
         .find(|a| a.agent_id == agent_id);
@@ -763,12 +764,31 @@ fn ingest_subagent_hook(
 /// hooks existed, or missed events), then return the merged rows.
 pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let mut known = db.subagents(&s.id)?;
     if let Some(src) = db.transcript_source(&s.id)? {
+        // Cheap per call: transcript stats are incremental (only appended
+        // bytes are read). Every agent is checked, finished or not (a
+        // finished one may still be resumed or get its last lines flushed),
+        // but the DB is only written when something changed.
+        let mut changed = false;
         for a in claude::scan_subagents(&s.id, &src) {
-            db.upsert_subagent(&a)?;
+            let same = known.iter().any(|k| {
+                k.agent_id == a.agent_id
+                    && k.input_tokens >= a.input_tokens
+                    && k.output_tokens >= a.output_tokens
+                    && k.started_at == a.started_at
+                    && (a.finished_at.is_none() || k.finished_at.is_some())
+            });
+            if !same {
+                db.upsert_subagent(&a)?;
+                changed = true;
+            }
+        }
+        if changed {
+            known = db.subagents(&s.id)?;
         }
     }
-    Ok(serde_json::to_value(db.subagents(&s.id)?)?)
+    Ok(serde_json::to_value(known)?)
 }
 
 /// Startup reconcile: sessions marked running whose tmux is gone are stopped
