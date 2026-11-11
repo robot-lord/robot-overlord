@@ -495,6 +495,21 @@ them.
   The overlord delegates tidy passes to the `rlord-tidy` subagent
   (`daemon/src/tidy.md`, written to `<data>/overlord/.claude/agents/`), which
   runs in the background with its own context and a narrow tool list.
+- **Import** (`core/src/import.rs`, `daemon/src/import.rs`): finds agent
+  conversations rlord doesn't track, from the agents' own transcripts (Claude:
+  `~/.claude/projects/<cwd slug>/<uuid>.jsonl`), with no AI and nothing
+  specific to the tool that started them. `session.import_scan` pre-filters
+  by file mtime, then measures activity by the last user/assistant message
+  timestamp. The cwd must slugify to the transcript's folder, or
+  `claude --resume` couldn't find it. It skips rlord's own folders, temp dirs,
+  headless (`sdk-*`) runs, and conversations with no typed prompt.
+  `session.import` adds a stopped row with trust `hook` (the id is the
+  transcript's file name, so restarts resume it) and no tmux name until it
+  first runs. It can recreate a removed worktree from its branch, or import
+  as archived. A conversation id on a running process's command line, or a
+  transcript written in the last 10 minutes, is flagged "maybe open
+  elsewhere". The overlord's `rlord-import` subagent (`daemon/src/import.md`)
+  proposes what to import and imports what the user approves.
 - **MCP**: `rlord mcp` is a hand-rolled stdio JSON-RPC shim that speaks the
   protocol and forwards `tools/list` / `tools/call` to the daemon methods
   `mcp.tools` / `mcp.call`. Tools are defined in `daemon/src/mcp.rs` as thin,

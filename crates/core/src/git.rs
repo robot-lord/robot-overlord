@@ -35,10 +35,12 @@ pub fn repo_root(path: &str) -> Option<String> {
 /// primary checkout so all session worktrees nest under one `.worktrees/`.
 pub fn main_repo_root(path: &str) -> Option<String> {
     let common = git(&["-C", path, "rev-parse", "--git-common-dir"]).ok()?;
+    // A relative answer is relative to the folder we asked from (`-C`),
+    // not the top level: from a subfolder it is e.g. `../.git`.
     let common = if Path::new(&common).is_absolute() {
         PathBuf::from(common)
     } else {
-        PathBuf::from(repo_root(path)?).join(common)
+        PathBuf::from(path).join(common)
     };
     let root = common.parent()?.to_path_buf();
     std::fs::canonicalize(root)
@@ -95,7 +97,17 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let dir_s = dir.to_string_lossy();
-    let exists = git(&[
+    if branch_exists(repo, branch) {
+        git(&["-C", repo, "worktree", "add", &dir_s, branch])?;
+    } else {
+        git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?;
+    }
+    Ok(())
+}
+
+/// Whether `repo` has a local branch named `branch`.
+pub fn branch_exists(repo: &str, branch: &str) -> bool {
+    git(&[
         "-C",
         repo,
         "rev-parse",
@@ -103,13 +115,16 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
         "--quiet",
         &format!("refs/heads/{branch}"),
     ])
-    .is_ok();
-    if exists {
-        git(&["-C", repo, "worktree", "add", &dir_s, branch])?;
-    } else {
-        git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?;
-    }
-    Ok(())
+    .is_ok()
+}
+
+/// Whether some checkout of `repo` (the main one or a worktree) has
+/// `branch` checked out; `git worktree add` refuses a second one.
+pub fn branch_checked_out(repo: &str, branch: &str) -> bool {
+    let want = format!("branch refs/heads/{branch}");
+    git(&["-C", repo, "worktree", "list", "--porcelain"])
+        .map(|out| out.lines().any(|l| l == want))
+        .unwrap_or(false)
 }
 
 /// Keep the workspace dir out of `git status` without touching the tracked

@@ -166,6 +166,33 @@ enum Command {
         #[arg(long, short = 'n', default_value = "50")]
         limit: i64,
     },
+    /// Import agent conversations started outside rlord (found in the
+    /// agents' own files). With no IDs, list what could be imported; with
+    /// IDs (or unique prefixes), import them as stopped sessions that resume
+    /// them. To have the overlord pick, name and group them, ask it to
+    /// "import my existing sessions".
+    Import {
+        /// Conversation ids (or unique prefixes) to import
+        ids: Vec<String>,
+        /// Only list conversations active within this window (30d, 2w, 12h)
+        #[arg(long, default_value = "30d")]
+        since: String,
+        /// Max conversations to list
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+        /// Session name (importing a single conversation)
+        #[arg(long)]
+        name: Option<String>,
+        /// Import as archived (history only)
+        #[arg(long)]
+        archive: bool,
+        /// Recreate a removed worktree in its old place (its branch must exist)
+        #[arg(long)]
+        recreate_worktree: bool,
+        /// Raw JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Configuration file management
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -184,6 +211,15 @@ enum Command {
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
+    /// Install the latest release from GitHub (needs `gh` logged in; no
+    /// compiling). Same as scripts/update.sh.
+    Update {
+        /// Release tag to install, e.g. v0.4.0 (default: latest)
+        tag: Option<String>,
+        /// Reinstall even if already on that version; replace a dev symlink
+        #[arg(long)]
+        force: bool,
+    },
     /// Unstick rlord: restart the daemon, close overlays, resync session
     /// state, reload rlord's tmux config and key bindings, restart the list.
     /// Agent sessions keep running.
@@ -328,6 +364,15 @@ fn main() -> Result<()> {
             println!("wrote {}", path.display());
             Ok(())
         }
+        Command::Import {
+            ids,
+            since,
+            limit,
+            name,
+            archive,
+            recreate_worktree,
+            json,
+        } => import_cmd(ids, &since, limit, name, archive, recreate_worktree, json),
         Command::Config(ConfigCmd::Path) => {
             println!("{}", paths::config_path().display());
             Ok(())
@@ -372,6 +417,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Mcp => mcp_stdio(),
+        Command::Update { tag, force } => update(tag, force),
         Command::Reset { hard, yes } => reset(hard, yes),
         Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Overlord(OverlordCmd::Open) => {
@@ -832,6 +878,177 @@ fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
 
 /// RPC to the daemon, starting it (or replacing an older-version one) on the
 /// first call of this process.
+/// `30d` / `2w` / `12h` / `45` (days) to hours.
+fn parse_since_hours(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("bad --since '{s}' (try 30d, 2w, 12h)"))?;
+    Ok(match unit {
+        "h" => n,
+        "" | "d" => n * 24,
+        "w" => n * 24 * 7,
+        _ => anyhow::bail!("bad --since '{s}' (try 30d, 2w, 12h)"),
+    })
+}
+
+fn import_cmd(
+    ids: Vec<String>,
+    since: &str,
+    limit: u64,
+    name: Option<String>,
+    archive: bool,
+    recreate_worktree: bool,
+    json_out: bool,
+) -> Result<()> {
+    if ids.is_empty() {
+        let r = call(
+            "session.import_scan",
+            json!({"since_hours": parse_since_hours(since)?, "limit": limit}),
+        )?;
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(&r["candidates"])?);
+            return Ok(());
+        }
+        let list = r["candidates"].as_array().cloned().unwrap_or_default();
+        if list.is_empty() {
+            println!("nothing to import: no untracked conversations active in the last {since}");
+            return Ok(());
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        for c in &list {
+            let dir = c["cwd"].as_str().unwrap_or("");
+            let dir = match dir.strip_prefix(&home) {
+                Some(rest) if !home.is_empty() => format!("~{rest}"),
+                _ => dir.to_string(),
+            };
+            let what = c["title"]
+                .as_str()
+                .or(c["first_prompt"].as_str())
+                .unwrap_or("");
+            let mut flags = Vec::new();
+            if c["dir_exists"] == false {
+                flags.push(if c["recreatable"] == true {
+                    "folder gone, recreatable"
+                } else {
+                    "folder gone"
+                });
+            }
+            if c["open_elsewhere"] == true || c["recently_written"] == true {
+                flags.push("maybe open elsewhere");
+            }
+            let flags = if flags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", flags.join(", "))
+            };
+            println!(
+                "{}  {:>9}  {}{}\n          {}",
+                &c["agent_session"].as_str().unwrap_or("")[..8],
+                rel_age(c["last_active_at"].as_i64()),
+                dir,
+                flags,
+                claude::clip(what, 100),
+            );
+        }
+        println!(
+            "\n{} conversation(s). Import with `rlord import <id>...`, or ask the overlord to pick and organize them.",
+            list.len()
+        );
+        return Ok(());
+    }
+    if name.is_some() && ids.len() > 1 {
+        anyhow::bail!("--name needs a single conversation id");
+    }
+    let mut failed = 0;
+    for id in &ids {
+        let full = resolve_conversation(id)?;
+        let mut p = json!({"agent_session": full, "archive": archive,
+                           "recreate_worktree": recreate_worktree});
+        if let Some(n) = &name {
+            p["name"] = json!(n);
+        }
+        match call("session.import", p) {
+            Ok(s) => {
+                println!(
+                    "imported {} as {}{}",
+                    &full[..8],
+                    s["name"].as_str().unwrap_or("?"),
+                    if archive { " (archived)" } else { "" }
+                );
+                if let Some(w) = s["warning"].as_str() {
+                    eprintln!("  warning: {w}");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{}: {e:#}", &full[..8]);
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} of {} not imported", ids.len());
+    }
+    Ok(())
+}
+
+/// A full conversation id from an id or unique prefix.
+fn resolve_conversation(id: &str) -> Result<String> {
+    if id.len() == 36 {
+        return Ok(id.to_string());
+    }
+    // Matched by prefix in the daemon, at any age: the listing's window and
+    // limit shouldn't decide what a prefix finds.
+    let r = call("session.import_scan", json!({"ids": [id], "limit": 200}))?;
+    let hits: Vec<String> = r["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["agent_session"].as_str())
+        .map(str::to_string)
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => {
+            let all = call("session.list", json!({"archived": "all"}))?;
+            let owner = all.as_array().into_iter().flatten().find(|s| {
+                s["agent_session"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with(id))
+            });
+            match owner {
+                Some(s) => anyhow::bail!(
+                    "'{id}' is already in rlord as '{}'",
+                    s["name"].as_str().unwrap_or("?")
+                ),
+                None => anyhow::bail!("no conversation starts with '{id}'"),
+            }
+        }
+        _ => anyhow::bail!(
+            "'{id}' matches {} conversations; use more of the id",
+            hits.len()
+        ),
+    }
+}
+
+/// scripts/update.sh, compiled in so updating needs no checkout.
+const UPDATE_SH: &str = include_str!("../../../scripts/update.sh");
+
+fn update(tag: Option<String>, force: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(UPDATE_SH).arg("rlord-update");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.args(tag);
+    let st = cmd.status().context("running bash")?;
+    if !st.success() {
+        anyhow::bail!("update failed");
+    }
+    Ok(())
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();

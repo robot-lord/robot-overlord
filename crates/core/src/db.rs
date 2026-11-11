@@ -25,7 +25,8 @@ pub struct NewSession<'a> {
     pub agent: &'a str,
     pub agent_session: Option<&'a str>,
     pub project_path: &'a str,
-    pub tmux_session: &'a str,
+    /// None until it first runs (imported sessions start stopped).
+    pub tmux_session: Option<&'a str>,
     pub launch_spec: &'a str,
     pub created_at: i64,
     pub repo_path: Option<&'a str>,
@@ -286,6 +287,25 @@ impl Db {
         self.attach_tags(&mut sessions)?;
         self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
+    }
+
+    /// The session (live or archived) holding an agent conversation id.
+    pub fn session_by_agent_session(&self, agent_session: &str) -> Result<Option<Session>> {
+        self.get_session_where("agent_session = ?1", agent_session)
+    }
+
+    /// Every agent conversation id rlord tracks, live or archived, including
+    /// ones a session moved on from (`/clear` starts a new conversation; the
+    /// hook logs the switch as `agent_session_changed`).
+    pub fn agent_session_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_session FROM sessions WHERE agent_session IS NOT NULL \
+             UNION SELECT json_extract(payload, '$.from') FROM events \
+             WHERE kind = 'agent_session_changed' \
+               AND json_extract(payload, '$.from') IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// The overlord session, if one has ever been created.
@@ -866,7 +886,7 @@ mod tests {
             agent: "claude",
             agent_session: Some("uuid-1"),
             project_path: "/tmp/p",
-            tmux_session: &format!("rlord_{id}"),
+            tmux_session: Some(&format!("rlord_{id}")),
             launch_spec: "{}",
             created_at: 1000,
             repo_path: None,
@@ -1164,7 +1184,7 @@ mod tests {
             agent: "claude",
             agent_session: None,
             project_path: "/tmp/o",
-            tmux_session: "rlord_overlord",
+            tmux_session: Some("rlord_overlord"),
             launch_spec: "{}",
             created_at: 1000,
             repo_path: None,

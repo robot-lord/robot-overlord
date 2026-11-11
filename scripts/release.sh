@@ -5,7 +5,7 @@
 #   2. scripts/release.sh            # tags v<version> on origin and uploads
 #
 # Asset: rlord-v<version>-aarch64-apple-darwin.tar.gz (rlord + install.sh).
-# Install on another Mac: see "Installing a release" in the README.
+# Install on another Mac: scripts/update.sh or `rlord update` (README: "Installing on a Mac").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
