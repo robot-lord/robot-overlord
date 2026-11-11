@@ -10,7 +10,7 @@ use std::io::IsTerminal;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -23,6 +23,10 @@ use crate::{build_id, client_call, exe_id, methods};
 const LAUNCHD_LABEL: &str = "robot-overlord.daemon";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+/// After our spawned daemon bows out (lost the lock), how long to wait for
+/// the lock holder to answer: long enough for a racing client's daemon to
+/// finish starting, short enough that a wedged one fails fast.
+const LOCK_HOLDER_GRACE: Duration = Duration::from_secs(3);
 
 /// Where the daemon logs (shared with the launchd agent and dev-daemon.sh).
 pub fn log_path() -> PathBuf {
@@ -60,12 +64,14 @@ pub fn ensure_daemon(socket: &Path) -> Result<()> {
 
 /// Stop the running daemon (if any) and start a fresh one on this binary.
 pub fn restart_daemon(socket: &Path) -> Result<()> {
-    let old = read_pid();
+    // A pidfile left by a crashed daemon may name a pid the OS has since
+    // reused: only ever signal a process that is actually `rlord daemon`.
+    let old = read_pid().filter(|&pid| is_rlord_daemon(pid));
     let launchd = launchd_pid();
     if launchd.is_some() && launchd == old {
         // launchd owns the daemon serving our socket: let it do the restart.
         kickstart(true)?;
-        return wait_for_new(socket, old);
+        return wait_for_new(socket, old, None);
     }
     if let Some(pid) = old {
         // Wait for the process itself to exit, not just its socket: it holds
@@ -88,16 +94,17 @@ pub fn restart_daemon(socket: &Path) -> Result<()> {
 fn start_daemon(socket: &Path, old: Option<i32>) -> Result<()> {
     if launchd_job_loaded() {
         kickstart(false)?;
+        wait_for_new(socket, old, None)
     } else {
-        spawn_detached()?;
+        let mut child = spawn_detached()?;
+        wait_for_new(socket, old, Some(&mut child))
     }
-    wait_for_new(socket, old)
 }
 
 /// Spawn `rlord daemon` in its own session (survives the terminal, never
 /// gets its Ctrl-C), stdio to the log, through the stable binary path so the
 /// paths it writes into hooks and tmux bindings survive upgrades.
-fn spawn_detached() -> Result<()> {
+fn spawn_detached() -> Result<Child> {
     let log = log_path();
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
@@ -126,26 +133,65 @@ fn spawn_detached() -> Result<()> {
             Ok(())
         });
     }
-    // Not waited on: the daemon outlives us. Dropping the Child doesn't kill it.
-    cmd.spawn().context("spawning `rlord daemon`")?;
-    Ok(())
+    // Only polled, never waited on: the daemon outlives us, and dropping the
+    // Child doesn't kill it.
+    cmd.spawn().context("spawning `rlord daemon`")
 }
 
 /// Wait until the pidfile names a daemon other than `old` and it answers
-/// (the old one may still answer while it exits).
-fn wait_for_new(socket: &Path, old: Option<i32>) -> Result<()> {
-    let deadline = Instant::now() + START_TIMEOUT;
-    while Instant::now() < deadline {
+/// (the old one may still answer while it exits). If `child` (the daemon we
+/// spawned) exits first, it lost the instance lock: some other daemon holds
+/// it, and we give that one only a short grace to answer.
+fn wait_for_new(socket: &Path, old: Option<i32>, mut child: Option<&mut Child>) -> Result<()> {
+    let mut deadline = Instant::now() + START_TIMEOUT;
+    let mut bowed_out = false;
+    loop {
         let pid = read_pid();
         if pid.is_some() && pid != old && client_call(socket, "ping", Value::Null).is_ok() {
             return Ok(());
         }
+        if !bowed_out
+            && child
+                .as_mut()
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+        {
+            bowed_out = true;
+            deadline = deadline.min(Instant::now() + LOCK_HOLDER_GRACE);
+        }
+        if Instant::now() > deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if bowed_out {
+        bail!(
+            "another rlord daemon holds the lock but isn't answering on {} \
+             (`rlord reset` restarts it; see {})",
+            socket.display(),
+            log_path().display()
+        );
     }
     bail!(
         "daemon did not start within {START_TIMEOUT:?}; see {}",
         log_path().display()
     )
+}
+
+/// Whether `pid` is a live `rlord daemon` process (by its argv).
+fn is_rlord_daemon(pid: i32) -> bool {
+    let Ok(o) = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let cmd = String::from_utf8_lossy(&o.stdout);
+    let mut argv = cmd.split_whitespace();
+    let exe_is_rlord = argv
+        .next()
+        .is_some_and(|e| Path::new(e).file_name().is_some_and(|n| n == "rlord"));
+    exe_is_rlord && argv.next() == Some("daemon")
 }
 
 fn read_pid() -> Option<i32> {
@@ -202,11 +248,13 @@ fn kickstart(kill: bool) -> Result<()> {
     Ok(())
 }
 
-/// Exclusive per-user daemon lock, held for the daemon's lifetime. Returns
-/// `None` if another daemon holds it, so concurrent starts end with exactly
-/// one daemon (and never two draining the hook spool).
+/// Exclusive daemon lock, held for the daemon's lifetime. Returns `None` if
+/// another daemon holds it, so concurrent starts end with exactly one daemon.
+/// It lives in the data dir, next to what it protects (the DB and hook
+/// spool), not the runtime dir: two daemons with different runtime dirs
+/// would otherwise both get "their" lock and share one state.db.
 pub fn acquire_instance_lock() -> Result<Option<File>> {
-    let dir = paths::runtime_dir();
+    let dir = paths::data_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("daemon.lock");
     let f = File::create(&path).with_context(|| format!("opening {}", path.display()))?;

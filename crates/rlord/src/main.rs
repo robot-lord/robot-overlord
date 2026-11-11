@@ -785,7 +785,8 @@ fn tmux_import(dry_run: bool, remove: bool) -> Result<()> {
             tmux_profile::report_path().display()
         );
     }
-    match call("tmux.reload", json!({})) {
+    // No autostart: a daemon that starts later applies the profile itself.
+    match call_running("tmux.reload", json!({})) {
         Ok(_) => println!("rlord's tmux reloaded; sessions updated"),
         Err(e) => println!("not applied yet ({e:#}): it applies when rlord's daemon starts"),
     }
@@ -841,6 +842,12 @@ fn call(method: &str, params: Value) -> Result<Value> {
     client_call(&socket, method, params)
 }
 
+/// RPC to an already-running daemon only (never starts one), for callers
+/// that tolerate a missing daemon and mustn't block on starting it.
+fn call_running(method: &str, params: Value) -> Result<Value> {
+    client_call(&paths::socket_path(), method, params)
+}
+
 fn tags_of(session: &Value) -> String {
     let t: Vec<&str> = session["tags"]
         .as_array()
@@ -866,14 +873,15 @@ fn run_daemon() -> Result<()> {
     // Pin both at startup, before any rebuild or reinstall.
     rlord_daemon::build_id();
     rlord_daemon::exe_id();
-    let rt = tokio::runtime::Runtime::new()?;
     // One daemon per user: a second one (a lost autostart race, or launchd
     // starting its job while an autostarted daemon runs) exits 0 quietly, so
-    // launchd's KeepAlive doesn't respawn it in a loop.
+    // launchd's KeepAlive doesn't respawn it in a loop. Checked before the
+    // runtime exists, so a loser doesn't spin up worker threads to exit.
     let Some(_lock) = autostart::acquire_instance_lock()? else {
         eprintln!("rlord: another daemon is already running");
         return Ok(());
     };
+    let rt = tokio::runtime::Runtime::new()?;
     let r = rt.block_on(async {
         let db = rlord_core::db::Db::open(&paths::db_path())?;
         let daemon = Daemon::new(db, Config::load()?);
@@ -924,7 +932,10 @@ fn hook_emit(agent: &str) -> Result<()> {
 fn nav_home() -> Result<()> {
     // Overlay up on this terminal → Option-D just closes it.
     if let Some(client) = tmux::current_client() {
-        if call("ui.overlay.close_on", json!({"client": client})).is_ok_and(|r| r["closed"] == true)
+        // No autostart: with no daemon there's no overlay, and a key press
+        // must not stall while one starts.
+        if call_running("ui.overlay.close_on", json!({"client": client}))
+            .is_ok_and(|r| r["closed"] == true)
         {
             return Ok(());
         }

@@ -20,7 +20,10 @@ tag="v$ver"
 [[ -z "$(git status --porcelain)" ]] || { echo "working tree is dirty" >&2; exit 1; }
 git fetch -q origin
 head=$(git rev-parse HEAD)
-git branch -r --contains "$head" | grep -q . || { echo "HEAD $head is not pushed to origin" >&2; exit 1; }
+# Only merged code ships: HEAD must be on origin/main, not just on some
+# pushed branch (a PR branch would burn the version before it merges).
+git merge-base --is-ancestor "$head" origin/main ||
+  { echo "HEAD $head is not on origin/main — release only merged code" >&2; exit 1; }
 if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
   echo "$tag already exists — bump the version in Cargo.toml" >&2; exit 1
 fi
