@@ -142,7 +142,7 @@ the real UI you're looking at):
   list (`set_list_view`, groups), edit names, tags, notes and descriptions,
   answer from rlord's data ("what's waiting on me?"), and run the tidy and
   import passes. Anything that needs thought, it hands off (`hand_off`).
-- **↳ Mastermind (Option-M)**: the overlord's deeper half on a strong model
+- **↳ Mastermind (Option-M inside the overlay)**: the overlord's deeper half on a strong model
   (`opus`, medium effort, by default). It launches sessions (the list's `n`
   form goes straight to it; describe → confirm via `confirm_new_session`) and
   takes one-off questions that need reasoning, research or reading code. A
@@ -150,7 +150,9 @@ the real UI you're looking at):
   there. It starts the first time it's needed, does its groundwork in
   subagents to keep its context small, and after 15 idle minutes (while
   you're not looking at it) restarts on a fresh conversation
-  (`mastermind_fresh_after_mins`).
+  (`mastermind_fresh_after_mins`; not while its last turn asked you
+  something). `[tmux] mastermind = "M-m"` makes Option-M reach it from any
+  pane too.
 
 Both float as an overlay over whatever you're looking at. Inside it, Option-O
 and Option-M switch between them, and the key of the one shown (or Option-D)

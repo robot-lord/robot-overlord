@@ -190,7 +190,10 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         seat.key
     );
     let key = |k: &str| tmux::key_label(k);
-    let (o, m) = (key(&d.config.tmux.overlord), key(&d.config.tmux.mastermind));
+    let (o, m) = (
+        key(&d.config.tmux.overlord),
+        key(d.config.tmux.mastermind_switch()),
+    );
     let title = if seat.key == overlord::MASTERMIND.key {
         format!(" ◆ mastermind · {o} overlord · {m} close ")
     } else {
@@ -423,6 +426,8 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             prefill.insert(k.into(), params[k].clone());
         }
     }
+    // The mastermind is now waiting on the user (its fresh start waits too).
+    d.db().kv_set("confirm_pending", "1")?;
     d.ui_cmd(json!({"cmd": "confirm_new_session", "prefill": prefill}));
     show_list(d)?;
     Ok(json!({"shown": prefill,

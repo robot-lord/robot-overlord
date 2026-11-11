@@ -34,6 +34,9 @@ pub struct Seat {
     pub tmux: &'static str,
     instructions: &'static str,
     subagents: &'static [(&'static str, &'static str)],
+    /// Its model and effort in the config.
+    model_of: fn(&Config) -> &str,
+    effort_of: fn(&Config) -> &str,
 }
 
 pub const FRONT: Seat = Seat {
@@ -44,6 +47,8 @@ pub const FRONT: Seat = Seat {
         ("rlord-tidy.md", include_str!("tidy.md")),
         ("rlord-import.md", include_str!("import.md")),
     ],
+    model_of: |c| &c.overlord.model,
+    effort_of: |c| &c.overlord.effort,
 };
 
 pub const MASTERMIND: Seat = Seat {
@@ -51,6 +56,8 @@ pub const MASTERMIND: Seat = Seat {
     tmux: "rlord_mastermind",
     instructions: include_str!("mastermind.md"),
     subagents: &[],
+    model_of: |c| &c.overlord.mastermind_model,
+    effort_of: |c| &c.overlord.mastermind_effort,
 };
 
 pub const SEATS: [&Seat; 2] = [&FRONT, &MASTERMIND];
@@ -76,18 +83,10 @@ impl Seat {
         paths::data_dir().join(self.key)
     }
     fn model<'a>(&self, cfg: &'a Config) -> &'a str {
-        if self.key == MASTERMIND.key {
-            &cfg.overlord.mastermind_model
-        } else {
-            &cfg.overlord.model
-        }
+        (self.model_of)(cfg)
     }
     fn effort<'a>(&self, cfg: &'a Config) -> &'a str {
-        if self.key == MASTERMIND.key {
-            &cfg.overlord.mastermind_effort
-        } else {
-            &cfg.overlord.effort
-        }
+        (self.effort_of)(cfg)
     }
     pub fn session(&self, db: &Db) -> Result<Option<rlord_core::types::Session>> {
         db.role_session(self.key)
@@ -183,7 +182,7 @@ pub fn style(cfg: &Config) {
             &FRONT,
             format!(
                 "#[bold] ◆ OVERLORD #[nobold]· {} mastermind · {} list  ",
-                keys(&cfg.tmux.mastermind),
+                keys(cfg.tmux.mastermind_switch()),
                 keys(&cfg.tmux.back)
             ),
         ),
@@ -221,15 +220,19 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
             .to_string()
     };
     // The setup dialog picks the mastermind's model too, before it exists.
+    // (Kept only when it differs from the config's default, so a later
+    // config change still applies to a mastermind not yet started.)
     if let Some(m) = params["mastermind_model"].as_str().map(str::trim) {
-        if !m.is_empty() {
+        if !m.is_empty() && m != MASTERMIND.model(cfg).trim() {
             db.kv_set("mastermind_model", m)?;
+        } else {
+            db.kv_set("mastermind_model", "")?;
         }
     }
     match seat.session(db)? {
         None => {
             let chosen = if seat.key == MASTERMIND.key {
-                db.kv_get("mastermind_model")?
+                db.kv_get("mastermind_model")?.filter(|m| !m.is_empty())
             } else {
                 None
             };
@@ -313,6 +316,11 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     if now - last < (mins as i64) * 60_000 {
         return Ok(());
     }
+    // Its last turn asked the user something (a question, or a form to
+    // confirm): it's waiting on them, whatever the status says.
+    if waiting_on_user(d, &s)? {
+        return Ok(());
+    }
     // Nothing new since the last fresh start: nothing to clear.
     let fresh_at: i64 = d
         .db()
@@ -332,13 +340,35 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         return Ok(());
     }
     {
+        // No hand-off may paste into the pane while it's being replaced.
+        let _send = d.mastermind_send.lock().expect("mastermind send lock");
         let db = d.db();
+        // Re-check under the lock: a hand-off may have just landed.
+        let cur = MASTERMIND.session(&db)?.context("mastermind vanished")?;
+        if cur.status != Status::Idle || cur.last_user_msg_at != s.last_user_msg_at {
+            return Ok(());
+        }
         crate::methods::session_fresh(&db, &json!({"ref": s.id}))?;
         db.kv_set("mastermind_fresh_at", &now.to_string())?;
     }
     tracing::info!("mastermind idle: restarted on a fresh conversation");
     d.changed();
     Ok(())
+}
+
+/// Whether the mastermind's last turn waits on the user: its reply ends in a
+/// question, or a new-session form it reopened is still out for confirming.
+fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<bool> {
+    if d.db().kv_get("confirm_pending")?.is_some_and(|v| v == "1") {
+        return Ok(true);
+    }
+    let Some(src) = d.db().transcript_source(&s.id)? else {
+        return Ok(false);
+    };
+    let ex = rlord_core::agents::claude::transcript_excerpts(std::path::Path::new(&src));
+    Ok(ex
+        .last_reply
+        .is_some_and(|r| r.trim_end_matches(['…', ' ', '*', '`']).ends_with('?')))
 }
 
 /// Everything the startup check needs: does the overlord exist, what models

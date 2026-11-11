@@ -1145,7 +1145,7 @@ impl App {
                             "{} · {} to talk",
                             s["model"].as_str().unwrap_or("default model"),
                             if is_mastermind {
-                                tmux::key_label(&self.config.tmux.mastermind)
+                                tmux::key_label(self.config.tmux.mastermind_switch())
                             } else {
                                 self.keys.label(Action::Overlord)
                             }

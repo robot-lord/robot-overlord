@@ -365,7 +365,7 @@ impl App {
         lines.extend(row(
             1,
             "↳ Mastermind",
-            &keys(&self.config.tmux.mastermind),
+            &keys(self.config.tmux.mastermind_switch()),
             [
                 "Launches sessions and takes questions that need thought. A strong",
                 "model, where judgment pays; starts the first time it's needed.",
@@ -389,7 +389,7 @@ impl App {
             )));
         }
         f.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 theme::modal("◆ Start your overlord")
                     .border_style(Style::default().fg(theme::overlord())),
             ),

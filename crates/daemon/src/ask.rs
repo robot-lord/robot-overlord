@@ -22,7 +22,8 @@ use rlord_core::types::Status;
 use crate::{overlord, Daemon};
 
 /// How long to wait for a just-(re)started overlord to accept input.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// (A first-time mastermind on a big model can take a while.)
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
     let text = params
@@ -38,6 +39,9 @@ pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
 /// Type `text` into a seat's pane (starting the seat if needed). The
 /// mastermind starts on first use; the overlord must have been set up.
 pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
+    // Not while an idle mastermind is being restarted fresh.
+    let _send = (seat.key == overlord::MASTERMIND.key)
+        .then(|| d.mastermind_send.lock().expect("mastermind send lock"));
     if d.db().overlord()?.is_none() {
         bail!("no overlord yet: press Option-O to set one up (or N for the manual form)");
     }
@@ -69,6 +73,10 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
+    // A confirmed form answers the one the mastermind reopened.
+    if params["confirmed"].as_bool() == Some(true) {
+        d.db().kv_set("confirm_pending", "0")?;
+    }
     send_to(d, &overlord::MASTERMIND, &text)
 }
 
@@ -102,8 +110,11 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
     if let Some(c) = client {
         p["client"] = json!(c);
     }
-    let _ = crate::ui::overlord(d, &p);
-    Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"}))
+    match crate::ui::overlord(d, &p) {
+        Ok(_) => Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"})),
+        Err(e) => Ok(json!({"handed_off": true,
+            "note": format!("delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M")})),
+    }
 }
 
 /// The `[rlord new-session request]` message. Hints say whether the user

@@ -317,12 +317,7 @@ impl Db {
 
     /// The overlord session, if one has ever been created.
     pub fn overlord(&self) -> Result<Option<Session>> {
-        let mut v = self.query_sessions("role = ?1", "overlord")?;
-        Ok(if v.is_empty() {
-            None
-        } else {
-            Some(v.remove(0))
-        })
+        self.role_session("overlord")
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {

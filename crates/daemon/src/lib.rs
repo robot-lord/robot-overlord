@@ -48,6 +48,9 @@ pub struct Daemon {
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
     /// Which overlord seat the open overlay shows (`overlord`/`mastermind`).
     pub(crate) overlay_seat: Mutex<&'static str>,
+    /// Held while text is pasted into the mastermind, and while an idle one
+    /// is restarted fresh: the two must not overlap.
+    pub(crate) mastermind_send: Mutex<()>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
 }
@@ -66,6 +69,7 @@ impl Daemon {
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
             overlay_seat: Mutex::new(overlord::FRONT.key),
+            mastermind_send: Mutex::new(()),
             warm: Default::default(),
         })
     }
@@ -456,6 +460,20 @@ impl Daemon {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 tracing::info!(tool = name, caller = ?params.get("caller"), "mcp tool call");
+                // The mastermind does the work handed to it; it can't hand
+                // off to itself.
+                if name == "hand_off" {
+                    let caller = params["caller"].as_str().unwrap_or("");
+                    let is_mastermind = self
+                        .db()
+                        .resolve_ref(caller)
+                        .is_ok_and(|s| s.role == overlord::MASTERMIND.key);
+                    if is_mastermind {
+                        return Some(Err(anyhow::anyhow!(
+                            "you are the mastermind: do it yourself (hand_off is the overlord's)"
+                        )));
+                    }
+                }
                 mcp::call(self, name, &args)
             }
             _ => return None,

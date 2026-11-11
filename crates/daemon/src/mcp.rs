@@ -89,7 +89,7 @@ pub fn tools() -> Value {
             "The defaults new sessions get (agent, model, model choices, workspace, default repo).",
             json!({}), &[]),
         tool("hand_off",
-            "Give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call.",
+            "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
             json!({
                 "request": s("The user's words, verbatim"),
                 "context": s("What the mastermind needs from your conversation (it sees none of it): earlier messages, sessions mentioned, what you already found"),

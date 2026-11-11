@@ -43,7 +43,8 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     report(true);
     let mut terminal = ratatui::init();
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
-    let r = run_loop(&mut terminal, &pane, seat);
+    let keys = SeatKeys::from_config(&rlord_core::config::Config::load().unwrap_or_default());
+    let r = run_loop(&mut terminal, &pane, seat, &keys);
     let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     report(false);
@@ -52,7 +53,12 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     r
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str, seat: &Seat) -> Result<()> {
+fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    pane: &str,
+    seat: &Seat,
+    keys: &SeatKeys,
+) -> Result<()> {
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
@@ -98,7 +104,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str, seat: &Seat) ->
         }
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
-                match seat_key(&k) {
+                match keys.seat_key(&k) {
                     // This seat's key (or Option-D) closes the overlay.
                     Some(s) if s == seat.key || s == "close" => return Ok(()),
                     // The other seat's key switches to it (the daemon opens
@@ -135,17 +141,62 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, pane: &str, seat: &Seat) ->
 }
 
 /// Option-O (the key that opened it) or Option-D (the "back" key) closes it.
-/// Option-O → the overlord, Option-M → the mastermind, Option-D → close.
-/// (Inside a popup, keys reach this program, not tmux's key table.)
-fn seat_key(k: &KeyEvent) -> Option<&'static str> {
-    if !k.modifiers.contains(KeyModifiers::ALT) {
-        return None;
+/// The overlay's own keys, from the configured tmux keys: the overlord's
+/// (Option-O), the mastermind's (Option-M) and back (Option-D, closes).
+/// Inside a popup, keys reach this program, not tmux's key table.
+struct SeatKeys {
+    overlord: Option<(bool, bool, char)>,
+    mastermind: Option<(bool, bool, char)>,
+    close: Option<(bool, bool, char)>,
+}
+
+/// A tmux key spec (`M-o`, `C-g`, `M-C-x`) as (alt, ctrl, char).
+fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
+    let (mut alt, mut ctrl, mut rest) = (false, false, spec.trim());
+    loop {
+        if let Some(r) = rest.strip_prefix("M-") {
+            alt = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("C-") {
+            ctrl = true;
+            rest = r;
+        } else {
+            break;
+        }
     }
-    match k.code {
-        KeyCode::Char('o') => Some(overlord::FRONT.key),
-        KeyCode::Char('m') => Some(overlord::MASTERMIND.key),
-        KeyCode::Char('d') => Some("close"),
-        _ => None,
+    let mut chars = rest.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some((alt, ctrl, c))
+}
+
+impl SeatKeys {
+    fn from_config(cfg: &rlord_core::config::Config) -> Self {
+        let or = |k: &str, d: &str| parse_key(if k.trim().is_empty() { d } else { k });
+        SeatKeys {
+            overlord: or(&cfg.tmux.overlord, "M-o"),
+            mastermind: parse_key(cfg.tmux.mastermind_switch()),
+            close: or(&cfg.tmux.back, "M-d"),
+        }
+    }
+
+    fn seat_key(&self, k: &KeyEvent) -> Option<&'static str> {
+        let KeyCode::Char(c) = k.code else {
+            return None;
+        };
+        let got = (
+            k.modifiers.contains(KeyModifiers::ALT),
+            k.modifiers.contains(KeyModifiers::CONTROL),
+            c,
+        );
+        if self.overlord == Some(got) {
+            Some(overlord::FRONT.key)
+        } else if self.mastermind == Some(got) {
+            Some(overlord::MASTERMIND.key)
+        } else if self.close == Some(got) {
+            Some("close")
+        } else {
+            None
+        }
     }
 }
 
@@ -235,11 +286,14 @@ mod tests {
 
     #[test]
     fn option_keys_pick_the_seat_or_close() {
-        let k = |c, m| seat_key(&ev(KeyCode::Char(c), m));
+        let keys = SeatKeys::from_config(&rlord_core::config::Config::default());
+        let k = |c, m| keys.seat_key(&ev(KeyCode::Char(c), m));
         assert_eq!(k('o', KeyModifiers::ALT), Some("overlord"));
         assert_eq!(k('m', KeyModifiers::ALT), Some("mastermind"));
         assert_eq!(k('d', KeyModifiers::ALT), Some("close"));
         assert_eq!(k('o', KeyModifiers::NONE), None);
-        assert_eq!(seat_key(&ev(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(keys.seat_key(&ev(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(parse_key("M-C-x"), Some((true, true, 'x')));
+        assert_eq!(parse_key("M-xy"), None);
     }
 }

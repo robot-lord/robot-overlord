@@ -421,18 +421,13 @@ fn main() -> Result<()> {
         Command::Nav(NavCmd::Next) => nav_step(1),
         Command::Nav(NavCmd::Prev) => nav_step(-1),
         Command::Nav(NavCmd::Mastermind) => {
-            let r = call(
-                "ui.overlord",
-                json!({"client": tmux::current_client(), "from": tmux::current_session(),
-                       "seat": "mastermind"}),
-            );
-            if let Err(e) = r {
+            if let Err(e) = nav_overlord("mastermind") {
                 let _ = tmux::display_message(&format!("rlord: {e:#}"));
             }
             Ok(())
         }
         Command::Nav(NavCmd::Overlord) => {
-            if let Err(e) = nav_overlord() {
+            if let Err(e) = nav_overlord("overlord") {
                 let _ = tmux::display_message(&format!("rlord: {e:#}"));
             }
             Ok(())
@@ -443,7 +438,7 @@ fn main() -> Result<()> {
         Command::Overlay { token, seat } => rlord_tui::run_overlay(token, &seat),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
-                nav_overlord()
+                nav_overlord("overlord")
             } else {
                 // Not in tmux: the overlay needs a tmux terminal to pop up
                 // over, so start (or rejoin) rlord there first.
@@ -1199,15 +1194,16 @@ fn nav_home() -> Result<()> {
 
 /// `nav overlord` (Option-O): in the TUI, toggle the overlord overlay;
 /// anywhere else, bring the user to the TUI with it open.
-fn nav_overlord() -> Result<()> {
+/// Option-O / Option-M: show that overlord seat over this terminal.
+fn nav_overlord(seat: &str) -> Result<()> {
     // Say where the key was pressed (run-shell runs in that client's
     // context), rather than making the daemon guess which terminal it was.
     let r = call(
         "ui.overlord",
-        json!({"client": tmux::current_client(), "from": tmux::current_session()}),
+        json!({"client": tmux::current_client(), "from": tmux::current_session(), "seat": seat}),
     )?;
     if r["overlord"] == "already here" {
-        let _ = tmux::display_message("you're in the overlord · ⌥D: back to the list");
+        let _ = tmux::display_message(&format!("you're in the {seat} · ⌥D: back to the list"));
     }
     Ok(())
 }

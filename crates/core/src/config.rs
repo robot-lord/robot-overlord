@@ -107,7 +107,10 @@ pub struct TmuxKeys {
     /// From any pane: jump to rlord with the overlord overlay open; in rlord:
     /// toggle the overlay.
     pub overlord: String,
-    /// The same for the mastermind (the overlord's second, deeper session).
+    /// The same for the mastermind (the overlord's second, deeper session),
+    /// from any pane. Off by default (it would take the key from every agent
+    /// session); inside the overlord's overlay, `mastermind_switch()` always
+    /// flips between the two.
     pub mastermind: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
@@ -122,13 +125,23 @@ impl Default for TmuxKeys {
             next: String::new(),
             prev: String::new(),
             overlord: "M-o".into(),
-            mastermind: "M-m".into(),
+            mastermind: String::new(),
             profile: true,
         }
     }
 }
 
 impl TmuxKeys {
+    /// The key that switches the overlay to the mastermind: the configured
+    /// global key, else `M-m` (inside the overlay only).
+    pub fn mastermind_switch(&self) -> &str {
+        if self.mastermind.trim().is_empty() {
+            "M-m"
+        } else {
+            &self.mastermind
+        }
+    }
+
     /// (key, nav verb) pairs for every enabled binding.
     pub fn bindings(&self) -> Vec<(&str, &'static str)> {
         [
@@ -394,7 +407,8 @@ back = "M-d"    # back to the rlord TUI (or detach if you attached from outside 
 next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
 overlord = "M-o" # from any pane: the overlord (quick front desk) over it
-mastermind = "M-m" # from any pane: the mastermind (launches, deeper questions)
+mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
+                  # overlord's overlay, Option-M always switches to it)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 "##;
 
@@ -424,7 +438,8 @@ mod tests {
         assert_eq!(c.overlord.effort, "low");
         assert_eq!(c.overlord.mastermind_model, "opus");
         assert_eq!(c.overlord.mastermind_effort, "medium");
-        assert_eq!(c.tmux.mastermind, "M-m");
+        assert_eq!(c.tmux.mastermind, "");
+        assert_eq!(c.tmux.mastermind_switch(), "M-m");
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
     }
@@ -437,10 +452,7 @@ mod tests {
         assert_eq!(c.layout, Layout::Stack);
         assert_eq!(c.keys.quit, "Q");
         assert_eq!(c.keys.attach, "enter");
-        // back disabled, next/prev off by default; the overlord keys remain
-        assert_eq!(
-            c.tmux.bindings(),
-            [("M-o", "overlord"), ("M-m", "mastermind")]
-        );
+        // back disabled, next/prev/mastermind off by default; the overlord remains
+        assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
     }
 }
