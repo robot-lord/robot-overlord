@@ -23,6 +23,7 @@
 //!   overlord and the list say plainly when this machine can't use it.
 
 use std::collections::{HashMap, HashSet};
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,8 @@ use crate::{methods, overlord, Daemon};
 
 /// How often the keeper looks.
 const TICK: Duration = Duration::from_secs(5);
+/// A deferred restart waits for the session to be quiet this long.
+const QUIET_MS: i64 = 5_000;
 /// How long a session started with the flag may take to connect.
 const SETTLE_MS: i64 = 45_000;
 /// Availability is re-checked this often (a login or plan change).
@@ -48,7 +51,8 @@ pub struct Remote {
     avail: Mutex<Option<(Instant, Availability)>>,
     /// Sessions to restart (onto their current wish) once nothing is going
     /// on in them.
-    restart_when_idle: Mutex<HashSet<String>>,
+    /// (When asked, ms: a process started after it has the change.)
+    restart_when_idle: Mutex<HashMap<String, i64>>,
     /// Last state per session, for the list (cheap to annotate).
     snapshot: Mutex<HashMap<String, Value>>,
     /// One keeper pass at a time (the keeper and a `remote.set`).
@@ -128,6 +132,14 @@ fn wanted(db: &Db, id: &str) -> Result<Option<(String, i64)>> {
         }))
 }
 
+/// rlord turned Remote Control off for it (held off on every launch).
+fn turned_off_spec(db: &Db, id: &str) -> bool {
+    db.launch_spec(id)
+        .ok()
+        .and_then(|sp| serde_json::from_str::<Value>(&sp).ok())
+        .is_some_and(|sp| sp["remote_control_off"] == true)
+}
+
 fn set_wanted(db: &Db, s: &Session, on: bool) -> Result<()> {
     let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     if let Some(o) = spec.as_object_mut() {
@@ -162,28 +174,55 @@ fn live() -> HashMap<String, Live> {
     remote::live_sessions(pid_alive)
 }
 
-/// The text on the agent's input line (after the prompt mark), read from
-/// its screen (never typed into). Claude's placeholder counts as empty.
+/// The text the user has typed on the agent's input line, read from its
+/// screen with attributes (never typed into). Claude draws its placeholder
+/// and suggested next prompt dim (`ESC[2m`): those aren't the user's.
 fn input_text(screen: &str) -> Option<String> {
-    let line = screen.lines().rev().find(|l| l.starts_with('❯'))?;
-    let rest = line.trim_start_matches('❯').trim();
-    (!rest.is_empty() && !rest.starts_with("Try \"")).then(|| rest.to_string())
+    let line = screen
+        .lines()
+        .rev()
+        .find(|l| strip_ansi(l).starts_with('❯'))?;
+    let rest = line.split_once('❯')?.1;
+    let rest = rest.trim_start_matches([' ', '\u{a0}']);
+    if rest.starts_with("\x1b[2m") {
+        return None;
+    }
+    let text = strip_ansi(rest);
+    let text = text.trim_matches([' ', '\u{a0}']);
+    // A placeholder in a capture without attributes.
+    (!text.is_empty() && !text.starts_with("Try \"")).then(|| text.to_string())
 }
 
-/// How many shells the agent process has running (its background
-/// commands; MCP servers and helpers aren't shells).
+/// Drop ANSI escape sequences (CSI: ESC [ … final byte).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// How many commands the agent has running in its own shells (they
+/// source Claude's shell snapshot; MCP servers, even shell-wrapped ones,
+/// don't).
 fn background_shells(pid: u32) -> usize {
     std::process::Command::new("pgrep")
-        .args(["-l", "-P", &pid.to_string()])
+        .args(["-lf", "-P", &pid.to_string()])
         .output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .filter_map(|l| l.split_whitespace().nth(1))
-                .filter(|name| {
-                    let base = name.rsplit('/').next().unwrap_or(name);
-                    matches!(base, "zsh" | "bash" | "sh" | "fish" | "dash")
-                })
+                .filter(|l| l.contains("shell-snapshots"))
                 .count()
         })
         .unwrap_or(0)
@@ -215,21 +254,12 @@ fn work_going(s: &Session, live: Option<&Live>) -> Vec<String> {
         .tmux_session
         .as_deref()
         .and_then(|n| tmux::pane_id(n).ok())
-        .and_then(|p| tmux::capture_pane_id(&p).ok())
+        .and_then(|p| tmux::capture_pane_id_ansi(&p).ok())
         .and_then(|sc| input_text(&sc));
     if draft.is_some() {
         why.push("there's unsent text in its input".into());
     }
     why
-}
-
-/// Whether the running process matches the wish (connected iff wanted,
-/// started after the wish was set).
-fn running_matches(want: Option<&(String, i64)>, l: &Live) -> bool {
-    match want {
-        Some((_, at)) => l.bridge.is_some() || l.started_at >= *at,
-        None => l.bridge.is_none(),
-    }
 }
 
 /// `{state, url?, reason?, wanted, name}` for one session.
@@ -238,12 +268,18 @@ fn state_of(
     want: Option<&(String, i64)>,
     live: Option<&Live>,
     avail: &Availability,
+    turned_off: bool,
     restart_queued: bool,
     now: i64,
 ) -> Value {
     let url = live.and_then(Live::url);
     let (state, reason): (&str, Option<String>) = match (want, live) {
-        _ if url.is_some() && want.is_none() => ("disconnecting", None),
+        // rlord turned it off; the restart that applies it is still to come.
+        _ if url.is_some() && want.is_none() && turned_off => ("disconnecting", None),
+        // Connected from inside the session (/remote-control), not by rlord.
+        _ if url.is_some() && want.is_none() => {
+            ("on", Some("connected from inside the session".into()))
+        }
         _ if url.is_some() => ("on", None),
         (None, _) => ("off", None),
         _ if s.agent != "claude" => (
@@ -251,7 +287,9 @@ fn state_of(
             Some(format!("{} has no Remote Control", s.agent)),
         ),
         _ if !avail.available => ("unavailable", avail.reason.clone()),
-        (Some(_), None) => ("stopped", None),
+        (Some(_), None) if s.status == Status::Stopped => ("stopped", None),
+        // Between a restart's old process and its new one.
+        (Some(_), None) => ("connecting", None),
         (Some((_, at)), Some(l)) if l.started_at < *at => (
             "pending",
             Some(if restart_queued {
@@ -275,15 +313,29 @@ fn state_of(
 }
 
 /// Restart a session onto its current wish (resuming the conversation).
-fn restart(d: &Daemon, id: &str) -> Result<()> {
-    // Not while a hand-off is being pasted into the mastermind.
+/// `only_if_quiet`: check again, right before, that nothing is going on
+/// (and has been for a few seconds); false means it wasn't restarted.
+fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
+    // Not while a hand-off is being pasted into the mastermind (and checked
+    // under that lock, after any hand-off that held it).
     let is_mastermind = overlord::MASTERMIND
         .session(&d.db())?
         .is_some_and(|m| m.id == id);
     let _send = is_mastermind.then(|| d.mastermind_send.lock().expect("mastermind send lock"));
+    if only_if_quiet {
+        let s = d.db().resolve_ref(id)?;
+        let live = live();
+        let l = s.agent_session.as_deref().and_then(|a| live.get(a));
+        let now = rlord_core::types::now_ms();
+        let quiet = l.is_none_or(|l| now - l.status_at > QUIET_MS)
+            && s.last_user_msg_at.is_none_or(|u| now - u > QUIET_MS);
+        if !quiet || !work_going(&s, l).is_empty() {
+            return Ok(false);
+        }
+    }
     methods::session_restart(&d.db(), &json!({"ref": id}))?;
     d.changed();
-    Ok(())
+    Ok(true)
 }
 
 /// One keeper pass: run deferred restarts whose sessions went quiet, and
@@ -293,11 +345,14 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     let sessions = d.db().sessions(&all_sessions())?;
     let live = live();
     let mut wants = HashMap::new();
+    let mut turned_off = HashSet::new();
     {
         let db = d.db();
         for s in &sessions {
             if let Some(w) = wanted(&db, &s.id)? {
                 wants.insert(s.id.clone(), w);
+            } else if turned_off_spec(&db, &s.id) {
+                turned_off.insert(s.id.clone());
             }
         }
     }
@@ -308,15 +363,15 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         _ => d.remote.availability(false),
     };
     let now = rlord_core::types::now_ms();
-    let queued: Vec<String> = d
+    let queued: Vec<(String, i64)> = d
         .remote
         .restart_when_idle
         .lock()
         .expect("remote mutex")
         .iter()
-        .cloned()
+        .map(|(k, v)| (k.clone(), *v))
         .collect();
-    for id in queued {
+    for (id, asked_at) in queued {
         let Some(s) = sessions.iter().find(|s| s.id == id) else {
             d.remote
                 .restart_when_idle
@@ -326,21 +381,26 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
             continue;
         };
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
-        let done = l.is_none_or(|l| running_matches(wants.get(&id), l));
+        // Done once a process started after the request runs (or none
+        // does: the next start applies it).
+        let done = l.is_none_or(|l| l.started_at >= asked_at);
+        let remove = |d: &Daemon| {
+            d.remote
+                .restart_when_idle
+                .lock()
+                .expect("remote mutex")
+                .remove(&id);
+        };
         if done {
-            d.remote
-                .restart_when_idle
-                .lock()
-                .expect("remote mutex")
-                .remove(&id);
+            remove(d);
         } else if work_going(s, l).is_empty() {
-            d.remote
-                .restart_when_idle
-                .lock()
-                .expect("remote mutex")
-                .remove(&id);
-            if let Err(e) = restart(d, &id) {
-                tracing::warn!(session = %id, error = %e, "remote control: restart");
+            match restart(d, &id, true) {
+                Ok(true) => remove(d),
+                Ok(false) => {}
+                Err(e) => {
+                    remove(d);
+                    tracing::warn!(session = %id, error = %e, "remote control: restart");
+                }
             }
         }
     }
@@ -354,7 +414,15 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     for s in &sessions {
         let want = wants.get(&s.id);
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
-        let st = state_of(s, want, l, &avail, queued.contains(&s.id), now);
+        let st = state_of(
+            s,
+            want,
+            l,
+            &avail,
+            turned_off.contains(&s.id),
+            queued.contains_key(&s.id),
+            now,
+        );
         if st["state"] != "off" {
             out.insert(s.id.clone(), st);
         }
@@ -517,10 +585,10 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
                 .restart_when_idle
                 .lock()
                 .expect("remote mutex")
-                .insert(t.id.clone());
+                .insert(t.id.clone(), rlord_core::types::now_ms());
             deferred.push(t.name.clone());
         } else {
-            restart(d, &t.id)?;
+            restart(d, &t.id, false)?;
             restarted.push(t.name.clone());
         }
     }
@@ -555,7 +623,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         }
         (true, Some("stopped")) => "it connects when the session next starts".into(),
         (_, _) if !deferred.is_empty() => format!(
-            "{} restart(s) as soon as its current turn is done (the conversation resumes)",
+            "{} restart(s) as soon as its work is done (the conversation resumes)",
             deferred.join(" and ")
         ),
         (true, Some("connecting")) => "restarted; it's connecting".into(),
@@ -622,27 +690,12 @@ mod tests {
         );
         // The last prompt line counts (earlier ones are history).
         assert_eq!(input_text("❯ old\n  done\n❯ \n"), None);
-    }
-
-    #[test]
-    fn running_process_against_the_wish() {
-        let l = |bridge: Option<&str>, started_at| Live {
-            pid: 1,
-            status: "idle".into(),
-            bridge: bridge.map(str::to_string),
-            started_at,
-        };
-        let want = ("x".to_string(), 100);
-        assert!(
-            running_matches(Some(&want), &l(None, 150)),
-            "started with the flag"
+        // Claude's suggested next prompt (dim) isn't a draft.
+        let suggestion = "\x1b[39m❯\u{a0}\x1b[2mStart `sleep 60` as a task\x1b[0m\n";
+        assert_eq!(input_text(suggestion), None);
+        assert_eq!(
+            input_text("\x1b[39m❯\u{a0}real draft\n").as_deref(),
+            Some("real draft")
         );
-        assert!(
-            !running_matches(Some(&want), &l(None, 50)),
-            "started before the wish"
-        );
-        assert!(running_matches(Some(&want), &l(Some("b"), 50)));
-        assert!(!running_matches(None, &l(Some("b"), 50)), "still connected");
-        assert!(running_matches(None, &l(None, 50)));
     }
 }

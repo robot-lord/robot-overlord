@@ -30,6 +30,8 @@ pub struct Live {
     pub bridge: Option<String>,
     /// When the process started (ms since the epoch; 0 if unknown).
     pub started_at: i64,
+    /// When `status` last changed (ms; 0 if unknown).
+    pub status_at: i64,
 }
 
 impl Live {
@@ -84,6 +86,7 @@ pub fn live_sessions_in(dir: &Path, alive: impl Fn(u32) -> bool) -> HashMap<Stri
                 .filter(|b| !b.is_empty())
                 .map(str::to_string),
             started_at: v["startedAt"].as_i64().unwrap_or(0),
+            status_at: v["statusUpdatedAt"].as_i64().unwrap_or(0),
         };
         match out.get(sid) {
             Some((t, _)) if *t >= at => {}

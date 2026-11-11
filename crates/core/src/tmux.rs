@@ -374,9 +374,10 @@ pub fn capture_pane(name: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-t", &pane_id])
 }
 
-/// A pane's text, by pane id (`%3`): the exact pane, whatever is active.
-pub fn capture_pane_id(pane_id: &str) -> Result<String> {
-    run(&["capture-pane", "-p", "-t", pane_id])
+/// A pane's text with colour/attribute escapes, by pane id (`%3`): the
+/// exact pane, whatever is active.
+pub fn capture_pane_id_ansi(pane_id: &str) -> Result<String> {
+    run(&["capture-pane", "-p", "-e", "-t", pane_id])
 }
 
 /// Same, with ANSI colour/attribute escapes preserved (`-e`).
