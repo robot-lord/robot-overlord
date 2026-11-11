@@ -88,12 +88,19 @@ risks signing breakage). Every PR merged to `main` ships as a new release.
   enforces this: CI runs it on every PR, and `.githooks/pre-push` runs it
   before pushing a branch (enable once per clone with
   `git config core.hooksPath .githooks`).
-- **After the PR merges:** release from an up-to-date `main`:
+- **After the PR merges, cutting the release is Claude's job.** Don't
+  hand it back to the user. If you merge the PR, release right after. If
+  you opened it, check `gh pr view <n> --json state` when you next act
+  and release once it reads `MERGED`. If the user tells you it merged,
+  release then. Release from the merged `main` (detached, so it works in a
+  worktree while `main` is checked out elsewhere):
 
   ```bash
-  git checkout main && git pull --ff-only
+  git fetch origin && git checkout --detach origin/main
   scripts/release.sh
   ```
+
+  Then report the release URL to the user.
 
   `release.sh` builds `aarch64-apple-darwin`, ad-hoc signs, uploads
   `rlord-v<version>-aarch64-apple-darwin.tar.gz`, and creates tag
