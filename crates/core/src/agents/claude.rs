@@ -579,7 +579,7 @@ impl StatsCursor {
 
 /// A sub-agent whose transcript hasn't been written for this long has
 /// stopped, whatever its meta file says.
-const AGENT_QUIET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const AGENT_QUIET: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Transcripts whose read position is remembered (most recently used).
 const STATS_CURSOR_CAP: usize = 1000;
