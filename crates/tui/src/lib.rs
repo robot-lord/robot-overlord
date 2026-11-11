@@ -980,7 +980,8 @@ impl App {
             f.render_widget(Block::default().style(theme::base()), f.area());
         }
         let [bars_area, main_area, footer_area] = RLayout::vertical([
-            Constraint::Length(2),
+            // The header: tabs, then the view, beside the 4-row logo.
+            Constraint::Length(4),
             Constraint::Min(5),
             Constraint::Length(2),
         ])
@@ -2125,7 +2126,7 @@ mod tests {
             println!("{}", out.join("\n"));
         }
         let all = out.join("\n");
-        assert!(all.contains("◆ rlord") && all.contains("● working") && all.contains("#wip"));
+        assert!(all.contains("▲▲▲  rlord") && all.contains("● working") && all.contains("#wip"));
 
         // The groups tab: group column focused.
         app.tab = Tab::Groups;

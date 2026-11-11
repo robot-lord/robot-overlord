@@ -276,15 +276,14 @@ impl App {
                 Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
+        // The logo: a stern robot (dark red) in a crown (dark gold), four
+        // rows tall, beside the name.
+        let (crown, robot, eye) = theme::logo();
+        let red = Style::default().fg(robot);
         let mut top = vec![
-            Span::styled(
-                " ◆ rlord ",
-                Style::default()
-                    .fg(theme::on_accent())
-                    .bg(theme::accent())
-                    .bold(),
-            ),
-            Span::raw("  "),
+            Span::styled("  ▲▲▲ ", Style::default().fg(crown)),
+            Span::styled(" rlord", red.bold()),
+            Span::raw("   "),
         ];
         top.extend(tab(Tab::Sessions, self.all.len()));
         top.push(Span::raw(" "));
@@ -306,7 +305,14 @@ impl App {
             }
         }
 
-        let mut view = vec![Span::raw(" "), Span::styled("⌕ ", theme::muted())];
+        let mut view = vec![
+            Span::styled(" ▐", red),
+            Span::styled("◥ ◤", Style::default().fg(eye)),
+            Span::styled("▌", red),
+            // Under the tabs: past the name.
+            Span::raw("          "),
+            Span::styled("⌕ ", theme::muted()),
+        ];
         if self.filter.trim().is_empty() {
             view.push(Span::styled("search", theme::faint()));
         } else {
@@ -339,8 +345,14 @@ impl App {
         });
         view.push(Span::raw(" "));
         view.push(key(Action::ToggleArchived));
+        let mouth = Line::from(vec![
+            Span::styled(" ▐ ", red),
+            Span::styled("▬", Style::default().fg(eye)),
+            Span::styled(" ▌", red),
+        ]);
+        let chin = Line::from(Span::styled(" ▝▀▀▀▘", red));
         f.render_widget(
-            Paragraph::new(vec![Line::from(top), Line::from(view)]),
+            Paragraph::new(vec![Line::from(top), Line::from(view), mouth, chin]),
             area,
         );
     }
