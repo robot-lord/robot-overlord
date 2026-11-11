@@ -96,28 +96,55 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
     {
         text.push_str(&format!("\ncontext:\n{c}"));
     }
+    // Switch the user first, so they watch the mastermind start and pick
+    // the request up (a first start can take a while), then deliver it.
+    let note = show_mastermind(d);
     send_to(d, &overlord::MASTERMIND, &text)?;
-    // Switch the user's overlay to the mastermind if they're in one; if
-    // they've moved on, don't pop it up over whatever they're doing now.
+    Ok(json!({"handed_off": true, "note": note}))
+}
+
+/// Show the mastermind where the user is: switch their open overlay, or a
+/// terminal showing the overlord full screen. Returns a note for the
+/// overlord about what the user now sees.
+fn show_mastermind(d: &Daemon) -> String {
     let client = d
         .overlay
         .lock()
         .expect("ui mutex")
         .as_ref()
         .map(|(c, _)| c.clone());
-    let Some(client) = client else {
-        return Ok(json!({"handed_off": true,
-            "note": "delivered; the user isn't in the overlay: tell them Option-M (in the overlay) or the list shows the mastermind"}));
-    };
-    // The overlord's overlay is about to be replaced (killed before its own
-    // cleanup): give its window its size back first.
-    let _ = rlord_core::tmux::auto_size_window(overlord::FRONT.tmux);
-    let p = json!({"seat": overlord::MASTERMIND.key, "show": true, "client": client});
-    match crate::ui::overlord(d, &p) {
-        Ok(_) => Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"})),
-        Err(e) => Ok(json!({"handed_off": true,
-            "note": format!("delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M in the overlay")})),
+    if let Some(client) = client {
+        // The overlord's overlay is about to be replaced (killed before its
+        // own cleanup): give its window its size back first.
+        let _ = rlord_core::tmux::auto_size_window(overlord::FRONT.tmux);
+        let p = json!({"seat": overlord::MASTERMIND.key, "show": true, "client": client});
+        return match crate::ui::overlord(d, &p) {
+            Ok(_) => "the user now sees the mastermind".into(),
+            Err(e) => format!(
+                "delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M in the overlay"
+            ),
+        };
     }
+    // Full screen on the overlord: move that terminal to the mastermind.
+    let on_front = rlord_core::tmux::list_clients()
+        .iter()
+        .any(|c| c.session == overlord::FRONT.tmux);
+    if on_front {
+        if let Ok(Some(m)) = overlord::MASTERMIND.session(&d.db()).and_then(|m| match m {
+            Some(m) => Ok(Some(m)),
+            None => overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))
+                .map(|v| v["id"].as_str().map(str::to_string))
+                .and_then(|id| match id {
+                    Some(id) => d.db().resolve_ref(&id).map(Some),
+                    None => Ok(None),
+                }),
+        }) {
+            if crate::ui::goto(d, &json!({"ref": m.id})).is_ok() {
+                return "the user now sees the mastermind (full screen)".into();
+            }
+        }
+    }
+    "delivered; the user isn't looking at the overlord: tell them the mastermind has it (the list's ↳ mastermind row)".into()
 }
 
 /// The `[rlord new-session request]` message. Hints say whether the user

@@ -713,7 +713,16 @@ impl App {
         // Sent in the background: a first-time mastermind can take a while
         // to start, and the list must not freeze meanwhile. Its overlay opens
         // now, so the user watches it pick the request up.
-        if f.prompt.trim().is_empty() {
+        // What can fail fast is checked here, so the form stays open with
+        // the error (no overlord set up yet).
+        let exists = self
+            .call("overlord.status", Value::Null)
+            .is_some_and(|st| st["exists"] == true);
+        if !exists {
+            f.error = Some(format!(
+                "no overlord yet: press {} to set it up (or N for the manual form)",
+                self.keys.label(Action::Overlord)
+            ));
             return Ok(Some(f));
         }
         std::thread::spawn(move || {

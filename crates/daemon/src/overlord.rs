@@ -345,8 +345,18 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
         return Ok(());
     }
-    // Its last turn asked the user something (a question, or a form to
-    // confirm): it's waiting on them, whatever the status says.
+    // Its turn must really be over: the transcript ends in a final reply
+    // (not a pending tool call, e.g. a permission prompt mid-turn)...
+    let ended = d
+        .db()
+        .transcript_source(&s.id)?
+        .and_then(|p| rlord_core::agents::claude::transcript_stats(std::path::Path::new(&p)))
+        .is_some_and(|st| st.ended);
+    if !ended {
+        return Ok(());
+    }
+    // ...and that reply didn't ask the user something (a question, or a form
+    // to confirm): then it's waiting on them, whatever the status says.
     if waiting_on_user(d, &s)? {
         return Ok(());
     }
@@ -502,7 +512,9 @@ pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         "model_changed",
         &json!({"from": s.model, "to": model}).to_string(),
     )?;
-    write_files(seat, cfg)?;
+    // Current flags too (an effort change applies with the switch).
+    spec["extra_args"] = json!(write_files(seat, cfg)?);
+    db.set_launch_spec(&s.id, &spec.to_string())?;
     methods::session_restart(db, &json!({"ref": s.id}))?;
     ensure(db, cfg, &json!({"seat": seat.key}))
 }

@@ -376,11 +376,10 @@ impl Daemon {
         let r = match method {
             "overlord.ensure" => {
                 let r = overlord::ensure(&self.db(), &self.config, params);
-                if let Ok(v) = &r {
+                // (ensure syncs the seat's tmux keys itself.)
+                if r.is_ok() {
                     self.changed();
                     self.bind_nav_keys();
-                    // (ensure syncs the seat's tmux keys itself.)
-                    let _ = v;
                 }
                 r
             }
