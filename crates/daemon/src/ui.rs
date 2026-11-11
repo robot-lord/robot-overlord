@@ -420,9 +420,22 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
     let norm = |k: &str, v: Option<&Value>| -> Option<Value> {
         let v = v?.clone();
         Some(match (k, &v) {
+            // The same place however it's spelled: a repo by its main root
+            // (a worktree or symlink of it is the same repo), a folder by
+            // its real path.
             ("repo", Value::String(r)) => match r.strip_suffix(FOLDER) {
-                Some(f) => json!(format!("{}{FOLDER}", f.trim_end_matches('/'))),
-                None => json!(r.trim_end_matches('/')),
+                Some(f) => {
+                    let f = f.trim_end_matches('/');
+                    let real = std::fs::canonicalize(f)
+                        .ok()
+                        .and_then(|p| p.to_str().map(str::to_string))
+                        .unwrap_or_else(|| f.to_string());
+                    json!(format!("{real}{FOLDER}"))
+                }
+                None => {
+                    let r = r.trim_end_matches('/');
+                    json!(rlord_core::git::main_repo_root(r).unwrap_or_else(|| r.to_string()))
+                }
             },
             ("tags", Value::Array(a)) => {
                 let mut t: Vec<String> = a
@@ -436,7 +449,11 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
             _ => v,
         })
     };
+    // A plain folder forced the worktree off: that value was nobody's
+    // choice, so it can't make a later one look like a default.
+    let prev_folder = prev["repo"].as_str().is_some_and(|r| r.ends_with(FOLDER));
     let prev_value = |k: &str| match k {
+        "worktree" if prev_folder => None,
         "worktree" => norm(k, prev.get("workspace")),
         _ => norm(k, prev.get(k)),
     };
