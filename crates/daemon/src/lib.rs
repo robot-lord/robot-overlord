@@ -1,4 +1,5 @@
 pub mod ask;
+pub mod autostart;
 pub mod mcp;
 pub mod methods;
 pub mod overlord;
@@ -421,7 +422,7 @@ pub fn build_id() -> u64 {
 }
 
 /// Blocking one-shot client used by the CLI: connect, send one request, read one response.
-pub fn client_call(socket_path: &PathBuf, method: &str, params: Value) -> Result<Value> {
+pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Value> {
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path).with_context(|| {
         format!(

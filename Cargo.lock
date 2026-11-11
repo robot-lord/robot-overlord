@@ -792,6 +792,7 @@ name = "rlord-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rlord-core",
  "serde",
  "serde_json",

@@ -41,7 +41,7 @@ first for the evidence behind the choices here.
 ```
 
 One cargo workspace, one installed binary `rlord` with subcommands; the
-daemon is `rlord daemon` (run as a launchd user agent). Crates:
+daemon is `rlord daemon` (started on demand by the first client that needs it, or by an optional launchd user agent). Crates:
 
 - `rlord-core` — domain types, state store, event log, status engine,
   mailbox, adapter trait + claude/codex adapters, tmux supervisor.
