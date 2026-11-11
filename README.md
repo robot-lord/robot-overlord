@@ -329,8 +329,9 @@ writes a commented one):
   `catppuccin-latte`, `tokyonight-night`, `tokyonight-day`, `gruvbox-dark`,
   `gruvbox-light`, `solarized-dark`, `solarized-light`, `nord`, `dracula`.
 
-`rlord`'s own themes use your terminal's background and 256-color palette.
-The others paint their own background and need a truecolor terminal (kitty,
+`rlord-dark` uses your terminal's background; `rlord-light` paints a light
+one, so it reads right even if your terminal stays dark. Both use the
+256-color palette. The others paint their own background and need a truecolor terminal (kitty,
 iTerm2, Ghostty, WezTerm). The overlord's bar and overlay border take the
 theme's accent color. Restart rlord (`rlord reset`) after changing `theme`.
 

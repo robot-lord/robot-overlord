@@ -95,7 +95,10 @@ pub const THEMES: &[Palette] = &[
     Palette {
         name: "rlord-light",
         dark: false,
-        bg: None,
+        // Painted: a terminal left dark while macOS is light (kitty doesn't
+        // follow the system by default) would otherwise show light-theme
+        // text on black.
+        bg: Some(i(255)),
         surface: i(254),
         chip: i(253),
         border: i(250),
