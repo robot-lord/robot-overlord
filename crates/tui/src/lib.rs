@@ -1288,21 +1288,44 @@ impl App {
                 Some("overlord — see dialog".to_string())
             }
         };
-        let line1 = match prompt {
-            Some(p) => Line::from(Span::styled(p, Style::default().fg(Color::Yellow))),
-            None => Line::from(
-                self.keys
-                    .legend()
-                    .into_iter()
-                    .map(|(k, label)| key(k, label))
-                    .collect::<Vec<_>>(),
-            ),
-        };
         let line2 = Line::from(Span::styled(
             self.status_line.clone(),
             Style::default().fg(Color::Gray),
         ));
-        f.render_widget(Paragraph::new(vec![line1, line2]), area);
+        let [line1_area, line2_area] =
+            RLayout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        f.render_widget(Paragraph::new(line2), line2_area);
+        if let Some(p) = prompt {
+            let line1 = Line::from(Span::styled(p, Style::default().fg(Color::Yellow)));
+            f.render_widget(Paragraph::new(line1), line1_area);
+            return;
+        }
+        // Keys that always work sit on the left; keys for what's highlighted
+        // sit on the right after a divider, and only the ones that apply.
+        let global = Line::from(
+            self.keys
+                .global_legend()
+                .into_iter()
+                .map(|(k, label)| key(k, label))
+                .collect::<Vec<_>>(),
+        );
+        let ctx = self.keys.labelled(&context_legend(
+            self.tab == Tab::Groups && self.group_focus,
+            self.group_sel.as_deref(),
+            self.selected(),
+        ));
+        if ctx.is_empty() {
+            f.render_widget(Paragraph::new(global), line1_area);
+            return;
+        }
+        let mut spans = vec![Span::raw("│ ").fg(Color::DarkGray)];
+        spans.extend(ctx.into_iter().map(|(k, label)| key(k, label)));
+        let ctx = Line::from(spans);
+        let [left, right] =
+            RLayout::horizontal([Constraint::Min(0), Constraint::Length(ctx.width() as u16)])
+                .areas(line1_area);
+        f.render_widget(Paragraph::new(global), left);
+        f.render_widget(Paragraph::new(ctx), right);
     }
 }
 
@@ -1522,30 +1545,76 @@ impl KeyMap {
             .unwrap_or_default()
     }
 
-    fn legend(&self) -> Vec<(String, &'static str)> {
-        [
+    /// Keys that work whatever is highlighted.
+    fn global_legend(&self) -> Vec<(String, &'static str)> {
+        self.labelled(&[
             (Action::Overlord, "overlord"),
             (Action::SwitchTab, "sessions/groups"),
-            (Action::Attach, "attach"),
             (Action::New, "new"),
             (Action::NewManual, "new (manual)"),
-            (Action::Restart, "restart"),
-            (Action::Stop, "stop"),
-            (Action::Archive, "archive"),
-            (Action::Unarchive, "unarchive"),
-            (Action::Rename, "rename"),
-            (Action::Pin, "pin"),
-            (Action::Tags, "tags"),
             (Action::ReverseSort, "reverse"),
             (Action::ToggleLog, "log"),
-            (Action::Describe, "describe"),
-            (Action::Notes, "notes"),
             (Action::Quit, "quit"),
-        ]
-        .into_iter()
-        .map(|(a, l)| (self.label(a), l))
-        .collect()
+        ])
     }
+
+    fn labelled(&self, actions: &[(Action, &'static str)]) -> Vec<(String, &'static str)> {
+        actions.iter().map(|&(a, l)| (self.label(a), l)).collect()
+    }
+}
+
+/// Keys that apply to what's highlighted, in footer order: a group (groups
+/// tab, group column focused) or a session row. Only what the handler would
+/// actually do for that row is listed: archive xor unarchive, stop only
+/// while running, nothing the overlord refuses.
+fn context_legend(
+    group_focus: bool,
+    group: Option<&str>,
+    session: Option<&Value>,
+) -> Vec<(Action, &'static str)> {
+    if group_focus {
+        let mut v = Vec::new();
+        if let Some(g) = group {
+            v.push((Action::Attach, "open"));
+            if g != groups::UNTAGGED {
+                v.push((Action::Rename, "rename group"));
+            }
+        }
+        return v;
+    }
+    let Some(s) = session else {
+        return Vec::new();
+    };
+    let overlord = s["role"] == "overlord";
+    let stopped = s["status"] == "stopped" || s["status"].is_null();
+    let archived = !s["archived_at"].is_null();
+    let mut v = vec![(Action::Attach, if stopped { "resume" } else { "attach" })];
+    if !stopped {
+        if s["agent"] == "claude" && !s["agent_session"].is_null() {
+            v.push((Action::Restart, "restart"));
+        }
+        v.push((Action::Stop, "stop"));
+    }
+    if archived {
+        v.push((Action::Unarchive, "unarchive"));
+    } else if !overlord {
+        v.push((Action::Archive, "archive"));
+    }
+    v.push((Action::Rename, "rename"));
+    v.push((
+        Action::Pin,
+        if s["pinned"].as_bool().unwrap_or(false) {
+            "unpin"
+        } else {
+            "pin"
+        },
+    ));
+    if !overlord {
+        v.push((Action::Tags, "tags"));
+    }
+    v.push((Action::Describe, "describe"));
+    v.push((Action::Notes, "notes"));
+    v
 }
 
 #[cfg(test)]
@@ -1563,6 +1632,58 @@ mod tests {
         assert!(KeyBinding::parse("alt-tab").unwrap().alt);
         assert!(KeyBinding::parse("bogus-key").is_err());
         assert!(KeyMap::from_config(&Keys::default()).is_ok());
+    }
+
+    fn labels(v: &[(Action, &str)]) -> Vec<String> {
+        v.iter().map(|(_, l)| l.to_string()).collect()
+    }
+
+    #[test]
+    fn context_legend_lists_only_what_applies() {
+        let running = json!({"status": "working", "agent": "claude", "agent_session": "x",
+                             "archived_at": null, "pinned": false, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&running))),
+            ["attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe", "notes"]
+        );
+        let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
+                              "archived_at": 1, "pinned": true, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&archived))),
+            ["resume", "unarchive", "rename", "unpin", "tags", "describe", "notes"]
+        );
+        let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
+                              "archived_at": null, "pinned": false, "role": "overlord"});
+        let l = labels(&context_legend(false, None, Some(&overlord)));
+        assert!(!l.contains(&"archive".into()) && !l.contains(&"tags".into()));
+        assert!(context_legend(false, None, None).is_empty());
+        assert_eq!(
+            labels(&context_legend(true, Some("wip"), Some(&running))),
+            ["open", "rename group"]
+        );
+        assert_eq!(labels(&context_legend(true, Some(groups::UNTAGGED), None)), ["open"]);
+    }
+
+    #[test]
+    fn footer_puts_contextual_keys_right_of_a_divider() {
+        use ratatui::backend::TestBackend;
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![json!({"status": "stopped", "archived_at": 1, "pinned": false,
+                                   "role": "", "agent": "claude"})];
+        app.table.select(Some(0));
+        let mut term = ratatui::Terminal::new(TestBackend::new(220, 2)).unwrap();
+        term.draw(|f| app.draw_footer(f, f.area())).unwrap();
+        let row: String = (0..220)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        let row = row.trim_end();
+        let (left, right) = row.split_once('│').expect("divider");
+        assert!(left.contains(":new ") && left.contains(":quit "), "{row}");
+        assert!(right.contains(":unarchive ") && right.contains(":resume "), "{row}");
+        assert!(!row.contains(":archive ") && !row.contains(":stop "), "{row}");
+        assert!(row.len() > 200, "contextual keys sit at the right edge: {row}");
     }
 }
 
