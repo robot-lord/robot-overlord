@@ -482,7 +482,7 @@ impl App {
                             self.handle_input(k, buf, InputKind::RenameGroup, terminal)?
                         }
                         Mode::NewSession(form) => {
-                            if let Some(form) = self.handle_form(k, form)? {
+                            if let Some(form) = self.handle_form(k, form, terminal)? {
                                 self.mode = Mode::NewSession(form);
                             }
                         }
@@ -858,25 +858,8 @@ impl App {
         };
         let id = s["id"].as_str().unwrap_or("").to_string();
         let current = s["notes"].as_str().unwrap_or("").to_string();
-        let dir = std::env::temp_dir().join("rlord-notes");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{id}.md"));
-        std::fs::write(&path, &current)?;
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".into());
-        restore_terminal();
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$1\""))
-            .arg("rlord")
-            .arg(&path)
-            .status();
-        *terminal = init_terminal();
-        terminal.clear()?;
-        match status {
-            Ok(st) if st.success() => {
-                let new = std::fs::read_to_string(&path).unwrap_or_default();
+        match edit_in_editor(terminal, &format!("notes-{id}.md"), &current)? {
+            Ok(new) => {
                 if new.trim_end() != current.trim_end() {
                     self.call("session.notes", json!({"ref": id, "notes": new}));
                     self.status_line = "notes saved".into();
@@ -884,10 +867,8 @@ impl App {
                     self.status_line = "notes unchanged".into();
                 }
             }
-            Ok(_) => self.status_line = "editor exited with error; notes not saved".into(),
-            Err(e) => self.status_line = format!("could not run editor '{editor}': {e}"),
+            Err(why) => self.status_line = format!("{why}; notes not saved"),
         }
-        let _ = std::fs::remove_file(&path);
         self.dirty = true;
         Ok(())
     }
@@ -1561,6 +1542,39 @@ fn updated_at(s: &Value) -> Option<i64> {
     .iter()
     .filter_map(|k| s[*k].as_i64())
     .max()
+}
+
+/// Edit `text` in the user's `$VISUAL` / `$EDITOR` (vi if unset): the TUI
+/// hands the terminal over and takes it back after. Ok(new text), or
+/// Err(why it wasn't saved) when the editor failed or couldn't start.
+fn edit_in_editor(
+    terminal: &mut DefaultTerminal,
+    file: &str,
+    text: &str,
+) -> Result<std::result::Result<String, String>> {
+    let dir = std::env::temp_dir().join("rlord-edit");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(file);
+    std::fs::write(&path, text)?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    restore_terminal();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("rlord")
+        .arg(&path)
+        .status();
+    *terminal = init_terminal();
+    terminal.clear()?;
+    let r = match status {
+        Ok(st) if st.success() => Ok(std::fs::read_to_string(&path).unwrap_or_default()),
+        Ok(_) => Err("editor exited with an error".to_string()),
+        Err(e) => Err(format!("could not run editor '{editor}': {e}")),
+    };
+    let _ = std::fs::remove_file(&path);
+    Ok(r)
 }
 
 /// The overlord's rows (overlord, mastermind): fixed, special rows.

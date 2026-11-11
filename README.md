@@ -142,6 +142,10 @@ the real UI you're looking at):
   list (`set_list_view`, groups), edit names, tags, notes and descriptions,
   answer from rlord's data ("what's waiting on me?"), and run the tidy and
   import passes. Anything that needs thought, it hands off (`hand_off`).
+- **Starting a session**: just tell the overlord ("start a session in ai to
+  fix the flaky login tests"). The list's `n` form is a thin wrapper around
+  the same thing, with optional hints; `ctrl-e` in it opens the description in
+  your `$EDITOR` (e.g. vim).
 - **↳ Mastermind (Option-M inside the overlay)**: the overlord's deeper half on a strong model
   (`opus`, medium effort, by default). It launches sessions (the list's `n`
   form goes straight to it; describe → confirm via `confirm_new_session`) and

@@ -391,6 +391,7 @@ impl App {
         &mut self,
         k: ratatui::crossterm::event::KeyEvent,
         mut f: Box<NewForm>,
+        terminal: &mut DefaultTerminal,
     ) -> Result<Option<Box<NewForm>>> {
         let code = k.code;
         // --- a text prompt (other repo path / folder) is open ---
@@ -533,6 +534,23 @@ impl App {
         let shift_enter = code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT);
         if shift_enter || (ctrl && code == KeyCode::Char('s')) {
             return self.submit_form(f);
+        }
+        // ctrl-e: edit the description (or the manual form's prompt) in
+        // $EDITOR, e.g. your vim; it comes back into the box.
+        if ctrl && code == KeyCode::Char('e') && f.fields().contains(&Field::Prompt) {
+            match edit_in_editor(terminal, "new-session.md", &f.prompt)? {
+                Ok(text) => {
+                    f.prompt = text.trim_end().to_string();
+                    f.error = None;
+                }
+                Err(why) => f.error = Some(why),
+            }
+            f.focus = f
+                .fields()
+                .iter()
+                .position(|x| *x == Field::Prompt)
+                .unwrap_or(0);
+            return Ok(Some(f));
         }
         let next = |f: &mut NewForm| f.focus = (f.focus + 1) % n;
         let prev = |f: &mut NewForm| f.focus = (f.focus + n - 1) % n;
@@ -779,7 +797,7 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 24), "New session"),
+            FormKind::Overlord => (centered(f.area(), 82, 27), "New session"),
             FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
         };
         f.render_widget(Clear, area);
@@ -837,7 +855,8 @@ impl App {
         }
 
         if form.kind == FormKind::Overlord {
-            draw_describe_form(f, inner, form);
+            let overlord_key = tmux::key_label(&self.config.tmux.overlord);
+            draw_describe_form(f, inner, form, &overlord_key);
             return;
         }
         let mut lines: Vec<Line> = Vec::new();
@@ -893,7 +912,7 @@ impl App {
             };
             let line = if *field == Field::Launch {
                 let label = match form.kind {
-                    FormKind::Overlord => "Send to overlord",
+                    FormKind::Overlord => "Send to mastermind",
                     FormKind::Manual => "Launch",
                 };
                 Line::from(vec![
@@ -957,7 +976,7 @@ impl App {
 
 /// The overlord form: a description box up top (the part that matters),
 /// then the optional hints, visibly secondary, then send.
-fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
+fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: &str) {
     let dim = theme::faint();
     let gray = theme::muted();
     let accent = Style::default().fg(theme::accent());
@@ -984,12 +1003,27 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
             accent,
         ))),
         (None, false) => {
+            // This form is a thin wrapper: the intended way to start a session
+            // is to just tell the overlord. Say so, with an example.
+            head.push(Line::from(vec![
+                Span::styled("  Tip: ", Style::default().fg(theme::accent()).bold()),
+                Span::styled("you don't need this form. Press ", gray),
+                Span::styled(
+                    format!(" {overlord_key} "),
+                    Style::default().fg(theme::text()).bg(theme::chip()).bold(),
+                ),
+                Span::styled(" and just say it:", gray),
+            ]));
             head.push(Line::from(Span::styled(
-                "  Describe it in your own words. The overlord names the session,",
+                "  \"start a session in ai to fix the flaky login tests\"",
+                Style::default().fg(theme::text()).italic(),
+            )));
+            head.push(Line::from(Span::styled(
+                "  This form sends the same thing (with optional hints) to the overlord's",
                 gray,
             )));
             head.push(Line::from(Span::styled(
-                "  writes its prompt and launches it.",
+                "  mastermind, which names the session, writes its prompt and launches it.",
                 gray,
             )));
         }
@@ -1141,7 +1175,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     let send = if form.confirmed {
         " Launch "
     } else {
-        " Send to overlord "
+        " Send to mastermind "
     };
     lines.push(Line::from(vec![
         Span::raw(if send_focused { "  ▶ " } else { "    " }),
@@ -1168,6 +1202,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     lines.push(keys_line(&[
         ("shift-enter", "send", Cap::Context),
         ("enter", enter, Cap::Global),
+        ("^E", "editor", Cap::Global),
         ("tab", "move", Cap::Global),
         ("esc", "cancel", Cap::Global),
     ]));
@@ -1261,7 +1296,7 @@ mod tests {
         };
         assert!(at("What should this session do?") < at("Optional hints"));
         assert!(out.contains("your description wins"));
-        assert!(out.contains("Send to overlord"));
+        assert!(out.contains("Send to mastermind"));
         assert!(!out.contains("Request"));
 
         // Reopened by the overlord: its note, updated hints marked.

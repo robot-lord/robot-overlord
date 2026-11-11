@@ -757,7 +757,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rlord"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "rlord-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "rlord-daemon"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "rlord-tui"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
