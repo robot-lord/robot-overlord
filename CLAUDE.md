@@ -100,6 +100,14 @@ fields with defaults, a `confirm_*` MCP tool that reopens the form, and
 list (`tui/src/newform.rs`, `confirm_new_session`, `ask::format_request`).
 A manual form (`N`) can exist alongside it for users who want no overlord.
 
+## Review every PR before it merges
+
+After opening a PR (and after pushing more to it before merge), run the
+Claude Code review on it: `/code-review <PR number>`. Fix what's real,
+push, and say in one line per finding what was fixed or why it wasn't.
+Only then merge (when the user has said to). Don't merge a PR the review
+hasn't seen.
+
 ## Releases: build locally after every merge to main
 
 Binaries are built on this Mac and uploaded to GitHub Releases. There is no

@@ -232,6 +232,10 @@ enum Command {
         /// Don't ask for confirmation (--hard)
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Also re-read every sub-agent transcript from the start (saved read
+        /// positions and token totals are recounted)
+        #[arg(long)]
+        rescan: bool,
     },
     /// MCP server over stdio (what the overlord's agent connects to)
     #[command(hide = true)]
@@ -419,7 +423,7 @@ fn main() -> Result<()> {
         }
         Command::Mcp => mcp_stdio(),
         Command::Update { tag, force } => update(tag, force),
-        Command::Reset { hard, yes } => reset(hard, yes),
+        Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
         Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
@@ -1191,7 +1195,7 @@ fn nav_overlord() -> Result<()> {
 }
 
 /// `rlord reset [--hard]`.
-fn reset(hard: bool, yes: bool) -> Result<()> {
+fn reset(hard: bool, yes: bool, rescan: bool) -> Result<()> {
     if hard {
         let running = call("session.list", json!({"archived": "live"}))
             .ok()
@@ -1225,7 +1229,7 @@ fn reset(hard: bool, yes: bool) -> Result<()> {
         }
     }
     restart_daemon()?;
-    let r = call("admin.reset", json!({}))?;
+    let r = call("admin.reset", json!({"rescan": rescan}))?;
     println!(
         "daemon restarted · {} session(s) running, {} stopped (resumable)",
         r["running"], r["stopped"]

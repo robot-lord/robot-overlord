@@ -340,6 +340,12 @@ one, so it reads right even if your terminal stays dark. Both use the
 iTerm2, Ghostty, WezTerm). The overlord's bar and overlay border take the
 theme's accent color. Restart rlord (`rlord reset`) after changing `theme`.
 
+**Unstick or recount:** `rlord reset` restarts the daemon and reloads the
+list and tmux config (agent sessions keep running). `--rescan` also
+re-reads every sub-agent transcript from the start: rlord saves how far it
+has read each one and reads forward after that, so this is only needed if
+counts look wrong.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its

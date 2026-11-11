@@ -190,8 +190,15 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
 /// Post-restart cleanup for `rlord reset`: close overlays, drop parked UI
 /// commands, resync session state with tmux, re-apply rlord's tmux config and
 /// key bindings, and restart the list (if it's open) so it starts fresh.
-pub fn reset(d: &Daemon) -> Result<Value> {
+pub fn reset(d: &Daemon, params: &Value) -> Result<Value> {
     hide_overlord(d);
+    // `--rescan`: forget every transcript read position and recount
+    // sub-agent totals from the transcripts (after parsing changes, or if
+    // numbers look wrong).
+    if params["rescan"].as_bool() == Some(true) {
+        d.db().clear_transcript_cursors()?;
+        rlord_core::agents::claude::clear_cursors();
+    }
     *d.pending_ui.lock().expect("ui mutex") = None;
     methods::reconcile(&d.db())?;
     let _ = tmux::source_conf();

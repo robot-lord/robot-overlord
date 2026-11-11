@@ -1,4 +1,5 @@
-use std::path::Path;
+use crate::agents::claude::CursorState;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,6 +13,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_description_notes.sql"),
     include_str!("../migrations/0004_subagents.sql"),
     include_str!("../migrations/0005_overlord.sql"),
+    include_str!("../migrations/0006_transcript_cursors.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
@@ -562,8 +564,68 @@ impl Db {
         )? as usize)
     }
 
-    /// Rename a tag on every session (merging into `to` where it exists).
-    /// Returns how many sessions carried it.
+    // ---- transcript read positions ----
+
+    pub fn transcript_cursors(&self) -> Result<Vec<(PathBuf, CursorState)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended \
+             FROM transcript_cursors",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                PathBuf::from(r.get::<_, String>(0)?),
+                CursorState {
+                    ino: r.get::<_, i64>(1)? as u64,
+                    offset: r.get::<_, i64>(2)? as u64,
+                    input_tokens: r.get(3)?,
+                    output_tokens: r.get(4)?,
+                    first: r.get(5)?,
+                    last: r.get(6)?,
+                    ended: r.get::<_, i64>(7)? != 0,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Save moved positions (one transaction).
+    pub fn save_transcript_cursors(&self, cursors: &[(PathBuf, CursorState)]) -> Result<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (p, c) in cursors {
+            tx.execute(
+                "INSERT OR REPLACE INTO transcript_cursors \
+                   (path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    p.to_string_lossy(),
+                    c.ino as i64,
+                    c.offset as i64,
+                    c.input_tokens,
+                    c.output_tokens,
+                    c.first,
+                    c.last,
+                    c.ended as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forget all read positions and sub-agent token totals, so everything
+    /// is recounted from the transcripts (`rlord reset --rescan`).
+    pub fn clear_transcript_cursors(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM transcript_cursors", [])?;
+        self.conn.execute(
+            "UPDATE subagents SET input_tokens = 0, output_tokens = 0",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// The user's favourite groups, in their order (top of the group list).
     pub fn group_order(&self) -> Result<Vec<String>> {
         Ok(self
@@ -585,6 +647,8 @@ impl Db {
         Ok(out)
     }
 
+    /// Rename a tag on every session (merging into `to` where it exists).
+    /// Returns how many sessions carried it.
     pub fn rename_tag(&self, from: &str, to: &str) -> Result<usize> {
         if from == to {
             // Nothing to move; the DELETE below would drop the tag everywhere.
@@ -1041,9 +1105,33 @@ mod tests {
     }
 
     #[test]
+    fn transcript_cursors_round_trip_and_clear() {
+        let db = Db::open_in_memory().unwrap();
+        let c = CursorState {
+            ino: 7,
+            offset: 1234,
+            input_tokens: 10,
+            output_tokens: 2,
+            first: Some(1),
+            last: Some(9),
+            ended: true,
+        };
+        db.save_transcript_cursors(&[(PathBuf::from("/t/a.jsonl"), c.clone())])
+            .unwrap();
+        db.save_transcript_cursors(&[(PathBuf::from("/t/a.jsonl"), c.clone())])
+            .unwrap();
+        assert_eq!(
+            db.transcript_cursors().unwrap(),
+            vec![(PathBuf::from("/t/a.jsonl"), c)]
+        );
+        db.clear_transcript_cursors().unwrap();
+        assert!(db.transcript_cursors().unwrap().is_empty());
+    }
+
+    #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
         for table in [
             "sessions",
             "tags",
@@ -1071,7 +1159,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]

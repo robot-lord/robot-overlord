@@ -471,6 +471,7 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
         let cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
         cursors.get(path).cloned().unwrap_or_default()
     };
+    let before = (c.ino, c.offset);
     if c.ino != ino || len < c.offset {
         c = StatsCursor {
             ino,
@@ -520,6 +521,9 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     let mut stats = c.stats();
     stats.modified = modified;
     c.used = std::time::Instant::now();
+    if (c.ino, c.offset) != before {
+        c.dirty = true;
+    }
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     cursors.insert(path.to_path_buf(), c);
     // Bounded: forget the least recently used files past the cap.
@@ -550,6 +554,8 @@ pub struct TranscriptStats {
 /// How far `transcript_stats` has read a file, and the totals so far.
 #[derive(Clone)]
 struct StatsCursor {
+    /// Moved since last saved (`take_dirty_cursors`).
+    dirty: bool,
     ended: bool,
     ino: u64,
     offset: u64,
@@ -563,6 +569,7 @@ struct StatsCursor {
 impl Default for StatsCursor {
     fn default() -> Self {
         StatsCursor {
+            dirty: false,
             ended: false,
             ino: 0,
             offset: 0,
@@ -586,6 +593,69 @@ impl StatsCursor {
             modified: None,
         }
     }
+}
+
+/// A transcript's read position and totals, as saved in the DB so a
+/// restarted daemon reads forward instead of from the start.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CursorState {
+    pub ino: u64,
+    pub offset: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub first: Option<i64>,
+    pub last: Option<i64>,
+    pub ended: bool,
+}
+
+/// Load saved positions (daemon start). Files already read this run keep
+/// their in-memory position.
+pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
+    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    for (path, st) in saved {
+        cursors.entry(path).or_insert_with(|| StatsCursor {
+            ino: st.ino,
+            offset: st.offset,
+            input: st.input_tokens,
+            output: st.output_tokens,
+            first: st.first,
+            last: st.last,
+            ended: st.ended,
+            ..Default::default()
+        });
+    }
+}
+
+/// Positions that moved since the last call, to save.
+pub fn take_dirty_cursors() -> Vec<(PathBuf, CursorState)> {
+    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    cursors
+        .iter_mut()
+        .filter(|(_, c)| c.dirty)
+        .map(|(p, c)| {
+            c.dirty = false;
+            (
+                p.clone(),
+                CursorState {
+                    ino: c.ino,
+                    offset: c.offset,
+                    input_tokens: c.input,
+                    output_tokens: c.output,
+                    first: c.first,
+                    last: c.last,
+                    ended: c.ended,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Forget every position: the next reads start from the top (`--rescan`).
+pub fn clear_cursors() {
+    STATS_CURSORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// A sub-agent whose transcript hasn't been written for this long has
