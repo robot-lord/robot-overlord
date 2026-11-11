@@ -272,9 +272,10 @@ impl App {
         };
         // The logo: a stern robot (dark red, heavy outline) with a crown
         // (dark gold) set into its head, four rows tall. No name beside it: the logo is the brand.
-        let (crown, robot, eye) = theme::logo();
+        let (crown, robot) = theme::logo();
         let red = Style::default().fg(robot);
-        let eyes = Style::default().fg(eye);
+        // Eyes and mouth in the head's red: only the crown is gold.
+        let eyes = red;
         let logo = [
             vec![
                 Span::styled(" ┏", red),
