@@ -34,6 +34,8 @@ pub(crate) struct Upgrade {
     /// Model to switch to; None when switching can't help (the agent CLI
     /// resolves the alias to an old model — it needs updating instead).
     suggest: Option<String>,
+    /// An offer of the seat's default model: esc means "don't ask again".
+    declinable: bool,
     error: Option<String>,
 }
 
@@ -109,11 +111,30 @@ impl App {
             }));
             return;
         }
-        // Either seat on an old model: offer the switch (the overlord first).
+        // Either seat on an old model, or on another model than its default:
+        // offer the switch (the overlord first).
         for (seat, st) in [("overlord", &st), ("mastermind", &st["mastermind"])] {
             let f = &st["freshness"];
             if st["exists"] != true {
                 continue;
+            }
+            if let Some(d) = st["suggest_default"].as_str() {
+                self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
+                    seat: seat.into(),
+                    note: format!(
+                        "it runs {}; rlord's default for the {seat} is now {d}{}",
+                        st["model"].as_str().unwrap_or("?"),
+                        if seat == "overlord" {
+                            " (a fast front desk that hands deeper work to the mastermind)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    suggest: Some(d.to_string()),
+                    declinable: true,
+                    error: None,
+                }));
+                return;
             }
             if f["outdated"] == true {
                 let suggest = f["suggest"]
@@ -124,6 +145,7 @@ impl App {
                     seat: seat.into(),
                     note: f["note"].as_str().unwrap_or("outdated model").to_string(),
                     suggest,
+                    declinable: false,
                     error: None,
                 }));
                 return;
@@ -186,7 +208,16 @@ impl App {
 
     pub(crate) fn handle_upgrade(&mut self, k: KeyEvent, mut u: Box<Upgrade>) {
         match k.code {
-            KeyCode::Esc => self.status_line = "overlord model left as is".into(),
+            KeyCode::Esc => {
+                if u.declinable {
+                    let _ = client_call(
+                        &paths::socket_path(),
+                        "overlord.decline_default",
+                        json!({"seat": u.seat, "model": u.suggest}),
+                    );
+                }
+                self.status_line = format!("{} model left as is", u.seat);
+            }
             KeyCode::Enter => {
                 let r = match &u.suggest {
                     Some(m) => client_call(
@@ -297,9 +328,15 @@ impl App {
     /// `rlord overlay`); the daemon starts it if needed. No overlord yet →
     /// the setup dialog.
     pub(crate) fn show_overlord(&mut self) {
+        self.show_seat("overlord");
+    }
+
+    /// Open an overlord seat (`overlord` / `mastermind`) over this terminal.
+    pub(crate) fn show_seat(&mut self, seat: &str) {
         let params = json!({
             "client": tmux::current_client(),
             "from": tmux::current_session(),
+            "seat": seat,
         });
         self.call("ui.overlord", params);
     }
@@ -407,7 +444,11 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Your overlord is not on the latest model:",
+                if u.seat == "mastermind" {
+                    "  Your mastermind could be on a better model:"
+                } else {
+                    "  Your overlord could be on a better model:"
+                },
                 Style::default().bold(),
             )),
             Line::from(format!("  {}", u.note)),
@@ -424,7 +465,11 @@ impl App {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(theme::modal("◆ Overlord model")),
+                .block(theme::modal(if u.seat == "mastermind" {
+                    "◆ Mastermind model"
+                } else {
+                    "◆ Overlord model"
+                })),
             area,
         );
     }

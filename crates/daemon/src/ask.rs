@@ -73,9 +73,10 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
-    // Any form sent back answers the one the mastermind reopened.
+    let r = send_to(d, &overlord::MASTERMIND, &text)?;
+    // Delivered: it answers any form the mastermind had reopened.
     d.db().kv_set("confirm_pending", "0")?;
-    send_to(d, &overlord::MASTERMIND, &text)
+    Ok(r)
 }
 
 /// `{request, context?}`: the overlord hands a request to the mastermind
@@ -108,6 +109,9 @@ pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
     if let Some(c) = client {
         p["client"] = json!(c);
     }
+    // The overlord's overlay is about to be replaced (killed before its own
+    // cleanup): give its window its size back first.
+    let _ = rlord_core::tmux::auto_size_window(overlord::FRONT.tmux);
     match crate::ui::overlord(d, &p) {
         Ok(_) => Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"})),
         Err(e) => Ok(json!({"handed_off": true,

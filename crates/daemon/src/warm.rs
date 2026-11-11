@@ -78,8 +78,12 @@ pub fn start(d: &Arc<Daemon>) {
     std::thread::spawn(move || {
         let mut since_notify = std::time::Instant::now();
         while let Ok(id) = rx.recv() {
-            if let Err(e) = refresh(&d, &id) {
-                tracing::debug!(session = %id, error = %e, "warming session");
+            // A panic on one session (odd transcript data) must not end the
+            // worker and leave every other session "loading" for good.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh(&d, &id))) {
+                Ok(Err(e)) => tracing::debug!(session = %id, error = %e, "warming session"),
+                Err(_) => tracing::warn!(session = %id, "warming session panicked"),
+                Ok(Ok(_)) => {}
             }
             if let Ok(mut p) = d.warm.pending.lock() {
                 if let Some(n) = p.get_mut(&id) {

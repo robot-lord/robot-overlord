@@ -156,6 +156,13 @@ pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let seat = seat(params["seat"].as_str().unwrap_or(FRONT.key));
     let v = ensure_running(db, cfg, seat, params)?;
     style(cfg);
+    // The user's keys and the window name, on every path that starts a seat
+    // (the mastermind starts lazily from a hand-off, the overlay or goto).
+    if let Some(s) = seat.session(db)? {
+        if let Err(e) = crate::profile::sync(db, cfg, &s, false) {
+            tracing::debug!(error = %e, seat = seat.key, "syncing overlord seat's tmux");
+        }
+    }
     Ok(v)
 }
 
@@ -170,7 +177,7 @@ pub fn color(cfg: &Config) -> String {
 /// looks like any session. Re-run when the theme changes (`overlord.style`).
 pub fn style(cfg: &Config) {
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    let keys = |k: &str| rlord_core::tmux::key_label(k);
+    let keys = |k: &str| rlord_core::tmux::key_label(if k.trim().is_empty() { "M-d" } else { k });
     for (seat, label) in [
         (
             &FRONT,
@@ -298,8 +305,11 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     let Some(s) = MASTERMIND.session(&d.db())? else {
         return Ok(());
     };
-    // Only when it's done with a turn (not working, not waiting on the user).
-    if s.status != Status::Idle || !s.tmux_session.as_deref().is_some_and(tmux::has_session) {
+    // Only between turns: idle, or "waiting for input" (Claude flips an idle
+    // session to that about a minute after its turn). Whether it actually
+    // asked the user something is checked below.
+    let between_turns = matches!(s.status, Status::Idle | Status::WaitingInput);
+    if !between_turns || !s.tmux_session.as_deref().is_some_and(tmux::has_session) {
         return Ok(());
     }
     let now = rlord_core::types::now_ms();
@@ -315,11 +325,6 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     if now - last < (mins as i64) * 60_000 {
         return Ok(());
     }
-    // Its last turn asked the user something (a question, or a form to
-    // confirm): it's waiting on them, whatever the status says.
-    if waiting_on_user(d, &s)? {
-        return Ok(());
-    }
     // Nothing new since the last fresh start: nothing to clear.
     let fresh_at: i64 = d
         .db()
@@ -327,6 +332,11 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
+        return Ok(());
+    }
+    // Its last turn asked the user something (a question, or a form to
+    // confirm): it's waiting on them, whatever the status says.
+    if waiting_on_user(d, &s)? {
         return Ok(());
     }
     // Someone is looking at it: its overlay is open, or a terminal shows it.
@@ -344,7 +354,9 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         let db = d.db();
         // Re-check under the lock: a hand-off may have just landed.
         let cur = MASTERMIND.session(&db)?.context("mastermind vanished")?;
-        if cur.status != Status::Idle || cur.last_user_msg_at != s.last_user_msg_at {
+        if !matches!(cur.status, Status::Idle | Status::WaitingInput)
+            || cur.last_user_msg_at != s.last_user_msg_at
+        {
             return Ok(());
         }
         crate::methods::session_fresh(&db, &json!({"ref": s.id}))?;
@@ -396,6 +408,24 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         out["catalog"] = catalog(&agent);
     }
     out["mastermind"] = seat_status(db, cfg, &MASTERMIND)?;
+    // An overlord created before the two-seat split (or by hand) on another
+    // model than the configured default: offer the default once.
+    for (k, seat) in [("", &FRONT), ("mastermind", &MASTERMIND)] {
+        let st = if k.is_empty() { &mut out } else { &mut out[k] };
+        let (cur, dflt) = (
+            st["model"].as_str().unwrap_or("").to_string(),
+            st["default_model"].as_str().unwrap_or("").to_string(),
+        );
+        let fam = |m: &str| models::parse(m).map(|(f, _)| f);
+        let declined = db.kv_get(&format!("default_declined:{}", seat.key))?;
+        if st["exists"] == true
+            && !dflt.is_empty()
+            && fam(&cur) != fam(&dflt)
+            && declined.as_deref() != Some(dflt.as_str())
+        {
+            st["suggest_default"] = json!(dflt);
+        }
+    }
     Ok(out)
 }
 

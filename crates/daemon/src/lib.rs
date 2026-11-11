@@ -404,6 +404,14 @@ impl Daemon {
                 .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
+            // Don't offer this seat's default model again (the user said no).
+            "overlord.decline_default" => {
+                let seat = overlord::seat(params["seat"].as_str().unwrap_or("overlord"));
+                let m = params["model"].as_str().unwrap_or("");
+                self.db()
+                    .kv_set(&format!("default_declined:{}", seat.key), m)
+                    .map(|_| json!({"declined": m}))
+            }
             "session.subagents" => warm::session_subagents(self, params),
             "overlord.style" => {
                 overlord::style(&self.config);

@@ -1203,7 +1203,9 @@ fn nav_overlord(seat: &str) -> Result<()> {
         json!({"client": tmux::current_client(), "from": tmux::current_session(), "seat": seat}),
     )?;
     if r["overlord"] == "already here" {
-        let _ = tmux::display_message(&format!("you're in the {seat} · ⌥D: back to the list"));
+        let back = Config::load().map(|c| c.tmux.back).unwrap_or_default();
+        let back = tmux::key_label(if back.trim().is_empty() { "M-d" } else { &back });
+        let _ = tmux::display_message(&format!("you're in the {seat} · {back}: back to the list"));
     }
     Ok(())
 }

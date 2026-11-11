@@ -715,9 +715,9 @@ impl App {
                 self.status_line = if f.confirmed {
                     "confirmed — the overlord is launching it".into()
                 } else {
-                    "sent to the overlord".into()
+                    "sent to the mastermind".into()
                 };
-                self.show_overlord();
+                self.show_seat("mastermind");
                 Ok(None)
             }
             Err(e) => {
