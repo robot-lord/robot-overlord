@@ -797,9 +797,9 @@ impl App {
                 Paragraph::new(vec![
                     Line::from(Span::styled(
                         format!("find repo: {}▏", finder.query),
-                        Style::default().fg(theme::YELLOW),
+                        Style::default().fg(theme::yellow()),
                     )),
-                    Line::from(Span::styled(hint, Style::default().fg(theme::MUTED))),
+                    Line::from(Span::styled(hint, Style::default().fg(theme::muted_c()))),
                 ]),
                 q_area,
             );
@@ -871,7 +871,7 @@ impl App {
             };
             let style = if focused {
                 Style::default()
-                    .fg(theme::YELLOW)
+                    .fg(theme::yellow())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -894,7 +894,7 @@ impl App {
                         } else {
                             format!("  {label}  ")
                         },
-                        style.fg(theme::GREEN),
+                        style.fg(theme::green()),
                     ),
                 ])
             } else if *field == Field::Prompt && form.kind == FormKind::Overlord {
@@ -929,7 +929,7 @@ impl App {
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {e}"),
-                Style::default().fg(theme::RED),
+                Style::default().fg(theme::red()),
             )));
         }
         if let Some((kind, buf)) = &form.text_prompt {
@@ -938,7 +938,7 @@ impl App {
             };
             lines.push(Line::from(Span::styled(
                 format!("{label}: {buf}▏   (enter · esc)"),
-                Style::default().fg(theme::YELLOW),
+                Style::default().fg(theme::yellow()),
             )));
         }
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -950,7 +950,7 @@ impl App {
 fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     let dim = theme::faint();
     let gray = theme::muted();
-    let accent = Style::default().fg(theme::ACCENT);
+    let accent = Style::default().fg(theme::accent());
     let focus = |fld: Field| form.current() == fld;
     // Text width inside the box: margins, borders and padding.
     let width = inner.width.saturating_sub(8).max(10) as usize;
@@ -1006,7 +1006,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     .areas(inner);
     f.render_widget(Paragraph::new(head), head_area);
     let label_style = if focus(Field::Prompt) {
-        Style::default().fg(theme::YELLOW).bold()
+        Style::default().fg(theme::yellow()).bold()
     } else {
         Style::default().bold()
     };
@@ -1023,7 +1023,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         ..box_area
     };
     let border = if focus(Field::Prompt) {
-        Style::default().fg(theme::YELLOW)
+        Style::default().fg(theme::yellow())
     } else {
         dim
     };
@@ -1065,7 +1065,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         let focused = focus(fld);
         let changed = form.changed.iter().any(|c| c == key);
         let label_style = if focused {
-            Style::default().fg(theme::YELLOW).bold()
+            Style::default().fg(theme::yellow()).bold()
         } else {
             gray
         };
@@ -1138,9 +1138,12 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         Span::styled(
             send,
             if send_focused {
-                Style::default().fg(Color::Black).bg(theme::GREEN).bold()
+                Style::default()
+                    .fg(theme::on_accent())
+                    .bg(theme::green())
+                    .bold()
             } else {
-                Style::default().fg(theme::GREEN).bold()
+                Style::default().fg(theme::green()).bold()
             },
         ),
     ]));
@@ -1161,7 +1164,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
     if let Some(e) = &form.error {
         lines.push(Line::from(Span::styled(
             format!("  error: {e}"),
-            Style::default().fg(theme::RED),
+            Style::default().fg(theme::red()),
         )));
     }
     if let Some((kind, buf)) = &form.text_prompt {
@@ -1170,7 +1173,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm) {
         };
         lines.push(Line::from(Span::styled(
             format!("  {label}: {buf}▏   (enter · esc)"),
-            Style::default().fg(theme::YELLOW),
+            Style::default().fg(theme::yellow()),
         )));
     }
     f.render_widget(Paragraph::new(lines), rest);

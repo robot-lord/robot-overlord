@@ -317,6 +317,23 @@ The list has two tabs (`Tab` switches):
   - `set_list_view` opens a tab or group (`tab`, `group`) and can save it as
     your default.
 
+## Themes
+
+Set `theme` in `~/.config/robot-overlord/config.toml` (`rlord config init`
+writes a commented one):
+
+- **A family follows your system's light/dark mode**, switching live (checked
+  every few seconds): `rlord` (default), `catppuccin`, `tokyonight`,
+  `gruvbox`, `solarized`.
+- **Or pin one variant:** `rlord-dark`, `rlord-light`, `catppuccin-mocha`,
+  `catppuccin-latte`, `tokyonight-night`, `tokyonight-day`, `gruvbox-dark`,
+  `gruvbox-light`, `solarized-dark`, `solarized-light`, `nord`, `dracula`.
+
+`rlord`'s own themes use your terminal's background and 256-color palette.
+The others paint their own background and need a truecolor terminal (kitty,
+iTerm2, Ghostty, WezTerm). The overlord's bar and overlay border take the
+theme's accent color. Restart rlord (`rlord reset`) after changing `theme`.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its

@@ -344,6 +344,10 @@ impl Daemon {
                 .overlord()
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
+            "overlord.style" => {
+                overlord::style(&self.config);
+                Ok(json!({"styled": true}))
+            }
             "session.import_scan" => import::scan(self, params),
             "session.import" => {
                 let r = import::import(self, params);

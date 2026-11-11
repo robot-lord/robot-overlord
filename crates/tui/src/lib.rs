@@ -10,7 +10,7 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout as RLayout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -154,6 +154,10 @@ struct App {
     status_line: String,
     dirty: bool,
     last_preview: Instant,
+    /// The system's appearance last time we looked (theme families follow
+    /// it), and when that was.
+    dark: bool,
+    last_appearance: Instant,
     /// Whether row 0 is the overlord (shown first when not filtering).
     overlord_row: bool,
     /// Session to select once the next refresh lands (set by the overlord).
@@ -189,6 +193,8 @@ impl App {
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
+            dark: true,
+            last_appearance: Instant::now(),
             overlord_row: false,
             pending_select: None,
             reported_view: Value::Null,
@@ -403,7 +409,9 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         self.startup();
+        self.apply_theme();
         loop {
+            self.follow_appearance();
             if self.dirty {
                 self.refresh();
             } else if self.last_preview.elapsed()
@@ -910,7 +918,33 @@ impl App {
         Ok(())
     }
 
+    /// Pick the palette for config `theme` and the system's appearance.
+    fn apply_theme(&mut self) {
+        self.dark = rlord_core::themes::system_is_dark();
+        self.last_appearance = Instant::now();
+        theme::set(rlord_core::themes::resolve(&self.config.theme, self.dark));
+    }
+
+    /// Theme families follow the system's light/dark mode: check every few
+    /// seconds, switch when it flips (and recolor the overlord's bar).
+    fn follow_appearance(&mut self) {
+        if !rlord_core::themes::follows_system(&self.config.theme)
+            || self.last_appearance.elapsed() < Duration::from_secs(3)
+        {
+            return;
+        }
+        let was = self.dark;
+        self.apply_theme();
+        if self.dark != was {
+            let _ = self.call("overlord.style", Value::Null);
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame) {
+        // Themes with their own background paint it under everything.
+        if theme::bg().is_some() {
+            f.render_widget(Block::default().style(theme::base()), f.area());
+        }
         let [bars_area, main_area, footer_area] = RLayout::vertical([
             Constraint::Length(2),
             Constraint::Min(5),
@@ -1009,17 +1043,17 @@ impl App {
                 let num = i.saturating_sub(usize::from(self.overlord_row));
                 let mut cells = vec![
                     if is_overlord {
-                        Cell::from("◆").fg(theme::OVERLORD)
+                        Cell::from("◆").fg(theme::overlord())
                     } else {
                         Cell::from(if num < 9 {
                             ((b'1' + num as u8) as char).to_string()
                         } else {
                             String::new()
                         })
-                        .fg(theme::FAINT)
+                        .fg(theme::faint_c())
                     },
                     if s["pinned"].as_bool().unwrap_or(false) && !is_overlord {
-                        Cell::from("★").fg(theme::YELLOW)
+                        Cell::from("★").fg(theme::yellow())
                     } else {
                         Cell::from(" ")
                     },
@@ -1031,7 +1065,7 @@ impl App {
                                 0 => String::new(),
                                 n => format!(" ⚙{n}"),
                             },
-                            Style::default().fg(theme::OVERLORD),
+                            Style::default().fg(theme::overlord()),
                         ),
                     ])),
                     Cell::from(Span::styled(rel_age(updated_at(s)), theme::muted())),
@@ -1050,16 +1084,16 @@ impl App {
                             s["model"].as_str().unwrap_or("default model"),
                             self.keys.label(Action::Overlord)
                         ))
-                        .fg(theme::FAINT)
+                        .fg(theme::faint_c())
                     } else {
-                        Cell::from(get("project_path").replacen(&home, "~", 1)).fg(theme::FAINT)
+                        Cell::from(get("project_path").replacen(&home, "~", 1)).fg(theme::faint_c())
                     });
                 }
                 let row = Row::new(cells);
                 if is_overlord {
-                    row.style(Style::default().fg(theme::OVERLORD).bold())
+                    row.style(Style::default().fg(theme::overlord()).bold())
                 } else {
-                    row.style(Style::default().fg(theme::TEXT))
+                    row.style(Style::default().fg(theme::text()))
                 }
             })
             .collect();
@@ -1073,7 +1107,7 @@ impl App {
             .row_highlight_style(theme::selected())
             .highlight_symbol(Span::styled(
                 theme::SELECT_BAR,
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent()),
             ))
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
         f.render_stateful_widget(table, area, &mut self.table);
@@ -1091,7 +1125,7 @@ impl App {
         };
         let title = Line::from(vec![
             Span::raw(" "),
-            Span::styled(name.to_string(), Style::default().fg(theme::TEXT).bold()),
+            Span::styled(name.to_string(), Style::default().fg(theme::text()).bold()),
             Span::styled(format!(" · {what} "), theme::muted()),
         ]);
         let switch =
@@ -1140,7 +1174,7 @@ impl App {
         let mut lines = vec![
             // Headline: name, status, then the description (what it's doing).
             Line::from(vec![
-                Span::styled(get("name"), Style::default().fg(theme::TEXT).bold()),
+                Span::styled(get("name"), Style::default().fg(theme::text()).bold()),
                 Span::raw("   "),
                 theme::status_chip(&status),
                 Span::styled(
@@ -1162,7 +1196,7 @@ impl App {
             } else {
                 Line::from(Span::styled(
                     desc.to_string(),
-                    Style::default().fg(theme::YELLOW),
+                    Style::default().fg(theme::yellow()),
                 ))
             },
             Line::raw(""),
@@ -1182,14 +1216,14 @@ impl App {
                         .as_str()
                         .map(tilde)
                         .unwrap_or_else(|| "none".into()),
-                    Style::default().fg(theme::TEXT),
+                    Style::default().fg(theme::text()),
                 ),
                 Span::styled(
                     s["branch"]
                         .as_str()
                         .map(|b| format!("  ⎇ {b}"))
                         .unwrap_or_default(),
-                    Style::default().fg(theme::CYAN),
+                    Style::default().fg(theme::cyan()),
                 ),
             ]),
             Line::from(vec![
@@ -1198,11 +1232,11 @@ impl App {
             ]),
             Line::from(vec![
                 key("agent"),
-                Span::styled(get("agent"), Style::default().fg(theme::TEXT)),
+                Span::styled(get("agent"), Style::default().fg(theme::text())),
                 sep(),
                 Span::styled(
                     s["model"].as_str().unwrap_or("default model").to_string(),
-                    Style::default().fg(theme::TEXT),
+                    Style::default().fg(theme::text()),
                 ),
                 sep(),
                 Span::styled(format!("id {}", get("id")), theme::faint()),
@@ -1231,7 +1265,7 @@ impl App {
                 key("agents"),
                 Span::styled(
                     format!("{} total · {} running", self.agents.len(), running),
-                    Style::default().fg(theme::OVERLORD),
+                    Style::default().fg(theme::overlord()),
                 ),
             ]));
             // Most recent first; the card has limited rows.
@@ -1241,11 +1275,11 @@ impl App {
                 let (state, style) = match (started, finished) {
                     (Some(st), Some(fi)) => (
                         format!("done {}s", ((fi - st) as f64 / 1000.0).round()),
-                        Style::default().fg(theme::FAINT),
+                        Style::default().fg(theme::faint_c()),
                     ),
                     (Some(st), None) => (
                         format!("running {}", rel_age(Some(st))),
-                        Style::default().fg(theme::GREEN),
+                        Style::default().fg(theme::green()),
                     ),
                     _ => ("?".into(), Style::default()),
                 };
@@ -1256,7 +1290,7 @@ impl App {
                     .next()
                     .unwrap_or("");
                 lines.push(Line::from(vec![
-                    Span::styled("        ⚙ ", Style::default().fg(theme::OVERLORD)),
+                    Span::styled("        ⚙ ", Style::default().fg(theme::overlord())),
                     Span::styled(
                         a["agent_type"].as_str().unwrap_or("?").to_string(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -1269,7 +1303,7 @@ impl App {
                         } else {
                             format!(" ↳ {result}")
                         },
-                        Style::default().fg(theme::FAINT),
+                        Style::default().fg(theme::faint_c()),
                     ),
                 ]));
             }
@@ -1316,7 +1350,7 @@ impl App {
             Line::raw("")
         } else {
             Line::from(vec![
-                Span::styled(" › ", Style::default().fg(theme::ACCENT)),
+                Span::styled(" › ", Style::default().fg(theme::accent())),
                 Span::styled(self.status_line.clone(), theme::muted()),
             ])
         };
@@ -1334,13 +1368,16 @@ impl App {
             if !label.is_empty() {
                 spans.push(Span::styled(
                     format!(" {label} "),
-                    Style::default().fg(Color::Black).bg(theme::YELLOW).bold(),
+                    Style::default()
+                        .fg(theme::on_accent())
+                        .bg(theme::yellow())
+                        .bold(),
                 ));
                 spans.push(Span::raw(" "));
             }
             spans.push(Span::styled(
                 text.to_string(),
-                Style::default().fg(theme::TEXT),
+                Style::default().fg(theme::text()),
             ));
             spans.push(Span::styled(hints.to_string(), theme::faint()));
             f.render_widget(Paragraph::new(Line::from(spans)), line1_area);
@@ -1426,7 +1463,7 @@ enum Cap {
 
 /// The footer's right slot: divider, then the row keys as accent keycaps.
 fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
-    let mut spans = vec![Span::raw("│  ").fg(theme::BORDER)];
+    let mut spans = vec![Span::raw("│  ").fg(theme::border())];
     spans.extend(
         ctx.into_iter()
             .flat_map(|(k, label)| keycap(&k, label, Cap::Context)),
@@ -1460,8 +1497,8 @@ fn keys_line(items: &[(&str, &str, Cap)]) -> Line<'static> {
 /// A key hint as a padded keycap chip, then its label: ` n  new   `.
 fn keycap(k: &str, label: &str, cap: Cap) -> [Span<'static>; 2] {
     let chip = match cap {
-        Cap::Global => Style::default().fg(theme::TEXT).bg(theme::CHIP),
-        Cap::Context => Style::default().fg(Color::Black).bg(theme::ACCENT),
+        Cap::Global => Style::default().fg(theme::text()).bg(theme::chip()),
+        Cap::Context => Style::default().fg(theme::on_accent()).bg(theme::accent()),
     };
     [
         Span::styled(format!(" {k} "), chip.bold()),
@@ -1903,6 +1940,17 @@ mod tests {
             println!("{}", out[..12].join("\n"));
         }
         assert!(out.join("\n").contains("Groups"));
+
+        // Every theme renders; themes with a background paint all of it.
+        for p in rlord_core::themes::THEMES {
+            theme::set(p);
+            term.draw(|f| app.draw(f)).unwrap();
+            if let Some(bg) = p.bg {
+                let corner = &term.backend().buffer()[(w - 1, h - 1)];
+                assert_eq!(corner.bg, theme::color(bg), "{}", p.name);
+            }
+        }
+        theme::set(rlord_core::themes::by_name("rlord-dark").unwrap());
     }
 
     #[test]

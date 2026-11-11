@@ -180,6 +180,7 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         &d.config.overlord.width,
         &d.config.overlord.height,
         " ◆ overlord · ⌥O / ⌥D close ",
+        &format!("fg={}", crate::overlord::color(&d.config)),
         &cmd,
     )?;
     *d.overlay.lock().expect("ui mutex") = Some((client, token));

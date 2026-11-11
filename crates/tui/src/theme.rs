@@ -1,45 +1,86 @@
-//! The TUI's look in one place: a soft 256-color palette, rounded panels
-//! whose border lights up when focused, status chips and tag chips. Every
+//! The TUI's look in one place: the active palette (from config `theme`,
+//! following the system's light/dark mode for theme families), rounded
+//! panels whose border lights up when focused, status and tag chips. Every
 //! view draws through these so the app looks like one thing.
+
+use std::sync::RwLock;
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
+use rlord_core::themes::{self, Palette, Rgb};
 
-pub const ACCENT: Color = Color::Indexed(75); // soft blue
-pub const OVERLORD: Color = Color::Indexed(141); // lavender; the tmux bar and overlay border use colour141 too
-pub const GREEN: Color = Color::Indexed(114);
-pub const YELLOW: Color = Color::Indexed(221);
-pub const RED: Color = Color::Indexed(203);
-pub const CYAN: Color = Color::Indexed(80);
-pub const TEXT: Color = Color::Indexed(252);
-pub const MUTED: Color = Color::Indexed(245);
-pub const FAINT: Color = Color::Indexed(240);
-pub const BORDER: Color = Color::Indexed(238);
-/// Selected row background.
-pub const SURFACE: Color = Color::Indexed(236);
-/// Chip background (tabs, keycaps).
-pub const CHIP: Color = Color::Indexed(237);
+static ACTIVE: RwLock<Option<&'static Palette>> = RwLock::new(None);
+
+/// Switch the palette everything draws with.
+pub fn set(p: &'static Palette) {
+    *ACTIVE.write().expect("theme lock") = Some(p);
+}
+
+pub fn palette() -> &'static Palette {
+    ACTIVE
+        .read()
+        .expect("theme lock")
+        .unwrap_or_else(|| themes::by_name("rlord-dark").expect("built-in theme"))
+}
+
+pub fn color(c: Rgb) -> Color {
+    match c {
+        Rgb::Indexed(n) => Color::Indexed(n),
+        Rgb::Hex(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+macro_rules! colors {
+    ($($f:ident),*) => {$(
+        pub fn $f() -> Color {
+            color(palette().$f)
+        }
+    )*};
+}
+colors!(surface, chip, border, text, on_accent, accent, overlord, green, yellow, red, cyan);
+
+pub fn faint_c() -> Color {
+    color(palette().faint)
+}
+
+pub fn muted_c() -> Color {
+    color(palette().muted)
+}
+
+/// The background to paint, if the theme has one.
+pub fn bg() -> Option<Color> {
+    palette().bg.map(color)
+}
+
+/// Base style: theme text on theme background.
+pub fn base() -> Style {
+    let s = Style::default().fg(text());
+    match bg() {
+        Some(b) => s.bg(b),
+        None => s,
+    }
+}
 
 pub fn muted() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(muted_c())
 }
 
 pub fn faint() -> Style {
-    Style::default().fg(FAINT)
+    Style::default().fg(faint_c())
 }
 
 /// A rounded panel. Focused panels get an accent border and title.
 pub fn panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
     let (border, title_style) = if focused {
         (
-            Style::default().fg(ACCENT),
-            Style::default().fg(ACCENT).bold(),
+            Style::default().fg(accent()),
+            Style::default().fg(accent()).bold(),
         )
     } else {
         (
-            Style::default().fg(BORDER),
-            Style::default().fg(TEXT).bold(),
+            Style::default().fg(border()),
+            Style::default().fg(text()).bold(),
         )
     };
     Block::default()
@@ -48,16 +89,18 @@ pub fn panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
         .border_style(border)
         .title(title.into().style(title_style))
         .padding(Padding::horizontal(1))
+        .style(base())
 }
 
-/// A modal dialog: rounded, accent border, title with a leading glyph.
+/// A modal dialog: rounded, accent border, title.
 pub fn modal<'a>(title: &str) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Line::from(format!(" {title} ")).style(Style::default().fg(ACCENT).bold()))
+        .border_style(Style::default().fg(accent()))
+        .title(Line::from(format!(" {title} ")).style(Style::default().fg(accent()).bold()))
         .padding(Padding::horizontal(1))
+        .style(base())
 }
 
 /// Panel title text with breathing room.
@@ -68,13 +111,13 @@ pub fn title(text: &str) -> String {
 /// How a status reads: glyph, short label, color.
 pub fn status_parts(status: &str) -> (&'static str, &'static str, Color) {
     match status {
-        "working" => ("●", "working", GREEN),
-        "waiting_input" => ("◐", "waiting", YELLOW),
-        "idle" => ("○", "idle", CYAN),
-        "error" => ("✕", "error", RED),
-        "starting" => ("◌", "starting", OVERLORD),
-        "stopped" => ("■", "stopped", FAINT),
-        _ => ("·", "unknown", FAINT),
+        "working" => ("●", "working", green()),
+        "waiting_input" => ("◐", "waiting", yellow()),
+        "idle" => ("○", "idle", cyan()),
+        "error" => ("✕", "error", red()),
+        "starting" => ("◌", "starting", overlord()),
+        "stopped" => ("■", "stopped", faint_c()),
+        _ => ("·", "unknown", faint_c()),
     }
 }
 
@@ -86,11 +129,11 @@ pub fn status_chip(status: &str) -> Span<'static> {
 
 /// A stable color per tag, so a group reads the same everywhere.
 pub fn tag_color(tag: &str) -> Color {
-    const PALETTE: [u8; 8] = [75, 114, 221, 141, 80, 209, 176, 150];
+    let palette = palette().tag_colors();
     let h = tag
         .bytes()
         .fold(5381u32, |h, b| h.wrapping_mul(33) ^ u32::from(b));
-    Color::Indexed(PALETTE[h as usize % PALETTE.len()])
+    color(palette[h as usize % palette.len()])
 }
 
 /// `#tag` spans, space-separated.
@@ -110,7 +153,7 @@ pub fn tag_spans<'a>(tags: impl IntoIterator<Item = &'a str>) -> Vec<Span<'stati
 
 /// Selected row: a lifted surface, bold.
 pub fn selected() -> Style {
-    Style::default().bg(SURFACE).add_modifier(Modifier::BOLD)
+    Style::default().bg(surface()).add_modifier(Modifier::BOLD)
 }
 
 /// The bar drawn left of the selected row.

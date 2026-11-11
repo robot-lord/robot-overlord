@@ -254,7 +254,7 @@ impl App {
             let label = Span::styled(
                 format!(" {} ", t.label()),
                 if active {
-                    Style::default().fg(theme::TEXT).bg(theme::CHIP).bold()
+                    Style::default().fg(theme::text()).bg(theme::chip()).bold()
                 } else {
                     theme::muted()
                 },
@@ -262,7 +262,7 @@ impl App {
             let n = Span::styled(
                 format!("{count} "),
                 if active {
-                    Style::default().fg(theme::ACCENT).bg(theme::CHIP)
+                    Style::default().fg(theme::accent()).bg(theme::chip())
                 } else {
                     theme::faint()
                 },
@@ -273,13 +273,16 @@ impl App {
         let key = |a: Action| {
             Span::styled(
                 format!(" {} ", self.keys.label(a)),
-                Style::default().fg(theme::MUTED).bg(theme::CHIP),
+                Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
         let mut top = vec![
             Span::styled(
                 " ◆ rlord ",
-                Style::default().fg(Color::Black).bg(theme::ACCENT).bold(),
+                Style::default()
+                    .fg(theme::on_accent())
+                    .bg(theme::accent())
+                    .bold(),
             ),
             Span::raw("  "),
         ];
@@ -295,7 +298,7 @@ impl App {
         } else {
             view.push(Span::styled(
                 self.filter.clone(),
-                Style::default().fg(theme::YELLOW).bold(),
+                Style::default().fg(theme::yellow()).bold(),
             ));
             view.push(Span::raw(" "));
             view.push(key(Action::Cancel));
@@ -310,15 +313,15 @@ impl App {
                 self.sort.label(),
                 if self.reverse { " ↑" } else { "" }
             ),
-            Style::default().fg(theme::TEXT),
+            Style::default().fg(theme::text()),
         ));
         view.push(Span::raw(" "));
         view.push(key(Action::Sort));
         view.push(Span::styled("    ◷ ", theme::muted()));
         view.push(if self.show_archived {
-            Span::styled("archived", Style::default().fg(theme::YELLOW).bold())
+            Span::styled("archived", Style::default().fg(theme::yellow()).bold())
         } else {
-            Span::styled("live", Style::default().fg(theme::TEXT))
+            Span::styled("live", Style::default().fg(theme::text()))
         });
         view.push(Span::raw(" "));
         view.push(key(Action::ToggleArchived));
@@ -365,7 +368,7 @@ impl App {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if fav { "★ " } else { "  " },
-                        Style::default().fg(theme::YELLOW),
+                        Style::default().fg(theme::yellow()),
                     ),
                     Span::styled(label, style),
                     Span::raw(" ".repeat(pad)),
