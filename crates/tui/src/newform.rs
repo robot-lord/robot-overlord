@@ -188,6 +188,9 @@ pub(crate) struct NewForm {
     model_chosen: bool,
     workspace_chosen: bool,
     tags_chosen: bool,
+    /// The worktree default, restored when a plain folder (no worktree)
+    /// gives way to a repo again.
+    default_workspace: bool,
     /// Reopened by the overlord: the hints it set that the user hadn't picked
     /// (its resolved values: shown as such, sent as "your earlier pick").
     resolved: Vec<&'static str>,
@@ -322,6 +325,16 @@ impl NewForm {
             .unwrap_or(0);
     }
 
+    /// Set the location; leaving a plain folder brings the worktree default
+    /// back (the folder turned it off, the user didn't).
+    fn set_location(&mut self, loc: Location) {
+        let was_folder = matches!(self.location, Location::Folder(_));
+        if was_folder && !matches!(loc, Location::Folder(_)) && !self.workspace_chosen {
+            self.workspace = self.default_workspace;
+        }
+        self.location = loc;
+    }
+
     /// The user picked a hint (`repo` / `model` / `worktree` / `tags`). On a fresh form
     /// any pick is theirs (pinning the default counts); on a form the
     /// overlord reopened only a real change is, and it drops the overlord's
@@ -425,6 +438,7 @@ impl App {
             name: String::new(),
             model,
             workspace: defaults["workspace"].as_bool().unwrap_or(true),
+            default_workspace: defaults["workspace"].as_bool().unwrap_or(true),
             branch: String::new(),
             branch_touched: false,
             prompt: String::new(),
@@ -536,7 +550,7 @@ impl App {
                             "repo",
                             !matches!(&f.location, Location::Repo(p) if p == path),
                         );
-                        f.location = Location::Repo(path.clone());
+                        f.set_location(Location::Repo(path.clone()));
                         f.error = None;
                     } else {
                         f.finder = Some(finder); // nothing to pick; stay
@@ -590,7 +604,7 @@ impl App {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
                             f.mark_picked("repo", !matches!(f.location, Location::Auto));
-                            f.location = Location::Auto;
+                            f.set_location(Location::Auto);
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
@@ -598,7 +612,7 @@ impl App {
                                 "repo",
                                 !matches!(&f.location, Location::Repo(p) if *p == path),
                             );
-                            f.location = Location::Repo(path);
+                            f.set_location(Location::Repo(path));
                             f.error = None;
                         }
                     }

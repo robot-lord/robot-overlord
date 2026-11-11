@@ -416,9 +416,26 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
             _ => prefill.get("tags").cloned(),
         }
     };
+    // Compared loosely: a trailing slash, tag order or a '#' is no change.
+    let norm = |k: &str, v: Option<&Value>| -> Option<Value> {
+        let v = v?.clone();
+        Some(match (k, &v) {
+            ("repo", Value::String(r)) => json!(r.trim_end_matches('/')),
+            ("tags", Value::Array(a)) => {
+                let mut t: Vec<String> = a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|t| t.trim_start_matches('#').to_string())
+                    .collect();
+                t.sort();
+                json!(t)
+            }
+            _ => v,
+        })
+    };
     let prev_value = |k: &str| match k {
-        "worktree" => prev.get("workspace"),
-        _ => prev.get(k),
+        "worktree" => norm(k, prev.get("workspace")),
+        _ => norm(k, prev.get(k)),
     };
     let mut chosen = Vec::new();
     let mut resolved = Vec::new();
@@ -428,9 +445,10 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
             .get("changed")
             .is_some_and(|c| c.as_array().is_some_and(|a| a.iter().any(|x| x == k)));
         // The user's pick only while it still holds the value they sent.
-        if in_list(prev, "chosen", k) && !changed && prev_value(k) == Some(&v) {
+        let same = prev_value(k) == norm(k, Some(&v));
+        if in_list(prev, "chosen", k) && !changed && same {
             chosen.push(k);
-        } else if changed || in_list(prev, "resolved", k) || prev_value(k) != Some(&v) {
+        } else if changed || in_list(prev, "resolved", k) || !same {
             resolved.push(k);
         }
     }
@@ -480,7 +498,13 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
     // The request this form answers (none for one the mastermind starts
     // itself): its hints' labels come from it.
     let provenance = match params["request"].as_str().filter(|r| !r.trim().is_empty()) {
-        Some(r) => crate::ask::provenance_of(d, r)?,
+        Some(r) => {
+            let v = crate::ask::provenance_of(d, r)?;
+            if v.is_null() {
+                bail!("unknown request id '{r}': pass the `request:` id from the new-session request you're answering, or omit it");
+            }
+            v
+        }
         None => Value::Null,
     };
     apply_provenance(&mut prefill, &provenance);

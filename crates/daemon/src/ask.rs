@@ -271,6 +271,12 @@ pub fn format_request(p: &Value) -> Result<String> {
     };
     m += &match get("model") {
         Some(model) => format!("- model: {model} ({})\n", source("model")),
+        // "" is the agent default; say whose choice it was, if anyone's.
+        None if p.get("model").is_some_and(Value::is_string)
+            && (chosen("model") || resolved("model")) =>
+        {
+            format!("- model: agent default ({})\n", source("model"))
+        }
         None => "- model: (agent default)\n".to_string(),
     };
     let wt = p.get("workspace").and_then(Value::as_bool).unwrap_or(true);
