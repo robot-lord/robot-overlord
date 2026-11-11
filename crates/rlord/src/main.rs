@@ -1011,6 +1011,17 @@ fn resolve_conversation(id: &str) -> Result<String> {
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.clone()),
+        [] if r["rejected"][0]["reason"].is_string()
+            && !r["rejected"][0]["reason"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("no untracked") =>
+        {
+            anyhow::bail!(
+                "'{id}' can't be imported: {}",
+                r["rejected"][0]["reason"].as_str().unwrap_or("")
+            )
+        }
         [] => {
             let all = call("session.list", json!({"archived": "all"}))?;
             let owner = all.as_array().into_iter().flatten().find(|s| {

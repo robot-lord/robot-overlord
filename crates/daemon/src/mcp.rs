@@ -440,7 +440,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 .as_array()
                 .map(|a| a.iter().map(summarize_candidate).collect())
                 .unwrap_or_default();
-            Ok(json!({"count": rows.len(), "conversations": rows}))
+            let mut out = json!({"count": rows.len(), "conversations": rows});
+            if r["rejected"].as_array().is_some_and(|a| !a.is_empty()) {
+                out["not_importable"] = r["rejected"].clone();
+            }
+            Ok(out)
         }
         "import_sessions" => {
             let items = args

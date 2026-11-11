@@ -278,6 +278,11 @@ and one session's profile never affects another.
 - `--dry-run` shows the report and writes nothing. `--remove` deletes the
   profile. Re-run the import after you change your config.
 - The profile is on for agent sessions by default (`[tmux] profile`).
+- The overlord keeps its own bar but gets your keys (prefix, root bindings,
+  copy mode) when a profile is imported.
+- Agent sessions show rlord's keys on their status bar (`⌥d list · ⌥o
+  overlord`): in front of your status-right with the profile on, or on a
+  slim bar of their own without it.
 - Per session: `rlord tmux profile on|off|toggle|default [REF]`.
 - rlord tracks the agent's pane, so splits never confuse the preview or
   status.
