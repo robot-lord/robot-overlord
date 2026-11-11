@@ -221,12 +221,24 @@ fn undimmed(s: &str) -> String {
                 params.push(c);
             }
             if fin == 'm' {
-                for p in params.split(';') {
-                    match p {
+                let ps: Vec<&str> = params.split(';').collect();
+                let mut i = 0;
+                while i < ps.len() {
+                    match ps[i] {
                         "" | "0" | "22" => dim = false,
                         "2" => dim = true,
+                        // Extended colours carry their own numbers (a 2 or
+                        // 0 in an RGB triple isn't an attribute): skip them.
+                        "38" | "48" | "58" => {
+                            i += match ps.get(i + 1) {
+                                Some(&"5") => 2,
+                                Some(&"2") => 4,
+                                _ => 0,
+                            };
+                        }
                         _ => {}
                     }
+                    i += 1;
                 }
             }
         } else if !dim {
@@ -367,6 +379,7 @@ fn state_of(
 
 const QUEUE_KEY: &str = "remote_restart_queue";
 
+/// Saved while the queue's lock is held, so saves land in order.
 fn save_queue(d: &Daemon, q: &HashMap<String, i64>) {
     if let Err(e) = d.db().kv_set(QUEUE_KEY, &json!(q).to_string()) {
         tracing::warn!(error = %e, "remote control: saving the restart queue");
@@ -393,20 +406,17 @@ fn load_queue(d: &Daemon) {
 }
 
 fn enqueue(d: &Daemon, id: &str) {
-    let q = {
-        let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
-        q.insert(id.to_string(), rlord_core::types::now_ms());
-        q.clone()
-    };
+    // The saved queue first: never overwrite it with a partial one.
+    load_queue(d);
+    let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
+    q.insert(id.to_string(), rlord_core::types::now_ms());
     save_queue(d, &q);
 }
 
 fn dequeue(d: &Daemon, id: &str) {
-    let q = {
-        let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
-        q.remove(id);
-        q.clone()
-    };
+    load_queue(d);
+    let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
+    q.remove(id);
     save_queue(d, &q);
 }
 
@@ -802,6 +812,12 @@ mod tests {
         );
         // Combined codes and a cursor cell over the suggestion: still dim.
         assert_eq!(input_text("❯ \x1b[0;2mStart a task\x1b[0m\n"), None);
+        // RGB colours (whose numbers include 2s and 0s) aren't dim.
+        assert_eq!(
+            input_text("❯ \x1b[38;2;200;2;0mmy draft\x1b[48;2;0;0;22m here\n").as_deref(),
+            Some("my draft here")
+        );
+        assert_eq!(input_text("❯ \x1b[2;38;5;2mStart a task\n"), None);
         assert_eq!(
             input_text("❯ \x1b[7mS\x1b[27m\x1b[2mtart a task\x1b[22m\n"),
             None
