@@ -95,7 +95,17 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let dir_s = dir.to_string_lossy();
-    let exists = git(&[
+    if branch_exists(repo, branch) {
+        git(&["-C", repo, "worktree", "add", &dir_s, branch])?;
+    } else {
+        git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?;
+    }
+    Ok(())
+}
+
+/// Whether `repo` has a local branch named `branch`.
+pub fn branch_exists(repo: &str, branch: &str) -> bool {
+    git(&[
         "-C",
         repo,
         "rev-parse",
@@ -103,13 +113,7 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
         "--quiet",
         &format!("refs/heads/{branch}"),
     ])
-    .is_ok();
-    if exists {
-        git(&["-C", repo, "worktree", "add", &dir_s, branch])?;
-    } else {
-        git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?;
-    }
-    Ok(())
+    .is_ok()
 }
 
 /// Keep the workspace dir out of `git status` without touching the tracked

@@ -335,7 +335,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         agent: &agent,
         agent_session: Some(&claude_sid),
         project_path: &project_path,
-        tmux_session: &tmux_name,
+        tmux_session: Some(&tmux_name),
         launch_spec: &launch_spec,
         created_at: now,
         repo_path: repo.as_deref(),
@@ -365,6 +365,139 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
+}
+
+/// Import an agent conversation rlord doesn't track yet (found by
+/// `session.import_scan`) as a stopped session that resumes it.
+pub fn session_import(db: &Db, params: &Value) -> Result<Value> {
+    let sid = p_str(params, "agent_session")?.trim();
+    let agent = params["agent"].as_str().unwrap_or("claude");
+    if agent != "claude" {
+        bail!("importing '{agent}' conversations isn't supported yet (claude only)");
+    }
+    if let Some(s) = db.session_by_agent_session(sid)? {
+        bail!("already in rlord as '{}'", s.name);
+    }
+    let opts = rlord_core::import::ScanOpts {
+        only: vec![sid.to_string()],
+        ..Default::default()
+    };
+    let c = rlord_core::import::scan_claude(&opts, &|_| false)
+        .into_iter()
+        .next()
+        .with_context(|| format!("no importable Claude conversation {sid}"))?;
+    import_candidate(db, &c, params)
+}
+
+pub(crate) fn import_candidate(
+    db: &Db,
+    c: &rlord_core::import::Candidate,
+    params: &Value,
+) -> Result<Value> {
+    let p_opt = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let archive = params["archive"].as_bool().unwrap_or(false);
+    let recreate = params["recreate_worktree"].as_bool().unwrap_or(false);
+    let mut recreated = false;
+    if !c.dir_exists {
+        match (&c.repo, &c.branch) {
+            (Some(repo), Some(branch)) if recreate && c.recreatable => {
+                git::worktree_add(repo, branch, std::path::Path::new(&c.cwd))
+                    .with_context(|| format!("recreating the worktree at {}", c.cwd))?;
+                recreated = true;
+            }
+            _ if archive => {} // history only: it can't be resumed
+            _ if c.recreatable => bail!(
+                "{} is gone; pass recreate_worktree (branch {} still exists) or archive",
+                c.cwd,
+                c.branch.as_deref().unwrap_or("?")
+            ),
+            _ => bail!(
+                "{} is gone and can't be recreated; pass archive to keep it as history only",
+                c.cwd
+            ),
+        }
+    }
+
+    let id = new_id();
+    let name = p_opt("name").map(str::to_string).unwrap_or_else(|| {
+        let base = std::path::Path::new(&c.cwd)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .unwrap_or("session");
+        format!("{}-{}", base, &id[id.len() - 4..])
+    });
+    let launch_spec =
+        json!({"agent": c.agent, "model": null, "prompt": null, "extra_args": []}).to_string();
+    let created_at = c.started_at.unwrap_or(c.last_active_at);
+    db.insert_session(&NewSession {
+        id: &id,
+        name: &name,
+        agent: &c.agent,
+        agent_session: Some(&c.agent_session),
+        project_path: &c.cwd,
+        // Named on first resume (session_restart mints one).
+        tmux_session: None,
+        launch_spec: &launch_spec,
+        created_at,
+        repo_path: c.repo.as_deref(),
+        workspace_path: c.worktree.then_some(c.cwd.as_str()),
+        branch: c.branch.as_deref(),
+        role: "",
+    })?;
+    // The id is the transcript's own file name: as authoritative as a hook
+    // report, so restarts resume it (unlike a scavenged guess).
+    db.set_agent_session(&id, &c.agent_session, "hook")?;
+    db.set_status(&id, Status::Stopped, c.last_active_at)?;
+    if let Some(t) = c.last_user_at {
+        db.touch_last_user_msg(&id, t)?;
+    }
+    if let Some(t) = c.last_agent_at {
+        db.touch_last_agent_msg(&id, t)?;
+    }
+    db.upsert_transcript_source(&id, &c.transcript)?;
+    if let Some(v) = p_opt("description") {
+        db.set_description(&id, v)?;
+    }
+    if let Some(v) = p_opt("notes") {
+        db.set_notes(&id, v)?;
+    }
+    for t in str_list(params, "tags") {
+        let t = t.trim().trim_start_matches('#');
+        if !t.is_empty() {
+            db.add_tag(&id, t)?;
+        }
+    }
+    let now = now_ms();
+    if archive {
+        db.set_archived(&id, Some(now))?;
+    }
+    if let Some(r) = &c.repo {
+        db.touch_repo(r, c.last_active_at)?;
+    }
+    db.insert_event(
+        &id,
+        now,
+        "imported",
+        &json!({"transcript": c.transcript, "entrypoint": c.entrypoint,
+                "recreated_worktree": recreated})
+        .to_string(),
+    )?;
+    tracing::info!(session = %id, agent_session = %c.agent_session, "imported session");
+
+    let mut out = serde_json::to_value(db.resolve_ref(&id)?)?;
+    if c.open_elsewhere || c.recently_written {
+        out["warning"] = json!(
+            "this conversation may be open elsewhere; close that copy before resuming it here, \
+             or the two will fork the transcript"
+        );
+    }
+    Ok(out)
 }
 
 /// A fresh `rlord-adjective-noun`, unused in the database and on tmux.
@@ -673,7 +806,7 @@ mod tests {
             agent: "claude",
             agent_session: None,
             project_path: "/tmp/o",
-            tmux_session: "rlord-test-overlord",
+            tmux_session: Some("rlord-test-overlord"),
             launch_spec: "{}",
             created_at: 1,
             repo_path: None,
@@ -706,5 +839,85 @@ mod tests {
         let s = db.resolve_ref("01o").unwrap();
         assert_eq!(s.name, "overlord");
         assert!(!s.pinned && s.tags.is_empty() && s.archived_at.is_none());
+    }
+
+    fn candidate(cwd: &str, dir_exists: bool) -> rlord_core::import::Candidate {
+        rlord_core::import::Candidate {
+            agent: "claude".into(),
+            agent_session: "11111111-1111-4111-8111-111111111111".into(),
+            transcript: "/x/t.jsonl".into(),
+            cwd: cwd.into(),
+            dir_exists,
+            repo: Some("/repo".into()),
+            branch: Some("feat/x".into()),
+            worktree: true,
+            recreatable: false,
+            title: Some("Fix login".into()),
+            first_prompt: Some("fix login".into()),
+            last_prompt: None,
+            last_reply: None,
+            pr_url: None,
+            entrypoint: Some("cli".into()),
+            started_at: Some(1_000),
+            last_active_at: 5_000,
+            last_user_at: Some(4_000),
+            last_agent_at: Some(5_000),
+            open_elsewhere: true,
+            recently_written: false,
+        }
+    }
+
+    #[test]
+    fn import_makes_a_stopped_resumable_session() {
+        let db = Db::open_in_memory().unwrap();
+        let c = candidate("/repo/.worktrees/feat-x", true);
+        let p = json!({"name": "login-fix", "description": "fixing login",
+                       "tags": ["#web"], "notes": "PR #7"});
+        let out = import_candidate(&db, &c, &p).unwrap();
+        assert!(out["warning"].is_string(), "open elsewhere must warn");
+        let s = db.resolve_ref("login-fix").unwrap();
+        assert_eq!(s.status, Status::Stopped);
+        assert_eq!(s.agent_session.as_deref(), Some(c.agent_session.as_str()));
+        // Trusted, so a restart resumes it (scavenged ids never resume).
+        assert_eq!(s.agent_session_trust, "hook");
+        assert_eq!(s.tmux_session, None);
+        assert_eq!(s.project_path, c.cwd);
+        assert_eq!(s.workspace_path.as_deref(), Some(c.cwd.as_str()));
+        assert_eq!(s.branch.as_deref(), Some("feat/x"));
+        assert_eq!(s.tags, ["web"]);
+        assert_eq!(
+            (s.description.as_str(), s.notes.as_str()),
+            ("fixing login", "PR #7")
+        );
+        assert_eq!(s.created_at, 1_000);
+        assert_eq!(s.last_user_msg_at, Some(4_000));
+        assert_eq!(s.last_agent_msg_at, Some(5_000));
+        assert!(s.archived_at.is_none());
+        assert_eq!(
+            db.session_by_agent_session(&c.agent_session)
+                .unwrap()
+                .map(|s| s.id),
+            Some(s.id)
+        );
+    }
+
+    #[test]
+    fn import_of_a_gone_folder_needs_archive() {
+        let db = Db::open_in_memory().unwrap();
+        let c = candidate("/nonexistent/rlord-import-test", false);
+        let e = import_candidate(&db, &c, &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("archive"), "{e}");
+        assert!(
+            db.agent_session_ids().unwrap().is_empty(),
+            "nothing written on refusal"
+        );
+        import_candidate(&db, &c, &json!({"archive": true})).unwrap();
+        let s = db
+            .session_by_agent_session(&c.agent_session)
+            .unwrap()
+            .unwrap();
+        assert!(s.archived_at.is_some());
     }
 }

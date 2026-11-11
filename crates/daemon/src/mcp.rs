@@ -132,6 +132,25 @@ pub fn tools() -> Value {
                 "sessions": {"type": "array", "items": {"type": "string"}, "description": "Session refs"},
                 "all": b("Mark every live session reviewed"),
             }), &[]),
+        tool("scan_agent_sessions",
+            "Find agent conversations on this machine that rlord doesn't track yet (read from the agents' own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
+            json!({
+                "since_days": {"type": "integer", "description": "Only conversations with an exchange in the last N days (default 30)"},
+                "limit": {"type": "integer", "description": "Max conversations (default 30)"},
+                "query": s("Words that must all appear in the folder, branch, title or prompts"),
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Only these conversation ids (any age)"},
+            }), &[]),
+        tool("import_sessions",
+            "Import conversations found by scan_agent_sessions as stopped rlord sessions that resume them, with name, description, notes and tags. Per-conversation results.",
+            json!({"sessions": {"type": "array", "items": {"type": "object", "properties": {
+                "id": s("Conversation id from scan_agent_sessions"),
+                "name": s("Short display name"),
+                "description": s("One-line description"),
+                "notes": s("Durable context (PR link, what's left)"),
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "archive": b("Import as archived (history only; required when its folder is gone and can't be recreated)"),
+                "recreate_worktree": b("Its folder is gone but recreatable: recreate the worktree there"),
+            }, "required": ["id"]}}}), &["sessions"]),
         tool("session_action",
             "Lifecycle: restart (resumes the conversation), stop (resumable), archive (stop + hide), unarchive.",
             json!({
@@ -165,6 +184,26 @@ fn summarize(s: &Value) -> Value {
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
         "subagents_running": s["agents_running"],
     })
+}
+
+/// The compact row the overlord sees per importable conversation.
+fn summarize_candidate(c: &Value) -> Value {
+    let ts = |k: &str| c[k].as_i64().map(|t| rel_age(Some(t)));
+    let mut row = json!({
+        "id": c["agent_session"], "agent": c["agent"], "dir": c["cwd"],
+        "repo": c["repo"], "branch": c["branch"], "worktree": c["worktree"],
+        "title": c["title"], "first_prompt": c["first_prompt"],
+        "last_prompt": c["last_prompt"], "last_reply": c["last_reply"],
+        "pr": c["pr_url"], "started": ts("started_at"), "last_active": ts("last_active_at"),
+    });
+    if c["dir_exists"] == false {
+        row["dir_gone"] = json!(true);
+        row["recreatable"] = c["recreatable"].clone();
+    }
+    if c["open_elsewhere"] == true || c["recently_written"] == true {
+        row["maybe_open_elsewhere"] = json!(true);
+    }
+    row
 }
 
 /// Copy whitelisted session-creation fields.
@@ -350,6 +389,58 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             json!({"sessions": args.get("sessions").cloned().unwrap_or(json!([])),
                    "all": args.get("all").and_then(Value::as_bool).unwrap_or(false)}),
         ),
+        "scan_agent_sessions" => {
+            let mut p = Map::new();
+            for k in ["since_days", "limit", "query", "ids"] {
+                if let Some(v) = args.get(k) {
+                    p.insert(k.into(), v.clone());
+                }
+            }
+            let r = d.rpc("session.import_scan", Value::Object(p))?;
+            let rows: Vec<Value> = r["candidates"]
+                .as_array()
+                .map(|a| a.iter().map(summarize_candidate).collect())
+                .unwrap_or_default();
+            Ok(json!({"count": rows.len(), "conversations": rows}))
+        }
+        "import_sessions" => {
+            let items = args
+                .get("sessions")
+                .and_then(Value::as_array)
+                .context("missing 'sessions'")?;
+            let mut results = Vec::new();
+            for it in items {
+                let id = it["id"].as_str().unwrap_or("").trim();
+                let mut p = Map::new();
+                p.insert("agent_session".into(), json!(id));
+                for k in [
+                    "name",
+                    "description",
+                    "notes",
+                    "tags",
+                    "archive",
+                    "recreate_worktree",
+                ] {
+                    if let Some(v) = it.get(k) {
+                        p.insert(k.into(), v.clone());
+                    }
+                }
+                match d.rpc("session.import", Value::Object(p)) {
+                    Ok(s) => {
+                        // Imported with its meta-context set: already reviewed.
+                        d.rpc("overlord.mark_reviewed", json!({"sessions": [s["id"]]}))?;
+                        let mut row = json!({"id": id, "session": s["name"],
+                                             "archived": !s["archived_at"].is_null()});
+                        if !s["warning"].is_null() {
+                            row["warning"] = s["warning"].clone();
+                        }
+                        results.push(row);
+                    }
+                    Err(e) => results.push(json!({"id": id, "error": format!("{e:#}")})),
+                }
+            }
+            Ok(json!({"results": results}))
+        }
         "session_action" => {
             let r = session_ref(args)?;
             let method = match arg_str(args, "action") {

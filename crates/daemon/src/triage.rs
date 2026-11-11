@@ -191,7 +191,7 @@ mod tests {
             agent: "shell",
             agent_session: None,
             project_path: "/tmp",
-            tmux_session: "rlord-test-web",
+            tmux_session: Some("rlord-test-web"),
             launch_spec: "{}",
             created_at: 1,
             repo_path: None,

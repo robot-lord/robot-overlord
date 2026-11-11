@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod autostart;
+pub mod import;
 pub mod mcp;
 pub mod methods;
 pub mod overlord;
@@ -279,6 +280,7 @@ impl Daemon {
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config, &params),
+            "session.import" => methods::session_import(&db, &params),
             "repo.list" => methods::repo_list(&db, &self.config),
             "repo.find" => {
                 let scanned = self.scanned_repos();
@@ -342,6 +344,7 @@ impl Daemon {
                 .overlord()
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
+            "session.import_scan" => import::scan(self, params),
             "overlord.ask" => ask::ask(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
@@ -542,7 +545,7 @@ mod tests {
                 agent: "claude",
                 agent_session: Some("uuid-1"),
                 project_path: "/tmp",
-                tmux_session: "rlord_01test",
+                tmux_session: Some("rlord_01test"),
                 launch_spec: "{}",
                 created_at: 1,
                 repo_path: None,

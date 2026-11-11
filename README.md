@@ -197,6 +197,29 @@ tokens); the session list shows `⚙N` while any are running; `rlord agents
 <ref>` prints them. Sessions that ran before the hooks existed are backfilled
 from disk on first view.
 
+## Bringing in existing sessions
+
+rlord can adopt agent conversations you started elsewhere: in a terminal,
+another session manager, or the desktop app. It finds them in the agents' own
+files (`~/.claude/projects/`), so it doesn't matter what started them.
+
+- **Ask the overlord**: "import my sessions from the last month". It proposes
+  which to import, archive or skip, with names and groups. Nothing is
+  imported until you approve the list.
+- **By hand**: `rlord import` lists conversations rlord doesn't track yet,
+  most recently active first (`--since 30d`, `2w` or `12h`, measured by the
+  last exchange, not when it started). `rlord import <id>...` imports them;
+  `--name`, `--archive` and `--recreate-worktree` are optional.
+- An imported conversation is a stopped session. Opening it resumes the
+  conversation in its original folder.
+- If its folder is gone but the branch still exists, the worktree can be
+  recreated in place. Otherwise it can only be imported as archived history.
+- Close a conversation in its old home before resuming it in rlord. Two
+  copies running at once fork the transcript. The listing flags
+  conversations that look open elsewhere.
+
+Only Claude Code conversations for now.
+
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated

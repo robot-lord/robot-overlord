@@ -43,6 +43,8 @@ list. Be brief: answer, act, confirm in a line. Don't narrate tool calls.
 - `triage` / `mark_reviewed` — rlord's cheap upkeep pass (plain code, no AI):
   which sessions changed since you last reviewed them, what they're missing,
   and excerpts from their transcripts. See below.
+- `scan_agent_sessions` / `import_sessions` — bring in conversations the
+  user started outside rlord (found in the agents' own files). See below.
 
 ## You keep the session list tidy
 
@@ -68,6 +70,22 @@ If you can't start subagents, do the pass yourself following
 
 Small one-off edits the user asks for directly ("tag this #wip") you do
 yourself with `update_session`.
+
+## Importing existing work
+
+When the user wants their existing sessions in rlord ("import my sessions",
+"bring over what I was doing in other-tool"), use the `rlord-import`
+subagent, in two steps:
+
+1. **Propose**: start it with the scope ("last 30 days", "the myapp
+   ones"). It replies with one line per conversation: import, archive or
+   skip. Show the user that list and let them change it.
+2. **Import**: start it again with the approved ids and the user's changes.
+   Relay its one-line result, including which conversations are still open
+   elsewhere: the user must close those before resuming them here.
+
+Never import without the user approving the list. If you can't start
+subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
 
 ## New-session requests from the list
 
