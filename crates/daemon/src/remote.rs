@@ -52,7 +52,10 @@ pub struct Remote {
     /// Sessions to restart (onto their current wish) once nothing is going
     /// on in them.
     /// (When asked, ms: a process started after it has the change.)
+    /// Persisted in kv (`remote_restart_queue`): a daemon restart (an
+    /// update) doesn't forget it. Loaded on the first pass.
     restart_when_idle: Mutex<HashMap<String, i64>>,
+    queue_loaded: std::sync::atomic::AtomicBool,
     /// Last state per session, for the list (cheap to annotate).
     snapshot: Mutex<HashMap<String, Value>>,
     /// One keeper pass at a time (the keeper and a `remote.set`).
@@ -88,7 +91,13 @@ impl Remote {
     pub fn availability(&self, force: bool) -> Availability {
         if !force {
             if let Some((at, a)) = self.avail.lock().expect("remote mutex").as_ref() {
-                if at.elapsed() < RECHECK {
+                // A check that failed outright is retried within a minute.
+                let ttl = if a.transient {
+                    Duration::from_secs(60)
+                } else {
+                    RECHECK
+                };
+                if at.elapsed() < ttl {
                     return a.clone();
                 }
             }
@@ -183,14 +192,60 @@ fn input_text(screen: &str) -> Option<String> {
         .rev()
         .find(|l| strip_ansi(l).starts_with('❯'))?;
     let rest = line.split_once('❯')?.1;
-    let rest = rest.trim_start_matches([' ', '\u{a0}']);
-    if rest.starts_with("\x1b[2m") {
+    let text = undimmed(rest);
+    let text = text.trim_matches([' ', '\u{a0}']);
+    // One character is the cursor drawn over a suggestion, not a draft.
+    if text.chars().count() <= 1 {
         return None;
     }
-    let text = strip_ansi(rest);
-    let text = text.trim_matches([' ', '\u{a0}']);
     // A placeholder in a capture without attributes.
-    (!text.is_empty() && !text.starts_with("Try \"")).then(|| text.to_string())
+    (!text.starts_with("Try \"")).then(|| text.to_string())
+}
+
+/// The text of `s` drawn without the dim attribute (SGR 2, cleared by 0
+/// or 22), however the codes are combined.
+fn undimmed(s: &str) -> String {
+    let mut out = String::new();
+    let mut dim = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut fin = ' ';
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    fin = c;
+                    break;
+                }
+                params.push(c);
+            }
+            if fin == 'm' {
+                let ps: Vec<&str> = params.split(';').collect();
+                let mut i = 0;
+                while i < ps.len() {
+                    match ps[i] {
+                        "" | "0" | "22" => dim = false,
+                        "2" => dim = true,
+                        // Extended colours carry their own numbers (a 2 or
+                        // 0 in an RGB triple isn't an attribute): skip them.
+                        "38" | "48" | "58" => {
+                            i += match ps.get(i + 1) {
+                                Some(&"5") => 2,
+                                Some(&"2") => 4,
+                                _ => 0,
+                            };
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        } else if !dim {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Drop ANSI escape sequences (CSI: ESC [ … final byte).
@@ -322,6 +377,49 @@ fn state_of(
            "name": want.map(|w| &w.0)})
 }
 
+const QUEUE_KEY: &str = "remote_restart_queue";
+
+/// Saved while the queue's lock is held, so saves land in order.
+fn save_queue(d: &Daemon, q: &HashMap<String, i64>) {
+    if let Err(e) = d.db().kv_set(QUEUE_KEY, &json!(q).to_string()) {
+        tracing::warn!(error = %e, "remote control: saving the restart queue");
+    }
+}
+
+/// Bring back deferred restarts saved by an earlier run (once).
+fn load_queue(d: &Daemon) {
+    use std::sync::atomic::Ordering;
+    if d.remote.queue_loaded.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let saved: HashMap<String, i64> = d
+        .db()
+        .kv_get(QUEUE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
+    for (k, v) in saved {
+        q.entry(k).or_insert(v);
+    }
+}
+
+fn enqueue(d: &Daemon, id: &str) {
+    // The saved queue first: never overwrite it with a partial one.
+    load_queue(d);
+    let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
+    q.insert(id.to_string(), rlord_core::types::now_ms());
+    save_queue(d, &q);
+}
+
+fn dequeue(d: &Daemon, id: &str) {
+    load_queue(d);
+    let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
+    q.remove(id);
+    save_queue(d, &q);
+}
+
 /// Restart a session onto its current wish (resuming the conversation).
 /// `only_if_quiet`: check again, right before, that nothing is going on
 /// (and has been for a few seconds); false means it wasn't restarted.
@@ -371,6 +469,7 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     // (Re-checked every RECHECK: a login or plan change shows up.)
     let avail = d.remote.availability(false);
     let now = rlord_core::types::now_ms();
+    load_queue(d);
     let queued: Vec<(String, i64)> = d
         .remote
         .restart_when_idle
@@ -381,11 +480,7 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         .collect();
     for (id, asked_at) in queued {
         let Some(s) = sessions.iter().find(|s| s.id == id) else {
-            d.remote
-                .restart_when_idle
-                .lock()
-                .expect("remote mutex")
-                .remove(&id);
+            dequeue(d, &id);
             continue;
         };
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
@@ -397,13 +492,7 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
             Some(l) => l.started_at >= asked_at,
             None => s.status == Status::Stopped,
         };
-        let remove = |d: &Daemon| {
-            d.remote
-                .restart_when_idle
-                .lock()
-                .expect("remote mutex")
-                .remove(&id);
-        };
+        let remove = |d: &Daemon| dequeue(d, &id);
         if done {
             remove(d);
         } else if work_going(s, l).is_empty() {
@@ -592,8 +681,12 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     for t in &targets {
         let before = wanted(&d.db(), &t.id)?;
         let connected = lv(t).is_some_and(|l| l.bridge.is_some());
-        // Already as asked: nothing to change or restart.
+        // Already as asked: nothing to restart. Off is still recorded (a
+        // link made inside the session would come back on a plain resume).
         if before.is_some() == on && (connected == on || !running(t)) {
+            if !on && !turned_off_spec(&d.db(), &t.id) {
+                set_wanted(&d.db(), t, false)?;
+            }
             continue;
         }
         set_wanted(&d.db(), t, on)?;
@@ -605,11 +698,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             continue;
         }
         if seats || mode == Some("when_idle") {
-            d.remote
-                .restart_when_idle
-                .lock()
-                .expect("remote mutex")
-                .insert(t.id.clone(), rlord_core::types::now_ms());
+            enqueue(d, &t.id);
             deferred.push(t.name.clone());
         } else {
             restart(d, &t.id, false)?;
@@ -720,6 +809,18 @@ mod tests {
         assert_eq!(
             input_text("\x1b[39m❯\u{a0}real draft\n").as_deref(),
             Some("real draft")
+        );
+        // Combined codes and a cursor cell over the suggestion: still dim.
+        assert_eq!(input_text("❯ \x1b[0;2mStart a task\x1b[0m\n"), None);
+        // RGB colours (whose numbers include 2s and 0s) aren't dim.
+        assert_eq!(
+            input_text("❯ \x1b[38;2;200;2;0mmy draft\x1b[48;2;0;0;22m here\n").as_deref(),
+            Some("my draft here")
+        );
+        assert_eq!(input_text("❯ \x1b[2;38;5;2mStart a task\n"), None);
+        assert_eq!(
+            input_text("❯ \x1b[7mS\x1b[27m\x1b[2mtart a task\x1b[22m\n"),
+            None
         );
     }
 }
