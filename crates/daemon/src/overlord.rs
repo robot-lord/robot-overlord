@@ -256,6 +256,18 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
             )?;
             let agent = pick("agent", &cfg.overlord.agent);
             let d = seat.dir();
+            // Remote Control: as the setup chose for the overlord; the
+            // mastermind goes with the overlord (a hand-off lands there).
+            let remote = if seat.key == MASTERMIND.key {
+                match FRONT.session(db)? {
+                    Some(f) => serde_json::from_str::<Value>(&db.launch_spec(&f.id)?)
+                        .ok()
+                        .is_some_and(|sp| sp["remote_control"].is_string()),
+                    None => false,
+                }
+            } else {
+                params["remote_control"].as_bool().unwrap_or(false)
+            };
             methods::session_new(
                 db,
                 cfg,
@@ -268,6 +280,7 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
                     "role": seat.key,
                     "tmux_name": seat.tmux,
                     "extra_args": extra_args,
+                    "remote_control": remote,
                 }),
             )
         }

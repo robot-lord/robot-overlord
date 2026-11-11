@@ -5,6 +5,7 @@ pub mod mcp;
 pub mod methods;
 pub mod overlord;
 pub mod profile;
+pub mod remote;
 pub mod rpc;
 pub mod triage;
 pub mod ui;
@@ -53,6 +54,8 @@ pub struct Daemon {
     pub(crate) mastermind_send: Mutex<()>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
+    /// Remote Control: availability and each session's link (remote.rs).
+    pub(crate) remote: remote::Remote,
 }
 
 impl Daemon {
@@ -71,6 +74,7 @@ impl Daemon {
             overlay_seat: Mutex::new(overlord::FRONT.key),
             mastermind_send: Mutex::new(()),
             warm: Default::default(),
+            remote: Default::default(),
         })
     }
 
@@ -341,6 +345,7 @@ impl Daemon {
                     let id = row["id"].as_str().unwrap_or("");
                     row["loading"] = json!(loading.contains(id));
                 }
+                remote::annotate(self, &mut rows);
                 Ok(Value::Array(rows))
             }
             (_, r) => r,
@@ -399,7 +404,15 @@ impl Daemon {
             "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
                 .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
-            "overlord.status" => overlord::status(&self.db(), &self.config),
+            "overlord.status" => overlord::status(&self.db(), &self.config).map(|mut v| {
+                v["remote"] = remote::offer(self);
+                v
+            }),
+            // Don't offer Remote Control for the overlord again.
+            "remote.decline_offer" => self
+                .db()
+                .kv_set("remote_offer_declined", "1")
+                .map(|_| json!({"declined": true})),
             // Don't offer this seat's default model again (the user said no).
             "overlord.decline_default" => {
                 let seat = overlord::seat(params["seat"].as_str().unwrap_or("overlord"));
@@ -409,6 +422,9 @@ impl Daemon {
                     .map(|_| json!({"declined": m}))
             }
             "session.subagents" => warm::session_subagents(self, params),
+            "remote.availability" => remote::availability(self, params),
+            "remote.status" => remote::status(self, params),
+            "remote.set" => remote::set(self, params),
             "overlord.style" => {
                 overlord::style(&self.config);
                 Ok(json!({"styled": true}))

@@ -264,6 +264,31 @@ files (`~/.claude/projects/`), so it doesn't matter what started them.
 
 Only Claude Code conversations for now.
 
+## Remote Control (from your phone)
+
+Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control)
+lets you continue a session from the Claude app (Code tab) or claude.ai while
+it keeps running on this machine. rlord manages it per session:
+
+- **Ask the overlord**: "turn on remote control for the web app". It
+  replies with the link, or with the reason it can't. The overlord itself can
+  have it too (offered once, and in the first-run setup): then you can talk
+  to the overlord from your phone. The mastermind goes with it.
+- **By hand**: `rlord remote` lists what's connected; `rlord remote <session>
+  on|off` turns it on or off.
+- It's remembered: every restart, resume and fresh start reconnects it. A
+  running session connects as soon as it's idle with an empty input line
+  (rlord never types over you). If a connection drops, rlord reconnects it.
+- The list marks connected sessions with ⇄ (red when it can't connect).
+
+It needs a claude.ai login on a Pro, Max, Team or Enterprise plan, against
+Anthropic's own API: not an API key, Bedrock, Vertex, Foundry or a custom
+`ANTHROPIC_BASE_URL`. rlord checks this up front and says why when it's not
+available. On Team and Enterprise an admin must allow it first; rlord can't
+see that setting, so a session that never connects is reported as such
+after a few tries. While connected, the conversation is also stored on
+Anthropic's servers.
+
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated
