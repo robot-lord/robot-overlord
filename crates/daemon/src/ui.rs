@@ -426,6 +426,14 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             prefill.insert(k.into(), params[k].clone());
         }
     }
+    // The hints the user had picked themselves stay theirs on the reopened
+    // form; the rest are the overlord's resolved values.
+    let chosen: Value = d
+        .db()
+        .kv_get("last_request_chosen")?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(json!([]));
+    prefill.insert("chosen".into(), chosen);
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
         .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;

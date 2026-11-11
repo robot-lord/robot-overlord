@@ -73,6 +73,9 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
+    // What the user picked themselves: a form the overlord reopens keeps it.
+    d.db()
+        .kv_set("last_request_chosen", &params["chosen"].to_string())?;
     let r = send_to(d, &overlord::MASTERMIND, &text)?;
     // Delivered: it answers any form the mastermind had reopened.
     d.db().kv_set("confirm_pending", "0")?;
@@ -170,9 +173,18 @@ pub fn format_request(p: &Value) -> Result<String> {
             .and_then(Value::as_array)
             .is_some_and(|a| a.iter().any(|c| c == k))
     };
+    // Hints the overlord resolved in an earlier round (a reopened form),
+    // which the user then sent on unchanged.
+    let resolved = |k: &str| {
+        p.get("resolved")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|c| c == k))
+    };
     let source = |k: &str| {
         if chosen(k) {
             "picked by the user"
+        } else if resolved(k) {
+            "your earlier pick"
         } else {
             "default"
         }

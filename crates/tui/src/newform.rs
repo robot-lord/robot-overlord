@@ -187,6 +187,9 @@ pub(crate) struct NewForm {
     repo_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
+    /// Reopened by the overlord: hints the user didn't pick hold its resolved
+    /// values (shown as such, sent as "your earlier pick"), not defaults.
+    resolved: bool,
     /// Reopened by the overlord with corrected hints: submitting confirms
     /// them. `changed` names the hints it updated; `note` says why.
     confirmed: bool,
@@ -275,9 +278,17 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        // (Not marked as the user's own picks: these are the overlord's.
-        // Confirmed, they launch as shown; if the user edits instead, only the
-        // hints they change count as theirs.)
+        // The user's own earlier picks stay theirs; the rest are the
+        // overlord's resolved values (not defaults).
+        let picked = |k: &str| {
+            p["chosen"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|c| c == k))
+        };
+        self.repo_chosen = picked("repo");
+        self.model_chosen = picked("model");
+        self.workspace_chosen = picked("worktree");
+        self.resolved = true;
         self.confirmed = true;
         self.changed = p["changed"]
             .as_array()
@@ -387,6 +398,7 @@ impl App {
             repo_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
+            resolved: false,
             confirmed: false,
             changed: Vec::new(),
             note: None,
@@ -414,7 +426,10 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
-                                f.description_changed();
+                                f.repo_chosen = true;
+                                if !matches!(&f.location, Location::Folder(p) if *p == path) {
+                                    f.description_changed();
+                                }
                                 f.location = Location::Folder(path);
                                 f.workspace = false;
                                 f.error = None;
@@ -525,12 +540,14 @@ impl App {
                         f.model = picked;
                     }
                     PickerKind::Repo => {
-                        f.repo_chosen = true;
+                        // (Chosen once a repo or folder is actually set, not
+                        // when a sub-prompt opens and may be cancelled.)
                         if items[i] == OTHER_REPO {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
+                            f.repo_chosen = true;
                             if !matches!(f.location, Location::Auto) {
                                 f.description_changed();
                             }
@@ -538,6 +555,7 @@ impl App {
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
+                            f.repo_chosen = true;
                             if !matches!(&f.location, Location::Repo(p) if *p == path) {
                                 f.description_changed();
                             }
@@ -760,6 +778,15 @@ impl App {
             "workspace": f.workspace,
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
+            // The overlord's resolved values the user left as they were.
+            "resolved": if f.resolved {
+                [("repo", f.repo_chosen), ("model", f.model_chosen), ("worktree", f.workspace_chosen)]
+                    .into_iter()
+                    .filter_map(|(k, c)| (!c).then_some(k))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            },
             "confirmed": f.confirmed,
         });
         match &f.location {
@@ -839,7 +866,7 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 25), "New session"),
+            FormKind::Overlord => (centered(f.area(), 82, 26), "New session"),
             FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
         };
         f.render_widget(Clear, area);
@@ -1171,7 +1198,14 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         if changed {
             spans.push(Span::styled("  ✦ updated", accent));
         } else if !chosen && !value.starts_with("overlord picks") {
-            spans.push(Span::styled("  · default", dim));
+            spans.push(Span::styled(
+                if form.resolved {
+                    "  · overlord's pick"
+                } else {
+                    "  · default"
+                },
+                dim,
+            ));
         }
         Line::from(spans)
     };

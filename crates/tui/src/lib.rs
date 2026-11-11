@@ -1555,13 +1555,16 @@ fn edit_in_editor(
     // A unique file per edit: several TUIs (clients) may edit at once.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join("rlord-edit");
+    // rlord's own runtime dir (owned by the user), not the shared temp dir.
+    let dir = paths::runtime_dir().join("edit");
     let path = dir.join(format!("{}-{n}-{file}", std::process::id()));
     // File errors are the user's to see (the caller keeps its text), not a
     // reason to quit the TUI.
     // Created fresh (never through an existing file or symlink).
     let made = std::fs::create_dir_all(&dir).and_then(|_| {
         use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1569,6 +1572,7 @@ fn edit_in_editor(
             .write_all(text.as_bytes())
     });
     if let Err(e) = made {
+        let _ = std::fs::remove_file(&path); // a partial write
         return Err(format!("could not prepare {}: {e}", path.display()));
     }
     let editor = std::env::var("VISUAL")
