@@ -158,7 +158,10 @@ fn state_of(
     } else if want.is_none() {
         ("off", None)
     } else if s.agent != "claude" {
-        ("unavailable", Some(format!("{} has no Remote Control", s.agent)))
+        (
+            "unavailable",
+            Some(format!("{} has no Remote Control", s.agent)),
+        )
     } else if !avail.available {
         ("unavailable", avail.reason.clone())
     } else if let Some((_, why)) = track.and_then(|t| t.failed.as_ref()) {
@@ -395,13 +398,18 @@ pub fn status(d: &Daemon, params: &Value) -> Result<Value> {
 /// remembered for every future start, and connected now if it's running
 /// (waits briefly for the link). The overlord's two seats go together.
 pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
-    let on = params["on"].as_bool().context("missing 'on' (true or false)")?;
+    let on = params["on"]
+        .as_bool()
+        .context("missing 'on' (true or false)")?;
     let s = d
         .db()
         .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?;
     if on {
         if s.agent != "claude" {
-            bail!("Remote Control is a Claude Code feature; {} has none", s.agent);
+            bail!(
+                "Remote Control is a Claude Code feature; {} has none",
+                s.agent
+            );
         }
         let a = d.remote.availability(true);
         if !a.available {
@@ -468,8 +476,10 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         _ => "",
     };
     let avail = d.remote.availability(false);
-    Ok(json!({"session": s.id, "name": s.name, "remote": st, "note": note,
-              "caveat": avail.note}))
+    Ok(
+        json!({"session": s.id, "name": s.name, "remote": st, "note": note,
+              "caveat": avail.note}),
+    )
 }
 
 /// For `overlord.status`: can this machine use Remote Control, is the

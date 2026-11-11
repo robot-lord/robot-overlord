@@ -1577,7 +1577,9 @@ fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
         Some("connecting") | Some("stopped") => Span::styled(" ⇄", theme::faint()),
-        Some("failed") | Some("unavailable") => Span::styled(" ⇄", Style::default().fg(theme::red())),
+        Some("failed") | Some("unavailable") => {
+            Span::styled(" ⇄", Style::default().fg(theme::red()))
+        }
         _ => Span::raw(""),
     }
 }

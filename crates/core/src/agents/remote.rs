@@ -124,7 +124,9 @@ pub fn assess(auth: &Value, b: &Blockers) -> Availability {
         return Availability::no(format!("turned off by disableRemoteControl in {by}"));
     }
     if auth["loggedIn"] != true {
-        return Availability::no("Claude Code isn't logged in to claude.ai (run `claude auth login`)");
+        return Availability::no(
+            "Claude Code isn't logged in to claude.ai (run `claude auth login`)",
+        );
     }
     match auth["apiProvider"].as_str() {
         Some("firstParty") | None => {}
@@ -254,7 +256,8 @@ mod tests {
         assert!(assess(&team, &Blockers::default()).note.is_some());
         let key = json!({"loggedIn": true, "authMethod": "api_key", "apiProvider": "firstParty"});
         assert!(!assess(&key, &Blockers::default()).available);
-        let bedrock = json!({"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "bedrock"});
+        let bedrock =
+            json!({"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "bedrock"});
         assert!(assess(&bedrock, &Blockers::default())
             .reason
             .unwrap()
@@ -276,11 +279,20 @@ mod tests {
     fn live_state_files() {
         let d = tempfile::tempdir().unwrap();
         let w = |n: &str, v: Value| std::fs::write(d.path().join(n), v.to_string()).unwrap();
-        w("1.json", json!({"pid": 1, "sessionId": "a", "status": "idle",
-                           "bridgeSessionId": "session_x", "updatedAt": 5}));
+        w(
+            "1.json",
+            json!({"pid": 1, "sessionId": "a", "status": "idle",
+                           "bridgeSessionId": "session_x", "updatedAt": 5}),
+        );
         // An older file for the same conversation loses.
-        w("2.json", json!({"pid": 2, "sessionId": "a", "status": "busy", "updatedAt": 1}));
-        w("3.json", json!({"pid": 3, "sessionId": "b", "status": "idle"}));
+        w(
+            "2.json",
+            json!({"pid": 2, "sessionId": "a", "status": "busy", "updatedAt": 1}),
+        );
+        w(
+            "3.json",
+            json!({"pid": 3, "sessionId": "b", "status": "idle"}),
+        );
         w("junk.json", json!("nope"));
         let l = live_sessions_in(d.path());
         assert_eq!(l.len(), 2);

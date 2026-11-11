@@ -102,7 +102,7 @@ pub fn tools() -> Value {
             "Reopen the user's new-session form with your corrections when their description contradicts the hints they sent (or left as defaults): their description verbatim, the hints as you would launch them, which ones you changed and why. Nothing launches until they send it back; that message says `confirmed: yes`.",
             json!({
                 "description": s("The user's description, verbatim"),
-                "request": s("The `request:` id of the new-session request you're answering (omit if none)"),
+                "request_id": s("The `request_id:` of the new-session request you're answering (omit if none)"),
                 "repo": s("Repo as you would launch it (omit: you choose at launch)"),
                 "project": s("Plain folder instead of a repo"),
                 "model": s("Model as you would launch it (\"\" for the agent default)"),
@@ -354,7 +354,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let mut p = Map::new();
             for k in [
                 "description",
-                "request",
+                "request_id",
                 "repo",
                 "project",
                 "model",
@@ -375,7 +375,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // The session exists either way; Remote Control that can't be had
             // is a note, not a failed launch.
             if args.get("remote_control").and_then(Value::as_bool) == Some(true) {
-                out["remote"] = match d.rpc("remote.set", json!({"ref": s["id"], "on": true, "wait": false})) {
+                out["remote"] = match d.rpc(
+                    "remote.set",
+                    json!({"ref": s["id"], "on": true, "wait": false}),
+                ) {
                     Ok(v) => v["remote"].clone(),
                     Err(e) => json!({"state": "unavailable", "reason": format!("{e:#}")}),
                 };
@@ -421,7 +424,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
         }
         "list_groups" => d.rpc("tag.list", json!({})),
-        "remote_control" => match (arg_str(args, "session"), args.get("on").and_then(Value::as_bool)) {
+        "remote_control" => match (
+            arg_str(args, "session"),
+            args.get("on").and_then(Value::as_bool),
+        ) {
             (Some(r), Some(on)) => d.rpc("remote.set", json!({"ref": r, "on": on})),
             (r, None) => d.rpc("remote.status", json!({"ref": r})),
             (None, Some(_)) => bail!("which session? (pass `session`)"),
