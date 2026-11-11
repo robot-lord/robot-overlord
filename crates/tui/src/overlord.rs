@@ -214,11 +214,7 @@ impl App {
             | KeyCode::Down => {
                 let rows = if s.remote.is_some() { 3 } else { 2 };
                 let back = matches!(k.code, KeyCode::BackTab | KeyCode::Char('k') | KeyCode::Up);
-                s.row = if back {
-                    (s.row + rows - 1) % rows
-                } else {
-                    (s.row + 1) % rows
-                };
+                s.row = if back { (s.row + rows - 1) % rows } else { (s.row + 1) % rows };
                 self.mode = Mode::OverlordSetup(s);
             }
             // The Remote Control row: any of ← → space toggles it.
@@ -470,9 +466,7 @@ impl App {
                 lines.push(Line::from(Span::styled(
                     format!(
                         "    away from this terminal.{}",
-                        why.as_deref()
-                            .map(|w| format!(" Note: {w}."))
-                            .unwrap_or_default()
+                        why.as_deref().map(|w| format!(" Note: {w}.")).unwrap_or_default()
                     ),
                     theme::muted(),
                 )));
@@ -609,18 +603,11 @@ impl App {
             )),
         ];
         if let Some(n) = &o.note {
-            lines.push(Line::from(Span::styled(
-                format!("  Note: {n}."),
-                theme::faint(),
-            )));
+            lines.push(Line::from(Span::styled(format!("  Note: {n}."), theme::faint())));
         }
         lines.push(Line::from(""));
         lines.push(keys_line(&[("enter", "turn it on", Cap::Context)]));
-        lines.push(keys_line(&[(
-            "esc",
-            "no thanks (won't ask again)",
-            Cap::Global,
-        )]));
+        lines.push(keys_line(&[("esc", "no thanks (won't ask again)", Cap::Global)]));
         if let Some(e) = &o.error {
             lines.push(Line::from(Span::styled(
                 format!("  {e}"),

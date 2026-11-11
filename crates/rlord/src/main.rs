@@ -794,16 +794,12 @@ fn main() -> Result<()> {
                         println!("{n}");
                     }
                 }
-                (_, Some(other)) => {
-                    anyhow::bail!("usage: rlord remote [session] [on|off] (got '{other}')")
-                }
+                (_, Some(other)) => anyhow::bail!("usage: rlord remote [session] [on|off] (got '{other}')"),
                 (r, None) => {
                     let v = call("remote.status", json!({"ref": r, "force": true}))?;
                     avail(&v["availability"]);
                     match v["sessions"].as_array() {
-                        Some(list) if list.is_empty() => {
-                            println!("no session has Remote Control on")
-                        }
+                        Some(list) if list.is_empty() => println!("no session has Remote Control on"),
                         Some(list) => {
                             for x in list {
                                 print(x["name"].as_str().unwrap_or("?"), &x["remote"]);

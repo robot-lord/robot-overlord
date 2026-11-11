@@ -69,7 +69,7 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 }
 
 /// kv key: recent form requests' hints and their provenance, by request id
-/// (the `request_id:` line of the message). A reopened form names the request
+/// (the `request:` line of the message). A reopened form names the request
 /// it answers, so its labels come from that request, never another.
 pub const PROVENANCE_KEY: &str = "request_provenance";
 /// Requests remembered (oldest dropped first).
@@ -262,7 +262,7 @@ pub fn format_request(p: &Value) -> Result<String> {
     let mut m = String::from("[rlord new-session request]\n");
     m += &format!("confirmed: {}\n", if confirmed { "yes" } else { "no" });
     if let Some(id) = get("request_id") {
-        m += &format!("request_id: {id}\n");
+        m += &format!("request: {id}\n");
     }
     m += "hints (optional; the description wins if they disagree):\n";
     m += &match get("repo") {
@@ -315,7 +315,7 @@ mod tests {
         assert!(m.ends_with("description:\nfix the login flake\n\nkeep the retry count at 3"));
         assert!(format_request(&json!({"description": "  "})).is_err());
         let r = format_request(&json!({"description": "x", "request_id": "rab12"})).unwrap();
-        assert!(r.contains("confirmed: no\nrequest_id: rab12\n"), "{r}");
+        assert!(r.contains("confirmed: no\nrequest: rab12\n"), "{r}");
         let r = format_request(&json!({"description": "x", "repo": "/r", "model": "opus",
                                         "chosen": ["model"], "resolved": ["repo"]}))
         .unwrap();

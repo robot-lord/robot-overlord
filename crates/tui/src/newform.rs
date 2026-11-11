@@ -189,11 +189,8 @@ pub(crate) struct NewForm {
     workspace_chosen: bool,
     tags_chosen: bool,
     /// The worktree default, restored when a plain folder (no worktree)
-    /// gives way to a repo again...
+    /// gives way to a repo again.
     default_workspace: bool,
-    /// ...unless there was a worktree choice before the folder: (value,
-    /// the user's pick, the overlord's pick), put back on leaving it.
-    before_folder: Option<(bool, bool, bool)>,
     /// Reopened by the overlord: the hints it set that the user hadn't picked
     /// (its resolved values: shown as such, sent as "your earlier pick").
     resolved: Vec<&'static str>,
@@ -332,18 +329,8 @@ impl NewForm {
     /// back (the folder turned it off, the user didn't).
     fn set_location(&mut self, loc: Location) {
         let was_folder = matches!(self.location, Location::Folder(_));
-        if was_folder && !matches!(loc, Location::Folder(_)) {
-            match self.before_folder.take() {
-                Some((w, chosen, resolved)) => {
-                    self.workspace = w;
-                    self.workspace_chosen = chosen;
-                    if resolved && !self.resolved.contains(&"worktree") {
-                        self.resolved.push("worktree");
-                    }
-                }
-                None if !self.workspace_chosen => self.workspace = self.default_workspace,
-                None => {}
-            }
+        if was_folder && !matches!(loc, Location::Folder(_)) && !self.workspace_chosen {
+            self.workspace = self.default_workspace;
         }
         self.location = loc;
     }
@@ -452,7 +439,6 @@ impl App {
             model,
             workspace: defaults["workspace"].as_bool().unwrap_or(true),
             default_workspace: defaults["workspace"].as_bool().unwrap_or(true),
-            before_folder: None,
             branch: String::new(),
             branch_touched: false,
             prompt: String::new(),
@@ -497,14 +483,6 @@ impl App {
                                     !matches!(&f.location, Location::Folder(p) if *p == path);
                                 f.mark_picked("repo", moved);
                                 if moved {
-                                    // Kept for a change of mind back to a repo.
-                                    if !matches!(f.location, Location::Folder(_)) {
-                                        f.before_folder = Some((
-                                            f.workspace,
-                                            f.workspace_chosen,
-                                            f.resolved.contains(&"worktree"),
-                                        ));
-                                    }
                                     f.location = Location::Folder(path);
                                     // A plain folder has no worktree: neither
                                     // the overlord's pick nor the user's.
