@@ -297,9 +297,14 @@ The list has two tabs (`Tab` switches):
 - **groups**: **tags are the groups**.
   - A column on the left lists each tag with its session count, then
     "untagged". The selected group's sessions sit next to it.
-  - `←`/`→` move between the column and the sessions. `enter` on a group
-    opens it.
-  - `R` on a group renames that tag on every session.
+  - `←`/`→` (or `h`/`l`) move between the column and the sessions; `esc`
+    also goes back. `enter` on a group opens it.
+  - **Favourites:** `p` on a group makes it a favourite (★). Favourites head
+    the column in your order (`J`/`K` move one); the rest follow, biggest
+    first. Use them for the few groups you actually work in, like `work` or
+    the feature you're on.
+  - `R` on a group renames that tag on every session (a favourite keeps its
+    place).
   - A session with two tags appears in both groups.
 - **Filter bar:** above both tabs, a line always shows the current filter,
   sort and live/archived, with the keys that change them.
@@ -308,6 +313,7 @@ The list has two tabs (`Tab` switches):
   - `organize` tags, renames and describes many sessions in one call;
   - `list_groups` lists groups and counts;
   - `rename_group` renames a group;
+  - `set_group_order` sets your favourites ("put work and auth-fix first");
   - `set_list_view` opens a tab or group (`tab`, `group`) and can save it as
     your default.
 

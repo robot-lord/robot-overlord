@@ -564,6 +564,27 @@ impl Db {
 
     /// Rename a tag on every session (merging into `to` where it exists).
     /// Returns how many sessions carried it.
+    /// The user's favourite groups, in their order (top of the group list).
+    pub fn group_order(&self) -> Result<Vec<String>> {
+        Ok(self
+            .kv_get("group_order")?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default())
+    }
+
+    /// Replace the favourite groups (trimmed, `#` dropped, first wins).
+    pub fn set_group_order(&self, order: &[String]) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for t in order {
+            let t = t.trim().trim_start_matches('#');
+            if !t.is_empty() && !out.iter().any(|o| o == t) {
+                out.push(t.to_string());
+            }
+        }
+        self.kv_set("group_order", &serde_json::to_string(&out)?)?;
+        Ok(out)
+    }
+
     pub fn rename_tag(&self, from: &str, to: &str) -> Result<usize> {
         if from == to {
             // Nothing to move; the DELETE below would drop the tag everywhere.
@@ -581,6 +602,16 @@ impl Db {
         let removed = self
             .conn
             .execute("DELETE FROM tags WHERE tag = ?1", [from])?;
+        // A renamed favourite keeps its place (merging into one already
+        // there keeps the earlier place).
+        let order = self.group_order()?;
+        if order.iter().any(|t| t == from) {
+            let renamed: Vec<String> = order
+                .into_iter()
+                .map(|t| if t == from { to.to_string() } else { t })
+                .collect();
+            self.set_group_order(&renamed)?;
+        }
         Ok(n.max(removed))
     }
 
@@ -907,6 +938,21 @@ mod tests {
         assert_eq!(db.untagged_count().unwrap(), 0);
         db.rename_tag("web", "frontend").unwrap();
         assert_eq!(db.tag_counts().unwrap(), vec![("frontend".to_string(), 1)]);
+    }
+
+    #[test]
+    fn group_order_survives_renames() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01a", "a");
+        db.add_tag("01a", "web").unwrap();
+        let o = db
+            .set_group_order(&["#work".into(), "web".into(), " work ".into()])
+            .unwrap();
+        assert_eq!(o, ["work", "web"]);
+        db.rename_tag("web", "frontend").unwrap();
+        assert_eq!(db.group_order().unwrap(), ["work", "frontend"]);
+        db.rename_tag("frontend", "work").unwrap(); // merge: keeps the first place
+        assert_eq!(db.group_order().unwrap(), ["work"]);
     }
 
     #[test]

@@ -134,6 +134,8 @@ struct App {
     /// Groups tab: (tag, count) column, its selection, and the selected tag
     /// ("" = untagged), kept by name across refreshes.
     groups: Vec<(String, usize)>,
+    /// Favourite groups, in the user's order (daemon `tag.order`).
+    group_order: Vec<String>,
     group_state: ListState,
     group_sel: Option<String>,
     /// Groups tab: keys go to the group column (else to the sessions).
@@ -170,6 +172,7 @@ impl App {
             all: Vec::new(),
             tab: Tab::Sessions,
             groups: Vec::new(),
+            group_order: Vec::new(),
             group_state: ListState::default(),
             group_sel: None,
             group_focus: false,
@@ -231,6 +234,17 @@ impl App {
             // where it would only steal the top match — and isn't in groups.
             self.overlord_row = false;
             if self.tab == Tab::Groups {
+                if let Some(o) = self.call("tag.order", json!({})) {
+                    self.group_order = o["order"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
                 self.regroup();
             } else if self.filter.trim().is_empty() && !self.show_archived {
                 if let Some(o) = self
@@ -1349,6 +1363,19 @@ impl App {
         // Inside a group, say how to get back out.
         if self.tab == Tab::Groups && !self.group_focus {
             ctx.insert(0, (self.keys.label(Action::Cancel), "groups"));
+        }
+        // On the group list: favourite it, and reorder favourites.
+        if self.tab == Tab::Groups && self.group_focus {
+            if let Some(g) = self.group_sel.as_deref().filter(|g| *g != groups::UNTAGGED) {
+                let fav = self.is_favourite(g);
+                ctx.push((
+                    self.keys.label(Action::Pin),
+                    if fav { "unfavourite" } else { "favourite" },
+                ));
+                if fav {
+                    ctx.push(("J/K".into(), "reorder"));
+                }
+            }
         }
         // The divider sits at a fixed column: the right slot is as wide as
         // the longest row-key set, and row keys fill it from the left, so

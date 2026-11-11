@@ -133,6 +133,10 @@ pub fn tools() -> Value {
         tool("rename_group",
             "Rename a group (tag) on every session that has it; merges into an existing group of the new name.",
             json!({"from": s("Current tag"), "to": s("New tag (one word)")}), &["from", "to"]),
+        tool("set_group_order",
+            "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
+            json!({"order": {"type": "array", "items": {"type": "string"}, "description": "Tags, most important first; [] clears"}}),
+            &["order"]),
         tool("triage",
             "Cheap first pass for upkeep (no AI, no screen reads): live sessions changed since you last reviewed them, newest first, with what their meta-context is missing (flags: default_name, no_description, untagged, waiting_on_user) and excerpts from their transcripts (first_prompt, last_prompt, last_reply, title). Editing a session with update_session/organize marks it reviewed.",
             json!({
@@ -383,6 +387,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
         }
         "list_groups" => d.rpc("tag.list", json!({})),
+        "set_group_order" => d.rpc(
+            "tag.order",
+            json!({"order": args.get("order").cloned().unwrap_or(json!([]))}),
+        ),
         "rename_group" => d.rpc(
             "tag.rename",
             json!({"from": arg_str(args, "from").context("missing 'from'")?,

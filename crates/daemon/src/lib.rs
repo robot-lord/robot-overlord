@@ -275,7 +275,7 @@ impl Daemon {
                 | "session.subagents"
                 | "session.defaults"
                 | "tag.list"
-        );
+        ) && !(method == "tag.order" && params.get("order").is_none());
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
@@ -296,6 +296,7 @@ impl Daemon {
             "tag.list" => methods::tag_list(&db),
             "overlord.mark_reviewed" => triage::mark_reviewed(&db, &params),
             "tag.rename" => methods::tag_rename(&db, &params),
+            "tag.order" => methods::tag_order(&db, &params),
             "session.pin" => methods::session_pin(&db, &params),
             "session.describe" => methods::session_describe(&db, &params),
             "session.notes" => methods::session_notes(&db, &params),

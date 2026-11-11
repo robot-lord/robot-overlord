@@ -41,6 +41,10 @@ list. Be brief: answer, act, confirm in a line. Don't narrate tool calls.
   `infra`, `wip`). File each session you launch into a group (`organize`
   right after `create_session`), and offer to tidy up when many sessions are
   untagged or groups sprawl. `organize` changes many sessions in one call.
+- `set_group_order` — the user's favourite groups, in order: they head the
+  groups list. Set it when the user says which groups matter most ("work and
+  auth-fix first"); `list_groups` shows the current order. It replaces the
+  whole list, so keep the favourites they didn't mention.
 - `session_action` — restart / stop / archive / unarchive.
 - `triage` / `mark_reviewed` — rlord's cheap upkeep pass (plain code, no AI):
   which sessions changed since you last reviewed them, what they're missing,

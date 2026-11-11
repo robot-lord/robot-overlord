@@ -36,9 +36,11 @@ fn tags_of(s: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Groups over `sessions`: (tag, count), most sessions first, then
-/// "untagged" last when there are any.
-pub(crate) fn group_list(sessions: &[Value]) -> Vec<(String, usize)> {
+/// Groups over `sessions`: (tag, count). The user's favourites first, in
+/// their order (`order`), then the rest, most sessions first, then
+/// "untagged" last when there are any. Favourites with no sessions here
+/// aren't shown (they keep their place for when they have some).
+pub(crate) fn group_list(sessions: &[Value], order: &[String]) -> Vec<(String, usize)> {
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut untagged = 0;
     for s in sessions {
@@ -54,7 +56,13 @@ pub(crate) fn group_list(sessions: &[Value]) -> Vec<(String, usize)> {
         .into_iter()
         .map(|(t, n)| (t.to_string(), n))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let rank = |t: &str| order.iter().position(|o| o == t).unwrap_or(usize::MAX);
+    v.sort_by(|a, b| {
+        rank(&a.0)
+            .cmp(&rank(&b.0))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     if untagged > 0 {
         v.push((UNTAGGED.to_string(), untagged));
     }
@@ -82,7 +90,7 @@ impl App {
     /// Rebuild the groups column from `all` and show the selected group's
     /// sessions (keeping the group selected by name across refreshes).
     pub(crate) fn regroup(&mut self) {
-        self.groups = group_list(&self.all);
+        self.groups = group_list(&self.all, &self.group_order);
         let idx = self
             .group_sel
             .as_ref()
@@ -113,6 +121,61 @@ impl App {
             self.table.select(Some(0));
             self.dirty = true;
         }
+    }
+
+    pub(crate) fn is_favourite(&self, g: &str) -> bool {
+        self.group_order.iter().any(|o| o == g)
+    }
+
+    /// `p` on the group list: add the highlighted group to the favourites
+    /// (at the end) or take it out.
+    fn toggle_favourite(&mut self) {
+        let Some(g) = self.group_sel.clone().filter(|g| g != UNTAGGED) else {
+            self.status_line = "untagged can't be a favourite".into();
+            return;
+        };
+        let mut order = self.group_order.clone();
+        if self.is_favourite(&g) {
+            order.retain(|o| *o != g);
+            self.status_line = format!("#{g} is no longer a favourite");
+        } else {
+            order.push(g.clone());
+            self.status_line = format!("#{g} is a favourite (J/K to reorder)");
+        }
+        self.save_group_order(order);
+    }
+
+    /// `K`/`J` on a favourite: move it up or down among the favourites.
+    fn move_favourite(&mut self, delta: isize) {
+        let Some(g) = self.group_sel.clone() else {
+            return;
+        };
+        let mut order = self.group_order.clone();
+        let Some(i) = order.iter().position(|o| *o == g) else {
+            self.status_line = format!(
+                "{} first makes it a favourite",
+                self.keys.label(Action::Pin)
+            );
+            return;
+        };
+        let j = (i as isize + delta).clamp(0, order.len() as isize - 1) as usize;
+        order.swap(i, j);
+        self.save_group_order(order);
+    }
+
+    fn save_group_order(&mut self, order: Vec<String>) {
+        if let Some(v) = self.call("tag.order", json!({"order": order})) {
+            self.group_order = v["order"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        self.regroup();
     }
 
     /// Move the selected group by `delta` (clamped).
@@ -171,6 +234,10 @@ impl App {
             Some(Action::Bottom) => self.move_group(self.groups.len() as isize),
             // Enter opens the group: focus moves to its sessions.
             Some(Action::Attach) => self.group_focus = self.sessions.is_empty(),
+            Some(Action::Pin) => self.toggle_favourite(),
+            None if matches!(k.code, KeyCode::Char('K') | KeyCode::Char('J')) => {
+                self.move_favourite(if k.code == KeyCode::Char('K') { -1 } else { 1 })
+            }
             Some(Action::Rename) => match self.group_sel.clone() {
                 Some(g) if g != UNTAGGED => self.mode = Mode::RenameGroup(g),
                 _ => self.status_line = "untagged isn't a group you can rename".into(),
@@ -262,7 +329,7 @@ impl App {
     }
 
     fn groups_count(&self) -> usize {
-        group_list(&self.all)
+        group_list(&self.all, &[])
             .iter()
             .filter(|(t, _)| t != UNTAGGED)
             .count()
@@ -275,7 +342,7 @@ impl App {
             .iter()
             // label + space + 2-digit count + borders, padding and the
             // selection bar (2 + 2 + 2).
-            .map(|(t, _)| group_label(t).chars().count() + 9)
+            .map(|(t, _)| group_label(t).chars().count() + 11)
             .max()
             .unwrap_or(12)
             .clamp(18, 30) as u16;
@@ -294,7 +361,12 @@ impl App {
                 } else {
                     Style::default().fg(theme::tag_color(t))
                 };
+                let fav = self.group_order.iter().any(|o| o == t);
                 ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if fav { "★ " } else { "  " },
+                        Style::default().fg(theme::YELLOW),
+                    ),
                     Span::styled(label, style),
                     Span::raw(" ".repeat(pad)),
                     Span::styled(format!("{n:>2}"), theme::faint()),
@@ -359,7 +431,7 @@ mod tests {
     fn groups_count_tags_and_untagged() {
         let s = |tags: &[&str]| json!({"tags": tags});
         let all = vec![s(&["web", "wip"]), s(&["web"]), s(&[]), s(&["api"])];
-        let g = group_list(&all);
+        let g = group_list(&all, &[]);
         assert_eq!(
             g,
             vec![
@@ -372,6 +444,16 @@ mod tests {
         // A session with two tags is in both groups.
         assert!(in_group(&all[0], "web") && in_group(&all[0], "wip"));
         assert!(in_group(&all[2], UNTAGGED) && !in_group(&all[1], UNTAGGED));
+    }
+
+    #[test]
+    fn favourites_lead_in_their_order() {
+        let s = |tags: &[&str]| json!({"tags": tags});
+        let all = vec![s(&["web", "wip"]), s(&["web"]), s(&[]), s(&["api"])];
+        // "gone" has no sessions: not shown, but keeps its place.
+        let order = ["wip".to_string(), "gone".to_string(), "api".to_string()];
+        let names: Vec<String> = group_list(&all, &order).into_iter().map(|g| g.0).collect();
+        assert_eq!(names, ["wip", "api", "web", UNTAGGED]);
     }
 }
 
