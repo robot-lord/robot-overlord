@@ -108,8 +108,12 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    refuse_overlord(&s, "tagged (it isn't in any group)")?;
-    for t in str_list(params, "add") {
+    let add = str_list(params, "add");
+    // Removing stays allowed, so tags it got before its row was fixed can go.
+    if !add.is_empty() {
+        refuse_overlord(&s, "tagged (it isn't in any group)")?;
+    }
+    for t in add {
         db.add_tag(&s.id, &t)?;
     }
     for t in str_list(params, "remove") {
@@ -175,11 +179,14 @@ pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_pin(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    refuse_overlord(&s, "pinned or unpinned (it always sits on top)")?;
     let pinned = params
         .get("pinned")
         .and_then(Value::as_bool)
         .context("missing bool param 'pinned'")?;
+    // Unpinning stays allowed, to clear a pin from before its row was fixed.
+    if pinned {
+        refuse_overlord(&s, "pinned (it always sits on top)")?;
+    }
     db.set_pinned(&s.id, pinned)?;
     Ok(json!({"id": s.id, "pinned": pinned}))
 }
@@ -703,6 +710,9 @@ mod tests {
             let e = res.expect_err(what).to_string();
             assert!(e.starts_with("the overlord can't be"), "{what}: {e}");
         }
+        // Clearing tags or a pin from before the row was fixed still works.
+        session_tag(&db, &with("remove", json!(["wip"]))).unwrap();
+        session_pin(&db, &with("pinned", json!(false))).unwrap();
         let s = db.resolve_ref("01o").unwrap();
         assert_eq!(s.name, "overlord");
         assert!(!s.pinned && s.tags.is_empty() && s.archived_at.is_none());

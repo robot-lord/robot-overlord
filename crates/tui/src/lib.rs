@@ -531,15 +531,20 @@ impl App {
             Action::Attach => self.attach(terminal)?,
             Action::Restart => self.action("session.restart", "restarted"),
             Action::Stop => self.action("session.stop", "stopped"),
-            Action::Archive if self.selected_is_overlord() => {
-                self.status_line = "the overlord can't be archived (s stops it)".into();
-            }
-            Action::Rename | Action::Pin | Action::Describe | Action::Notes
-                if self.selected_is_overlord()
-                    && !(self.tab == Tab::Groups && self.group_focus) =>
+            // One rule for the overlord's row, mirrored by `context_legend`
+            // (which never offers these keys for it) and enforced again by
+            // the daemon.
+            Action::Archive
+            | Action::Rename
+            | Action::Pin
+            | Action::Describe
+            | Action::Notes
+            | Action::Tags
+                if self.selected_is_overlord() =>
             {
                 self.status_line =
-                    "the overlord's row is fixed: no rename, pin, description or notes".into();
+                    "the overlord's row is fixed: it can only be attached, restarted or stopped"
+                        .into();
             }
             Action::Archive => self.action("session.archive", "archived"),
             Action::Overlord => self.show_overlord(),
@@ -590,9 +595,6 @@ impl App {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
             }),
-            Action::Tags if self.selected_is_overlord() => {
-                self.status_line = "the overlord isn't grouped".into();
-            }
             Action::Tags => {
                 if let Some(s) = self.selected() {
                     let cur = s["tags"]
@@ -1323,9 +1325,16 @@ impl App {
         // The divider sits at a fixed column: the right slot is as wide as
         // the longest row-key set, and row keys fill it from the left, so
         // moving the highlight never shifts it.
-        let slot = self.keys.context_slot_width();
-        let [left, right] =
-            RLayout::horizontal([Constraint::Min(0), Constraint::Length(slot)]).areas(line1_area);
+        // Too narrow for both: the global keys keep their full width (quit,
+        // new and the overlord must stay findable) and row keys get the rest.
+        let slot = self.keys.slot_width;
+        let global_w = u16::try_from(global.width()).unwrap_or(u16::MAX);
+        let constraints = if line1_area.width >= global_w.saturating_add(slot) {
+            [Constraint::Min(0), Constraint::Length(slot)]
+        } else {
+            [Constraint::Length(global_w), Constraint::Min(0)]
+        };
+        let [left, right] = RLayout::horizontal(constraints).areas(line1_area);
         f.render_widget(Paragraph::new(global), left);
         f.render_widget(Paragraph::new(context_line(ctx)), right);
     }
@@ -1526,6 +1535,8 @@ impl KeyBinding {
 
 struct KeyMap {
     bindings: Vec<(Action, KeyBinding)>,
+    /// Width of the footer's right slot (see `context_slot_width`).
+    slot_width: u16,
 }
 
 impl KeyMap {
@@ -1564,7 +1575,12 @@ impl KeyMap {
         // Arrow keys always work for movement, alongside whatever is configured.
         bindings.push((Action::Up, KeyBinding::parse("up")?));
         bindings.push((Action::Down, KeyBinding::parse("down")?));
-        Ok(KeyMap { bindings })
+        let mut km = KeyMap {
+            bindings,
+            slot_width: 0,
+        };
+        km.slot_width = km.context_slot_width();
+        Ok(km)
     }
 
     fn action(&self, k: &ratatui::crossterm::event::KeyEvent) -> Option<Action> {
@@ -1596,12 +1612,20 @@ impl KeyMap {
     }
 
     /// Width of the footer's right slot: the widest row-key set any row can
-    /// produce (a running, archived, pinned session lists the most and the
-    /// longest labels).
+    /// produce. Measured over every row shape (configured keys can make
+    /// either of archive/unarchive or pin/unpin the wider one), once.
     fn context_slot_width(&self) -> u16 {
-        let widest = json!({"status": "working", "agent": "claude", "agent_session": "x",
-                            "archived_at": 1, "pinned": true, "role": ""});
-        let w = context_line(self.labelled(&context_legend(false, None, Some(&widest)))).width();
+        let mut w = 0;
+        for status in ["working", "stopped"] {
+            for archived in [Value::Null, json!(1)] {
+                for pinned in [false, true] {
+                    let s = json!({"status": status, "agent": "claude", "agent_session": "x",
+                                   "archived_at": archived, "pinned": pinned, "role": ""});
+                    let line = context_line(self.labelled(&context_legend(false, None, Some(&s))));
+                    w = w.max(line.width());
+                }
+            }
+        }
         u16::try_from(w).unwrap_or(u16::MAX)
     }
 
@@ -1635,12 +1659,18 @@ fn context_legend(
     let overlord = s["role"] == "overlord";
     let stopped = s["status"] == "stopped" || s["status"].is_null();
     let archived = !s["archived_at"].is_null();
-    let mut v = vec![(Action::Attach, if stopped { "resume" } else { "attach" })];
+    // Resuming (Enter on a stopped row) and restarting both need a
+    // conversation the agent can resume.
+    let resumable = s["agent"] == "claude" && !s["agent_session"].is_null();
+    let mut v = Vec::new();
     if !stopped {
-        if s["agent"] == "claude" && !s["agent_session"].is_null() {
+        v.push((Action::Attach, "attach"));
+        if resumable {
             v.push((Action::Restart, "restart"));
         }
         v.push((Action::Stop, "stop"));
+    } else if resumable {
+        v.push((Action::Attach, "resume"));
     }
     if overlord {
         // Its row is fixed: no name, pin, tags, description, notes, archive.
@@ -1718,6 +1748,13 @@ mod tests {
             labels(&context_legend(false, None, Some(&overlord))),
             ["attach", "restart", "stop"]
         );
+        // No conversation to resume: Enter and restart would only error.
+        let fresh = json!({"status": "stopped", "agent": "codex", "archived_at": null,
+                           "pinned": false, "role": ""});
+        assert_eq!(
+            labels(&context_legend(false, None, Some(&fresh)))[0],
+            "archive"
+        );
         assert!(context_legend(false, None, None).is_empty());
         assert_eq!(
             labels(&context_legend(true, Some("wip"), Some(&running))),
@@ -1745,7 +1782,7 @@ mod tests {
         let mut app = App::new(rx, Config::default(), keys);
         app.sessions = vec![
             json!({"status": "stopped", "archived_at": 1, "pinned": false, "role": "",
-                   "agent": "claude"}),
+                   "agent": "claude", "agent_session": "y"}),
             json!({"status": "working", "archived_at": null, "pinned": false, "role": "",
                    "agent": "claude", "agent_session": "x"}),
         ];
@@ -1778,6 +1815,14 @@ mod tests {
             "{running}"
         );
         assert!(!right.contains("unarchive"), "{running}");
+
+        // Narrower than both halves: the global keys stay whole.
+        app.table.select(Some(1));
+        let narrow = footer_row(&app, 120);
+        assert!(
+            narrow.contains(" new ") && narrow.contains(" quit ") && narrow.contains(" overlord "),
+            "{narrow}"
+        );
     }
 }
 
