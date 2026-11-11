@@ -65,7 +65,9 @@ fn write_files() -> Result<Vec<String>> {
     // Subagents the overlord delegates to (Claude's project agents dir).
     let agents = d.join(".claude").join("agents");
     std::fs::create_dir_all(&agents)?;
-    std::fs::write(agents.join("rlord-tidy.md"), TIDY_AGENT)?;
+    for (file, text) in SUBAGENTS {
+        std::fs::write(agents.join(file), text)?;
+    }
 
     Ok(vec![
         "--mcp-config".into(),
@@ -218,8 +220,12 @@ pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 /// Built-in standing instructions; maintained as markdown next to this file.
 const INSTRUCTIONS: &str = include_str!("overlord.md");
 
-/// The `rlord-tidy` subagent: upkeep passes run in their own context.
-const TIDY_AGENT: &str = include_str!("tidy.md");
+/// Subagents the overlord delegates to, each in its own context:
+/// `rlord-tidy` runs upkeep passes, `rlord-import` imports existing work.
+const SUBAGENTS: &[(&str, &str)] = &[
+    ("rlord-tidy.md", include_str!("tidy.md")),
+    ("rlord-import.md", include_str!("import.md")),
+];
 
 /// Every agent's project-instructions file name. The overlord gets the same
 /// text under each, so whichever agent runs it reads them, alongside the
@@ -246,7 +252,7 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .filter(|n| {
                 let q = format!("`{n}`");
-                !INSTRUCTIONS.contains(&q) && !TIDY_AGENT.contains(&q)
+                !INSTRUCTIONS.contains(&q) && !SUBAGENTS.iter().any(|(_, t)| t.contains(&q))
             })
             .collect();
         assert!(
@@ -255,21 +261,23 @@ mod tests {
         );
     }
 
-    /// The tidy subagent may only use rlord tools that exist.
+    /// Subagents may only use rlord tools that exist.
     #[test]
-    fn tidy_agent_tools_exist() {
+    fn subagent_tools_exist() {
         let names: Vec<String> = crate::mcp::tools()
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|t| t["name"].as_str().map(|n| format!("mcp__rlord__{n}")))
             .collect();
-        let line = TIDY_AGENT
-            .lines()
-            .find_map(|l| l.strip_prefix("tools:"))
-            .expect("tools line");
-        for t in line.split(',').map(str::trim) {
-            assert!(names.iter().any(|n| n == t), "unknown tool in tidy.md: {t}");
+        for (file, text) in SUBAGENTS {
+            let line = text
+                .lines()
+                .find_map(|l| l.strip_prefix("tools:"))
+                .unwrap_or_else(|| panic!("no tools line in {file}"));
+            for t in line.split(',').map(str::trim) {
+                assert!(names.iter().any(|n| n == t), "unknown tool in {file}: {t}");
+            }
         }
     }
 }

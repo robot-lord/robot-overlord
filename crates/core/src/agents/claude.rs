@@ -271,7 +271,7 @@ pub fn subagents_dir(transcript_path: &str) -> PathBuf {
 }
 
 /// Parse ISO-8601 `2026-10-27T17:03:44.498Z` to ms epoch (lenient).
-fn parse_iso_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_iso_ms(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
     let (y, m, day) = (d.next()??, d.next()??, d.next()??);
@@ -304,7 +304,7 @@ pub struct Excerpts {
 /// Bytes read from each end of a transcript; they can be many MB.
 const EXCERPT_WINDOW: u64 = 256 * 1024;
 
-fn read_window(path: &Path, from_end: bool) -> Option<String> {
+pub(crate) fn read_window(path: &Path, from_end: bool) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -327,7 +327,7 @@ fn read_window(path: &Path, from_end: bool) -> Option<String> {
     })
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.chars().count() <= max {
         s
@@ -338,7 +338,7 @@ fn clip(s: &str, max: usize) -> String {
 
 /// A prompt the human typed (not tool results, meta, summaries, or command
 /// wrappers like `<command-name>`).
-fn human_prompt(v: &Value) -> Option<String> {
+pub(crate) fn human_prompt(v: &Value) -> Option<String> {
     if v["type"] != "user"
         || v["isMeta"] == true
         || v["isCompactSummary"] == true
@@ -375,19 +375,29 @@ fn reply_text(v: &Value) -> Option<String> {
 }
 
 pub fn transcript_excerpts(path: &Path) -> Excerpts {
+    let (head, tail) = read_head_tail(path);
+    excerpts_from(&head, &tail)
+}
+
+/// Parsed JSON lines from the start and the end of a transcript (each at
+/// most `EXCERPT_WINDOW` bytes; a small file is read once and used for both).
+pub(crate) fn read_head_tail(path: &Path) -> (Vec<Value>, Vec<Value>) {
     let parse = |s: String| -> Vec<Value> {
         s.lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     };
     let head = read_window(path, false).map(parse).unwrap_or_default();
-    // A file that fits in one window was read whole: reuse it as the tail.
     let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= EXCERPT_WINDOW);
     let tail = if small {
         head.clone()
     } else {
         read_window(path, true).map(parse).unwrap_or_default()
     };
+    (head, tail)
+}
+
+pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
     let mut e = Excerpts {
         first_prompt: head.iter().find_map(human_prompt).map(|t| clip(&t, 300)),
         ..Default::default()
@@ -399,12 +409,22 @@ pub fn transcript_excerpts(path: &Path) -> Excerpts {
         if e.last_reply.is_none() {
             e.last_reply = reply_text(v).map(|t| clip(&t, 500));
         }
+        // A title the user set wins over the one Claude generated.
         if e.title.is_none() && v["type"] == "custom-title" {
             e.title = v["customTitle"].as_str().map(str::to_string);
         }
         if e.last_prompt.is_some() && e.last_reply.is_some() && e.title.is_some() {
             break;
         }
+    }
+    if e.title.is_none() {
+        e.title = tail
+            .iter()
+            .rev()
+            .filter(|v| v["type"] == "ai-title")
+            .find_map(|v| v["aiTitle"].as_str())
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| clip(t, 120));
     }
     // Long tool-heavy turns push the last typed prompt out of the tail
     // window; Claude also records it in `last-prompt` entries.
@@ -417,8 +437,12 @@ pub fn transcript_excerpts(path: &Path) -> Excerpts {
             .filter(|t| !t.trim().is_empty())
             .map(|t| clip(t, 300));
     }
-    if e.last_prompt == e.first_prompt {
-        e.last_prompt = None; // one prompt so far: don't repeat it
+    // One prompt so far: don't repeat it. Claude's `last-prompt` record may
+    // be a truncated copy, so compare without the ellipsis.
+    if let (Some(l), Some(f)) = (&e.last_prompt, &e.first_prompt) {
+        if f.starts_with(l.trim_end_matches('…')) {
+            e.last_prompt = None;
+        }
     }
     e
 }
