@@ -453,25 +453,66 @@ pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
 }
 
 /// Token totals and time span from a sub-agent transcript.
+///
+/// Incremental: a running agent's transcript is polled again and again while
+/// it grows, so the totals so far and the offset read up to are kept per
+/// file, and each call parses only the bytes appended since (complete lines
+/// only; a half-written last line waits for the next call). A file that
+/// shrank (rewritten) is read again from the start.
 pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i64>)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let (mut input, mut output) = (0i64, 0i64);
-    let (mut first, mut last) = (None, None);
-    for line in content.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(ts) = v["timestamp"].as_str().and_then(parse_iso_ms) {
-            first.get_or_insert(ts);
-            last = Some(ts);
-        }
-        if let Some(u) = v["message"]["usage"].as_object() {
-            input += u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-            output += u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-        }
+    use std::io::{Read, Seek, SeekFrom};
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = cursors.entry(path.to_path_buf()).or_default();
+    if len < c.offset {
+        *c = StatsCursor::default();
     }
-    Some((input, output, first, last))
+    if len > c.offset {
+        let mut f = std::fs::File::open(path).ok()?;
+        f.seek(SeekFrom::Start(c.offset)).ok()?;
+        let mut buf = Vec::with_capacity((len - c.offset) as usize);
+        f.take(len - c.offset).read_to_end(&mut buf).ok()?;
+        // Only up to the last complete line.
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
+            return Some(c.stats());
+        };
+        for line in buf[..end].split(|&b| b == b'\n') {
+            let Ok(v) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if let Some(ts) = v["timestamp"].as_str().and_then(parse_iso_ms) {
+                c.first.get_or_insert(ts);
+                c.last = Some(ts);
+            }
+            if let Some(u) = v["message"]["usage"].as_object() {
+                c.input += u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                c.output += u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
+            }
+        }
+        c.offset += end as u64 + 1;
+    }
+    Some(c.stats())
 }
+
+/// How far `transcript_stats` has read a file, and the totals so far.
+#[derive(Default)]
+struct StatsCursor {
+    offset: u64,
+    input: i64,
+    output: i64,
+    first: Option<i64>,
+    last: Option<i64>,
+}
+
+impl StatsCursor {
+    fn stats(&self) -> (i64, i64, Option<i64>, Option<i64>) {
+        (self.input, self.output, self.first, self.last)
+    }
+}
+
+static STATS_CURSORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, StatsCursor>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Every sub-agent described by a `*.meta.json` in the session's subagents
 /// dir (the Agent tool writes one per real sub-agent; Claude's internal
@@ -574,6 +615,32 @@ mod subagent_tests {
             parse_iso_ms("2026-09-11T20:20:47.939Z"),
             Some(1_789_158_047_939)
         );
+    }
+
+    #[test]
+    fn transcript_stats_reads_only_what_was_appended() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("agent-x.jsonl");
+        let line = |ts: &str, i: i64| {
+            format!(
+                "{{\"timestamp\":\"2026-10-27T17:03:{ts}.000Z\",\"message\":{{\"usage\":{{\"input_tokens\":{i},\"output_tokens\":1}}}}}}\n"
+            )
+        };
+        std::fs::write(&p, line("00", 10)).unwrap();
+        assert_eq!(transcript_stats(&p).unwrap().0, 10);
+        // Appended: a full line and half of the next.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        let next = line("05", 7);
+        write!(f, "{}{}", line("02", 5), &next[..10]).unwrap();
+        let (i, o, first, last) = transcript_stats(&p).unwrap();
+        assert_eq!((i, o), (15, 2), "the half line isn't counted yet");
+        assert_eq!(last.unwrap() - first.unwrap(), 2_000);
+        write!(f, "{}", &next[10..]).unwrap();
+        assert_eq!(transcript_stats(&p).unwrap().0, 22);
+        // Rewritten shorter: read again from the start.
+        std::fs::write(&p, line("00", 3)).unwrap();
+        assert_eq!(transcript_stats(&p).unwrap().0, 3);
     }
 
     #[test]
