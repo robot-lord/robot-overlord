@@ -535,13 +535,8 @@ impl App {
             return Ok(false);
         }
         let Some(action) = action else {
-            match k.code {
-                KeyCode::Char('q') if k.modifiers.is_empty() => self.quit_hint(),
-                // H / L: the sessions tab / the groups tab (left / right),
-                // besides Tab. Only while not bound to something else.
-                KeyCode::Char('H') => self.switch_tab(Tab::Sessions),
-                KeyCode::Char('L') => self.switch_tab(Tab::Groups),
-                _ => {}
+            if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+                self.quit_hint();
             }
             return Ok(false);
         };
@@ -636,6 +631,10 @@ impl App {
                 }
             }
             Action::Notes => self.edit_notes(terminal)?,
+            Action::SessionsTab => self.switch_tab(Tab::Sessions),
+            // Inside a group, the groups tab's own place is its group list.
+            Action::GroupsTab if self.tab == Tab::Groups => self.group_focus = true,
+            Action::GroupsTab => self.switch_tab(Tab::Groups),
             Action::SwitchTab => self.switch_tab(match self.tab {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
@@ -1577,6 +1576,8 @@ enum Action {
     Notes,
     Overlord,
     SwitchTab,
+    SessionsTab,
+    GroupsTab,
     Tags,
     Cancel,
 }
@@ -1703,6 +1704,8 @@ impl KeyMap {
             (Action::Notes, &k.notes),
             (Action::Overlord, &k.overlord),
             (Action::SwitchTab, &k.switch_tab),
+            (Action::SessionsTab, &k.sessions_tab),
+            (Action::GroupsTab, &k.groups_tab),
             (Action::Tags, &k.tags),
             (Action::Cancel, &k.cancel),
         ];

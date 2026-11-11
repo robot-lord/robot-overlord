@@ -292,14 +292,8 @@ impl App {
         top.push(Span::raw("  "));
         top.push(key(Action::SwitchTab));
         top.push(Span::styled(" or ", theme::faint()));
-        top.push(Span::styled(
-            " H ",
-            Style::default().fg(theme::muted_c()).bg(theme::chip()),
-        ));
-        top.push(Span::styled(
-            " L ",
-            Style::default().fg(theme::muted_c()).bg(theme::chip()),
-        ));
+        top.push(key(Action::SessionsTab));
+        top.push(key(Action::GroupsTab));
 
         let mut view = vec![Span::raw(" "), Span::styled("⌕ ", theme::muted())];
         if self.filter.trim().is_empty() {
