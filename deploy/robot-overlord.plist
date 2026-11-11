@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd user agent for the Robot Overlord daemon (rlordd).
+     Template: scripts/install-launchd.sh fills in __BIN__ / __HOME__ / __PATH__
+     and installs it to ~/Library/LaunchAgents/. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>robot-overlord.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a bare PATH; the daemon spawns tmux, git and the
+         agent CLIs, and tmux panes inherit this environment. -->
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/rlordd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/rlordd.log</string>
+</dict>
+</plist>

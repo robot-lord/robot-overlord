@@ -58,6 +58,9 @@ pub struct Session {
     pub agents_running: i64,
     #[serde(default)]
     pub agents_total: i64,
+    /// '' for ordinary sessions, 'overlord' for the management session.
+    #[serde(default)]
+    pub role: String,
 }
 
 pub fn now_ms() -> i64 {

@@ -1,6 +1,13 @@
-//! The new-session form: a centered modal. Field order puts the repo first
-//! so the common path is `n`, glance at the default, `Enter` to launch — or
-//! `j`/`↓` to drop into the repo list, pick one, `Enter`.
+//! The new-session forms, as centered modals.
+//!
+//! - `n` — a **request to the overlord**: what you want done (as long as you
+//!   like, including any instructions for the overlord) plus a few defaults
+//!   (repo, model, worktree, tags). Sent as a `[rlord new-session request]`
+//!   message; the overlord names the session, writes its prompt and
+//!   launches it.
+//! - `N` — the **manual form**: launch directly, no overlord involved. Field
+//!   order puts the repo first. `Enter` on a field opens its picker; arrows
+//!   only ever move between fields.
 
 use super::*;
 use ratatui::widgets::{Clear, List, ListItem, ListState};
@@ -14,8 +21,25 @@ pub(crate) enum Field {
     Workspace,
     Branch,
     Prompt,
+    Tags,
     Launch,
 }
+
+/// Which form: the overlord request (`n`) or the manual launch (`N`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormKind {
+    Overlord,
+    Manual,
+}
+
+const OVERLORD_FIELDS: [Field; 6] = [
+    Field::Prompt,
+    Field::Repo,
+    Field::Model,
+    Field::Workspace,
+    Field::Tags,
+    Field::Launch,
+];
 
 const FIELDS: [Field; 7] = [
     Field::Repo,
@@ -29,16 +53,21 @@ const FIELDS: [Field; 7] = [
 
 impl Field {
     fn is_text(self) -> bool {
-        matches!(self, Field::Name | Field::Branch | Field::Prompt)
+        matches!(
+            self,
+            Field::Name | Field::Branch | Field::Prompt | Field::Tags
+        )
     }
-    fn label(self) -> &'static str {
+    fn label(self, kind: FormKind) -> &'static str {
         match self {
             Field::Repo => "Repo",
             Field::Name => "Name",
             Field::Model => "Model",
             Field::Workspace => "Workspace",
             Field::Branch => "Branch",
+            Field::Prompt if kind == FormKind::Overlord => "Request",
             Field::Prompt => "Prompt",
+            Field::Tags => "Tags",
             Field::Launch => "",
         }
     }
@@ -48,6 +77,8 @@ impl Field {
 pub(crate) enum Location {
     Repo(String),
     Folder(String),
+    /// Overlord form only: the overlord picks the repo from the request.
+    Auto,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +164,7 @@ impl Finder {
 }
 
 pub(crate) struct NewForm {
+    kind: FormKind,
     focus: usize,
     location: Location,
     name: String,
@@ -141,6 +173,8 @@ pub(crate) struct NewForm {
     branch: String,
     branch_touched: bool,
     prompt: String,
+    /// Overlord form: space-separated groups for the new session.
+    tags: String,
     repos: Vec<Value>,
     models: Vec<String>,
     picker: Option<(PickerKind, Vec<String>, ListState)>,
@@ -150,8 +184,54 @@ pub(crate) struct NewForm {
 }
 
 impl NewForm {
+    /// Overlay fields proposed by the overlord (`repo`/`project`, `name`,
+    /// `branch`, `model`, `workspace`, `prompt`); focus lands on Launch so
+    /// confirming is one keypress.
+    pub(crate) fn prefill(&mut self, p: &Value) {
+        let get = |k: &str| p[k].as_str().map(str::to_string);
+        if let Some(r) = get("repo") {
+            self.location = Location::Repo(r);
+        } else if let Some(d) = get("project") {
+            self.location = Location::Folder(d);
+            self.workspace = false;
+        }
+        if let Some(n) = get("name") {
+            self.name = n;
+        }
+        if let Some(b) = get("branch") {
+            self.branch = b;
+            self.branch_touched = true;
+        } else if !self.name.is_empty() && !self.branch_touched {
+            self.branch = sanitize_branch(&self.name);
+        }
+        if let Some(m) = get("model") {
+            if !self.models.contains(&m) {
+                self.models.insert(0, m.clone());
+            }
+            self.model = m;
+        }
+        if let Some(w) = p["workspace"].as_bool() {
+            self.workspace = w && matches!(self.location, Location::Repo(_));
+        }
+        if let Some(pr) = get("prompt") {
+            self.prompt = pr;
+        }
+        self.focus = self
+            .fields()
+            .iter()
+            .position(|f| *f == Field::Launch)
+            .unwrap_or(0);
+    }
+
+    fn fields(&self) -> &'static [Field] {
+        match self.kind {
+            FormKind::Overlord => &OVERLORD_FIELDS,
+            FormKind::Manual => &FIELDS,
+        }
+    }
+
     fn current(&self) -> Field {
-        FIELDS[self.focus]
+        self.fields()[self.focus]
     }
 
     fn location_label(&self) -> String {
@@ -159,13 +239,14 @@ impl NewForm {
         match &self.location {
             Location::Repo(p) => shorten(&p.replacen(&home, "~", 1), 58),
             Location::Folder(p) => format!("{} (no repo)", shorten(&p.replacen(&home, "~", 1), 48)),
+            Location::Auto => "(overlord picks, from the request)".into(),
         }
     }
 }
 
 impl App {
-    /// Open the form, seeded from the daemon's session defaults and repo list.
-    pub(crate) fn open_new_form(&mut self) {
+    /// Open a form, seeded from the daemon's session defaults and repo list.
+    pub(crate) fn open_new_form(&mut self, kind: FormKind) {
         let defaults = self
             .call("session.defaults", Value::Null)
             .unwrap_or(json!({}));
@@ -201,7 +282,13 @@ impl App {
         if !model.is_empty() && !models.contains(&model) {
             models.insert(0, model.clone());
         }
+        // On the groups tab, a new session joins the group being viewed.
+        let tags = match (&self.tab, &self.group_sel) {
+            (groups::Tab::Groups, Some(g)) if g != groups::UNTAGGED => g.clone(),
+            _ => String::new(),
+        };
         self.mode = Mode::NewSession(Box::new(NewForm {
+            kind,
             focus: 0,
             location,
             name: String::new(),
@@ -210,6 +297,7 @@ impl App {
             branch: String::new(),
             branch_touched: false,
             prompt: String::new(),
+            tags,
             repos,
             models,
             picker: None,
@@ -340,6 +428,9 @@ impl App {
                             self.open_finder(&mut f);
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
+                        } else if items[i] == AUTO_REPO {
+                            f.location = Location::Auto;
+                            f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
                             f.location = Location::Repo(path);
@@ -353,21 +444,28 @@ impl App {
         }
         // --- form navigation / editing ---
         let field = f.current();
-        let n = FIELDS.len();
+        let n = f.fields().len();
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        // Shift-Enter (or ctrl-s, where the terminal can't tell Shift-Enter
+        // from Enter) sends from any field.
+        let shift_enter = code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT);
+        if shift_enter || (ctrl && code == KeyCode::Char('s')) {
+            return self.submit_form(f);
+        }
         let next = |f: &mut NewForm| f.focus = (f.focus + 1) % n;
         let prev = |f: &mut NewForm| f.focus = (f.focus + n - 1) % n;
         match code {
             KeyCode::Esc => return Ok(None),
             KeyCode::Tab => next(&mut f),
             KeyCode::BackTab => prev(&mut f),
-            // On the repo field, "down" means "show me the list".
-            KeyCode::Down | KeyCode::Char('j') if field == Field::Repo => {
-                self.open_picker(&mut f, PickerKind::Repo)
-            }
             KeyCode::Down => next(&mut f),
             KeyCode::Up => prev(&mut f),
             KeyCode::Char('j') if !field.is_text() => next(&mut f),
             KeyCode::Char('k') if !field.is_text() => prev(&mut f),
+            // The request is free text: Enter is a new line (ctrl-s sends).
+            KeyCode::Enter if field == Field::Prompt && f.kind == FormKind::Overlord => {
+                f.prompt.push('\n')
+            }
             KeyCode::Enter => match field {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
@@ -391,6 +489,9 @@ impl App {
                 Field::Prompt => {
                     f.prompt.pop();
                 }
+                Field::Tags => {
+                    f.tags.pop();
+                }
                 _ => {}
             },
             KeyCode::Char(c) if field.is_text() && !k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -406,6 +507,7 @@ impl App {
                         f.branch_touched = true;
                     }
                     Field::Prompt => f.prompt.push(c),
+                    Field::Tags => f.tags.push(c),
                     _ => {}
                 }
             }
@@ -436,6 +538,9 @@ impl App {
                     .collect();
                 v.push(OTHER_REPO.to_string());
                 v.push(NO_REPO.to_string());
+                if f.kind == FormKind::Overlord {
+                    v.push(AUTO_REPO.to_string());
+                }
                 v
             }
             PickerKind::Model => {
@@ -452,7 +557,8 @@ impl App {
                     .iter()
                     .position(|r| r["path"].as_str() == Some(p))
                     .unwrap_or(0),
-                Location::Folder(_) => items.len() - 1,
+                Location::Folder(_) => f.repos.len() + 1,
+                Location::Auto => items.len() - 1,
             },
             PickerKind::Model => f.models.iter().position(|m| *m == f.model).unwrap_or(0),
         };
@@ -477,7 +583,49 @@ impl App {
         });
     }
 
-    fn submit_form(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+    fn submit_form(&mut self, f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+        match f.kind {
+            FormKind::Overlord => self.submit_request(f),
+            FormKind::Manual => self.submit_manual(f),
+        }
+    }
+
+    /// Hand the request to the overlord and open it, so the user sees any
+    /// question it asks.
+    fn submit_request(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+        if f.prompt.trim().is_empty() {
+            f.error = Some("write a request first".into());
+            f.focus = 0;
+            return Ok(Some(f));
+        }
+        let mut params = json!({
+            "request": f.prompt,
+            "model": f.model,
+            "workspace": f.workspace,
+            "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
+        });
+        match &f.location {
+            Location::Repo(p) => params["repo"] = json!(p),
+            Location::Folder(p) => {
+                params["repo"] = json!(format!("{p} (plain folder, not a repo)"));
+                params["workspace"] = json!(false);
+            }
+            Location::Auto => {}
+        }
+        match client_call(&paths::socket_path(), "overlord.new_session", params) {
+            Ok(_) => {
+                self.status_line = "sent to the overlord".into();
+                self.show_overlord();
+                Ok(None)
+            }
+            Err(e) => {
+                f.error = Some(format!("{e:#}"));
+                Ok(Some(f))
+            }
+        }
+    }
+
+    fn submit_manual(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
         let mut params = json!({
             "name": if f.name.trim().is_empty() { None } else { Some(f.name.trim()) },
             "prompt": if f.prompt.trim().is_empty() { None } else { Some(f.prompt.trim()) },
@@ -490,6 +638,10 @@ impl App {
             Location::Folder(p) => {
                 params["project"] = json!(p);
                 params["workspace"] = json!(false);
+            }
+            Location::Auto => {
+                f.error = Some("pick a repo".into());
+                return Ok(Some(f));
             }
         }
         match client_call(&paths::socket_path(), "session.new", params) {
@@ -514,11 +666,18 @@ impl App {
     }
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
-        let area = centered(f.area(), 74, 16);
+        let (area, title) = match form.kind {
+            FormKind::Overlord => (
+                centered(f.area(), 78, 24),
+                " new session · via the overlord ",
+            ),
+            FormKind::Manual => (
+                centered(f.area(), 74, 16),
+                " new session, manual  (tab/↑↓ move · enter: pick/launch · esc) ",
+            ),
+        };
         f.render_widget(Clear, area);
-        let block = Block::default().borders(Borders::ALL).title(
-            " new session  (tab/↑↓ move · j/↓ on repo: list · enter: pick/launch · esc: cancel) ",
-        );
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -578,7 +737,14 @@ impl App {
         }
 
         let mut lines: Vec<Line> = Vec::new();
-        for (i, field) in FIELDS.iter().enumerate() {
+        if form.kind == FormKind::Overlord {
+            lines.push(Line::from(Span::styled(
+                "  Say what you want. The overlord names the session and launches it.",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::raw(""));
+        }
+        for (i, field) in form.fields().iter().enumerate() {
             let focused = i == form.focus;
             let marker = if focused { "▶ " } else { "  " };
             let value = match field {
@@ -593,6 +759,7 @@ impl App {
                 }
                 Field::Workspace => match (&form.location, form.workspace) {
                     (Location::Folder(_), _) => "n/a (no repo)".into(),
+                    (Location::Auto, true) => "[x] dedicated worktree".into(),
                     (_, true) => "[x] dedicated worktree".into(),
                     (_, false) => "[ ] work directly in the repo".into(),
                 },
@@ -606,6 +773,13 @@ impl App {
                     }
                 }
                 Field::Prompt => form.prompt.clone(),
+                Field::Tags => {
+                    if form.tags.is_empty() && !focused {
+                        "(overlord picks)".into()
+                    } else {
+                        form.tags.clone()
+                    }
+                }
                 Field::Launch => String::new(),
             };
             let style = if focused {
@@ -621,17 +795,42 @@ impl App {
                 ""
             };
             let line = if *field == Field::Launch {
+                let label = match form.kind {
+                    FormKind::Overlord => "Send to overlord",
+                    FormKind::Manual => "Launch",
+                };
                 Line::from(vec![
                     Span::raw(marker),
                     Span::styled(
-                        if focused { "[ Launch ]" } else { "  Launch  " },
+                        if focused {
+                            format!("[ {label} ]")
+                        } else {
+                            format!("  {label}  ")
+                        },
                         style.fg(Color::Green),
                     ),
                 ])
+            } else if *field == Field::Prompt && form.kind == FormKind::Overlord {
+                // Multi-line request: label on its own line, text indented.
+                lines.push(Line::from(vec![
+                    Span::raw(marker),
+                    Span::styled(field.label(form.kind), style),
+                ]));
+                let text = format!("{value}{cursor}");
+                let body: Vec<&str> = if text.is_empty() {
+                    vec![""]
+                } else {
+                    text.split('\n').collect()
+                };
+                for l in body {
+                    lines.push(Line::raw(format!("    {l}")));
+                }
+                lines.push(Line::raw(""));
+                continue;
             } else {
                 Line::from(vec![
                     Span::raw(marker),
-                    Span::styled(format!("{:<10}", field.label()), style),
+                    Span::styled(format!("{:<10}", field.label(form.kind)), style),
                     Span::raw(format!("{value}{cursor}")),
                 ])
             };
@@ -639,6 +838,12 @@ impl App {
             if *field == Field::Prompt {
                 lines.push(Line::raw(""));
             }
+        }
+        if form.kind == FormKind::Overlord {
+            lines.push(Line::from(Span::styled(
+                "  shift-enter send · enter: new line, pick · tab/↑↓ move · esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
@@ -661,6 +866,7 @@ impl App {
 
 const OTHER_REPO: &str = "  find another repo…";
 const NO_REPO: &str = "  no repo — plain folder…";
+const AUTO_REPO: &str = "  let the overlord pick (from the request)";
 
 /// Keep the tail of a long path (the part that identifies it).
 fn shorten(p: &str, max: usize) -> String {
@@ -673,7 +879,7 @@ fn shorten(p: &str, max: usize) -> String {
     }
 }
 
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
+pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
     Rect {

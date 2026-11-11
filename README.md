@@ -67,7 +67,57 @@ rlord stop <ref> && rlord restart <ref>      # resume with full conversation con
 rlord rename/tag/untag/pin/archive/log <ref> # meta-context
 ```
 
-For a persistent daemon, install `deploy/robot-overlord.service` (systemd user unit).
+For a persistent daemon, run `scripts/install-launchd.sh` (launchd user agent;
+`uninstall` removes it). `scripts/dev-daemon.sh` then restarts it via launchd.
+
+## The overlord
+
+The primary way to drive rlord is the **overlord**: one long-running agent
+session (your tool and model, `opus` by default) that you talk to in order to
+run the fleet. It has rlord's MCP tools, pre-allowed, and they act on the real
+UI you're looking at:
+
+- launch sessions: open the new-session form **pre-filled** for you to confirm
+  (`propose_session`), or create one directly and send you there or not
+  (`create_session`, `go`);
+- search and jump: switch your terminal to a session (`goto_session`) or to the
+  list (`show_list`);
+- shape the list: set the current filter/sort, and save it as the default view
+  (`set_list_view`);
+- inspect and edit: sessions' meta-context, recent events, live screen, names,
+  tags, notes, lifecycle.
+
+**Option-O** opens it as an overlay floating over whatever you're looking at:
+an agent session or the list. Option-O again, or Option-D, closes it. `enter` on the magenta ◆ row at the top of the list opens the
+overlord full screen, like any session. Its status bar turns magenta
+(`◆ OVERLORD`), Option-O does nothing there, and Option-D goes back to the
+list. The overlay is a tmux
+popup running rlord's own renderer of the overlord's live pane, so everything
+you type goes to the overlord. When the overlord moves you somewhere (a
+session, the list, a pre-filled form) it closes itself first. `rlord` always
+runs its TUI inside tmux (it starts a `rlord` tmux session if you're outside
+one).
+
+Quitting the list takes **Shift-Q** plus a confirmation. `q` and Ctrl-C only show
+that hint.
+
+First start with no overlord shows a setup dialog where everything is defaulted,
+so `enter` launches it. On every start rlord checks the overlord's model: it
+reads what the agent actually ran from its transcript and compares it with a
+per-tool table of latest models (`crates/core/src/models.rs`). If you're on an
+older Opus, a dialog offers to switch and restart, and the conversation resumes.
+`rlord overlord status|model <m>|restart|open` does the same from the CLI.
+
+`enter` on a stopped session resumes it and attaches.
+
+The list's UPDATED column (and the default sort) is the session's last
+update: the latest message either way, or status change. The details card
+breaks it down.
+
+Add standing instructions in `~/.config/robot-overlord/overlord.md`. They're
+appended to the overlord's built-in instructions, which are written to its
+folder as `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` on each start. Your usual
+global files (`~/.claude/CLAUDE.md` and friends) still apply.
 
 ## Creating sessions
 
@@ -78,9 +128,21 @@ git worktree at `<repo>/.worktrees/<branch>` (other-tool's layout; the dir is
 `workspace_dir`, excluded via `.git/info/exclude`, never touching your
 `.gitignore`). Set `default_repo` and the form opens on it.
 
-In the TUI, `n` opens the form with the repo preselected (your default repo,
-else the repo around the current directory). `Enter` launches straight away;
-`j`/`↓` on the repo line drops into the repo list — default first (★), then
+In the TUI, `n` asks the **overlord** to launch a session. Write what you
+want, as long as you like, and adjust the defaults (repo, or "let the
+overlord pick"; model; worktree; tags, prefilled with the group you're
+viewing). `Enter` adds a new line in the
+request; `shift-enter` (or `ctrl-s`) sends it. The overlord names the session and launches it.
+It may ask a quick question or do a little groundwork first (its overlay
+opens so you see it); say "launch as is" in the request to skip that. The
+prompt it writes starts with your request word for word, plus any context
+it found. From
+anywhere: `rlord overlord ask "…"` (or pipe text in) sends the overlord any
+message.
+
+`N` opens the **manual** form, which launches directly, with the repo preselected (your default repo,
+else the repo around the current directory). `shift-enter`, `ctrl-s` or `Enter` on
+Launch launches; `Enter` on the repo line opens the repo list — default first (★), then
 every repo you've used, most recent first — plus "find another repo…" (a
 filter-as-you-type finder over every git repo under `repo_roots`, default
 `["~"]` to depth 3, MRU first; a typed path that is a repo is offered too)
@@ -109,22 +171,76 @@ tokens); the session list shows `⚙N` while any are running; `rlord agents
 <ref>` prints them. Sessions that ran before the hooks existed are backfilled
 from disk on first view.
 
+## rlord's tmux
+
+rlord runs its own private tmux server (`tmux -L rlord`) with a generated
+config: no status bar, no prefix key, mouse on. The only keys it binds are
+Option-D (to the list) and Option-O (the overlord). Your personal tmux is never
+touched. Starting `rlord` from inside your own tmux nests cleanly. Put your
+own tweaks for rlord's tmux in `~/.local/share/robot-overlord/tmux.local.conf`.
+
+**Your tmux, per session.** `rlord tmux import` turns your tmux config into a
+profile that agent sessions use: your prefix, key bindings, status bar,
+splits and windows. The list page and the overlord keep rlord's plain tmux,
+and one session's profile never affects another.
+
+- The import asks tmux what your config produced, by loading it on a scratch
+  server. So `if-shell`, `source-file` and plugins all come through.
+- It prints a report of everything it left out, and why.
+- Left out: rlord's own keys (Option-D/O stay rlord's), `kill-server`,
+  session-restore plugins (resurrect, continuum), and server-wide options
+  that would change the list page.
+- `--dry-run` shows the report and writes nothing. `--remove` deletes the
+  profile. Re-run the import after you change your config.
+- The profile is on for agent sessions by default (`[tmux] profile`).
+- Per session: `rlord tmux profile on|off|toggle|default [REF]`.
+- rlord tracks the agent's pane, so splits never confuse the preview or
+  status.
+
+**When it gets stuck:** `rlord reset` restarts the daemon, closes overlays,
+resyncs session state, reloads the tmux config and keys, and restarts the
+list. Agent sessions keep running. `rlord reset --hard` also kills rlord's
+whole tmux server. Every session stops, but no conversation is lost: `enter`
+in the list resumes each one. It also removes rlord sessions and bindings that
+older versions left on your default tmux server.
+
+## Sessions and groups
+
+The list has two tabs (`Tab` switches):
+
+- **sessions**: every session, flat.
+- **groups**: **tags are the groups**.
+  - A column on the left lists each tag with its session count, then
+    "untagged". The selected group's sessions sit next to it.
+  - `←`/`→` move between the column and the sessions. `enter` on a group
+    opens it.
+  - `R` on a group renames that tag on every session.
+  - A session with two tags appears in both groups.
+- **Filter bar:** above both tabs, a line always shows the current filter,
+  sort and live/archived, with the keys that change them.
+- **Editing tags:** `#` edits the selected session's tags (space-separated).
+- **The overlord** is expected to do most of the organizing:
+  - `organize` tags, renames and describes many sessions in one call;
+  - `list_groups` lists groups and counts;
+  - `rename_group` renames a group;
+  - `set_list_view` opens a tab or group (`tab`, `group`) and can save it as
+    your default.
+
 ## Navigation and keys
 
 The TUI is the hub. `enter` on a session switches your tmux client into its
 pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
-TUI — a home-row key, because you press it constantly. rlord never overrides
-your tmux prefix or a root-table key you already bind; it warns and skips.
+TUI. It's a home-row key, because you press it constantly. Stopped sessions
+resume on `enter`. Quit the list with Shift-Q, then confirm.
 
 Jumping is search-driven, not cycling: `/` filters as you type and `Enter`
 attaches to the top match (`Tab` keeps the filter, ↑/↓ move within matches);
 digits `1`–`9` attach to the Nth listed session. The search box and
-`rlord ls <query>` share one syntax — free words match name/project/group/tag,
-and `status:waiting` `tag:wip` `proj:wait2` `agent:claude` `group:work`
+`rlord ls <query>` share one syntax — free words match name/project/tag,
+and `status:waiting` `tag:wip` `proj:wait2` `agent:claude`
 `sort:user` set typed filters. `o` cycles sorts, `O` reverses. (macOS: make
-Option send Alt, e.g. kitty `macos_option_as_alt both`.) Those three are tmux root-table
-bindings that rlord installs on your tmux server (`rlord tmux bind|unbind`);
-if you attached from outside tmux, Option-D detaches instead.
+Option send Alt, e.g. kitty `macos_option_as_alt both`.) Option-D and
+Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).
 
 Everything is configurable in `~/.config/robot-overlord/config.toml`
 (`rlord config init` writes a commented template; `rlord config show` prints

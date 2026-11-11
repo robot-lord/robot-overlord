@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::types::{Session, Status, Subagent};
 
@@ -11,12 +11,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_repos_workspaces.sql"),
     include_str!("../migrations/0003_description_notes.sql"),
     include_str!("../migrations/0004_subagents.sql"),
+    include_str!("../migrations/0005_overlord.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
-     repo_path, workspace_path, branch, description, notes, launch_spec";
+     repo_path, workspace_path, branch, description, notes, launch_spec, role";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -30,6 +31,8 @@ pub struct NewSession<'a> {
     pub repo_path: Option<&'a str>,
     pub workspace_path: Option<&'a str>,
     pub branch: Option<&'a str>,
+    /// '' for ordinary sessions, 'overlord' for the management session.
+    pub role: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -59,8 +62,10 @@ pub enum ArchivedMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortMode {
-    /// Most recent agent activity first (the default).
+    /// Most recently updated first (the default): the latest message either
+    /// way or status change.
     #[default]
+    #[serde(alias = "updated")]
     Activity,
     /// Most recent user prompt first.
     User,
@@ -73,7 +78,7 @@ pub enum SortMode {
 impl SortMode {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
-            "activity" | "agent" => SortMode::Activity,
+            "updated" | "activity" | "agent" => SortMode::Activity,
             "user" => SortMode::User,
             "state" | "status" => SortMode::State,
             "created" | "age" => SortMode::Created,
@@ -83,7 +88,7 @@ impl SortMode {
     }
     pub fn label(self) -> &'static str {
         match self {
-            SortMode::Activity => "activity",
+            SortMode::Activity => "updated",
             SortMode::User => "user",
             SortMode::State => "state",
             SortMode::Created => "created",
@@ -119,6 +124,9 @@ pub struct SessionQuery {
     pub search: Option<String>,
     pub sort: SortMode,
     pub reverse: bool,
+    /// Include the overlord session (excluded by default: clients show it
+    /// as a special row, not as one of the fleet).
+    pub include_overlord: bool,
 }
 
 impl SessionQuery {
@@ -216,8 +224,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO sessions (id, name, agent, agent_session, project_path, tmux_session, \
                                    status, launch_spec, created_at, repo_path, workspace_path, \
-                                   branch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?8, ?9, ?10, ?11)",
+                                   branch, role) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 s.id,
                 s.name,
@@ -229,7 +237,8 @@ impl Db {
                 s.created_at,
                 s.repo_path,
                 s.workspace_path,
-                s.branch
+                s.branch,
+                s.role
             ],
         )?;
         Ok(())
@@ -239,6 +248,10 @@ impl Db {
     /// then unique name prefix.
     pub fn resolve_ref(&self, r: &str) -> Result<Session> {
         if let Some(s) = self.get_session_where("id = ?1", r)? {
+            return Ok(s);
+        }
+        // Its tmux session name (`rlord-brave-otter`), e.g. from inside it.
+        if let Some(s) = self.get_session_where("tmux_session = ?1", r)? {
             return Ok(s);
         }
         let by_name: Vec<Session> = self.query_sessions("name = ?1", r)?;
@@ -275,6 +288,32 @@ impl Db {
         Ok(sessions)
     }
 
+    /// The overlord session, if one has ever been created.
+    pub fn overlord(&self) -> Result<Option<Session>> {
+        let mut v = self.query_sessions("role = ?1", "overlord")?;
+        Ok(if v.is_empty() {
+            None
+        } else {
+            Some(v.remove(0))
+        })
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<Session>> {
         self.sessions(&SessionQuery {
             archived: if include_archived {
@@ -290,6 +329,9 @@ impl Db {
     pub fn sessions(&self, q: &SessionQuery) -> Result<Vec<Session>> {
         let mut conds: Vec<String> = Vec::new();
         let mut args: Vec<String> = Vec::new();
+        if !q.include_overlord {
+            conds.push("role = ''".into());
+        }
         match q.archived {
             ArchivedMode::Live => conds.push("archived_at IS NULL".into()),
             ArchivedMode::Only => conds.push("archived_at IS NOT NULL".into()),
@@ -345,7 +387,8 @@ impl Db {
         };
         let (expr, natural) = match q.sort {
             SortMode::Activity => (
-                "COALESCE(last_agent_msg_at, last_user_msg_at, created_at)",
+                "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
+                 COALESCE(last_user_msg_at, 0), COALESCE(last_state_change_at, 0))",
                 "DESC",
             ),
             SortMode::User => ("COALESCE(last_user_msg_at, created_at)", "DESC"),
@@ -477,12 +520,67 @@ impl Db {
         Ok(())
     }
 
+    /// Every tag on live (unarchived) sessions with its session count, most
+    /// used first; the overlord is never tagged.
+    pub fn tag_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.tag, COUNT(*) FROM tags t JOIN sessions s ON s.id = t.session_id \
+             WHERE s.archived_at IS NULL AND s.role = '' \
+             GROUP BY t.tag ORDER BY COUNT(*) DESC, t.tag",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Rename a tag on every session (merging into `to` where it exists).
+    /// Returns how many sessions carried it.
+    pub fn rename_tag(&self, from: &str, to: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO tags (session_id, tag) \
+             SELECT session_id, ?2 FROM tags WHERE tag = ?1",
+            params![from, to],
+        )?;
+        let removed = self
+            .conn
+            .execute("DELETE FROM tags WHERE tag = ?1", [from])?;
+        Ok(n.max(removed))
+    }
+
     pub fn launch_spec(&self, id: &str) -> Result<String> {
         Ok(self.conn.query_row(
             "SELECT launch_spec FROM sessions WHERE id = ?1",
             [id],
             |r| r.get(0),
         )?)
+    }
+
+    /// Whether any session (archived included) uses this tmux session name.
+    pub fn tmux_name_taken(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE tmux_session = ?1 LIMIT 1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn set_tmux_session(&self, id: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET tmux_session = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_launch_spec(&self, id: &str, spec: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET launch_spec = ?2 WHERE id = ?1",
+            params![id, spec],
+        )?;
+        Ok(())
     }
 
     /// Update status; stamps last_state_change_at and returns true iff changed.
@@ -724,6 +822,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
             .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
             .filter(|m| !m.is_empty()),
         tags: Vec::new(),
+        role: r.get(22)?,
     })
 }
 
@@ -755,6 +854,7 @@ mod tests {
             repo_path: None,
             workspace_path: None,
             branch: None,
+            role: "",
         })
         .unwrap();
     }
@@ -762,7 +862,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
         for table in [
             "sessions",
             "tags",
@@ -790,7 +890,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -1022,5 +1122,46 @@ mod tests {
         assert!(db.resolve_ref("01ab").is_err()); // ambiguous prefix
         assert!(db.resolve_ref("01abc").is_ok());
         assert!(db.resolve_ref("zzz").is_err());
+    }
+
+    #[test]
+    fn overlord_hidden_from_queries_and_kv_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01a", "a");
+        db.insert_session(&NewSession {
+            id: "01o",
+            name: "overlord",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp/o",
+            tmux_session: "rlord_overlord",
+            launch_spec: "{}",
+            created_at: 1000,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "overlord",
+        })
+        .unwrap();
+        let ids: Vec<String> = db
+            .sessions(&SessionQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["01a"]);
+        let all = db
+            .sessions(&SessionQuery {
+                include_overlord: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(db.overlord().unwrap().unwrap().id, "01o");
+
+        assert_eq!(db.kv_get("k").unwrap(), None);
+        db.kv_set("k", "1").unwrap();
+        db.kv_set("k", "2").unwrap();
+        assert_eq!(db.kv_get("k").unwrap().as_deref(), Some("2"));
     }
 }

@@ -28,7 +28,10 @@ pub struct Keys {
     pub top: String,
     pub bottom: String,
     pub attach: String,
+    /// New session via the overlord: a request plus a few defaults.
     pub new: String,
+    /// New session via the manual form (no overlord).
+    pub new_manual: String,
     pub restart: String,
     pub stop: String,
     pub archive: String,
@@ -42,19 +45,27 @@ pub struct Keys {
     pub toggle_log: String,
     pub describe: String,
     pub notes: String,
+    /// Show/hide the overlord overlay. Defaults to Option-O, the same key
+    /// that summons it from any pane.
+    pub overlord: String,
+    /// Switch between the sessions tab (flat list) and the groups tab.
+    pub switch_tab: String,
+    /// Edit the selected session's tags (tags are the groups).
+    pub tags: String,
     pub cancel: String,
 }
 
 impl Default for Keys {
     fn default() -> Self {
         Keys {
-            quit: "q".into(),
+            quit: "Q".into(),
             up: "k".into(),
             down: "j".into(),
             top: "g".into(),
             bottom: "G".into(),
             attach: "enter".into(),
             new: "n".into(),
+            new_manual: "N".into(),
             restart: "r".into(),
             stop: "s".into(),
             archive: "x".into(),
@@ -68,6 +79,9 @@ impl Default for Keys {
             toggle_log: "l".into(),
             describe: "D".into(),
             notes: "E".into(),
+            overlord: "M-o".into(),
+            switch_tab: "tab".into(),
+            tags: "#".into(),
             cancel: "esc".into(),
         }
     }
@@ -84,6 +98,13 @@ pub struct TmuxKeys {
     /// Cycle to the next / previous live session without going home.
     pub next: String,
     pub prev: String,
+    /// From any pane: jump to rlord with the overlord overlay open; in rlord:
+    /// toggle the overlay.
+    pub overlord: String,
+    /// Agent sessions use your imported tmux profile (`rlord tmux import`):
+    /// your prefix, bindings and status bar, in that session only. Turn it
+    /// on/off per session with `rlord tmux profile` or `T` in the list.
+    pub profile: bool,
 }
 
 impl Default for TmuxKeys {
@@ -92,6 +113,8 @@ impl Default for TmuxKeys {
             back: "M-d".into(),
             next: String::new(),
             prev: String::new(),
+            overlord: "M-o".into(),
+            profile: true,
         }
     }
 }
@@ -103,11 +126,40 @@ impl TmuxKeys {
             (&self.back, "home"),
             (&self.next, "next"),
             (&self.prev, "prev"),
+            (&self.overlord, "overlord"),
         ]
         .into_iter()
         .filter(|(k, _)| !k.trim().is_empty())
         .map(|(k, v)| (k.as_str(), v))
         .collect()
+    }
+}
+
+/// The overlord: the long-running session you talk to in order to drive
+/// rlord itself (launch sessions, search, navigate, set views).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlordConfig {
+    /// Coding tool. Only `claude` today.
+    pub agent: String,
+    /// Model for the overlord. Empty = the agent's own default.
+    pub model: String,
+    /// Size of the overlord overlay in the TUI: `90%` of the screen, or a
+    /// cell count.
+    #[serde(alias = "popup_width")]
+    pub width: String,
+    #[serde(alias = "popup_height")]
+    pub height: String,
+}
+
+impl Default for OverlordConfig {
+    fn default() -> Self {
+        OverlordConfig {
+            agent: "claude".into(),
+            model: "opus".into(),
+            width: "90%".into(),
+            height: "85%".into(),
+        }
     }
 }
 
@@ -185,6 +237,7 @@ pub struct Config {
     /// Height of the details pane under the preview (rows).
     pub details_height: u16,
     pub session: SessionDefaults,
+    pub overlord: OverlordConfig,
     pub keys: Keys,
     pub tmux: TmuxKeys,
 }
@@ -198,6 +251,7 @@ impl Default for Config {
             jump_digits: true,
             details_height: 12,
             session: SessionDefaults::default(),
+            overlord: OverlordConfig::default(),
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
         }
@@ -242,16 +296,27 @@ default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 repo_roots = ["~"]              # where the repo finder looks for git repos...
 repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
 
+# The overlord: a long-running session you talk to in order to drive rlord —
+# launch sessions, search, jump around, set the list's sort/filter. It gets
+# rlord's MCP tools; add your own standing instructions in
+# ~/.config/robot-overlord/overlord.md.
+[overlord]
+agent = "claude"
+model = "opus"
+width = "90%"           # size of the overlord overlay in the TUI
+height = "85%"          # (percent of the screen, or a cell count)
+
 # TUI keys. A character ("q", "R"), a named key ("enter", "esc", "tab", "up",
 # "down", "space", "backspace", "f1".."f12"), optionally "ctrl-"/"alt-" prefixed.
 [keys]
-quit = "q"
+quit = "Q"              # Shift-Q, then confirm; plain q just shows a hint
 up = "k"
 down = "j"
 top = "g"
 bottom = "G"
 attach = "enter"
-new = "n"
+new = "n"               # new session: describe it, the overlord launches it
+new_manual = "N"        # new session: the manual form
 restart = "r"
 stop = "s"
 archive = "x"
@@ -265,20 +330,22 @@ filter = "/"
 toggle_log = "l"
 describe = "D"          # edit the one-line description
 notes = "E"             # edit notes in $EDITOR
+overlord = "M-o"        # show/hide the overlord (same as Option-O everywhere)
+switch_tab = "tab"      # sessions tab (flat list) <-> groups tab (sessions by tag)
+tags = "#"              # edit the selected session's tags (tags are the groups)
 cancel = "esc"
 
-# Global tmux bindings rlord installs (root key table, tmux key syntax) so they
-# work from inside any agent pane. Set a key to "" to disable it.
-# `back` is the one you press constantly: Option/Alt + d, a home-row key.
+# Keys bound in rlord's own tmux server (tmux key syntax), so they work from
+# inside any agent pane. rlord runs a private tmux (`tmux -L rlord`, no status
+# bar, no prefix): these are the only keys it binds, and your own tmux is
+# never touched. Set a key to "" to disable it.
 # (On macOS make Option send Alt — kitty: `macos_option_as_alt both`.)
-# next/prev cycle through live sessions in list order; off by default because
-# jumping by search (`/` + Enter) or digit is usually what you actually want.
-# rlord will not override your tmux prefix or a key you already bind in the
-# root table; it warns and skips that key instead.
 [tmux]
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
 next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
+overlord = "M-o" # from any pane: back to rlord with the overlord open
+profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 "##;
 
 #[cfg(test)]
@@ -303,6 +370,9 @@ mod tests {
         assert_eq!(c.preview_refresh_ms, 500);
         assert!(c.session.workspace);
         assert_eq!(c.session.workspace_dir, ".worktrees");
+        assert_eq!(c.overlord.model, "opus");
+        assert_eq!(c.tmux.overlord, "M-o");
+        assert_eq!(c.keys.overlord, "M-o");
     }
 
     #[test]
@@ -313,6 +383,7 @@ mod tests {
         assert_eq!(c.layout, Layout::Stack);
         assert_eq!(c.keys.quit, "Q");
         assert_eq!(c.keys.attach, "enter");
-        assert!(c.tmux.bindings().is_empty()); // back disabled, next/prev off by default
+        // back disabled, next/prev off by default; only the overlord key remains
+        assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
     }
 }
