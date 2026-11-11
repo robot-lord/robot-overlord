@@ -420,7 +420,10 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
     let norm = |k: &str, v: Option<&Value>| -> Option<Value> {
         let v = v?.clone();
         Some(match (k, &v) {
-            ("repo", Value::String(r)) => json!(r.trim_end_matches('/')),
+            ("repo", Value::String(r)) => match r.strip_suffix(FOLDER) {
+                Some(f) => json!(format!("{}{FOLDER}", f.trim_end_matches('/'))),
+                None => json!(r.trim_end_matches('/')),
+            },
             ("tags", Value::Array(a)) => {
                 let mut t: Vec<String> = a
                     .iter()
@@ -497,11 +500,14 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
     }
     // The request this form answers (none for one the mastermind starts
     // itself): its hints' labels come from it.
-    let provenance = match params["request"].as_str().filter(|r| !r.trim().is_empty()) {
+    let provenance = match params["request_id"]
+        .as_str()
+        .filter(|r| !r.trim().is_empty())
+    {
         Some(r) => {
             let v = crate::ask::provenance_of(d, r)?;
             if v.is_null() {
-                bail!("unknown request id '{r}': pass the `request:` id from the new-session request you're answering, or omit it");
+                bail!("unknown request id '{r}': pass the `request_id:` from the new-session request you're answering, or omit it");
             }
             v
         }

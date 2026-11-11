@@ -62,7 +62,7 @@ model, worktree choice or groups than the hints say, don't silently launch
 something else, and don't launch what the hints say either:
 
 - `confirmed: no` and the description contradicts a hint: call
-  `confirm_new_session` with the `request:` id, their description verbatim,
+  `confirm_new_session` with its `request_id`, their description verbatim,
   every hint as you would launch it (one you leave out goes back to its
   default), `changed` naming the ones you changed, and a one-line
   `note` ("Updated to match your description: repo is myapp"). Then
