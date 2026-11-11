@@ -705,7 +705,7 @@ fn ingest_subagent_hook(
     let from_disk = source
         .as_deref()
         // Only this hook's agent, not every sub-agent of the session.
-        .map(|src| claude::scan_subagents_where(session_id, src, &|id| id == agent_id))
+        .map(|src| claude::scan_subagents_where(session_id, src, true, &|id| id == agent_id))
         .unwrap_or_default()
         .into_iter()
         .find(|a| a.agent_id == agent_id);
@@ -771,7 +771,8 @@ pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
         // finished one may still be resumed or get its last lines flushed),
         // but the DB is only written when something changed.
         let mut changed = false;
-        for a in claude::scan_subagents(&s.id, &src) {
+        let running = s.status != Status::Stopped;
+        for a in claude::scan_subagents_where(&s.id, &src, running, &|_| true) {
             let same = known.iter().any(|k| {
                 k.agent_id == a.agent_id
                     && k.input_tokens >= a.input_tokens
@@ -783,11 +784,6 @@ pub fn session_subagents(db: &Db, params: &Value) -> Result<Value> {
                 db.upsert_subagent(&a)?;
                 changed = true;
             }
-        }
-        // Found for a stopped session (e.g. an imported one): none of its
-        // sub-agents can still be running.
-        if s.status == Status::Stopped && known.iter().any(|k| k.finished_at.is_none()) {
-            changed |= db.close_open_subagents(Some(&s.id), now_ms())? > 0;
         }
         if changed {
             known = db.subagents(&s.id)?;

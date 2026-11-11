@@ -464,6 +464,7 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
     let (len, ino) = (meta.len(), meta.ino());
+    let modified = meta.modified().ok();
     // Copy the cursor out: the (possibly large) read happens unlocked, so one
     // slow file never holds up stats for another.
     let mut c = {
@@ -503,14 +504,21 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
             // Done when the latest turn is a final reply (no tool call
             // pending); a tool result or new prompt reopens it.
             match v["type"].as_str() {
-                Some("assistant") => c.ended = v["message"]["stop_reason"] == "end_turn",
+                // Any final stop reason (end_turn, max_tokens, …); not a
+                // tool call, nor a partial message without one.
+                Some("assistant") => {
+                    c.ended = v["message"]["stop_reason"]
+                        .as_str()
+                        .is_some_and(|r| r != "tool_use")
+                }
                 Some("user") => c.ended = false,
                 _ => {}
             }
         }
         c.offset += end as u64;
     }
-    let stats = c.stats();
+    let mut stats = c.stats();
+    stats.modified = modified;
     c.used = std::time::Instant::now();
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     cursors.insert(path.to_path_buf(), c);
@@ -526,7 +534,6 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     Some(stats)
 }
 
-/// How far `transcript_stats` has read a file, and the totals so far.
 /// What `transcript_stats` knows about a transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TranscriptStats {
@@ -536,8 +543,11 @@ pub struct TranscriptStats {
     pub last: Option<i64>,
     /// The latest turn is a final reply: the agent finished.
     pub ended: bool,
+    /// When the file was last written.
+    pub modified: Option<std::time::SystemTime>,
 }
 
+/// How far `transcript_stats` has read a file, and the totals so far.
 #[derive(Clone)]
 struct StatsCursor {
     ended: bool,
@@ -573,6 +583,7 @@ impl StatsCursor {
             first: self.first,
             last: self.last,
             ended: self.ended,
+            modified: None,
         }
     }
 }
@@ -592,16 +603,19 @@ static STATS_CURSORS: std::sync::LazyLock<
 /// dir (the Agent tool writes one per real sub-agent; Claude's internal
 /// helper agents have none and are deliberately excluded).
 pub fn scan_subagents(session_id: &str, transcript_path: &str) -> Vec<Subagent> {
-    scan_subagents_where(session_id, transcript_path, &|_| true)
+    scan_subagents_where(session_id, transcript_path, true, &|_| true)
 }
 
 /// `scan_subagents` for only the agent ids `want` accepts. Reading a
 /// sub-agent means reading its whole transcript (token totals), so callers
 /// skip the ones they already know are finished: on a long-lived session
 /// that is dozens of multi-MB files, and this runs as the user navigates.
+/// `parent_running`: false when the session has stopped; then none of its
+/// sub-agents can still be running.
 pub fn scan_subagents_where(
     session_id: &str,
     transcript_path: &str,
+    parent_running: bool,
     want: &dyn Fn(&str) -> bool,
 ) -> Vec<Subagent> {
     let dir = subagents_dir(transcript_path);
@@ -632,12 +646,12 @@ pub fn scan_subagents_where(
         // Claude doesn't always mark an agent finished (older versions,
         // agents cut off when the session ended), so also: its last turn is
         // a final reply, or its transcript has gone quiet.
-        let quiet = std::fs::metadata(&jsonl)
-            .and_then(|m| m.modified())
-            .ok()
+        let quiet = stats
+            .modified
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|d| d > AGENT_QUIET);
-        let finished = meta["finished"].as_bool().unwrap_or(false) || stats.ended || quiet;
+        let finished =
+            meta["finished"].as_bool().unwrap_or(false) || stats.ended || quiet || !parent_running;
         out.push(Subagent {
             agent_id: id.to_string(),
             session_id: session_id.to_string(),
@@ -749,6 +763,18 @@ mod subagent_tests {
         assert!(transcript_stats(&p).unwrap().ended);
         writeln!(f, r#"{{"type":"user","message":{{}}}}"#).unwrap();
         assert!(!transcript_stats(&p).unwrap().ended);
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"stop_reason":"tool_use"}}}}"#
+        )
+        .unwrap();
+        assert!(!transcript_stats(&p).unwrap().ended);
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"stop_reason":"max_tokens"}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_stats(&p).unwrap().ended);
         // Replaced by a different, longer file: start over.
         let q = dir.path().join("other.jsonl");
         std::fs::write(
@@ -781,7 +807,7 @@ mod subagent_tests {
         std::fs::write(sub.join("junk.txt"), "x").unwrap();
         // Callers skip agents they already know (finished ones).
         let t = transcript.to_str().unwrap();
-        assert!(scan_subagents_where("s1", t, &|id| id != "a1").is_empty());
+        assert!(scan_subagents_where("s1", t, true, &|id| id != "a1").is_empty());
         let v = scan_subagents("s1", transcript.to_str().unwrap());
         assert_eq!(v.len(), 1);
         let a = &v[0];

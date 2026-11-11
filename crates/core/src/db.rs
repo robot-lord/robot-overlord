@@ -659,7 +659,7 @@ impl Db {
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
-        if status == Status::Stopped {
+        if n > 0 && status == Status::Stopped {
             // A sub-agent can't outlive its session's agent process.
             self.close_open_subagents(Some(id), ts)?;
         }
@@ -670,17 +670,25 @@ impl Db {
     /// (None) every stopped session. Claude doesn't always record an agent's
     /// end, and one can't keep running once its session has stopped.
     pub fn close_open_subagents(&self, session: Option<&str>, ts: i64) -> Result<usize> {
+        // Finished when the session stopped (never before the agent started).
+        let finish = "MAX(COALESCE(started_at, 0), COALESCE( \
+             (SELECT last_state_change_at FROM sessions s WHERE s.id = subagents.session_id), ?1))";
+        let stopped = Status::Stopped.as_str();
         let n = match session {
             Some(id) => self.conn.execute(
-                "UPDATE subagents SET finished_at = MAX(COALESCE(started_at, 0), ?2) \
-                 WHERE finished_at IS NULL AND session_id = ?1",
-                params![id, ts],
+                &format!(
+                    "UPDATE subagents SET finished_at = {finish} \
+                     WHERE finished_at IS NULL AND session_id = ?2"
+                ),
+                params![ts, id],
             )?,
             None => self.conn.execute(
-                "UPDATE subagents SET finished_at = COALESCE(started_at, ?1) \
-                 WHERE finished_at IS NULL \
-                   AND session_id IN (SELECT id FROM sessions WHERE status = 'stopped')",
-                params![ts],
+                &format!(
+                    "UPDATE subagents SET finished_at = {finish} \
+                     WHERE finished_at IS NULL \
+                       AND session_id IN (SELECT id FROM sessions WHERE status = ?2)"
+                ),
+                params![ts, stopped],
             )?,
         };
         Ok(n)
@@ -773,7 +781,11 @@ impl Db {
                spawn_depth = MAX(spawn_depth, excluded.spawn_depth), \
                background = MAX(background, excluded.background), \
                started_at = COALESCE(started_at, excluded.started_at), \
-               finished_at = COALESCE(excluded.finished_at, finished_at), \
+               finished_at = CASE \
+                 WHEN excluded.finished_at IS NOT NULL THEN excluded.finished_at \
+                 WHEN excluded.input_tokens + excluded.output_tokens > input_tokens + output_tokens \
+                   THEN NULL \
+                 ELSE finished_at END, \
                transcript_path = COALESCE(excluded.transcript_path, transcript_path), \
                result = CASE WHEN excluded.result != '' THEN excluded.result ELSE result END, \
                input_tokens = MAX(input_tokens, excluded.input_tokens), \
@@ -1015,6 +1027,17 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(db.close_open_subagents(None, 200).unwrap(), 0);
+        // Finished, then new usage (resumed): open again.
+        a.finished_at = None;
+        a.input_tokens = 50;
+        db.upsert_subagent(&a).unwrap();
+        let ag2 = db
+            .subagents("01a")
+            .unwrap()
+            .into_iter()
+            .find(|x| x.agent_id == "ag2")
+            .unwrap();
+        assert_eq!(ag2.finished_at, None);
     }
 
     #[test]
