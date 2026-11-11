@@ -166,6 +166,12 @@ pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     Ok(v)
 }
 
+/// The overlay popup's style: the theme's overlay background.
+pub fn overlay_style(cfg: &Config) -> String {
+    let p = themes::resolve(&cfg.theme, themes::system_is_dark());
+    format!("bg={}", p.overlay_bg().tmux())
+}
+
 /// The overlord's color in the current theme (tmux spelling).
 pub fn color(cfg: &Config) -> String {
     themes::resolve(&cfg.theme, themes::system_is_dark())

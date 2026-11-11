@@ -22,6 +22,25 @@ impl Rgb {
     }
 }
 
+impl Palette {
+    /// The overlord overlay's background: a faint wash of the overlord's
+    /// colour over the theme's background, so the overlay reads as its own
+    /// place without a heavy block of grey.
+    pub fn overlay_bg(&self) -> Rgb {
+        let base = match self.bg {
+            Some(Rgb::Hex(r, g, b)) => (r, g, b),
+            _ if self.dark => (20, 18, 26),
+            _ => (250, 249, 252),
+        };
+        let Rgb::Hex(r, g, b) = self.overlord else {
+            return if self.dark { h(0x1d1828) } else { h(0xf4effb) };
+        };
+        // About a tenth of the overlord colour.
+        let mix = |a: u8, o: u8| ((a as u16 * 9 + o as u16) / 10) as u8;
+        Rgb::Hex(mix(base.0, r), mix(base.1, g), mix(base.2, b))
+    }
+}
+
 const fn h(hex: u32) -> Rgb {
     Rgb::Hex((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
@@ -381,6 +400,22 @@ pub fn system_is_dark() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn overlay_background_is_a_faint_overlord_wash() {
+        for name in ["rlord", "rlord-light"] {
+            for dark in [true, false] {
+                let p = resolve(name, dark);
+                let Rgb::Hex(r, g, b) = p.overlay_bg() else {
+                    panic!("hex expected");
+                };
+                // Near the background, not a loud colour.
+                let lum = (r as u32 + g as u32 + b as u32) / 3;
+                assert!(if p.dark { lum < 70 } else { lum > 190 }, "{name}: {lum}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
