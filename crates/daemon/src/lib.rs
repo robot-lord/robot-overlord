@@ -387,6 +387,19 @@ impl Daemon {
                 }
                 r
             }
+            // `seat: "all"`: both seats' sessions (those that exist), in order.
+            "overlord.get" if params["seat"] == "all" => {
+                let db = self.db();
+                overlord::SEATS
+                    .iter()
+                    .map(|seat| seat.session(&db))
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|v| {
+                        Ok(serde_json::to_value(
+                            v.into_iter().flatten().collect::<Vec<_>>(),
+                        )?)
+                    })
+            }
             "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
                 .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),

@@ -110,12 +110,21 @@ fn run_loop(
                     // The other seat's key switches to it (the daemon opens
                     // its overlay in place of this one).
                     Some(other) => {
-                        let _ = client_call(
+                        // Hand this seat's window its size back first: the
+                        // new overlay replaces (kills) this one.
+                        let _ = tmux::auto_size_window(seat.tmux);
+                        match client_call(
                             &paths::socket_path(),
                             "ui.overlord",
                             json!({"seat": other, "show": true}),
-                        );
-                        return Ok(());
+                        ) {
+                            Ok(_) => return Ok(()),
+                            // Stay, and say why the switch didn't happen.
+                            Err(e) => {
+                                error = Some(format!("couldn't switch to the {other}: {e:#}"))
+                            }
+                        }
+                        continue;
                     }
                     None => {}
                 }

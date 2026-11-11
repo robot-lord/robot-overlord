@@ -268,14 +268,13 @@ impl App {
                 self.regroup();
             } else if self.filter.trim().is_empty() && !self.show_archived {
                 // The overlord, and under it the mastermind once it exists.
-                for seat in ["overlord", "mastermind"] {
-                    if let Some(o) = self
-                        .call("overlord.get", json!({"seat": seat}))
-                        .filter(|o| !o.is_null())
-                    {
-                        self.sessions.insert(self.overlord_rows, o);
-                        self.overlord_rows += 1;
-                    }
+                let seats = self
+                    .call("overlord.get", json!({"seat": "all"}))
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                for o in seats {
+                    self.sessions.insert(self.overlord_rows, o);
+                    self.overlord_rows += 1;
                 }
             }
             let n = self.sessions.len();
@@ -1144,10 +1143,14 @@ impl App {
                         Cell::from(format!(
                             "{} · {} to talk",
                             s["model"].as_str().unwrap_or("default model"),
-                            if is_mastermind {
-                                tmux::key_label(self.config.tmux.mastermind_switch())
-                            } else {
+                            // Only a key that works from the list: the
+                            // mastermind's global key if bound, else enter.
+                            if !is_mastermind {
                                 self.keys.label(Action::Overlord)
+                            } else if self.config.tmux.mastermind.trim().is_empty() {
+                                self.keys.label(Action::Attach)
+                            } else {
+                                tmux::key_label(&self.config.tmux.mastermind)
                             }
                         ))
                         .fg(theme::faint_c())

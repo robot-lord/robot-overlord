@@ -62,10 +62,8 @@ pub const MASTERMIND: Seat = Seat {
 
 pub const SEATS: [&Seat; 2] = [&FRONT, &MASTERMIND];
 
-/// The front desk's names (the overlord most code means).
+/// The front desk's tmux name (the overlord most code means).
 pub const TMUX_NAME: &str = FRONT.tmux;
-pub const NAME: &str = FRONT.key;
-pub const ROLE: &str = FRONT.key;
 
 /// A seat by key (`overlord` / `mastermind`); anything else is the front.
 pub fn seat(key: &str) -> &'static Seat {
@@ -91,10 +89,6 @@ impl Seat {
     pub fn session(&self, db: &Db) -> Result<Option<rlord_core::types::Session>> {
         db.role_session(self.key)
     }
-}
-
-pub fn dir() -> PathBuf {
-    FRONT.dir()
 }
 
 /// User-authored standing instructions appended to the generated ones.
@@ -181,8 +175,13 @@ pub fn style(cfg: &Config) {
         (
             &FRONT,
             format!(
-                "#[bold] ◆ OVERLORD #[nobold]· {} mastermind · {} list  ",
-                keys(cfg.tmux.mastermind_switch()),
+                "#[bold] ◆ OVERLORD #[nobold]· {}{} list  ",
+                // Only a key that works here (the global one, if bound).
+                if cfg.tmux.mastermind.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{} mastermind · ", keys(&cfg.tmux.mastermind))
+                },
                 keys(&cfg.tmux.back)
             ),
         ),
@@ -359,7 +358,13 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
 /// Whether the mastermind's last turn waits on the user: its reply ends in a
 /// question, or a new-session form it reopened is still out for confirming.
 fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<bool> {
-    if d.db().kv_get("confirm_pending")?.is_some_and(|v| v == "1") {
+    // A reopened form counts for an hour (it may have been dismissed).
+    let pending: i64 = d
+        .db()
+        .kv_get("confirm_pending")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if rlord_core::types::now_ms() - pending < 60 * 60_000 {
         return Ok(true);
     }
     let Some(src) = d.db().transcript_source(&s.id)? else {

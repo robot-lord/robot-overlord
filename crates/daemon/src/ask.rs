@@ -73,10 +73,8 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
-    // A confirmed form answers the one the mastermind reopened.
-    if params["confirmed"].as_bool() == Some(true) {
-        d.db().kv_set("confirm_pending", "0")?;
-    }
+    // Any form sent back answers the one the mastermind reopened.
+    d.db().kv_set("confirm_pending", "0")?;
     send_to(d, &overlord::MASTERMIND, &text)
 }
 

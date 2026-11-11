@@ -427,7 +427,8 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         }
     }
     // The mastermind is now waiting on the user (its fresh start waits too).
-    d.db().kv_set("confirm_pending", "1")?;
+    d.db()
+        .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;
     d.ui_cmd(json!({"cmd": "confirm_new_session", "prefill": prefill}));
     show_list(d)?;
     Ok(json!({"shown": prefill,
