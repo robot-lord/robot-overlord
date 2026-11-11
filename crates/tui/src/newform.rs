@@ -187,6 +187,7 @@ pub(crate) struct NewForm {
     repo_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
+    tags_chosen: bool,
     /// Reopened by the overlord: the hints it set that the user hadn't picked
     /// (its resolved values: shown as such, sent as "your earlier pick").
     resolved: Vec<&'static str>,
@@ -264,8 +265,9 @@ impl NewForm {
             }
             (None, None) => self.location = Location::Auto,
         }
-        if let Some(m) = get("model") {
-            if !self.models.contains(&m) {
+        // "" is the agent default (the overlord reset the model).
+        if let Some(m) = p["model"].as_str().map(|m| m.trim().to_string()) {
+            if !m.is_empty() && !self.models.contains(&m) {
                 self.models.insert(0, m.clone());
             }
             self.model = m;
@@ -280,27 +282,31 @@ impl NewForm {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        // The user's own picks (as the overlord reports them) stay theirs,
-        // unless the overlord changed that hint; hints it set otherwise are
-        // its resolved values; anything it didn't set is still a default.
+        // Provenance comes from rlord (`prev_chosen` / `prev_resolved`: the
+        // last request it delivered), not from the model. The user's picks
+        // stay theirs unless the overlord changed that hint; a hint it
+        // changed, or resolved in an earlier round, is its pick; anything
+        // else is still a default.
         let has =
             |list: &str, k: &str| p[list].as_array().is_some_and(|a| a.iter().any(|c| c == k));
+        let folder = matches!(self.location, Location::Folder(_));
         let given = |k: &str| match k {
             "repo" => get("repo").is_some() || get("project").is_some(),
-            "model" => get("model").is_some(),
-            _ => p["workspace"].is_boolean(),
+            "model" => p["model"].is_string(),
+            // A plain folder has no worktree to pick.
+            "worktree" => p["workspace"].is_boolean() && !folder,
+            _ => p["tags"].is_array(),
         };
-        // Only a value the overlord sent back can be the user's pick (a hint
-        // it left out is the form's default, whatever it reports).
-        let picked = |k: &str| given(k) && has("user_picked", k) && !has("changed", k);
+        // Only a value the overlord sent back can be anyone's pick (a hint
+        // it left out is the form's default).
+        let picked = |k: &str| given(k) && has("prev_chosen", k) && !has("changed", k);
         self.repo_chosen = picked("repo");
         self.model_chosen = picked("model");
         self.workspace_chosen = picked("worktree");
-        // The overlord's picks are the hints it changed; a value it merely
-        // sent back unchanged is still a default.
-        self.resolved = ["repo", "model", "worktree"]
+        self.tags_chosen = picked("tags");
+        self.resolved = ["repo", "model", "worktree", "tags"]
             .into_iter()
-            .filter(|k| given(k) && has("changed", k) && !picked(k))
+            .filter(|k| given(k) && (has("changed", k) || has("prev_resolved", k)) && !picked(k))
             .collect();
         self.reopened = true;
         self.confirmed = true;
@@ -330,6 +336,7 @@ impl NewForm {
             match key {
                 "repo" => self.repo_chosen = true,
                 "model" => self.model_chosen = true,
+                "tags" => self.tags_chosen = true,
                 _ => self.workspace_chosen = true,
             }
         }
@@ -430,6 +437,7 @@ impl App {
             repo_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
+            tags_chosen: false,
             resolved: Vec::new(),
             reopened: false,
             confirmed: false,
@@ -680,6 +688,7 @@ impl App {
                 }
                 Field::Tags => {
                     f.tags.pop();
+                    f.mark_picked("tags", true);
                     f.description_changed();
                 }
                 _ => {}
@@ -702,6 +711,7 @@ impl App {
                     }
                     Field::Tags => {
                         f.tags.push(c);
+                        f.mark_picked("tags", true);
                         f.description_changed();
                     }
                     _ => {}
@@ -798,6 +808,7 @@ impl App {
             ("repo", f.repo_chosen),
             ("model", f.model_chosen),
             ("worktree", f.workspace_chosen),
+            ("tags", f.tags_chosen && !f.tags.trim().is_empty()),
         ]
         .into_iter()
         .filter_map(|(k, c)| c.then_some(k))
@@ -1272,7 +1283,12 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     } else {
         format!("{}{}", form.tags, if tags_focused { "▏" } else { "" })
     };
-    lines.push(hint(Field::Tags, "tags", tags, !form.tags.is_empty()));
+    lines.push(hint(
+        Field::Tags,
+        "tags",
+        tags,
+        form.tags_chosen && !form.tags.is_empty(),
+    ));
     lines.push(Line::raw(""));
 
     let send_focused = focus(Field::Launch);
@@ -1448,10 +1464,26 @@ mod tests {
         // still defaults.
         f.prefill_confirm(&json!({
             "description": "x", "repo": "/r/a", "model": "opus",
-            "user_picked": ["model", "repo"], "changed": ["repo"], "note": "n",
+            "prev_chosen": ["model", "repo"], "changed": ["repo"], "note": "n",
         }));
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
         assert_eq!(f.resolved, ["repo"], "only the hint it changed");
+
+        // A second round: what it resolved earlier stays its pick, though it
+        // only changes the model now.
+        f.prefill_confirm(&json!({
+            "description": "x", "repo": "/r/a", "model": "",
+            "prev_resolved": ["repo"], "changed": ["model"], "note": "n",
+        }));
+        assert_eq!(f.resolved, ["repo", "model"]);
+        assert_eq!(f.model, "", "reset to the agent default");
+
+        // A plain folder: no worktree pick, whatever the request said.
+        f.prefill_confirm(&json!({
+            "description": "x", "project": "/tmp", "workspace": true,
+            "prev_chosen": ["worktree"], "changed": ["repo"], "note": "n",
+        }));
+        assert!(!f.workspace_chosen && !f.workspace);
     }
 
     #[test]

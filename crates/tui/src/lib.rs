@@ -1554,15 +1554,17 @@ fn edit_in_editor(
 ) -> std::result::Result<String, String> {
     // A unique file per edit: several TUIs (clients) may edit at once.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // rlord's own runtime dir (owned by the user), not the shared temp dir.
     let dir = paths::runtime_dir().join("edit");
-    let path = dir.join(format!("{}-{n}-{file}", std::process::id()));
+    let next_path = || {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.join(format!("{}-{n}-{file}", std::process::id()))
+    };
+    let mut path = next_path();
     // File errors are the user's to see (the caller keeps its text), not a
     // reason to quit the TUI.
     // Created fresh (never through an existing file or symlink).
     // A stale file left by a crashed TUI with the same pid: take the next name.
-    let mut path = path;
     let opened = std::fs::create_dir_all(&dir).and_then(|_| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -1575,8 +1577,7 @@ fn edit_in_editor(
             {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => {
                     tries += 1;
-                    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    path = dir.join(format!("{}-{n}-{file}", std::process::id()));
+                    path = next_path();
                 }
                 r => break r,
             }

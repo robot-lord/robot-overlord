@@ -75,7 +75,12 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
     let r = send_to(d, &overlord::MASTERMIND, &text)?;
     // Delivered: it answers any form the mastermind had reopened.
-    d.db().kv_set("confirm_pending", "0")?;
+    let db = d.db();
+    db.kv_set("confirm_pending", "0")?;
+    // Which hints were the user's and which the overlord's, kept here so a
+    // reopened form gets them back from rlord, not from the model.
+    let provenance = json!({"chosen": params["chosen"], "resolved": params["resolved"]});
+    db.kv_set("request_provenance", &provenance.to_string())?;
     Ok(r)
 }
 
@@ -213,7 +218,7 @@ pub fn format_request(p: &Value) -> Result<String> {
     m += &if tags.is_empty() {
         "- tags: (you choose)\n".to_string()
     } else {
-        format!("- tags: {} (picked by the user)\n", tags.join(", "))
+        format!("- tags: {} ({})\n", tags.join(", "), source("tags"))
     };
     m += "description:\n";
     m += description;
@@ -229,7 +234,7 @@ mod tests {
         let m = format_request(&json!({
             "description": "  fix the login flake\n\nkeep the retry count at 3 ",
             "repo": "/r/web", "model": "opus", "tags": ["web", "wip"],
-            "chosen": ["repo"],
+            "chosen": ["repo", "tags"],
         }))
         .unwrap();
         assert!(m.starts_with("[rlord new-session request]\nconfirmed: no\n"));

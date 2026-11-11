@@ -421,15 +421,30 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
             bail!("{r} is not a git repository (use find_repos)");
         }
     }
+    // "" is the agent default: a model the overlord reset, not one it left out.
+    if params["model"]
+        .as_str()
+        .is_some_and(|m| m.trim().is_empty())
+    {
+        prefill.insert("model".into(), json!(""));
+    }
     for k in ["workspace", "tags", "changed"] {
         if !params[k].is_null() {
             prefill.insert(k.into(), params[k].clone());
         }
     }
-    // Which hints the user had picked themselves (the overlord reads them off
-    // the request it got): they stay the user's on the reopened form.
-    if !params["user_picked"].is_null() {
-        prefill.insert("user_picked".into(), params["user_picked"].clone());
+    // Which hints the user picked and which the overlord resolved, from the
+    // last request rlord delivered (not from the model): they keep their
+    // labels on the reopened form.
+    let provenance: Value = d
+        .db()
+        .kv_get("request_provenance")?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    for (from, to) in [("chosen", "prev_chosen"), ("resolved", "prev_resolved")] {
+        if provenance[from].is_array() {
+            prefill.insert(to.into(), provenance[from].clone());
+        }
     }
     // The mastermind is now waiting on the user (its fresh start waits too).
     d.db()
