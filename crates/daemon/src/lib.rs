@@ -259,7 +259,7 @@ impl Daemon {
     fn call(&self, method: &str, params: Value) -> std::result::Result<Value, MethodError> {
         if method == "ping" {
             return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION"),
-                             "build": build_id()}));
+                             "build": build_id(), "exe": exe_id()}));
         }
         if let Some(r) = self.call_ui(method, &params) {
             return r.map_err(MethodError::Internal);
@@ -403,6 +403,21 @@ impl Daemon {
 enum MethodError {
     NotFound,
     Internal(anyhow::Error),
+}
+
+/// Canonical path of the binary this process was started from (pinned when
+/// first asked). Clients only restart a daemon running their own binary, so
+/// two installs (say a worktree's debug build and ~/.local/bin/rlord) don't
+/// take turns restarting the shared daemon.
+pub fn exe_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
+    .clone()
 }
 
 /// Identity of the binary this process was started from (its mtime when

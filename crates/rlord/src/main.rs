@@ -863,7 +863,9 @@ fn ensure_daemon_current() {
 }
 
 fn run_daemon() -> Result<()> {
-    rlord_daemon::build_id(); // pin it at startup, before any rebuild
+    // Pin both at startup, before any rebuild or reinstall.
+    rlord_daemon::build_id();
+    rlord_daemon::exe_id();
     let rt = tokio::runtime::Runtime::new()?;
     // One daemon per user: a second one (a lost autostart race, or launchd
     // starting its job while an autostarted daemon runs) exits 0 quietly, so

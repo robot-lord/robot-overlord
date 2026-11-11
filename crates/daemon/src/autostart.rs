@@ -6,6 +6,7 @@
 //! launchd so it stays the owner.
 
 use std::fs::File;
+use std::io::IsTerminal;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use serde_json::Value;
 
 use rlord_core::paths;
 
-use crate::{build_id, client_call, methods};
+use crate::{build_id, client_call, exe_id, methods};
 
 const LAUNCHD_LABEL: &str = "robot-overlord.daemon";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -30,17 +31,31 @@ pub fn log_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("rlordd.log"))
 }
 
-/// Make sure a daemon of this binary's build is answering on `socket`:
-/// start one if none is running, restart one from an older build.
+/// Make sure a daemon is answering on `socket`: start one if none is
+/// running, and restart it if it runs an older build of this same binary
+/// (an upgrade or rebuild). A daemon running a *different* binary is left
+/// alone: restarting it would just hand the flip-flop to the next client.
 pub fn ensure_daemon(socket: &Path) -> Result<()> {
-    match client_call(socket, "ping", Value::Null) {
-        Ok(pong) if pong["build"].as_u64() == Some(build_id()) => Ok(()),
-        Ok(_) => {
-            eprintln!("rlord: daemon is from an older build; restarting it");
-            restart_daemon(socket)
-        }
-        Err(_) => start_daemon(socket, None),
+    let Ok(pong) = client_call(socket, "ping", Value::Null) else {
+        return start_daemon(socket, None);
+    };
+    if pong["build"].as_u64() == Some(build_id()) {
+        return Ok(());
     }
+    match pong["exe"].as_str() {
+        // Same binary, different build: upgraded or rebuilt in place.
+        // (No "exe" at all: a daemon from before this check; replace it.)
+        Some(theirs) if theirs == exe_id() => {}
+        None => {}
+        Some(theirs) => {
+            if std::io::stderr().is_terminal() {
+                eprintln!("rlord: note: the daemon runs {theirs}, not this binary");
+            }
+            return Ok(());
+        }
+    }
+    eprintln!("rlord: daemon is from an older build; restarting it");
+    restart_daemon(socket)
 }
 
 /// Stop the running daemon (if any) and start a fresh one on this binary.
