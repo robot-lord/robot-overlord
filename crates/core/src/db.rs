@@ -310,6 +310,11 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The session with this role (`overlord`, `mastermind`), if created.
+    pub fn role_session(&self, role: &str) -> Result<Option<Session>> {
+        Ok(self.query_sessions("role = ?1", role)?.into_iter().next())
+    }
+
     /// The overlord session, if one has ever been created.
     pub fn overlord(&self) -> Result<Option<Session>> {
         let mut v = self.query_sessions("role = ?1", "overlord")?;

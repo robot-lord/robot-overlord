@@ -168,7 +168,9 @@ struct App {
     /// process, which the draw loop must never wait on).
     system_dark: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether row 0 is the overlord (shown first when not filtering).
-    overlord_row: bool,
+    /// Fixed overlord rows at the top of the list (overlord, mastermind):
+    /// unnumbered, so digits count the fleet below them.
+    overlord_rows: usize,
     /// Session to select once the next refresh lands (set by the overlord).
     pending_select: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -207,7 +209,7 @@ impl App {
             watching_appearance: false,
             dark: true,
             system_dark: Default::default(),
-            overlord_row: false,
+            overlord_rows: 0,
             pending_select: None,
             reported_view: Value::Null,
         }
@@ -250,7 +252,7 @@ impl App {
             self.sessions = self.all.clone();
             // The overlord heads the live list — but not while searching,
             // where it would only steal the top match — and isn't in groups.
-            self.overlord_row = false;
+            self.overlord_rows = 0;
             if self.tab == Tab::Groups {
                 if let Some(o) = self.call("tag.order", json!({})) {
                     self.group_order = o["order"]
@@ -265,12 +267,15 @@ impl App {
                 }
                 self.regroup();
             } else if self.filter.trim().is_empty() && !self.show_archived {
-                if let Some(o) = self
-                    .call("overlord.get", Value::Null)
-                    .filter(|o| !o.is_null())
-                {
-                    self.sessions.insert(0, o);
-                    self.overlord_row = true;
+                // The overlord, and under it the mastermind once it exists.
+                for seat in ["overlord", "mastermind"] {
+                    if let Some(o) = self
+                        .call("overlord.get", json!({"seat": seat}))
+                        .filter(|o| !o.is_null())
+                    {
+                        self.sessions.insert(self.overlord_rows, o);
+                        self.overlord_rows += 1;
+                    }
                 }
             }
             let n = self.sessions.len();
@@ -321,7 +326,7 @@ impl App {
     }
 
     fn selected_is_overlord(&self) -> bool {
-        self.selected().is_some_and(|s| s["role"] == "overlord")
+        self.selected().is_some_and(is_overlord_role)
     }
 
     fn selected(&self) -> Option<&Value> {
@@ -521,7 +526,7 @@ impl App {
             if let KeyCode::Char(c @ '1'..='9') = k.code {
                 if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT {
                     // Digits count the fleet; the overlord row is unnumbered.
-                    let i = c as usize - '1' as usize + usize::from(self.overlord_row);
+                    let i = c as usize - '1' as usize + self.overlord_rows;
                     if i < n {
                         self.table.select(Some(i));
                         self.attach(terminal)?;
@@ -893,14 +898,15 @@ impl App {
         let Some(mut s) = self.selected().cloned() else {
             return Ok(());
         };
-        if s["role"] == "overlord" {
+        if is_overlord_role(&s) {
             // Like any session, full screen — started/resumed if needed, and
             // its window handed back from whatever size an overlay set.
-            match self.call("overlord.ensure", json!({})) {
+            let seat = rlord_daemon::overlord::seat(s["role"].as_str().unwrap_or(""));
+            match self.call("overlord.ensure", json!({"seat": seat.key})) {
                 Some(v) => s = v,
                 None => return Ok(()),
             }
-            let _ = tmux::auto_size_window(rlord_daemon::overlord::TMUX_NAME);
+            let _ = tmux::auto_size_window(seat.tmux);
         } else if s["status"] == "stopped"
             || !s["tmux_session"].as_str().is_some_and(tmux::has_session)
         {
@@ -1085,8 +1091,9 @@ impl App {
             .map(|(i, s)| {
                 let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
                 let status = get("status");
-                let is_overlord = s["role"] == "overlord";
-                let num = i.saturating_sub(usize::from(self.overlord_row));
+                let is_overlord = is_overlord_role(s);
+                let is_mastermind = s["role"] == "mastermind";
+                let num = i.saturating_sub(self.overlord_rows);
                 let mut cells = vec![
                     if is_overlord {
                         Cell::from("◆").fg(theme::overlord())
@@ -1103,7 +1110,11 @@ impl App {
                     } else {
                         Cell::from(" ")
                     },
-                    Cell::from(get("name")),
+                    Cell::from(if is_mastermind {
+                        format!("↳ {}", get("name"))
+                    } else {
+                        get("name")
+                    }),
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
@@ -1133,7 +1144,11 @@ impl App {
                         Cell::from(format!(
                             "{} · {} to talk",
                             s["model"].as_str().unwrap_or("default model"),
-                            self.keys.label(Action::Overlord)
+                            if is_mastermind {
+                                tmux::key_label(&self.config.tmux.mastermind)
+                            } else {
+                                self.keys.label(Action::Overlord)
+                            }
                         ))
                         .fg(theme::faint_c())
                     } else {
@@ -1545,6 +1560,11 @@ fn updated_at(s: &Value) -> Option<i64> {
     .max()
 }
 
+/// The overlord's rows (overlord, mastermind): fixed, special rows.
+fn is_overlord_role(s: &Value) -> bool {
+    rlord_daemon::overlord::is_overlord_role(s["role"].as_str().unwrap_or(""))
+}
+
 /// How long the highlight must rest before its preview loads.
 const PREVIEW_SETTLE: Duration = Duration::from_millis(80);
 
@@ -1835,7 +1855,7 @@ fn context_legend(
     let Some(s) = session else {
         return Vec::new();
     };
-    let overlord = s["role"] == "overlord";
+    let overlord = is_overlord_role(s);
     let stopped = s["status"] == "stopped" || s["status"].is_null();
     let archived = !s["archived_at"].is_null();
     // Resuming (Enter on a stopped row) and restarting both need a
@@ -1977,7 +1997,7 @@ mod tests {
                    "archived_at": null}),
         ];
         app.all = app.sessions.clone();
-        app.overlord_row = true;
+        app.overlord_rows = 1;
         app.table.select(Some(1));
         app.status_line = "launched login-flake".into();
         let (w, h) = (150, 34);

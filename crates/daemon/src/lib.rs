@@ -46,6 +46,8 @@ pub struct Daemon {
     /// clear its successor).
     pub(crate) overlay: Mutex<Option<(String, u64)>>,
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
+    /// Which overlord seat the open overlay shows (`overlord`/`mastermind`).
+    pub(crate) overlay_seat: Mutex<&'static str>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
 }
@@ -63,6 +65,7 @@ impl Daemon {
             tui_subscribers: AtomicUsize::new(0),
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
+            overlay_seat: Mutex::new(overlord::FRONT.key),
             warm: Default::default(),
         })
     }
@@ -380,9 +383,8 @@ impl Daemon {
                 }
                 r
             }
-            "overlord.get" => self
-                .db()
-                .overlord()
+            "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
+                .session(&self.db())
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => overlord::status(&self.db(), &self.config),
             "session.subagents" => warm::session_subagents(self, params),
@@ -403,6 +405,7 @@ impl Daemon {
                 r
             }
             "overlord.ask" => ask::ask(self, params),
+            "overlord.hand_off" => ask::hand_off(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {

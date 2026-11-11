@@ -28,7 +28,7 @@ fn choice(db: &Db, s: &Session) -> Result<Option<bool>> {
 }
 
 fn wanted(db: &Db, cfg: &Config, s: &Session) -> Result<bool> {
-    if s.role == overlord::ROLE || !tmux_profile::exists() {
+    if overlord::is_overlord_role(&s.role) || !tmux_profile::exists() {
         return Ok(false);
     }
     Ok(choice(db, s)?.unwrap_or(cfg.tmux.profile))
@@ -43,7 +43,7 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     };
     // The overlord keeps its own bar but gets the user's keys (copy mode,
     // prefix, pane moves), when they have a profile.
-    if s.role == overlord::ROLE {
+    if overlord::is_overlord_role(&s.role) {
         tmux::set_profile_keys(name, tmux_profile::exists() && cfg.tmux.profile)?;
         tmux::name_agent_window(name, &s.name)?;
         return Ok(());
@@ -104,7 +104,7 @@ pub fn profile(d: &Daemon, params: &Value) -> Result<Value> {
     let db = d.db();
     let s = db.resolve_ref(methods::p_str(params, "ref")?)?;
     if let Some(set) = params.get("set").and_then(Value::as_str) {
-        if s.role == overlord::ROLE {
+        if overlord::is_overlord_role(&s.role) {
             anyhow::bail!("the overlord keeps rlord's tmux");
         }
         if !tmux_profile::exists() && set != "default" && set != "off" {

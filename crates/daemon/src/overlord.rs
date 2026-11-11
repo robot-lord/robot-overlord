@@ -22,13 +22,80 @@ use rlord_core::{models, paths, tmux};
 
 use crate::methods;
 
-/// Fixed tmux session name. The TUI embeds this session's pane.
-pub const TMUX_NAME: &str = "rlord_overlord";
-pub const NAME: &str = "overlord";
-pub const ROLE: &str = "overlord";
+/// One of the overlord's two sessions. The **overlord** is the quick front
+/// desk (Option-O): mechanical work itself, everything that needs thought
+/// handed to the **mastermind** (Option-M), which launches sessions and takes
+/// one-off questions. Each has its own folder, instructions, model, effort
+/// and fixed tmux name.
+pub struct Seat {
+    /// Role in the DB, display name and folder name.
+    pub key: &'static str,
+    /// Fixed tmux session name (the overlay embeds its pane).
+    pub tmux: &'static str,
+    instructions: &'static str,
+    subagents: &'static [(&'static str, &'static str)],
+}
+
+pub const FRONT: Seat = Seat {
+    key: "overlord",
+    tmux: "rlord_overlord",
+    instructions: include_str!("overlord.md"),
+    subagents: &[
+        ("rlord-tidy.md", include_str!("tidy.md")),
+        ("rlord-import.md", include_str!("import.md")),
+    ],
+};
+
+pub const MASTERMIND: Seat = Seat {
+    key: "mastermind",
+    tmux: "rlord_mastermind",
+    instructions: include_str!("mastermind.md"),
+    subagents: &[],
+};
+
+pub const SEATS: [&Seat; 2] = [&FRONT, &MASTERMIND];
+
+/// The front desk's names (the overlord most code means).
+pub const TMUX_NAME: &str = FRONT.tmux;
+pub const NAME: &str = FRONT.key;
+pub const ROLE: &str = FRONT.key;
+
+/// A seat by key (`overlord` / `mastermind`); anything else is the front.
+pub fn seat(key: &str) -> &'static Seat {
+    SEATS.into_iter().find(|s| s.key == key).unwrap_or(&FRONT)
+}
+
+/// Whether a session role is one of the overlord's seats (fixed rows: no
+/// rename, tags, notes, archive).
+pub fn is_overlord_role(role: &str) -> bool {
+    SEATS.iter().any(|s| s.key == role)
+}
+
+impl Seat {
+    pub fn dir(&self) -> PathBuf {
+        paths::data_dir().join(self.key)
+    }
+    fn model<'a>(&self, cfg: &'a Config) -> &'a str {
+        if self.key == MASTERMIND.key {
+            &cfg.overlord.mastermind_model
+        } else {
+            &cfg.overlord.model
+        }
+    }
+    fn effort<'a>(&self, cfg: &'a Config) -> &'a str {
+        if self.key == MASTERMIND.key {
+            &cfg.overlord.mastermind_effort
+        } else {
+            &cfg.overlord.effort
+        }
+    }
+    pub fn session(&self, db: &Db) -> Result<Option<rlord_core::types::Session>> {
+        db.role_session(self.key)
+    }
+}
 
 pub fn dir() -> PathBuf {
-    paths::data_dir().join("overlord")
+    FRONT.dir()
 }
 
 /// User-authored standing instructions appended to the generated ones.
@@ -39,10 +106,10 @@ pub fn user_instructions_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("overlord.md"))
 }
 
-/// Write the overlord's folder (instruction files + mcp.json); return the adapter
-/// flags it must always be launched with.
-fn write_files() -> Result<Vec<String>> {
-    let d = dir();
+/// Write a seat's folder (instruction files, mcp.json, subagents); return
+/// the adapter flags it must always be launched with.
+fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
+    let d = seat.dir();
     std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     let mcp_path = d.join("mcp.json");
     let mcp = json!({"mcpServers": {"rlord": {
@@ -52,7 +119,7 @@ fn write_files() -> Result<Vec<String>> {
     }}});
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)?;
 
-    let mut md = format!("{GENERATED_NOTE}{INSTRUCTIONS}");
+    let mut md = format!("{GENERATED_NOTE}{}", seat.instructions);
     if let Ok(user) = std::fs::read_to_string(user_instructions_path()) {
         if !user.trim().is_empty() {
             md.push_str("\n## Standing instructions from the user\n\n");
@@ -63,23 +130,29 @@ fn write_files() -> Result<Vec<String>> {
     for name in CONTEXT_FILES {
         std::fs::write(d.join(name), &md)?;
     }
-    // Subagents the overlord delegates to (Claude's project agents dir).
+    // Subagents the seat delegates to (Claude's project agents dir).
     let agents = d.join(".claude").join("agents");
     std::fs::create_dir_all(&agents)?;
-    for (file, text) in SUBAGENTS {
+    for (file, text) in seat.subagents {
         std::fs::write(agents.join(file), text)?;
     }
 
-    Ok(vec![
+    let mut args = vec![
         "--mcp-config".into(),
         mcp_path.to_string_lossy().into_owned(),
         // The whole point is a cheap, prompt-free control surface. Read-only
-        // file tools are pre-allowed for new-session groundwork (reading a
-        // repo's README or the files a request names); anything that writes
-        // or runs commands still asks.
+        // file tools are pre-allowed for groundwork (reading a repo's README
+        // or the files a request names); anything that writes or runs
+        // commands still asks.
         "--allowedTools".into(),
         "mcp__rlord,Read,Grep,Glob".into(),
-    ])
+    ];
+    let effort = seat.effort(cfg).trim();
+    if !effort.is_empty() {
+        args.push("--effort".into());
+        args.push(effort.into());
+    }
+    Ok(args)
 }
 
 /// Make sure the overlord exists and is running; returns its session.
@@ -87,7 +160,8 @@ fn write_files() -> Result<Vec<String>> {
 /// restarts it (resuming the conversation) if stopped. An existing
 /// overlord's model is its own — changed only via `set_model`.
 pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
-    let v = ensure_running(db, cfg, params)?;
+    let seat = seat(params["seat"].as_str().unwrap_or(FRONT.key));
+    let v = ensure_running(db, cfg, seat, params)?;
     style(cfg);
     Ok(v)
 }
@@ -103,20 +177,40 @@ pub fn color(cfg: &Config) -> String {
 /// looks like any session. Re-run when the theme changes (`overlord.style`).
 pub fn style(cfg: &Config) {
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    if !tmux::has_session(TMUX_NAME) {
-        return;
-    }
-    if let Err(e) = tmux::style_session(
-        TMUX_NAME,
-        &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
-        "#[bold] ◆ OVERLORD #[nobold]· ⌥D: list  ",
-    ) {
-        tracing::debug!(error = %e, "styling overlord session");
+    let keys = |k: &str| rlord_core::tmux::key_label(k);
+    for (seat, label) in [
+        (
+            &FRONT,
+            format!(
+                "#[bold] ◆ OVERLORD #[nobold]· {} mastermind · {} list  ",
+                keys(&cfg.tmux.mastermind),
+                keys(&cfg.tmux.back)
+            ),
+        ),
+        (
+            &MASTERMIND,
+            format!(
+                "#[bold] ◆ MASTERMIND #[nobold]· {} overlord · {} list  ",
+                keys(&cfg.tmux.overlord),
+                keys(&cfg.tmux.back)
+            ),
+        ),
+    ] {
+        if !tmux::has_session(seat.tmux) {
+            continue;
+        }
+        if let Err(e) = tmux::style_session(
+            seat.tmux,
+            &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
+            &label,
+        ) {
+            tracing::debug!(error = %e, seat = seat.key, "styling overlord session");
+        }
     }
 }
 
-fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
-    let extra_args = write_files()?;
+fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<Value> {
+    let extra_args = write_files(seat, cfg)?;
     let pick = |k: &str, dflt: &str| {
         params
             .get(k)
@@ -126,11 +220,22 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .unwrap_or(dflt)
             .to_string()
     };
-    match db.overlord()? {
+    // The setup dialog picks the mastermind's model too, before it exists.
+    if let Some(m) = params["mastermind_model"].as_str().map(str::trim) {
+        if !m.is_empty() {
+            db.kv_set("mastermind_model", m)?;
+        }
+    }
+    match seat.session(db)? {
         None => {
-            let model = pick("model", cfg.overlord.model.trim());
+            let chosen = if seat.key == MASTERMIND.key {
+                db.kv_get("mastermind_model")?
+            } else {
+                None
+            };
+            let model = pick("model", chosen.as_deref().unwrap_or(seat.model(cfg)).trim());
             let agent = pick("agent", &cfg.overlord.agent);
-            let d = dir();
+            let d = seat.dir();
             methods::session_new(
                 db,
                 cfg,
@@ -138,10 +243,10 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                     "agent": agent,
                     "project": d.to_string_lossy(),
                     "workspace": false,
-                    "name": NAME,
+                    "name": seat.key,
                     "model": model,
-                    "role": ROLE,
-                    "tmux_name": TMUX_NAME,
+                    "role": seat.key,
+                    "tmux_name": seat.tmux,
                     "extra_args": extra_args,
                 }),
             )
@@ -168,8 +273,78 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     }
 }
 
-/// Everything the startup check needs: does the overlord exist, what model
-/// is it set to, what did it actually run, and is that the latest.
+/// Keep the mastermind's context from growing without end: once a minute,
+/// if it has sat idle past `[overlord] mastermind_fresh_after_mins` since its
+/// last exchange, and nobody is looking at it, restart it on a fresh
+/// conversation. Its instructions tell it to keep nothing durable only in its
+/// conversation.
+pub fn start_fresh_keeper(d: &std::sync::Arc<crate::Daemon>) {
+    let mins = d.config.overlord.mastermind_fresh_after_mins;
+    if mins == 0 {
+        return;
+    }
+    let d = std::sync::Arc::clone(d);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if let Err(e) = fresh_if_idle(&d, mins) {
+            tracing::debug!(error = %e, "mastermind fresh start");
+        }
+    });
+}
+
+fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
+    let Some(s) = MASTERMIND.session(&d.db())? else {
+        return Ok(());
+    };
+    // Only when it's done with a turn (not working, not waiting on the user).
+    if s.status != Status::Idle || !s.tmux_session.as_deref().is_some_and(tmux::has_session) {
+        return Ok(());
+    }
+    let now = rlord_core::types::now_ms();
+    let last = [
+        s.last_user_msg_at,
+        s.last_agent_msg_at,
+        s.last_state_change_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(now);
+    if now - last < (mins as i64) * 60_000 {
+        return Ok(());
+    }
+    // Nothing new since the last fresh start: nothing to clear.
+    let fresh_at: i64 = d
+        .db()
+        .kv_get("mastermind_fresh_at")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
+        return Ok(());
+    }
+    // Someone is looking at it: its overlay is open, or a terminal shows it.
+    let overlay_on_it = d.overlay.lock().expect("ui mutex").is_some()
+        && *d.overlay_seat.lock().expect("ui mutex") == MASTERMIND.key;
+    let attached = tmux::list_clients()
+        .iter()
+        .any(|c| c.session == MASTERMIND.tmux);
+    if overlay_on_it || attached {
+        return Ok(());
+    }
+    {
+        let db = d.db();
+        crate::methods::session_fresh(&db, &json!({"ref": s.id}))?;
+        db.kv_set("mastermind_fresh_at", &now.to_string())?;
+    }
+    tracing::info!("mastermind idle: restarted on a fresh conversation");
+    d.changed();
+    Ok(())
+}
+
+/// Everything the startup check needs: does the overlord exist, what models
+/// are its seats set to, what did they actually run, and is that the latest.
+/// The front desk's fields are top-level (as before); the mastermind's are
+/// under `mastermind`.
 pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
     let catalog = |agent: &str| -> Value {
         models::latest_table(agent)
@@ -177,14 +352,28 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
             .map(|(fam, id)| json!({"family": fam, "latest": id}))
             .collect()
     };
-    let Some(s) = db.overlord()? else {
-        return Ok(json!({
-            "exists": false,
-            "default_agent": cfg.overlord.agent,
-            "default_model": cfg.overlord.model,
-            "agents": ["claude"],
-            "catalog": catalog(&cfg.overlord.agent),
-        }));
+    let mut out = seat_status(db, cfg, &FRONT)?;
+    if out["exists"] != true {
+        out["agents"] = json!(["claude"]);
+        out["catalog"] = catalog(&cfg.overlord.agent);
+    } else {
+        let agent = out["agent"].as_str().unwrap_or("claude").to_string();
+        out["catalog"] = catalog(&agent);
+    }
+    out["mastermind"] = seat_status(db, cfg, &MASTERMIND)?;
+    Ok(out)
+}
+
+fn seat_status(db: &Db, cfg: &Config, seat: &Seat) -> Result<Value> {
+    let defaults = json!({
+        "default_agent": cfg.overlord.agent,
+        "default_model": seat.model(cfg),
+        "default_effort": seat.effort(cfg),
+    });
+    let Some(s) = seat.session(db)? else {
+        let mut v = defaults;
+        v["exists"] = json!(false);
+        return Ok(v);
     };
     let observed = match s.agent.as_str() {
         "claude" => db
@@ -195,7 +384,7 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
     let fresh = models::check(&s.agent, s.model.as_deref(), observed.as_deref());
     let running =
         s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session);
-    Ok(json!({
+    let mut v = json!({
         "exists": true,
         "id": s.id,
         "status": s.status,
@@ -204,16 +393,20 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         "model": s.model,
         "observed_model": observed,
         "freshness": fresh,
-        "catalog": catalog(&s.agent),
-    }))
+    });
+    for (k, val) in defaults.as_object().into_iter().flatten() {
+        v[k] = val.clone();
+    }
+    Ok(v)
 }
 
-/// Change the overlord's model and restart it onto that model (the
-/// conversation resumes).
+/// Change a seat's model (`seat`: overlord by default) and restart it onto
+/// that model (the conversation resumes).
 pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let model = methods::p_str(params, "model")?.trim().to_string();
-    let Some(s) = db.overlord()? else {
-        return ensure(db, cfg, &json!({"model": model}));
+    let seat = seat(params["seat"].as_str().unwrap_or(FRONT.key));
+    let Some(s) = seat.session(db)? else {
+        return ensure(db, cfg, &json!({"model": model, "seat": seat.key}));
     };
     let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     spec["model"] = if model.is_empty() {
@@ -228,20 +421,10 @@ pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         "model_changed",
         &json!({"from": s.model, "to": model}).to_string(),
     )?;
-    write_files()?;
+    write_files(seat, cfg)?;
     methods::session_restart(db, &json!({"ref": s.id}))?;
-    ensure(db, cfg, &json!({}))
+    ensure(db, cfg, &json!({"seat": seat.key}))
 }
-
-/// Built-in standing instructions; maintained as markdown next to this file.
-const INSTRUCTIONS: &str = include_str!("overlord.md");
-
-/// Subagents the overlord delegates to, each in its own context:
-/// `rlord-tidy` runs upkeep passes, `rlord-import` imports existing work.
-const SUBAGENTS: &[(&str, &str)] = &[
-    ("rlord-tidy.md", include_str!("tidy.md")),
-    ("rlord-import.md", include_str!("import.md")),
-];
 
 /// Every agent's project-instructions file name. The overlord gets the same
 /// text under each, so whichever agent runs it reads them, alongside the
@@ -268,7 +451,10 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .filter(|n| {
                 let q = format!("`{n}`");
-                !INSTRUCTIONS.contains(&q) && !SUBAGENTS.iter().any(|(_, t)| t.contains(&q))
+                !SEATS.iter().any(|seat| {
+                    seat.instructions.contains(&q)
+                        || seat.subagents.iter().any(|(_, t)| t.contains(&q))
+                })
             })
             .collect();
         assert!(
@@ -286,7 +472,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(|n| format!("mcp__rlord__{n}")))
             .collect();
-        for (file, text) in SUBAGENTS {
+        for (file, text) in SEATS.iter().flat_map(|s| s.subagents.iter()) {
             let line = text
                 .lines()
                 .find_map(|l| l.strip_prefix("tools:"))

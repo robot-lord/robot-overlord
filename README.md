@@ -132,42 +132,44 @@ It builds, signs, tags `v<version>` and uploads the release. See CLAUDE.md.
 
 ## The overlord
 
-The primary way to drive rlord is the **overlord**: one long-running agent
-session (your tool and model, `opus` by default) that you talk to in order to
-run the fleet. It has rlord's MCP tools, pre-allowed, and they act on the real
-UI you're looking at:
+The primary way to drive rlord is the **overlord**, and it's two sessions
+that work together, each with rlord's MCP tools (pre-allowed; they act on
+the real UI you're looking at):
 
-- launch sessions: describe one with `n` in the list and the overlord launches
-  it. If your description contradicts the optional hints (repo, model,
-  worktree, tags), it reopens the form with them corrected for you to confirm
-  (`confirm_new_session`). It can also open the manual form pre-filled
-  (`propose_session`), or create one directly (`create_session`, `go`);
-- search and jump: switch your terminal to a session (`goto_session`) or to the
-  list (`show_list`);
-- shape the list: set the current filter/sort, and save it as the default view
-  (`set_list_view`);
-- inspect and edit: sessions' meta-context, recent events, live screen, names,
-  tags, notes, lifecycle.
+- **◆ Overlord (Option-O)**: a quick front desk on a fast model (`sonnet`,
+  low effort, by default). Summon it, say what you want, get it done in
+  seconds: find and jump to sessions (`goto_session`, `show_list`), shape the
+  list (`set_list_view`, groups), edit names, tags, notes and descriptions,
+  answer from rlord's data ("what's waiting on me?"), and run the tidy and
+  import passes. Anything that needs thought, it hands off (`hand_off`).
+- **↳ Mastermind (Option-M)**: the overlord's deeper half on a strong model
+  (`opus`, medium effort, by default). It launches sessions (the list's `n`
+  form goes straight to it; describe → confirm via `confirm_new_session`) and
+  takes one-off questions that need reasoning, research or reading code. A
+  hand-off switches the overlay to it, so you watch it work and carry on
+  there. It starts the first time it's needed, does its groundwork in
+  subagents to keep its context small, and after 15 idle minutes (while
+  you're not looking at it) restarts on a fresh conversation
+  (`mastermind_fresh_after_mins`).
 
-**Option-O** opens it as an overlay floating over whatever you're looking at:
-an agent session or the list. Option-O again, or Option-D, closes it. `enter` on the magenta ◆ row at the top of the list opens the
-overlord full screen, like any session. Its status bar turns magenta
-(`◆ OVERLORD`), Option-O does nothing there, and Option-D goes back to the
-list. The overlay is a tmux
-popup running rlord's own renderer of the overlord's live pane, so everything
-you type goes to the overlord. When the overlord moves you somewhere (a
-session, the list, a pre-filled form) it closes itself first. `rlord` always
-runs its TUI inside tmux (it starts a `rlord` tmux session if you're outside
-one).
+Both float as an overlay over whatever you're looking at. Inside it, Option-O
+and Option-M switch between them, and the key of the one shown (or Option-D)
+closes it. Both sit at the top of the list (◆ overlord, ↳ mastermind);
+`enter` opens either full screen with its own lavender bar. Models and
+efforts live in `config.toml` under `[overlord]`; the first-run dialog sets
+the models. When either moves you somewhere (a session, the list, a form) it
+closes itself first. `rlord` always runs its TUI inside tmux (it starts a
+`rlord` tmux session if you're outside one).
 
 Quitting the list takes **Shift-Q** plus a confirmation. `q` and Ctrl-C only show
 that hint.
 
-First start with no overlord shows a setup dialog where everything is defaulted,
-so `enter` launches it. On every start rlord checks the overlord's model: it
+First start with no overlord shows a setup dialog with both seats defaulted
+(and why), so `enter` launches it. On every start rlord checks the overlord's model: it
 reads what the agent actually ran from its transcript and compares it with a
-per-tool table of latest models (`crates/core/src/models.rs`). If you're on an
-older Opus, a dialog offers to switch and restart, and the conversation resumes.
+per-tool table of latest models (`crates/core/src/models.rs`). If either seat is
+on an older model, a dialog offers to switch and restart, and the conversation
+resumes.
 `rlord overlord status|model <m>|restart|open` does the same from the CLI.
 
 `enter` on a stopped session resumes it and attaches.

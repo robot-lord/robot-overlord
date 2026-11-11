@@ -245,6 +245,9 @@ enum Command {
     Overlay {
         #[arg(long)]
         token: Option<u64>,
+        /// Which overlord seat to show: overlord (default) or mastermind
+        #[arg(long, default_value = "overlord")]
+        seat: String,
     },
 }
 
@@ -307,6 +310,8 @@ enum NavCmd {
     Prev,
     /// Toggle the overlord overlay (Option-O)
     Overlord,
+    /// Toggle the mastermind overlay (Option-M)
+    Mastermind,
 }
 
 #[derive(Subcommand)]
@@ -415,6 +420,17 @@ fn main() -> Result<()> {
         Command::Nav(NavCmd::Home) => nav_home(),
         Command::Nav(NavCmd::Next) => nav_step(1),
         Command::Nav(NavCmd::Prev) => nav_step(-1),
+        Command::Nav(NavCmd::Mastermind) => {
+            let r = call(
+                "ui.overlord",
+                json!({"client": tmux::current_client(), "from": tmux::current_session(),
+                       "seat": "mastermind"}),
+            );
+            if let Err(e) = r {
+                let _ = tmux::display_message(&format!("rlord: {e:#}"));
+            }
+            Ok(())
+        }
         Command::Nav(NavCmd::Overlord) => {
             if let Err(e) = nav_overlord() {
                 let _ = tmux::display_message(&format!("rlord: {e:#}"));
@@ -424,7 +440,7 @@ fn main() -> Result<()> {
         Command::Mcp => mcp_stdio(),
         Command::Update { tag, force } => update(tag, force),
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
-        Command::Overlay { token } => rlord_tui::run_overlay(token),
+        Command::Overlay { token, seat } => rlord_tui::run_overlay(token, &seat),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
                 nav_overlord()
@@ -1119,6 +1135,8 @@ fn run_daemon() -> Result<()> {
         daemon.startup()?;
         // Load every live session's sub-agent data in the background.
         rlord_daemon::warm::start(&daemon);
+        // Restart an idle mastermind on a fresh conversation (context hygiene).
+        rlord_daemon::overlord::start_fresh_keeper(&daemon);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;

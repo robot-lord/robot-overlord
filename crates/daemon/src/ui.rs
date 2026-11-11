@@ -58,6 +58,7 @@ pub fn state(d: &Daemon) -> Result<Value> {
         None => json!({"kind": "none", "note": "no terminal attached to tmux"}),
         Some(c) if Some(&c.session) == home.as_ref() => json!({"kind": "session_list"}),
         Some(c) if c.session == overlord::TMUX_NAME => json!({"kind": "overlord"}),
+        Some(c) if c.session == overlord::MASTERMIND.tmux => json!({"kind": "mastermind"}),
         Some(c) => {
             let db = d.db();
             let all = db.sessions(&SessionQuery {
@@ -133,7 +134,9 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         hide_overlord(d);
         return Ok(json!({"overlord": "hidden"}));
     }
-    if params.get("from").and_then(Value::as_str) == Some(overlord::TMUX_NAME) {
+    // Which seat: the overlord (front desk) unless asked for the mastermind.
+    let seat = overlord::seat(params["seat"].as_str().unwrap_or(overlord::FRONT.key));
+    if params.get("from").and_then(Value::as_str) == Some(seat.tmux) {
         return Ok(json!({"overlord": "already here"}));
     }
     if d.db().overlord()?.is_none() {
@@ -143,10 +146,18 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         switch_user_to(&home)?;
         return Ok(json!({"setup": true}));
     }
-    overlord::ensure(&d.db(), &d.config, &json!({}))?;
+    overlord::ensure(&d.db(), &d.config, &json!({"seat": seat.key}))?;
     d.changed();
+    // The open overlay's terminal, when asked from inside it (switching seats).
+    let open_client = d
+        .overlay
+        .lock()
+        .expect("ui mutex")
+        .as_ref()
+        .map(|(c, _)| c.clone());
     let client = match params.get("client").and_then(Value::as_str) {
         Some(c) => c.to_string(),
+        None if open_client.is_some() => open_client.unwrap_or_default(),
         None => {
             let clients = tmux::list_clients();
             let home = tmux::home();
@@ -164,7 +175,9 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         .expect("ui mutex")
         .as_ref()
         .is_some_and(|(c, _)| *c == client);
-    if open_here && show != Some(true) {
+    // The same seat's key closes it; the other seat's key switches to it.
+    let same_seat = *d.overlay_seat.lock().expect("ui mutex") == seat.key;
+    if open_here && same_seat && show != Some(true) {
         hide_overlord(d);
         return Ok(json!({"overlord": "hidden"}));
     }
@@ -172,19 +185,28 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         .overlay_seq
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let cmd = format!(
-        "exec {} overlay --token {token}",
-        tmux::shell_quote(&methods::rlord_bin())
+        "exec {} overlay --token {token} --seat {}",
+        tmux::shell_quote(&methods::rlord_bin()),
+        seat.key
     );
+    let key = |k: &str| tmux::key_label(k);
+    let (o, m) = (key(&d.config.tmux.overlord), key(&d.config.tmux.mastermind));
+    let title = if seat.key == overlord::MASTERMIND.key {
+        format!(" ◆ mastermind · {o} overlord · {m} close ")
+    } else {
+        format!(" ◆ overlord · {m} mastermind · {o} close ")
+    };
     tmux::open_popup(
         &client,
         &d.config.overlord.width,
         &d.config.overlord.height,
-        " ◆ overlord · ⌥O / ⌥D close ",
+        &title,
         &format!("fg={}", crate::overlord::color(&d.config)),
         &cmd,
     )?;
     *d.overlay.lock().expect("ui mutex") = Some((client, token));
-    Ok(json!({"overlord": "shown"}))
+    *d.overlay_seat.lock().expect("ui mutex") = seat.key;
+    Ok(json!({"overlord": "shown", "seat": seat.key}))
 }
 
 /// Post-restart cleanup for `rlord reset`: close overlays, drop parked UI
@@ -216,6 +238,12 @@ pub fn reset(d: &Daemon, params: &Value) -> Result<Value> {
         .is_some_and(|o| o.tmux_session.as_deref().is_some_and(tmux::has_session));
     if overlord_running {
         let _ = overlord::ensure(&d.db(), &d.config, &json!({})); // restyle
+    }
+    let mastermind_running = overlord::MASTERMIND
+        .session(&d.db())?
+        .is_some_and(|o| o.tmux_session.as_deref().is_some_and(tmux::has_session));
+    if mastermind_running {
+        let _ = overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}));
     }
     d.changed();
     let all = d.db().sessions(&SessionQuery {
@@ -252,8 +280,8 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
     let s = {
         let db = d.db();
         let s = db.resolve_ref(r)?;
-        if s.role == overlord::ROLE {
-            overlord::ensure(&db, &d.config, &json!({}))?;
+        if overlord::is_overlord_role(&s.role) {
+            overlord::ensure(&db, &d.config, &json!({"seat": s.role}))?;
         } else if s.status == Status::Stopped
             || !s.tmux_session.as_deref().is_some_and(tmux::has_session)
         {
@@ -262,9 +290,9 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         db.resolve_ref(&s.id)?
     };
     d.changed();
-    if s.role == overlord::ROLE {
+    if overlord::is_overlord_role(&s.role) {
         // Full screen: hand the window's size back from any overlay.
-        let _ = tmux::auto_size_window(overlord::TMUX_NAME);
+        let _ = tmux::auto_size_window(overlord::seat(&s.role).tmux);
     }
     let t = s
         .tmux_session

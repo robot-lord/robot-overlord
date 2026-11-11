@@ -77,7 +77,7 @@ pub fn session_unarchive(db: &Db, params: &Value) -> Result<Value> {
 /// The overlord's row is fixed: always on top, never renamed, grouped,
 /// described, annotated or archived. Its meta-context is its instructions.
 fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
-    if s.role == "overlord" {
+    if crate::overlord::is_overlord_role(&s.role) {
         bail!("the overlord can't be {what}");
     }
     Ok(())
@@ -586,6 +586,47 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &json!({"argv": argv}).to_string(),
     )?;
     tracing::info!(session = %s.id, resumed, "restarted session");
+    Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+/// Restart a session's agent on a **fresh conversation** in its pane (a new
+/// conversation id, not a resume). The old conversation stays on disk and
+/// can still be resumed with the agent's own `--resume`.
+pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    if s.agent != "claude" {
+        bail!("fresh start not supported for agent '{}'", s.agent);
+    }
+    let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
+    let model = spec.get("model").and_then(Value::as_str);
+    let extra_args = str_list(&spec, "extra_args");
+    let sid = claude::mint_session_id();
+    let argv = claude::launch_argv(&sid, None, model, &extra_args);
+    let tmux_name = s
+        .tmux_session
+        .clone()
+        .context("session has no tmux session")?;
+    let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
+    if tmux::has_session(&tmux_name) {
+        tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
+    } else {
+        tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
+    }
+    let now = now_ms();
+    db.set_agent_session(&s.id, &sid, "minted")?;
+    db.upsert_transcript_source(
+        &s.id,
+        claude::transcript_path(&s.project_path, &sid)
+            .to_str()
+            .unwrap_or(""),
+    )?;
+    db.set_status(&s.id, Status::Starting, now)?;
+    db.insert_event(
+        &s.id,
+        now,
+        "fresh_conversation",
+        &json!({"from": s.agent_session, "to": sid}).to_string(),
+    )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 

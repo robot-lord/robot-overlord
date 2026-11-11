@@ -32,24 +32,23 @@ pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
         .filter(|t| !t.is_empty())
         .context("nothing to send")?
         .to_string();
-    send(d, &text)
+    send_to(d, &overlord::FRONT, &text)
 }
 
-fn send(d: &Daemon, text: &str) -> Result<Value> {
+/// Type `text` into a seat's pane (starting the seat if needed). The
+/// mastermind starts on first use; the overlord must have been set up.
+pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
     if d.db().overlord()?.is_none() {
         bail!("no overlord yet: press Option-O to set one up (or N for the manual form)");
     }
-    let s = overlord::ensure(&d.db(), &d.config, &json!({}))?;
-    let pane = s["tmux_session"]
-        .as_str()
-        .unwrap_or(overlord::TMUX_NAME)
-        .to_string();
+    let s = overlord::ensure(&d.db(), &d.config, &json!({"seat": seat.key}))?;
+    let pane = s["tmux_session"].as_str().unwrap_or(seat.tmux).to_string();
     d.changed();
     // A fresh or resumed overlord isn't listening until its SessionStart hook
     // flips it out of `starting`.
     let start = Instant::now();
     loop {
-        let s = d.db().overlord()?.context("overlord vanished")?;
+        let s = seat.session(&d.db())?.context("overlord vanished")?;
         if s.status != Status::Starting {
             break;
         }
@@ -67,9 +66,44 @@ fn send(d: &Daemon, text: &str) -> Result<Value> {
 
 /// `{description, repo?, model?, workspace?, tags?: [..], chosen?: [..],
 /// confirmed?}` from the list's new-session form.
+/// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
     let text = format_request(params)?;
-    send(d, &text)
+    send_to(d, &overlord::MASTERMIND, &text)
+}
+
+/// `{request, context?}`: the overlord hands a request to the mastermind
+/// (verbatim, with what it knew), and the user's overlay switches to the
+/// mastermind so they can watch and carry on there.
+pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
+    let request = params["request"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .context("missing 'request' (the user's words, verbatim)")?;
+    let mut text = format!("[rlord hand-off from the overlord]\nrequest:\n{request}");
+    if let Some(c) = params["context"]
+        .as_str()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        text.push_str(&format!("\ncontext:\n{c}"));
+    }
+    send_to(d, &overlord::MASTERMIND, &text)?;
+    // Show the mastermind where the user is looking (the overlay they asked
+    // in, if open).
+    let client = d
+        .overlay
+        .lock()
+        .expect("ui mutex")
+        .as_ref()
+        .map(|(c, _)| c.clone());
+    let mut p = json!({"seat": overlord::MASTERMIND.key, "show": true});
+    if let Some(c) = client {
+        p["client"] = json!(c);
+    }
+    let _ = crate::ui::overlord(d, &p);
+    Ok(json!({"handed_off": true, "note": "the user now sees the mastermind"}))
 }
 
 /// The `[rlord new-session request]` message. Hints say whether the user
