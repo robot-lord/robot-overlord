@@ -2126,7 +2126,7 @@ mod tests {
             println!("{}", out.join("\n"));
         }
         let all = out.join("\n");
-        assert!(all.contains("▲▲▲  rlord") && all.contains("● working") && all.contains("#wip"));
+        assert!(all.contains("┏▲▲▲┓") && all.contains("● working") && all.contains("#wip"));
 
         // The groups tab: group column focused.
         app.tab = Tab::Groups;
