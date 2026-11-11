@@ -157,6 +157,11 @@ struct App {
     /// The highlight moved: refresh the preview once keys pause (moving
     /// itself must never wait on tmux or the daemon).
     preview_due: Option<Instant>,
+    /// Which session the preview and sub-agents were loaded for: while the
+    /// highlight moves they belong to another row and aren't shown.
+    preview_for: Option<String>,
+    /// The appearance watcher thread is running.
+    watching_appearance: bool,
     /// The system's appearance as last applied (theme families follow it).
     dark: bool,
     /// Latest appearance from the watcher thread (asking macOS spawns a
@@ -198,6 +203,8 @@ impl App {
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
             preview_due: None,
+            preview_for: None,
+            watching_appearance: false,
             dark: true,
             system_dark: Default::default(),
             overlord_row: false,
@@ -336,6 +343,7 @@ impl App {
     fn refresh_preview(&mut self) {
         self.last_preview = Instant::now();
         self.preview_due = None;
+        self.preview_for = self.selected_id();
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
@@ -943,7 +951,8 @@ impl App {
         theme::set(rlord_core::themes::resolve(&self.config.theme, self.dark));
         // Theme families follow the system: a thread re-checks every few
         // seconds; the loop just reads what it found.
-        if rlord_core::themes::follows_system(&self.config.theme) {
+        if rlord_core::themes::follows_system(&self.config.theme) && !self.watching_appearance {
+            self.watching_appearance = true;
             let flag = self.system_dark.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(3));
@@ -1155,7 +1164,11 @@ impl App {
             Line::from(Span::styled(format!(" {log} {other} "), theme::faint())).right_aligned();
         // Show the tail that fits: the bottom of a pane is what matters.
         let inner_h = area.height.saturating_sub(2) as usize;
+        // Loaded for another row (the highlight is moving): show nothing
+        // rather than the wrong session's screen.
+        let current = self.preview_for == self.selected_id();
         let text: Text = match &self.preview_rich {
+            _ if !current => Text::from(Span::styled("…", theme::faint())),
             Some(rich) if self.preview == Preview::Pane => {
                 let start = rich.lines.len().saturating_sub(inner_h);
                 Text::from(rich.lines[start..].to_vec())
@@ -1278,7 +1291,7 @@ impl App {
                 ),
             ]),
         ];
-        if !self.agents.is_empty() {
+        if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
                 .agents
                 .iter()

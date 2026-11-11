@@ -456,26 +456,38 @@ pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
 ///
 /// Incremental: a running agent's transcript is polled again and again while
 /// it grows, so the totals so far and the offset read up to are kept per
-/// file, and each call parses only the bytes appended since (complete lines
-/// only; a half-written last line waits for the next call). A file that
-/// shrank (rewritten) is read again from the start.
+/// file, and each call parses only the bytes appended since. A trailing line
+/// without its newline counts once it parses as complete JSON. A file that
+/// was replaced (new inode) or shrank is read again from the start.
 pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i64>)> {
     use std::io::{Read, Seek, SeekFrom};
-    let len = std::fs::metadata(path).ok()?.len();
-    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
-    let c = cursors.entry(path.to_path_buf()).or_default();
-    if len < c.offset {
-        *c = StatsCursor::default();
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let (len, ino) = (meta.len(), meta.ino());
+    // Copy the cursor out: the (possibly large) read happens unlocked, so one
+    // slow file never holds up stats for another.
+    let mut c = {
+        let cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+        cursors.get(path).cloned().unwrap_or_default()
+    };
+    if c.ino != ino || len < c.offset {
+        c = StatsCursor {
+            ino,
+            ..Default::default()
+        };
     }
     if len > c.offset {
         let mut f = std::fs::File::open(path).ok()?;
         f.seek(SeekFrom::Start(c.offset)).ok()?;
         let mut buf = Vec::with_capacity((len - c.offset) as usize);
         f.take(len - c.offset).read_to_end(&mut buf).ok()?;
-        // Only up to the last complete line.
-        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else {
-            return Some(c.stats());
-        };
+        // Complete lines, plus a trailing one if it is already whole JSON
+        // (a final record may never get its newline).
+        let mut end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |e| e + 1);
+        let tail = &buf[end..];
+        if !tail.is_empty() && serde_json::from_slice::<Value>(tail).is_ok() {
+            end = buf.len();
+        }
         for line in buf[..end].split(|&b| b == b'\n') {
             let Ok(v) = serde_json::from_slice::<Value>(line) else {
                 continue;
@@ -489,19 +501,48 @@ pub fn transcript_stats(path: &Path) -> Option<(i64, i64, Option<i64>, Option<i6
                 c.output += u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
             }
         }
-        c.offset += end as u64 + 1;
+        c.offset += end as u64;
     }
-    Some(c.stats())
+    let stats = c.stats();
+    c.used = std::time::Instant::now();
+    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    cursors.insert(path.to_path_buf(), c);
+    // Bounded: forget the least recently used files past the cap.
+    if cursors.len() > STATS_CURSOR_CAP {
+        let mut by_age: Vec<(std::time::Instant, PathBuf)> =
+            cursors.iter().map(|(p, c)| (c.used, p.clone())).collect();
+        by_age.sort();
+        for (_, p) in by_age.into_iter().take(cursors.len() - STATS_CURSOR_CAP) {
+            cursors.remove(&p);
+        }
+    }
+    Some(stats)
 }
 
 /// How far `transcript_stats` has read a file, and the totals so far.
-#[derive(Default)]
+#[derive(Clone)]
 struct StatsCursor {
+    ino: u64,
     offset: u64,
     input: i64,
     output: i64,
     first: Option<i64>,
     last: Option<i64>,
+    used: std::time::Instant,
+}
+
+impl Default for StatsCursor {
+    fn default() -> Self {
+        StatsCursor {
+            ino: 0,
+            offset: 0,
+            input: 0,
+            output: 0,
+            first: None,
+            last: None,
+            used: std::time::Instant::now(),
+        }
+    }
 }
 
 impl StatsCursor {
@@ -509,6 +550,9 @@ impl StatsCursor {
         (self.input, self.output, self.first, self.last)
     }
 }
+
+/// Transcripts whose read position is remembered (most recently used).
+const STATS_CURSOR_CAP: usize = 1000;
 
 static STATS_CURSORS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, StatsCursor>>,
@@ -640,6 +684,25 @@ mod subagent_tests {
         assert_eq!(transcript_stats(&p).unwrap().0, 22);
         // Rewritten shorter: read again from the start.
         std::fs::write(&p, line("00", 3)).unwrap();
+        assert_eq!(transcript_stats(&p).unwrap().0, 3);
+        // A final record without its newline still counts, once.
+        let whole = line("09", 4);
+        write!(
+            std::fs::OpenOptions::new().append(true).open(&p).unwrap(),
+            "{}",
+            whole.trim_end()
+        )
+        .unwrap();
+        assert_eq!(transcript_stats(&p).unwrap().0, 7);
+        assert_eq!(transcript_stats(&p).unwrap().0, 7);
+        // Replaced by a different, longer file: start over.
+        let q = dir.path().join("other.jsonl");
+        std::fs::write(
+            &q,
+            format!("{}{}{}", line("00", 1), line("01", 1), line("02", 1)),
+        )
+        .unwrap();
+        std::fs::rename(&q, &p).unwrap();
         assert_eq!(transcript_stats(&p).unwrap().0, 3);
     }
 
