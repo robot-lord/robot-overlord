@@ -283,19 +283,20 @@ impl NewForm {
         // its resolved values; anything it didn't set is still a default.
         let has =
             |list: &str, k: &str| p[list].as_array().is_some_and(|a| a.iter().any(|c| c == k));
-        let picked = |k: &str| has("user_picked", k) && !has("changed", k);
+        let given = |k: &str| match k {
+            "repo" => get("repo").is_some() || get("project").is_some(),
+            "model" => get("model").is_some(),
+            _ => p["workspace"].is_boolean(),
+        };
+        // Only a value the overlord sent back can be the user's pick (a hint
+        // it left out is the form's default, whatever it reports).
+        let picked = |k: &str| given(k) && has("user_picked", k) && !has("changed", k);
         self.repo_chosen = picked("repo");
         self.model_chosen = picked("model");
         self.workspace_chosen = picked("worktree");
-        let set = [
-            ("repo", get("repo").is_some() || get("project").is_some()),
-            ("model", get("model").is_some()),
-            ("worktree", p["workspace"].is_boolean()),
-        ];
-        self.resolved = set
+        self.resolved = ["repo", "model", "worktree"]
             .into_iter()
-            .filter(|(k, given)| *given && !picked(k))
-            .map(|(k, _)| k)
+            .filter(|k| given(k) && !picked(k))
             .collect();
         self.confirmed = true;
         self.changed = p["changed"]
@@ -313,6 +314,25 @@ impl NewForm {
             .iter()
             .position(|f| *f == Field::Launch)
             .unwrap_or(0);
+    }
+
+    /// The user picked a hint (`repo` / `model` / `worktree`). On a fresh form
+    /// any pick is theirs (pinning the default counts); on a form the
+    /// overlord reopened only a real change is, and it drops the overlord's
+    /// label and confirmation.
+    fn mark_picked(&mut self, key: &'static str, changed: bool) {
+        let reopened = self.confirmed || !self.resolved.is_empty();
+        if changed || !reopened {
+            match key {
+                "repo" => self.repo_chosen = true,
+                "model" => self.model_chosen = true,
+                _ => self.workspace_chosen = true,
+            }
+        }
+        if changed {
+            self.resolved.retain(|k| *k != key);
+            self.description_changed();
+        }
     }
 
     /// The description or a hint changed after the overlord reopened the
@@ -434,12 +454,14 @@ impl App {
                     match kind {
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
-                                if !matches!(&f.location, Location::Folder(p) if *p == path) {
-                                    f.repo_chosen = true;
-                                    f.resolved.retain(|k| *k != "repo");
-                                    f.description_changed();
-                                }
+                                f.mark_picked(
+                                    "repo",
+                                    !matches!(&f.location, Location::Folder(p) if *p == path),
+                                );
                                 f.location = Location::Folder(path);
+                                // A plain folder has no worktree: not the
+                                // overlord's pick any more.
+                                f.resolved.retain(|k| *k != "worktree");
                                 f.workspace = false;
                                 f.error = None;
                             } else {
@@ -497,11 +519,10 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some((path, _)) = finder.rows().get(i) {
-                        if !matches!(&f.location, Location::Repo(p) if p == path) {
-                            f.repo_chosen = true;
-                            f.resolved.retain(|k| *k != "repo");
-                            f.description_changed();
-                        }
+                        f.mark_picked(
+                            "repo",
+                            !matches!(&f.location, Location::Repo(p) if p == path),
+                        );
                         f.location = Location::Repo(path.clone());
                         f.error = None;
                     } else {
@@ -544,11 +565,7 @@ impl App {
                             items[i].clone()
                         };
                         // A real change only (re-picking keeps provenance).
-                        if picked != f.model {
-                            f.model_chosen = true;
-                            f.resolved.retain(|k| *k != "model");
-                            f.description_changed();
-                        }
+                        f.mark_picked("model", picked != f.model);
                         f.model = picked;
                     }
                     PickerKind::Repo => {
@@ -559,20 +576,15 @@ impl App {
                         } else if items[i] == NO_REPO {
                             f.text_prompt = Some((TextPrompt::Folder, String::new()));
                         } else if items[i] == AUTO_REPO {
-                            if !matches!(f.location, Location::Auto) {
-                                f.repo_chosen = true;
-                                f.resolved.retain(|k| *k != "repo");
-                                f.description_changed();
-                            }
+                            f.mark_picked("repo", !matches!(f.location, Location::Auto));
                             f.location = Location::Auto;
                             f.error = None;
                         } else {
                             let path = f.repos[i]["path"].as_str().unwrap_or("").to_string();
-                            if !matches!(&f.location, Location::Repo(p) if *p == path) {
-                                f.repo_chosen = true;
-                                f.resolved.retain(|k| *k != "repo");
-                                f.description_changed();
-                            }
+                            f.mark_picked(
+                                "repo",
+                                !matches!(&f.location, Location::Repo(p) if *p == path),
+                            );
                             f.location = Location::Repo(path);
                             f.error = None;
                         }
@@ -635,18 +647,14 @@ impl App {
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
                 Field::Workspace => {
                     f.workspace = !f.workspace;
-                    f.workspace_chosen = true;
-                    f.resolved.retain(|k| *k != "worktree");
-                    f.description_changed();
+                    f.mark_picked("worktree", true);
                 }
                 Field::Launch => return self.submit_form(f),
                 _ => next(&mut f),
             },
             KeyCode::Char(' ') if field == Field::Workspace => {
                 f.workspace = !f.workspace;
-                f.workspace_chosen = true;
-                f.resolved.retain(|k| *k != "worktree");
-                f.description_changed();
+                f.mark_picked("worktree", true);
             }
             KeyCode::Char('l') if field == Field::Launch => return self.submit_form(f),
             KeyCode::Backspace if field.is_text() => match field {

@@ -1561,18 +1561,26 @@ fn edit_in_editor(
     // File errors are the user's to see (the caller keeps its text), not a
     // reason to quit the TUI.
     // Created fresh (never through an existing file or symlink).
-    let made = std::fs::create_dir_all(&dir).and_then(|_| {
-        use std::io::Write;
+    let opened = std::fs::create_dir_all(&dir).and_then(|_| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)?
-            .write_all(text.as_bytes())
+            .open(&path)
     });
-    if let Err(e) = made {
-        let _ = std::fs::remove_file(&path); // a partial write
+    let written = match opened {
+        Ok(mut f) => {
+            use std::io::Write;
+            let w = f.write_all(text.as_bytes());
+            if w.is_err() {
+                let _ = std::fs::remove_file(&path); // ours, partly written
+            }
+            w
+        }
+        Err(e) => Err(e), // not ours: leave whatever is there
+    };
+    if let Err(e) = written {
         return Err(format!("could not prepare {}: {e}", path.display()));
     }
     let editor = std::env::var("VISUAL")
