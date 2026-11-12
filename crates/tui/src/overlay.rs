@@ -183,6 +183,7 @@ fn run_loop(
                     }
                     if !f.in_mode && in_mode {
                         prompt = None;
+                        repeat = None;
                         if let Some(before) = buffer_at_entry.take() {
                             let now = tmux::newest_buffer();
                             if now.is_some() && now != before {
@@ -272,8 +273,10 @@ fn run_loop(
                     last = Instant::now() - Duration::from_secs(1);
                     match step {
                         PromptStep::Typing => continue,
+                        // Cancelled: a count it was meant to take goes too.
                         PromptStep::Cancel => {
                             prompt = None;
+                            repeat = None;
                             continue;
                         }
                         PromptStep::Run(Action::Copy(cmd), arg) => {
@@ -458,6 +461,14 @@ impl Prompt {
     }
 
     fn key(&mut self, k: &KeyEvent) -> PromptStep {
+        // A count ends at any non-digit, a chord too (5 C-e scrolls 5),
+        // except the cancel chords.
+        let chord = k
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if self.numeric && chord && !matches!(k.code, KeyCode::Char('c' | 'g')) {
+            return PromptStep::CountThen(std::mem::take(&mut self.text));
+        }
         // Chords aren't text: C-c / C-g cancel (as tmux's prompt), C-u
         // clears, the rest are ignored.
         if k.modifiers
