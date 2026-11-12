@@ -145,16 +145,31 @@ lock is released:
   cursor (only appended bytes are parsed) and are saved with it in
   `transcript_cursors`. OpenCode: indexed look-ups in `session_v2` /
   `session_message` only, cached until the database or its WAL changes.
-- **Window**: what the agent reports (Codex's `model_context_window`),
-  else `models::context_window` (a per-family table; `[1m]` is 1M, and a
-  200k model that sent more than 200k is taken as its 1M variant). Unknown
-  → no `context_pct`, shown as `–`.
-- The list never stalls on a first full read: a transcript rlord hasn't
-  read (or one more than 4 MB behind) is queued on the warm-up worker
-  (`Job::Usage`, once per run) and the row shows as loading meanwhile.
+- Claude messages Claude Code made up (`"model":"<synthetic>"`, e.g. an
+  API error) and any with zero context aren't requests: they don't move
+  the totals or the context. `[Request interrupted by user…]` lines aren't
+  prompts.
+- **Window**: what the agent reports (Codex's `model_context_window`);
+  else a configured `[1m]` model is 1M (the transcript names the model
+  alone); else `models::context_window` (a per-family table; a 200k model
+  that sent more than 200k is taken as its 1M variant). Unknown → no
+  `context_pct`, shown as `–`.
+- **A request never reads a whole transcript.** It reads what was
+  appended since the last read, at most 4 MB. A position that fell out of
+  memory (`STATS_CURSOR_CAP`) is reloaded from `transcript_cursors`, so
+  long archived lists don't re-read files. A transcript with no position,
+  or more than 4 MB behind, goes to the warm-up worker (`Job::Usage`, its
+  own pending set, so it doesn't mark sub-agents loading); the row says
+  `usage_loading` meanwhile. Once read it can be queued again; one whose
+  read failed isn't, this run. `session.get` (one row) may read an
+  unread transcript of at most 4 MB itself.
+- OpenCode rows are read per database over one connection
+  (`usage::of_opencode`).
 - The measure is `SessionQuery::usage` (the TUI sends its current one),
   else config `usage`. `SortMode::Usage` sorts by it: pinned first, most
-  first, unknown last.
+  first, unknown last; equals stay most recently active first, reversed
+  or not. The toolbar names the measure (the column may be hidden for
+  width).
 
 ## tmux supervisor
 
@@ -365,7 +380,13 @@ Claude Code exposes sub-agents outside the pane, and rlord consumes all of it:
   are filtered out.
 
 `subagents` table rows are upsert-merged from both sources (hooks for
-latency, disk for description/tool-use id/backfill); `sessions` carry
+latency, disk for description/tool-use id/backfill). Token totals keep the
+larger value, except that `subagents.counted` records the
+`STATS_PARSE_VERSION` they were counted with: totals from older counting
+(or marked by `rlord reset --rescan`) are replaced by the next count from
+the agent's transcript, even when lower. So bumping the parse version
+needs no data migration: a live session is recounted by the warm-up, an
+archived one when it's next viewed. `sessions` carry
 `agents_running`/`agents_total`. Surfaces: TUI details card + `⚙N` in the
 list, `rlord subagents`, `rlord show`. Sub-agent transcripts will join the
 transcript store so `rlord search` covers them.

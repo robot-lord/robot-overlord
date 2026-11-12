@@ -201,7 +201,13 @@ pub(crate) fn human_prompt(v: &Value) -> Option<String> {
         _ => return None,
     };
     let t = text.trim();
-    (!t.is_empty() && !t.starts_with('<') && !t.starts_with("Caveat:")).then(|| t.to_string())
+    // (`[Request interrupted by user]`, `… for tool use]`: Claude writes
+    // these when the user presses Esc; they're not prompts.)
+    (!t.is_empty()
+        && !t.starts_with('<')
+        && !t.starts_with("Caveat:")
+        && !t.starts_with("[Request interrupted by user"))
+    .then(|| t.to_string())
 }
 
 pub(crate) fn reply_text(v: &Value) -> Option<String> {
@@ -299,20 +305,30 @@ pub(crate) fn last_prompt(v: &Value) -> Option<&str> {
 }
 
 /// One request's usage; its context is everything it sent, cached or not.
+/// None for messages Claude Code made up itself (`"model":"<synthetic>"`,
+/// e.g. an API error shown as a reply) and any that sent no context: their
+/// zeros aren't a request, and would drop context % to 0.
 pub(crate) fn usage(v: &Value) -> Option<Usage> {
+    if v["message"]["model"] == "<synthetic>" {
+        return None;
+    }
     let u = v["message"]["usage"].as_object()?;
     let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let context: u64 = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+    .sum();
+    if context == 0 {
+        return None;
+    }
     Some(Usage {
         input: n("input_tokens"),
         output: n("output_tokens"),
-        context: [
-            "input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ]
-        .iter()
-        .filter_map(|k| u.get(*k).and_then(Value::as_u64))
-        .sum(),
+        context,
         fresh: n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens"),
         window: None,
         cumulative: false,
@@ -453,6 +469,39 @@ pub fn scan_subagents_where(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn interruptions_are_not_prompts() {
+        let user = |c: Value| json!({"type": "user", "message": {"role": "user", "content": c}});
+        assert_eq!(
+            human_prompt(&user(json!("fix it"))).as_deref(),
+            Some("fix it")
+        );
+        assert_eq!(
+            human_prompt(&user(json!("[Request interrupted by user]"))),
+            None
+        );
+        assert_eq!(
+            human_prompt(&user(json!([
+                {"type": "text", "text": "[Request interrupted by user for tool use]"}
+            ]))),
+            None
+        );
+    }
+
+    #[test]
+    fn synthetic_and_empty_messages_carry_no_usage() {
+        let msg = |model: &str, input: u64, cached: u64| {
+            json!({"type": "assistant", "message": {"id": "m", "model": model,
+                "usage": {"input_tokens": input, "cache_read_input_tokens": cached,
+                          "output_tokens": 0}}})
+        };
+        assert_eq!(usage(&msg("claude-opus-5-5", 1, 500)).unwrap().context, 501);
+        // An API error Claude Code shows as a reply: zeros, not a request.
+        assert!(usage(&msg("<synthetic>", 0, 0)).is_none());
+        assert!(usage(&msg("claude-opus-5-5", 0, 0)).is_none());
+    }
 
     #[test]
     fn slug_matches_observed_claude_encoding() {
@@ -488,7 +537,6 @@ mod tests {
 
     #[test]
     fn needs_you_is_a_block_mid_turn_not_an_idle_reminder() {
-        use serde_json::json;
         let note = |ty: &str| map_hook_event("Notification", &json!({"notification_type": ty})).1;
         assert_eq!(note("permission_prompt"), Effect::Set(Status::WaitingInput));
         assert_eq!(

@@ -23,14 +23,19 @@ use crate::{methods, Daemon};
 
 #[derive(Default)]
 pub struct Warm {
-    /// Sessions queued and not yet loaded, with how many loads are queued
-    /// (one queued again mid-load stays loading until its last load ends).
+    /// Sessions queued for a full load (sub-agents and usage) and not yet
+    /// loaded, with how many loads are queued (one queued again mid-load
+    /// stays loading until its last load ends). What "loading" (sub-agents)
+    /// means; usage-only jobs aren't here.
     pending: Mutex<HashMap<String, usize>>,
     queue: Mutex<Option<mpsc::Sender<(String, Job)>>>,
-    /// Sessions queued for their usage alone (`enqueue_usage`), once each
-    /// per daemon run: a transcript that can't be read isn't queued again
-    /// on every list.
-    usage_tried: Mutex<HashSet<String>>,
+    /// Sessions queued for their usage alone (`enqueue_usage`) and not yet
+    /// read. Once read, one can be queued again (it fell far behind).
+    usage_pending: Mutex<HashSet<String>>,
+    /// Sessions whose usage job left nothing read (an unreadable
+    /// transcript): not queued again this run, so a list can't keep the
+    /// worker busy on them.
+    usage_failed: Mutex<HashSet<String>>,
 }
 
 /// What a queued session needs.
@@ -39,7 +44,7 @@ enum Job {
     /// Sub-agents and usage.
     Full,
     /// Only its usage (a session the list shows whose transcript rlord
-    /// hasn't read yet, e.g. an archived one).
+    /// hasn't read yet, e.g. an archived one, or is far behind on).
     Usage,
 }
 
@@ -61,15 +66,24 @@ impl Warm {
         self.send(id, Job::Full);
     }
 
-    /// Queue a session to read its usage, unless that was tried before in
-    /// this run. False: it was (the caller reads it itself, or goes
-    /// without).
+    /// Queue a session to read its usage, unless it's queued already.
+    /// True: its usage is being read (the row shows it as loading); false:
+    /// it won't be (its last read failed, or there's no worker).
     pub fn enqueue_usage(&self, id: &str) -> bool {
-        let first = self
-            .usage_tried
-            .lock()
-            .is_ok_and(|mut t| t.insert(id.to_string()));
-        first && self.send(id, Job::Usage)
+        if self.usage_failed.lock().is_ok_and(|f| f.contains(id)) {
+            return false;
+        }
+        let Ok(mut p) = self.usage_pending.lock() else {
+            return false;
+        };
+        if p.contains(id) {
+            return true;
+        }
+        let sent = self.send(id, Job::Usage);
+        if sent {
+            p.insert(id.to_string());
+        }
+        sent
     }
 
     fn send(&self, id: &str, job: Job) -> bool {
@@ -79,10 +93,43 @@ impl Warm {
         let Some(tx) = q.as_ref() else {
             return false;
         };
-        if let Ok(mut p) = self.pending.lock() {
-            *p.entry(id.to_string()).or_default() += 1;
+        if job == Job::Full {
+            if let Ok(mut p) = self.pending.lock() {
+                *p.entry(id.to_string()).or_default() += 1;
+            }
         }
         tx.send((id.to_string(), job)).is_ok()
+    }
+
+    /// A job ended: the session is no longer pending for it.
+    fn done(&self, id: &str, job: Job, read: bool) {
+        match job {
+            Job::Full => {
+                if let Ok(mut p) = self.pending.lock() {
+                    if let Some(n) = p.get_mut(id) {
+                        *n -= 1;
+                        if *n == 0 {
+                            p.remove(id);
+                        }
+                    }
+                }
+            }
+            Job::Usage => {
+                if let Ok(mut p) = self.usage_pending.lock() {
+                    p.remove(id);
+                }
+                if !read {
+                    if let Ok(mut f) = self.usage_failed.lock() {
+                        f.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn idle(&self) -> bool {
+        self.pending.lock().is_ok_and(|p| p.is_empty())
+            && self.usage_pending.lock().is_ok_and(|p| p.is_empty())
     }
 }
 
@@ -114,25 +161,24 @@ pub fn start(d: &Arc<Daemon>) {
             // A panic on one session (odd transcript data) must not end the
             // worker and leave every other session "loading" for good.
             let run = || match job {
-                Job::Full => refresh(&d, &id).map(drop),
+                Job::Full => refresh(&d, &id).map(|_| true),
                 Job::Usage => read_usage(&d, &id),
             };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-                Ok(Err(e)) => tracing::debug!(session = %id, error = %e, "warming session"),
-                Err(_) => tracing::warn!(session = %id, "warming session panicked"),
-                Ok(Ok(_)) => {}
-            }
-            if let Ok(mut p) = d.warm.pending.lock() {
-                if let Some(n) = p.get_mut(&id) {
-                    *n -= 1;
-                    if *n == 0 {
-                        p.remove(&id);
-                    }
+            let read = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                Ok(Err(e)) => {
+                    tracing::debug!(session = %id, error = %e, "warming session");
+                    false
                 }
-            }
+                Err(_) => {
+                    tracing::warn!(session = %id, "warming session panicked");
+                    false
+                }
+                Ok(Ok(read)) => read,
+            };
+            d.warm.done(&id, job, read);
             // Tell the list now and then (and when the queue drains), not
             // after every session: each tick makes every TUI refetch.
-            let drained = d.warm.pending.lock().is_ok_and(|p| p.is_empty());
+            let drained = d.warm.idle();
             if drained || since_notify.elapsed() > std::time::Duration::from_secs(2) {
                 d.changed();
                 since_notify = std::time::Instant::now();
@@ -142,19 +188,20 @@ pub fn start(d: &Arc<Daemon>) {
 }
 
 /// Read one session's usage (its transcript, without the DB lock), so
-/// the list has it at hand.
-fn read_usage(d: &Daemon, r: &str) -> Result<()> {
+/// the list has it at hand. False: nothing was read (no transcript, or it
+/// can't be read).
+fn read_usage(d: &Daemon, r: &str) -> Result<bool> {
     let (s, src) = {
         let db = d.db();
         let s = db.resolve_ref(r)?;
         let src = db.transcript_source(&s.id)?;
         (s, src)
     };
-    if let Some(src) = src {
-        rlord_core::usage::of(std::path::Path::new(&src), s.model.as_deref());
-        methods::save_cursors(&d.db());
-    }
-    Ok(())
+    let Some(src) = src else { return Ok(false) };
+    let path = std::path::Path::new(&src);
+    rlord_core::usage::of(path, s.model.as_deref());
+    methods::save_cursors(&d.db());
+    Ok(rlord_core::agents::transcript::unread_bytes(path).is_some())
 }
 
 /// Bring one session's sub-agents and usage up to date from disk. The
@@ -193,18 +240,24 @@ pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
     db.subagents(&s.id)
 }
 
-/// Write the scanned agents that differ from the known rows.
+/// Write the scanned agents that differ from the known rows (or whose
+/// totals were counted by older logic: the scan recounts them).
 fn apply(db: &Db, known: &[Subagent], scanned: &[Subagent]) -> Result<()> {
+    let recount = match scanned.first() {
+        Some(a) => db.subagents_to_recount(&a.session_id)?,
+        None => return Ok(()),
+    };
     for a in scanned {
         let same = known.iter().any(|k| {
             k.agent_id == a.agent_id
+                && !(recount.contains(&a.agent_id) && a.transcript_path.is_some())
                 && k.input_tokens >= a.input_tokens
                 && k.output_tokens >= a.output_tokens
                 && k.started_at == a.started_at
                 && (a.finished_at.is_none() || k.finished_at.is_some())
         });
         if !same {
-            db.upsert_subagent(a)?;
+            db.upsert_subagent_counted(a)?;
         }
     }
     Ok(())

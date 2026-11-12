@@ -401,13 +401,13 @@ impl Daemon {
                     row["summarizing"] = json!(summarizing.contains(&id));
                 }
                 remote::annotate(self, &mut rows);
-                usage::list(self, &params, &mut rows, &loading);
+                usage::list(self, &params, &mut rows);
                 Ok(Value::Array(rows))
             }
             ("session.get", Ok(row)) => {
                 let mut rows = [row];
                 remote::annotate(self, &mut rows);
-                usage::annotate(self, &mut rows, &self.warm.loading(), true);
+                usage::annotate(self, &mut rows, true);
                 let [row] = rows;
                 Ok(row)
             }
@@ -965,7 +965,22 @@ mod tests {
                 .map(|r| r["id"].as_str().unwrap().to_string())
                 .collect()
         };
+        // Unread transcripts: the warm-up reads them, not the list (here
+        // there's no worker yet: nothing is read at all).
         let v = list(json!({"sort": "usage"})).await.unwrap();
+        assert!(
+            v.as_array().unwrap().iter().all(|r| r["usage"].is_null()),
+            "{v}"
+        );
+        crate::warm::start(&daemon);
+        let mut v = Value::Null;
+        for _ in 0..200 {
+            v = list(json!({"sort": "usage"})).await.unwrap();
+            if v[0]["usage"].is_object() && v[1]["usage"].is_object() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(ids(&v), ["01a", "01b", "01c"], "most turns first: {v}");
         assert_eq!(v[0]["usage"]["turns"], 3);
         assert_eq!(v[0]["usage"]["context_pct"], 1);
@@ -979,6 +994,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&v), ["01a", "01b", "01c"], "unknown stays last: {v}");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_never_read_a_whole_unread_transcript() {
+        use rlord_core::agents::transcript::{self, CursorState};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let line = |i: usize| {
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"p{i}\"}}}}\n"
+            )
+        };
+        let write = |name: &str, prompts: usize| {
+            let p = dir.path().join(format!("{name}.jsonl"));
+            std::fs::write(&p, (0..prompts).map(line).collect::<String>()).unwrap();
+            p
+        };
+        // a: never read. b: read before (a saved position, no longer in
+        // memory) up to its end; its saved totals say 7 turns.
+        let (a, b) = (write("a", 2), write("b", 3));
+        {
+            use std::os::unix::fs::MetadataExt;
+            let db = daemon.db.lock().unwrap();
+            for (id, t) in [("01a", &a), ("01b", &b)] {
+                db.insert_session(&rlord_core::db::NewSession {
+                    id,
+                    name: id,
+                    agent: "claude",
+                    agent_session: Some(id),
+                    project_path: "/tmp",
+                    tmux_session: None,
+                    launch_spec: "{}",
+                    created_at: 1,
+                    repo_path: None,
+                    workspace_path: None,
+                    branch: None,
+                    role: "",
+                })
+                .unwrap();
+                db.upsert_transcript_source(id, &t.to_string_lossy())
+                    .unwrap();
+            }
+            let meta = std::fs::metadata(&b).unwrap();
+            let saved = CursorState {
+                ino: meta.ino(),
+                offset: meta.len(),
+                turns: 7,
+                ..Default::default()
+            };
+            db.save_transcript_cursors(&[(b.clone(), saved)]).unwrap();
+        }
+        let listener = Daemon::bind(&sock).unwrap();
+        let server = tokio::spawn(daemon.clone().serve(listener));
+        let call = |method: &'static str, params: Value| {
+            let sock = sock.clone();
+            tokio::task::spawn_blocking(move || client_call(&sock, method, params).unwrap())
+        };
+        let v = call("session.list", json!({})).await.unwrap();
+        let row = |id: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        // Never read: not read by the list (no worker here to queue it on).
+        assert!(row("01a")["usage"].is_null(), "{v}");
+        assert_eq!(transcript::unread_bytes(&a), None, "the list read it");
+        // Read before: its saved totals, without reading it again.
+        assert_eq!(row("01b")["usage"]["turns"], 7, "{v}");
+        // One session's details may read a small unread transcript.
+        let one = call("session.get", json!({"ref": "01a"})).await.unwrap();
+        assert_eq!(one["usage"]["turns"], 2, "{one}");
         server.abort();
     }
 

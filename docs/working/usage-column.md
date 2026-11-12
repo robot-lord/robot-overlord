@@ -1,4 +1,4 @@
-**Status:** in progress (built on `usage-column`, 0.22.0-dev.2; PR open, not merged)
+**Status:** in progress (built on `usage-column`, 0.22.0-dev.2; PR #9 open, review fixes in)
 
 # Usage column
 
@@ -32,9 +32,30 @@ has, read cheaply, no model calls.
   message, the daemon re-sorts by the shown measure (pinned first, unknown
   last). The measure travels in `SessionQuery::usage`; default config
   `usage`.
-- **No stall.** A transcript rlord hasn't read, or one >4 MB behind, goes
-  to the warm-up worker (`Job::Usage`, once per run, so an unreadable file
-  can't loop); the row shows as loading meanwhile.
+- **No stall, no full read on a request.** A request reads only what was
+  appended, at most 4 MB. A read position evicted from memory is reloaded
+  from `transcript_cursors`. A transcript with no position, or >4 MB
+  behind, goes to the warm-up worker (`Job::Usage`, own pending set, not
+  `subagents_loading`); the row carries `usage_loading` (MCP: `"loading"`,
+  `rlord ls`/TUI: `…`). Re-queued after its job ends; a job that read
+  nothing marks it failed for the run, so an unreadable file can't loop.
+  `session.get` may read an unread transcript up to 4 MB itself.
+- **Recount without zeroing.** `subagents.counted` (migration 0008) is the
+  parse version a sub-agent's totals were counted with; existing rows get
+  0. The keep-the-larger upsert (and `warm::apply`'s `same` check) lets a
+  count from the agent's transcript replace an older-version one, even
+  when lower. The startup prune no longer touches `subagents` (one
+  transaction, set-based deletes); archived sessions are recounted lazily
+  when viewed. `--rescan` sets `counted = 0` instead of zeroing. No index
+  on `subagents.transcript_path`: nothing queries by it now.
+- **Claude oddities.** `<synthetic>` messages and zero-context ones don't
+  count (an API error no longer drops context % to 0).
+  `[Request interrupted by user…]` isn't a turn. A configured `[1m]` model
+  gives a 1M window even when the transcript names the model.
+- **Reverse.** SQL keeps most-recent-first for the usage sort either way;
+  only the usage order flips, so ties read the same in both directions.
+- **Toolbar** names the measure under the usage sort (`⇅ turns ▼`), since
+  the column can be hidden for width.
 - **Header click sorts, doesn't switch the measure.** Every other header
   click means "sort by this / reverse", so the Usage header does the same.
   Switching is `:usage turns|tokens|context`, config, or the overlord
@@ -54,3 +75,6 @@ has, read cheaply, no model calls.
 - The list refetches on daemon change notices (hooks), so tokens/context
   update at turn boundaries, not mid-turn.
 - Screenshots not retaken (demo now produces plausible numbers).
+- A list of more archived sessions than `STATS_CURSOR_CAP` (1000) reloads
+  evicted positions from the DB on each list (DB reads, no file reads).
+  Fine at current sizes; raise the cap or cache per list if it shows.

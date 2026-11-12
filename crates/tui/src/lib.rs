@@ -1432,6 +1432,8 @@ impl App {
                     let u = Usage::from_json(&s["usage"]);
                     let text = match &u {
                         Some(u) => u.cell(metric),
+                        // (The daemon's warm-up is reading it.)
+                        None if s["usage_loading"] == true => format!("{:>4}", "…"),
                         None => rlord_core::usage::cell(None, metric),
                     };
                     cells.push(Cell::from(format!(" {text}")).fg(if u.is_some() {

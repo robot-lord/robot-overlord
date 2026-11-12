@@ -1322,6 +1322,11 @@ fn ingest_subagent_hook(
     if agent_type.is_empty() && from_disk.is_none() && !db.subagent_exists(&agent_id)? {
         return Ok(()); // internal helper (title/suggestion generators)
     }
+    // Totals read from its transcript (whole, as `transcript_stats` keeps
+    // them) may replace ones counted by older logic.
+    let mut counted = from_disk
+        .as_ref()
+        .is_some_and(|a| a.transcript_path.is_some());
     let mut a = from_disk.unwrap_or(Subagent {
         agent_id: agent_id.clone(),
         session_id: session_id.to_string(),
@@ -1352,6 +1357,7 @@ fn ingest_subagent_hook(
                 if let Some(st) = transcript::transcript_stats(std::path::Path::new(tp)) {
                     a.input_tokens = st.input_tokens;
                     a.output_tokens = st.output_tokens;
+                    counted = true;
                 }
             }
             if let Some(r) = payload["last_assistant_message"].as_str() {
@@ -1359,7 +1365,11 @@ fn ingest_subagent_hook(
             }
         }
     }
-    db.upsert_subagent(&a)?;
+    if counted {
+        db.upsert_subagent_counted(&a)?;
+    } else {
+        db.upsert_subagent(&a)?;
+    }
     db.insert_event(
         session_id,
         now,

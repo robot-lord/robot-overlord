@@ -7,6 +7,7 @@
 //! appended) and `opencode::usage` for OpenCode (cached until its database
 //! changes). No model calls.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -155,23 +156,48 @@ pub fn of(path: &Path, configured: Option<&str>) -> Option<Usage> {
         Some((db, id)) => opencode::usage(db, id)?,
         None => transcript::transcript_stats(path)?,
     };
+    Some(from_stats(&st, configured))
+}
+
+/// `of` for several OpenCode conversations in one database `db` (a list's
+/// rows), over one connection: (conversation id, configured model) in,
+/// usage per conversation id out (those found).
+pub fn of_opencode(db: &Path, items: &[(&str, Option<&str>)]) -> HashMap<String, Usage> {
+    let ids: Vec<&str> = items.iter().map(|(id, _)| *id).collect();
+    let stats = opencode::usage_many(db, &ids);
+    items
+        .iter()
+        .filter_map(|(id, configured)| {
+            let st = stats.get(*id)?;
+            Some((id.to_string(), from_stats(st, *configured)))
+        })
+        .collect()
+}
+
+fn from_stats(st: &transcript::TranscriptStats, configured: Option<&str>) -> Usage {
+    // A configured `[1m]` model (`opus[1m]`) runs with a 1M window, which
+    // its transcript doesn't say: it names the model alone.
+    let one_m = configured.is_some_and(|m| m.trim().to_lowercase().ends_with("[1m]"));
     let mut window = st.window.or_else(|| {
+        if one_m {
+            return Some(1_000_000);
+        }
         st.model
             .as_deref()
             .and_then(context_window)
             .or_else(|| configured.and_then(context_window))
     });
-    // More context than a 200k window holds: a 1M-context variant (Claude
-    // names the model alone in its transcript, without the `[1m]`).
+    // More context than a 200k window holds: a 1M-context variant too
+    // (one switched to mid-session, say).
     if window == Some(200_000) && st.context > 200_000 {
         window = Some(1_000_000);
     }
-    Some(Usage {
+    Usage {
         turns: st.turns,
         tokens: st.tokens.max(0) as u64,
         context: st.context,
         window,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +295,10 @@ mod tests {
         assert_eq!(got.tokens, 2 * 115);
         assert_eq!(got.context, 2110);
         assert_eq!(got.window, Some(200_000));
+        // Launched as `opus[1m]`: a 1M window, though the transcript names
+        // only `claude-opus-5-5`.
+        assert_eq!(of(&p, Some("opus[1m]")).unwrap().window, Some(1_000_000));
+        assert_eq!(of(&p, Some("opus")).unwrap().window, Some(200_000));
         std::fs::write(&p, [text, a("m3", 300_000)].concat()).unwrap();
         let got = of(&p, None).unwrap();
         assert_eq!(got.window, Some(1_000_000));

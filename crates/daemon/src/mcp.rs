@@ -261,10 +261,15 @@ fn summarize(s: &Value) -> Value {
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
         "subagents_running": s["agents_running"],
-        // Turns, tokens, context % (null while unknown).
-        "usage": rlord_core::usage::Usage::from_json(&s["usage"]).map(|u| json!({
-            "turns": u.turns, "tokens": u.tokens, "context_pct": u.context_pct(),
-        })),
+        // Turns, tokens, context % (null while unknown; "loading" while
+        // rlord reads it).
+        "usage": match rlord_core::usage::Usage::from_json(&s["usage"]) {
+            Some(u) => json!({
+                "turns": u.turns, "tokens": u.tokens, "context_pct": u.context_pct(),
+            }),
+            None if s["usage_loading"] == true => json!("loading"),
+            None => Value::Null,
+        },
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
     });

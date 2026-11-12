@@ -2,22 +2,23 @@
 //! overlord's `list_sessions`), and the usage sort.
 //!
 //! Each row gets `usage` (turns, tokens, context, window, context_pct; null
-//! while unknown) from `rlord_core::usage::of`, read here without the DB
-//! lock. A transcript rlord hasn't read yet, or one far behind, is left to
-//! the warm-up worker (the row shows as loading) so a list never stalls on
-//! a first full read of a large file.
+//! while unknown) from `rlord_core::usage`, read here without the DB lock.
+//! A request never reads a whole large transcript: one rlord hasn't read
+//! (that it has no saved position for), or one far behind, is left to the
+//! warm-up worker, and the row says `usage_loading` meanwhile.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use rlord_core::agents::{opencode, transcript};
 use rlord_core::db::SortMode;
 use rlord_core::usage::{self, Usage, UsageMetric};
 
 use crate::{methods, Daemon};
 
-/// More than this left to read: the warm-up reads it, not the list.
+/// More than this left to read: the warm-up reads it, not the request.
 const READ_INLINE_MAX: u64 = 4 << 20;
 
 /// The metric a request asks for (`usage`), else the configured one.
@@ -28,52 +29,98 @@ pub fn metric(d: &Daemon, params: &Value) -> UsageMetric {
         .unwrap_or(d.config().usage)
 }
 
-/// Fill in each row's `usage`. Rows still `loading` (the warm-up) are
-/// left null. `inline`: read a transcript here even if rlord hasn't yet
-/// (one session's details), rather than queue it.
-pub fn annotate(d: &Daemon, rows: &mut [Value], loading: &HashSet<String>, inline: bool) {
+/// Fill in each row's `usage` (null while unknown; `usage_loading` while
+/// the warm-up reads it). Reads here are bounded: what was appended since
+/// the last read, at most `READ_INLINE_MAX`. `single`: one session's
+/// details, which may also read a transcript rlord hasn't read yet if it's
+/// no bigger than that.
+pub fn annotate(d: &Daemon, rows: &mut [Value], single: bool) {
     if rows.is_empty() {
         return;
     }
-    let sources: HashMap<String, String> = d
+    let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+    let sources: HashMap<String, PathBuf> = d
         .db()
-        .transcript_sources()
+        .transcript_sources_for(&ids)
         .unwrap_or_default()
         .into_iter()
+        .map(|(id, p)| (id, PathBuf::from(p)))
         .collect();
+    // Transcripts whose read position fell out of memory (or wasn't loaded
+    // at start): take the saved one, so only what's new is read.
+    let forgotten: Vec<&str> = sources
+        .values()
+        .filter(|p| opencode::locate(p).is_none() && transcript::unread_bytes(p).is_none())
+        .filter_map(|p| p.to_str())
+        .collect();
+    if !forgotten.is_empty() {
+        if let Ok(saved) = d.db().transcript_cursors_for(&forgotten) {
+            transcript::seed_cursors(saved);
+        }
+    }
+    let opencode = opencode_usage(rows, &sources);
+    let full_loading = d.warm.loading();
     for row in rows.iter_mut() {
         let id = row["id"].as_str().unwrap_or("").to_string();
         row["usage"] = Value::Null;
-        if loading.contains(&id) {
-            continue;
-        }
-        let Some(src) = sources.get(&id) else {
+        let Some(path) = sources.get(&id) else {
             continue;
         };
-        let path = Path::new(src);
-        // (No such file: nothing to read, nothing to queue.)
-        let unread = usage_unread(path);
-        let Some(unread) = unread else { continue };
-        if !inline && unread.is_none_or(|n| n > READ_INLINE_MAX) && d.warm.enqueue_usage(&id) {
-            row["loading"] = json!(true);
+        if opencode::locate(path).is_some() {
+            if let Some(u) = opencode.get(&id) {
+                row["usage"] = u.to_json();
+            }
             continue;
         }
-        if let Some(u) = usage::of(path, row["model"].as_str()) {
-            row["usage"] = u.to_json();
+        let Ok(meta) = std::fs::metadata(path) else {
+            // (No such file: nothing to read, nothing to queue.)
+            continue;
+        };
+        let cheap = match transcript::unread_bytes(path) {
+            Some(n) => n <= READ_INLINE_MAX,
+            // Never read: all of it.
+            None => single && meta.len() <= READ_INLINE_MAX,
+        };
+        if cheap {
+            if let Some(u) = usage::of(path, row["model"].as_str()) {
+                row["usage"] = u.to_json();
+            }
+        } else if full_loading.contains(&id) || d.warm.enqueue_usage(&id) {
+            // (A full load reads its usage too.)
+            row["usage_loading"] = json!(true);
         }
     }
     methods::save_cursors(&d.db());
 }
 
-/// Some(None): the transcript exists but rlord hasn't read it; Some(Some(n)):
-/// n bytes appended since it last did; None: there's no transcript.
-fn usage_unread(path: &Path) -> Option<Option<u64>> {
-    use rlord_core::agents::transcript;
-    match transcript::unread_bytes(path) {
-        Some(n) => Some(Some(n)),
-        None if path.is_file() => Some(None),
-        None => None,
+/// The OpenCode rows' usage: one connection per database.
+fn opencode_usage(rows: &[Value], sources: &HashMap<String, PathBuf>) -> HashMap<String, Usage> {
+    // Per database: (row id, (conversation id, configured model)).
+    type Rows<'a> = Vec<(&'a str, (&'a str, Option<&'a str>))>;
+    let mut by_db: HashMap<&Path, Rows> = HashMap::new();
+    for row in rows {
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        let Some((db, conv)) = sources.get(id).and_then(|p| opencode::locate(p)) else {
+            continue;
+        };
+        by_db
+            .entry(db)
+            .or_default()
+            .push((id, (conv, row["model"].as_str())));
     }
+    let mut out = HashMap::new();
+    for (db, items) in by_db {
+        let convs: Vec<(&str, Option<&str>)> = items.iter().map(|(_, c)| *c).collect();
+        let got = usage::of_opencode(db, &convs);
+        for (id, (conv, _)) in items {
+            if let Some(u) = got.get(conv) {
+                out.insert(id.to_string(), u.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Order rows by usage (`metric`), most first (`reverse`: least first);
@@ -96,8 +143,8 @@ pub fn sort(rows: &mut [Value], metric: UsageMetric, reverse: bool) {
 }
 
 /// `session.list`'s rows: usage on each, sorted by it when asked.
-pub fn list(d: &Daemon, params: &Value, rows: &mut [Value], loading: &HashSet<String>) {
-    annotate(d, rows, loading, false);
+pub fn list(d: &Daemon, params: &Value, rows: &mut [Value]) {
+    annotate(d, rows, false);
     let sort = params["sort"].as_str().and_then(SortMode::parse);
     if sort == Some(SortMode::Usage) {
         let reverse = params["reverse"].as_bool().unwrap_or(false);

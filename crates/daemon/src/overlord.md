@@ -56,7 +56,8 @@ you've sat idle a while (the user may also clear you). So:
   sub-agent list is still being loaded: don't draw conclusions from it yet.
   `usage` is how much a session has used: `turns` (prompts the user
   typed), `tokens`, `context_pct` (how full its context window is; null
-  when unknown). "Which sessions are biggest / nearly full?": sort by
+  when unknown; `"loading"` while rlord reads it: ask again shortly).
+  "Which sessions are biggest / nearly full?": sort by
   `usage` with the measure asked about; don't read transcripts for it.
 - `get_ui_state` — what the user is looking at: their current list view
   (tab/filter/sort), the default view, and which session their terminal shows.

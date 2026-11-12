@@ -830,11 +830,18 @@ pub fn context_tokens(db: &Path, id: &str) -> u64 {
 
 /// The Usage column's numbers for a conversation: prompts typed (its
 /// `user` rows), tokens (the session row's input and output totals), the
-/// latest request's context and model. Three indexed look-ups, only in
-/// `session_v2` and `session_message`; the answer is kept until the
-/// database or its write-ahead log changes (size or time), so a list that
-/// asks again and again costs a `stat`. None: no such session (yet).
+/// latest request's context and model. None: no such session (yet). See
+/// `usage_many`.
 pub fn usage(db: &Path, id: &str) -> Option<TranscriptStats> {
+    usage_many(db, &[id]).remove(id)
+}
+
+/// `usage` for several conversations in one database (a list's rows):
+/// three indexed look-ups each, only in `session_v2` and
+/// `session_message`, over one connection. Answers are kept until the
+/// database or its write-ahead log changes (size or time), so a list that
+/// asks again and again costs a `stat`. Sessions not there are left out.
+pub fn usage_many(db: &Path, ids: &[&str]) -> std::collections::HashMap<String, TranscriptStats> {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     type Stamp = [(u64, Option<SystemTime>); 2];
@@ -848,59 +855,76 @@ pub fn usage(db: &Path, id: &str) -> Option<TranscriptStats> {
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
     let stamp: Stamp = [stamp_of(db), stamp_of(Path::new(&wal))];
-    let key = format!("{}/{id}", db.display());
-    if let Some((s, st)) = CACHE.lock().ok()?.get(&key) {
-        if *s == stamp {
-            return Some(st.clone());
+    let key = |id: &str| format!("{}/{id}", db.display());
+    let mut out = HashMap::new();
+    let mut missed = Vec::new();
+    if let Ok(cache) = CACHE.lock() {
+        for id in ids {
+            match cache.get(&key(id)) {
+                Some((s, st)) if *s == stamp => {
+                    out.insert(id.to_string(), st.clone());
+                }
+                _ => missed.push(*id),
+            }
         }
     }
-    let c = open(db)?;
-    let (input, output): (i64, i64) = c
-        .query_row(
+    if missed.is_empty() {
+        return out;
+    }
+    let Some(c) = open(db) else { return out };
+    let mut fresh = Vec::new();
+    for id in missed {
+        let Ok((input, output)) = c.query_row(
             "SELECT tokens_input, tokens_output FROM session_v2 WHERE id = ?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()?;
-    let turns: i64 = c
-        .query_row(
-            "SELECT COUNT(*) FROM session_message WHERE session_id = ?1 AND type = 'user'",
-            [id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let last = one_data(
-        &c,
-        "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'assistant' \
-         ORDER BY seq DESC LIMIT 1",
-        id,
-    );
-    let st = TranscriptStats {
-        input_tokens: input,
-        output_tokens: output,
-        turns: turns.max(0) as u64,
-        tokens: input + output,
-        context: last
-            .as_ref()
-            .map(|v| {
-                let t = &v["tokens"];
-                [&t["input"], &t["cache"]["read"], &t["cache"]["write"]]
-                    .iter()
-                    .filter_map(|n| n.as_u64())
-                    .sum()
-            })
-            .unwrap_or(0),
-        model: last.as_ref().and_then(|v| model_name(&v["model"])),
-        ..Default::default()
-    };
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) else {
+            continue;
+        };
+        let turns: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM session_message WHERE session_id = ?1 AND type = 'user'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let last = one_data(
+            &c,
+            "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'assistant' \
+             ORDER BY seq DESC LIMIT 1",
+            id,
+        );
+        let st = TranscriptStats {
+            input_tokens: input,
+            output_tokens: output,
+            turns: turns.max(0) as u64,
+            tokens: input + output,
+            context: last
+                .as_ref()
+                .map(|v| {
+                    let t = &v["tokens"];
+                    [&t["input"], &t["cache"]["read"], &t["cache"]["write"]]
+                        .iter()
+                        .filter_map(|n| n.as_u64())
+                        .sum()
+                })
+                .unwrap_or(0),
+            model: last.as_ref().and_then(|v| model_name(&v["model"])),
+            ..Default::default()
+        };
+        fresh.push((id, st));
+    }
     if let Ok(mut cache) = CACHE.lock() {
         // (Bounded: one entry per OpenCode session rlord has listed.)
-        if cache.len() > 1000 {
+        if cache.len() + fresh.len() > 1000 {
             cache.clear();
         }
-        cache.insert(key, (stamp, st.clone()));
+        for (id, st) in &fresh {
+            cache.insert(key(id), (stamp, st.clone()));
+        }
     }
-    Some(st)
+    out.extend(fresh.into_iter().map(|(id, st)| (id.to_string(), st)));
+    out
 }
 
 /// The model of the latest turn (`provider/model`); before any, the one
@@ -1396,7 +1420,10 @@ pub(crate) mod tests {
         );
         assert_eq!(u.window, None);
         // Asked again with nothing changed: the cached answer.
-        assert_eq!(crate::usage::of(&db.join(SES), None), Some(u));
+        assert_eq!(crate::usage::of(&db.join(SES), None), Some(u.clone()));
+        // A list's rows: one connection; sessions not there are left out.
+        let many = crate::usage::of_opencode(&db, &[(SES, None), ("ses_none", None)]);
+        assert_eq!((many.get(SES), many.len()), (Some(&u), 1));
         assert_eq!(
             (exists(&db, SES), exists(&db, "ses_none")),
             (Some(true), Some(false))
