@@ -81,7 +81,7 @@ session from last week decide? rlord is built around a few ideas:
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ayersb/robot-overlord/main/scripts/get.sh | sh
+curl -fsSL https://raw.githubusercontent.com/robot-lord/robot-overlord/main/scripts/get.sh | sh
 ```
 
 This installs the latest release for your machine to `~/.local/bin/rlord`
@@ -92,8 +92,8 @@ This installs the latest release for your machine to `~/.local/bin/rlord`
 
 | | |
 |---|---|
-| Homebrew (macOS, Linux) | `brew install ayersb/tap/rlord` |
-| Debian, Ubuntu | `sudo apt install ./rlord_<version>_<arch>.deb` from [releases](https://github.com/ayersb/robot-overlord/releases) |
+| Homebrew (macOS, Linux) | `brew install robot-lord/tap/rlord` |
+| Debian, Ubuntu | `sudo apt install ./rlord_<version>_<arch>.deb` from [releases](https://github.com/robot-lord/robot-overlord/releases) |
 | Fedora, RHEL, Amazon Linux | `sudo dnf install ./rlord-<version>.<arch>.rpm` from releases |
 | Cargo | `cargo install robot-overlord` |
 | From source | `cargo build --release`, then put `target/release/rlord` on your PATH |
