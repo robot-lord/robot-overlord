@@ -434,7 +434,11 @@ pub fn list_clients() -> Vec<Client> {
 /// rlord (its home session or an rlord session), else the most recently
 /// active client at all.
 pub fn user_client<'a>(clients: &'a [Client], home: Option<&str>) -> Option<&'a Client> {
-    let ours = |c: &&Client| Some(c.session.as_str()) == home || c.session.starts_with("rlord");
+    let ours = |c: &&Client| {
+        Some(c.session.as_str()) == home
+            || c.session.ends_with("-rlord")
+            || c.session.starts_with("rlord")
+    };
     clients
         .iter()
         .filter(ours)

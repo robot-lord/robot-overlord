@@ -552,8 +552,13 @@ pub fn start(d: &std::sync::Arc<Daemon>) {
         let mut last_ensure: Option<Instant> = None;
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                move_front_desk_remote(&d)?;
-                keep_mastermind_up(&d, &mut last_ensure)?;
+                // Each step on its own: one failing never stalls the rest.
+                if let Err(e) = move_front_desk_remote(&d) {
+                    tracing::warn!(error = %e, "remote control: moving the front desk's");
+                }
+                if let Err(e) = keep_mastermind_up(&d, &mut last_ensure) {
+                    tracing::warn!(error = %e, "remote control: starting the mastermind");
+                }
                 pass(&d).map(|_| ())
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("panicked")));
@@ -568,15 +573,19 @@ pub fn start(d: &std::sync::Arc<Daemon>) {
 /// An overlord set up when Remote Control lived on the front desk: move it
 /// to the mastermind (the front desk is turned off once it's idle).
 fn move_front_desk_remote(d: &Daemon) -> Result<()> {
-    let front = overlord::FRONT.session(&d.db())?;
-    let on = match &front {
-        Some(f) => wanted(&d.db(), &f.id)?.is_some(),
-        None => false,
+    let Some(front) = overlord::FRONT.session(&d.db())? else {
+        return Ok(());
     };
-    if on {
-        tracing::info!("moving the overlord's Remote Control to the mastermind");
-        set(d, &json!({"seat": "overlord", "on": true, "wait": false}))?;
+    if wanted(&d.db(), &front.id)?.is_none() {
+        return Ok(());
     }
+    tracing::info!("moving the overlord's Remote Control to the mastermind");
+    // The choice moves to the mastermind whatever happens next, and the
+    // front desk's wish goes (so this runs once, not every tick).
+    d.db().kv_set(MASTERMIND_REMOTE, "1")?;
+    set_wanted(&d.db(), &front, false)?;
+    // Its running link (if any) drops when it next restarts idle.
+    enqueue(d, &front.id);
     Ok(())
 }
 
@@ -654,9 +663,14 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         .context("missing 'on' (true or false)")?;
     // `seat` (overlord / mastermind) names a seat unambiguously.
     let s = match params["seat"].as_str() {
-        Some(seat) => overlord::seat(seat)
-            .session(&d.db())?
-            .context("no overlord yet")?,
+        // (The mastermind may not have started yet: either seat will do,
+        // both lead to it below.)
+        Some(seat) => match overlord::seat(seat).session(&d.db())? {
+            Some(s) => s,
+            None => overlord::FRONT
+                .session(&d.db())?
+                .context("no overlord yet")?,
+        },
         None => d
             .db()
             .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?,
@@ -685,6 +699,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     // The overlord's Remote Control lives on the mastermind (the front desk
     // stays fast; the mastermind is kept running for it). Asked for either
     // seat, it's the mastermind's; the front desk is always turned off.
+    let mut started_now = false;
     let (s, mut targets) = if seats {
         d.db()
             .kv_set(MASTERMIND_REMOTE, if on { "1" } else { "0" })?;
@@ -693,6 +708,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             // Not started yet: start it now (with the flag, from the kv).
             None if on => {
                 overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))?;
+                started_now = true;
                 overlord::MASTERMIND
                     .session(&d.db())?
                     .context("the mastermind didn't start")?
@@ -755,6 +771,10 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     let mut deferred = Vec::new();
     for (t, on) in &targets {
         let (t, on) = (t, *on);
+        // Just launched with the flag: nothing to restart.
+        if started_now && t.role == overlord::MASTERMIND.key {
+            continue;
+        }
         let before = wanted(&d.db(), &t.id)?;
         let connected = lv(t).is_some_and(|l| l.bridge.is_some());
         // Already as asked: nothing to restart. Off is still recorded (a

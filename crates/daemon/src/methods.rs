@@ -559,8 +559,12 @@ pub(crate) fn import_candidate(
 fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
     // own check still catches.
+    // The seats' fixed names are reserved, even before the seats exist.
+    let reserved =
+        |n: &str| n == crate::overlord::FRONT.tmux || n == crate::overlord::MASTERMIND.tmux;
     rlord_core::names::tmux_name_for(name, |n| {
-        Some(n) != own && (db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
+        Some(n) != own
+            && (reserved(n) || db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
     })
 }
 
@@ -608,7 +612,11 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
         include_overlord: true,
         ..Default::default()
     })?;
-    for s in all {
+    // The seats first: their fixed names must never be taken by another.
+    let (seats, rest): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|s| crate::overlord::is_overlord_role(&s.role));
+    for s in seats.into_iter().chain(rest) {
         if let Err(e) = sync_tmux_name(db, &s) {
             tracing::warn!(session = %s.id, error = %e, "renaming tmux session");
         }
