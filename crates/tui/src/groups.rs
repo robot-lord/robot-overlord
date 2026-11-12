@@ -351,7 +351,13 @@ impl App {
             bar.push((Span::styled("⇅ ", theme::muted()), sort.clone()));
             bar.push((
                 Span::styled(
-                    format!("{} ", self.sort.title()),
+                    // (The usage sort names its measure: the Usage
+                    // column, which would say, may be hidden for width.)
+                    if self.sort == SortMode::Usage {
+                        format!("{} ", self.usage.title())
+                    } else {
+                        format!("{} ", self.sort.title())
+                    },
                     Style::default().fg(theme::text()),
                 ),
                 sort,

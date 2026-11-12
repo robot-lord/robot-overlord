@@ -201,7 +201,13 @@ pub(crate) fn human_prompt(v: &Value) -> Option<String> {
         _ => return None,
     };
     let t = text.trim();
-    (!t.is_empty() && !t.starts_with('<') && !t.starts_with("Caveat:")).then(|| t.to_string())
+    // (`[Request interrupted by user]`, `… for tool use]`: Claude writes
+    // these when the user presses Esc; they're not prompts.)
+    (!t.is_empty()
+        && !t.starts_with('<')
+        && !t.starts_with("Caveat:")
+        && !t.starts_with("[Request interrupted by user"))
+    .then(|| t.to_string())
 }
 
 pub(crate) fn reply_text(v: &Value) -> Option<String> {
@@ -299,20 +305,32 @@ pub(crate) fn last_prompt(v: &Value) -> Option<&str> {
 }
 
 /// One request's usage; its context is everything it sent, cached or not.
+/// None for messages Claude Code made up itself (`"model":"<synthetic>"`,
+/// e.g. an API error shown as a reply) and any that sent no context: their
+/// zeros aren't a request, and would drop context % to 0.
 pub(crate) fn usage(v: &Value) -> Option<Usage> {
+    if v["message"]["model"] == "<synthetic>" {
+        return None;
+    }
     let u = v["message"]["usage"].as_object()?;
     let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let context: u64 = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+    .sum();
+    if context == 0 {
+        return None;
+    }
     Some(Usage {
         input: n("input_tokens"),
         output: n("output_tokens"),
-        context: [
-            "input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ]
-        .iter()
-        .filter_map(|k| u.get(*k).and_then(Value::as_u64))
-        .sum(),
+        context,
+        fresh: n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens"),
+        window: None,
         cumulative: false,
     })
 }
@@ -391,6 +409,21 @@ pub fn scan_subagents_where(
     parent_running: bool,
     want: &dyn Fn(&str) -> bool,
 ) -> Vec<Subagent> {
+    scan_subagents_read(session_id, transcript_path, parent_running, want)
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect()
+}
+
+/// `scan_subagents_where`, saying for each agent whether its transcript
+/// was read (its token totals are a count from it; false: they're zeros
+/// because it couldn't be, and mustn't replace anything).
+pub fn scan_subagents_read(
+    session_id: &str,
+    transcript_path: &str,
+    parent_running: bool,
+    want: &dyn Fn(&str) -> bool,
+) -> Vec<(Subagent, bool)> {
     let dir = subagents_dir(transcript_path);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
@@ -415,7 +448,9 @@ pub fn scan_subagents_where(
             continue;
         };
         let jsonl = dir.join(format!("agent-{id}.jsonl"));
-        let stats = transcript_stats(&jsonl).unwrap_or_default();
+        let read = transcript_stats(&jsonl);
+        let counted = read.is_some();
+        let stats = read.unwrap_or_default();
         // Claude doesn't always mark an agent finished (older versions,
         // agents cut off when the session ended), so also: its last turn is
         // a final reply, or its transcript has gone quiet.
@@ -425,25 +460,28 @@ pub fn scan_subagents_where(
             .is_some_and(|d| d > AGENT_QUIET);
         let finished =
             meta["finished"].as_bool().unwrap_or(false) || stats.ended || quiet || !parent_running;
-        out.push(Subagent {
-            agent_id: id.to_string(),
-            session_id: session_id.to_string(),
-            agent_type: meta["agentType"].as_str().unwrap_or("").to_string(),
-            description: meta["description"].as_str().unwrap_or("").to_string(),
-            tool_use_id: meta["toolUseId"].as_str().map(str::to_string),
-            spawn_depth: meta["spawnDepth"].as_i64().unwrap_or(1),
-            background: meta["requestShape"].as_str() == Some("background"),
-            started_at: stats.first,
-            finished_at: if finished {
-                stats.last.or(stats.first)
-            } else {
-                None
+        out.push((
+            Subagent {
+                agent_id: id.to_string(),
+                session_id: session_id.to_string(),
+                agent_type: meta["agentType"].as_str().unwrap_or("").to_string(),
+                description: meta["description"].as_str().unwrap_or("").to_string(),
+                tool_use_id: meta["toolUseId"].as_str().map(str::to_string),
+                spawn_depth: meta["spawnDepth"].as_i64().unwrap_or(1),
+                background: meta["requestShape"].as_str() == Some("background"),
+                started_at: stats.first,
+                finished_at: if finished {
+                    stats.last.or(stats.first)
+                } else {
+                    None
+                },
+                transcript_path: jsonl.exists().then(|| jsonl.to_string_lossy().into_owned()),
+                result: String::new(),
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
             },
-            transcript_path: jsonl.exists().then(|| jsonl.to_string_lossy().into_owned()),
-            result: String::new(),
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
-        });
+            counted,
+        ));
     }
     out
 }
@@ -451,6 +489,39 @@ pub fn scan_subagents_where(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn interruptions_are_not_prompts() {
+        let user = |c: Value| json!({"type": "user", "message": {"role": "user", "content": c}});
+        assert_eq!(
+            human_prompt(&user(json!("fix it"))).as_deref(),
+            Some("fix it")
+        );
+        assert_eq!(
+            human_prompt(&user(json!("[Request interrupted by user]"))),
+            None
+        );
+        assert_eq!(
+            human_prompt(&user(json!([
+                {"type": "text", "text": "[Request interrupted by user for tool use]"}
+            ]))),
+            None
+        );
+    }
+
+    #[test]
+    fn synthetic_and_empty_messages_carry_no_usage() {
+        let msg = |model: &str, input: u64, cached: u64| {
+            json!({"type": "assistant", "message": {"id": "m", "model": model,
+                "usage": {"input_tokens": input, "cache_read_input_tokens": cached,
+                          "output_tokens": 0}}})
+        };
+        assert_eq!(usage(&msg("claude-opus-5-5", 1, 500)).unwrap().context, 501);
+        // An API error Claude Code shows as a reply: zeros, not a request.
+        assert!(usage(&msg("<synthetic>", 0, 0)).is_none());
+        assert!(usage(&msg("claude-opus-5-5", 0, 0)).is_none());
+    }
 
     #[test]
     fn slug_matches_observed_claude_encoding() {
@@ -486,7 +557,6 @@ mod tests {
 
     #[test]
     fn needs_you_is_a_block_mid_turn_not_an_idle_reminder() {
-        use serde_json::json;
         let note = |ty: &str| map_hook_event("Notification", &json!({"notification_type": ty})).1;
         assert_eq!(note("permission_prompt"), Effect::Set(Status::WaitingInput));
         assert_eq!(

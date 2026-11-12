@@ -448,6 +448,12 @@ impl App {
         if let Some(r) = v["reverse"].as_bool() {
             self.reverse = r;
         }
+        if let Some(m) = v["usage"]
+            .as_str()
+            .and_then(rlord_core::usage::UsageMetric::parse)
+        {
+            self.usage = m;
+        }
         if let Some(a) = v["archived"].as_str() {
             self.show_archived = a == "only";
         }
@@ -472,6 +478,7 @@ impl App {
             "query": self.filter,
             "sort": self.sort.label(),
             "reverse": self.reverse,
+            "usage": self.usage.label(),
             "archived": if self.show_archived { "only" } else { "live" },
             "tab": self.tab.label(),
             "group": if self.tab == Tab::Groups { json!(self.group_sel) } else { Value::Null },

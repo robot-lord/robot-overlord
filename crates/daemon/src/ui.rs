@@ -17,6 +17,7 @@ use rlord_core::config::expand_tilde;
 use rlord_core::db::{ArchivedMode, SessionQuery, SortMode};
 use rlord_core::tmux;
 use rlord_core::types::Status;
+use rlord_core::usage::UsageMetric;
 
 use crate::{methods, overlord, Daemon};
 
@@ -30,6 +31,9 @@ fn normalize_view(v: &Value) -> Value {
         "query": v.get("query").and_then(Value::as_str).unwrap_or(""),
         "sort": v.get("sort").and_then(Value::as_str).unwrap_or("updated"),
         "reverse": v.get("reverse").and_then(Value::as_bool).unwrap_or(false),
+        // What the Usage column shows; null: the configured `usage`.
+        "usage": v.get("usage").and_then(Value::as_str)
+            .and_then(UsageMetric::parse).map(UsageMetric::label),
         "archived": v.get("archived").and_then(Value::as_str).unwrap_or("live"),
         // "sessions" (the flat list) or "groups" (sessions by tag).
         "tab": match v.get("tab").and_then(Value::as_str) {
@@ -303,9 +307,15 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
         obj.insert("query".into(), json!(q.trim()));
     }
     if let Some(sort) = params.get("sort").and_then(Value::as_str) {
-        let m = SortMode::parse(sort)
-            .with_context(|| format!("unknown sort '{sort}' (updated|user|state|created|name)"))?;
+        let m = SortMode::parse(sort).with_context(|| {
+            format!("unknown sort '{sort}' (updated|user|state|created|name|usage)")
+        })?;
         obj.insert("sort".into(), json!(m.label()));
+    }
+    if let Some(u) = params.get("usage").and_then(Value::as_str) {
+        let m = UsageMetric::parse(u)
+            .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?;
+        obj.insert("usage".into(), json!(m.label()));
     }
     if let Some(r) = params.get("reverse").and_then(Value::as_bool) {
         obj.insert("reverse".into(), json!(r));

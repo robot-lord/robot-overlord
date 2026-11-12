@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_overlord.sql"),
     include_str!("../migrations/0006_transcript_cursors.sql"),
     include_str!("../migrations/0007_summary.sql"),
+    include_str!("../migrations/0008_usage.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
@@ -77,6 +78,10 @@ pub enum SortMode {
     State,
     Created,
     Name,
+    /// Most used first, by what the Usage column shows (turns, tokens or
+    /// context %; `SessionQuery::usage`). Not SQL: the daemon sorts the
+    /// rows once their usage is read (`rlord_daemon::usage`).
+    Usage,
 }
 
 impl SortMode {
@@ -89,6 +94,7 @@ impl SortMode {
             "state" | "status" | "changed" | "status-change" | "status_change" => SortMode::State,
             "created" | "age" => SortMode::Created,
             "name" => SortMode::Name,
+            "usage" | "use" | "used" => SortMode::Usage,
             _ => return None,
         })
     }
@@ -100,6 +106,7 @@ impl SortMode {
             SortMode::State => "status change",
             SortMode::Created => "created",
             SortMode::Name => "name",
+            SortMode::Usage => "usage",
         }
     }
 
@@ -111,6 +118,7 @@ impl SortMode {
             SortMode::State => "state",
             SortMode::Created => "created",
             SortMode::Name => "name",
+            SortMode::Usage => "usage",
         }
     }
     pub fn next(self) -> Self {
@@ -119,7 +127,8 @@ impl SortMode {
             SortMode::User => SortMode::State,
             SortMode::State => SortMode::Created,
             SortMode::Created => SortMode::Name,
-            SortMode::Name => SortMode::Activity,
+            SortMode::Name => SortMode::Usage,
+            SortMode::Usage => SortMode::Activity,
         }
     }
 }
@@ -143,6 +152,9 @@ pub struct SessionQuery {
     pub search: Option<String>,
     pub sort: SortMode,
     pub reverse: bool,
+    /// What the usage sort sorts by (and the rows' Usage column shows);
+    /// None: the configured `usage`.
+    pub usage: Option<crate::usage::UsageMetric>,
     /// Include the overlord session (excluded by default: clients show it
     /// as a special row, not as one of the fleet).
     pub include_overlord: bool,
@@ -472,7 +484,9 @@ impl Db {
         let (expr, natural) = match q.sort {
             // Messages only: a resume or an idle notification changes the
             // state (the State sort), not the conversation.
-            SortMode::Activity => (
+            // (Usage: in this order until the daemon sorts by usage, which
+            // keeps it among equals, reversed or not.)
+            SortMode::Activity | SortMode::Usage => (
                 "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
                  COALESCE(last_user_msg_at, 0))",
                 "DESC",
@@ -482,7 +496,10 @@ impl Db {
             SortMode::Created => ("created_at", "DESC"),
             SortMode::Name => ("name COLLATE NOCASE", "ASC"),
         };
-        let dir = match (natural, q.reverse) {
+        // (Usage: the daemon reverses the usage order; equals stay most
+        // recent first either way.)
+        let reverse = q.reverse && q.sort != SortMode::Usage;
+        let dir = match (natural, reverse) {
             ("DESC", false) | ("ASC", true) => "DESC",
             _ => "ASC",
         };
@@ -643,23 +660,11 @@ impl Db {
     /// parse version.
     pub fn transcript_cursors(&self, limit: usize) -> Result<Vec<(PathBuf, CursorState)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended \
+            "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
+                    turns, tokens, context, window, model \
              FROM transcript_cursors WHERE version = ?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![STATS_PARSE_VERSION, limit as i64], |r| {
-            Ok((
-                PathBuf::from(r.get::<_, String>(0)?),
-                CursorState {
-                    ino: r.get::<_, i64>(1)? as u64,
-                    offset: r.get::<_, i64>(2)? as u64,
-                    input_tokens: r.get(3)?,
-                    output_tokens: r.get(4)?,
-                    first: r.get(5)?,
-                    last: r.get(6)?,
-                    ended: r.get::<_, i64>(7)? != 0,
-                },
-            ))
-        })?;
+        let rows = stmt.query_map(params![STATS_PARSE_VERSION, limit as i64], cursor_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -674,8 +679,8 @@ impl Db {
             tx.execute(
                 "INSERT OR REPLACE INTO transcript_cursors \
                    (path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
-                    version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    version, turns, tokens, context, window, model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     p.to_string_lossy(),
                     c.ino as i64,
@@ -685,7 +690,12 @@ impl Db {
                     c.first,
                     c.last,
                     c.ended as i64,
-                    STATS_PARSE_VERSION
+                    STATS_PARSE_VERSION,
+                    c.turns as i64,
+                    c.tokens,
+                    c.context as i64,
+                    c.window.map(|w| w as i64),
+                    c.model
                 ],
             )?;
         }
@@ -693,63 +703,68 @@ impl Db {
         Ok(())
     }
 
-    /// Startup upkeep: drop positions from older counting logic (their
-    /// sub-agents get recounted), for transcripts that are gone, and past
-    /// the newest `keep`. Returns how many rows went.
+    /// Startup upkeep: drop positions from older counting logic, for
+    /// transcripts that are gone, and past the newest `keep`. Returns how
+    /// many rows went. One transaction, set-based but for the file checks.
+    /// (Sub-agent totals counted by older logic aren't touched: their
+    /// `counted` marks them, and the next count from the transcript
+    /// overwrites them; an archived session's when it is next viewed.)
     pub fn prune_transcript_cursors(&self, keep: usize) -> Result<usize> {
-        let rows: Vec<(String, i64)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT path, version FROM transcript_cursors")?;
-            let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut gone = tx.execute(
+            "DELETE FROM transcript_cursors WHERE version != ?1",
+            [STATS_PARSE_VERSION],
+        )?;
+        let paths: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT path FROM transcript_cursors")?;
+            let it = stmt.query_map([], |r| r.get(0))?;
             it.collect::<std::result::Result<_, _>>()?
         };
-        let mut gone = 0;
-        for (path, version) in rows {
-            let exists = Path::new(&path).exists();
-            if version != STATS_PARSE_VERSION && exists {
-                self.recount_from(&path)?;
-            }
-            if version != STATS_PARSE_VERSION || !exists {
-                gone += self
-                    .conn
-                    .execute("DELETE FROM transcript_cursors WHERE path = ?1", [&path])?;
+        {
+            let mut del = tx.prepare("DELETE FROM transcript_cursors WHERE path = ?1")?;
+            for p in paths.iter().filter(|p| !Path::new(p).exists()) {
+                gone += del.execute([p])?;
             }
         }
-        gone += self.conn.execute(
+        gone += tx.execute(
             "DELETE FROM transcript_cursors WHERE rowid NOT IN \
              (SELECT rowid FROM transcript_cursors ORDER BY rowid DESC LIMIT ?1)",
             [keep as i64],
         )?;
+        tx.commit()?;
         Ok(gone)
     }
 
-    /// Zero a sub-agent's token totals so the next read of its transcript
-    /// (from the start) sets them (the upsert keeps the larger value).
-    fn recount_from(&self, transcript: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE subagents SET input_tokens = 0, output_tokens = 0 WHERE transcript_path = ?1",
-            [transcript],
-        )?;
+    /// Forget all read positions, and mark every sub-agent's token totals
+    /// for a recount: the next read of its transcript (from the start)
+    /// overwrites them (`rlord reset --rescan`). Totals of agents whose
+    /// transcript is gone stay as they are (nothing to recount them from).
+    pub fn clear_transcript_cursors(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE subagents SET counted = 0", [])?;
+        tx.execute("DELETE FROM transcript_cursors", [])?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Forget all read positions, and zero token totals of sub-agents whose
-    /// transcript still exists, so they're recounted (`rlord reset
-    /// --rescan`). Totals of agents whose transcript is gone are kept.
-    pub fn clear_transcript_cursors(&self) -> Result<()> {
-        let paths: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT transcript_path FROM subagents WHERE transcript_path IS NOT NULL",
-            )?;
-            let it = stmt.query_map([], |r| r.get(0))?;
-            it.collect::<std::result::Result<_, _>>()?
-        };
-        for p in paths.iter().filter(|p| Path::new(p).exists()) {
-            self.recount_from(p)?;
+    /// Saved positions (current parse version) of these transcripts, to
+    /// read forward from when one fell out of memory (`seed_cursors`).
+    pub fn transcript_cursors_for(&self, paths: &[&str]) -> Result<Vec<(PathBuf, CursorState)>> {
+        let mut out = Vec::new();
+        for chunk in paths.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
+                        turns, tokens, context, window, model \
+                 FROM transcript_cursors WHERE version = {STATS_PARSE_VERSION} \
+                   AND path IN ({marks})"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), cursor_row)?;
+            for r in rows {
+                out.push(r?);
+            }
         }
-        self.conn.execute("DELETE FROM transcript_cursors", [])?;
-        Ok(())
+        Ok(out)
     }
 
     /// The user's favourite groups, in their order (top of the group list).
@@ -972,12 +987,32 @@ impl Db {
 
     /// Insert or update a sub-agent; only provided (Some / non-empty) fields
     /// overwrite, so hook and disk sources can each contribute what they know.
+    /// Token totals keep the larger value (a transcript that went or was
+    /// cut short doesn't lower them), except over a count from older
+    /// counting logic (`upsert_subagent_counted`).
     pub fn upsert_subagent(&self, a: &Subagent) -> Result<()> {
+        self.upsert_subagent_as(a, 0)
+    }
+
+    /// `upsert_subagent` for totals counted from the agent's transcript
+    /// (`a.transcript_path`) by the current `transcript_stats`: they replace
+    /// totals counted by an older parse version, even when lower (a recount
+    /// after a counting fix). Without a transcript path, as `upsert_subagent`.
+    pub fn upsert_subagent_counted(&self, a: &Subagent) -> Result<()> {
+        self.upsert_subagent_as(a, STATS_PARSE_VERSION)
+    }
+
+    fn upsert_subagent_as(&self, a: &Subagent, counted: i64) -> Result<()> {
+        let counted = if a.transcript_path.is_some() {
+            counted
+        } else {
+            0
+        };
         self.conn.execute(
             "INSERT INTO subagents (agent_id, session_id, agent_type, description, tool_use_id, \
                                     spawn_depth, background, started_at, finished_at, \
-                                    transcript_path, result, input_tokens, output_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                                    transcript_path, result, input_tokens, output_tokens, counted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
              ON CONFLICT(agent_id) DO UPDATE SET \
                agent_type = CASE WHEN excluded.agent_type != '' THEN excluded.agent_type ELSE agent_type END, \
                description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END, \
@@ -992,8 +1027,11 @@ impl Db {
                  ELSE finished_at END, \
                transcript_path = COALESCE(excluded.transcript_path, transcript_path), \
                result = CASE WHEN excluded.result != '' THEN excluded.result ELSE result END, \
-               input_tokens = MAX(input_tokens, excluded.input_tokens), \
-               output_tokens = MAX(output_tokens, excluded.output_tokens)",
+               input_tokens = CASE WHEN excluded.counted > counted THEN excluded.input_tokens \
+                 ELSE MAX(input_tokens, excluded.input_tokens) END, \
+               output_tokens = CASE WHEN excluded.counted > counted THEN excluded.output_tokens \
+                 ELSE MAX(output_tokens, excluded.output_tokens) END, \
+               counted = MAX(counted, excluded.counted)",
             params![
                 a.agent_id,
                 a.session_id,
@@ -1007,10 +1045,24 @@ impl Db {
                 a.transcript_path,
                 a.result,
                 a.input_tokens,
-                a.output_tokens
+                a.output_tokens,
+                counted
             ],
         )?;
         Ok(())
+    }
+
+    /// A session's sub-agents whose token totals weren't counted by the
+    /// current parse version (a recount may lower them).
+    pub fn subagents_to_recount(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT agent_id FROM subagents WHERE session_id = ?1 AND counted < ?2")?;
+        let rows = stmt.query_map(params![session_id, STATS_PARSE_VERSION], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn subagents(&self, session_id: &str) -> Result<Vec<Subagent>> {
@@ -1152,6 +1204,22 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// These sessions' transcript files (session id, path).
+    pub fn transcript_sources_for(&self, ids: &[&str]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut st = self.conn.prepare(&format!(
+                "SELECT session_id, source_path FROM transcripts WHERE session_id IN ({marks})"
+            ))?;
+            let rows = st.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            out.extend(rows.filter_map(|r| r.ok()));
+        }
+        Ok(out)
+    }
+
     pub fn upsert_transcript_source(&self, session_id: &str, source_path: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO transcripts (session_id, source_path) VALUES (?1, ?2) \
@@ -1160,6 +1228,29 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+/// A `transcript_cursors` row (path, ino, offset, input_tokens,
+/// output_tokens, first_at, last_at, ended, turns, tokens, context, window,
+/// model).
+fn cursor_row(r: &rusqlite::Row) -> rusqlite::Result<(PathBuf, CursorState)> {
+    Ok((
+        PathBuf::from(r.get::<_, String>(0)?),
+        CursorState {
+            ino: r.get::<_, i64>(1)? as u64,
+            offset: r.get::<_, i64>(2)? as u64,
+            input_tokens: r.get(3)?,
+            output_tokens: r.get(4)?,
+            first: r.get(5)?,
+            last: r.get(6)?,
+            ended: r.get::<_, i64>(7)? != 0,
+            turns: r.get::<_, i64>(8)? as u64,
+            tokens: r.get(9)?,
+            context: r.get::<_, i64>(10)? as u64,
+            window: r.get::<_, Option<i64>>(11)?.map(|w| w as u64),
+            model: r.get(12)?,
+        },
+    ))
 }
 
 fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -1342,6 +1433,11 @@ mod tests {
             first: Some(1),
             last: Some(9),
             ended: true,
+            turns: 3,
+            tokens: 4567,
+            context: 890,
+            window: Some(272_000),
+            model: Some("gpt-5".into()),
         };
         db.save_transcript_cursors(&[(PathBuf::from("/t/a.jsonl"), c.clone())])
             .unwrap();
@@ -1362,9 +1458,91 @@ mod tests {
     }
 
     #[test]
+    fn a_recount_replaces_totals_from_older_counting() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "alpha");
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("agent-a1.jsonl");
+        std::fs::write(&t, "").unwrap();
+        let a = Subagent {
+            agent_id: "a1".into(),
+            session_id: "01aaa".into(),
+            agent_type: "Explore".into(),
+            description: String::new(),
+            tool_use_id: None,
+            spawn_depth: 1,
+            background: false,
+            started_at: Some(100),
+            finished_at: Some(200),
+            transcript_path: Some(t.to_string_lossy().into_owned()),
+            result: String::new(),
+            input_tokens: 200,
+            output_tokens: 40,
+        };
+        // Saved by older counting (it double-counted): `counted` 0, as the
+        // migration leaves every existing row. An old-version position for
+        // its transcript is pruned without touching the totals.
+        db.upsert_subagent(&a).unwrap();
+        let old = CursorState::default();
+        db.save_transcript_cursors(&[(t.clone(), old)]).unwrap();
+        db.conn
+            .execute("UPDATE transcript_cursors SET version = 1", [])
+            .unwrap();
+        assert_eq!(db.prune_transcript_cursors(10).unwrap(), 1);
+        let tokens = |db: &Db| {
+            let a = &db.subagents("01aaa").unwrap()[0];
+            (a.input_tokens, a.output_tokens)
+        };
+        assert_eq!(tokens(&db), (200, 40), "kept until recounted");
+        assert_eq!(db.subagents_to_recount("01aaa").unwrap().len(), 1);
+        // A hook without counts can't lower them.
+        db.upsert_subagent(&Subagent {
+            input_tokens: 0,
+            output_tokens: 0,
+            ..a.clone()
+        })
+        .unwrap();
+        assert_eq!(tokens(&db), (200, 40));
+        // The recount (current logic, from its transcript) wins, though lower.
+        let recount = Subagent {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..a.clone()
+        };
+        db.upsert_subagent_counted(&recount).unwrap();
+        assert_eq!(tokens(&db), (100, 20));
+        assert!(db.subagents_to_recount("01aaa").unwrap().is_empty());
+        // Counted now: back to keeping the larger value.
+        db.upsert_subagent_counted(&Subagent {
+            input_tokens: 50,
+            ..recount.clone()
+        })
+        .unwrap();
+        assert_eq!(tokens(&db), (100, 20));
+        // --rescan marks it for a recount again.
+        db.clear_transcript_cursors().unwrap();
+        db.upsert_subagent_counted(&Subagent {
+            input_tokens: 90,
+            ..recount
+        })
+        .unwrap();
+        assert_eq!(tokens(&db), (90, 20));
+        // With no transcript to count from, nothing is replaced.
+        db.clear_transcript_cursors().unwrap();
+        db.upsert_subagent_counted(&Subagent {
+            input_tokens: 0,
+            output_tokens: 0,
+            transcript_path: None,
+            ..a
+        })
+        .unwrap();
+        assert_eq!(tokens(&db), (90, 20));
+    }
+
+    #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
         for table in [
             "sessions",
             "tags",
@@ -1392,7 +1570,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
     }
 
     #[test]

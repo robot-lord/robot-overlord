@@ -446,6 +446,9 @@ pub struct Config {
     pub jump_digits: bool,
     /// Height of the details pane under the preview (rows).
     pub details_height: u16,
+    /// What the list's Usage column shows (and the usage sort sorts by):
+    /// turns, tokens or context (% of the context window).
+    pub usage: crate::usage::UsageMetric,
     /// Color theme: a family (follows the system's light/dark mode) or one
     /// variant. See `rlord_core::themes`.
     pub theme: String,
@@ -514,6 +517,7 @@ impl Default for Config {
             preview_refresh_ms: 500,
             jump_digits: true,
             details_height: 12,
+            usage: Default::default(),
             theme: "rlord".into(),
             session: SessionDefaults::default(),
             overlord: OverlordConfig::default(),
@@ -650,6 +654,8 @@ list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
 details_height = 12     # rows for the details pane under the preview
+usage = "turns"         # the list's Usage column: "turns" (prompts you typed),
+                        # "tokens", or "context" (% of the context window)
 
 # Color theme. A family follows your system's light/dark mode:
 #   rlord, catppuccin, tokyonight, gruvbox, solarized

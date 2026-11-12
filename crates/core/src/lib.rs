@@ -14,3 +14,4 @@ pub mod timefmt;
 pub mod tmux;
 pub mod tmux_profile;
 pub mod types;
+pub mod usage;

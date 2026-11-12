@@ -128,8 +128,29 @@ Sorts (`o` cycles them, `O` reverses; the time column follows the sort):
 | **status change** | the last time it started, stopped, finished or needed you |
 | **created** | when it started |
 | **name** | A–Z |
+| **usage** | most used first, by what the Usage column shows |
 
 The details card breaks the times down.
+
+**The Usage column** shows how much each session has used, in one of three
+measures:
+
+- **turns** (default): prompts you typed;
+- **tokens**: tokens the agent took in new or wrote (cache re-reads don't
+  count);
+- **context**: how full its context window is, e.g. ` 42%`. `–` when
+  rlord doesn't know the model's window.
+
+Set the default with `usage = "turns" | "tokens" | "context"` in
+`config.toml`; switch it for now with `:usage turns`, `:usage tokens` or
+`:usage context`, or ask the overlord. Numbers keep to four characters
+(`999`, `1.2k`, `45k`, `3.1M`), so the column doesn't jump. Clicking its
+header sorts by it (again: reverses), and the usage sort follows whichever
+measure the column shows. The details card always has all three. In a
+narrow list the Usage column goes before Groups does. rlord reads these
+from the agents' own transcripts (Claude Code and Codex JSONL, OpenCode's
+database), only what was appended since it last looked; no model calls.
+`rlord ls` has a USAGE column too (`--usage tokens`, `--sort usage`).
 
 Add standing instructions in `~/.config/robot-overlord/overlord.md`. They're
 appended to the overlord's built-in instructions, which are written to its
@@ -497,7 +518,7 @@ Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).
 
 The footer shows only the everyday keys. `?` opens a cheat sheet of every
 key; `:` opens a command launcher for the rest (`:keys`, `:sort created`,
-`:archived`, `:log`, …).
+`:archived`, `:log`, `:usage tokens`, …).
 
 **Changing keys:** ask the overlord ("change my keys", "Option-D is
 awkward"), or `:keys`. The key screen lists every key rlord binds and what
