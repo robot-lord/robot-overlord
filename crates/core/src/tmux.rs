@@ -346,15 +346,25 @@ pub fn new_session(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     // Dead pane instead of dead session when the agent exits. If this
     // follow-up fails, tear the half-made session down rather than leaking it.
     let configure = || -> Result<()> {
-        let (window_id, _) = window_pane_ids(name)?;
-        run(&["set-option", "-w", "-t", &window_id, "remain-on-exit", "on"])?;
         pin_agent_pane(name)?;
+        keep_agent_pane_on_exit(name)?;
         Ok(())
     };
     if let Err(e) = configure() {
         let _ = kill_session(name);
         return Err(e);
     }
+    Ok(())
+}
+
+/// The agent's pane stays (dead) when the agent exits, so rlord can show it
+/// stopped and restart it: `remain-on-exit` on that pane only. Panes the
+/// user splits off close normally when their program exits. (Older rlord set
+/// it on the whole window: that is undone here.) Idempotent.
+pub fn keep_agent_pane_on_exit(session: &str) -> Result<()> {
+    let (window_id, pane_id) = window_pane_ids(session)?;
+    run(&["set-option", "-p", "-t", &pane_id, "remain-on-exit", "on"])?;
+    run(&["set-option", "-wu", "-t", &window_id, "remain-on-exit"])?;
     Ok(())
 }
 
