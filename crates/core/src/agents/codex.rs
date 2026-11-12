@@ -38,6 +38,10 @@ pub fn sessions_dir() -> PathBuf {
 }
 
 fn with_model(mut argv: Vec<String>, model: Option<&str>, extra: &[String]) -> Vec<String> {
+    // In the pane itself, not Codex's shared background app-server: there
+    // the turn (and its hooks) would run outside the pane, without the
+    // environment that tells rlord which session a hook is from.
+    argv.push("--no-daemon".to_string());
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         argv.push("--model".to_string());
         argv.push(m.to_string());
@@ -596,12 +600,12 @@ mod tests {
     fn argv() {
         assert_eq!(
             launch_argv(Some("hello"), Some("gpt-6-luna"), &[]),
-            ["codex", "--model", "gpt-6-luna", "hello"]
+            ["codex", "--no-daemon", "--model", "gpt-6-luna", "hello"]
         );
-        assert_eq!(launch_argv(None, Some(" "), &[]), ["codex"]);
+        assert_eq!(launch_argv(None, Some(" "), &[]), ["codex", "--no-daemon"]);
         assert_eq!(
             resume_argv("t-1", None, &["--search".to_string()]),
-            ["codex", "resume", "t-1", "--search"]
+            ["codex", "resume", "t-1", "--no-daemon", "--search"]
         );
     }
 

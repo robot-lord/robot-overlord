@@ -440,7 +440,7 @@ mod tests {
         );
         assert!(l.transcript.unwrap().ends_with(format!("{id}.jsonl")));
         let l = Agent::Codex.launch("/src/app", Some("hi"), None, &[]);
-        assert_eq!(l.argv, ["codex", "hi"]);
+        assert_eq!(l.argv, ["codex", "--no-daemon", "hi"]);
         assert_eq!((l.session_id, l.transcript), (None, None));
         assert!(Agent::Claude.mints_id() && !Agent::Codex.mints_id());
     }
@@ -450,7 +450,17 @@ mod tests {
         let (argv, resumed) = Agent::Codex
             .resume(Some("t-1"), "hook", "/src/app", Some("gpt-6-luna"), &[])
             .unwrap();
-        assert_eq!(argv, ["codex", "resume", "t-1", "--model", "gpt-6-luna"]);
+        assert_eq!(
+            argv,
+            [
+                "codex",
+                "resume",
+                "t-1",
+                "--no-daemon",
+                "--model",
+                "gpt-6-luna"
+            ]
+        );
         assert!(resumed);
         let e = Agent::Codex
             .resume(None, "minted", "/src/app", None, &[])
