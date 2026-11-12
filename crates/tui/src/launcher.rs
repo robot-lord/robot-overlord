@@ -21,7 +21,8 @@ enum Cmd {
     Act(Action),
     Keys,
     Sort(SortMode),
-    Usage(UsageMetric),
+    /// None: back to config `usage` (forget the pick).
+    Usage(Option<UsageMetric>),
     Summarize,
 }
 
@@ -75,17 +76,22 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     (
         "usage turns",
         "Usage column: prompts you typed",
-        Cmd::Usage(UsageMetric::Turns),
+        Cmd::Usage(Some(UsageMetric::Turns)),
     ),
     (
         "usage tokens",
         "Usage column: tokens taken in or written",
-        Cmd::Usage(UsageMetric::Tokens),
+        Cmd::Usage(Some(UsageMetric::Tokens)),
     ),
     (
         "usage context",
         "Usage column: how full the context window is",
-        Cmd::Usage(UsageMetric::Context),
+        Cmd::Usage(Some(UsageMetric::Context)),
+    ),
+    (
+        "usage default",
+        "Usage column: back to config.toml's usage",
+        Cmd::Usage(None),
     ),
     ("reverse", "reverse the sort", Cmd::Act(Action::ReverseSort)),
     (
@@ -314,11 +320,15 @@ impl App {
             row(k(Action::Notes), "notes in $EDITOR"),
             row(k(Action::Sort), "next sort"),
             row(k(Action::ReverseSort), "reverse sort"),
-            row(k(Action::Usage), "Usage: turns/tokens/context"),
             row(k(Action::ToggleArchived), "show archived"),
             row(k(Action::ToggleLog), "pane ⇄ log preview"),
             row(k(Action::Quit), "quit"),
         ];
+        // (Unbound: its default `U` gave way to a key of the user's.)
+        if self.keys.event(Action::Usage).is_some() {
+            let at = left.len() - 3;
+            left.insert(at, row(k(Action::Usage), "Usage: turns/tokens/context"));
+        }
         if self.config.jump_digits {
             left.insert(4, row("1–9".into(), "attach the Nth session"));
         }

@@ -196,13 +196,20 @@ pub fn sort(rows: &mut [Value], metric: UsageMetric, reverse: bool) {
     });
 }
 
-/// `session.list`'s rows: usage on each, sorted by it when asked.
+/// `session.list`'s rows: usage on each, sorted by it when asked. Each
+/// row says which measure this list used (`usage_metric`: the request's,
+/// else the saved pick, else config), so a client that didn't ask shows
+/// the same one.
 pub fn list(d: &Daemon, params: &Value, rows: &mut [Value]) {
     annotate(d, rows, false);
+    let m = metric(d, params);
+    for row in rows.iter_mut() {
+        row["usage_metric"] = json!(m.label());
+    }
     let sort = params["sort"].as_str().and_then(SortMode::parse);
     if sort == Some(SortMode::Usage) {
         let reverse = params["reverse"].as_bool().unwrap_or(false);
-        self::sort(rows, metric(d, params), reverse);
+        self::sort(rows, m, reverse);
     }
 }
 

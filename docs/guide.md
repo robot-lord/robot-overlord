@@ -178,15 +178,19 @@ measures, and its header names the one shown (**Turns**, **Tokens** or
 
 Switch it with `U` (turns → tokens → context), by clicking `Σ turns` in
 the toolbar, with `:usage turns`, `:usage tokens` or `:usage context`, or
-by asking the overlord. rlord remembers the last one picked, any of those
-ways, across restarts of the list and the daemon; until you pick one, it's
-`usage = "turns" | "tokens" | "context"` in `config.toml` (default turns).
+by asking the overlord. Until you pick one, the column shows
+`usage = "turns" | "tokens" | "context"` from `config.toml` (default
+turns). Once you pick one, any of those ways, rlord remembers it across
+restarts of the list and the daemon, over the config. `:usage default` (or
+asking the overlord to reset it) forgets the pick and goes back to the
+config's `usage`.
 On a narrow screen the toolbar drops the measure's name first (`Σ U`),
 then its keycap with the others (`Σ`). Numbers keep to four characters
 (`999`, `1.2k`, `45k`, `3.1M`), and the column keeps its width whatever it
 shows, so nothing jumps. Clicking its header sorts by it (again: reverses);
 the usage sort is a sort like the others, by whichever measure the column
-shows (sorted by context, the header shortens to `Ctx % ▼`). The details
+shows (sorted by context, the header shortens to `Ctx % ▼`; the values
+stay put). The details
 card always has all three. In a narrow list the Usage column goes before
 Groups does.
 
@@ -194,11 +198,12 @@ Headers that can change read in a quieter blue: the time column (it
 follows the sort) and the Usage column (it follows `U`). The one the list
 is sorted by is bright, with its arrow; fixed headers (Name, Status,
 Groups) are plain. The toolbar's sort and `Σ` controls use the same
-quieter blue for what they're set to. rlord reads these
+quieter blue for what they're set to. Clicking `Σ` works even if `U` is
+bound to something else (then it has no keycap). rlord reads these
 from the agents' own transcripts (Claude Code and Codex JSONL, OpenCode's
 database), only what was appended since it last looked; no model calls.
-`rlord ls` has a USAGE column too (`--usage tokens`, `--sort usage`; it
-shows config `usage` unless told, not the list's remembered measure).
+`rlord ls` has a USAGE column too (`--usage tokens`, `--sort usage`);
+without `--usage` it shows (and sorts by) the same measure as the list.
 
 Add standing instructions in `~/.config/robot-overlord/overlord.md`. They're
 appended to the overlord's built-in instructions, which are written to its

@@ -87,7 +87,8 @@ enum Command {
         #[arg(long)]
         reverse: bool,
         /// What the USAGE column shows (and `--sort usage` sorts by): turns,
-        /// tokens or context (%); default: `usage` in config.toml
+        /// tokens or context (%); default: the list's (the measure last
+        /// picked there, else `usage` in config.toml)
         #[arg(long)]
         usage: Option<String>,
         /// Raw JSON output
@@ -662,11 +663,14 @@ fn main() -> Result<()> {
             usage,
             json,
         } => {
-            let usage = match usage {
-                Some(u) => rlord_core::usage::UsageMetric::parse(&u)
-                    .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?,
-                None => Config::load().map(|c| c.usage).unwrap_or_default(),
-            };
+            // Unasked, the daemon picks (the list's saved measure, else
+            // config) and says which it used.
+            let usage = usage
+                .map(|u| {
+                    rlord_core::usage::UsageMetric::parse(&u)
+                        .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))
+                })
+                .transpose()?;
             let archived_mode = if archived {
                 "only"
             } else if all {
@@ -688,19 +692,26 @@ fn main() -> Result<()> {
                 ..Default::default()
             };
             q.apply_search_text(&query.join(" "));
-            let r = call(
-                "session.list",
-                json!({
-                    "archived": archived_mode, "status": q.status, "tag": q.tag,
-                    "agent": q.agent, "project": q.project, "name": q.name,
-                    "group": q.group, "search": q.search, "sort": q.sort.label(),
-                    "reverse": q.reverse, "usage": usage.label(),
-                }),
-            )?;
+            let mut params = json!({
+                "archived": archived_mode, "status": q.status, "tag": q.tag,
+                "agent": q.agent, "project": q.project, "name": q.name,
+                "group": q.group, "search": q.search, "sort": q.sort.label(),
+                "reverse": q.reverse,
+            });
+            if let Some(u) = usage {
+                params["usage"] = json!(u.label());
+            }
+            let r = call("session.list", params)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
             } else {
-                print_session_table(&r, usage);
+                // The measure the daemon used (an empty list: any).
+                let used = r[0]["usage_metric"]
+                    .as_str()
+                    .and_then(rlord_core::usage::UsageMetric::parse)
+                    .or(usage)
+                    .unwrap_or_default();
+                print_session_table(&r, used);
             }
             Ok(())
         }

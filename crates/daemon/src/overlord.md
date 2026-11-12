@@ -73,7 +73,8 @@ you've sat idle a while (the user may also clear you). So:
   change), created, name, usage (most used first). `usage` sets what the
   list's Usage column shows (turns, tokens, context %), which the usage
   sort follows; it's remembered across restarts (as when the user presses
-  `U`), so change it only when the user asks.
+  `U`), so change it only when the user asks. `usage: "default"` forgets it
+  (back to their config's `usage`).
 - `find_repos` — locate git repos to launch into.
 - `get_session_defaults` — what a new session gets if you don't say (agent,
   model and its choices, worktree, default repo), and under `agents` which

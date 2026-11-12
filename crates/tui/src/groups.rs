@@ -305,7 +305,10 @@ impl App {
         type Piece = (Span<'static>, Option<mouse::Hit>);
         let press = |a: Action| self.keys.event(a).map(mouse::Hit::Key);
         let build = |tier: u8| -> Vec<Piece> {
-            let key = |a: Action| -> Option<Piece> { (tier < 3).then(|| (key(a), press(a))) };
+            // (No keycap for an unbound action.)
+            let key = |a: Action| -> Option<Piece> {
+                (tier < 3 && self.keys.event(a).is_some()).then(|| (key(a), press(a)))
+            };
             let sep = || {
                 (
                     Span::styled(
@@ -381,12 +384,12 @@ impl App {
             bar.push(sep());
             // What the Usage column shows; a click (or its key) moves it on:
             // turns → tokens → context.
-            let usage = press(Action::Usage);
+            let usage = Some(mouse::Hit::CycleUsage);
             bar.push((Span::styled("Σ ", theme::muted()), usage.clone()));
             if tier < 2 {
                 bar.push((
                     Span::styled(
-                        format!("{} ", self.usage.label()),
+                        format!("{} ", self.usage.title()),
                         Style::default().fg(theme::accent_dim()),
                     ),
                     usage,

@@ -55,10 +55,9 @@ pub fn default_view(d: &Daemon) -> Result<Value> {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(json!({})),
     );
-    // The last measure picked wins over one saved with the default view.
-    if let Some(m) = usage_pref(d) {
-        view["usage"] = json!(m.label());
-    }
+    // The measure lives in `USAGE_KEY` alone (one an older default view
+    // saved is ignored); null: config `usage`.
+    view["usage"] = json!(usage_pref(d).map(UsageMetric::label));
     Ok(view)
 }
 
@@ -72,13 +71,35 @@ pub fn usage_pref(d: &Daemon) -> Option<UsageMetric> {
         .and_then(UsageMetric::parse)
 }
 
-/// `ui.usage`: save the Usage column's measure with `usage`; without it,
-/// read it back (null: never picked).
+/// A requested measure: `Some(None)` for null or "default" (forget the
+/// pick: config `usage` again), None when not asked.
+fn usage_param(params: &Value) -> Result<Option<Option<UsageMetric>>> {
+    Ok(match params.get("usage") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(u)) if u.trim().eq_ignore_ascii_case("default") => Some(None),
+        Some(Value::String(u)) => {
+            Some(Some(UsageMetric::parse(u).with_context(|| {
+                format!("unknown usage '{u}' (turns|tokens|context|default)")
+            })?))
+        }
+        Some(v) => bail!("usage must be a string or null, not {v}"),
+    })
+}
+
+fn save_usage(d: &Daemon, m: Option<UsageMetric>) -> Result<()> {
+    match m {
+        Some(m) => d.db().kv_set(USAGE_KEY, m.label()),
+        None => d.db().kv_delete(USAGE_KEY),
+    }
+}
+
+/// `ui.usage`: save the Usage column's measure with `usage` (null or
+/// "default" forgets it: config `usage` again); without it, read it back
+/// (null: never picked).
 pub fn usage(d: &Daemon, params: &Value) -> Result<Value> {
-    if let Some(u) = params.get("usage").and_then(Value::as_str) {
-        let m = UsageMetric::parse(u)
-            .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?;
-        d.db().kv_set(USAGE_KEY, m.label())?;
+    if let Some(m) = usage_param(params)? {
+        save_usage(d, m)?;
     }
     Ok(json!({"usage": usage_pref(d).map(UsageMetric::label)}))
 }
@@ -345,12 +366,11 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
         })?;
         obj.insert("sort".into(), json!(m.label()));
     }
-    if let Some(u) = params.get("usage").and_then(Value::as_str) {
-        let m = UsageMetric::parse(u)
-            .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?;
-        obj.insert("usage".into(), json!(m.label()));
-        // Sticky, as when the user picks it.
-        d.db().kv_set(USAGE_KEY, m.label())?;
+    // (Saved below, once the whole view is known to be good.)
+    let usage = usage_param(params)?;
+    if let Some(m) = usage {
+        // Null: the TUI goes back to config `usage`.
+        obj.insert("usage".into(), json!(m.map(UsageMetric::label)));
     }
     if let Some(r) = params.get("reverse").and_then(Value::as_bool) {
         obj.insert("reverse".into(), json!(r));
@@ -372,15 +392,24 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
         obj.insert("tab".into(), json!("groups"));
     }
     let view = normalize_view(&view);
-    if params.get("save_as_default").and_then(Value::as_bool) == Some(true) {
-        d.db().kv_set(DEFAULT_VIEW_KEY, &view.to_string())?;
-    }
     let mut cmd = Map::new();
     cmd.insert("cmd".into(), json!("set_view"));
     cmd.insert("view".into(), view.clone());
     if let Some(sel) = params.get("select").and_then(Value::as_str) {
         let id = d.db().resolve_ref(sel)?.id;
         cmd.insert("select".into(), json!(id));
+    }
+    // Valid throughout: now save. The measure is sticky (as when the user
+    // picks it) and kept only under its own key, never in the default view.
+    if let Some(m) = usage {
+        save_usage(d, m)?;
+    }
+    if params.get("save_as_default").and_then(Value::as_bool) == Some(true) {
+        let mut saved = view.clone();
+        if let Some(o) = saved.as_object_mut() {
+            o.remove("usage");
+        }
+        d.db().kv_set(DEFAULT_VIEW_KEY, &saved.to_string())?;
     }
     *d.ui_view.lock().expect("ui mutex") = view.clone();
     d.ui_cmd(Value::Object(cmd));
@@ -696,7 +725,18 @@ mod usage_tests {
         set_view(&d, &json!({"usage": "context", "show": false})).unwrap();
         assert_eq!(usage(&d, &json!({})).unwrap()["usage"], "context");
         assert_eq!(default_view(&d).unwrap()["usage"], "context");
-        // Over a measure saved with an older default view, too.
+        // A set_list_view that fails saves nothing, the measure included.
+        assert!(set_view(&d, &json!({"usage": "turns", "tab": "nope", "show": false})).is_err());
+        assert_eq!(usage(&d, &json!({})).unwrap()["usage"], "context");
+        // Saving the default view keeps the measure out of it.
+        set_view(
+            &d,
+            &json!({"sort": "name", "save_as_default": true, "show": false}),
+        )
+        .unwrap();
+        let saved = d.db().kv_get(DEFAULT_VIEW_KEY).unwrap().unwrap();
+        assert!(!saved.contains("usage"), "{saved}");
+        // A measure an older default view saved is ignored.
         d.db()
             .kv_set(DEFAULT_VIEW_KEY, r#"{"usage": "turns", "sort": "name"}"#)
             .unwrap();
@@ -705,5 +745,17 @@ mod usage_tests {
             (v["usage"].as_str(), v["sort"].as_str()),
             (Some("context"), Some("name"))
         );
+        // Forgetting it: config `usage` again (null, "default", or the
+        // overlord's "default").
+        usage(&d, &json!({"usage": null})).unwrap();
+        assert_eq!(default_view(&d).unwrap()["usage"], Value::Null);
+        assert_eq!(crate::usage::metric(&d, &json!({})), UsageMetric::Turns);
+        usage(&d, &json!({"usage": "tokens"})).unwrap();
+        usage(&d, &json!({"usage": "default"})).unwrap();
+        assert_eq!(usage(&d, &json!({})).unwrap()["usage"], Value::Null);
+        usage(&d, &json!({"usage": "tokens"})).unwrap();
+        let r = set_view(&d, &json!({"usage": "default", "show": false})).unwrap();
+        assert_eq!(r["view"]["usage"], Value::Null);
+        assert_eq!(usage(&d, &json!({})).unwrap()["usage"], Value::Null);
     }
 }

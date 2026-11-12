@@ -285,15 +285,24 @@ impl App {
         }
     }
 
-    /// Show `m` in the Usage column (the toolbar, its key, `:usage`), and
-    /// save it with the daemon: it is kept across restarts, over config
-    /// `usage`.
-    fn set_usage(&mut self, m: UsageMetric) {
-        self.usage = m;
-        self.dirty = true;
-        if self.call("ui.usage", json!({"usage": m.label()})).is_some() {
-            self.status_line = format!("Usage column: {}", m.title());
+    /// Show `m` in the Usage column (the toolbar, its key, `:usage`), saved
+    /// with the daemon so it's kept across restarts, over config `usage`;
+    /// None forgets the pick (config `usage` again). Only once saved: if
+    /// the daemon can't, nothing changes and the status line says why.
+    pub(crate) fn set_usage(&mut self, m: Option<UsageMetric>) {
+        if self
+            .call("ui.usage", json!({"usage": m.map(UsageMetric::label)}))
+            .is_none()
+        {
+            self.status_line = format!("Usage column not changed: {}", self.status_line);
+            return;
         }
+        self.usage = m.unwrap_or(self.config.usage);
+        self.dirty = true;
+        self.status_line = match m {
+            Some(m) => format!("Usage column: {}", m.title()),
+            None => format!("Usage column: {} (config.toml)", self.usage.title()),
+        };
     }
 
     fn query(&self) -> Value {
@@ -828,7 +837,7 @@ impl App {
                 self.reverse = !self.reverse;
                 self.dirty = true;
             }
-            Action::Usage => self.set_usage(self.usage.next()),
+            Action::Usage => self.set_usage(Some(self.usage.next())),
             Action::ToggleLog => {
                 self.preview = match self.preview {
                     Preview::Pane => Preview::Log,
@@ -1357,7 +1366,6 @@ impl App {
             UsageMetric::Context if arrow_on_usage => "Ctx %",
             UsageMetric::Context => "Context",
         };
-        let usage_label_w = usage_label.chars().count();
         let mut header = vec![
             Cell::from(""),
             Cell::from(""),
@@ -1455,8 +1463,8 @@ impl App {
                     )),
                 ];
                 if show_usage {
-                    // Right-aligned under the header's label; 4 wide
-                    // whatever the number, so the column never shifts.
+                    // 4 wide whatever the number, so the column never
+                    // shifts.
                     let u = Usage::from_json(&s["usage"]);
                     let text = match &u {
                         Some(u) => u.cell(metric),
@@ -1465,7 +1473,9 @@ impl App {
                         None => rlord_core::usage::cell(None, metric),
                     };
                     cells.push(
-                        Cell::from(format!("{text:>usage_label_w$}")).fg(if u.is_some() {
+                        // (A fixed 5, under whatever label: values never
+                        // move when the header changes.)
+                        Cell::from(format!(" {text}")).fg(if u.is_some() {
                             theme::text()
                         } else {
                             theme::faint_c()

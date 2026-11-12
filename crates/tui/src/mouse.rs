@@ -30,6 +30,9 @@ pub(crate) enum Hit {
     /// A sortable column header: sort by it, or flip the direction if the
     /// list is already sorted by it.
     SortBy(rlord_core::db::SortMode),
+    /// The toolbar's Usage control: the next measure (a click works even
+    /// with no key bound to it).
+    CycleUsage,
     /// One of the overlord's earlier conversations in the details pane
     /// (1: the newest): show it in the preview.
     Conv(usize),
@@ -296,6 +299,7 @@ impl App {
                 return self.handle_key(k, terminal);
             }
             Hit::Tab(t) if !right => self.switch_tab(t),
+            Hit::CycleUsage if !right => self.set_usage(Some(self.usage.next())),
             Hit::SortBy(m) if !right => {
                 if self.sort == m {
                     self.reverse = !self.reverse;
@@ -954,9 +958,10 @@ mod tests {
         assert_eq!(at("Name", 1), Some(Hit::SortBy(SortMode::Name)));
         // The toolbar's direction arrow flips it.
         assert_eq!(at("▼ ", 0), press(Action::ReverseSort));
-        // The Usage measure: its Σ, its name and its keycap all cycle it.
-        assert_eq!(at("Σ turns  U ", 0), press(Action::Usage));
-        assert_eq!(at("Σ turns  U ", 3), press(Action::Usage));
+        // The Usage measure: its Σ and its name cycle it, its keycap
+        // presses its key (the same).
+        assert_eq!(at("Σ turns  U ", 0), Some(Hit::CycleUsage));
+        assert_eq!(at("Σ turns  U ", 3), Some(Hit::CycleUsage));
         assert_eq!(at("Σ turns  U ", 9), press(Action::Usage));
         // The footer: a keycap's label presses its key; so do row keys.
         assert_eq!(at(" quit", 2), press(Action::Quit));
@@ -999,24 +1004,27 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.contains("12 turns · 1.2M tokens · 42% of 200k context")));
-        // Another measure: the header says so, in the same place, with the
-        // values right-aligned under its label.
+        // Another measure: the header says so, in the same place; the
+        // values stay in the same 5 cells whatever the label.
         let under = |rows: &[String], label: &str, name: &str| -> String {
             let (x, _) = find(rows, label);
             assert_eq!(x, ux, "{label}: the column doesn't move");
-            rows[find(rows, name).1 as usize]
-                .chars()
-                .skip(x as usize)
-                .take(label.chars().count())
-                .collect()
+            cell(&rows[find(rows, name).1 as usize])
         };
         app.usage = UsageMetric::Tokens;
         let rows = drawn_at(&mut app, 220, 34);
-        assert_eq!(under(&rows, "Tokens", "✻  login-flake"), "  1.2M");
+        assert_eq!(under(&rows, "Tokens", "✻  login-flake"), " 1.2M");
         app.usage = UsageMetric::Context;
         let rows = drawn_at(&mut app, 220, 34);
-        assert_eq!(under(&rows, "Context", "✻  login-flake"), "    42%");
-        assert_eq!(under(&rows, "Context", ">_ image-pipe"), "      –");
+        assert_eq!(under(&rows, "Context", "✻  login-flake"), "  42%");
+        assert_eq!(under(&rows, "Context", ">_ image-pipe"), "    –");
+        // Sorting by it shortens the label ("Ctx % ▼"), and the values
+        // don't move.
+        app.sort = SortMode::Usage;
+        let sorted = drawn_at(&mut app, 220, 34);
+        assert_eq!(under(&sorted, "Ctx % ▼", "✻  login-flake"), "  42%");
+        assert_eq!(under(&sorted, "Ctx % ▼", ">_ image-pipe"), "    –");
+        app.sort = SortMode::Activity;
         // Sorted by usage: the arrow is on the measure, not the time
         // column; "Context ▼" wouldn't fit its 8 cells.
         app.sort = SortMode::Usage;
@@ -1093,6 +1101,36 @@ mod tests {
         assert_eq!(style("Last message"), (dim, false));
     }
 
+    /// With `U` bound to something else (its default gives way), the
+    /// toolbar's Σ still cycles the measure by click, with no empty keycap,
+    /// and the cheat sheet leaves its row out.
+    #[test]
+    fn the_usage_control_works_unbound() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys {
+            archive: "U".into(),
+            ..Keys::default()
+        })
+        .unwrap();
+        assert_eq!(keys.event(Action::Usage), None);
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = fleet().sessions;
+        app.all = app.sessions.clone();
+        let rows = drawn(&mut app);
+        let bar = rows.iter().find(|r| r.contains('Σ')).unwrap();
+        // (No keycap: the separator follows the measure.)
+        assert!(bar.contains("Σ turns   │"), "{bar}");
+        let (x, y) = find(&rows, "Σ turns");
+        assert_eq!(app.hits.at(x, y), Some(Hit::CycleUsage));
+        assert_eq!(app.hits.at(x + 3, y), Some(Hit::CycleUsage));
+        app.mode = Mode::Help;
+        let has_row = |app: &mut App| drawn(app).iter().any(|r| r.contains("Usage: turns/tokens"));
+        assert!(!has_row(&mut app));
+        let mut bound = fleet();
+        bound.mode = Mode::Help;
+        assert!(has_row(&mut bound));
+    }
+
     /// The toolbar narrows in steps: the Usage measure's name goes before
     /// any keycap does; then keycaps go and its Σ stays. What's drawn is
     /// still what's clicked.
@@ -1109,9 +1147,9 @@ mod tests {
             let keycap = bar.contains(" U ");
             assert!(!label || keycap, "width {w}: the label goes first\n{bar}");
             let (x, y) = find(&rows, "Σ");
-            assert_eq!(app.hits.at(x, y), press(&app), "width {w}");
+            assert_eq!(app.hits.at(x, y), Some(Hit::CycleUsage), "width {w}");
             if label {
-                assert_eq!(app.hits.at(x + 3, y), press(&app), "width {w}");
+                assert_eq!(app.hits.at(x + 3, y), Some(Hit::CycleUsage), "width {w}");
             }
             if keycap {
                 let (kx, ky) = find(&rows, " U ");
