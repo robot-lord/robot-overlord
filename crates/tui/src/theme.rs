@@ -5,7 +5,7 @@
 
 use std::sync::RwLock;
 
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 use rlord_core::themes::{self, Palette, Rgb};

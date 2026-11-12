@@ -4,12 +4,12 @@
 #
 #   scripts/update-tap.sh VERSION SHA256SUMS [TAP_REPO]
 #
-# Users: brew install ayersb/tap/rlord   (brings tmux along)
+# Users: brew install robot-lord/tap/rlord   (brings tmux along)
 set -euo pipefail
 ver=${1:?version}
 sums=${2:?SHA256SUMS file}
-tap=${3:-ayersb/homebrew-tap}
-repo=ayersb/robot-overlord
+tap=${3:-robot-lord/homebrew-tap}
+repo=robot-lord/robot-overlord
 
 sha() { awk -v a="rlord-v$ver-$1.tar.gz" '$2 == a {print $1}' "$sums"; }
 mac=$(sha aarch64-apple-darwin)

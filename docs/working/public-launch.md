@@ -26,6 +26,12 @@ Dependabot version updates, grouped weekly.
 
 ## Right after flipping it public
 
+- [ ] Re-create the `main protect` and `release tags` rulesets (lost: a free
+      org can't use rulesets on a private repo; the repo moved to
+      `robot-lord` on 2026-11-12). Same rules as before: PR + `check`,
+      `version-bump`, `advisories` required; no force-push or deletion;
+      admin bypass; squash only; `v*` tags can't be deleted or moved.
+
 - [ ] `scripts/go-public.sh`: secret scanning + push protection, private
       vulnerability reporting, approval for workflows on outside PRs (all
       unavailable on private repositories).

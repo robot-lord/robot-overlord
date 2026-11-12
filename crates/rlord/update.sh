@@ -19,7 +19,7 @@
 # ~/.local/bin/rlord. After installing a new version it runs `rlord reset`
 # if rlord is running.
 set -euo pipefail
-repo=ayersb/robot-overlord
+repo=robot-lord/robot-overlord
 force=()
 tag=
 channel=${RLORD_CHANNEL:-stable}
