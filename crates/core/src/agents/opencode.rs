@@ -1261,6 +1261,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// The overlord's folder config: rlord's server, and rules that end
+    /// with its tools allowed after everything was set to ask.
+    #[test]
+    fn overlord_config_allows_only_what_it_names() {
+        let env = vec![("XDG_DATA_HOME".to_string(), "/d".to_string())];
+        let cfg = overlord_config("/bin/rlord", &env);
+        let server = &cfg["mcp"]["servers"]["rlord"];
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["command"], serde_json::json!(["/bin/rlord", "mcp"]));
+        assert_eq!(server["environment"]["XDG_DATA_HOME"], "/d");
+        let rules = cfg["permissions"].as_array().unwrap();
+        // The last matching rule wins: "ask" for everything comes first.
+        assert_eq!(
+            rules[0],
+            serde_json::json!({"action": "*", "resource": "*", "effect": "ask"})
+        );
+        let effect = |action: &str| {
+            rules
+                .iter()
+                .rev()
+                .find(|r| r["action"] == action)
+                .map(|r| r["effect"].as_str().unwrap().to_string())
+        };
+        assert_eq!(effect("rlord_*").as_deref(), Some("allow"));
+        assert_eq!(effect("read").as_deref(), Some("allow"));
+        // Nothing that writes or runs commands is named: it asks.
+        for a in ["shell", "edit", "webfetch", "external_directory"] {
+            assert_eq!(effect(a), None, "{a}");
+        }
+        assert!(rules.iter().all(|r| r["effect"] != "deny"));
+    }
+
+    #[test]
+    fn a_subagent_file_has_its_description_up_front() {
+        let md = subagent_md("Tidy: names, \"tags\"", "Do the pass.\n");
+        assert!(md.starts_with("---\ndescription: \"Tidy: names, \\\"tags\\\"\"\nmode: subagent\n---\n\nDo the pass.\n"));
+    }
+
     #[test]
     fn models_are_named_provider_slash_model() {
         assert_eq!(

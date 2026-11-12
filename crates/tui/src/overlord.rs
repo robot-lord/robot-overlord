@@ -644,6 +644,16 @@ impl App {
                 )));
                 lines.push(Line::from(""));
             }
+        } else if !s.choice().remote {
+            // The row is gone for this agent: say why, so it isn't missed.
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  ⇄ Remote Control is a Claude Code feature: none on {}.",
+                    s.choice().label
+                ),
+                theme::faint(),
+            )));
+            lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
             "  Saved to config.toml under [overlord]; change it there any time.",

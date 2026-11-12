@@ -815,11 +815,10 @@ pub fn offer(d: &Daemon) -> Value {
     let on = o
         .as_ref()
         .is_some_and(|o| wanted(&db, &o.id).ok().flatten().is_some());
-    // (No overlord yet: whether the configured agent could have it.)
-    let agent = o
-        .as_ref()
-        .map_or_else(|| d.config().overlord.agent.clone(), |o| o.agent.clone());
-    let can = has_remote_control(&agent);
+    // Whether its agent has it. No overlord yet: what this machine can do;
+    // the setup dialog shows the row only for an agent that has it
+    // (`overlord::status`: each agent's `remote_control`).
+    let can = o.as_ref().is_none_or(|o| has_remote_control(&o.agent));
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()

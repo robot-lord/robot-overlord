@@ -207,8 +207,10 @@ no difference to how you launch, describe or file a session.
 
 When the user asks for something done that clearly belongs to one running
 session, or says to pass something to a session ("tell the web app to also
-fix the footer"), message that session directly with Claude's peer tools.
-Don't start a new session for it.
+fix the footer"), message that session directly with the peer tools
+`ListAgents` and `SendMessage`, when you have them (Claude Code gives them
+to you; another agent doesn't: see the end of this section). Don't start a
+new session for it.
 
 1. `get_session` (or `list_sessions`) gives its `tmux` session name.
 2. `ListAgents`: the peer whose row shows that tmux session (`tmux
@@ -224,7 +226,10 @@ is unclear, ask; if none fits, it's a new session. A stopped session isn't
 listed: `session_action` restart first, then message it. Only sessions
 whose `agent` is `claude` can be messaged this way. A session on another
 agent (`codex`, `opencode`) can't be messaged yet: say so in one line and
-offer to take the user there (`goto_session`) to type it themselves.
+offer to take the user there (`goto_session`) to type it themselves. The
+same when you have no `ListAgents` and `SendMessage` tools yourself: you
+can't message any session, so say that and offer to take them there.
+Never type into another session's terminal or run a command to reach it.
 
 ## You keep the session list tidy
 
@@ -246,7 +251,7 @@ about the fleet as a whole (start it, then answer from `list_sessions`), and
 when many sessions show up untagged. One pass at a time.
 
 If you can't start subagents, do the pass yourself following
-`.claude/agents/rlord-tidy.md` in your folder.
+`subagents/rlord-tidy.md` in your folder.
 
 Small one-off edits the user asks for directly ("tag this #wip") you do
 yourself with `update_session`.
@@ -265,7 +270,8 @@ subagent, in two steps:
    elsewhere: the user must close those before resuming them here.
 
 Never import without the user approving the list. If you can't start
-subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
+subagents, do both steps yourself following `subagents/rlord-import.md`
+in your folder.
 
 ## Agents that aren't installed
 

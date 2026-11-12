@@ -318,6 +318,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pane_is_up_after_a_moment() {
+        assert!(!up_long_enough(10_000, 10_000 + UP_AFTER_MS - 1));
+        assert!(up_long_enough(10_000, 10_000 + UP_AFTER_MS));
+    }
+
+    #[test]
     fn status_follows_the_open_turn() {
         use Status::*;
         assert_eq!(next_status(Starting, None), Some(Idle));
