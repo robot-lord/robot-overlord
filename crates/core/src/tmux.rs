@@ -574,6 +574,39 @@ pub struct PaneFrame {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub cursor_visible: bool,
+    /// The pane is in a mode (copy mode): the screen and cursor are the
+    /// mode's.
+    pub in_mode: bool,
+    /// Copy mode's selection on screen, ends inclusive and in order:
+    /// ((col, row), (col, row)). tmux doesn't draw it into a capture.
+    pub selection: Option<((u16, u16), (u16, u16))>,
+}
+
+/// The on-screen selection from tmux's (history-line) coordinates.
+fn screen_selection(f: &str) -> Option<((u16, u16), (u16, u16))> {
+    let n: Vec<i64> = f
+        .split(',')
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    let [sx, sy, ex, ey, hist, pos, h] = n[..] else {
+        return None;
+    };
+    let top = hist - pos; // history line shown on screen row 0
+    let a = (sy - top, sx);
+    let b = (ey - top, ex);
+    let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+    if r1 < 0 || r0 >= h {
+        return None;
+    }
+    // Clipped to the screen: a part above starts at the top-left.
+    let (r0, c0) = if r0 < 0 { (0, 0) } else { (r0, c0) };
+    let (r1, c1) = if r1 >= h {
+        (h - 1, i64::from(u16::MAX))
+    } else {
+        (r1, c1)
+    };
+    let u = |v: i64| v.clamp(0, i64::from(u16::MAX)) as u16;
+    Some(((u(c0), u(r0)), (u(c1), u(r1))))
 }
 
 pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
@@ -584,11 +617,19 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
             "-p",
             "-t",
             pane,
-            "#{cursor_x} #{cursor_y} #{cursor_flag}",
+            // In copy mode: its cursor, and (-M) its screen with the
+            // selection.
+            "#{?pane_in_mode,#{copy_cursor_x},#{cursor_x}} \
+             #{?pane_in_mode,#{copy_cursor_y},#{cursor_y}} \
+             #{?pane_in_mode,1,#{cursor_flag}} #{pane_in_mode} \
+             #{?selection_present,#{selection_start_x}#,#{selection_start_y}#,\
+             #{selection_end_x}#,#{selection_end_y}#,#{history_size}#,\
+             #{scroll_position}#,#{pane_height},-}",
             ";",
             "capture-pane",
             "-p",
             "-e",
+            "-M",
             "-t",
             pane,
         ])
@@ -609,8 +650,36 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
         cursor_x: f.next().unwrap_or(0),
         cursor_y: f.next().unwrap_or(0),
         cursor_visible: f.next().unwrap_or(0) == 1,
+        in_mode: f.next().unwrap_or(0) == 1,
+        selection: head.split_whitespace().nth(4).and_then(screen_selection),
         ansi: ansi.to_string(),
     })
+}
+
+/// Put a pane in copy mode (no-op if it already is).
+pub fn copy_mode(pane: &str) -> Result<()> {
+    run(&["copy-mode", "-t", pane])?;
+    Ok(())
+}
+
+/// Scroll a pane's history a few lines: up enters copy mode (leaving it at
+/// the bottom, `-e`), as tmux's wheel binding does; down only in the mode.
+pub fn scroll(pane: &str, up: bool) -> Result<()> {
+    if up {
+        run(&["copy-mode", "-e", "-t", pane])?;
+    }
+    let dir = if up { "scroll-up" } else { "scroll-down" };
+    run(&["send-keys", "-t", pane, "-X", "-N", "3", dir])?;
+    Ok(())
+}
+
+/// A session option's value (`prefix`, …), as the session sees it
+/// (inherited from the global value when not set on it: `-A`).
+pub fn session_option(session: &str, name: &str) -> Result<String> {
+    // (show-options takes the plain name: `=name` isn't accepted there.)
+    Ok(run(&["show-options", "-Aqv", "-t", session, name])?
+        .trim()
+        .to_string())
 }
 
 /// Send tmux key names (`Enter`, `C-c`, `M-x`, `Up`, …) to a pane.
@@ -1032,6 +1101,24 @@ pub fn detach_client() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn selection_maps_history_lines_to_the_screen() {
+        // 191 history lines, at the bottom, 10 rows: line 200 is row 9.
+        assert_eq!(
+            screen_selection("0,200,2,198,191,0,10"),
+            Some(((2, 7), (0, 9)))
+        );
+        // Scrolled up 1: the lines sit a row lower, the end runs off the
+        // bottom (clipped to the last row); scrolled up 5, all off-screen.
+        assert_eq!(
+            screen_selection("0,200,2,198,191,1,10"),
+            Some(((2, 8), (u16::MAX, 9)))
+        );
+        assert_eq!(screen_selection("0,200,2,198,191,5,10"), None);
+        assert_eq!(screen_selection("-"), None);
+    }
+
     use super::*;
 
     #[test]

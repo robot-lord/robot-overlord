@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Text;
@@ -42,10 +42,19 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     };
     report(true);
     let mut terminal = ratatui::init();
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ =
+        ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let keys = SeatKeys::from_config(&rlord_core::config::Config::load().unwrap_or_default());
-    let r = run_loop(&mut terminal, &pane, seat, &keys);
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    // The user's tmux prefix there (prefix then `[` enters copy mode).
+    let prefix = tmux::session_option(seat.tmux, "prefix")
+        .ok()
+        .and_then(|p| parse_key(&p));
+    let r = run_loop(&mut terminal, &pane, seat, &keys, prefix);
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     report(false);
     // The window follows clients again once nobody is embedding it.
@@ -58,7 +67,13 @@ fn run_loop(
     pane: &str,
     seat: &Seat,
     keys: &SeatKeys,
+    prefix: Option<(bool, bool, char)>,
 ) -> Result<()> {
+    // tmux's copy mode on the seat's pane: the overlay isn't a pane, so it
+    // puts the real pane in copy mode, draws that mode's screen, and keys go
+    // to the mode (the user's copy bindings: select, yank, search, q).
+    let mut in_mode = false;
+    let mut after_prefix = false;
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
@@ -79,7 +94,11 @@ fn run_loop(
             last = Instant::now();
             match tmux::capture_frame(pane) {
                 Ok(f) => {
+                    in_mode = f.in_mode;
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
+                    if let Some(sel) = f.selection {
+                        highlight(&mut screen, sel);
+                    }
                     cursor = f.cursor_visible.then_some((f.cursor_x, f.cursor_y));
                     if Instant::now() >= hold_error_until {
                         error = None;
@@ -108,6 +127,42 @@ fn run_loop(
         }
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
+                // Prefix, then `[`: copy mode (another key after the prefix
+                // goes to the agent, prefix first).
+                let is_prefix = prefix.is_some_and(|p| {
+                    let KeyCode::Char(c) = k.code else {
+                        return false;
+                    };
+                    p == (
+                        k.modifiers.contains(KeyModifiers::ALT),
+                        k.modifiers.contains(KeyModifiers::CONTROL),
+                        c,
+                    )
+                });
+                if after_prefix {
+                    after_prefix = false;
+                    if k.code == KeyCode::Char('[') {
+                        if let Err(e) = tmux::copy_mode(pane) {
+                            error = Some(format!("{e:#}"));
+                        }
+                        last = Instant::now() - Duration::from_secs(1);
+                        continue;
+                    }
+                    if let Some((a, c, ch)) = prefix {
+                        let mut n = String::new();
+                        if c {
+                            n.push_str("C-");
+                        }
+                        if a {
+                            n.push_str("M-");
+                        }
+                        n.push(ch);
+                        let _ = tmux::send_keys(pane, &[n.as_str()]);
+                    }
+                } else if is_prefix && !in_mode {
+                    after_prefix = true;
+                    continue;
+                }
                 match keys.seat_key(&k) {
                     // This seat's key (or Option-D) closes the overlay.
                     Some(s) if s == seat.key || s == "close" => return Ok(()),
@@ -143,6 +198,19 @@ fn run_loop(
                 }
                 last = Instant::now() - Duration::from_secs(1); // show the echo now
             }
+            // The wheel scrolls the pane's history (entering copy mode, as
+            // tmux's own wheel binding does).
+            Event::Mouse(m) => {
+                let r = match m.kind {
+                    MouseEventKind::ScrollUp => tmux::scroll(pane, true),
+                    MouseEventKind::ScrollDown if in_mode => tmux::scroll(pane, false),
+                    _ => Ok(()),
+                };
+                if let Err(e) = r {
+                    error = Some(format!("{e:#}"));
+                }
+                last = Instant::now() - Duration::from_secs(1);
+            }
             Event::Paste(t) => {
                 if let Err(e) = tmux::paste(pane, &t) {
                     error = Some(format!("{e:#}"));
@@ -151,6 +219,60 @@ fn run_loop(
             }
             _ => {}
         }
+    }
+}
+
+/// Draw copy mode's selection (tmux leaves it out of a capture): reversed
+/// cells from `a` to `b` (column, row; inclusive, in reading order).
+fn highlight(text: &mut Text<'static>, (a, b): ((u16, u16), (u16, u16))) {
+    use ratatui::style::Modifier;
+    use ratatui::text::{Line, Span};
+    use unicode_width::UnicodeWidthChar;
+    for (row, line) in text.lines.iter_mut().enumerate() {
+        let row = row as u16;
+        if row < a.1 || row > b.1 {
+            continue;
+        }
+        let from = if row == a.1 { a.0 } else { 0 };
+        let to = if row == b.1 { b.0 } else { u16::MAX };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut col: u16 = 0;
+        for span in line.spans.drain(..) {
+            // Split each span at the selection's edges, by display column.
+            let mut buf = String::new();
+            let mut inside: Option<bool> = None;
+            for ch in span.content.chars() {
+                let w = ch.width().unwrap_or(0) as u16;
+                let sel = col >= from && col <= to;
+                if inside.is_some_and(|i| i != sel) {
+                    let st = if inside == Some(true) {
+                        span.style.add_modifier(Modifier::REVERSED)
+                    } else {
+                        span.style
+                    };
+                    spans.push(Span::styled(std::mem::take(&mut buf), st));
+                }
+                inside = Some(sel);
+                buf.push(ch);
+                col = col.saturating_add(w);
+            }
+            if !buf.is_empty() {
+                let st = if inside == Some(true) {
+                    span.style.add_modifier(Modifier::REVERSED)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(buf, st));
+            }
+        }
+        // A selected empty line still shows one cell.
+        if spans.is_empty() && from == 0 {
+            spans.push(Span::styled(
+                " ",
+                ratatui::style::Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        }
+        *line = Line::from(spans).style(line.style);
     }
 }
 
