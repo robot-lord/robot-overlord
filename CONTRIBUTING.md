@@ -32,6 +32,13 @@ rlord stop <ref> && rlord restart <ref>           # resume with full context
 rlord search <words> / rlord history <ref>        # past work
 ```
 
+## Demo and screenshots
+
+`scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
+(its own data, config and tmux server; a stand-in `claude` that needs no
+model), for trying the UI. `scripts/demo/screenshots.sh DIR` retakes the
+README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs).
+
 ## Tests
 
 ```sh

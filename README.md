@@ -10,7 +10,7 @@ session that drives rlord for you.
 
 [Install](#install) · [How it works](#how-it-works) · [User guide](docs/guide.md) · [Contributing](CONTRIBUTING.md)
 
-<!-- screenshot: the list with the overlord overlay open -->
+<img src="docs/images/overlord.png" alt="The overlord, open over the session list" width="900">
 
 </div>
 
@@ -43,10 +43,16 @@ session from last week decide? rlord is built around a few ideas:
 - **One list for everything.** Live status (working, waiting on you, idle),
   sorting by your last message or the agent's, groups by tag, favourites,
   search, and a live preview of the selected session.
+
+  <img src="docs/images/waiting.png" alt="The session list, with a session waiting on you" width="800">
+
 - **Jump around without losing your place.** `enter` attaches; Option-D
   brings you back to the list from inside any session.
 - **Archive with a memory.** Archived sessions keep a short summary of what
   they did, written for you when you archive them.
+
+  <img src="docs/images/archived.png" alt="An archived session's summary" width="800">
+
 - **Search past work.** `rlord search` looks through every session's actual
   conversation, archived ones included; the overlord does it for you when
   you ask.
