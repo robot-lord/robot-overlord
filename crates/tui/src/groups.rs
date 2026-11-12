@@ -349,16 +349,25 @@ impl App {
             bar.push((Span::styled("⇅ ", theme::muted()), sort.clone()));
             bar.push((
                 Span::styled(
-                    format!(
-                        "{}{} ",
-                        self.sort.label(),
-                        if self.reverse { " ↑" } else { "" }
-                    ),
+                    format!("{} ", self.sort.title()),
                     Style::default().fg(theme::text()),
                 ),
                 sort,
             ));
+            // The direction: names A→Z, times newest first, unless flipped.
+            let ascending = (self.sort == SortMode::Name) != self.reverse;
+            bar.push((
+                Span::styled(
+                    if ascending { "▲ " } else { "▼ " },
+                    Style::default().fg(theme::accent()),
+                ),
+                press(Action::ReverseSort),
+            ));
             bar.extend(key(Action::Sort));
+            if let Some(k) = key(Action::ReverseSort) {
+                bar.push((Span::raw(" "), None));
+                bar.push(k);
+            }
             bar.push(sep());
             let archived = press(Action::ToggleArchived);
             bar.push((Span::styled("◷ ", theme::muted()), archived.clone()));

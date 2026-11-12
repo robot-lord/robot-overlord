@@ -27,6 +27,9 @@ pub(crate) enum Hit {
     /// A session row / a group, by index.
     Row(usize),
     Group(usize),
+    /// A sortable column header: sort by it, or flip the direction if the
+    /// list is already sorted by it.
+    SortBy(rlord_core::db::SortMode),
     /// Wheel areas: the session table, the group column, the preview.
     List,
     Groups,
@@ -278,6 +281,15 @@ impl App {
                 return self.handle_key(k, terminal);
             }
             Hit::Tab(t) if !right => self.switch_tab(t),
+            Hit::SortBy(m) if !right => {
+                if self.sort == m {
+                    self.reverse = !self.reverse;
+                } else {
+                    self.sort = m;
+                    self.reverse = false;
+                }
+                self.dirty = true;
+            }
             Hit::Row(i) if i < self.sessions.len() => {
                 self.group_focus = false;
                 if self.table.selected() != Some(i) {
