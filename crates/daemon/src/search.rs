@@ -99,16 +99,23 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         paths_of.insert(i, ps);
     }
     if everywhere {
-        // Codex rollouts sit together by date: which ran in a seat's folder
-        // is one question to Codex's index (each file's head only when
-        // there is no index).
-        let seat_rollouts = agents::codex::rollouts_in_folders(&agents::codex::home(), &seat_dirs);
-        let in_seat_folder = |p: &Path| match &seat_rollouts {
-            Some(set) => set.contains(p),
-            None => {
-                agents::agent_of(p) == Agent::Codex
-                    && agents::codex::rollout_cwd(p).is_some_and(|cwd| seat_dirs.contains(&cwd))
-            }
+        // Codex rollouts sit together by date: which folder each ran in is
+        // one question to Codex's index; a rollout it doesn't list (older
+        // than the index, or no index at all) says so in its first bytes.
+        // A seat's folder may be recorded as given or resolved (symlinks).
+        let folders = agents::codex::rollout_folders(&agents::codex::home()).unwrap_or_default();
+        let seat_real: Vec<String> = seat_dirs
+            .iter()
+            .filter_map(|d| std::fs::canonicalize(d).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let is_seat = |cwd: &str| seat_dirs.iter().chain(&seat_real).any(|d| d == cwd);
+        let in_seat_folder = |p: &Path| {
+            agents::agent_of(p) == Agent::Codex
+                && match folders.get(p) {
+                    Some(cwd) => is_seat(cwd),
+                    None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
+                }
         };
         paths.extend(history::all_transcripts().into_iter().filter(|p| {
             !by_path.contains_key(p)

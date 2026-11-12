@@ -333,6 +333,12 @@ impl Db {
             .optional()?)
     }
 
+    pub fn kv_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO kv (key, value) VALUES (?1, ?2) \

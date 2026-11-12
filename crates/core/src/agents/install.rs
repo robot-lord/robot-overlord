@@ -180,64 +180,123 @@ pub fn on_path(bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// Where a command is, as a session's pane would find it: on this
-/// process's PATH, else where the user's login shell resolves it (`$SHELL
-/// -lc 'command -v <bin>'`: the daemon may run with a shorter PATH than
-/// the user's shell has). The shell's answer is remembered for a minute
-/// (it can be slow to start), and it gets three seconds.
+/// What the user's login shell last said about each command.
+type Asked = std::collections::HashMap<String, (std::time::Instant, Option<PathBuf>)>;
+static ASKED: std::sync::LazyLock<std::sync::Mutex<Asked>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// How long a login-shell answer is taken as current by `resolve`.
+const ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn asked(bin: &str, max_age: Option<std::time::Duration>) -> Option<Option<PathBuf>> {
+    let asked = ASKED.lock().ok()?;
+    let (at, found) = asked.get(bin)?;
+    max_age
+        .is_none_or(|max| at.elapsed() < max)
+        .then(|| found.clone())
+}
+
+/// Where a command is: on this process's PATH, else where the user's
+/// login shell resolves it (`$SHELL -lc 'command -v <bin>'`: the daemon
+/// may run with a shorter PATH than the user's shell has). **May start
+/// that shell** (three seconds at most; its answer is remembered for a
+/// minute): never call it while holding a lock others wait on. Use
+/// `resolved` there.
 pub fn resolve(bin: &str) -> Option<PathBuf> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use std::time::{Duration, Instant};
     if let Some(p) = on_path(bin) {
         return Some(p);
     }
-    type Asked = HashMap<String, (Instant, Option<PathBuf>)>;
-    static ASKED: LazyLock<Mutex<Asked>> = LazyLock::new(Default::default);
-    if let Some((at, found)) = ASKED.lock().ok()?.get(bin) {
-        if at.elapsed() < Duration::from_secs(60) {
-            return found.clone();
-        }
+    if let Some(found) = asked(bin, Some(ASK_AGAIN)) {
+        return found;
     }
-    let found = login_shell_path(bin, Duration::from_secs(3));
+    let found = login_shell_path(bin, std::time::Duration::from_secs(3));
     if let Ok(mut asked) = ASKED.lock() {
-        asked.insert(bin.to_string(), (Instant::now(), found.clone()));
+        asked.insert(bin.to_string(), (std::time::Instant::now(), found.clone()));
     }
     found
 }
 
-/// `$SHELL -lc 'command -v <bin>'`: an absolute path, or nothing.
+/// `resolve` without ever starting anything: PATH, else the login shell's
+/// last answer (however old; `warm` keeps it fresh). Safe under a lock.
+pub fn resolved(bin: &str) -> Option<PathBuf> {
+    on_path(bin).or_else(|| asked(bin, None).flatten())
+}
+
+/// Ask the login shell about every agent rlord runs that PATH doesn't
+/// have (outside any lock: at daemon start, and before a launch), so
+/// `resolved` knows.
+pub fn warm() {
+    for t in TOOLS.iter().filter(|t| t.agent.is_some()) {
+        resolve(t.name);
+    }
+}
+
+/// The program a session's pane should run for `bin`: None when the bare
+/// name works (it is on this process's PATH, which rlord's tmux panes
+/// share); else the path the login shell found, so the launch finds what
+/// the "is it installed" check found.
+pub fn pane_program(bin: &str) -> Option<PathBuf> {
+    if on_path(bin).is_some() {
+        return None;
+    }
+    resolved(bin)
+}
+
+/// `$SHELL -lc 'command -v <bin>'`: an absolute path, or nothing. The
+/// shell and reading its answer both end at `limit`.
 fn login_shell_path(bin: &str, limit: std::time::Duration) -> Option<PathBuf> {
-    use std::io::Read;
     // (Only ever rlord's own agent names: never text from outside.)
     if !bin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
+    shell_answer(&shell, &format!("command -v {bin}"), limit)
+}
+
+/// Run `shell -lc script` and take the last line it prints as a path.
+fn shell_answer(shell: &str, script: &str, limit: std::time::Duration) -> Option<PathBuf> {
+    use std::io::Read;
     let mut child = std::process::Command::new(shell)
-        .args(["-lc", &format!("command -v {bin}")])
+        .args(["-lc", script])
         .env_remove("RLORD_SESSION_ID")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    // Read on a thread: something the shell's rc left running can hold the
+    // pipe open long after the shell is gone.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
     let start = std::time::Instant::now();
-    loop {
+    let ok = loop {
         match child.try_wait() {
-            Ok(Some(st)) if st.success() => break,
+            Ok(Some(st)) => break st.success(),
             Ok(None) if start.elapsed() < limit => {
                 std::thread::sleep(std::time::Duration::from_millis(20))
             }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break false;
             }
         }
+    };
+    if !ok {
+        return None;
     }
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let out = rx
+        .recv_timeout(
+            limit
+                .saturating_sub(start.elapsed())
+                .max(std::time::Duration::from_millis(200)),
+        )
+        .ok()?;
     // (A shell rc may print before it: the answer is the last line.)
     let p = PathBuf::from(out.lines().next_back()?.trim());
     (p.is_absolute() && p.is_file()).then_some(p)
@@ -399,14 +458,21 @@ pub struct Status {
     pub next: Option<String>,
 }
 
-/// Every known agent's state. `versions`: also run each one's `--version`
-/// (cached; skip it where only "is it there" matters).
-pub fn status(versions: bool) -> Vec<Status> {
+/// Every known agent's state. `full` (`rlord agents`, `list_agents`: never
+/// under a lock): ask the login shell where PATH doesn't have one, and run
+/// each one's `--version`. Otherwise nothing is started: agents rlord runs
+/// come from PATH or the shell's last answer, the others from PATH alone.
+pub fn status(full: bool) -> Vec<Status> {
+    let versions = full;
     let machine = Machine::detect();
     TOOLS
         .iter()
         .map(|t| {
-            let path = resolve(t.name);
+            let path = match (full, t.agent) {
+                (true, _) => resolve(t.name),
+                (false, Some(_)) => resolved(t.name),
+                (false, None) => on_path(t.name),
+            };
             let installed = path.is_some();
             let missing = t.agent.map(|a| hooks_missing(a, &a.hooks_file()));
             let hooks_installed = missing.as_ref().map(Vec::is_empty);
@@ -460,9 +526,9 @@ pub fn status(versions: bool) -> Vec<Status> {
 
 /// Why sessions on `agent` can't launch here, with what to do about it;
 /// None when its command can be found (on PATH, or by the user's login
-/// shell).
+/// shell as last asked: see `warm`). Starts nothing.
 pub fn missing(agent: Agent) -> Option<String> {
-    if resolve(agent.name()).is_some() {
+    if resolved(agent.name()).is_some() {
         return None;
     }
     let t = tool(agent.name())?;
@@ -627,6 +693,23 @@ mod tests {
         assert!(!exec(&bin));
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(exec(&bin));
+        // The login shell's answer: a path that exists, within the limit
+        // (a shell that hangs, or leaves the pipe open, doesn't hold it up).
+        let limit = std::time::Duration::from_secs(2);
+        let script = format!("echo noise; echo {}", bin.display());
+        assert_eq!(
+            shell_answer("/bin/sh", &script, limit).as_deref(),
+            Some(bin.as_path())
+        );
+        assert_eq!(shell_answer("/bin/sh", "echo /nonexistent/x", limit), None);
+        let start = std::time::Instant::now();
+        let short = std::time::Duration::from_millis(300);
+        assert_eq!(shell_answer("/bin/sh", "sleep 5", short), None);
+        assert_eq!(
+            shell_answer("/bin/sh", "(sleep 5 &) ; echo /bin/sh", short),
+            None
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
         // Names that aren't plain command names never reach a shell.
         assert_eq!(
             login_shell_path("codex; rm -rf x", std::time::Duration::from_secs(1)),

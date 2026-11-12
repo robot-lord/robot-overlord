@@ -119,9 +119,15 @@ After the PR's code review:
   whatever the hooks name; with nothing bound, only a SessionStart binds
   (a late event from a replaced process is ignored). Another thread's
   permission prompt still shows "needs you".
-- **Who "needs you" is for** is remembered (kv `needs_you_by:<id>`: a
-  Claude sub-agent's `agent_id`, a Codex sub-agent's thread, or the main
-  agent), and only that one moving on clears it.
+- **Who "needs you" is for** is a set (kv `needs_you_by:<id>`, a JSON
+  list, kept only while the session waits: a Claude sub-agent's
+  `agent_id`, a Codex sub-agent's thread, "" for the main agent). A party
+  leaves it by running a tool or ending (SubagentStop, its thread's
+  Stop); the session needs you until it is empty; the main agent's own
+  prompt or end of turn clears it. A cut-off payload names nobody.
+- A bound Codex session moves to another thread only when Codex's index
+  says the user drives it (any event); one the index doesn't know yet
+  waits.
 - **Index binding is cautious** (`discover::pick_thread`): CLI threads
   only, the first message must be the launch prompt when there was one,
   and nothing is bound when two sessions wait in one folder or two
@@ -132,7 +138,13 @@ After the PR's code review:
   and spooling; bounded waits; spooled only when the daemon is
   unreachable.
 - **Installed** means found on the daemon's PATH or by the user's login
-  shell; hooks count as installed only when every event is.
+  shell; when only the shell has it, the pane runs that path (launch,
+  resume, fresh). The shell is asked outside the DB lock (before a launch,
+  and at daemon start); under the lock only its last answer is read.
+  Hooks count as installed only when every event is.
+- **Hook client**: an event is spooled unless the daemon answered or is
+  merely slow to answer (a closed or reset connection is a restart: keep
+  it).
 - Clicks that stop, restart or archive ask first; menus and double-clicks
   go by session id.
 

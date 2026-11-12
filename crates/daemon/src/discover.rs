@@ -133,6 +133,9 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
     // rlord's own attribution ("minted"), until a hook confirms it.
     db.set_agent_session(&s.id, &t.id, "minted")?;
     db.upsert_transcript_source(&s.id, &t.rollout_path)?;
+    // Bound: what the search for its thread needed is done with.
+    db.kv_delete(&methods::bind_since_key(&s.id))?;
+    db.kv_delete(&methods::bind_prompt_key(&s.id))?;
     db.insert_event(
         &s.id,
         now_ms(),
@@ -150,6 +153,8 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
 ///   prompt. One that has no first message yet may still become it: wait.
 /// - no prompt (a fresh conversation, or launched without one): the only
 ///   candidate, and only when no other session is waiting in this folder.
+/// - an older Codex whose index keeps no first message: as with no
+///   prompt (the only candidate, nobody else waiting).
 /// - two that fit equally: neither (the hooks will say).
 fn pick_thread<'a>(
     candidates: &'a [codex::Thread],
@@ -161,10 +166,12 @@ fn pick_thread<'a>(
         // (Codex may keep only the start of a long first message.)
         !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
     };
-    let fit: Vec<&codex::Thread> = match prompt {
+    // (The index keeps first messages, or it doesn't: all or none.)
+    let messages = candidates.iter().any(|t| t.first_user_message.is_some());
+    let fit: Vec<&codex::Thread> = match prompt.filter(|_| messages) {
         Some(p) => candidates
             .iter()
-            .filter(|t| same(&t.first_user_message, p))
+            .filter(|t| same(t.first_user_message.as_deref().unwrap_or(""), p))
             .collect(),
         None if others_waiting => Vec::new(),
         None => candidates.iter().collect(),
@@ -254,7 +261,7 @@ mod tests {
             id: id.into(),
             rollout_path: format!("/r/{id}.jsonl"),
             created_at_ms: 1,
-            first_user_message: first.into(),
+            first_user_message: Some(first.into()),
         }
     }
 
@@ -291,5 +298,13 @@ mod tests {
         assert_eq!(pick(&two, Some("fix it"), false), None);
         assert_eq!(pick(&two, None, false), None);
         assert_eq!(pick(&[], None, false), None);
+        // An older Codex (no first messages in its index): the only
+        // thread in the folder, when nobody else waits there.
+        let old = [codex::Thread {
+            first_user_message: None,
+            ..thread("a", "")
+        }];
+        assert_eq!(pick(&old, Some("fix it"), false).as_deref(), Some("a"));
+        assert_eq!(pick(&old, Some("fix it"), true), None);
     }
 }

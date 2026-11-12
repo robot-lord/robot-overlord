@@ -114,8 +114,9 @@ pub struct Thread {
     pub id: String,
     pub rollout_path: String,
     pub created_at_ms: i64,
-    /// The prompt that started it ("" until Codex records one).
-    pub first_user_message: String,
+    /// The prompt that started it ("" until Codex records one). None: this
+    /// Codex's index doesn't keep it.
+    pub first_user_message: Option<String>,
 }
 
 fn open_state(home: &Path) -> Option<rusqlite::Connection> {
@@ -146,21 +147,35 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
     let real = std::fs::canonicalize(cwd)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string());
-    let q = c.prepare(
+    // An older Codex's index has neither where a thread was started from
+    // nor its first message: then every thread in the folder is a
+    // candidate, with no message to tell them apart (None).
+    let (mut q, full) = match c.prepare(
         "SELECT id, rollout_path, created_at_ms, first_user_message FROM threads \
          WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 AND source = 'cli' \
            AND (thread_source IS NULL OR thread_source = 'user') \
          ORDER BY created_at_ms ASC LIMIT 8",
-    );
-    let Ok(mut q) = q else {
-        return Vec::new(); // another Codex version's schema
+    ) {
+        Ok(q) => (q, true),
+        Err(_) => match c.prepare(
+            "SELECT id, rollout_path, created_at_ms FROM threads \
+             WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 \
+             ORDER BY created_at_ms ASC LIMIT 8",
+        ) {
+            Ok(q) => (q, false),
+            Err(_) => return Vec::new(), // not a schema rlord knows
+        },
     };
     let rows = q.query_map(rusqlite::params![cwd, real, since_ms], |r| {
         Ok(Thread {
             id: r.get(0)?,
             rollout_path: r.get(1)?,
             created_at_ms: r.get(2)?,
-            first_user_message: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            first_user_message: if full {
+                Some(r.get::<_, Option<String>>(3)?.unwrap_or_default())
+            } else {
+                None
+            },
         })
     });
     match rows {
@@ -182,22 +197,20 @@ pub fn is_user_thread(home: &Path, id: &str) -> Option<bool> {
         .map(|source| source.is_none_or(|s| s == "user"))
 }
 
-/// The rollouts of conversations that ran in any of `folders`, from the
-/// index (one query). None when there is no index to ask.
-pub fn rollouts_in_folders(
-    home: &Path,
-    folders: &[String],
-) -> Option<std::collections::HashSet<PathBuf>> {
+/// The folder each indexed rollout's conversation ran in (one query).
+/// None when there is no index to ask; a rollout it doesn't list (older
+/// than the index) says its own folder (`rollout_cwd`).
+pub fn rollout_folders(home: &Path) -> Option<std::collections::HashMap<PathBuf, String>> {
     let c = open_state(home)?;
-    let mut q = c
-        .prepare("SELECT rollout_path FROM threads WHERE cwd = ?1")
+    let mut q = c.prepare("SELECT rollout_path, cwd FROM threads").ok()?;
+    let rows = q
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .ok()?;
-    let mut out = std::collections::HashSet::new();
-    for f in folders {
-        let rows = q.query_map([f], |r| r.get::<_, String>(0)).ok()?;
-        out.extend(rows.flatten().map(PathBuf::from));
-    }
-    Some(out)
+    Some(
+        rows.flatten()
+            .map(|(p, cwd)| (PathBuf::from(p), cwd))
+            .collect(),
+    )
 }
 
 /// The rollout file of a conversation: from the thread index, else by its
@@ -865,14 +878,31 @@ mod tests {
         // Not the sub-agent's thread, nor the one started from an editor.
         assert_eq!(ids, ["mine", "later"]);
         assert_eq!(
-            threads_started_in(dir.path(), "/src/app", 4000)[0].first_user_message,
-            "fix it"
+            threads_started_in(dir.path(), "/src/app", 4000)[0]
+                .first_user_message
+                .as_deref(),
+            Some("fix it")
         );
         assert_eq!(is_user_thread(dir.path(), "mine"), Some(true));
         assert_eq!(is_user_thread(dir.path(), "sub"), Some(false));
         assert_eq!(is_user_thread(dir.path(), "unknown"), None);
-        let in_web = rollouts_in_folders(dir.path(), &["/src/web".to_string()]).unwrap();
-        assert!(in_web.contains(Path::new("/r/other.jsonl")) && in_web.len() == 1);
+        let folders = rollout_folders(dir.path()).unwrap();
+        assert_eq!(folders[Path::new("/r/other.jsonl")], "/src/web");
+        assert_eq!(folders.len(), 6);
+        // An older Codex's index (no `source`, no first message): the
+        // threads in the folder, with nothing to tell them apart.
+        let old = tempfile::tempdir().unwrap();
+        let c = rusqlite::Connection::open(old.path().join("state_5.sqlite")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, \
+               cwd TEXT NOT NULL, created_at_ms INTEGER);
+             INSERT INTO threads VALUES ('a', '/r/a.jsonl', '/src/app', 5000);",
+        )
+        .unwrap();
+        drop(c);
+        let found = threads_started_in(old.path(), "/src/app", 4000);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].first_user_message, None);
         assert!(threads_started_in(dir.path(), "/src/none", 0).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0).is_empty());

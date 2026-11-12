@@ -1480,6 +1480,9 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
         rlord_daemon::discover::start(&daemon);
+        // Where each agent's command is (may ask the login shell): known
+        // before the first launch needs it.
+        std::thread::spawn(rlord_core::agents::install::warm);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;
