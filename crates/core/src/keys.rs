@@ -108,7 +108,6 @@ const fn l(field: &'static str, does: &'static str) -> Slot {
 pub const SLOTS: &[Slot] = &[
     g("back", "go home to the list (closes the overlay)", true),
     g("overlord", "open the overlord", true),
-    g("mastermind", "open the mastermind", true),
     g("next", "next session", true),
     g("prev", "previous session", true),
     l("overlord", "show/hide the overlord"),
@@ -540,16 +539,6 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             ),
         };
         add(Level::Taken, text);
-    }
-    // In the overlay, ⌥m (or the mastermind key) switches seats.
-    if slot.scope == Scope::Global
-        && slot.field != "mastermind"
-        && Key::parse(cfg.tmux.mastermind_switch()).as_ref() == Some(key)
-    {
-        add(
-            Level::Taken,
-            format!("{label} switches overlord ⇄ mastermind in the overlay"),
-        );
     }
     if slot.scope == Scope::List
         && cfg.jump_digits

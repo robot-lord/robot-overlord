@@ -191,10 +191,17 @@ struct App {
     /// Latest appearance from the watcher thread (asking macOS spawns a
     /// process, which the draw loop must never wait on).
     system_dark: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether row 0 is the overlord (shown first when not filtering).
-    /// Fixed overlord rows at the top of the list (overlord, mastermind):
-    /// unnumbered, so digits count the fleet below them.
+    /// The overlord's fixed row at the top of the list (1 when shown: not
+    /// while filtering): unnumbered, so digits count the fleet below it.
     overlord_rows: usize,
+    /// The overlord's conversations (`overlord.conversations`: the current
+    /// one and the earlier ones), loaded while its row is selected.
+    convs: Value,
+    /// Which of them the preview shows: 0 the live pane, n the nth earlier
+    /// conversation (newest first).
+    conv_sel: usize,
+    /// That conversation's text, by id (read once).
+    conv_text: Option<(String, String)>,
     /// Session to select once the next refresh lands (set by the overlord).
     pending_select: Option<String>,
     /// The selection as last saved with the daemon (kept across restarts).
@@ -246,6 +253,9 @@ impl App {
             dark: true,
             system_dark: Default::default(),
             overlord_rows: 0,
+            convs: Value::Null,
+            conv_sel: 0,
+            conv_text: None,
             pending_select: None,
             saved_sel: None,
             reported_view: Value::Null,
@@ -312,14 +322,12 @@ impl App {
                 }
                 self.regroup();
             } else if self.filter.trim().is_empty() && !self.show_archived {
-                // The overlord, and under it the mastermind once it exists.
-                let seats = self
-                    .call("overlord.get", json!({"seat": "all"}))
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default();
-                for o in seats {
-                    self.sessions.insert(self.overlord_rows, o);
-                    self.overlord_rows += 1;
+                if let Some(o) = self
+                    .call("overlord.get", json!({}))
+                    .filter(|o| !o.is_null())
+                {
+                    self.sessions.insert(0, o);
+                    self.overlord_rows = 1;
                 }
             }
             let n = self.sessions.len();
@@ -396,6 +404,49 @@ impl App {
             .map(str::to_string)
     }
 
+    /// The text of the overlord's earlier conversation the preview is on
+    /// (read once: it no longer changes).
+    fn conversation_text(&mut self) -> String {
+        let Some(id) = self
+            .earlier_convs()
+            .get(self.conv_sel - 1)
+            .and_then(|c| c["id"].as_str())
+            .map(str::to_string)
+        else {
+            return String::new();
+        };
+        if let Some((have, text)) = &self.conv_text {
+            if *have == id {
+                return text.clone();
+            }
+        }
+        let text = match client_call(
+            &paths::socket_path(),
+            "overlord.conversation",
+            json!({"id": id}),
+        ) {
+            Ok(v) => v["messages"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|m| {
+                            let who = match m["who"].as_str().unwrap_or("") {
+                                "you" => "you",
+                                "agent" => "overlord",
+                                w => w,
+                            };
+                            format!("{who} ▸ {}\n", m["text"].as_str().unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default(),
+            Err(e) => format!("(can't show it: {e:#})"),
+        };
+        self.conv_text = Some((id, text.clone()));
+        text
+    }
+
     /// The highlight moved: redraw now, load its preview and details when
     /// the keys pause.
     pub(crate) fn preview_soon(&mut self) {
@@ -421,6 +472,15 @@ impl App {
             self.agents.clear();
             return;
         };
+        // The overlord's conversations, while its row is selected.
+        if is_overlord_role(&s) {
+            self.convs = client_call(&paths::socket_path(), "overlord.conversations", json!({}))
+                .unwrap_or(Value::Null);
+            self.conv_sel = self.conv_sel.min(self.earlier_convs().len());
+        } else {
+            self.convs = Value::Null;
+            self.conv_sel = 0;
+        }
         self.agents = client_call(
             &paths::socket_path(),
             "session.subagents",
@@ -431,6 +491,8 @@ impl App {
         .unwrap_or_default();
         self.preview_rich = None;
         self.preview_text = match self.preview {
+            // One of the overlord's earlier conversations, not its pane.
+            Preview::Pane if self.conv_sel > 0 => self.conversation_text(),
             Preview::Pane => {
                 let running = s["status"] != "stopped";
                 match s["tmux_session"].as_str() {
@@ -624,6 +686,21 @@ impl App {
         if self.handle_groups_key(&k, action) {
             return Ok(false);
         }
+        // On the overlord's row, [ and ] step through its earlier
+        // conversations in the preview (unless the user bound them).
+        if action.is_none() && k.modifiers.is_empty() && self.selected_is_overlord() {
+            match k.code {
+                KeyCode::Char('[') => {
+                    self.show_conversation(self.conv_sel + 1);
+                    return Ok(false);
+                }
+                KeyCode::Char(']') => {
+                    self.show_conversation(self.conv_sel.saturating_sub(1));
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         let Some(action) = action else {
             if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
                 self.quit_hint();
@@ -666,6 +743,11 @@ impl App {
                     self.preview_soon();
                 }
             }
+            // An earlier conversation of the overlord's is in the preview:
+            // Enter continues it (asked first).
+            Action::Attach if self.selected_is_overlord() && self.conv_sel > 0 => {
+                self.confirm_continue()
+            }
             Action::Attach => self.attach(terminal)?,
             Action::Restart | Action::Stop
                 if self.selected().is_some_and(|s| !s["archived_at"].is_null()) =>
@@ -689,7 +771,8 @@ impl App {
                     "the overlord's row is fixed: it can only be attached, restarted or stopped"
                         .into();
             }
-            Action::Archive => self.action("session.archive", "archived"),
+            // Too easy to hit by accident: asked first.
+            Action::Archive => self.confirm_archive(),
             Action::Overlord => self.show_overlord(),
             Action::Unarchive => self.action("session.unarchive", "unarchived"),
             Action::Pin => {
@@ -759,6 +842,7 @@ impl App {
             }
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
+            Action::Cancel if self.conv_sel > 0 => self.show_conversation(0),
             Action::Cancel => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
@@ -767,6 +851,23 @@ impl App {
             }
         }
         Ok(false)
+    }
+
+    /// The overlord's earlier conversations, as last loaded.
+    fn earlier_convs(&self) -> &[Value] {
+        self.convs["earlier"].as_array().map_or(&[], |a| a)
+    }
+
+    /// Show the overlord's `n`th earlier conversation in the preview (0:
+    /// its live pane again).
+    pub(crate) fn show_conversation(&mut self, n: usize) {
+        let max = self.earlier_convs().len();
+        if max == 0 {
+            self.status_line = "the overlord has no earlier conversations yet".into();
+        }
+        self.conv_sel = n.min(max);
+        self.preview_scroll = 0;
+        self.refresh_preview();
     }
 
     fn action(&mut self, method: &str, verb: &str) {
@@ -987,12 +1088,11 @@ impl App {
         if is_overlord_role(&s) {
             // Like any session, full screen — started/resumed if needed, and
             // its window handed back from whatever size an overlay set.
-            let seat = rlord_daemon::overlord::seat(s["role"].as_str().unwrap_or(""));
-            match self.call("overlord.ensure", json!({"seat": seat.key})) {
+            match self.call("overlord.ensure", json!({})) {
                 Some(v) => s = v,
                 None => return Ok(()),
             }
-            let _ = tmux::auto_size_window(seat.tmux);
+            let _ = tmux::auto_size_window(rlord_daemon::overlord::TMUX_NAME);
         } else if s["status"] == "stopped"
             || !s["tmux_session"].as_str().is_some_and(tmux::has_session)
         {
@@ -1233,13 +1333,7 @@ impl App {
                 let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
                 let status = get("status");
                 let is_overlord = is_overlord_role(s);
-                let is_mastermind = s["role"] == "mastermind";
-                // Each seat in its own colour, as in its bar and overlay.
-                let seat_color = if is_mastermind {
-                    theme::mastermind()
-                } else {
-                    theme::overlord()
-                };
+                let seat_color = theme::overlord();
                 let num = i.saturating_sub(self.overlord_rows);
                 let mut cells = vec![
                     if is_overlord {
@@ -1260,11 +1354,7 @@ impl App {
                     // Which agent runs it (its marker), then its name.
                     Cell::from(Line::from({
                         let mut spans = theme::agent_marker(s["agent"].as_str().unwrap_or(""));
-                        spans.push(Span::raw(if is_mastermind {
-                            format!("↳ {}", get("name"))
-                        } else {
-                            get("name")
-                        }));
+                        spans.push(Span::raw(get("name")));
                         spans
                     })),
                     Cell::from(Line::from(vec![
@@ -1306,30 +1396,37 @@ impl App {
                         .as_array()
                         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
                         .unwrap_or_default();
-                    cells.push(Cell::from(Line::from(theme::tag_spans(tags))));
+                    cells.push(if is_overlord {
+                        // Its conversation: when it started fresh, and how
+                        // many came before (in full under Project, when
+                        // that column shows).
+                        Cell::from(if show_project {
+                            String::new()
+                        } else {
+                            fresh_short(&s["conversations"])
+                        })
+                        .fg(theme::faint_c())
+                    } else {
+                        Cell::from(tags_cell(&tags, TAGS_W as usize))
+                    });
                 }
                 if show_project {
                     cells.push(if is_overlord {
                         Cell::from(format!(
-                            "{} · {} to talk",
+                            "{} · {} to talk{}",
                             s["model"].as_str().unwrap_or("default model"),
-                            // Only a key that works from the list: the
-                            // mastermind's global key if bound, else enter.
-                            if !is_mastermind {
-                                self.keys.label(Action::Overlord)
-                            } else if self.config.tmux.mastermind.trim().is_empty() {
-                                self.keys.label(Action::Attach)
-                            } else {
-                                tmux::key_label(&self.config.tmux.mastermind)
-                            }
+                            self.keys.label(Action::Overlord),
+                            rlord_daemon::recall::fresh_label(&s["conversations"])
+                                .map(|l| format!(" · {l}"))
+                                .unwrap_or_default(),
                         ))
                         .fg(theme::faint_c())
                     } else {
                         Cell::from(get("project_path").replacen(&home, "~", 1)).fg(theme::faint_c())
                     });
                 }
-                // A line of space under the overlord rows: they're a
-                // section of their own, not the top of the sorted list.
+                // A line of space under the overlord's row: it's a
+                // section of its own, not the top of the sorted list.
                 let last_seat = self.overlord_rows > 0
                     && i + 1 == self.overlord_rows
                     && self.sessions.len() > self.overlord_rows;
@@ -1443,6 +1540,19 @@ impl App {
             Preview::Pane => ("live pane", "log"),
             Preview::Log => ("event log", "pane"),
         };
+        let what = if self.preview == Preview::Pane && self.conv_sel > 0 {
+            format!(
+                "earlier conversation {} of {} · [ older · ] newer · {} continue it · {} back",
+                self.conv_sel,
+                self.convs["total_earlier"]
+                    .as_u64()
+                    .unwrap_or(self.conv_sel as u64),
+                self.keys.label(Action::Attach),
+                self.keys.label(Action::Cancel),
+            )
+        } else {
+            what.to_string()
+        };
         let title = Line::from(vec![
             Span::raw(" "),
             Span::styled(name.to_string(), Style::default().fg(theme::text()).bold()),
@@ -1485,7 +1595,7 @@ impl App {
         let current = self.preview_for == self.selected_id();
         let text: Text = match &self.preview_rich {
             _ if !current => Text::from(Span::styled("…", theme::faint())),
-            Some(rich) if self.preview == Preview::Pane => {
+            Some(rich) if self.preview == Preview::Pane && self.conv_sel == 0 => {
                 Text::from(rich.lines[window(rich.lines.len())].to_vec())
             }
             _ => {
@@ -1499,7 +1609,13 @@ impl App {
             }
         };
         let block = theme::panel(title, false).title(switch);
-        f.render_widget(Paragraph::new(text).block(block), area);
+        // A conversation is prose: wrapped (a pane is drawn as it is).
+        let p = Paragraph::new(text).block(block);
+        if self.preview == Preview::Pane && self.conv_sel > 0 {
+            f.render_widget(p.wrap(Wrap { trim: false }), area);
+        } else {
+            f.render_widget(p, area);
+        }
     }
 
     /// The control-layer card: everything we know about the session that
@@ -1510,6 +1626,9 @@ impl App {
             f.render_widget(block, area);
             return;
         };
+        if is_overlord_role(s) {
+            return self.draw_overlord_details(f, area, s);
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         let tilde = |p: &str| p.replacen(&home, "~", 1);
         let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
@@ -1710,6 +1829,147 @@ impl App {
                 .wrap(Wrap { trim: false }),
             area,
         );
+    }
+
+    /// The overlord's card: what runs it, then its conversations. It
+    /// restarts on a fresh one after sitting idle; the earlier ones are
+    /// listed (newest first) and can be looked at in the preview.
+    fn draw_overlord_details(&self, f: &mut Frame, area: Rect, s: &Value) {
+        f.render_widget(theme::panel(theme::title("Details"), false), area);
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(2),
+        };
+        let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
+        let key = |k: &str| Span::styled(format!("{k:<10}"), theme::faint());
+        let sep = || Span::styled("  ·  ", theme::faint());
+        let c = &s["conversations"];
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(get("name"), Style::default().fg(theme::overlord()).bold()),
+                Span::raw("   "),
+                theme::status_chip(&get("status")),
+                Span::styled(
+                    format!("  ·  {} to talk", self.keys.label(Action::Overlord)),
+                    theme::muted(),
+                ),
+            ]),
+            Line::from({
+                let mut l = vec![key("agent")];
+                l.extend(theme::agent_marker(&get("agent")));
+                l.extend([
+                    Span::styled(get("agent"), Style::default().fg(theme::text())),
+                    sep(),
+                    Span::styled(
+                        s["model"].as_str().unwrap_or("default model").to_string(),
+                        Style::default().fg(theme::text()),
+                    ),
+                    sep(),
+                    Span::styled(
+                        match self.config.overlord.effort.trim() {
+                            "" => "default effort".to_string(),
+                            e => format!("effort {e}"),
+                        },
+                        theme::muted(),
+                    ),
+                ]);
+                if let Some(st) = s["remote"]["state"].as_str() {
+                    l.push(sep());
+                    l.push(Span::styled(format!("remote {st}"), theme::muted()));
+                }
+                l
+            }),
+            Line::from(vec![
+                key("fresh"),
+                Span::styled(
+                    match rlord_daemon::recall::fresh_label(c) {
+                        Some(l) => format!(
+                            "{}  ({})",
+                            l.trim_start_matches("fresh "),
+                            c["why"].as_str().unwrap_or("a fresh conversation")
+                        ),
+                        None => match self.config.overlord.fresh_after_mins {
+                            0 => "never restarted (fresh restarts are off)".to_string(),
+                            m => format!(
+                                "its first conversation (a fresh one starts after {m}m idle)"
+                            ),
+                        },
+                    },
+                    theme::muted(),
+                ),
+            ]),
+        ];
+        let earlier = self.earlier_convs();
+        if !earlier.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "earlier conversations  ·  [ ] look  ·  {} continues the one shown",
+                    self.keys.label(Action::Attach)
+                ),
+                theme::faint(),
+            )));
+        }
+        let head = lines.len() as u16;
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                height: head.min(inner.height),
+                ..inner
+            },
+        );
+        // The list, scrolled so the one in the preview stays in view.
+        let list = Rect {
+            y: inner.y + head,
+            height: inner.height.saturating_sub(head),
+            ..inner
+        };
+        if list.height == 0 {
+            return;
+        }
+        let rows = list.height as usize;
+        let sel = self.conv_sel.checked_sub(1);
+        let top = sel.map_or(0, |i| i.saturating_sub(rows - 1));
+        let mut out = Vec::new();
+        for (i, c) in earlier.iter().enumerate().skip(top).take(rows) {
+            let on = sel == Some(i);
+            let turns = c["turns"].as_u64().unwrap_or(0);
+            let ended = match c["ended"].as_str().unwrap_or("") {
+                "idle" => "idle",
+                "clear" => "/clear",
+                "manual" => "restart",
+                "continued" => "left",
+                _ => "moved on",
+            };
+            out.push(Line::from(vec![
+                Span::styled(
+                    if on { "▸ " } else { "  " },
+                    Style::default().fg(theme::accent()),
+                ),
+                Span::styled(
+                    format!("{:>4} ago  ", rel_age(c["ended_at"].as_i64())),
+                    theme::muted(),
+                ),
+                Span::styled(format!("{turns:>3} turns  "), theme::faint()),
+                Span::styled(format!("{ended:<9}"), theme::faint()),
+                Span::styled(
+                    match c["first_prompt"].as_str() {
+                        Some(p) => p.to_string(),
+                        None if c["on_disk"] == false => "(transcript gone)".to_string(),
+                        None => "(nothing said)".to_string(),
+                    },
+                    if on {
+                        Style::default().fg(theme::text()).bold()
+                    } else {
+                        Style::default().fg(theme::text())
+                    },
+                ),
+            ]));
+            self.hits
+                .row(list, list.y + (i - top) as u16, mouse::Hit::Conv(i + 1));
+        }
+        f.render_widget(Paragraph::new(out), list);
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -2013,7 +2273,36 @@ fn edit_in_editor(
     r
 }
 
-/// The overlord's rows (overlord, mastermind): fixed, special rows.
+/// The Groups column of a row: its tags when they fit in `width`, else how
+/// many groups it is in ("3 groups"), never a tag cut mid-word. All of them
+/// show in the details pane and the groups tab.
+fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    // `#a #b`: a `#` each, a space between.
+    let need: usize =
+        tags.iter().map(|t| t.width() + 1).sum::<usize>() + tags.len().saturating_sub(1);
+    if need <= width {
+        return Line::from(theme::tag_spans(tags.iter().copied()));
+    }
+    Line::from(Span::styled(
+        match tags.len() {
+            1 => "1 group".to_string(),
+            n => format!("{n} groups"),
+        },
+        theme::muted(),
+    ))
+}
+
+/// The overlord's conversation in a narrow column: "fresh 2h · 14" (when
+/// it started, how many came before); empty when it has never restarted.
+fn fresh_short(c: &Value) -> String {
+    match c["earlier"].as_u64() {
+        Some(n) if n > 0 => format!("fresh {} · {n}", rel_age(c["fresh_at"].as_i64())),
+        _ => String::new(),
+    }
+}
+
+/// The overlord's row: fixed, special.
 fn is_overlord_role(s: &Value) -> bool {
     rlord_daemon::overlord::is_overlord_role(s["role"].as_str().unwrap_or(""))
 }

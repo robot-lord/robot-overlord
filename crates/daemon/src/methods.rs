@@ -406,7 +406,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let extra_args = str_list(params, "extra_args");
     let role = p_opt("role").unwrap_or_default();
     if crate::overlord::is_overlord_role(&role) {
-        agent.overlord_seat()?;
+        agent.runs_overlord()?;
     }
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(agent) {
@@ -655,20 +655,19 @@ pub(crate) fn import_candidate(
 fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
     // own check still catches.
-    // The seats' fixed names are reserved, even before the seats exist.
-    let reserved =
-        |n: &str| n == crate::overlord::FRONT.tmux || n == crate::overlord::MASTERMIND.tmux;
+    // The overlord's fixed name is reserved, even before it exists.
+    let reserved = |n: &str| n == crate::overlord::TMUX_NAME;
     rlord_core::names::tmux_name_for(name, |n| {
         Some(n) != own
             && (reserved(n) || db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
     })
 }
 
-/// The tmux name a session should have: a seat's fixed one, else its name
-/// plus `-rlord`.
+/// The tmux name a session should have: the overlord's fixed one, else its
+/// name plus `-rlord`.
 fn wanted_tmux_name(db: &Db, s: &rlord_core::types::Session) -> Option<String> {
     if crate::overlord::is_overlord_role(&s.role) {
-        return Some(crate::overlord::seat(&s.role).tmux.to_string());
+        return Some(crate::overlord::TMUX_NAME.to_string());
     }
     let cur = s.tmux_session.as_deref();
     if cur.is_some_and(|c| rlord_core::names::is_tmux_name_for(c, &s.name)) {
@@ -708,11 +707,11 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
         include_overlord: true,
         ..Default::default()
     })?;
-    // The seats first: their fixed names must never be taken by another.
-    let (seats, rest): (Vec<_>, Vec<_>) = all
+    // The overlord first: its fixed name must never be taken by another.
+    let (overlord, rest): (Vec<_>, Vec<_>) = all
         .into_iter()
         .partition(|s| crate::overlord::is_overlord_role(&s.role));
-    for s in seats.into_iter().chain(rest) {
+    for s in overlord.into_iter().chain(rest) {
         if let Err(e) = sync_tmux_name(db, &s) {
             tracing::warn!(session = %s.id, error = %e, "renaming tmux session");
         }
@@ -792,7 +791,9 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
 
 /// Restart a session's agent on a **fresh conversation** in its pane (a new
 /// conversation id, not a resume). The old conversation stays on disk and
-/// can still be resumed with the agent's own `--resume`.
+/// can still be resumed with the agent's own `--resume`. `reason` says why
+/// in the event (`idle`: the overlord's idle restart, with `idle_mins`;
+/// `manual` otherwise).
 pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     let agent = Agent::named(&s.agent)?;
@@ -833,7 +834,10 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
         &s.id,
         now,
         "fresh_conversation",
-        &json!({"from": s.agent_session, "to": launch.session_id}).to_string(),
+        &json!({"from": s.agent_session, "to": launch.session_id,
+                "reason": params["reason"].as_str().unwrap_or("manual"),
+                "idle_mins": params["idle_mins"]})
+        .to_string(),
     )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
@@ -961,12 +965,27 @@ pub(crate) fn hook_emit_with(
             }
             (Whose::Adopt, Some(sid)) => {
                 // The agent is the truth about what it's writing; adopt, but log it.
-                db.insert_event(
-                    &s.id,
-                    now,
-                    "agent_session_changed",
-                    &json!({"from": s.agent_session, "to": sid}).to_string(),
-                )?;
+                // The user's own `/clear` (Claude says so when the new
+                // conversation starts) is a fresh conversation like an idle
+                // restart, so the history of them is complete.
+                if cleared(event, &payload) {
+                    db.insert_event(
+                        &s.id,
+                        now,
+                        "fresh_conversation",
+                        &json!({"from": s.agent_session, "to": sid, "reason": "clear"}).to_string(),
+                    )?;
+                    if crate::overlord::is_overlord_role(&s.role) {
+                        db.kv_set(crate::overlord::FRESH_AT, &now.to_string())?;
+                    }
+                } else {
+                    db.insert_event(
+                        &s.id,
+                        now,
+                        "agent_session_changed",
+                        &json!({"from": s.agent_session, "to": sid}).to_string(),
+                    )?;
+                }
                 db.set_agent_session(&s.id, sid, "hook")?;
             }
             (Whose::Unbound, _) => {
@@ -1073,6 +1092,12 @@ pub(crate) fn hook_emit_with(
         )?;
     }
     Ok(json!({"ok": true}))
+}
+
+/// Whether a hook says the user cleared the conversation: Claude's
+/// SessionStart carries `source: "clear"` for the one a `/clear` starts.
+fn cleared(event: &str, payload: &Value) -> bool {
+    event == "SessionStart" && payload["source"] == "clear"
 }
 
 /// kv key: who the session's "needs you" is for, as a JSON list ("" its

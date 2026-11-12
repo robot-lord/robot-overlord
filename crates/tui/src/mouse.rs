@@ -30,6 +30,9 @@ pub(crate) enum Hit {
     /// A sortable column header: sort by it, or flip the direction if the
     /// list is already sorted by it.
     SortBy(rlord_core::db::SortMode),
+    /// One of the overlord's earlier conversations in the details pane
+    /// (1: the newest): show it in the preview.
+    Conv(usize),
     /// Wheel areas: the session table, the group column, the preview.
     List,
     Groups,
@@ -198,14 +201,26 @@ pub(crate) enum Target {
     Group(String),
 }
 
-/// "Stop web-fix?": asked before a click stops, restarts or archives a
-/// session (a key does it at once, as always).
+/// "Stop web-fix?": asked before a click stops or restarts a session (a
+/// key does it at once, as always), before a session is archived however
+/// that was asked (key, click, menu, launcher), and before the overlord
+/// goes back to an earlier conversation.
 pub(crate) struct Confirm {
     question: String,
     /// What it does, for the button ("stop").
     verb: &'static str,
     target: Target,
-    key: KeyEvent,
+    /// What a yes does.
+    then: Then,
+}
+
+/// What a confirmation does once answered yes.
+enum Then {
+    /// Press this key on the target (a click's stop or restart).
+    Key(KeyEvent),
+    Archive,
+    /// Continue the overlord's earlier conversation with this id.
+    Continue(String),
 }
 
 /// The right-click menu: what the row (or group) under the pointer offers,
@@ -316,6 +331,10 @@ impl App {
                     self.group_focus = self.sessions.is_empty();
                 }
             }
+            // The same one again: back to the live pane.
+            Hit::Conv(i) if !right => {
+                self.show_conversation(if self.conv_sel == i { 0 } else { i })
+            }
             Hit::Pick(i) if !right => return self.pick(i, double, terminal),
             // Around a light modal: close it. (A form or a setup dialog
             // stays: a stray click mustn't lose what was entered.)
@@ -389,8 +408,9 @@ impl App {
         found
     }
 
-    /// A click asked for `k`: if that stops, restarts or archives the
-    /// highlighted session, ask first (true: a confirmation is now open).
+    /// A click asked for `k`: if that stops or restarts the highlighted
+    /// session, ask first (true: a confirmation is now open). (Archiving
+    /// asks by itself, however it was asked for: `confirm_archive`.)
     fn confirm_first(&mut self, k: KeyEvent) -> bool {
         if self.tab == Tab::Groups && self.group_focus {
             return false;
@@ -398,7 +418,6 @@ impl App {
         let verb = match self.keys.action(&k) {
             Some(Action::Stop) => "stop",
             Some(Action::Restart) => "restart",
-            Some(Action::Archive) => "archive",
             _ => return false,
         };
         let Some(s) = self.selected() else {
@@ -415,9 +434,50 @@ impl App {
             question,
             verb,
             target: Target::Session(id.to_string()),
-            key: k,
+            then: Then::Key(k),
         }));
         true
+    }
+
+    /// Archive the highlighted session, once the user says yes: `x` is
+    /// too easy to hit by accident. (Bulk archiving goes through the
+    /// overlord, which doesn't ask.)
+    pub(crate) fn confirm_archive(&mut self) {
+        let Some(s) = self.selected() else {
+            return;
+        };
+        let (Some(id), name) = (s["id"].as_str(), s["name"].as_str().unwrap_or("it")) else {
+            return;
+        };
+        self.mode = Mode::Confirm(Box::new(Confirm {
+            question: format!("Archive {name}?"),
+            verb: "archive",
+            target: Target::Session(id.to_string()),
+            then: Then::Archive,
+        }));
+    }
+
+    /// Go back to the overlord's earlier conversation shown in the
+    /// preview, once the user says yes.
+    pub(crate) fn confirm_continue(&mut self) {
+        let Some(conv) = self
+            .conv_sel
+            .checked_sub(1)
+            .and_then(|i| self.earlier_convs().get(i))
+            .and_then(|c| c["id"].as_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.mode = Mode::Confirm(Box::new(Confirm {
+            question: "Continue this conversation in the overlord? (Its current one ends.)".into(),
+            verb: "continue",
+            target: Target::Session(id),
+            then: Then::Continue(conv),
+        }));
     }
 
     /// Returns true to quit.
@@ -437,7 +497,21 @@ impl App {
         if !self.reselect(&c.target) {
             return Ok(false);
         }
-        self.handle_key(c.key, terminal)
+        match c.then {
+            Then::Key(k) => return self.handle_key(k, terminal),
+            Then::Archive => self.action("session.archive", "archived"),
+            Then::Continue(conv) => {
+                if self
+                    .call("overlord.continue", json!({"id": conv}))
+                    .is_some()
+                {
+                    self.status_line = "the overlord is back on that conversation".into();
+                }
+                self.conv_sel = 0;
+                self.dirty = true;
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn draw_confirm(&self, f: &mut Frame, c: &Confirm) {
@@ -450,7 +524,7 @@ impl App {
             Line::from(""),
             keys_line(&[
                 ("y/enter", c.verb, Cap::Context),
-                ("any key", "cancel", Cap::Global),
+                ("n/esc", "cancel", Cap::Global),
             ]),
         ];
         self.modal_hits(f.area(), area, &lines);
@@ -467,7 +541,8 @@ impl App {
         if !self.reselect(target) {
             return Ok(false);
         }
-        // (The menu came from a click: stop, restart, archive ask first.)
+        // (The menu came from a click: stop and restart ask first; archive
+        // asks by itself.)
         if self.confirm_first(key) {
             return Ok(false);
         }

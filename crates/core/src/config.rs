@@ -114,11 +114,6 @@ pub struct TmuxKeys {
     /// From any pane: jump to rlord with the overlord overlay open; in rlord:
     /// toggle the overlay.
     pub overlord: String,
-    /// The same for the mastermind (the overlord's second, deeper session),
-    /// from any pane. Off by default (it would take the key from every agent
-    /// session); inside the overlord's overlay, `mastermind_switch()` always
-    /// flips between the two.
-    pub mastermind: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
@@ -138,7 +133,6 @@ impl Default for TmuxKeys {
             next: String::new(),
             prev: String::new(),
             overlord: "M-o".into(),
-            mastermind: String::new(),
             profile: true,
             mouse: true,
         }
@@ -146,16 +140,6 @@ impl Default for TmuxKeys {
 }
 
 impl TmuxKeys {
-    /// The key that switches the overlay to the mastermind: the configured
-    /// global key, else `M-m` (inside the overlay only).
-    pub fn mastermind_switch(&self) -> &str {
-        if self.mastermind.trim().is_empty() {
-            "M-m"
-        } else {
-            &self.mastermind
-        }
-    }
-
     /// (key, nav verb) pairs for every enabled binding.
     pub fn bindings(&self) -> Vec<(&str, &'static str)> {
         [
@@ -163,7 +147,6 @@ impl TmuxKeys {
             (&self.next, "next"),
             (&self.prev, "prev"),
             (&self.overlord, "overlord"),
-            (&self.mastermind, "mastermind"),
         ]
         .into_iter()
         .filter(|(k, _)| !k.trim().is_empty())
@@ -173,46 +156,110 @@ impl TmuxKeys {
 }
 
 /// The overlord: the long-running session you talk to in order to drive
-/// rlord itself (launch sessions, search, navigate, set views).
+/// rlord itself (launch sessions, search, navigate, set views). One session:
+/// a strong model at low effort, which does light work itself and sends
+/// anything heavier to a subagent or a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "OverlordToml")]
 pub struct OverlordConfig {
     /// Coding tool. Only `claude` today.
     pub agent: String,
-    /// Model for the overlord: the quick front desk you summon with Alt-O.
-    /// It does mechanical work itself and hands anything that needs thought
-    /// to the mastermind, so a fast model fits. Empty = the agent's default.
+    /// Its model. Empty = the agent's own default.
     pub model: String,
     /// Its effort level (`low`..`max`; empty = the agent's default).
     pub effort: String,
-    /// Model for the mastermind: the second overlord session that launches
-    /// sessions and takes one-off questions — where judgment pays.
-    pub mastermind_model: String,
-    pub mastermind_effort: String,
-    /// Restart an idle mastermind on a fresh conversation after this many
+    /// Restart an idle overlord on a fresh conversation after this many
     /// minutes without activity (while you're not looking at it), so its
     /// context doesn't keep growing. 0 = never.
-    pub mastermind_fresh_after_mins: u64,
+    pub fresh_after_mins: u64,
     /// Size of the overlord overlay in the TUI: `90%` of the screen, or a
     /// cell count.
-    #[serde(alias = "popup_width")]
     pub width: String,
-    #[serde(alias = "popup_height")]
     pub height: String,
+}
+
+impl OverlordConfig {
+    /// The overlord's default (model, effort) on `agent`: a strong model at
+    /// low effort. Claude: Opus / low. Codex: its own default model with
+    /// `model_reasoning_effort = "low"`. OpenCode: its default model; it has
+    /// no effort to set.
+    pub fn defaults_for(agent: &str) -> (&'static str, &'static str) {
+        match agent.trim() {
+            "claude" | "" => ("opus", "low"),
+            "codex" => ("", "low"),
+            _ => ("", ""),
+        }
+    }
+
+    /// The effort levels offered for `agent` ("" = the agent's default);
+    /// empty when it has none to set.
+    pub fn efforts_for(agent: &str) -> &'static [&'static str] {
+        match agent.trim() {
+            "claude" | "" => &["low", "medium", "high", "max"],
+            "codex" => &["low", "medium", "high"],
+            _ => &[],
+        }
+    }
+}
+
+/// `[overlord]` as written, which may be from when the overlord was two
+/// sessions (a fast front desk on `model` / `effort`, and a mastermind on
+/// `mastermind_model` / `mastermind_effort`). The mastermind is the overlord
+/// now, so its keys carry over; see `From<OverlordToml>`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct OverlordToml {
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    mastermind_model: Option<String>,
+    mastermind_effort: Option<String>,
+    fresh_after_mins: Option<u64>,
+    mastermind_fresh_after_mins: Option<u64>,
+    #[serde(alias = "popup_width")]
+    width: Option<String>,
+    #[serde(alias = "popup_height")]
+    height: Option<String>,
+}
+
+/// The old front desk's defaults: next to a `mastermind_*` key they are the
+/// removed seat's values (the old template wrote both), not a choice for
+/// the overlord.
+const OLD_FRONT_MODEL: &str = "sonnet";
+const OLD_FRONT_EFFORT: &str = "low";
+
+impl From<OverlordToml> for OverlordConfig {
+    /// What the user wrote wins; only the defaults changed. `model` /
+    /// `effort` win over the old `mastermind_*` keys, unless they are just
+    /// the old front desk's defaults sitting beside one: then the
+    /// mastermind's value carries over.
+    fn from(t: OverlordToml) -> Self {
+        let agent = t.agent.unwrap_or_else(|| "claude".into());
+        let (model_dflt, effort_dflt) = OverlordConfig::defaults_for(&agent);
+        let pick =
+            |own: Option<String>, old: Option<String>, front: &str, dflt: &str| match (own, old) {
+                (Some(o), Some(_)) if o.trim() != front => o,
+                (_, Some(m)) => m,
+                (Some(o), None) => o,
+                (None, None) => dflt.to_string(),
+            };
+        OverlordConfig {
+            model: pick(t.model, t.mastermind_model, OLD_FRONT_MODEL, model_dflt),
+            effort: pick(t.effort, t.mastermind_effort, OLD_FRONT_EFFORT, effort_dflt),
+            fresh_after_mins: t
+                .fresh_after_mins
+                .or(t.mastermind_fresh_after_mins)
+                .unwrap_or(15),
+            width: t.width.unwrap_or_else(|| "90%".into()),
+            height: t.height.unwrap_or_else(|| "85%".into()),
+            agent,
+        }
+    }
 }
 
 impl Default for OverlordConfig {
     fn default() -> Self {
-        OverlordConfig {
-            agent: "claude".into(),
-            model: "sonnet".into(),
-            effort: "low".into(),
-            mastermind_model: "opus".into(),
-            mastermind_effort: "medium".into(),
-            mastermind_fresh_after_mins: 15,
-            width: "90%".into(),
-            height: "85%".into(),
-        }
+        OverlordToml::default().into()
     }
 }
 
@@ -425,22 +472,66 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let out = set_in(&text, section, field, value)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        // A symlinked config (a dotfiles repo) is written where it points.
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &out)?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_config(&path, &set_in(&text, section, field, value)?)
+    }
+
+    /// Save the overlord's agent, model and effort (the setup dialog's
+    /// choice) under `[overlord]`, keeping the rest of the file as written.
+    /// Keys from the two-session overlord (`mastermind_model`,
+    /// `mastermind_effort`) are dropped: the values chosen here replace them.
+    pub fn set_overlord(agent: &str, model: &str, effort: &str) -> Result<()> {
+        let path = paths::config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        write_config(&path, &set_overlord_in(&text, agent, model, effort)?)
     }
 
     /// Commented template written by `rlord config init`; equals the defaults.
     pub fn default_toml() -> String {
         DEFAULT_TOML.to_string()
     }
+}
+
+/// Write the config file's new text (already checked to load).
+fn write_config(path: &std::path::Path, out: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // A symlinked config (a dotfiles repo) is written where it points.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// `text` with the overlord's agent, model and effort set, and the old
+/// two-session keys they replace removed (see `Config::set_overlord`).
+fn set_overlord_in(text: &str, agent: &str, model: &str, effort: &str) -> Result<String> {
+    let mut out = text.to_string();
+    for (field, value) in [("agent", agent), ("model", model), ("effort", effort)] {
+        out = set_in(&out, "overlord", field, value)?;
+    }
+    let mut doc: toml_edit::DocumentMut = out.parse().context("parsing the edited config")?;
+    if let Some(t) = doc["overlord"].as_table_mut() {
+        t.remove("mastermind_model");
+        t.remove("mastermind_effort");
+    }
+    let out = doc.to_string();
+    let c = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+    // What was chosen is what loads (nothing left over outranks it).
+    if (
+        c.overlord.agent.as_str(),
+        c.overlord.model.as_str(),
+        c.overlord.effort.as_str(),
+    ) != (agent, model, effort)
+    {
+        anyhow::bail!("the overlord's settings didn't take in config.toml");
+    }
+    Ok(out)
 }
 
 /// `text` with `[section] field = value` set (see `Config::set_value`).
@@ -512,18 +603,15 @@ claude_tui = "default"          # Claude's renderer here: "default" (inline: tmu
 # launch sessions, search, jump around, set the list's sort/filter. It gets
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
-# The overlord is two sessions. The overlord (Alt-O; Option-O on a Mac) is a
-# quick front desk: it navigates, organizes and answers from rlord's tools
-# itself, and hands anything that needs thought to the mastermind (Alt-M), which
-# launches sessions and takes one-off questions. Fast model up front, a
-# strong one behind.
+# One session (Alt-O; Option-O on a Mac): a strong model at low effort. It
+# does light work itself (look-ups, small edits, short answers) and sends
+# anything heavier to a subagent or a new session. Too shallow for you?
+# Raise the effort to "medium".
 [overlord]
 agent = "claude"
-model = "sonnet"
+model = "opus"
 effort = "low"
-mastermind_model = "opus"
-mastermind_effort = "medium"
-mastermind_fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
+fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
 
@@ -573,9 +661,7 @@ command = ":"           # command launcher (keys, sort, log, archived, …)
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
 next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
-overlord = "M-o" # from any pane: the overlord (quick front desk) over it
-mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
-                  # overlord's overlay, Alt-M (Option-M on a Mac) always switches to it)
+overlord = "M-o" # from any pane: the overlord over it
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 mouse = true     # click and scroll in the list, the overlay and agent panes
                  # (drag-select then needs Shift; Option in some macOS
@@ -656,12 +742,9 @@ mod tests {
         assert_eq!(c.preview_refresh_ms, 500);
         assert!(c.session.workspace);
         assert_eq!(c.session.workspace_dir, ".worktrees");
-        assert_eq!(c.overlord.model, "sonnet");
+        assert_eq!(c.overlord.model, "opus");
         assert_eq!(c.overlord.effort, "low");
-        assert_eq!(c.overlord.mastermind_model, "opus");
-        assert_eq!(c.overlord.mastermind_effort, "medium");
-        assert_eq!(c.tmux.mastermind, "");
-        assert_eq!(c.tmux.mastermind_switch(), "M-m");
+        assert_eq!(c.overlord.fresh_after_mins, 15);
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
     }
@@ -674,7 +757,65 @@ mod tests {
         assert_eq!(c.layout, Layout::Stack);
         assert_eq!(c.keys.quit, "Q");
         assert_eq!(c.keys.attach, "enter");
-        // back disabled, next/prev/mastermind off by default; the overlord remains
+        // back disabled, next/prev off by default; the overlord remains
         assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
+    }
+
+    /// A config from the two-seat overlord: the mastermind's keys become
+    /// the overlord's; what the user set for the overlord itself wins.
+    #[test]
+    fn old_overlord_keys_map_onto_the_one_overlord() {
+        let o = |t: &str| toml::from_str::<Config>(t).unwrap().overlord;
+        // Nothing set: the new defaults.
+        let d = o("");
+        assert_eq!((d.model.as_str(), d.effort.as_str()), ("opus", "low"));
+        // The old template, as written: the mastermind carries over (the
+        // front desk's sonnet / low are the removed seat's).
+        let t = o("[overlord]\nmodel = \"sonnet\"\neffort = \"low\"\n\
+                   mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
+                   mastermind_fresh_after_mins = 30\n");
+        assert_eq!((t.model.as_str(), t.effort.as_str()), ("opus", "medium"));
+        assert_eq!(t.fresh_after_mins, 30);
+        // Only the old keys.
+        let m = o("[overlord]\nmastermind_model = \"fable\"\nmastermind_effort = \"high\"\n");
+        assert_eq!((m.model.as_str(), m.effort.as_str()), ("fable", "high"));
+        // An explicit model / effort wins over the old keys.
+        let e = o("[overlord]\nmodel = \"haiku\"\neffort = \"max\"\n\
+                   mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
+                   fresh_after_mins = 0\nmastermind_fresh_after_mins = 30\n");
+        assert_eq!((e.model.as_str(), e.effort.as_str()), ("haiku", "max"));
+        assert_eq!(e.fresh_after_mins, 0);
+        // On its own, sonnet is a choice.
+        assert_eq!(o("[overlord]\nmodel = \"sonnet\"\n").model, "sonnet");
+        // Another agent: its own defaults; an old tmux key is ignored.
+        let c = o("[overlord]\nagent = \"codex\"\n[tmux]\nmastermind = \"M-m\"\n");
+        assert_eq!((c.model.as_str(), c.effort.as_str()), ("", "low"));
+        assert_eq!(OverlordConfig::defaults_for("opencode"), ("", ""));
+        assert!(OverlordConfig::efforts_for("opencode").is_empty());
+    }
+
+    /// The setup dialog's choice is what loads afterwards, whatever old
+    /// keys the file had; the rest of the file stays as written.
+    #[test]
+    fn the_overlords_choice_is_saved_over_old_keys() {
+        let old = "# mine\n[overlord]\nmodel = \"sonnet\"   # front desk\neffort = \"low\"\n\
+                   mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\nwidth = \"80%\"\n";
+        // Low, picked over the medium that carried over: it must stick.
+        let out = set_overlord_in(old, "claude", "opus", "low").unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            (c.overlord.model.as_str(), c.overlord.effort.as_str()),
+            ("opus", "low")
+        );
+        assert_eq!(c.overlord.width, "80%");
+        assert!(out.starts_with("# mine\n") && out.contains("# front desk"));
+        assert!(!out.contains("mastermind"));
+        // An empty file gains the section.
+        let out = set_overlord_in("", "claude", "sonnet", "").unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            (c.overlord.model.as_str(), c.overlord.effort.as_str()),
+            ("sonnet", "")
+        );
     }
 }

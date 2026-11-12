@@ -22,7 +22,7 @@ use rlord_core::types::Status;
 use crate::{overlord, Daemon};
 
 /// How long to wait for a just-(re)started overlord to accept input.
-/// (A first-time mastermind on a big model can take a while.)
+/// (A first start on a big model can take a while.)
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
@@ -33,29 +33,31 @@ pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
         .filter(|t| !t.is_empty())
         .context("nothing to send")?
         .to_string();
-    send_to(d, &overlord::FRONT, &text)
+    send(d, &text)
 }
 
-/// Type `text` into a seat's pane (starting the seat if needed). The
-/// mastermind starts on first use; the overlord must have been set up.
-pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
-    // Not while an idle mastermind is being restarted fresh.
-    let _send = (seat.key == overlord::MASTERMIND.key)
-        .then(|| d.mastermind_send.lock().expect("mastermind send lock"));
+/// Type `text` into the overlord's pane (starting it if it has stopped).
+/// It must have been set up.
+pub fn send(d: &Daemon, text: &str) -> Result<Value> {
+    // Not while an idle overlord is being restarted fresh.
+    let _send = d.overlord_send.lock().expect("overlord send lock");
     if d.db().overlord()?.is_none() {
         bail!(
             "no overlord yet: press {}-O to set one up (or N for the manual form)",
             rlord_core::keys::alt_name()
         );
     }
-    let s = overlord::ensure(&d.db(), &d.config(), &json!({"seat": seat.key}))?;
-    let pane = s["tmux_session"].as_str().unwrap_or(seat.tmux).to_string();
+    let s = overlord::ensure(&d.db(), &d.config(), &json!({}))?;
+    let pane = s["tmux_session"]
+        .as_str()
+        .unwrap_or(overlord::TMUX_NAME)
+        .to_string();
     d.changed();
     // A fresh or resumed overlord isn't listening until its SessionStart hook
     // flips it out of `starting`.
     let start = Instant::now();
     loop {
-        let s = seat.session(&d.db())?.context("overlord vanished")?;
+        let s = overlord::session(&d.db())?.context("overlord vanished")?;
         if s.status != Status::Starting {
             break;
         }
@@ -126,16 +128,15 @@ pub fn in_list(p: &Value, list: &str, k: &str) -> bool {
 
 /// `{description, repo?, agent?, model?, workspace?, tags?: [..], chosen?: [..],
 /// confirmed?}` from the list's new-session form.
-/// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
-    // Each request gets an id; a form the mastermind reopens names it.
+    // Each request gets an id; a form the overlord reopens names it.
     let id = format!("r{}", &rlord_core::types::new_id()[20..]).to_lowercase();
     let mut params = params.clone();
     params["request_id"] = json!(id);
     let text = format_request(&params)?;
     // The hints as sent and whose they were, so a form reopened for this
     // request gets its labels from rlord, not from the model. Written before
-    // delivery (the mastermind may answer at once).
+    // delivery (the overlord may answer at once).
     remember_provenance(
         d,
         &id,
@@ -146,7 +147,7 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
             "workspace": params["workspace"], "tags": params["tags"],
         })),
     )?;
-    let r = match send_to(d, &overlord::MASTERMIND, &text) {
+    let r = match send(d, &text) {
         Ok(r) => r,
         Err(e) => {
             // Never delivered: nothing will answer it.
@@ -154,83 +155,9 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
             return Err(e);
         }
     };
-    // Delivered: it answers any form the mastermind had reopened.
+    // Delivered: it answers any form the overlord had reopened.
     d.db().kv_set("confirm_pending", "0")?;
     Ok(r)
-}
-
-/// `{request, context?}`: the overlord hands a request to the mastermind
-/// (verbatim, with what it knew), and the user's overlay switches to the
-/// mastermind so they can watch and carry on there.
-pub fn hand_off(d: &Daemon, params: &Value) -> Result<Value> {
-    let request = params["request"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .context("missing 'request' (the user's words, verbatim)")?;
-    let mut text = format!("[rlord hand-off from the overlord]\nrequest:\n{request}");
-    if let Some(c) = params["context"]
-        .as_str()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-    {
-        text.push_str(&format!("\ncontext:\n{c}"));
-    }
-    // Switch the user first, so they watch the mastermind start and pick
-    // the request up (a first start can take a while), then deliver it.
-    let note = show_mastermind(d);
-    send_to(d, &overlord::MASTERMIND, &text)?;
-    Ok(json!({"handed_off": true, "note": note}))
-}
-
-/// Show the mastermind where the user is: switch their open overlay, or a
-/// terminal showing the overlord full screen. Returns a note for the
-/// overlord about what the user now sees.
-fn show_mastermind(d: &Daemon) -> String {
-    let client = d
-        .overlay
-        .lock()
-        .expect("ui mutex")
-        .as_ref()
-        .map(|(c, _)| c.clone());
-    if let Some(client) = client {
-        // The overlord's overlay is about to be replaced (killed before its
-        // own cleanup): give its window its size back first.
-        let _ = rlord_core::tmux::auto_size_window(overlord::FRONT.tmux);
-        let p = json!({"seat": overlord::MASTERMIND.key, "show": true, "client": client});
-        return match crate::ui::overlord(d, &p) {
-            Ok(_) => "the user now sees the mastermind".into(),
-            Err(e) => format!(
-                "delivered, but the overlay didn't switch ({e:#}): tell the user to press {}-M in the overlay",
-                rlord_core::keys::alt_name()
-            ),
-        };
-    }
-    // Full screen on the overlord: move that terminal to the mastermind.
-    let on_front = rlord_core::tmux::list_clients()
-        .iter()
-        .any(|c| c.session == overlord::FRONT.tmux);
-    if on_front {
-        // One guard, held for the lookup, the start and the re-read (never
-        // a second lock while one is alive).
-        let mind = {
-            let db = d.db();
-            match overlord::MASTERMIND.session(&db) {
-                Ok(Some(m)) => Some(m),
-                Ok(None) => overlord::ensure(&db, &d.config(), &json!({"seat": "mastermind"}))
-                    .ok()
-                    .and_then(|v| v["id"].as_str().map(str::to_string))
-                    .and_then(|id| db.resolve_ref(&id).ok()),
-                Err(_) => None,
-            }
-        };
-        if let Some(m) = mind {
-            if crate::ui::goto(d, &json!({"ref": m.id})).is_ok() {
-                return "the user now sees the mastermind (full screen)".into();
-            }
-        }
-    }
-    "delivered; the user isn't looking at the overlord: tell them the mastermind has it (the list's ↳ mastermind row)".into()
 }
 
 /// The `[rlord new-session request]` message. Hints say whether the user

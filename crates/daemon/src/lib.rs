@@ -7,6 +7,7 @@ pub mod methods;
 pub mod opencode;
 pub mod overlord;
 pub mod profile;
+pub mod recall;
 pub mod remote;
 pub mod rpc;
 pub mod search;
@@ -53,11 +54,9 @@ pub struct Daemon {
     /// clear its successor).
     pub(crate) overlay: Mutex<Option<(String, u64)>>,
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
-    /// Which overlord seat the open overlay shows (`overlord`/`mastermind`).
-    pub(crate) overlay_seat: Mutex<&'static str>,
-    /// Held while text is pasted into the mastermind, and while an idle one
+    /// Held while text is pasted into the overlord, and while an idle one
     /// is restarted fresh: the two must not overlap.
-    pub(crate) mastermind_send: Mutex<()>,
+    pub(crate) overlord_send: Mutex<()>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
@@ -79,8 +78,7 @@ impl Daemon {
             tui_subscribers: AtomicUsize::new(0),
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
-            overlay_seat: Mutex::new(overlord::FRONT.key),
-            mastermind_send: Mutex::new(()),
+            overlord_send: Mutex::new(()),
             warm: Default::default(),
             remote: Default::default(),
             summaries: Default::default(),
@@ -191,6 +189,10 @@ impl Daemon {
             }
         }
         methods::save_cursors(&db);
+        // An overlord from when it was two sessions: now one.
+        if let Err(e) = overlord::migrate(&db) {
+            tracing::warn!(error = %e, "making the overlord one session");
+        }
         if let Err(e) = methods::sync_tmux_names(&db) {
             tracing::warn!(error = %e, "renaming legacy tmux sessions");
         }
@@ -449,29 +451,33 @@ impl Daemon {
         let r = match method {
             "overlord.ensure" => {
                 let r = overlord::ensure(&self.db(), &self.config(), params);
-                // (ensure syncs the seat's tmux keys itself.)
+                // (ensure syncs its tmux keys itself.)
                 if r.is_ok() {
                     self.changed();
                     self.bind_nav_keys();
                 }
                 r
             }
-            // `seat: "all"`: both seats' sessions (those that exist), in order.
-            "overlord.get" if params["seat"] == "all" => {
-                let db = self.db();
-                overlord::SEATS
-                    .iter()
-                    .map(|seat| seat.session(&db))
-                    .collect::<Result<Vec<_>>>()
-                    .and_then(|v| {
-                        Ok(serde_json::to_value(
-                            v.into_iter().flatten().collect::<Vec<_>>(),
-                        )?)
-                    })
+            // The overlord's session (null: not set up), with when its
+            // conversation started and how many came before.
+            "overlord.get" => overlord::session(&self.db()).and_then(|o| {
+                let Some(o) = o else {
+                    return Ok(Value::Null);
+                };
+                let mut v = serde_json::to_value(&o)?;
+                v["conversations"] = recall::summary(&self.db(), &o);
+                Ok(v)
+            }),
+            "overlord.conversations" => recall::conversations_rpc(self),
+            "overlord.conversation" => recall::conversation(self, params),
+            "overlord.recall" => recall::recall(self, params),
+            "overlord.continue" => {
+                let r = recall::continue_conversation(self, params);
+                if r.is_ok() {
+                    self.changed();
+                }
+                r
             }
-            "overlord.get" => overlord::seat(params["seat"].as_str().unwrap_or("overlord"))
-                .session(&self.db())
-                .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => {
                 // The db guard must drop before offer() locks it again.
                 let st = overlord::status(&self.db(), &self.config());
@@ -485,12 +491,11 @@ impl Daemon {
                 .db()
                 .kv_set("remote_offer_declined", "1")
                 .map(|_| json!({"declined": true})),
-            // Don't offer this seat's default model again (the user said no).
+            // Don't offer the overlord's default model again (the user said no).
             "overlord.decline_default" => {
-                let seat = overlord::seat(params["seat"].as_str().unwrap_or("overlord"));
                 let m = params["model"].as_str().unwrap_or("");
                 self.db()
-                    .kv_set(&format!("default_declined:{}", seat.key), m)
+                    .kv_set(overlord::DEFAULT_DECLINED, m)
                     .map(|_| json!({"declined": m}))
             }
             "agents.list" => methods::agents_list(),
@@ -518,7 +523,6 @@ impl Daemon {
                 r
             }
             "overlord.ask" => ask::ask(self, params),
-            "overlord.hand_off" => ask::hand_off(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
@@ -580,20 +584,6 @@ impl Daemon {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 tracing::info!(tool = name, caller = ?params.get("caller"), "mcp tool call");
-                // The mastermind does the work handed to it; it can't hand
-                // off to itself.
-                if name == "hand_off" {
-                    let caller = params["caller"].as_str().unwrap_or("");
-                    let is_mastermind = self
-                        .db()
-                        .resolve_ref(caller)
-                        .is_ok_and(|s| s.role == overlord::MASTERMIND.key);
-                    if is_mastermind {
-                        return Some(Err(anyhow::anyhow!(
-                            "you are the mastermind: do it yourself (hand_off is the overlord's)"
-                        )));
-                    }
-                }
                 mcp::call(self, name, &args)
             }
             _ => return None,

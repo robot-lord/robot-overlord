@@ -1,7 +1,9 @@
 //! The TUI's side of the overlord:
 //!
 //! - **Startup check** — no overlord yet → a setup modal that is all defaults
-//!   (Enter launches); an overlord on an outdated model → an upgrade modal.
+//!   (Enter launches; agent, model, effort and Remote Control can be
+//!   picked, and are saved to config.toml); an overlord on an outdated
+//!   model → an upgrade modal.
 //! - **UI commands** pushed by the daemon on the overlord's behalf: set the
 //!   list view, open the new-session form pre-filled.
 //! - **Opening it** — asks the daemon to pop the overlay (`rlord overlay`,
@@ -10,25 +12,48 @@
 use super::*;
 use ratatui::widgets::Clear;
 
-/// First-run setup: everything defaulted, Enter launches. Two rows: the
-/// overlord (front desk) and the mastermind, each with its model.
+/// First-run setup: everything defaulted, Enter launches. One overlord:
+/// its agent, model, effort and Remote Control, each pickable.
 pub(crate) struct Setup {
-    agent: String,
-    models: Vec<String>,
-    /// Model index per row: [overlord, mastermind].
-    idx: [usize; 2],
-    /// Effort per row (from config; shown, set in config.toml).
-    effort: [String; 2],
-    /// Which row the arrows change.
+    /// The agents that can run the overlord here (installed ones).
+    agents: Vec<AgentChoice>,
+    agent: usize,
+    /// The model and effort picked, as indexes into the agent's choices.
+    model: usize,
+    effort: usize,
+    /// Which row the arrows change (an index into `rows()`).
     row: usize,
-    /// family → latest id, for the "→ resolves to" hint.
-    catalog: Vec<(String, String)>,
     /// Remote Control for the overlord: Some(on?) when this machine can
-    /// use it (a third row), None when it can't or isn't known yet.
+    /// use it, None when it can't or isn't known yet.
     remote: Option<bool>,
     /// Why it can't, or a caveat when it can.
     remote_why: Option<String>,
     error: Option<String>,
+}
+
+/// One agent the overlord can run on, and what the dialog offers for it.
+struct AgentChoice {
+    name: String,
+    label: String,
+    /// Model choices ("" = the agent's own default) and where it starts.
+    models: Vec<String>,
+    model: usize,
+    /// Effort choices ("" = the agent's default); empty: it has none.
+    efforts: Vec<String>,
+    effort: usize,
+    /// It has Remote Control.
+    remote: bool,
+    /// family → latest id, for the "→ resolves to" hint.
+    catalog: Vec<(String, String)>,
+}
+
+/// A row of the setup dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SetupRow {
+    Agent,
+    Model,
+    Effort,
+    Remote,
 }
 
 /// A one-time offer of Remote Control for an existing overlord.
@@ -37,27 +62,161 @@ pub(crate) struct RemoteOffer {
     error: Option<String>,
 }
 
-/// An existing overlord seat on an old model.
+/// An existing overlord on an old model.
 pub(crate) struct Upgrade {
-    /// `overlord` or `mastermind`.
-    seat: String,
     note: String,
     /// Model to switch to; None when switching can't help (the agent CLI
     /// resolves the alias to an old model — it needs updating instead).
     suggest: Option<String>,
-    /// An offer of the seat's default model: esc means "don't ask again".
+    /// An offer of the default model: esc means "don't ask again".
     declinable: bool,
     error: Option<String>,
 }
 
+impl AgentChoice {
+    fn from_status(a: &Value) -> Self {
+        let list = |k: &str| -> Vec<String> {
+            a[k].as_array()
+                .map(|v| {
+                    v.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // The default heads the choices when it isn't one of them.
+        let with = |mut choices: Vec<String>, dflt: &str| {
+            let at = match choices.iter().position(|c| c == dflt) {
+                Some(i) => i,
+                None => {
+                    choices.insert(0, dflt.to_string());
+                    0
+                }
+            };
+            (choices, at)
+        };
+        let (models, model) = with(list("models"), a["model"].as_str().unwrap_or(""));
+        // No efforts: it has no such setting (no row).
+        let (efforts, effort) = match list("efforts") {
+            e if e.is_empty() => (e, 0),
+            e => with(e, a["effort"].as_str().unwrap_or("")),
+        };
+        AgentChoice {
+            name: a["name"].as_str().unwrap_or("claude").to_string(),
+            label: a["label"].as_str().unwrap_or("Claude Code").to_string(),
+            models,
+            model,
+            efforts,
+            effort,
+            remote: a["remote_control"] == true,
+            catalog: catalog_of(a),
+        }
+    }
+}
+
 impl Setup {
+    fn from_status(st: &Value) -> Self {
+        let mut agents: Vec<AgentChoice> = st["agents"]
+            .as_array()
+            .map(|a| a.iter().map(AgentChoice::from_status).collect())
+            .unwrap_or_default();
+        if agents.is_empty() {
+            // None found installed: offer the configured one (launching
+            // says what's missing).
+            agents.push(AgentChoice::from_status(&json!({
+                "name": st["default_agent"], "label": st["default_agent"],
+                "model": st["default_model"], "effort": st["default_effort"],
+                "models": [], "efforts": [],
+                "remote_control": st["default_agent"] == "claude",
+            })));
+        }
+        let agent = agents
+            .iter()
+            .position(|a| Some(a.name.as_str()) == st["default_agent"].as_str())
+            .unwrap_or(0);
+        let mut s = Setup {
+            model: agents[agent].model,
+            effort: agents[agent].effort,
+            agents,
+            agent,
+            row: 0,
+            // On by default where it works: the point is to reach the
+            // overlord from the Claude app.
+            remote: (st["remote"]["available"] == true).then_some(true),
+            remote_why: st["remote"]["reason"]
+                .as_str()
+                .or(st["remote"]["note"].as_str())
+                .map(str::to_string),
+            error: None,
+        };
+        // Start on the first row there is something to pick in.
+        s.row = usize::from(s.agents.len() < 2);
+        s
+    }
+
+    fn choice(&self) -> &AgentChoice {
+        &self.agents[self.agent]
+    }
+
+    /// The rows shown, top to bottom: effort only for an agent that has
+    /// one, Remote Control only where this machine and the agent can.
+    fn rows(&self) -> Vec<SetupRow> {
+        let mut v = vec![SetupRow::Agent, SetupRow::Model];
+        if !self.choice().efforts.is_empty() {
+            v.push(SetupRow::Effort);
+        }
+        if self.remote.is_some() && self.choice().remote {
+            v.push(SetupRow::Remote);
+        }
+        v
+    }
+
+    fn model(&self) -> &str {
+        self.choice().models.get(self.model).map_or("", |m| m)
+    }
+
+    fn effort(&self) -> &str {
+        self.choice().efforts.get(self.effort).map_or("", |e| e)
+    }
+
+    /// ← / →: the focused row's next or previous choice. Another agent
+    /// starts on its own default model and effort.
+    fn step(&mut self, forward: bool) {
+        let next = |i: usize, n: usize| {
+            if n == 0 {
+                0
+            } else if forward {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            }
+        };
+        match self.rows().get(self.row) {
+            Some(SetupRow::Agent) => {
+                let to = next(self.agent, self.agents.len());
+                if to != self.agent {
+                    self.agent = to;
+                    self.model = self.choice().model;
+                    self.effort = self.choice().effort;
+                }
+            }
+            Some(SetupRow::Model) => self.model = next(self.model, self.choice().models.len()),
+            Some(SetupRow::Effort) => self.effort = next(self.effort, self.choice().efforts.len()),
+            Some(SetupRow::Remote) => self.remote = self.remote.map(|on| !on),
+            None => {}
+        }
+        // (Another agent may have fewer rows.)
+        self.row = self.row.min(self.rows().len().saturating_sub(1));
+    }
+
     /// A click on row `i`: select it. True when it already was (the click
     /// then changes it, as → does).
     pub(crate) fn click_row(&mut self, i: usize) -> bool {
         if self.row == i {
             return true;
         }
-        self.row = i;
+        self.row = i.min(self.rows().len().saturating_sub(1));
         false
     }
 }
@@ -113,89 +272,38 @@ impl App {
             return;
         };
         if st["exists"] != true {
-            let front = st["default_model"].as_str().unwrap_or("").to_string();
-            let mind = st["mastermind"]["default_model"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let mut models: Vec<String> = self.config.session.models.clone();
-            for m in [&mind, &front] {
-                if !m.is_empty() && !models.contains(m) {
-                    models.insert(0, m.clone());
-                }
-            }
-            let at = |m: &str| models.iter().position(|x| x == m).unwrap_or(0);
-            let idx = [at(&front), at(&mind)];
-            self.mode = Mode::OverlordSetup(Box::new(Setup {
-                agent: st["default_agent"].as_str().unwrap_or("claude").to_string(),
-                idx,
-                effort: [
-                    st["default_effort"].as_str().unwrap_or("").to_string(),
-                    st["mastermind"]["default_effort"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
-                ],
-                row: 0,
-                models,
-                catalog: catalog_of(&st),
-                // On by default where it works: the point is to reach the
-                // overlord from the Claude app.
-                remote: (st["remote"]["available"] == true
-                    && st["default_agent"].as_str().is_none_or(|a| {
-                        rlord_core::agents::Agent::parse(a)
-                            .is_some_and(rlord_core::agents::Agent::has_remote_control)
-                    }))
-                .then_some(true),
-                remote_why: st["remote"]["reason"]
-                    .as_str()
-                    .or(st["remote"]["note"].as_str())
-                    .map(str::to_string),
+            self.mode = Mode::OverlordSetup(Box::new(Setup::from_status(&st)));
+            return;
+        }
+        // On an old model, or on another model than the default: offer the
+        // switch.
+        let f = &st["freshness"];
+        if let Some(d) = st["suggest_default"].as_str() {
+            self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
+                note: format!(
+                    "it runs {}; rlord's default for the overlord is now {d}",
+                    st["model"].as_str().unwrap_or("?"),
+                ),
+                suggest: Some(d.to_string()),
+                declinable: true,
                 error: None,
             }));
             return;
         }
-        // Either seat on an old model, or on another model than its default:
-        // offer the switch (the overlord first).
-        for (seat, st) in [("overlord", &st), ("mastermind", &st["mastermind"])] {
-            let f = &st["freshness"];
-            if st["exists"] != true {
-                continue;
-            }
-            if let Some(d) = st["suggest_default"].as_str() {
-                self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
-                    seat: seat.into(),
-                    note: format!(
-                        "it runs {}; rlord's default for the {seat} is now {d}{}",
-                        st["model"].as_str().unwrap_or("?"),
-                        if seat == "overlord" {
-                            " (a fast front desk that hands deeper work to the mastermind)"
-                        } else {
-                            ""
-                        }
-                    ),
-                    suggest: Some(d.to_string()),
-                    declinable: true,
-                    error: None,
-                }));
-                return;
-            }
-            if f["outdated"] == true {
-                let suggest = f["suggest"]
-                    .as_str()
-                    .filter(|s| Some(*s) != st["model"].as_str())
-                    .map(str::to_string);
-                self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
-                    seat: seat.into(),
-                    note: f["note"].as_str().unwrap_or("outdated model").to_string(),
-                    suggest,
-                    declinable: false,
-                    error: None,
-                }));
-                return;
-            } else if let Some(n) = f["note"].as_str() {
-                self.status_line = format!("{seat}: {n}");
-            }
+        if f["outdated"] == true {
+            let suggest = f["suggest"]
+                .as_str()
+                .filter(|s| Some(*s) != st["model"].as_str())
+                .map(str::to_string);
+            self.mode = Mode::OverlordUpgrade(Box::new(Upgrade {
+                note: f["note"].as_str().unwrap_or("outdated model").to_string(),
+                suggest,
+                declinable: false,
+                error: None,
+            }));
+            return;
+        } else if let Some(n) = f["note"].as_str() {
+            self.status_line = format!("overlord: {n}");
         }
         // Remote Control for the overlord, offered once where it works.
         if st["remote"]["offer"] == true {
@@ -204,6 +312,21 @@ impl App {
                 error: None,
             }));
         }
+    }
+
+    /// Save the dialog's agent, model and effort as the `[overlord]`
+    /// config (so later starts reuse them) when they differ from it.
+    fn save_setup(&mut self, s: &Setup) -> Result<()> {
+        let o = &self.config.overlord;
+        let (agent, model, effort) = (s.choice().name.as_str(), s.model(), s.effort());
+        if (o.agent.trim(), o.model.trim(), o.effort.trim()) == (agent, model, effort) {
+            return Ok(());
+        }
+        Config::set_overlord(agent, model, effort)?;
+        self.config = Config::load()?;
+        // The daemon reads it too: the effort is a launch flag.
+        client_call(&paths::socket_path(), "config.reload", json!({}))?;
+        Ok(())
     }
 
     pub(crate) fn handle_setup(&mut self, k: KeyEvent, mut s: Box<Setup>) {
@@ -215,13 +338,16 @@ impl App {
                 );
             }
             KeyCode::Enter => {
-                let model = |i: usize| s.models.get(s.idx[i]).cloned().unwrap_or_default();
-                match client_call(
-                    &paths::socket_path(),
-                    "overlord.ensure",
-                    json!({"agent": s.agent, "model": model(0), "mastermind_model": model(1),
-                           "remote_control": s.remote == Some(true)}),
-                ) {
+                let remote = s.remote == Some(true) && s.choice().remote;
+                let r = self.save_setup(&s).and_then(|_| {
+                    client_call(
+                        &paths::socket_path(),
+                        "overlord.ensure",
+                        json!({"agent": s.choice().name, "model": s.model(),
+                               "effort": s.effort(), "remote_control": remote}),
+                    )
+                });
+                match r {
                     Ok(_) => {
                         // Off by choice: don't offer it again later.
                         if s.remote == Some(false) {
@@ -240,13 +366,14 @@ impl App {
                     }
                 }
             }
-            // Rows: tab / j / k / ↑ / ↓. Model of the row: ← / → / h / l.
+            // Rows: tab / j / k / ↑ / ↓. The row's choice: ← / → / h / l
+            // (space too).
             KeyCode::Tab
             | KeyCode::BackTab
             | KeyCode::Char('j' | 'k')
             | KeyCode::Up
             | KeyCode::Down => {
-                let rows = if s.remote.is_some() { 3 } else { 2 };
+                let rows = s.rows().len();
                 let back = matches!(k.code, KeyCode::BackTab | KeyCode::Char('k') | KeyCode::Up);
                 s.row = if back {
                     (s.row + rows - 1) % rows
@@ -255,22 +382,12 @@ impl App {
                 };
                 self.mode = Mode::OverlordSetup(s);
             }
-            // The Remote Control row: any of ← → space toggles it.
-            KeyCode::Right | KeyCode::Left | KeyCode::Char('l' | 'h' | ' ') if s.row == 2 => {
-                s.remote = s.remote.map(|on| !on);
-                self.mode = Mode::OverlordSetup(s);
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if !s.models.is_empty() {
-                    s.idx[s.row] = (s.idx[s.row] + 1) % s.models.len();
-                }
+            KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                s.step(true);
                 self.mode = Mode::OverlordSetup(s);
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if !s.models.is_empty() {
-                    let n = s.models.len();
-                    s.idx[s.row] = (s.idx[s.row] + n - 1) % n;
-                }
+                s.step(false);
                 self.mode = Mode::OverlordSetup(s);
             }
             _ => self.mode = Mode::OverlordSetup(s),
@@ -284,34 +401,30 @@ impl App {
                     let _ = client_call(
                         &paths::socket_path(),
                         "overlord.decline_default",
-                        json!({"seat": u.seat, "model": u.suggest}),
+                        json!({"model": u.suggest}),
                     );
                 }
-                self.status_line = format!("{} model left as is", u.seat);
+                self.status_line = "overlord model left as is".into();
             }
             KeyCode::Enter => {
                 let r = match &u.suggest {
                     Some(m) => client_call(
                         &paths::socket_path(),
                         "overlord.set_model",
-                        json!({"model": m, "seat": u.seat}),
+                        json!({"model": m}),
                     ),
-                    None => client_call(
-                        &paths::socket_path(),
-                        "overlord.ensure",
-                        json!({"seat": u.seat}),
-                    )
-                    .and_then(|s| {
-                        client_call(
-                            &paths::socket_path(),
-                            "session.restart",
-                            json!({"ref": s["id"]}),
-                        )
-                    }),
+                    None => client_call(&paths::socket_path(), "overlord.ensure", json!({}))
+                        .and_then(|s| {
+                            client_call(
+                                &paths::socket_path(),
+                                "session.restart",
+                                json!({"ref": s["id"]}),
+                            )
+                        }),
                 };
                 match r {
                     Ok(_) => {
-                        self.status_line = format!("{} restarted (conversation resumed)", u.seat);
+                        self.status_line = "overlord restarted (conversation resumed)".into();
                         self.dirty = true;
                     }
                     Err(e) => {
@@ -408,137 +521,139 @@ impl App {
     /// `rlord overlay`); the daemon starts it if needed. No overlord yet →
     /// the setup dialog.
     pub(crate) fn show_overlord(&mut self) {
-        self.show_seat("overlord");
-    }
-
-    /// Open an overlord seat (`overlord` / `mastermind`) over this terminal.
-    pub(crate) fn show_seat(&mut self, seat: &str) {
         let params = json!({
             "client": tmux::current_client(),
             "from": tmux::current_session(),
-            "seat": seat,
         });
         self.call("ui.overlord", params);
     }
 
     pub(crate) fn draw_setup(&self, f: &mut Frame, s: &Setup) {
-        let area = newform::centered(f.area(), 78, 25);
+        let area = newform::centered(f.area(), 78, 26);
         f.render_widget(Clear, area);
-        let keys = |k: &str| tmux::key_label(k);
-        let row = |i: usize, name: &str, key: &str, why: [&str; 2]| -> Vec<Line<'static>> {
-            let model = s.models.get(s.idx[i]).cloned().unwrap_or_default();
-            let resolves = s
-                .catalog
-                .iter()
-                .find(|(fam, _)| *fam == model)
-                .map(|(_, id)| format!(" → {id}"))
-                .unwrap_or_default();
-            let focused = s.row == i;
-            let effort = if s.effort[i].is_empty() {
-                String::new()
+        let rows = s.rows();
+        let choice = s.choice();
+        let or_default = |v: &str| {
+            if v.is_empty() {
+                "agent default".to_string()
             } else {
-                format!("  · effort {}", s.effort[i])
-            };
-            vec![
-                Line::from(vec![
-                    Span::styled(
-                        if focused { "▌ " } else { "  " },
-                        Style::default().fg(theme::accent()),
-                    ),
-                    Span::styled(format!("{name:<12}"), Style::default().bold()),
-                    Span::styled(format!("{key:<4}"), theme::faint()),
-                    Span::styled(
-                        format!("◀ {model} ▶"),
-                        if focused {
-                            Style::default().bold().fg(theme::accent())
-                        } else {
-                            Style::default().fg(theme::text())
-                        },
-                    ),
-                    Span::styled(format!("{resolves}{effort}"), theme::faint()),
-                ]),
-                Line::from(Span::styled(format!("    {}", why[0]), theme::muted())),
-                Line::from(Span::styled(format!("    {}", why[1]), theme::muted())),
-                Line::from(""),
-            ]
+                v.to_string()
+            }
         };
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  The overlord is how you run rlord. It's two sessions:",
+                format!(
+                    "  The overlord is how you run rlord: one session you talk to ({}).",
+                    tmux::key_label(&self.config.tmux.overlord)
+                ),
+                Style::default().fg(theme::text()),
+            )),
+            Line::from(Span::styled(
+                "  It finds, jumps, organizes and launches; anything heavy it hands to",
+                Style::default().fg(theme::text()),
+            )),
+            Line::from(Span::styled(
+                "  subagents and new sessions.",
                 Style::default().fg(theme::text()),
             )),
             Line::from(""),
         ];
-        lines.extend(row(
-            0,
-            "◆ Overlord",
-            &keys(&self.config.tmux.overlord),
-            [
-                "Your quick front desk: finds, jumps, organizes, answers from",
-                "rlord. A fast model so it replies in seconds; it hands the rest on.",
-            ],
-        ));
-        lines.extend(row(
-            1,
-            "↳ Mastermind",
-            &keys(self.config.tmux.mastermind_switch()),
-            [
-                "Launches sessions and takes questions that need thought. A strong",
-                "model, where judgment pays; starts the first time it's needed.",
-            ],
-        ));
-        match (s.remote, &s.remote_why) {
-            (Some(on), why) => {
-                let focused = s.row == 2;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if focused { "▌ " } else { "  " },
-                        Style::default().fg(theme::accent()),
-                    ),
-                    Span::styled(format!("{:<16}", "⇄ Remote"), Style::default().bold()),
-                    Span::styled(
-                        if on { "◀ on ▶" } else { "◀ off ▶" },
-                        if focused {
-                            Style::default().bold().fg(theme::accent())
-                        } else {
-                            Style::default().fg(theme::text())
-                        },
-                    ),
-                ]));
-                lines.push(Line::from(Span::styled(
-                    "    Reach the mastermind from the Claude app (Code tab) or claude.ai,",
-                    theme::muted(),
-                )));
-                lines.push(Line::from(Span::styled(
+        // Where each row's lines start, for the mouse.
+        let mut starts = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let focused = s.row == i;
+            let (name, value, extra, why): (&str, String, String, String) = match row {
+                SetupRow::Agent => (
+                    "Agent",
+                    choice.label.clone(),
+                    String::new(),
+                    if s.agents.len() > 1 {
+                        "The coding agent that runs it. Changing it resets model and effort."
+                            .into()
+                    } else {
+                        "The coding agent that runs it (the only one installed that can)."
+                            .into()
+                    },
+                ),
+                SetupRow::Model => (
+                    "Model",
+                    or_default(s.model()),
+                    choice
+                        .catalog
+                        .iter()
+                        .find(|(fam, _)| fam == s.model())
+                        .map(|(_, id)| format!(" → {id}"))
+                        .unwrap_or_default(),
+                    "A strong model: it decides what to launch and where.".into(),
+                ),
+                SetupRow::Effort => (
+                    "Effort",
+                    or_default(s.effort()),
+                    String::new(),
+                    "Low keeps it quick: light work itself, the rest delegated. Too shallow? medium."
+                        .into(),
+                ),
+                SetupRow::Remote => (
+                    "⇄ Remote",
+                    if s.remote == Some(true) { "on" } else { "off" }.to_string(),
+                    String::new(),
                     format!(
-                        "    away from here: it's kept running for that.{}",
-                        why.as_deref()
+                        "Reach it from the Claude app or claude.ai; kept running for that.{}",
+                        s.remote_why
+                            .as_deref()
                             .map(|w| format!(" Note: {w}."))
                             .unwrap_or_default()
                     ),
-                    theme::muted(),
-                )));
-                lines.push(Line::from(""));
-            }
-            (None, Some(why)) => {
+                ),
+            };
+            starts.push(lines.len());
+            // One choice only: nothing to step through.
+            let fixed = *row == SetupRow::Agent && s.agents.len() < 2;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if focused { "▌ " } else { "  " },
+                    Style::default().fg(theme::accent()),
+                ),
+                Span::styled(format!("{name:<12}"), Style::default().bold()),
+                Span::styled(
+                    if fixed {
+                        format!("  {value}  ")
+                    } else {
+                        format!("◀ {value} ▶")
+                    },
+                    if focused {
+                        Style::default().bold().fg(theme::accent())
+                    } else {
+                        Style::default().fg(theme::text())
+                    },
+                ),
+                Span::styled(extra, theme::faint()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("    {why}"),
+                theme::muted(),
+            )));
+            lines.push(Line::from(""));
+        }
+        if s.remote.is_none() {
+            if let Some(why) = &s.remote_why {
                 lines.push(Line::from(Span::styled(
                     format!("  ⇄ Remote Control isn't available here: {why}."),
                     theme::faint(),
                 )));
                 lines.push(Line::from(""));
             }
-            (None, None) => {}
         }
         lines.push(Line::from(Span::styled(
-            "  Effort and the defaults live in config.toml under [overlord].",
+            "  Saved to config.toml under [overlord]; change it there any time.",
             theme::faint(),
         )));
         lines.push(Line::from(""));
         lines.push(keys_line(&[
             ("enter", "launch", Cap::Context),
             ("tab", "row", Cap::Global),
-            ("←/→", "model", Cap::Global),
+            ("←/→", "change", Cap::Global),
             ("esc", "later", Cap::Global),
         ]));
         if let Some(e) = &s.error {
@@ -548,13 +663,12 @@ impl App {
             )));
         }
         self.modal_hits(f.area(), area, &lines);
-        // Each row (three lines, from the fourth line on, a blank between):
-        // click selects it; again changes it.
-        let rows = if s.remote.is_some() { 3 } else { 2 };
-        for i in 0..rows {
-            for l in 0..3 {
+        // Each row (its line and the one under it): a click selects it;
+        // again changes it.
+        for (i, at) in starts.iter().enumerate() {
+            for l in 0..2 {
                 self.hits
-                    .row(area, area.y + 1 + 3 + 4 * i as u16 + l, mouse::Hit::Pick(i));
+                    .row(area, area.y + 1 + *at as u16 + l, mouse::Hit::Pick(i));
             }
         }
         f.render_widget(
@@ -576,11 +690,7 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                if u.seat == "mastermind" {
-                    "  Your mastermind could be on a better model:"
-                } else {
-                    "  Your overlord could be on a better model:"
-                },
+                "  Your overlord could be on a better model:",
                 Style::default().bold(),
             )),
             Line::from(format!("  {}", u.note)),
@@ -598,11 +708,7 @@ impl App {
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(theme::modal(if u.seat == "mastermind" {
-                    "◆ Mastermind model"
-                } else {
-                    "◆ Overlord model"
-                })),
+                .block(theme::modal("◆ Overlord model")),
             area,
         );
     }
@@ -621,11 +727,11 @@ impl App {
                 "remote.set",
                 // Don't hold the list up waiting for the link: the list
                 // shows it (⇄) once connected.
-                json!({"seat": "mastermind", "on": true, "wait": false}),
+                json!({"overlord": true, "on": true, "wait": false}),
             ) {
                 Ok(r) => {
                     self.status_line = format!(
-                        "mastermind: Remote Control on — {}",
+                        "overlord: Remote Control on — {}",
                         r["note"].as_str().unwrap_or("connecting")
                     );
                     self.dirty = true;
@@ -645,7 +751,7 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Reach your overlord's mastermind from your phone?",
+                "  Reach your overlord from your phone?",
                 Style::default().bold(),
             )),
             Line::from(Span::styled(

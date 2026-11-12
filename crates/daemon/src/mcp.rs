@@ -72,9 +72,10 @@ pub fn tools() -> Value {
             "Show the user the rlord session list (hides your overlay).",
             json!({}), &[]),
         tool("search_history",
-            "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear.",
+            "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear. Not your own conversations: those are `recall`.",
             json!({
                 "query": s("Words to find (all must appear in one message)"),
+                "session": s("Only this session (id, id prefix, or name): for \"what happened in X?\""),
                 "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also agent conversations (Claude Code, Codex, OpenCode) started outside rlord"},
                 "limit": {"type": "integer", "description": "Sessions to return (default 8)"},
             }), &["query"]),
@@ -121,12 +122,13 @@ pub fn tools() -> Value {
         tool("list_agents",
             "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it (`too_old`: installed, but a version rlord can't run), whether rlord's hooks are installed (and, for Codex, trusted; null for OpenCode, which needs none), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
             json!({}), &[]),
-        tool("hand_off",
-            "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
+        tool("recall",
+            "Your own earlier conversations (you restart on a fresh one after sitting idle, and the user may clear you). With `query`: the conversations that mention every word, newest first, with short dated snippets. Without: a digest of your previous conversation (what the user asked, what you answered, clipped). Plain look-up, bounded; nothing of it is in your context until you ask.",
             json!({
-                "request": s("The user's words, verbatim"),
-                "context": s("What the mastermind needs from your conversation (it sees none of it): earlier messages, sessions mentioned, what you already found"),
-            }), &["request"]),
+                "query": s("Words to find in your earlier conversations (all must appear in one message); omit for a digest of the previous one"),
+                "conversation": s("A conversation id from a recall search: digest that one instead of the previous"),
+                "limit": {"type": "integer", "description": "Conversations to return for a query (default 6)"},
+            }), &[]),
         tool("propose_session",
             "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
             new_session_props, &[]),
@@ -411,10 +413,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)
         "get_session_defaults" => d.rpc("session.defaults", json!({"no_listing": true})),
-        "hand_off" => d.rpc(
-            "overlord.hand_off",
-            json!({"request": arg_str(args, "request").context("missing 'request'")?,
-                   "context": arg_str(args, "context").unwrap_or("")}),
+        "recall" => d.rpc(
+            "overlord.recall",
+            json!({"query": arg_str(args, "query"),
+                   "conversation": arg_str(args, "conversation"),
+                   "limit": args.get("limit")}),
         ),
         "list_agents" => d.rpc("agents.list", json!({})),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),

@@ -4,12 +4,22 @@
 //! (so the TUI can embed it without a lookup), and rlord's MCP
 //! server wired in with its tools pre-allowed.
 //!
+//! One session: a strong model at low effort. It does light work itself and
+//! sends anything heavier to a subagent or a new session (`overlord.md`).
+//! It is restarted on a fresh conversation once it has sat idle
+//! (`start_fresh_keeper`), and looks its own past up with `recall`
+//! (recall.rs) rather than carrying it.
+//!
 //! It lives in its own folder under the data dir. On every `ensure` that
 //! folder's CLAUDE.md / AGENTS.md / GEMINI.md (the same standing instructions,
 //! from `overlord.md` plus the user's own) and mcp.json are regenerated, so
 //! upgrades to rlord reach an existing overlord on its next restart.
+//!
+//! The overlord used to be two sessions (a fast front desk and a
+//! "mastermind" behind it). `migrate` turns such a pair into the one
+//! overlord: the mastermind's conversation carries on as the overlord's.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -18,78 +28,61 @@ use rlord_core::agents::{transcript, Agent};
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::themes;
-use rlord_core::types::Status;
+use rlord_core::types::{Session, Status};
 use rlord_core::{models, paths, tmux};
 
 use crate::methods;
 
-/// One of the overlord's two sessions. The **overlord** is the quick front
-/// desk (Option-O): mechanical work itself, everything that needs thought
-/// handed to the **mastermind** (Option-M), which launches sessions and takes
-/// one-off questions. Each has its own folder, instructions, model, effort
-/// and fixed tmux name.
-pub struct Seat {
-    /// Role in the DB, display name and folder name.
-    pub key: &'static str,
-    /// Fixed tmux session name (the overlay embeds its pane).
-    pub tmux: &'static str,
-    instructions: &'static str,
-    subagents: &'static [(&'static str, &'static str)],
-    /// Its model and effort in the config.
-    model_of: fn(&Config) -> &str,
-    effort_of: fn(&Config) -> &str,
-}
+/// The overlord's role in the DB, and its display name.
+pub const ROLE: &str = "overlord";
+/// Its fixed tmux session name (the overlay embeds its pane).
+pub const TMUX_NAME: &str = "overlord-rlord";
+/// kv: when the overlord last started a fresh conversation (ms).
+pub const FRESH_AT: &str = "overlord_fresh_at";
+/// kv: don't offer this default model for the overlord again.
+pub const DEFAULT_DECLINED: &str = "default_declined:overlord";
 
-pub const FRONT: Seat = Seat {
-    key: "overlord",
-    tmux: "overlord-rlord",
-    instructions: include_str!("overlord.md"),
-    subagents: &[
-        ("rlord-tidy.md", include_str!("tidy.md")),
-        ("rlord-import.md", include_str!("import.md")),
-    ],
-    model_of: |c| &c.overlord.model,
-    effort_of: |c| &c.overlord.effort,
-};
+const INSTRUCTIONS: &str = include_str!("overlord.md");
+/// Subagents it delegates to (written to its `.claude/agents/`).
+const SUBAGENTS: &[(&str, &str)] = &[
+    ("rlord-tidy.md", include_str!("tidy.md")),
+    ("rlord-import.md", include_str!("import.md")),
+];
 
-pub const MASTERMIND: Seat = Seat {
-    key: "mastermind",
-    tmux: "mastermind-rlord",
-    instructions: include_str!("mastermind.md"),
-    subagents: &[],
-    model_of: |c| &c.overlord.mastermind_model,
-    effort_of: |c| &c.overlord.mastermind_effort,
-};
+/// The second session's role, tmux name and folder, from when the overlord
+/// was two (see `migrate`).
+const OLD_MASTERMIND: &str = "mastermind";
 
-pub const SEATS: [&Seat; 2] = [&FRONT, &MASTERMIND];
-
-/// The front desk's tmux name (the overlord most code means).
-pub const TMUX_NAME: &str = FRONT.tmux;
-
-/// A seat by key (`overlord` / `mastermind`); anything else is the front.
-pub fn seat(key: &str) -> &'static Seat {
-    SEATS.into_iter().find(|s| s.key == key).unwrap_or(&FRONT)
-}
-
-/// Whether a session role is one of the overlord's seats (fixed rows: no
-/// rename, tags, notes, archive).
+/// Whether a session role is the overlord's (a fixed row: no rename, tags,
+/// notes, archive).
 pub fn is_overlord_role(role: &str) -> bool {
-    SEATS.iter().any(|s| s.key == role)
+    role == ROLE
 }
 
-impl Seat {
-    pub fn dir(&self) -> PathBuf {
-        paths::data_dir().join(self.key)
+/// The overlord's session, if it has been set up.
+pub fn session(db: &Db) -> Result<Option<Session>> {
+    db.overlord()
+}
+
+/// The folder a new overlord gets.
+fn default_dir() -> PathBuf {
+    paths::data_dir().join(ROLE)
+}
+
+/// The overlord's folder: where its session runs (one that began as the
+/// mastermind keeps that folder, so its conversation resumes), else the
+/// folder a new one gets.
+pub fn dir(db: &Db) -> PathBuf {
+    match session(db) {
+        Ok(Some(s)) => PathBuf::from(s.project_path),
+        _ => default_dir(),
     }
-    fn model<'a>(&self, cfg: &'a Config) -> &'a str {
-        (self.model_of)(cfg)
-    }
-    fn effort<'a>(&self, cfg: &'a Config) -> &'a str {
-        (self.effort_of)(cfg)
-    }
-    pub fn session(&self, db: &Db) -> Result<Option<rlord_core::types::Session>> {
-        db.role_session(self.key)
-    }
+}
+
+/// Every folder an overlord has run in: its conversations there are its
+/// own (full of searches), never search results.
+pub fn dirs() -> Vec<PathBuf> {
+    vec![default_dir(), paths::data_dir().join(OLD_MASTERMIND)]
 }
 
 /// User-authored standing instructions appended to the generated ones.
@@ -100,11 +93,36 @@ pub fn user_instructions_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("overlord.md"))
 }
 
-/// Write a seat's folder (instruction files, mcp.json, subagents); return
-/// the adapter flags it must always be launched with.
-fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
-    let d = seat.dir();
-    std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+/// The flags that set `effort` on `agent` (none: it has no such setting,
+/// or the agent's own default is wanted).
+pub fn effort_args(agent: Agent, effort: &str) -> Vec<String> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Vec::new();
+    }
+    match agent {
+        Agent::Claude => vec!["--effort".into(), effort.into()],
+        Agent::Codex => vec!["-c".into(), format!("model_reasoning_effort=\"{effort}\"")],
+        Agent::OpenCode => Vec::new(),
+    }
+}
+
+/// The overlord's effort on `agent`: the configured one when that is the
+/// configured agent, else that agent's default.
+fn effort_for(cfg: &Config, agent: Agent) -> String {
+    if cfg.overlord.agent.trim() == agent.name() {
+        cfg.overlord.effort.trim().to_string()
+    } else {
+        rlord_core::config::OverlordConfig::defaults_for(agent.name())
+            .1
+            .to_string()
+    }
+}
+
+/// Write the overlord's folder (instruction files, mcp.json, subagents);
+/// return the adapter flags it must always be launched with.
+fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
+    std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     let mcp_path = d.join("mcp.json");
     let mcp = json!({"mcpServers": {"rlord": {
         "type": "stdio",
@@ -113,7 +131,7 @@ fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
     }}});
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)?;
 
-    let mut md = format!("{GENERATED_NOTE}{}", seat.instructions);
+    let mut md = format!("{GENERATED_NOTE}{INSTRUCTIONS}");
     if let Ok(user) = std::fs::read_to_string(user_instructions_path()) {
         if !user.trim().is_empty() {
             md.push_str("\n## Standing instructions from the user\n\n");
@@ -124,10 +142,10 @@ fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
     for name in CONTEXT_FILES {
         std::fs::write(d.join(name), &md)?;
     }
-    // Subagents the seat delegates to (Claude's project agents dir).
+    // Subagents it delegates to (Claude's project agents dir).
     let agents = d.join(".claude").join("agents");
     std::fs::create_dir_all(&agents)?;
-    for (file, text) in seat.subagents {
+    for (file, text) in SUBAGENTS {
         std::fs::write(agents.join(file), text)?;
     }
 
@@ -142,163 +160,126 @@ fn write_files(seat: &Seat, cfg: &Config) -> Result<Vec<String>> {
         "--allowedTools".into(),
         "mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage".into(),
     ];
-    let effort = seat.effort(cfg).trim();
-    if !effort.is_empty() {
-        args.push("--effort".into());
-        args.push(effort.into());
-    }
+    args.extend(effort_args(agent, effort));
     Ok(args)
 }
 
 /// Make sure the overlord exists and is running; returns its session.
-/// Creates it on first use (with `agent`/`model` from params, else config),
-/// restarts it (resuming the conversation) if stopped. An existing
-/// overlord's model is its own — changed only via `set_model`.
+/// Creates it on first use (with `agent` / `model` / `effort` /
+/// `remote_control` from params, else config), restarts it (resuming the
+/// conversation) if stopped. An existing overlord's model is its own —
+/// changed only via `set_model`.
 pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
-    let seat = seat(params["seat"].as_str().unwrap_or(FRONT.key));
-    let v = ensure_running(db, cfg, seat, params)?;
+    let v = ensure_running(db, cfg, params)?;
     style(cfg);
-    // The user's keys and the window name, on every path that starts a seat
-    // (the mastermind starts lazily from a hand-off, the overlay or goto).
-    if let Some(s) = seat.session(db)? {
+    // The user's keys and the window name, on every path that starts it.
+    if let Some(s) = session(db)? {
         if let Err(e) = crate::profile::sync(db, cfg, &s, false) {
-            tracing::debug!(error = %e, seat = seat.key, "syncing overlord seat's tmux");
+            tracing::debug!(error = %e, "syncing the overlord's tmux");
         }
     }
     Ok(v)
 }
 
-/// A seat's overlay popup style: a wash of the seat's colour.
-pub fn overlay_style(cfg: &Config, seat: &Seat) -> String {
+/// The overlay popup's style: a wash of the overlord's colour.
+pub fn overlay_style(cfg: &Config) -> String {
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    format!("bg={}", p.overlay_bg_for(seat.key).tmux())
+    format!("bg={}", p.overlay_bg().tmux())
 }
 
 /// The overlord's color in the current theme (tmux spelling).
 pub fn color(cfg: &Config) -> String {
-    seat_color(cfg, &FRONT)
-}
-
-/// A seat's own colour (the mastermind's differs from the overlord's).
-pub fn seat_color(cfg: &Config, seat: &Seat) -> String {
     themes::resolve(&cfg.theme, themes::system_is_dark())
-        .seat(seat.key)
+        .overlord
         .tmux()
 }
 
 /// Its tmux bar: viewed full screen it should be unmistakable, otherwise it
 /// looks like any session. Re-run when the theme changes (`overlord.style`).
 pub fn style(cfg: &Config) {
+    if !tmux::has_session(TMUX_NAME) {
+        return;
+    }
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    let keys = |k: &str| rlord_core::tmux::key_label(k);
     let back = if cfg.tmux.back.trim().is_empty() {
         "M-d"
     } else {
         &cfg.tmux.back
     };
-    for (seat, label) in [
-        (
-            &FRONT,
-            format!(
-                "#[bold] ◆ OVERLORD #[nobold]· {}{} list  ",
-                // Only a key that works here (the global one, if bound).
-                if cfg.tmux.mastermind.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("{} mastermind · ", keys(&cfg.tmux.mastermind))
-                },
-                keys(back)
-            ),
-        ),
-        (
-            &MASTERMIND,
-            format!(
-                "#[bold] ◆ MASTERMIND #[nobold]· {} overlord · {} list  ",
-                keys(&cfg.tmux.overlord),
-                keys(back)
-            ),
-        ),
-    ] {
-        if !tmux::has_session(seat.tmux) {
-            continue;
-        }
-        if let Err(e) = tmux::style_session(
-            seat.tmux,
-            &format!("bg={},fg={}", p.seat(seat.key).tmux(), p.on_accent.tmux()),
-            &label,
-        ) {
-            tracing::debug!(error = %e, seat = seat.key, "styling overlord session");
-        }
+    let label = format!(
+        "#[bold] ◆ OVERLORD #[nobold]· {} list  ",
+        rlord_core::tmux::key_label(back)
+    );
+    if let Err(e) = tmux::style_session(
+        TMUX_NAME,
+        &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
+        &label,
+    ) {
+        tracing::debug!(error = %e, "styling the overlord's session");
     }
 }
 
-fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<Value> {
-    let extra_args = write_files(seat, cfg)?;
-    let pick = |k: &str, dflt: &str| {
+fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+    let pick = |k: &str| {
         params
             .get(k)
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .unwrap_or(dflt)
-            .to_string()
+            .map(str::to_string)
     };
-    // The setup dialog picks the mastermind's model too, before it exists.
-    // (Kept only when it differs from the config's default, so a later
-    // config change still applies to a mastermind not yet started.)
-    if let Some(m) = params["mastermind_model"].as_str().map(str::trim) {
-        if !m.is_empty() && m != MASTERMIND.model(cfg).trim() {
-            db.kv_set("mastermind_model", m)?;
-        } else {
-            db.kv_set("mastermind_model", "")?;
-        }
-    }
-    match seat.session(db)? {
+    match session(db)? {
         None => {
-            let chosen = if seat.key == MASTERMIND.key {
-                db.kv_get("mastermind_model")?.filter(|m| !m.is_empty())
+            let agent_name = pick("agent").unwrap_or_else(|| cfg.overlord.agent.clone());
+            let agent = Agent::named(&agent_name)?;
+            agent.runs_overlord()?;
+            // The configured model and effort are for the configured agent;
+            // another agent gets its own defaults.
+            let configured = cfg.overlord.agent.trim() == agent.name();
+            let dflt_model = if configured {
+                cfg.overlord.model.trim()
             } else {
-                None
+                rlord_core::config::OverlordConfig::defaults_for(agent.name()).0
             };
-            let model = pick("model", chosen.as_deref().unwrap_or(seat.model(cfg)).trim());
+            // ("" given on purpose: the agent's own default.)
+            let model = match params.get("model").and_then(Value::as_str) {
+                Some(m) => m.trim().to_string(),
+                None => dflt_model.to_string(),
+            };
+            let effort = match params.get("effort").and_then(Value::as_str) {
+                Some(e) => e.trim().to_string(),
+                None => effort_for(cfg, agent),
+            };
+            let d = default_dir();
+            let extra_args = write_files(&d, agent, &effort)?;
             // Created now, with a model the user chose (or the default): never
             // "offer the default" back to it.
-            db.kv_set(
-                &format!("default_declined:{}", seat.key),
-                seat.model(cfg).trim(),
-            )?;
-            let agent = pick("agent", &cfg.overlord.agent);
-            let d = seat.dir();
-            // Remote Control lives on the mastermind (the front desk stays
-            // fast): the setup's choice is recorded for it, and a new
-            // mastermind starts with it.
-            if let Some(rc) = params["remote_control"].as_bool() {
-                db.kv_set(crate::remote::MASTERMIND_REMOTE, if rc { "1" } else { "0" })?;
-            }
-            let remote = seat.key == MASTERMIND.key
-                && db.kv_get(crate::remote::MASTERMIND_REMOTE)?.as_deref() == Some("1");
-            methods::session_new(
+            db.kv_set(DEFAULT_DECLINED, cfg.overlord.model.trim())?;
+            let remote =
+                params["remote_control"].as_bool().unwrap_or(false) && agent.has_remote_control();
+            let v = methods::session_new(
                 db,
                 cfg,
                 &json!({
-                    "agent": agent,
+                    "agent": agent.name(),
                     "project": d.to_string_lossy(),
                     "workspace": false,
-                    "name": seat.key,
+                    "name": ROLE,
                     "model": model,
-                    "role": seat.key,
-                    "tmux_name": seat.tmux,
+                    "role": ROLE,
+                    "tmux_name": TMUX_NAME,
                     "extra_args": extra_args,
                     "remote_control": remote,
                 }),
-            )
+            )?;
+            // Its first conversation starts now.
+            db.kv_set(FRESH_AT, &rlord_core::types::now_ms().to_string())?;
+            Ok(v)
         }
         Some(s) => {
-            // Fresh adapter flags (e.g. the rlord binary path moved).
-            let mut spec: Value =
-                serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
-            spec["extra_args"] = json!(extra_args);
-            db.set_launch_spec(&s.id, &spec.to_string())?;
+            // Fresh instructions and adapter flags (the rlord binary path
+            // moved, the effort changed).
+            refresh_launch(db, cfg, &s)?;
             if s.archived_at.is_some() {
                 db.set_archived(&s.id, None)?;
             }
@@ -315,27 +296,38 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
     }
 }
 
-/// Keep the mastermind's context from growing without end: once a minute,
-/// if it has sat idle past `[overlord] mastermind_fresh_after_mins` since its
-/// last exchange, and nobody is looking at it, restart it on a fresh
-/// conversation. Its instructions tell it to keep nothing durable only in its
-/// conversation.
+/// Rewrite the overlord's folder and put the current adapter flags in its
+/// launch spec: its next start (a restart, a fresh conversation) has them.
+fn refresh_launch(db: &Db, cfg: &Config, s: &Session) -> Result<()> {
+    let agent = Agent::named(&s.agent)?;
+    let extra_args = write_files(Path::new(&s.project_path), agent, &effort_for(cfg, agent))?;
+    let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
+    spec["extra_args"] = json!(extra_args);
+    db.set_launch_spec(&s.id, &spec.to_string())
+}
+
+/// Keep the overlord's context from growing without end: once a minute,
+/// if it has sat idle past `[overlord] fresh_after_mins` since its last
+/// exchange, and nobody is looking at it, restart it on a fresh
+/// conversation. Its instructions tell it to keep nothing durable only in
+/// its conversation, and to `recall` what it needs from earlier ones.
 pub fn start_fresh_keeper(d: &std::sync::Arc<crate::Daemon>) {
-    let mins = d.config().overlord.mastermind_fresh_after_mins;
-    if mins == 0 {
-        return;
-    }
     let d = std::sync::Arc::clone(d);
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
+        // (Read each time: a config reload changes it.)
+        let mins = d.config().overlord.fresh_after_mins;
+        if mins == 0 {
+            continue;
+        }
         if let Err(e) = fresh_if_idle(&d, mins) {
-            tracing::debug!(error = %e, "mastermind fresh start");
+            tracing::debug!(error = %e, "overlord fresh start");
         }
     });
 }
 
 fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
-    let Some(s) = MASTERMIND.session(&d.db())? else {
+    let Some(s) = session(&d.db())? else {
         return Ok(());
     };
     // Only between turns: idle, or "waiting for input" (Claude flips an idle
@@ -361,7 +353,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     // Nothing new since the last fresh start: nothing to clear.
     let fresh_at: i64 = d
         .db()
-        .kv_get("mastermind_fresh_at")?
+        .kv_get(FRESH_AT)?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
@@ -383,41 +375,38 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         return Ok(());
     }
     // Someone is looking at it: its overlay is open, or a terminal shows it.
-    let overlay_on_it = d.overlay.lock().expect("ui mutex").is_some()
-        && *d.overlay_seat.lock().expect("ui mutex") == MASTERMIND.key;
-    let attached = tmux::list_clients()
-        .iter()
-        .any(|c| c.session == MASTERMIND.tmux);
-    if overlay_on_it || attached {
+    let overlay_open = d.overlay.lock().expect("ui mutex").is_some();
+    let attached = tmux::list_clients().iter().any(|c| c.session == TMUX_NAME);
+    if overlay_open || attached {
         return Ok(());
     }
     // (Where the agent's command is: asked before any lock is taken.)
     rlord_core::agents::install::warm();
     {
-        // No hand-off may paste into the pane while it's being replaced.
-        let _send = d.mastermind_send.lock().expect("mastermind send lock");
+        // Nothing may be pasted into the pane while it's being replaced.
+        let _send = d.overlord_send.lock().expect("overlord send lock");
         let db = d.db();
-        // Re-check under the lock: a hand-off may have just landed.
-        let cur = MASTERMIND.session(&db)?.context("mastermind vanished")?;
+        // Re-check under the lock: a request may have just landed.
+        let cur = session(&db)?.context("overlord vanished")?;
         if !matches!(cur.status, Status::Idle | Status::WaitingInput)
             || cur.last_user_msg_at != s.last_user_msg_at
         {
             return Ok(());
         }
         // Current instructions and flags (effort may have changed).
-        let extra_args = write_files(&MASTERMIND, &d.config())?;
-        let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
-        spec["extra_args"] = json!(extra_args);
-        db.set_launch_spec(&s.id, &spec.to_string())?;
-        crate::methods::session_fresh(&db, &json!({"ref": s.id}))?;
-        db.kv_set("mastermind_fresh_at", &now.to_string())?;
+        refresh_launch(&db, &d.config(), &s)?;
+        crate::methods::session_fresh(
+            &db,
+            &json!({"ref": s.id, "reason": "idle", "idle_mins": mins}),
+        )?;
+        db.kv_set(FRESH_AT, &now.to_string())?;
     }
-    tracing::info!("mastermind idle: restarted on a fresh conversation");
+    tracing::info!("overlord idle: restarted on a fresh conversation");
     d.changed();
     Ok(())
 }
 
-/// Whether the mastermind's last turn waits on the user: its reply ends in a
+/// Whether the overlord's last turn waits on the user: its reply ends in a
 /// question, or a new-session form it reopened is still out for confirming.
 fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<bool> {
     // A reopened form counts for an hour (it may have been dismissed).
@@ -438,10 +427,10 @@ fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<
         .is_some_and(|r| r.trim_end_matches(['…', ' ', '*', '`']).ends_with('?')))
 }
 
-/// Everything the startup check needs: does the overlord exist, what models
-/// are its seats set to, what did they actually run, and is that the latest.
-/// The front desk's fields are top-level (as before); the mastermind's are
-/// under `mastermind`.
+/// Everything the startup check and the setup dialog need: does the
+/// overlord exist, what model is it set to, what did it actually run, and
+/// is that the latest; before it exists, which agents can run it and what
+/// each would default to.
 pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
     let catalog = |agent: &str| -> Value {
         models::latest_table(agent)
@@ -449,52 +438,40 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
             .map(|(fam, id)| json!({"family": fam, "latest": id}))
             .collect()
     };
-    let mut out = seat_status(db, cfg, &FRONT)?;
-    if out["exists"] != true {
-        // The agents a seat can run on.
-        let seats: Vec<&str> = Agent::ALL
-            .into_iter()
-            .filter(|a| a.overlord_seat().is_ok())
-            .map(Agent::name)
-            .collect();
-        out["agents"] = json!(seats);
-        out["catalog"] = catalog(&cfg.overlord.agent);
-    } else {
-        let agent = out["agent"].as_str().unwrap_or("claude").to_string();
-        out["catalog"] = catalog(&agent);
-    }
-    out["mastermind"] = seat_status(db, cfg, &MASTERMIND)?;
-    // An overlord created before the two-seat split (or by hand) on another
-    // model than the configured default: offer the default once.
-    for (k, seat) in [("", &FRONT), ("mastermind", &MASTERMIND)] {
-        let st = if k.is_empty() { &mut out } else { &mut out[k] };
-        let (cur, dflt) = (
-            st["model"].as_str().unwrap_or("").to_string(),
-            st["default_model"].as_str().unwrap_or("").to_string(),
-        );
-        let fam = |m: &str| models::parse(m).map(|(f, _)| f);
-        let declined = db.kv_get(&format!("default_declined:{}", seat.key))?;
-        if st["exists"] == true
-            && !dflt.is_empty()
-            && fam(&cur) != fam(&dflt)
-            && declined.as_deref() != Some(dflt.as_str())
-        {
-            st["suggest_default"] = json!(dflt);
-        }
-    }
-    Ok(out)
-}
-
-fn seat_status(db: &Db, cfg: &Config, seat: &Seat) -> Result<Value> {
-    let defaults = json!({
+    let mut out = json!({
         "default_agent": cfg.overlord.agent,
-        "default_model": seat.model(cfg),
-        "default_effort": seat.effort(cfg),
+        "default_model": cfg.overlord.model,
+        "default_effort": cfg.overlord.effort,
     });
-    let Some(s) = seat.session(db)? else {
-        let mut v = defaults;
-        v["exists"] = json!(false);
-        return Ok(v);
+    let Some(s) = session(db)? else {
+        out["exists"] = json!(false);
+        // The agents it can run on (installed ones), each with what the
+        // dialog offers: its default model and effort, and the choices.
+        let agents: Vec<Value> = Agent::ALL
+            .into_iter()
+            .filter(|a| a.runs_overlord().is_ok())
+            .filter(|a| rlord_core::agents::install::missing(*a).is_none())
+            .map(|a| {
+                let configured = cfg.overlord.agent.trim() == a.name();
+                let (m, e) = rlord_core::config::OverlordConfig::defaults_for(a.name());
+                let (model, effort) = if configured {
+                    (cfg.overlord.model.trim(), cfg.overlord.effort.trim())
+                } else {
+                    (m, e)
+                };
+                json!({
+                    "name": a.name(), "label": a.label(),
+                    "model": model, "effort": effort,
+                    "models": cfg.session.models_for(a),
+                    "efforts": rlord_core::config::OverlordConfig::efforts_for(a.name()),
+                    "remote_control": a.has_remote_control(),
+                    "catalog": catalog(a.name()),
+                })
+            })
+            .collect();
+        out["agents"] = json!(agents);
+        out["catalog"] = catalog(&cfg.overlord.agent);
+        return Ok(out);
     };
     let observed = db
         .transcript_source(&s.id)?
@@ -502,29 +479,39 @@ fn seat_status(db: &Db, cfg: &Config, seat: &Seat) -> Result<Value> {
     let fresh = models::check(&s.agent, s.model.as_deref(), observed.as_deref());
     let running =
         s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session);
-    let mut v = json!({
-        "exists": true,
-        "id": s.id,
-        "status": s.status,
-        "running": running,
-        "agent": s.agent,
-        "model": s.model,
-        "observed_model": observed,
-        "freshness": fresh,
-    });
-    for (k, val) in defaults.as_object().into_iter().flatten() {
-        v[k] = val.clone();
+    out["exists"] = json!(true);
+    out["id"] = json!(s.id);
+    out["status"] = json!(s.status);
+    out["running"] = json!(running);
+    out["agent"] = json!(s.agent);
+    out["model"] = json!(s.model);
+    out["observed_model"] = json!(observed);
+    out["freshness"] = json!(fresh);
+    out["catalog"] = catalog(&s.agent);
+    // An overlord on another model than the configured default (set up
+    // under older defaults, or by hand): offer the default once.
+    let (cur, dflt) = (
+        s.model.clone().unwrap_or_default(),
+        cfg.overlord.model.trim().to_string(),
+    );
+    let fam = |m: &str| models::parse(m).map(|(f, _)| f);
+    let declined = db.kv_get(DEFAULT_DECLINED)?;
+    if !dflt.is_empty()
+        && s.agent == cfg.overlord.agent.trim()
+        && fam(&cur) != fam(&dflt)
+        && declined.as_deref() != Some(dflt.as_str())
+    {
+        out["suggest_default"] = json!(dflt);
     }
-    Ok(v)
+    Ok(out)
 }
 
-/// Change a seat's model (`seat`: overlord by default) and restart it onto
-/// that model (the conversation resumes).
+/// Change the overlord's model and restart it onto that model (the
+/// conversation resumes).
 pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let model = methods::p_str(params, "model")?.trim().to_string();
-    let seat = seat(params["seat"].as_str().unwrap_or(FRONT.key));
-    let Some(s) = seat.session(db)? else {
-        return ensure(db, cfg, &json!({"model": model, "seat": seat.key}));
+    let Some(s) = session(db)? else {
+        return ensure(db, cfg, &json!({"model": model}));
     };
     let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     spec["model"] = if model.is_empty() {
@@ -540,10 +527,102 @@ pub fn set_model(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         &json!({"from": s.model, "to": model}).to_string(),
     )?;
     // Current flags too (an effort change applies with the switch).
-    spec["extra_args"] = json!(write_files(seat, cfg)?);
-    db.set_launch_spec(&s.id, &spec.to_string())?;
+    refresh_launch(db, cfg, &s)?;
     methods::session_restart(db, &json!({"ref": s.id}))?;
-    ensure(db, cfg, &json!({"seat": seat.key}))
+    ensure(db, cfg, &json!({}))
+}
+
+/// What `migrate_rows` retired, for the caller to clean up in tmux.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Migrated {
+    /// The old front desk's tmux session: to be killed, so its fixed name
+    /// is free for the overlord.
+    pub front_tmux: Option<String>,
+}
+
+/// The name the retired front desk is archived under.
+const RETIRED_FRONT: &str = "overlord-front-desk";
+
+/// Turn a two-session overlord (front desk + mastermind) into the one
+/// overlord, in the DB. The mastermind's session becomes the overlord: same
+/// row, so its conversation, folder, model, Remote Control and history stay;
+/// only its role and name change (its tmux session is renamed by
+/// `sync_tmux_names`). The old front desk is stopped and archived as an
+/// ordinary session. None: there was no mastermind, nothing to do (an
+/// overlord that never had one simply stays the overlord). Idempotent.
+pub fn migrate_rows(db: &Db) -> Result<Option<Migrated>> {
+    // (Renamed whether or not a mastermind ever started.)
+    for (old, new) in [
+        ("mastermind_fresh_at", FRESH_AT),
+        ("default_declined:mastermind", DEFAULT_DECLINED),
+    ] {
+        if let Some(v) = db.kv_get(old)? {
+            // Only the mastermind's row carries these over (below).
+            if db.role_session(OLD_MASTERMIND)?.is_some() {
+                db.kv_set(new, &v)?;
+            }
+            db.kv_delete(old)?;
+        }
+    }
+    // The setup dialog's pick for a mastermind not started yet.
+    db.kv_delete("mastermind_model")?;
+    // Remote Control lived on the mastermind, remembered here for one not
+    // started yet: now it is the overlord's own wish, like any session's.
+    let remote = db.kv_get("mastermind_remote")?.as_deref() == Some("1");
+    db.kv_delete("mastermind_remote")?;
+    let Some(mind) = db.role_session(OLD_MASTERMIND)? else {
+        if let Some(front) = db.role_session(ROLE)?.filter(|_| remote) {
+            crate::remote::want(db, &front)?;
+        }
+        return Ok(None);
+    };
+    let now = rlord_core::types::now_ms();
+    let mut out = Migrated::default();
+    if let Some(front) = db.role_session(ROLE)? {
+        out.front_tmux = front.tmux_session.clone();
+        db.retire_role(&front.id, RETIRED_FRONT, now)?;
+        db.insert_event(
+            &front.id,
+            now,
+            "archived",
+            &json!({"why": "the overlord is one session now: the mastermind's conversation is the overlord's"})
+                .to_string(),
+        )?;
+    }
+    db.set_role(&mind.id, ROLE, ROLE)?;
+    // Shown in the Claude app under the overlord's name from its next start.
+    let mut spec: Value = serde_json::from_str(&db.launch_spec(&mind.id)?).unwrap_or(json!({}));
+    if spec["remote_control"]
+        .as_str()
+        .is_some_and(|n| !n.is_empty())
+    {
+        spec["remote_control"] = json!(crate::remote::remote_name(ROLE, ROLE));
+        db.set_launch_spec(&mind.id, &spec.to_string())?;
+    } else if remote {
+        crate::remote::want(db, &db.resolve_ref(&mind.id)?)?;
+    }
+    db.insert_event(
+        &mind.id,
+        now,
+        "became_overlord",
+        &json!({"from": OLD_MASTERMIND}).to_string(),
+    )?;
+    tracing::info!(session = %mind.id, "the mastermind is now the overlord (one session)");
+    Ok(Some(out))
+}
+
+/// `migrate_rows`, then free the overlord's tmux name: the retired front
+/// desk's session is killed (the mastermind's is renamed onto the name by
+/// `sync_tmux_names`, which runs next at startup).
+pub fn migrate(db: &Db) -> Result<()> {
+    if let Some(m) = migrate_rows(db)? {
+        if let Some(t) = m.front_tmux {
+            if let Err(e) = tmux::kill_session(&t) {
+                tracing::warn!(error = %e, "stopping the old front desk");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every agent's project-instructions file name. The overlord gets the same
@@ -571,16 +650,48 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .filter(|n| {
                 let q = format!("`{n}`");
-                !SEATS.iter().any(|seat| {
-                    seat.instructions.contains(&q)
-                        || seat.subagents.iter().any(|(_, t)| t.contains(&q))
-                })
+                !INSTRUCTIONS.contains(&q) && !SUBAGENTS.iter().any(|(_, t)| t.contains(&q))
             })
             .collect();
         assert!(
             missing.is_empty(),
             "add to crates/daemon/src/overlord.md: {missing:?}"
         );
+    }
+
+    /// The instructions name no tool that doesn't exist (a removed tool
+    /// left behind makes the overlord call it), and nothing of the old
+    /// two-session overlord.
+    #[test]
+    fn instructions_name_only_tools_that_exist() {
+        let names: Vec<String> = crate::mcp::tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        for gone in ["hand_off", "mastermind", "front desk", "Alt-M", "Option-M"] {
+            assert!(
+                !INSTRUCTIONS.contains(gone),
+                "overlord.md still mentions {gone}"
+            );
+        }
+        // Every `snake_case` word in backticks under "What the tools do" is
+        // a tool.
+        let section = INSTRUCTIONS
+            .split("## What the tools do")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .expect("a tools section");
+        for line in section.lines().filter(|l| l.starts_with("- `")) {
+            let head = line.split('—').next().unwrap_or(line);
+            for name in head.split('`').skip(1).step_by(2) {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "overlord.md lists a tool that doesn't exist: {name}"
+                );
+            }
+        }
     }
 
     /// Subagents may only use rlord tools that exist.
@@ -592,7 +703,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(|n| format!("mcp__rlord__{n}")))
             .collect();
-        for (file, text) in SEATS.iter().flat_map(|s| s.subagents.iter()) {
+        for (file, text) in SUBAGENTS {
             let line = text
                 .lines()
                 .find_map(|l| l.strip_prefix("tools:"))
@@ -601,5 +712,125 @@ mod tests {
                 assert!(names.iter().any(|n| n == t), "unknown tool in {file}: {t}");
             }
         }
+    }
+
+    #[test]
+    fn effort_flags_per_agent() {
+        assert_eq!(effort_args(Agent::Claude, "low"), ["--effort", "low"]);
+        assert_eq!(
+            effort_args(Agent::Codex, " low "),
+            ["-c", "model_reasoning_effort=\"low\""]
+        );
+        assert!(effort_args(Agent::OpenCode, "low").is_empty());
+        assert!(effort_args(Agent::Claude, "").is_empty());
+    }
+
+    fn row(db: &Db, id: &str, role: &str, tmux: &str, dir: &str) {
+        db.insert_session(&rlord_core::db::NewSession {
+            id,
+            name: role,
+            agent: "claude",
+            agent_session: Some(&format!("conv-{id}")),
+            project_path: dir,
+            tmux_session: Some(tmux),
+            launch_spec: r#"{"model":"opus","remote_control":"rlord mastermind"}"#,
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_mastermind_becomes_the_overlord() {
+        let db = Db::open_in_memory().unwrap();
+        row(&db, "01FRONT", "overlord", "overlord-rlord", "/d/overlord");
+        row(
+            &db,
+            "01MIND",
+            "mastermind",
+            "mastermind-rlord",
+            "/d/mastermind",
+        );
+        db.kv_set("mastermind_fresh_at", "42").unwrap();
+        db.kv_set("default_declined:mastermind", "opus").unwrap();
+        db.kv_set("mastermind_model", "fable").unwrap();
+        db.insert_event(
+            "01MIND",
+            5,
+            "fresh_conversation",
+            r#"{"from":"old","to":"conv-01MIND"}"#,
+        )
+        .unwrap();
+
+        let m = migrate_rows(&db).unwrap().expect("migrated");
+        assert_eq!(m.front_tmux.as_deref(), Some("overlord-rlord"));
+        // The mastermind's row is the overlord: its conversation, folder,
+        // model and Remote Control wish are untouched.
+        let o = db.overlord().unwrap().expect("an overlord");
+        assert_eq!(o.id, "01MIND");
+        assert_eq!(o.name, "overlord");
+        assert_eq!(o.agent_session.as_deref(), Some("conv-01MIND"));
+        assert_eq!(o.project_path, "/d/mastermind");
+        assert!(db
+            .launch_spec("01MIND")
+            .unwrap()
+            .contains(r#""remote_control":"rlord overlord""#));
+        assert_eq!(db.past_agent_sessions("01MIND").unwrap(), ["old"]);
+        assert!(db.role_session("mastermind").unwrap().is_none());
+        // The front desk: an ordinary archived, stopped session.
+        let f = db.resolve_ref("01FRONT").unwrap();
+        assert_eq!(f.role, "");
+        assert_eq!(f.name, RETIRED_FRONT);
+        assert_eq!(f.status, Status::Stopped);
+        assert!(f.archived_at.is_some() && f.tmux_session.is_none());
+        // kv renamed.
+        assert_eq!(db.kv_get(FRESH_AT).unwrap().as_deref(), Some("42"));
+        assert_eq!(
+            db.kv_get(DEFAULT_DECLINED).unwrap().as_deref(),
+            Some("opus")
+        );
+        for gone in [
+            "mastermind_fresh_at",
+            "default_declined:mastermind",
+            "mastermind_model",
+        ] {
+            assert_eq!(db.kv_get(gone).unwrap(), None, "{gone}");
+        }
+        // Again: nothing to do.
+        assert_eq!(migrate_rows(&db).unwrap(), None);
+        assert_eq!(db.overlord().unwrap().unwrap().id, "01MIND");
+    }
+
+    #[test]
+    fn an_overlord_without_a_mastermind_stays() {
+        let db = Db::open_in_memory().unwrap();
+        row(&db, "01FRONT", "overlord", "overlord-rlord", "/d/overlord");
+        db.set_launch_spec("01FRONT", r#"{"model":"sonnet"}"#)
+            .unwrap();
+        db.kv_set(DEFAULT_DECLINED, "sonnet").unwrap();
+        db.kv_set("mastermind_fresh_at", "42").unwrap();
+        db.kv_set("mastermind_remote", "1").unwrap();
+        assert_eq!(migrate_rows(&db).unwrap(), None);
+        // Remote Control chosen for a mastermind that never started: the
+        // overlord's own now.
+        assert!(db
+            .launch_spec("01FRONT")
+            .unwrap()
+            .contains(r#""remote_control":"rlord overlord""#));
+        assert_eq!(db.kv_get("mastermind_remote").unwrap(), None);
+        let o = db.overlord().unwrap().unwrap();
+        assert_eq!((o.id.as_str(), o.archived_at), ("01FRONT", None));
+        // Its own "declined" stays; the unused mastermind's keys go.
+        assert_eq!(
+            db.kv_get(DEFAULT_DECLINED).unwrap().as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(db.kv_get("mastermind_fresh_at").unwrap(), None);
+        assert_eq!(db.kv_get(FRESH_AT).unwrap(), None);
+        // No overlord at all: nothing happens either.
+        assert_eq!(migrate_rows(&Db::open_in_memory().unwrap()).unwrap(), None);
     }
 }

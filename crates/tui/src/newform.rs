@@ -1088,7 +1088,7 @@ impl App {
             }
             Location::Auto => {}
         }
-        // Sent in the background: a first-time mastermind can take a while
+        // Sent in the background: a stopped overlord can take a while
         // to start, and the list must not freeze meanwhile. Its overlay opens
         // now, so the user watches it pick the request up.
         // What can fail fast is checked here, so the form stays open with
@@ -1107,11 +1107,11 @@ impl App {
             let _ = client_call(&paths::socket_path(), "overlord.new_session", params);
         });
         self.status_line = if f.confirmed {
-            "confirmed — the mastermind is launching it".into()
+            "confirmed — the overlord is launching it".into()
         } else {
-            "sent to the mastermind".into()
+            "sent to the overlord".into()
         };
-        self.show_seat("mastermind");
+        self.show_overlord();
         Ok(None)
     }
 
@@ -1306,7 +1306,7 @@ impl App {
             };
             let line = if *field == Field::Launch {
                 let label = match form.kind {
-                    FormKind::Overlord => "Send to mastermind",
+                    FormKind::Overlord => "Send to overlord",
                     FormKind::Manual => "Launch",
                 };
                 Line::from(vec![
@@ -1426,7 +1426,7 @@ fn draw_describe_form(
                 Style::default().fg(theme::text()).italic(),
             )));
             head.push(Line::from(Span::styled(
-                "  This form sends the same to the mastermind, with optional hints.",
+                "  This form sends the same to the overlord, with optional hints.",
                 gray,
             )));
         }
@@ -1607,7 +1607,7 @@ fn draw_describe_form(
     let send = if form.confirmed {
         " Launch "
     } else {
-        " Send to mastermind "
+        " Send to overlord "
     };
     hits.row(rest, rest.y + lines.len() as u16, pick(Field::Launch));
     lines.push(Line::from(vec![
@@ -1757,7 +1757,7 @@ mod tests {
         };
         assert!(at("What should this session do?") < at("Optional hints"));
         assert!(out.contains("your description wins"));
-        assert!(out.contains("Send to mastermind"));
+        assert!(out.contains("Send to overlord"));
         assert!(!out.contains("Request"));
 
         // Reopened by the overlord: its note, updated hints marked.

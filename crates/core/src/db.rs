@@ -330,7 +330,7 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// The session with this role (`overlord`, `mastermind`), if created.
+    /// The session with this role (`overlord`), if created.
     pub fn role_session(&self, role: &str) -> Result<Option<Session>> {
         Ok(self.query_sessions("role = ?1", role)?.into_iter().next())
     }
@@ -338,6 +338,27 @@ impl Db {
     /// The overlord session, if one has ever been created.
     pub fn overlord(&self) -> Result<Option<Session>> {
         self.role_session("overlord")
+    }
+
+    /// Give a session another role and name (the mastermind becoming the
+    /// overlord).
+    pub fn set_role(&self, id: &str, role: &str, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET role = ?2, name = ?3 WHERE id = ?1",
+            params![id, role, name],
+        )?;
+        Ok(())
+    }
+
+    /// Retire a session that had a role: an ordinary, stopped, archived
+    /// session under `name`, with no tmux session of its own.
+    pub fn retire_role(&self, id: &str, name: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET role = '', name = ?2, tmux_session = NULL, \
+             status = 'stopped', archived_at = ?3 WHERE id = ?1",
+            params![id, name, ts],
+        )?;
+        Ok(())
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -1079,6 +1100,35 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Each time a session moved to another conversation, oldest first:
+    /// (when, event kind, payload `{from, to, reason?}`). A fresh restart
+    /// or a `/clear` is a `fresh_conversation`; any other switch (a resume)
+    /// an `agent_session_changed`.
+    pub fn conversation_changes(&self, id: &str) -> Result<Vec<(i64, String, serde_json::Value)>> {
+        let mut st = self.conn.prepare(
+            "SELECT ts, kind, payload FROM events WHERE session_id = ?1 \
+             AND kind IN ('agent_session_changed', 'fresh_conversation') \
+             ORDER BY seq ASC",
+        )?;
+        let rows = st.query_map([id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows
+            .flatten()
+            .map(|(ts, kind, p)| {
+                (
+                    ts,
+                    kind,
+                    serde_json::from_str(&p).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect())
     }
 
     /// Every session's transcript file (session id, path).

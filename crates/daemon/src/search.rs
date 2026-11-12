@@ -45,6 +45,12 @@ fn matched_fields(s: &Session, ws: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
+/// The overlord's session, or one that ran in an overlord's folder (the
+/// retired front desk of a two-session overlord).
+fn is_overlords(s: &Session, dirs: &[String]) -> bool {
+    crate::overlord::is_overlord_role(&s.role) || dirs.iter().any(|d| *d == s.project_path)
+}
+
 pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let query = params["query"].as_str().unwrap_or("").trim();
     if query.is_empty() {
@@ -53,12 +59,27 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let ws = words(query);
     let everywhere = params["scope"].as_str() == Some("all");
     let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
-    let sessions = {
-        let q = SessionQuery {
-            archived: ArchivedMode::All,
-            ..Default::default()
-        };
-        d.db().sessions(&q)?
+    // One session ("what happened in X?"): only it, and its transcripts.
+    let one = match params["session"].as_str().map(str::trim) {
+        Some(r) if !r.is_empty() => {
+            let s = d.db().resolve_ref(r)?;
+            if crate::overlord::is_overlord_role(&s.role) {
+                bail!("the overlord's own conversations are searched with recall");
+            }
+            Some(s)
+        }
+        _ => None,
+    };
+    let everywhere = everywhere && one.is_none();
+    let sessions = match one {
+        Some(s) => vec![s],
+        None => {
+            let q = SessionQuery {
+                archived: ArchivedMode::All,
+                ..Default::default()
+            };
+            d.db().sessions(&q)?
+        }
     };
     // Each session's transcripts: the current one, then any from before a
     // `/clear`. Searched in that order, so a session's hits start with its
@@ -66,15 +87,16 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut paths_of: HashMap<usize, Vec<PathBuf>> = HashMap::new();
     let mut paths: Vec<PathBuf> = Vec::new();
-    // The overlord's own conversations are full of searches: never results.
-    // Whole folders: each seat runs in its own, so every conversation it
-    // ever had is in there, known to rlord or not.
+    // The overlord's own conversations are full of searches: never results
+    // (it looks its own past up with `recall`).
+    // Whole folders: it runs in its own, so every conversation it ever had
+    // is in there, known to rlord or not.
     // (Claude keeps a folder's conversations together, so its transcript
     // directory stands for the folder; a Codex rollout and an OpenCode
     // session say their folder.)
-    let seat_dirs: Vec<String> = crate::overlord::SEATS
+    let seat_dirs: Vec<String> = crate::overlord::dirs()
         .iter()
-        .map(|seat| seat.dir().to_string_lossy().into_owned())
+        .map(|dir| dir.to_string_lossy().into_owned())
         .collect();
     let skip: std::collections::HashSet<PathBuf> = seat_dirs
         .iter()
@@ -86,7 +108,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         })
         .collect();
     for (i, s) in sessions.iter().enumerate() {
-        if crate::overlord::is_overlord_role(&s.role) {
+        if is_overlords(s, &seat_dirs) {
             // (Its folder is skipped whole, above: no need to look its
             // transcripts up one by one.)
             continue;
@@ -103,7 +125,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         // Codex rollouts sit together by date: which folder each ran in is
         // one question to Codex's index; a rollout it doesn't list (older
         // than the index, or no index at all) says so in its first bytes.
-        // A seat's folder may be recorded as given or resolved (symlinks).
+        // Its folder may be recorded as given or resolved (symlinks).
         let folders = agents::codex::rollout_folders(&agents::codex::home()).unwrap_or_default();
         let seat_real: Vec<String> = seat_dirs
             .iter()
@@ -153,7 +175,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut rows: Vec<(usize, Vec<&'static str>, usize)> = sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| !crate::overlord::is_overlord_role(&s.role))
+        .filter(|(_, s)| !is_overlords(s, &seat_dirs))
         .map(|(i, s)| (i, matched_fields(s, &ws), hits.get(&i).map_or(0, |h| h.0)))
         .filter(|(_, f, n)| !f.is_empty() || *n > 0)
         .collect();
