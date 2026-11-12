@@ -1869,6 +1869,8 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
         };
         let used = match rlord_core::usage::Usage::from_json(&s["usage"]) {
             Some(u) => u.cell(usage),
+            // (Still being read by the daemon's warm-up.)
+            None if s["loading"] == true => format!("{:>4}", "…"),
             None => rlord_core::usage::cell(None, usage),
         };
         println!(

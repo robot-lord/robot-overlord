@@ -127,7 +127,34 @@ displays as "unknown", never as epoch or a guess.
 Sort/filter/pivot in CLI, TUI, and MCP all take the same query object:
 filter by status/agent/tag/group/archived/project, sort by any derived
 timestamp or name or manual order. This is the number-one product feature and
-it is just SQL.
+it is just SQL. The one sort that isn't is **usage** (below): SQL orders by
+last message, then the daemon re-sorts by the usage it attached.
+
+### Usage (the list's Usage column)
+
+Each `session.list` / `session.get` row carries `usage` (`turns`,
+`tokens`, `context`, `window`, `context_pct`; null while unknown), from
+`core::usage::of(transcript)`, filled in by `daemon::usage` after the DB
+lock is released:
+
+- **turns** = prompts the human typed (`Line::prompt`); **tokens** = input
+  not read from a cache (cache writes count) plus output; **context** = the
+  last request's whole context. Claude writes one API message over several
+  lines that repeat its usage: it counts once (`Line::message_id`).
+- JSONL transcripts: the counts ride on `transcript_stats`' incremental
+  cursor (only appended bytes are parsed) and are saved with it in
+  `transcript_cursors`. OpenCode: indexed look-ups in `session_v2` /
+  `session_message` only, cached until the database or its WAL changes.
+- **Window**: what the agent reports (Codex's `model_context_window`),
+  else `models::context_window` (a per-family table; `[1m]` is 1M, and a
+  200k model that sent more than 200k is taken as its 1M variant). Unknown
+  → no `context_pct`, shown as `–`.
+- The list never stalls on a first full read: a transcript rlord hasn't
+  read (or one more than 4 MB behind) is queued on the warm-up worker
+  (`Job::Usage`, once per run) and the row shows as loading meanwhile.
+- The measure is `SessionQuery::usage` (the TUI sends its current one),
+  else config `usage`. `SortMode::Usage` sorts by it: pinned first, most
+  first, unknown last.
 
 ## tmux supervisor
 
@@ -385,8 +412,9 @@ automatic**, so tools can default "me" and enforce policy (e.g. rate limits,
 no self-restart).
 
 Tools (v1):
-- `list_sessions(filter?, sort?)` — same query object as the CLI; returns
-  meta-context (status, timestamps, tags, pending-message counts).
+- `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
+  returns meta-context (status, timestamps, tags, usage, pending-message
+  counts).
 - `get_session(id)` — detail + recent event summary.
 - `get_context(id, {last_message | recent_activity | transcript_tail})` —
   "go get context from that other agent" without a round-trip through the
@@ -628,8 +656,9 @@ tmux server, so each is configurable and can be set to `""` to disable.
 commented template equal to the defaults; `rlord config show` prints the
 effective config). Missing keys take defaults; a malformed file is an error,
 never silently ignored. Sections: `layout` (`side` = list left / preview
-right, `stack`), `list_width_pct`, `preview_refresh_ms`, `[keys]` (every TUI
-action), `[tmux]` (the three navigation bindings).
+right, `stack`), `list_width_pct`, `preview_refresh_ms`, `usage` (what the
+Usage column shows), `[keys]` (every TUI action), `[tmux]` (the three
+navigation bindings).
 
 ## Session creation
 

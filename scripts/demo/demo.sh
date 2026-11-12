@@ -23,7 +23,7 @@ if [[ ${1:-} == --stop ]]; then
 fi
 
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
-mkdir -p "$d"/{data,config/robot-overlord,run,state,claude,codex,bin,src,screens,states,summaries}
+mkdir -p "$d"/{data,config/robot-overlord,run,state,claude,codex,bin,src,screens,states,summaries,usage}
 d=$(cd "$d" && pwd)
 # The daemon's socket lives under it, and a unix socket's path is short
 # (about 100 bytes): say so here, not as a daemon that "isn't answering".
@@ -72,10 +72,13 @@ box() { printf '%s\n' "${D}─────────────────�
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
 # AGENT=codex add …: a Codex session; AGENT=opencode: an OpenCode one.
+# USAGE="TURNS CONTEXT": how far its conversation has got (the stand-in
+# writes that many turns; the list's Usage column shows them).
 add() {
   local name=$1 proj=$2 state=$3 tags=$4 desc=$5 prompt=$6 dir=$d/src/$1
   mkdir -p "$dir"
   printf '%s' "$state" > "$d/states/$name"
+  printf '%s\n' "${USAGE:-3 20000}" > "$d/usage/$name"
   { printf '%s\n\n' "${D}${proj}${R}"; printf '%s\n' "> $prompt" ""; cat; printf '\n'; box ""; } > "$d/screens/$name.txt"
   rlord new --agent "${AGENT:-claude}" --project "$dir" --name "$name" "$prompt" >/dev/null
   # shellcheck disable=SC2086
@@ -83,7 +86,7 @@ add() {
   rlord describe "$name" "$desc" >/dev/null
 }
 
-add checkout-redesign acme-web working "web wip" "Rebuild checkout on the new design system" "Rebuild the checkout page with the new design system components" <<EOF
+USAGE="38 151000" add checkout-redesign acme-web working "web wip" "Rebuild checkout on the new design system" "Rebuild the checkout page with the new design system components" <<EOF
 ● I'll move checkout to the new components, one step at a time.
 ● Read(src/checkout/CheckoutPage.tsx)
   ${D}⎿  Read 214 lines${R}
@@ -97,7 +100,7 @@ add checkout-redesign acme-web working "web wip" "Rebuild checkout on the new de
 ${Y}✻ Swapping the address form to <Field>… (2m 14s · esc to interrupt)${R}
 EOF
 
-add billing-webhooks acme-api waiting "billing" "Retry failed Stripe webhooks idempotently" "Make the Stripe webhook handler retry failed events without double-charging" <<EOF
+USAGE="14 64000" add billing-webhooks acme-api waiting "billing" "Retry failed Stripe webhooks idempotently" "Make the Stripe webhook handler retry failed events without double-charging" <<EOF
 ● The handler now stores each event id and skips duplicates.
 ● Bash(cargo test webhooks)
   ${D}⎿  test result: ok. 18 passed; 0 failed${R}
@@ -110,7 +113,7 @@ add billing-webhooks acme-api waiting "billing" "Retry failed Stripe webhooks id
   ${B}3.${R} Something else
 EOF
 
-add flaky-login-test acme-web idle "auth tests" "Fix the flaky login integration test" "The login integration test fails about 1 in 10 runs, find out why" <<EOF
+USAGE="6 41000" add flaky-login-test acme-web idle "auth tests" "Fix the flaky login integration test" "The login integration test fails about 1 in 10 runs, find out why" <<EOF
 ● Found it: the test reads the session cookie before the refresh
   request finishes. It passes only when the refresh wins the race.
 ● Update(tests/auth/login.test.ts)
@@ -121,7 +124,7 @@ add flaky-login-test acme-web idle "auth tests" "Fix the flaky login integration
 ● Fixed: the test now awaits the refresh. 20 runs, no failures.
 EOF
 
-add api-rate-limits acme-api working "api" "Per-key rate limits on the public API" "Add per-API-key rate limiting to the public API" <<EOF
+USAGE="9 52000" add api-rate-limits acme-api working "api" "Per-key rate limits on the public API" "Add per-API-key rate limiting to the public API" <<EOF
 ● Plan: a token bucket per key in Redis, limits from the plan tier.
 ● Write(src/ratelimit/bucket.rs)
   ${D}⎿  Wrote 96 lines${R}
@@ -131,14 +134,14 @@ add api-rate-limits acme-api working "api" "Per-key rate limits on the public AP
 ${Y}✻ Testing the burst limit… (48s · esc to interrupt)${R}
 EOF
 
-add docs-navigation acme-docs waiting "docs" "New sidebar navigation for the docs" "Rework the docs sidebar so guides and API reference are separate" <<EOF
+USAGE="22 118000" add docs-navigation acme-docs waiting "docs" "New sidebar navigation for the docs" "Rework the docs sidebar so guides and API reference are separate" <<EOF
 ● The new sidebar is ready: Guides and Reference are separate trees,
   and every page keeps its URL.
 
 ● Want me to push the branch and open a PR?
 EOF
 
-add terraform-upgrade acme-infra idle "infra" "Upgrade Terraform providers to v5" "Upgrade the AWS Terraform provider to v5 and fix what breaks" <<EOF
+USAGE="11 73000" add terraform-upgrade acme-infra idle "infra" "Upgrade Terraform providers to v5" "Upgrade the AWS Terraform provider to v5 and fix what breaks" <<EOF
 ● Upgraded the AWS provider to 5.31 and fixed the three breaking changes.
 ● Bash(terraform plan)
   ${D}⎿  No changes. Your infrastructure matches the configuration.${R}
@@ -146,13 +149,13 @@ add terraform-upgrade acme-infra idle "infra" "Upgrade Terraform providers to v5
 ● Done. The plan is clean.
 EOF
 
-add push-notifications acme-mobile idle "mobile" "Push notifications for order updates" "Send push notifications when an order ships" <<EOF
+USAGE="4 23000" add push-notifications acme-mobile idle "mobile" "Push notifications for order updates" "Send push notifications when an order ships" <<EOF
 ● Shipping events now send a push through the notifications service.
 ● Bash(pnpm test notifications)
   ${D}⎿  12 passed${R}
 EOF
 
-AGENT=codex add image-pipeline acme-api idle "api perf" "Resize product images off the request path" "Move product image resizing to a background job" <<EOF
+AGENT=codex USAGE="7 88000" add image-pipeline acme-api idle "api perf" "Resize product images off the request path" "Move product image resizing to a background job" <<EOF
 • Moved resizing into a queue worker; uploads now return in ~80ms.
 • Ran cargo test images
   ${D}└ test result: ok. 9 passed; 0 failed${R}
@@ -162,7 +165,7 @@ EOF
 
 # An OpenCode session. (No stand-in server: rlord reads working / your
 # turn from OpenCode's session row; "needs you" would need its events.)
-AGENT=opencode add onboarding-emails acme-api idle "api growth" "Welcome email sequence for new sellers" "Draft the three-email welcome sequence for new sellers" <<EOF
+AGENT=opencode USAGE="3 15000" add onboarding-emails acme-api idle "api growth" "Welcome email sequence for new sellers" "Draft the three-email welcome sequence for new sellers" <<EOF
 • Drafted the sequence in emails/onboarding/: welcome, first listing, payouts.
 • Each email has a plain-text twin and one call to action.
 
@@ -174,6 +177,7 @@ EOF
 name=search-indexer-migration
 mkdir -p "$d/src/$name"
 printf idle > "$d/states/$name"
+printf '%s\n' "27 132000" > "$d/usage/$name"
 printf '%s\n' "● Migrated the indexer to the new queue." > "$d/screens/$name.txt"
 cat > "$d/summaries/$name.txt" <<'EOF'
 Moved the search indexer from cron batches to the event queue, so new
@@ -223,6 +227,7 @@ set_times search-indexer-migration 10080 10070 14400
 sql "update sessions set pinned=1 where name='checkout-redesign'"
 
 # The overlord (the stand-in draws its screen).
+printf '%s\n' "5 36000" > "$d/usage/overlord"
 cat > "$d/screens/overlord.txt" <<EOF
 ${M}${B}◆ overlord${R}
 
