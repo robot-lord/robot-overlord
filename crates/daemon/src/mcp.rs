@@ -50,7 +50,7 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error. The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
                 "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
@@ -231,6 +231,13 @@ pub fn tools() -> Value {
                 "text": s("The message, complete: the session sees only this"),
                 "when_idle": b("Session mid-turn: deliver when its turn is over instead of refusing (default false)"),
             }), &["session", "text"]),
+        tool("resume_after_limit",
+            "Pick sessions up when their usage limit resets. A session the agent stopped on a usage limit shows `status: limited` with `limited_until`. This schedules one resume per session: once its limit has reset (plus a minute) the session is sent the message, typed in as send_to_session types, unless it was used since the limit hit (the user typed, or it answered): then it is left alone. If the limit hits again the resume waits for the next reset. Scheduled resumes survive an rlord restart. Only when the user asks; nothing is resumed automatically. Without `sessions`: every session limited right now.",
+            json!({
+                "sessions": {"type": "array", "items": {"type": "string"},
+                             "description": "Sessions (id, id prefix or name). Omit for every limited session."},
+                "message": s("What to send (default: the user's configured resume message, \"continue\")"),
+            }), &[]),
         tool("session_action",
             "Lifecycle: restart (resumes the conversation), stop (resumable), archive (stop + hide), unarchive.",
             json!({
@@ -278,6 +285,12 @@ fn summarize(s: &Value) -> Value {
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
     });
+    // Stopped on a usage limit: that, rather than the status under it.
+    if !s["limit"].is_null() {
+        row["status"] = json!("limited");
+        row["limited_until"] = s["limit"]["until"].clone();
+        row["resume_scheduled"] = s["limit"]["resume"].clone();
+    }
     // Archived: what it did (get_session has it all).
     if !s["archived_at"].is_null() {
         let sum = s["summary"].as_str().unwrap_or("");
@@ -639,6 +652,15 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                    "text": args.get("text").and_then(Value::as_str).context("missing 'text'")?,
                    "when_idle": args.get("when_idle").and_then(Value::as_bool).unwrap_or(false)}),
         ),
+        "resume_after_limit" => {
+            let mut p = Map::new();
+            for k in ["sessions", "message"] {
+                if let Some(v) = args.get(k).filter(|v| !v.is_null()) {
+                    p.insert(k.into(), v.clone());
+                }
+            }
+            d.rpc("limits.resume", Value::Object(p))
+        }
         "session_action" => {
             let r = session_ref(args)?;
             let method = match arg_str(args, "action") {

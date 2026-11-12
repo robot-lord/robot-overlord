@@ -356,6 +356,30 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     }
 }
 
+/// A usage limit stopped the turn: Claude Code writes a synthetic
+/// assistant line for it (`"You've hit your 5-hour limit · resets 1:30pm
+/// (America/Los_Angeles)"`) with `isApiErrorMessage: true`, `apiError:
+/// "usage_limit_reached"`, `error: "rate_limit"` and the reset time as
+/// epoch seconds in `apiErrorParams.rate_limit_info.resetsAt` (also
+/// `quotaLimits.resetsAt`). Returns (when it resets in ms, which limit:
+/// `five_hour`, …). Other API errors (`server_error`, …) and messages that
+/// only talk about limits are not this; the text is never parsed.
+pub(crate) fn usage_limit(v: &Value) -> Option<(i64, String)> {
+    if v["type"] != "assistant" || v["isApiErrorMessage"] != true {
+        return None;
+    }
+    if v["apiError"] != "usage_limit_reached" && v["error"] != "rate_limit" {
+        return None;
+    }
+    let info = [&v["apiErrorParams"]["rate_limit_info"], &v["quotaLimits"]]
+        .into_iter()
+        .find(|i| i["resetsAt"].as_i64().is_some())?;
+    Some((
+        info["resetsAt"].as_i64()? * 1000,
+        info["rateLimitType"].as_str().unwrap_or("").to_string(),
+    ))
+}
+
 // ---- its screen ----
 
 /// A dialog is on Claude Code's screen: a permission prompt ("Do you want

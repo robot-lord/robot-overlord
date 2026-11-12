@@ -370,6 +370,61 @@ pub fn observed_model(path: &Path) -> Option<String> {
         .find_map(|v| format.line(v).model().map(str::to_string))
 }
 
+/// A usage limit that stopped a conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitHit {
+    /// When it hit (ms).
+    pub at: i64,
+    /// When the limit resets (ms).
+    pub resets_at: i64,
+    /// Which limit, in the agent's word (`five_hour`; may be empty).
+    pub kind: String,
+    /// The conversation went on after it: the user typed a prompt, or the
+    /// agent answered again. Then it is no longer stopped on that limit.
+    pub touched: bool,
+}
+
+/// The last usage limit near the end of a transcript, if it hit one
+/// (Claude Code only so far: `claude::usage_limit`). Reads only the
+/// file's tail.
+pub fn limit_hit(path: &Path) -> Option<LimitHit> {
+    let format = Format::of(path);
+    if format != Format::Claude {
+        return None;
+    }
+    let (_, tail) = read_head_tail(path);
+    limit_in(format, &tail)
+}
+
+/// `limit_hit` over parsed lines (oldest first).
+pub fn limit_in(format: Format, lines: &[Value]) -> Option<LimitHit> {
+    if format != Format::Claude {
+        return None;
+    }
+    let (i, (resets_at, kind)) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, v)| Some((i, claude::usage_limit(v)?)))?;
+    let at = format
+        .line(&lines[i])
+        .at()
+        .and_then(parse_iso_ms)
+        .unwrap_or(0);
+    // After it: a prompt the human typed, or a real answer (not injected
+    // context, a command wrapper or a bookkeeping line).
+    let touched = lines[i + 1..].iter().any(|v| {
+        let l = format.line(v);
+        l.prompt().is_some() || (v["type"] == "assistant" && l.reply().is_some())
+    });
+    Some(LimitHit {
+        at,
+        resets_at,
+        kind,
+        touched,
+    })
+}
+
 /// Whether the agent is mid-turn (`Some(true)` working, `Some(false)` its
 /// turn is over), from the turn lines read so far. Incremental (see
 /// `transcript_stats`): polling it costs only what was appended. None when
@@ -926,5 +981,43 @@ mod tests {
         .unwrap();
         std::fs::rename(&q, &p).unwrap();
         assert_eq!(transcript_stats(&p).unwrap().input_tokens, 3);
+    }
+
+    /// The line Claude Code 2.1.322 wrote on a 5-hour limit (trimmed).
+    const LIMIT_LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"You've hit your 5-hour limit · resets 1:30pm (America/Los_Angeles)"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1794519000,"rateLimitType":"five_hour"}},"quotaLimits":{"status":"rejected","resetsAt":1794519000,"rateLimitType":"five_hour"},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}"#;
+
+    #[test]
+    fn a_usage_limit_is_read_from_its_record_not_its_text() {
+        let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let limit = v(LIMIT_LINE);
+        let hit = limit_in(Format::Claude, std::slice::from_ref(&limit)).unwrap();
+        assert_eq!(hit.resets_at, 1_794_519_000_000);
+        assert_eq!(hit.kind, "five_hour");
+        assert_eq!(hit.at, parse_iso_ms("2026-11-12T18:40:58.108Z").unwrap());
+        assert!(!hit.touched);
+        // Bookkeeping and injected context after it don't touch it.
+        let system = v(r#"{"type":"system","subtype":"turn_duration","durationMs":471}"#);
+        let injected = v(
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>x</task-notification>"}}"#,
+        );
+        let lines = [limit.clone(), system, injected];
+        assert!(!limit_in(Format::Claude, &lines).unwrap().touched);
+        // A prompt the user typed does; so does a real answer.
+        let prompt = v(r#"{"type":"user","message":{"role":"user","content":"carry on"}}"#);
+        let mut lines = lines.to_vec();
+        lines.push(prompt);
+        assert!(limit_in(Format::Claude, &lines).unwrap().touched);
+        // Hit again: the newer one counts, untouched.
+        lines.push(limit.clone());
+        assert!(!limit_in(Format::Claude, &lines).unwrap().touched);
+        // Another API error, or talk about limits, is not a limit.
+        let slept = v(
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"computer_slept","error":"server_error","message":{"content":[{"type":"text","text":"x"}]}}"#,
+        );
+        let talk = v(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"You've hit your 5-hour limit · resets 1:30pm"}]}}"#,
+        );
+        assert_eq!(limit_in(Format::Claude, &[slept, talk]), None);
+        assert_eq!(limit_in(Format::Codex, &[limit]), None);
     }
 }

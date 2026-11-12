@@ -117,6 +117,9 @@ pub struct TmuxKeys {
     /// From any pane: jump to rlord with the overlord overlay open; in rlord:
     /// toggle the overlay.
     pub overlord: String,
+    /// In the overlord's overlay: switch to the next agent's overlord (the
+    /// overlay reads it; tmux doesn't bind it). Empty = off.
+    pub overlord_switch: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
@@ -136,6 +139,7 @@ impl Default for TmuxKeys {
             next: String::new(),
             prev: String::new(),
             overlord: "M-o".into(),
+            overlord_switch: "M-s".into(),
             profile: true,
             mouse: true,
         }
@@ -469,6 +473,24 @@ pub struct Config {
     pub tmux: TmuxKeys,
     pub archive: ArchiveConfig,
     pub update: UpdateConfig,
+    pub limits: LimitsConfig,
+}
+
+/// Sessions stopped by a usage limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// What a session is sent when it is resumed after its limit resets
+    /// (`resume_after_limit`, only when asked for).
+    pub resume_message: String,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            resume_message: "continue".into(),
+        }
+    }
 }
 
 /// `rlord update`: which releases it installs.
@@ -536,6 +558,7 @@ impl Default for Config {
             tmux: TmuxKeys::default(),
             archive: ArchiveConfig::default(),
             update: UpdateConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -759,6 +782,7 @@ back = "M-d"    # back to the rlord TUI (or detach if you attached from outside 
 next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
 overlord = "M-o" # from any pane: the overlord over it
+overlord_switch = "M-s" # in the overlay: the next agent's overlord
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 mouse = true     # click and scroll in the list, the overlay and agent panes
                  # (drag-select then needs Shift; Option in some macOS
@@ -780,6 +804,12 @@ summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
 # (development builds, macOS only, included).
 [update]
 channel = "stable"
+
+# A session stopped by a usage limit shows "limited until <time>". Ask the
+# overlord (or `rlord resume-after-limit`) to pick it up when the limit
+# resets: it is sent this message then, if nobody touched it meanwhile.
+[limits]
+resume_message = "continue"
 "##;
 
 #[cfg(test)]

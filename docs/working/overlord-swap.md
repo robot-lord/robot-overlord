@@ -1,0 +1,51 @@
+# Parallel overlords with a hot swap; resume after a usage limit
+
+**Status:** in progress
+
+Two features, one PR (0.23.0-dev.1).
+
+## 1. One overlord per agent, one active
+
+Decisions (the user's): an overlord may exist per agent; each starts the
+first time it is switched to and keeps running; exactly one is active and
+gets everything (overlay, `n`, `rlord overlord ask`, the Remote Control
+"you"); no automatic switching.
+
+Design calls:
+
+- **DB**: every overlord keeps role `overlord` (so every refusal and
+  `is_overlord_role` check holds for all of them); the agent column tells
+  them apart (one per agent); kv `overlord_active` holds the active one's
+  id. No kv: the oldest row, so an existing install needs no migration.
+- **Folders**: each overlord has its own (`overlord`, then
+  `overlord-<agent>`). `write_files` output is the same whichever agent
+  runs it, so sharing would work for the files, but every agent finds its
+  conversations by folder, and a migrated install's overlord may live in
+  `mastermind/` anyway.
+- **tmux**: the first keeps `overlord-rlord`; later ones are
+  `overlord-rlord-<agent>`. No renames on a swap.
+- **recall**: across all overlords (the user thinks of one desk, and
+  switches because one is limited). The list's "earlier conversations"
+  stay the active overlord's own.
+- **Swap key**: `[tmux] overlord_switch`, default `M-s`, read by the
+  overlay only.
+
+## 2. Resume after a usage limit
+
+- Detection: Claude Code's transcript record (`apiError:
+  "usage_limit_reached"`, `resetsAt` epoch seconds). Seen on CLI 2.1.322,
+  one sample (a 5-hour limit).
+- `limits.rs`: kv `limits` (what is limited now), kv `limit_resume` (jobs).
+
+## Owed
+
+- Codex limit detection: no rollout on this machine ever hit a limit, so
+  its record's shape is unverified. Likely signal: `token_count`
+  `rate_limits.rate_limit_reached_type` non-null, `resets_at` epoch
+  seconds. Needs one real sample.
+- OpenCode limit detection.
+- The swap key isn't on the key screen (`keys_list` / `:keys`): it is an
+  overlay key, not a tmux binding, and the screen's live test goes
+  through tmux.
+- No way to cancel a scheduled resume other than using the session.
+- `status:limited` as a list filter.

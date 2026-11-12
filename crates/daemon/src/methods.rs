@@ -663,21 +663,24 @@ pub(crate) fn import_candidate(
 fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
     // own check still catches.
-    // The overlord's fixed name is reserved, even before it exists.
-    let reserved = |n: &str| n == crate::overlord::TMUX_NAME;
+    // The overlords' fixed names are reserved, even before they exist.
+    let reserved = |n: &str| crate::overlord::is_tmux_name(n);
     rlord_core::names::tmux_name_for(name, |n| {
         Some(n) != own
             && (reserved(n) || db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
     })
 }
 
-/// The tmux name a session should have: the overlord's fixed one, else its
+/// The tmux name a session should have: an overlord's fixed one, else its
 /// name plus `-rlord`.
 fn wanted_tmux_name(db: &Db, s: &rlord_core::types::Session) -> Option<String> {
-    if crate::overlord::is_overlord_role(&s.role) {
-        return Some(crate::overlord::TMUX_NAME.to_string());
-    }
     let cur = s.tmux_session.as_deref();
+    if crate::overlord::is_overlord_role(&s.role) {
+        if cur.is_some_and(crate::overlord::is_tmux_name) {
+            return None; // already has one of them
+        }
+        return Some(crate::overlord::free_tmux_name(db, &s.agent));
+    }
     if cur.is_some_and(|c| rlord_core::names::is_tmux_name_for(c, &s.name)) {
         return None; // already named after it
     }
@@ -987,7 +990,7 @@ pub(crate) fn hook_emit_with(
                         &json!({"from": s.agent_session, "to": sid, "reason": "clear"}).to_string(),
                     )?;
                     if crate::overlord::is_overlord_role(&s.role) {
-                        db.kv_set(crate::overlord::FRESH_AT, &now.to_string())?;
+                        crate::overlord::set_fresh_at(db, &s.id, now)?;
                     }
                 } else {
                     db.insert_event(

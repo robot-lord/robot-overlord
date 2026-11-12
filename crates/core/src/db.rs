@@ -18,6 +18,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_usage.sql"),
 ];
 
+/// kv: the id of the active overlord (see `Db::overlord`).
+pub const OVERLORD_ACTIVE: &str = "overlord_active";
+
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
@@ -290,6 +293,12 @@ impl Db {
             return Ok(s);
         }
         let by_name: Vec<Session> = self.query_sessions("name = ?1", r)?;
+        // Every overlord is named "overlord": the name means the active one.
+        if by_name.len() > 1 && by_name.iter().all(|s| s.role == "overlord") {
+            if let Some(o) = self.overlord()? {
+                return Ok(o);
+            }
+        }
         match by_name.len() {
             1 => return Ok(by_name.into_iter().next().unwrap()),
             n if n > 1 => bail!("name '{r}' is ambiguous ({n} sessions); use the id"),
@@ -348,9 +357,29 @@ impl Db {
         Ok(self.query_sessions("role = ?1", role)?.into_iter().next())
     }
 
-    /// The overlord session, if one has ever been created.
+    /// Every overlord session: at most one per agent, oldest first.
+    pub fn overlords(&self) -> Result<Vec<Session>> {
+        let mut all = self.query_sessions("role = ?1", "overlord")?;
+        all.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(all)
+    }
+
+    /// The active overlord, if one has ever been created: the one kv
+    /// `OVERLORD_ACTIVE` names, else the oldest (an install from before
+    /// there could be several has one row and no kv: that row).
     pub fn overlord(&self) -> Result<Option<Session>> {
-        self.role_session("overlord")
+        let all = self.overlords()?;
+        let active = self.kv_get(OVERLORD_ACTIVE)?;
+        let at = all
+            .iter()
+            .position(|s| Some(&s.id) == active.as_ref())
+            .unwrap_or(0);
+        Ok(all.into_iter().nth(at))
+    }
+
+    /// Make overlord session `id` the active one.
+    pub fn set_active_overlord(&self, id: &str) -> Result<()> {
+        self.kv_set(OVERLORD_ACTIVE, id)
     }
 
     /// Give a session another role and name (the mastermind becoming the

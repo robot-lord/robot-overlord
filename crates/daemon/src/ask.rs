@@ -99,7 +99,10 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                 );
             }
             if s.status != Status::Starting {
-                let name = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
+                let name = s
+                    .tmux_session
+                    .as_deref()
+                    .context("the overlord has no pane")?;
                 // Its agent pane (not whichever pane is active); out of
                 // copy mode first (left there by the overlay).
                 let pane = tmux::pane_id(name)?;

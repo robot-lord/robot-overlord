@@ -2,6 +2,7 @@ pub mod ask;
 pub mod autostart;
 pub mod discover;
 pub mod import;
+pub mod limits;
 pub mod locks;
 pub mod mcp;
 pub mod methods;
@@ -70,6 +71,8 @@ pub struct Daemon {
     pub(crate) remote: remote::Remote,
     /// Archive summaries being written (summary.rs).
     pub(crate) summaries: summary::Summaries,
+    /// Sessions stopped on a usage limit (limits.rs).
+    pub(crate) limits: limits::Limits,
 }
 
 impl Daemon {
@@ -90,6 +93,7 @@ impl Daemon {
             warm: Default::default(),
             remote: Default::default(),
             summaries: Default::default(),
+            limits: Default::default(),
         })
     }
 
@@ -124,7 +128,7 @@ impl Daemon {
         *self.config.write().expect("config lock") = Arc::new(cfg);
         self.bind_nav_keys();
         profile::sync_all(self, false);
-        overlord::style(&self.config());
+        overlord::style(&self.db(), &self.config());
         Ok(json!({"reloaded": true}))
     }
 
@@ -345,6 +349,7 @@ impl Daemon {
                 | "ui.goto"
                 | "session.defaults"
                 | "overlord.ensure"
+                | "overlord.switch"
                 | "overlord.set_model"
                 | "overlord.new_session"
         ) {
@@ -427,12 +432,14 @@ impl Daemon {
                     row["summarizing"] = json!(summarizing.contains(&id));
                 }
                 remote::annotate(self, &mut rows);
+                limits::annotate(self, &mut rows);
                 usage::list(self, &params, &mut rows);
                 Ok(Value::Array(rows))
             }
             ("session.get", Ok(row)) => {
                 let mut rows = [row];
                 remote::annotate(self, &mut rows);
+                limits::annotate(self, &mut rows);
                 usage::annotate(self, &mut rows, true);
                 let [row] = rows;
                 Ok(row)
@@ -491,18 +498,56 @@ impl Daemon {
             // The overlord's session (null: not set up), with when its
             // conversation started and how many came before.
             "overlord.get" => {
-                // One guard for both reads (std's Mutex isn't reentrant).
-                let db = self.db();
-                overlord::session(&db).and_then(|o| {
-                    let Some(o) = o else {
-                        return Ok(Value::Null);
-                    };
-                    let mut v = serde_json::to_value(&o)?;
-                    v["conversations"] = recall::summary(&db, &o);
-                    // What it runs on now (config may since have changed).
-                    v["effort"] = json!(overlord::launched_effort(&db, &o));
-                    Ok(v)
+                let r = {
+                    // One guard for both reads (std's Mutex isn't reentrant).
+                    let db = self.db();
+                    overlord::session(&db).and_then(|o| {
+                        let Some(o) = o else {
+                            return Ok(Value::Null);
+                        };
+                        let mut v = serde_json::to_value(&o)?;
+                        v["conversations"] = recall::summary(&db, &o);
+                        // What it runs on now (config may since have changed).
+                        v["effort"] = json!(overlord::launched_effort(&db, &o));
+                        // The other agents' overlords, for the switchers.
+                        v["overlords"] = overlord::roster(&db)?;
+                        Ok(v)
+                    })
+                };
+                // (The DB guard is gone: `annotate` takes it.)
+                r.map(|v| {
+                    if v.is_null() {
+                        return v;
+                    }
+                    // Stopped on a usage limit: the row and the overlay say
+                    // so (the user may switch to another agent's).
+                    let mut rows = [v];
+                    limits::annotate(self, &mut rows);
+                    let [v] = rows;
+                    v
                 })
+            }
+            // Make another agent's overlord the active one (starting or
+            // creating it). Not while something is being pasted into the
+            // active one: the paste goes to whichever is active under
+            // this lock.
+            "overlord.switch" => {
+                let _send = self.overlord_send.lock().expect("overlord send lock");
+                let target = params["agent"]
+                    .as_str()
+                    .and_then(rlord_core::agents::Agent::parse)
+                    .and_then(|a| overlord::for_agent(&self.db(), a).ok().flatten());
+                let _session = target.as_ref().map(|t| self.sessions.lock(&t.id));
+                let r = overlord::switch(
+                    &self.db(),
+                    &self.config(),
+                    params["agent"].as_str().unwrap_or(""),
+                );
+                if r.is_ok() {
+                    self.changed();
+                    self.bind_nav_keys();
+                }
+                r
             }
             "overlord.conversations" => recall::conversations_rpc(self),
             "overlord.conversation" => recall::conversation(self, params),
@@ -543,7 +588,7 @@ impl Daemon {
             "remote.status" => remote::status(self, params),
             "remote.set" => remote::set(self, params),
             "overlord.style" => {
-                overlord::style(&self.config());
+                overlord::style(&self.db(), &self.config());
                 Ok(json!({"styled": true}))
             }
             "session.import_scan" => import::scan(self, params),
@@ -560,6 +605,7 @@ impl Daemon {
             }
             "overlord.ask" => ask::ask(self, params),
             "session.send" => send::send(self, params),
+            "limits.resume" => limits::resume(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
@@ -1582,7 +1628,7 @@ mod tests {
             ]
         );
         // The overlord's "fresh" clock restarts with a clear.
-        assert!(db.kv_get(overlord::FRESH_AT).unwrap().is_some());
+        assert!(overlord::fresh_at(&db, &o.id).unwrap() > 0);
         let (cur, earlier) = recall::list(&db, &o).unwrap();
         assert_eq!(cur.unwrap().id, "conv-3");
         assert_eq!(recall::why(&earlier[1]), "you cleared it with /clear");

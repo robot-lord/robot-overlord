@@ -382,7 +382,10 @@ fn dequeue(d: &Daemon, id: &str) {
 fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
     // Not while a request is being pasted into the overlord (and checked
     // under that lock, after any request that held it).
-    let is_overlord = overlord::session(&d.db())?.is_some_and(|o| o.id == id);
+    let is_overlord = d
+        .db()
+        .resolve_ref(id)
+        .is_ok_and(|s| overlord::is_overlord_role(&s.role));
     let _send = is_overlord.then(|| d.overlord_send.lock().expect("overlord send lock"));
     // Nothing typed into it meanwhile, and the check below holds until the
     // restart (locks.rs: after `overlord_send`, before the DB).
@@ -531,12 +534,17 @@ pub fn start(d: &std::sync::Arc<Daemon>) {
 /// user reaches from the Claude app, so it must be there when they're away.
 /// (Started lazily otherwise; retried at most once a minute.)
 fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
-    let Some(o) = overlord::session(&d.db())? else {
-        return Ok(()); // no overlord set up
+    // Whichever overlord has it on (Claude's: the only agent with Remote
+    // Control), active or not.
+    let found = {
+        let db = d.db();
+        overlord::all(&db)?
+            .into_iter()
+            .find(|o| wanted(&db, &o.id).ok().flatten().is_some())
     };
-    if wanted(&d.db(), &o.id)?.is_none() {
-        return Ok(());
-    }
+    let Some(o) = found else {
+        return Ok(()); // no overlord set up, or none with it on
+    };
     let up =
         o.status != Status::Stopped && o.tmux_session.as_deref().is_some_and(tmux::has_session);
     if up || last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
@@ -547,8 +555,8 @@ fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     rlord_core::agents::install::warm();
     // Not while a request is being pasted into it.
     let _send = d.overlord_send.lock().expect("overlord send lock");
-    let _session = d.lock_overlord();
-    overlord::ensure(&d.db(), &d.config(), &json!({}))?;
+    let _session = d.sessions.lock(&o.id);
+    overlord::ensure_session(&d.db(), &d.config(), &o.id)?;
     tracing::info!("started the overlord for Remote Control");
     d.changed();
     Ok(())
