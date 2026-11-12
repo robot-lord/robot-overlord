@@ -547,7 +547,7 @@ counts look wrong.
 
 **The mouse works everywhere a key does.** Click a row to select it,
 double-click to attach, right-click for its menu (the same actions as the
-footer, each with its key); the wheel moves through the list, the group
+footer, each with its key; its highlight follows the pointer); the wheel moves through the list, the group
 column and the preview. Tabs, search, sort and live/archived in the header
 are clickable, as is every keycap in the footer and in dialogs, form
 fields and their choices, and the `:` launcher's items. rlord's tmux has

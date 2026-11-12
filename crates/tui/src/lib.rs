@@ -218,6 +218,9 @@ struct App {
     hits: mouse::Hits,
     /// The last left click, for telling a double-click.
     last_click: Option<(Instant, String)>,
+    /// The last event was pointer motion that changed nothing: no need to
+    /// draw again for it (motion arrives in floods).
+    idle_motion: bool,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -269,6 +272,7 @@ impl App {
             reported_view: Value::Null,
             hits: Default::default(),
             last_click: None,
+            idle_motion: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
             preview_len: 0,
@@ -613,16 +617,23 @@ impl App {
         self.apply_theme();
         loop {
             self.follow_appearance();
-            if self.dirty {
+            let refreshed = if self.dirty {
                 self.refresh();
+                true
             } else if self.preview_due.is_some_and(|t| Instant::now() >= t)
                 || (self.preview_due.is_none()
                     && self.last_preview.elapsed()
                         > Duration::from_millis(self.config.preview_refresh_ms))
             {
                 self.refresh_preview();
+                true
+            } else {
+                false
+            };
+            // (Pointer motion that changed nothing: the screen is as drawn.)
+            if refreshed || !std::mem::take(&mut self.idle_motion) {
+                terminal.draw(|f| self.draw(f))?;
             }
-            terminal.draw(|f| self.draw(f))?;
 
             let mut tick = Duration::from_millis(self.config.preview_refresh_ms.clamp(50, 250));
             if let Some(due) = self.preview_due {

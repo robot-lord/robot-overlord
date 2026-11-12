@@ -255,7 +255,26 @@ impl App {
             MouseEventKind::Down(MouseButton::Right) => self.click(m.column, m.row, true, terminal),
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, true, terminal),
             MouseEventKind::ScrollDown => self.wheel(m.column, m.row, false, terminal),
+            MouseEventKind::Moved => {
+                self.idle_motion = !self.hover(m.column, m.row);
+                Ok(false)
+            }
             _ => Ok(false),
+        }
+    }
+
+    /// The pointer moved: in a right-click menu the highlight follows it
+    /// over the entries, as the arrow keys move it. True when that changed
+    /// what's highlighted (worth drawing again). (Lists that scroll with
+    /// their selection, like the launcher, don't follow: the rows would
+    /// move under the pointer.)
+    pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
+        match (&mut self.mode, self.hits.at(x, y)) {
+            (Mode::Menu(m), Some(Hit::Pick(i))) if i < m.items.len() && m.sel != i => {
+                m.sel = i;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1300,6 +1319,36 @@ mod tests {
         let rows = drawn(&mut app);
         let (x, y) = find(&rows, "favourite");
         assert!(x < 150 && y < 34);
+    }
+
+    #[test]
+    fn the_menu_highlight_follows_the_pointer() {
+        let sel = |app: &App| match &app.mode {
+            Mode::Menu(m) => m.sel,
+            _ => panic!("no menu"),
+        };
+        let mut app = fleet();
+        app.open_menu(30, 8, false);
+        let rows = drawn(&mut app);
+        assert_eq!(sel(&app), 0);
+        // Over row 3: it's highlighted, and worth a redraw.
+        let (x, y) = find(&rows, "archive");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Pick(3)));
+        assert!(app.hover(x, y));
+        assert_eq!(sel(&app), 3);
+        // Along the same row, or off the menu: nothing changes, no redraw.
+        assert!(!app.hover(x + 2, y));
+        assert!(!app.hover(2, 20));
+        assert_eq!(sel(&app), 3);
+        // Drawn again, the highlight is on that row.
+        let rows = drawn(&mut app);
+        let (x, y) = find(&rows, "rename");
+        assert!(app.hover(x, y));
+        assert_eq!(sel(&app), 4);
+        // No menu open: motion does nothing.
+        app.mode = Mode::Normal;
+        drawn(&mut app);
+        assert!(!app.hover(x, y));
     }
 
     #[test]
