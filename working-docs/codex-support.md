@@ -39,7 +39,10 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
    read, excerpts, stats; archive summaries.
 3. **Codex extras.** Import from `threads`; models catalog; `send_to_session`
    via `codex queue` (and the Claude path); sub-agents.
-4. **Codex overlord seats.** `[overlord] agent = "codex"` per seat.
+4. **A Codex overlord.** `[overlord] agent = "codex"`. (The overlord is one
+   session now. Its Codex defaults are in place: Codex's default model
+   with `-c model_reasoning_effort="low"`, `overlord::effort_args`. What's
+   missing is the MCP and tool-approval wiring, then `Agent::runs_overlord`.)
 5. Later: Codex Remote Control, key shadows, Gemini.
 
 ## Decisions (with Brandon)

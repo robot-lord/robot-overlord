@@ -1333,11 +1333,11 @@ impl App {
                 let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
                 let status = get("status");
                 let is_overlord = is_overlord_role(s);
-                let seat_color = theme::overlord();
+                let hue = theme::overlord();
                 let num = i.saturating_sub(self.overlord_rows);
                 let mut cells = vec![
                     if is_overlord {
-                        Cell::from("◆").fg(seat_color)
+                        Cell::from("◆").fg(hue)
                     } else {
                         Cell::from(if num < 9 {
                             ((b'1' + num as u8) as char).to_string()
@@ -1432,7 +1432,7 @@ impl App {
                     && self.sessions.len() > self.overlord_rows;
                 let row = Row::new(cells).bottom_margin(u16::from(last_seat));
                 if is_overlord {
-                    row.style(Style::default().fg(seat_color).bold())
+                    row.style(Style::default().fg(hue).bold())
                 } else {
                     row.style(Style::default().fg(theme::text()))
                 }

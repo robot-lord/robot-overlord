@@ -94,11 +94,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     // (Claude keeps a folder's conversations together, so its transcript
     // directory stands for the folder; a Codex rollout and an OpenCode
     // session say their folder.)
-    let seat_dirs: Vec<String> = crate::overlord::dirs()
+    let own_dirs: Vec<String> = crate::overlord::dirs()
         .iter()
         .map(|dir| dir.to_string_lossy().into_owned())
         .collect();
-    let skip: std::collections::HashSet<PathBuf> = seat_dirs
+    let skip: std::collections::HashSet<PathBuf> = own_dirs
         .iter()
         .filter_map(|dir| {
             Agent::Claude
@@ -108,7 +108,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         })
         .collect();
     for (i, s) in sessions.iter().enumerate() {
-        if is_overlords(s, &seat_dirs) {
+        if is_overlords(s, &own_dirs) {
             // (Its folder is skipped whole, above: no need to look its
             // transcripts up one by one.)
             continue;
@@ -127,24 +127,24 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         // than the index, or no index at all) says so in its first bytes.
         // Its folder may be recorded as given or resolved (symlinks).
         let folders = agents::codex::rollout_folders(&agents::codex::home()).unwrap_or_default();
-        let seat_real: Vec<String> = seat_dirs
+        let own_real: Vec<String> = own_dirs
             .iter()
             .filter_map(|d| std::fs::canonicalize(d).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let is_seat = |cwd: &str| seat_dirs.iter().chain(&seat_real).any(|d| d == cwd);
-        let in_seat_folder = |p: &Path| match agents::agent_of(p) {
+        let is_own = |cwd: &str| own_dirs.iter().chain(&own_real).any(|d| d == cwd);
+        let in_own_folder = |p: &Path| match agents::agent_of(p) {
             Agent::Claude => false, // (by its directory: `skip`)
             Agent::Codex => match folders.get(p) {
-                Some(cwd) => is_seat(cwd),
-                None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
+                Some(cwd) => is_own(cwd),
+                None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_own(&cwd)),
             },
-            Agent::OpenCode => is_seat(&Agent::OpenCode.transcript_folder(p)),
+            Agent::OpenCode => is_own(&Agent::OpenCode.transcript_folder(p)),
         };
         paths.extend(history::all_transcripts().into_iter().filter(|p| {
             !by_path.contains_key(p)
                 && !p.parent().is_some_and(|d| skip.contains(d))
-                && !in_seat_folder(p)
+                && !in_own_folder(p)
         }));
     }
     let found = history::search(&paths, query, PER_FILE);
@@ -175,7 +175,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut rows: Vec<(usize, Vec<&'static str>, usize)> = sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| !is_overlords(s, &seat_dirs))
+        .filter(|(_, s)| !is_overlords(s, &own_dirs))
         .map(|(i, s)| (i, matched_fields(s, &ws), hits.get(&i).map_or(0, |h| h.0)))
         .filter(|(_, f, n)| !f.is_empty() || *n > 0)
         .collect();

@@ -239,7 +239,10 @@ and without a model and a restart of a session OpenCode no longer had.
 
 - Import (`session_v2` has directory, title, model), messaging through
   the API (`POST …/prompt`, already used for the deferred prompt),
-  OpenCode overlord seats (`opencode.jsonc` in the seat folder).
+  an OpenCode overlord (`opencode.jsonc` in the overlord's folder). The
+  overlord is one session now, and its OpenCode defaults are in place
+  (default model, no effort: `OverlordConfig::defaults_for`); what's
+  missing is the MCP and tool wiring, then `Agent::runs_overlord`.
 - Sub-agent tracking (child sessions: `parent_id`).
 - A real permission prompt and question form, checked by hand.
 - Screenshots not retaken with the OpenCode demo session.
