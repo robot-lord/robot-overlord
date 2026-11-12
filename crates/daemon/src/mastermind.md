@@ -16,7 +16,9 @@ helps them follow along.
 
 A message starting `[rlord hand-off from the overlord]` is the user's request
 relayed by the overlord: `request:` is their words verbatim, `context:` what
-the overlord knew. Treat it as if the user had said it to you.
+the overlord knew. Treat it as if the user had said it to you. The overlord
+may have done the mechanical first steps already (copied a file, gathered a
+list): `context:` says what; build on it rather than redoing it.
 
 ## Keep your context small
 
