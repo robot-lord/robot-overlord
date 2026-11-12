@@ -1,9 +1,15 @@
 [package]
-name = "rlord-core"
+name = "robot-overlord-core"
+description = "rlord (Robot Overlord) internals: sessions database, tmux, agent transcripts. Not a stable API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rlord_core"
 
 [dependencies]
 anyhow.workspace = true

@@ -114,16 +114,19 @@ hasn't seen.
 
 ## Releases: build locally after every merge to main
 
-Binaries are built on this Mac and uploaded to GitHub Releases. There is no
-release CI (macOS runner minutes cost 10×, and cross-compiling from Linux
-risks signing breakage). Every PR merged to `main` ships as a new release.
+Binaries are built on the maintainer's Apple Silicon Mac and uploaded to
+GitHub Releases; there is no release CI. Linux builds are cross-compiled
+there (`cargo zigbuild`, static musl) and smoke-tested in Docker. Every PR
+merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
 
-- **In each PR:** bump `[workspace.package] version` in `Cargo.toml`
-  (pre-1.0: patch for fixes, minor for features or breaking changes) and
-  commit the regenerated `Cargo.lock`. `scripts/check-version-bump.sh`
-  enforces this: CI runs it on every PR, and `.githooks/pre-push` runs it
-  before pushing a branch (enable once per clone with
-  `git config core.hooksPath .githooks`).
+- **In each PR:** bump `[workspace.package] version` in `Cargo.toml` and
+  commit the regenerated `Cargo.lock`. Ordinary PRs bump to a **development
+  build**: the next version with `-dev.N` (`0.18.0` → `0.19.0-dev.1` for a
+  feature or `0.18.1-dev.1` for a fix, then `-dev.2`, … for later PRs
+  toward it). A **stable release** (`X.Y.Z`, no suffix) only when the user
+  asks for one. `scripts/check-version-bump.sh` enforces a semver bump: CI
+  runs it on every PR, and `.githooks/pre-push` before pushing a branch
+  (enable once per clone with `git config core.hooksPath .githooks`).
 - **After the PR merges, cutting the release is Claude's job.** Don't
   hand it back to the user. If you merge the PR, release right after. If
   you opened it, check `gh pr view <n> --json state` when you next act
@@ -138,12 +141,12 @@ risks signing breakage). Every PR merged to `main` ships as a new release.
 
   Then report the release URL to the user.
 
-  `release.sh` builds `aarch64-apple-darwin`, ad-hoc signs, uploads
-  `rlord-v<version>-aarch64-apple-darwin.tar.gz`, and creates tag
-  `v<version>`. It refuses a dirty tree, an unpushed HEAD, or an existing
-  tag. If the tag exists, the PR forgot the version bump.
-- Installing on another Mac: see "Installing on a Mac" in `README.md`
-  (`scripts/update.sh` the first time, then `rlord update`).
+  The version decides the kind: a dev build is macOS only and a GitHub
+  pre-release (installed by `[update] channel = "dev"`); a stable release
+  builds macOS + Linux tarballs, `.deb`/`.rpm`, smoke-tests them in Docker
+  (needs `colima start`), uploads with `SHA256SUMS`, updates the Homebrew
+  tap and publishes to crates.io. `release.sh` refuses a dirty tree, HEAD
+  not on `origin/main`, or an existing tag (the PR forgot the bump).
 
 ## Other rules
 

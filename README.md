@@ -1,8 +1,76 @@
-# Robot Overlord
+# Robot Overlord (`rlord`)
 
-Session management and orchestration for AI coding agents — a ground-up
-replacement for the parts of [another tool](https://github.com)
-we actually want, with full control over the design.
+Run many AI coding-agent sessions (Claude Code first) side by side in tmux,
+and keep track of them: one list to find, jump between, resume and organize
+them, plus an **overlord**, an agent you talk to, that drives rlord for you
+("start a session on the auth bug", "what's waiting on me?", "we did this
+before, find it").
+
+macOS (Apple Silicon) and Linux. MIT or Apache-2.0.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ayersb/robot-overlord/main/scripts/get.sh | sh
+```
+
+It installs the newest release for your machine to `~/.local/bin/rlord`
+(checksum-verified) and, if tmux is missing, offers to install it with your
+package manager. Or:
+
+| | |
+|---|---|
+| Homebrew (macOS, Linux) | `brew install ayersb/tap/rlord` |
+| Debian, Ubuntu | download `rlord_<version>_<arch>.deb` from [releases](https://github.com/ayersb/robot-overlord/releases), `sudo apt install ./rlord_*.deb` |
+| Fedora, RHEL, Amazon Linux | download `rlord-<version>.<arch>.rpm`, `sudo dnf install ./rlord-*.rpm` |
+| Cargo | `cargo install robot-overlord` (installs `rlord`) |
+| From source | `git clone` this repo, `cargo build --release`, copy `target/release/rlord` onto your PATH |
+
+Linux builds are static (x86_64 and aarch64): one binary for any distro.
+
+**Needs:** tmux 3.2 or newer, and [Claude Code](https://claude.com/claude-code)
+(`claude` on your PATH).
+
+**First run:**
+
+```sh
+rlord claude install-hooks   # lets rlord see Claude Code's state (adds hooks
+                             # to ~/.claude/settings.json, keeping yours)
+rlord                        # the list; the daemon starts by itself
+```
+
+Then press Alt-O (Option-O on a Mac) for the overlord, `?` for every key.
+Optional: ask the overlord to "import my sessions from the last month", or
+`rlord tmux import` to use your own tmux config in agent sessions.
+
+On macOS, make your terminal send Option as Alt/Meta (iTerm2: Esc+; Ghostty:
+`macos-option-as-alt`; Terminal: "Use Option as Meta key"); the key screen
+(`:keys`) checks this for you.
+
+### Updating
+
+```sh
+rlord update                 # newest stable release (then `rlord reset`s itself)
+rlord update v0.18.0         # a specific one
+```
+
+Homebrew and distro packages update the usual way (`brew upgrade`, `apt`,
+`dnf`). Development builds (`X.Y.Z-dev.N`, macOS only) come out between
+stable releases; to get them, set in `~/.config/robot-overlord/config.toml`:
+
+```toml
+[update]
+channel = "dev"
+```
+
+### The daemon
+
+You never start it by hand: like tmux, the first `rlord` command that finds
+no daemon starts one in the background (logging to
+`~/Library/Logs/rlordd.log` on macOS, `~/.local/state/robot-overlord/rlordd.log`
+on Linux), and a daemon from an older build is restarted on the current
+binary. To have the system own it instead (started at login):
+`scripts/install-launchd.sh` (macOS) or `scripts/install-systemd.sh` (Linux).
 
 ## Why
 
@@ -53,82 +121,10 @@ matter to us:
 
 See `docs/architecture.md` for the full plan and phased milestones.
 
-## Quickstart
+## Developing
 
-```bash
-ln -sfn "$PWD/target/debug/rlord" ~/.local/bin/rlord   # dev install: tracks every build
-scripts/dev-daemon.sh                        # build + (re)start the daemon (dev loop)
-./target/debug/rlord claude install-hooks    # merge-adds hooks to ~/.claude/settings.json
-rlord                                        # TUI dashboard (default command)
-rlord new --project ~/src/myrepo "first prompt"   # launch a Claude session in tmux
-rlord ls --sort user --tag wip               # query: status/tag/project/name filters, 5 sorts
-rlord attach <ref>                           # ref = id, id prefix, name, or name prefix
-rlord stop <ref> && rlord restart <ref>      # resume with full conversation context
-rlord rename/tag/untag/pin/archive/log <ref> # meta-context
-```
-
-You never need to start the daemon by hand: like tmux, the first `rlord`
-command (or the TUI) that finds no daemon starts one in the background
-(logging to `~/Library/Logs/rlordd.log`), and a daemon from an older build
-is restarted on the current binary. `rlord ping` and agent hooks never start
-one; hooks spool events until a daemon is up. To have launchd own the daemon
-instead (started at login), run `scripts/install-launchd.sh` (`uninstall`
-removes it); rlord then starts and restarts it through launchd.
-
-## Installing on a Mac (no compiling)
-
-Releases are prebuilt for Apple Silicon and attached to GitHub releases. The
-repo is private, so downloads go through the GitHub CLI.
-
-**First install**
-
-1. Install the tools rlord drives, and log in to GitHub with an account that
-   can see this repo:
-
-   ```bash
-   brew install tmux gh
-   gh auth login
-   ```
-
-   Claude Code must be installed too (`claude` on your PATH).
-2. Install rlord from a checkout of this repo. The script downloads the
-   latest release and installs it to `~/.local/bin/rlord`:
-
-   ```bash
-   git clone https://github.com/ayersb/robot-overlord && cd robot-overlord
-   scripts/update.sh
-   ```
-
-   If it says `~/.local/bin` is not on your PATH, add
-   `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new
-   terminal.
-3. Let rlord see what Claude sessions are doing (adds hooks to
-   `~/.claude/settings.json`, keeping what's there):
-
-   ```bash
-   rlord claude install-hooks
-   ```
-4. Run `rlord`. The list opens, and the daemon starts by itself.
-5. Optional:
-   - Bring over sessions from before: ask the overlord (Option-O) to "import
-     my sessions from the last month". See [Bringing in existing
-     sessions](#bringing-in-existing-sessions).
-   - `rlord tmux import` to use your own tmux config in agent sessions.
-
-**Updating**
-
-```bash
-rlord update        # latest release; `rlord update v0.4.0` pins one
-```
-
-`rlord update` does what `scripts/update.sh` does, so you don't need the
-checkout once rlord is installed. It does nothing if you're already on the
-latest release; after installing a new one it runs `rlord reset`, so the
-open list and daemon move to the new version. Running agent sessions keep running through an update.
-
-**Releasing** (from the dev machine): bump `[workspace.package] version` in
-`Cargo.toml` in the PR. After it merges, run `scripts/release.sh` on `main`.
-It builds, signs, tags `v<version>` and uploads the release. See CLAUDE.md.
+See [CONTRIBUTING.md](CONTRIBUTING.md): building, the dev loop, tests and
+releases.
 
 ## The overlord
 
