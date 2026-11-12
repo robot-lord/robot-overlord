@@ -2101,7 +2101,12 @@ fn context_legend(
     }
     // Resuming (Enter on a stopped row) and restarting both need a
     // conversation the agent can resume.
-    let resumable = s["agent"] == "claude" && !s["agent_session"].is_null();
+    // (A Codex session gets its conversation id only once Codex reports
+    // it; until then there is nothing to resume.)
+    let known = s["agent"]
+        .as_str()
+        .is_some_and(|a| rlord_core::agents::Agent::parse(a).is_some());
+    let resumable = known && !s["agent_session"].is_null();
     let mut v = Vec::new();
     if !stopped {
         v.push((Action::Attach, "attach"));

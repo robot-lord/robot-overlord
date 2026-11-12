@@ -38,13 +38,14 @@ pub fn tools() -> Value {
         "project": s("Plain folder instead of a repo (no worktree)"),
         "name": s("Short display name; also derives the branch"),
         "branch": s("Branch / worktree name (default: derived from name)"),
-        "model": s("Model (default: the configured session model)"),
+        "agent": s("Coding agent to run: claude or codex (default: the configured session agent). Only when the user asks for one."),
+        "model": s("Model, one of that agent's (default: the configured model for the agent; see get_session_defaults)"),
         "workspace": b("Give the session its own git worktree (default: configured, normally true)"),
         "prompt": s("First prompt for the agent: the full task, it has no other context"),
     });
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
-    create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks");
+    create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
             "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). The overlord itself is not listed.",
@@ -74,7 +75,7 @@ pub fn tools() -> Value {
             "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear.",
             json!({
                 "query": s("Words to find (all must appear in one message)"),
-                "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also Claude Code conversations started outside rlord"},
+                "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also agent conversations (Claude Code, Codex) started outside rlord"},
                 "limit": {"type": "integer", "description": "Sessions to return (default 8)"},
             }), &["query"]),
         tool("read_history",
@@ -115,7 +116,7 @@ pub fn tools() -> Value {
             "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk.",
             json!({"query": s("Words that must appear in the path")}), &[]),
         tool("get_session_defaults",
-            "The defaults new sessions get (agent, model, model choices, workspace, default repo).",
+            "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
         tool("hand_off",
             "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
@@ -133,10 +134,11 @@ pub fn tools() -> Value {
                 "request_id": s("The `request_id:` of the new-session request you're answering (omit if none)"),
                 "repo": s("Repo as you would launch it (omit: you choose at launch)"),
                 "project": s("Plain folder instead of a repo"),
+                "agent": s("Coding agent as you would launch it: claude or codex (omit: the one the user sent)"),
                 "model": s("Model as you would launch it (\"\" for the agent default)"),
                 "workspace": b("Own git worktree"),
                 "tags": {"type": "array", "items": {"type": "string"}},
-                "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "model", "worktree", "tags"]},
+                "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "agent", "model", "worktree", "tags"]},
                             "description": "Hints you changed from what the user sent"},
                 "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),
             }), &["description", "changed", "note"]),
@@ -194,7 +196,7 @@ pub fn tools() -> Value {
                 "all": b("Mark every live session reviewed"),
             }), &[]),
         tool("scan_agent_sessions",
-            "Find agent conversations on this machine that rlord doesn't track yet (read from the agents' own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
+            "Find agent conversations on this machine that rlord doesn't track yet (Claude Code's so far; read from its own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
             json!({
                 "since_days": {"type": "integer", "description": "Only conversations with an exchange in the last N days (default 30)"},
                 "limit": {"type": "integer", "description": "Max conversations (default 30)"},
@@ -238,7 +240,8 @@ fn session_ref(args: &Value) -> Result<String> {
 fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
     let mut row = json!({
-        "id": s["id"], "name": s["name"], "status": s["status"], "model": s["model"],
+        "id": s["id"], "name": s["name"], "status": s["status"],
+        "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         // Its tmux session: how ListAgents names its pane (to message it).
         "tmux": s["tmux_session"],
@@ -292,7 +295,9 @@ fn params_wants_remote(args: &Value) -> bool {
 /// Copy whitelisted session-creation fields.
 fn new_session_params(args: &Value) -> Value {
     let mut p = Map::new();
-    for k in ["repo", "project", "name", "branch", "model", "prompt"] {
+    for k in [
+        "repo", "project", "name", "branch", "agent", "model", "prompt",
+    ] {
         if let Some(v) = arg_str(args, k) {
             p.insert(k.into(), json!(v));
         }
@@ -412,6 +417,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 "request_id",
                 "repo",
                 "project",
+                "agent",
                 "model",
                 "workspace",
                 "tags",

@@ -367,7 +367,9 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
 /// Open the new-session form pre-filled, on the list, for the user to confirm.
 pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     let mut prefill = Map::new();
-    for k in ["repo", "project", "name", "branch", "model", "prompt"] {
+    for k in [
+        "repo", "project", "name", "branch", "agent", "model", "prompt",
+    ] {
         if let Some(v) = params
             .get(k)
             .and_then(Value::as_str)
@@ -386,6 +388,9 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
         if rlord_core::git::main_repo_root(r).is_none() {
             bail!("{r} is not a git repository (use find_repos)");
         }
+    }
+    if let Some(a) = prefill.get("agent").and_then(Value::as_str) {
+        rlord_core::agents::Agent::named(a)?;
     }
     if let Some(w) = params.get("workspace").and_then(Value::as_bool) {
         prefill.insert("workspace".into(), json!(w));
@@ -411,6 +416,7 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
                     .get("project")
                     .map(|f| json!(format!("{}{FOLDER}", f.as_str().unwrap_or(""))))
             }),
+            "agent" => prefill.get("agent").cloned(),
             "model" => prefill.get("model").cloned(),
             // A plain folder has no worktree to pick.
             "worktree" => prefill.get("workspace").cloned().filter(|_| !folder),
@@ -460,7 +466,7 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
     };
     let mut chosen = Vec::new();
     let mut resolved = Vec::new();
-    for k in ["repo", "model", "worktree", "tags"] {
+    for k in ["repo", "agent", "model", "worktree", "tags"] {
         let Some(v) = value(k) else { continue };
         let changed = prefill
             .get("changed")
@@ -489,7 +495,7 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         .context("missing 'description' (the user's, verbatim)")?;
     let mut prefill = Map::new();
     prefill.insert("description".into(), json!(description));
-    for k in ["repo", "project", "model", "note"] {
+    for k in ["repo", "project", "agent", "model", "note"] {
         if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
             let v = if matches!(k, "repo" | "project") {
                 expand_tilde(v)
@@ -503,6 +509,9 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         if rlord_core::git::main_repo_root(r).is_none() {
             bail!("{r} is not a git repository (use find_repos)");
         }
+    }
+    if let Some(a) = prefill.get("agent").and_then(Value::as_str) {
+        rlord_core::agents::Agent::named(a)?;
     }
     // "" is the agent default: a model the overlord reset, not one it left out.
     if params["model"]

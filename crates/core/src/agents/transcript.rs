@@ -314,10 +314,12 @@ pub fn observed_model(path: &Path) -> Option<String> {
 /// None when the tail doesn't say or the file can't be read.
 pub fn working(path: &Path) -> Option<bool> {
     let format = Format::of(path);
-    let (_, tail) = read_head_tail(path);
-    tail.iter()
+    // Only the tail, a line at a time from the end: this is polled.
+    read_window(path, true)?
+        .lines()
         .rev()
-        .find_map(|v| format.line(v).turn_ended())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| format.line(&v).turn_ended())
         .map(|ended| !ended)
 }
 

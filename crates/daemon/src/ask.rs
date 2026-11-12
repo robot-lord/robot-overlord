@@ -7,7 +7,7 @@
 //! fine.
 //!
 //! `overlord.new_session` is the list's `n` form: a request with a few
-//! defaults (repo, model, worktree, tags), formatted as a
+//! defaults (repo, agent, model, worktree, tags), formatted as a
 //! `[rlord new-session request]` message. The overlord's instructions say
 //! what that header means: launch exactly one session for this request.
 
@@ -124,7 +124,7 @@ pub fn in_list(p: &Value, list: &str, k: &str) -> bool {
         .is_some_and(|a| a.iter().any(|c| c == k))
 }
 
-/// `{description, repo?, model?, workspace?, tags?: [..], chosen?: [..],
+/// `{description, repo?, agent?, model?, workspace?, tags?: [..], chosen?: [..],
 /// confirmed?}` from the list's new-session form.
 /// Launching is the mastermind's job: the form goes straight to it.
 pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
@@ -142,7 +142,7 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
         Some(json!({
             "at": rlord_core::types::now_ms(),
             "chosen": params["chosen"], "resolved": params["resolved"],
-            "repo": params["repo"], "model": params["model"],
+            "repo": params["repo"], "agent": params["agent"], "model": params["model"],
             "workspace": params["workspace"], "tags": params["tags"],
         })),
     )?;
@@ -281,6 +281,10 @@ pub fn format_request(p: &Value) -> Result<String> {
         Some(r) => format!("- repo: {r} ({})\n", source("repo")),
         None => "- repo: (you choose, from the description)\n".to_string(),
     };
+    // Which coding agent runs it (older forms don't send one: the default).
+    if let Some(agent) = get("agent") {
+        m += &format!("- agent: {agent} ({})\n", source("agent"));
+    }
     m += &match get("model") {
         Some(model) => format!("- model: {model} ({})\n", source("model")),
         // "" is the agent default; say whose choice it was, if anyone's.
@@ -333,6 +337,17 @@ mod tests {
         .unwrap();
         assert!(r.contains("- repo: /r (your earlier pick)\n"), "{r}");
         assert!(r.contains("- model: opus (picked by the user)\n"), "{r}");
+        assert!(
+            !r.contains("- agent:"),
+            "no agent hint sent: none shown\n{r}"
+        );
+        let r = format_request(&json!({"description": "x", "agent": "codex", "model": "",
+                                        "chosen": ["agent"]}))
+        .unwrap();
+        assert!(
+            r.contains("- agent: codex (picked by the user)\n- model: (agent default)\n"),
+            "{r}"
+        );
         let c = format_request(&json!({"description": "x", "confirmed": true})).unwrap();
         assert!(c.contains("confirmed: yes\n") && c.contains("- repo: (you choose"));
     }

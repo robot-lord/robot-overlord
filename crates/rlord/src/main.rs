@@ -1422,6 +1422,8 @@ fn run_daemon() -> Result<()> {
         // Restart an idle mastermind on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
         rlord_daemon::remote::start(&daemon);
+        // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
+        rlord_daemon::discover::start(&daemon);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;

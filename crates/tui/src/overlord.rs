@@ -130,7 +130,10 @@ impl App {
                 // On by default where it works: the point is to reach the
                 // overlord from the Claude app.
                 remote: (st["remote"]["available"] == true
-                    && st["default_agent"].as_str().is_none_or(|a| a == "claude"))
+                    && st["default_agent"].as_str().is_none_or(|a| {
+                        rlord_core::agents::Agent::parse(a)
+                            .is_some_and(rlord_core::agents::Agent::has_remote_control)
+                    }))
                 .then_some(true),
                 remote_why: st["remote"]["reason"]
                     .as_str()

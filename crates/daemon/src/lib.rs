@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod autostart;
+pub mod discover;
 pub mod import;
 pub mod mcp;
 pub mod methods;
@@ -765,5 +766,73 @@ mod tests {
         assert_eq!(kinds, ["prompt_submitted", "agent_stopped"]);
 
         server.abort();
+    }
+
+    /// Codex assigns its own conversation id: the first hook binds it.
+    #[test]
+    fn codex_hooks_bind_the_conversation_and_set_status() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01codex",
+            name: "c",
+            agent: "codex",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01codex_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_status("01codex", rlord_core::types::Status::Starting, 1)
+            .unwrap();
+        let emit = |event: &str, sid: &str| {
+            methods::hook_emit(
+                &db,
+                &json!({"instance": "01codex", "agent": "codex", "event": event,
+                        "payload": {"session_id": sid, "hook_event_name": event,
+                                    "transcript_path": format!("/c/rollout-x-{sid}.jsonl")}}),
+            )
+            .unwrap()
+        };
+        let get = || db.resolve_ref("01codex").unwrap();
+        emit("SessionStart", "thread-1");
+        let s = get();
+        assert_eq!(s.agent_session.as_deref(), Some("thread-1"));
+        assert_eq!(s.agent_session_trust, "hook");
+        assert_eq!(s.status, rlord_core::types::Status::Idle);
+        assert_eq!(
+            db.transcript_source("01codex").unwrap().as_deref(),
+            Some("/c/rollout-x-thread-1.jsonl")
+        );
+        emit("UserPromptSubmit", "thread-1");
+        assert_eq!(get().status, rlord_core::types::Status::Working);
+        emit("PermissionRequest", "thread-1");
+        assert_eq!(get().status, rlord_core::types::Status::WaitingInput);
+        // A sub-agent's thread in the same pane: not this session's events.
+        let r = emit("Stop", "thread-sub");
+        assert!(r["ignored"].is_string());
+        let s = get();
+        assert_eq!(s.agent_session.as_deref(), Some("thread-1"));
+        assert_eq!(s.status, rlord_core::types::Status::WaitingInput);
+        emit("Stop", "thread-1");
+        assert_eq!(get().status, rlord_core::types::Status::Idle);
+        // A new thread in the pane (/new): the session follows it.
+        emit("SessionStart", "thread-2");
+        assert_eq!(get().agent_session.as_deref(), Some("thread-2"));
+        assert_eq!(db.past_agent_sessions("01codex").unwrap(), ["thread-1"]);
+        // Claude's hooks from a Codex session's pane are only logged.
+        methods::hook_emit(
+            &db,
+            &json!({"instance": "01codex", "agent": "claude", "event": "SessionEnd",
+                    "payload": {"session_id": "other"}}),
+        )
+        .unwrap();
+        let s = get();
+        assert_eq!(s.agent_session.as_deref(), Some("thread-2"));
+        assert_eq!(s.status, rlord_core::types::Status::Idle);
     }
 }
