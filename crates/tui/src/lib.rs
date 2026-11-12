@@ -706,7 +706,10 @@ impl App {
                 self.dirty = true;
             }
             Action::Sort => {
+                // A new sort starts in its natural direction (as a header
+                // click or the launcher).
                 self.sort = self.sort.next();
+                self.reverse = false;
                 self.dirty = true;
             }
             Action::ReverseSort => {
