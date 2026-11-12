@@ -64,10 +64,17 @@ resumes.
 
 `enter` on a stopped session resumes it and attaches.
 
-The list's UPDATED column (and the default sort) is the session's last
-update: the latest message either way (resuming it or a state change
-doesn't count; that's the CHANGED sort). The details card
-breaks it down.
+Sorts (`o` cycles them, `O` reverses; the time column follows the sort):
+
+| Sort | Newest first by |
+|---|---|
+| **last message** (default) | the last message from you or the agent (a resume or a status flip alone doesn't count) |
+| **last prompt** | the last message *you* sent: what you were just working with |
+| **status change** | the last time it started, stopped, finished or needed you |
+| **created** | when it started |
+| **name** | A–Z |
+
+The details card breaks the times down.
 
 Add standing instructions in `~/.config/robot-overlord/overlord.md`. They're
 appended to the overlord's built-in instructions, which are written to its

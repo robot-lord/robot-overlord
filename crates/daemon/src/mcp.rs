@@ -32,7 +32,7 @@ const SESSION_REF: &str = "Session id, id prefix, or name";
 
 pub fn tools() -> Value {
     let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name"],
-                      "description": "updated = latest message either way (a resume or status flip alone does not count); user = latest user prompt; state = latest status change"});
+                      "description": "updated = last message (from the user or the agent; a resume or status flip alone does not count); user = the user's last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change"});
     let new_session_props = json!({
         "repo": s("Git repo path to work in (see find_repos). Omit to use the configured default repo."),
         "project": s("Plain folder instead of a repo (no worktree)"),
