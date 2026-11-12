@@ -385,10 +385,10 @@ pub fn working_since(path: &Path, since_ms: i64) -> Option<bool> {
     let (_, tail) = read_head_tail(path);
     let ended = tail
         .iter()
+        .rev()
         .map(|v| format.line(v))
         .filter(|l| l.at().and_then(parse_iso_ms).is_some_and(|t| t >= since_ms))
-        .filter_map(|l| l.turn_ended())
-        .last();
+        .find_map(|l| l.turn_ended());
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = cursors.get_mut(path) {
         c.ended = ended.unwrap_or(false);

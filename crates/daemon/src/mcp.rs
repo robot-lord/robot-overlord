@@ -219,6 +219,13 @@ pub fn tools() -> Value {
                 "archive": b("Import as archived (history only; required when its folder is gone and can't be recreated)"),
                 "recreate_worktree": b("Its folder is gone but recreatable: recreate the worktree there"),
             }, "required": ["id"]}}}), &["sessions"]),
+        tool("send_to_session",
+            "Pass a message to an existing session: typed into its agent's prompt and submitted, as if the user had typed it. Use it to hand a session work or a follow-up. Only a session whose turn is over (your turn) takes it now; a working one or one that needs the user is refused unless `when_idle` (then it is delivered when that turn ends; one pending message per session, a newer one replaces it). Stopped, starting and archived sessions are refused.",
+            json!({
+                "session": s(SESSION_REF),
+                "text": s("The message, complete: the session sees only this"),
+                "when_idle": b("Session mid-turn: deliver when its turn is over instead of refusing (default false)"),
+            }), &["session", "text"]),
         tool("session_action",
             "Lifecycle: restart (resumes the conversation), stop (resumable), archive (stop + hide), unarchive.",
             json!({
@@ -250,8 +257,6 @@ fn summarize(s: &Value) -> Value {
         "status": rlord_core::types::Status::label_of(s["status"].as_str().unwrap_or("")),
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
-        // Its tmux session: how ListAgents names its pane (to message it).
-        "tmux": s["tmux_session"],
         "tags": s["tags"], "description": s["description"],
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
@@ -611,6 +616,12 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(json!({"results": results}))
         }
+        "send_to_session" => d.rpc(
+            "session.send",
+            json!({"ref": session_ref(args)?,
+                   "text": args.get("text").and_then(Value::as_str).context("missing 'text'")?,
+                   "when_idle": args.get("when_idle").and_then(Value::as_bool).unwrap_or(false)}),
+        ),
         "session_action" => {
             let r = session_ref(args)?;
             let method = match arg_str(args, "action") {

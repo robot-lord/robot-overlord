@@ -11,6 +11,7 @@ pub mod recall;
 pub mod remote;
 pub mod rpc;
 pub mod search;
+pub mod send;
 pub mod summary;
 pub mod triage;
 pub mod ui;
@@ -529,6 +530,7 @@ impl Daemon {
                 r
             }
             "overlord.ask" => ask::ask(self, params),
+            "session.send" => send::send(self, params),
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {

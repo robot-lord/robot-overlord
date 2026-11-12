@@ -1485,6 +1485,8 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
         rlord_daemon::discover::start(&daemon);
+        // Messages for sessions, held until their turn is over.
+        rlord_daemon::send::start(&daemon);
         // OpenCode sessions: status from its background server's events.
         rlord_daemon::opencode::start(&daemon);
         // Where each agent's command is (may ask the login shell): known

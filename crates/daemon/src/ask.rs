@@ -83,14 +83,11 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                 s
             };
             if s.status != Status::Starting {
-                let pane = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
-                // Out of copy mode first (left there by the overlay): its
-                // keys would take the Enter that submits this.
-                let _ = tmux::cancel_mode(pane);
-                tmux::paste(pane, text)?;
-                // Let the paste land before submitting it.
-                std::thread::sleep(Duration::from_millis(150));
-                tmux::send_keys(pane, &["Enter"])?;
+                let name = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
+                // Its agent pane (not whichever pane is active); out of
+                // copy mode first (left there by the overlay).
+                let pane = tmux::pane_id(name)?;
+                crate::send::type_into(&s.id, &pane, text)?;
                 return Ok(json!({"sent": true}));
             }
         }

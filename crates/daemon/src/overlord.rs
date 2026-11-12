@@ -255,11 +255,11 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
             mcp_path.to_string_lossy().into_owned(),
             // The whole point is a cheap, prompt-free control surface. Read-only
             // file tools are pre-allowed for groundwork (reading a repo's README
-            // or the files a request names), and Claude's peer messaging for
-            // passing work to a session; anything that writes or runs commands
-            // still asks.
+            // or the files a request names); passing work to a session is
+            // rlord's own `send_to_session`, as on every agent. Anything that
+            // writes or runs commands still asks.
             "--allowedTools".into(),
-            "mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage".into(),
+            "mcp__rlord,Read,Grep,Glob".into(),
         ],
         // The same surface in Codex's terms: rlord's tools without a
         // prompt, reading free, writes ask. (Its folder as Codex sees it:
@@ -816,7 +816,16 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str().map(str::to_string))
             .collect();
-        for gone in ["hand_off", "mastermind", "front desk", "Alt-M", "Option-M"] {
+        for gone in [
+            "hand_off",
+            "mastermind",
+            "front desk",
+            "Alt-M",
+            "Option-M",
+            // Claude's peer tools: `send_to_session` on every agent instead.
+            "ListAgents",
+            "SendMessage",
+        ] {
             assert!(
                 !INSTRUCTIONS.contains(gone),
                 "overlord.md still mentions {gone}"
