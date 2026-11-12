@@ -384,6 +384,36 @@ pub fn working(path: &Path) -> Option<bool> {
     }
 }
 
+/// `working`, counting only turn lines stamped at or after `since_ms`:
+/// what came before is history. For a conversation just resumed: one whose
+/// agent was killed mid-turn ends on a turn that opened and never closed,
+/// and must not read as working for ever. Reads only the file's tail, and
+/// leaves the incremental read position at the end with this answer, so
+/// later `working` calls carry on from here instead of from the old turn.
+pub fn working_since(path: &Path, since_ms: i64) -> Option<bool> {
+    if opencode::locate(path).is_some() {
+        return working(path);
+    }
+    // To the end first: what is read below is then already behind the
+    // position, whatever this call decides.
+    transcript_stats(path)?;
+    let format = Format::of(path);
+    let (_, tail) = read_head_tail(path);
+    let ended = tail
+        .iter()
+        .rev()
+        .map(|v| format.line(v))
+        .filter(|l| l.at().and_then(parse_iso_ms).is_some_and(|t| t >= since_ms))
+        .find_map(|l| l.turn_ended());
+    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cursors.get_mut(path) {
+        c.ended = ended.unwrap_or(false);
+        c.turn_seen = ended.is_some();
+        c.dirty = true;
+    }
+    ended.map(|e| !e)
+}
+
 /// Token totals and time span from a transcript.
 ///
 /// Incremental: a running agent's transcript is polled again and again while
@@ -743,6 +773,40 @@ mod tests {
         );
         // Nothing to save a read position for.
         assert!(take_dirty_cursors().iter().all(|(c, _)| c != &p));
+    }
+
+    /// A Codex conversation killed mid-turn and resumed: the old open turn
+    /// is history, not "working"; a turn opened after the resume counts.
+    #[test]
+    fn a_turn_left_open_before_a_resume_is_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir
+            .path()
+            .join("rollout-2026-11-12T10-00-00-0000aaaa.jsonl");
+        let ev = |ts: &str, kind: &str| {
+            format!(
+                "{}\n",
+                json!({"timestamp": ts, "type": "event_msg", "payload": {"type": kind}})
+            )
+        };
+        // Killed mid-turn: started, never completed.
+        std::fs::write(&p, ev("2026-11-12T10:00:00.000Z", "task_started")).unwrap();
+        assert_eq!(working(&p), Some(true));
+        let resumed = parse_iso_ms("2026-11-12T10:05:00.000Z").unwrap();
+        assert_eq!(working_since(&p, resumed), None);
+        // And the incremental reader carries on from there, not from the
+        // old turn.
+        assert_eq!(working(&p), None);
+        // A turn after the resume is read as usual.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        use std::io::Write;
+        f.write_all(ev("2026-11-12T10:05:03.000Z", "task_started").as_bytes())
+            .unwrap();
+        assert_eq!(working_since(&p, resumed), Some(true));
+        assert_eq!(working(&p), Some(true));
+        f.write_all(ev("2026-11-12T10:05:09.000Z", "task_complete").as_bytes())
+            .unwrap();
+        assert_eq!(working(&p), Some(false));
     }
 
     #[test]

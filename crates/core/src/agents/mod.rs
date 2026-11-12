@@ -41,6 +41,21 @@ use serde_json::{json, Value};
 use crate::types::Status;
 use transcript::Format;
 
+/// What `rlord mcp` (the overlord's MCP server) reads from its
+/// environment: which session is calling (only logged). Where the daemon
+/// is never comes from the environment: every overlord config passes
+/// `rlord mcp --socket <path>`. Each agent's wiring is derived from this
+/// one list: Codex, which starts the server with a short environment of
+/// its own, passes these on (`codex::overlord_args`); OpenCode, whose
+/// shared server would hand on whichever pane started it, blanks them
+/// (`opencode::overlord_config`).
+pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
+
+/// The arguments for `rlord mcp`, talking to the daemon at `socket`.
+pub fn mcp_args(socket: &str) -> Vec<String> {
+    vec!["mcp".into(), "--socket".into(), socket.into()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
@@ -435,23 +450,112 @@ impl Agent {
         matches!(self, Agent::Claude)
     }
 
-    /// It can run the overlord (rlord's MCP server, tool allow-list,
-    /// effort). Why not, when it can't.
-    pub fn runs_overlord(self) -> Result<()> {
-        match self {
-            Agent::Claude => Ok(()),
-            Agent::Codex | Agent::OpenCode => bail!(
-                "the overlord runs on Claude Code only for now (a {} overlord isn't built yet); \
-                 set `[overlord] agent = \"claude\"`",
-                self.label()
-            ),
-        }
-    }
-
     /// Can rlord import its conversations started outside rlord.
     pub fn importable(self) -> bool {
         matches!(self, Agent::Claude)
     }
+
+    // ---- its screen ----
+
+    /// Its pane (`screen`, as `capture-pane` gives it) is at its input
+    /// prompt: text pasted now, then Enter, becomes a prompt, and doesn't
+    /// answer a dialog. A dialog takes Enter as its highlighted choice
+    /// (Claude's "Yes, proceed", Codex's "Yes, proceed", OpenCode's "Allow
+    /// once"), and the status may not say one is up (a Codex session
+    /// without hooks reads as working while it asks).
+    ///
+    /// - Codex: its composer is the bottom input line (`codex::composer_shown`).
+    /// - Claude, OpenCode: no dialog is on screen
+    ///   (`claude::dialog_shown`, `opencode::dialog_shown`).
+    pub fn at_prompt(self, screen: &str) -> bool {
+        match self {
+            Agent::Claude => !claude::dialog_shown(screen),
+            Agent::Codex => codex::composer_shown(screen),
+            Agent::OpenCode => !opencode::dialog_shown(screen),
+        }
+    }
+}
+
+/// The last `n` non-blank lines of a screen, bottom first, without
+/// trailing spaces: where an agent draws its input area and its dialogs.
+pub fn bottom_lines(screen: &str, n: usize) -> impl Iterator<Item = &str> {
+    screen
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+}
+
+/// The text of `s` drawn without the dim attribute (SGR 2, cleared by 0
+/// or 22), however the codes are combined.
+pub fn undimmed(s: &str) -> String {
+    let mut out = String::new();
+    let mut dim = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut fin = ' ';
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    fin = c;
+                    break;
+                }
+                params.push(c);
+            }
+            if fin == 'm' {
+                let ps: Vec<&str> = params.split(';').collect();
+                let mut i = 0;
+                while i < ps.len() {
+                    match ps[i] {
+                        "" | "0" | "22" => dim = false,
+                        "2" => dim = true,
+                        // Extended colours carry their own numbers (a 2 or
+                        // 0 in an RGB triple isn't an attribute): skip them.
+                        "38" | "48" | "58" => {
+                            i += match ps.get(i + 1) {
+                                Some(&"5") => 2,
+                                Some(&"2") => 4,
+                                _ => 0,
+                            };
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        } else if !dim {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Drop ANSI escape sequences (CSI: ESC [ … final byte).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `text` starts with a numbered choice: digits, then `.` (`1. Yes`).
+pub fn numbered_choice(text: &str) -> bool {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && text[digits..].starts_with('.')
 }
 
 /// The agent a transcript file belongs to (see `Format::of`).

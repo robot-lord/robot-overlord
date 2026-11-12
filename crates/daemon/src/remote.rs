@@ -31,7 +31,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::agents::remote::{self, Availability, Live};
-use rlord_core::agents::Agent;
+use rlord_core::agents::{strip_ansi, undimmed, Agent};
 use rlord_core::db::{Db, SessionQuery};
 use rlord_core::tmux;
 use rlord_core::types::{Session, Status};
@@ -192,7 +192,7 @@ fn live() -> HashMap<String, Live> {
 /// The text the user has typed on the agent's input line, read from its
 /// screen with attributes (never typed into). Claude draws its placeholder
 /// and suggested next prompt dim (`ESC[2m`): those aren't the user's.
-fn input_text(screen: &str) -> Option<String> {
+pub(crate) fn input_text(screen: &str) -> Option<String> {
     let line = screen
         .lines()
         .rev()
@@ -206,71 +206,6 @@ fn input_text(screen: &str) -> Option<String> {
     }
     // A placeholder in a capture without attributes.
     (!text.starts_with("Try \"")).then(|| text.to_string())
-}
-
-/// The text of `s` drawn without the dim attribute (SGR 2, cleared by 0
-/// or 22), however the codes are combined.
-fn undimmed(s: &str) -> String {
-    let mut out = String::new();
-    let mut dim = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            let mut params = String::new();
-            let mut fin = ' ';
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    fin = c;
-                    break;
-                }
-                params.push(c);
-            }
-            if fin == 'm' {
-                let ps: Vec<&str> = params.split(';').collect();
-                let mut i = 0;
-                while i < ps.len() {
-                    match ps[i] {
-                        "" | "0" | "22" => dim = false,
-                        "2" => dim = true,
-                        // Extended colours carry their own numbers (a 2 or
-                        // 0 in an RGB triple isn't an attribute): skip them.
-                        "38" | "48" | "58" => {
-                            i += match ps.get(i + 1) {
-                                Some(&"5") => 2,
-                                Some(&"2") => 4,
-                                _ => 0,
-                            };
-                        }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
-        } else if !dim {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Drop ANSI escape sequences (CSI: ESC [ … final byte).
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if ('@'..='~').contains(&c) {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// How many commands the agent has running in its own shells (they
@@ -449,6 +384,9 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
     // under that lock, after any request that held it).
     let is_overlord = overlord::session(&d.db())?.is_some_and(|o| o.id == id);
     let _send = is_overlord.then(|| d.overlord_send.lock().expect("overlord send lock"));
+    // Nothing typed into it meanwhile, and the check below holds until the
+    // restart (locks.rs: after `overlord_send`, before the DB).
+    let _session = d.sessions.lock(id);
     if only_if_quiet {
         let s = d.db().resolve_ref(id)?;
         let live = live();
@@ -609,6 +547,7 @@ fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     rlord_core::agents::install::warm();
     // Not while a request is being pasted into it.
     let _send = d.overlord_send.lock().expect("overlord send lock");
+    let _session = d.lock_overlord();
     overlord::ensure(&d.db(), &d.config(), &json!({}))?;
     tracing::info!("started the overlord for Remote Control");
     d.changed();
@@ -815,11 +754,10 @@ pub fn offer(d: &Daemon) -> Value {
     let on = o
         .as_ref()
         .is_some_and(|o| wanted(&db, &o.id).ok().flatten().is_some());
-    // (No overlord yet: whether the configured agent could have it.)
-    let agent = o
-        .as_ref()
-        .map_or_else(|| d.config().overlord.agent.clone(), |o| o.agent.clone());
-    let can = has_remote_control(&agent);
+    // Whether its agent has it. No overlord yet: what this machine can do;
+    // the setup dialog shows the row only for an agent that has it
+    // (`overlord::status`: each agent's `remote_control`).
+    let can = o.as_ref().is_none_or(|o| has_remote_control(&o.agent));
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()

@@ -7,13 +7,16 @@ main way users drive rlord, and it does most of the upkeep: tagging sessions
 into groups, writing descriptions and notes, organizing the list. It only
 knows what its instructions and tool descriptions tell it.
 
-The overlord is one session, on a strong model at low effort. Its built-in
+The overlord is one session, on a strong model at medium effort. Its built-in
 instructions are `crates/daemon/src/overlord.md`. They are compiled in and
 written to its folder as `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` on every
 start, with the user's `~/.config/robot-overlord/overlord.md` appended.
+It runs on Claude Code, Codex or OpenCode (`[overlord] agent`), so a
+feature that gives the overlord something (a tool, an allowed action, a
+subagent) must be wired for each agent: `overlord::write_files`, and
+"The overlord" in `docs/architecture.md` for how each differs.
 
-Because it runs at low effort, `overlord.md` opens with one rule that every
-feature must respect: the overlord does only light work itself (look-ups,
+`overlord.md` opens with one rule that every feature must respect: the overlord does only light work itself (look-ups,
 small edits to rlord's metadata, short answers); anything heavier goes to a
 subagent or a new session. A feature that needs the overlord to think hard
 in its own conversation is designed wrong: give it a cheap tool, a subagent,
@@ -82,14 +85,20 @@ what it needs and a fresh context, the overlord's context stays small, and
 the user can keep talking to the overlord while it runs.
 
 - Subagent definitions live next to the instructions (`crates/daemon/src/tidy.md`
-  is `rlord-tidy`) and are written to `<data>/overlord/.claude/agents/` on
-  every start. Give each a narrow `tools:` list of `mcp__rlord__*` tools (a
-  test checks they exist), `omitClaudeMd: true`, and a cheaper `model:`.
+  is `rlord-tidy`), written once in Claude's format. Give each a narrow
+  `tools:` list of `mcp__rlord__*` tools (a test checks they exist),
+  `omitClaudeMd: true`, and a cheaper `model:`.
+- On every start they are written to the overlord's folder for each agent
+  (`overlord::write_files`): `.claude/agents/*.md` as they are,
+  `.codex/agents/*.toml` and `.opencode/agents/*.md` converted (name,
+  description, instructions; those agents' subagents inherit the
+  overlord's tools), and `subagents/*.md` as plain instructions. So keep
+  the body agent-neutral: tools by their rlord name, no agent's syntax.
 - `overlord.md` tells the overlord when to delegate and what scope to pass,
-  and keeps a fallback (do it yourself following the agent file) for agents
-  without subagents.
-- Codex (`.codex/agents/*.toml`) and Gemini (`.gemini/agents/*.md`) have
-  their own formats; add those when their adapters land.
+  and keeps a fallback (do it yourself following `subagents/<name>.md`)
+  for an overlord that can't start subagents.
+- Gemini (`.gemini/agents/*.md`) has its own format; add it when its
+  adapter lands.
 
 ## Input: describe, then confirm
 

@@ -1,4 +1,4 @@
-**Status:** in progress (phases 1 and 2 built on `codex-support`, 0.19.0-dev.1; phases 3 and 4 to come)
+**Status:** in progress (phases 1 and 2 built, 0.19.0-dev.1; phase 4, the overlord on Codex, and `send_to_session` built on `codex-overlord`, 0.22.0-dev.3; the rest of phase 3 to come)
 
 # Codex CLI support
 
@@ -39,13 +39,10 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
    read, excerpts, stats; archive summaries.
 3. **Codex extras.** Import from `threads`; models catalog; `send_to_session`
    via `codex queue` (and the Claude path); sub-agents.
-4. **A Codex overlord.** `[overlord] agent = "codex"`. (The overlord is one
-   session now. Its Codex defaults are in place: Codex's default model
-   with `-c model_reasoning_effort="low"`, `overlord::effort_args`. What's
-   missing is the MCP and tool-approval wiring, then `Agent::runs_overlord`.)
-   **Requirement before the repo goes public (Brandon's decision):** the
-   overlord must run on Codex, and preferably on OpenCode too. That is the
-   next work after the single-overlord PR (#7).
+4. **A Codex overlord.** `[overlord] agent = "codex"`. Built: see "Phase 4"
+   under Progress. **Requirement before the repo goes public (Brandon's
+   decision):** the overlord must run on Codex, and preferably on OpenCode
+   too. Both do now.
 5. Later: Codex Remote Control, key shadows, Gemini.
 
 ## Decisions (with Brandon)
@@ -157,6 +154,68 @@ After the PR's code review:
 - Clicks that stop, restart or archive ask first; menus and double-clicks
   go by session id.
 
+### Phase 4: the overlord on Codex (branch `codex-overlord`)
+
+How it works is in `docs/architecture.md` ("The overlord") and the guide
+("Which agent runs the overlord"). What was found on the way, against
+codex-cli 0.167.2:
+
+- **Wiring** (`codex::overlord_args`, all `-c` overrides, nothing written
+  under `~/.codex`): `mcp_servers.rlord.command` / `args` / `env_vars`,
+  `mcp_servers.rlord.default_tools_approval_mode="approve"` (values
+  `auto | prompt | writes | approve`, from `codex app-server
+  generate-json-schema`), `sandbox_mode="read-only"`,
+  `approval_policy="on-request"`, `check_for_update_on_startup=false`, and
+  the folder's trust.
+- **Folder trust**: `-c 'projects."<dir>".trust_level="trusted"'` is
+  accepted and ignored (Codex still shows "Trust this folder?"). The whole
+  table works: `-c 'projects={"<dir>"={trust_level="trusted"}}'`.
+- **Environment**: Codex starts an MCP server with a short list of
+  variables. Since the #10 review the server is `rlord mcp --socket
+  <path>` (the daemon's socket, never looked up), and `env_vars` passes on
+  `agents::MCP_ENV` (`RLORD_SESSION_ID`, only logged).
+- **AGENTS.md** in the folder is loaded (`codex debug prompt-input` shows
+  it, with no model call; that command takes `-c` only, not `-s` / `-a`).
+- **Subagents**: `.codex/agents/<name>.toml` (`name`, `description`,
+  `developer_instructions`; `model_reasoning_effort = "low"`). They
+  inherit the overlord's MCP servers and approvals and can't narrow them.
+  A hyphen in the name is fine.
+- **Codex reports nothing until a prompt**: no thread, no SessionStart,
+  for a new conversation before its first prompt or a resumed one before
+  its next. The overlord starts without a prompt and `ask` waits for it to
+  leave "starting", so `discover` now settles both (a promptless launch
+  becomes "your turn" once its pane has been up 4s; a hook-confirmed
+  session still "starting" is read from its transcript). This also fixes
+  ordinary promptless and resumed Codex sessions, which stayed "starting".
+- An overlord that stopped with no conversation bound starts fresh.
+- The setup dialog lists Codex when installed; its Remote Control row is
+  only shown for an agent that has it.
+
+Verified live (one throwaway overlord in a scratch rlord, its own XDG dirs
+and tmux socket; the three Codex threads deleted afterwards):
+
+- `rlord overlord ask` → `rlord.list_sessions` called with no approval
+  prompt, answered from the scratch daemon (so the socket's environment
+  reached the server); the call's `caller` was the overlord's session id.
+- Hooks: SessionStart bound the thread; UserPromptSubmit / Stop gave
+  working / your turn.
+- `rlord overlord restart` → `codex resume <id>` with the same overrides;
+  the conversation was back; status settled to "your turn".
+- `/clear` → the next prompt's SessionStart carried `source: "clear"`:
+  logged as `fresh_conversation` (`reason: clear`), new thread bound.
+- "Start a tidy pass" → `spawn_agent` with `agent_type: "rlord-tidy"`
+  (Codex's index: `agent_role = rlord-tidy`, `thread_source = subagent`);
+  it called `triage` and `list_groups` with no prompt, and its thread did
+  not rebind the overlord.
+- "Run `touch probe.txt`" → Codex asked ("Would you like to run the
+  following command?"), rlord showed "needs you", nothing was written.
+
+Not exercised: the idle fresh restart by the keeper (it is `session_fresh`,
+the same call the unbound start made live), "continue it" from the list
+(`codex resume <earlier id>`, the same argv as restart), a Codex overlord
+whose hooks aren't trusted (bound from the index, like any Codex session),
+and `rlord-import`.
+
 Unverified against a real Codex run: that hooks fire with these payload
 fields for an interactive session, that SessionStart is not fired for
 sub-agent threads, `thread_source = 'user'` for user threads only, and the
@@ -180,7 +239,103 @@ Known limits, accepted:
 - `RLORD_NO_LOGIN_SHELL=1` turns login-shell resolution off (the demo and
   scratch setups set it, with a stand-in `SHELL`).
 
+### PR #10 review (fixes, checked live on this Mac)
+
+- **`approval_policy`**: the review asked for `"untrusted"` (a sandboxed
+  command would run unasked under `"on-request"`; on Linux the read-only
+  sandbox may allow a Unix-socket connect, so `tmux -L rlord send-keys`
+  could type into a pane). Codex 0.167.2 refuses it at startup:
+  `approval_policy = "untrusted" is no longer supported; remove this
+  setting` (the pane died). The policies left are `on-request`, `never`
+  and `granular`. Kept `on-request`. Live: the overlord ran `tmux -L
+  <scratch socket> list-sessions` unasked and the sandbox refused it
+  (`error connecting to … (Operation not permitted)`); rlord's tools ran
+  with no prompt. Linux is unverified: owed below.
+- **Killed mid-turn, then resumed**: the rollout ends on `task_started`.
+  `follow` now counts only lines since the (re)start while a session is
+  starting (`transcript::working_since`), and leaves the incremental
+  reader at the end. Live: a session killed mid-story, restarted: starting,
+  then your turn (`agent_stopped` from the transcript), not working.
+- **Settling a start checks the screen**: `codex::composer_shown` (a `›`
+  line near the bottom that isn't a numbered dialog choice). Live: the
+  overlord and a promptless session settled once the composer showed.
+  `check_for_update_on_startup=false` is accepted (no warning).
+- **Unbound overlord**: `discover::bind_now` once with the old
+  `bind_since`. Live: an overlord's `agent_session` cleared by hand →
+  `ensure` bound the thread from the index (`agent_session_bound`) and
+  resumed it; with no thread, it started fresh (`reason: unbound`).
+- **`send_to_session`** (rlord's own tool, not `codex queue`): typed into
+  the target's agent pane. Live: the Codex overlord sent "reply with only
+  the word PONG" to a promptless Codex session; its hooks then showed
+  SessionStart, UserPromptSubmit, Stop.
+
+### PR #10 review 2 (fixes, checked live on this Mac, Codex 0.167.2)
+
+- **Never press Enter into a dialog.** `send::type_into` captures the
+  pinned pane right before every paste (ask, direct send, delivery tick)
+  and needs `Agent::at_prompt`. `codex::composer_shown` now looks only at
+  the bottom input area (the lowest `›` line of the last six, and no
+  "Press enter to confirm"). Captured live and kept as fixtures: an
+  approval (`› 1. Yes, proceed (y)` under the user's `›` prompt), an MCP
+  tool approval (indented `  › 1. Allow`, "enter to submit"), the login
+  choice (`> 1.`), working (status line, composer below). Live: with the
+  overlord's status forced to working over an approval dialog, `rlord
+  overlord ask` was refused ("its screen isn't at its input prompt") and
+  the dialog stayed; nothing was written.
+- **Never stuck in starting.** After 20s a start settles on any screen
+  without a numbered dialog (`codex::dialog_shown`), logged;
+  `awaiting_first_prompt` records `composer_seen`. Live: the overlord
+  settled with `composer_seen: true`.
+- **One paste per session; a direct send replaces the queued one.** Live:
+  a message queued (status forced to working), then a direct send →
+  `replaced_pending: true`, `message_dropped` (replaced), the newer one
+  answered, the older never arrived.
+- **`confirm_sends`** (Brandon's decision: stays off, sends run unasked):
+  `-c mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"` is
+  accepted by 0.167.2 (the variants are `auto`, `prompt`, `writes`,
+  `approve`). Live: the overlord asked "Allow the rlord MCP server to run
+  tool send_to_session?"; allowed, PONG arrived.
+- Not checked live: the attached-client check (no terminal could be
+  attached here; unit-tested) and the per-session lock against a restart
+  (unit-tested). A normal Codex session here (the user's own approval
+  settings) never showed an approval, so the send path's screen check was
+  checked live on the overlord (`ask`, same `type_into`) and on a scratch
+  tmux pane in a gated test.
+
+### PR #10 review 3 (screen checks)
+
+- `codex::composer_shown` / `dialog_shown` also treat "enter to submit"
+  and "esc to cancel" as a dialog's footer (the composer's is "esc to
+  interrupt").
+- A draft in the composer holds a send (`codex::draft`). Captured live
+  with attributes (codex-cli 0.167.2, scratch tmux socket, no turn run):
+  the placeholder is drawn dim (`ESC[2m`), typed text plain; a numbered
+  draft (`› 1. numbered`) already reads as not the composer.
+- Claude (`claude::dialog_shown`, not run live): only the lowest `❯` line
+  counts, and one under a `─` rule is the input box. The old check read
+  any numbered prompt in the history (`❯ 1. do x`) as a dialog and blocked
+  every send to that session. A draft in the input box
+  (`remote::input_text`, read with attributes) holds a send.
+- The overlay's terminal doesn't count as someone typing in the session
+  behind it; a held queued message is logged once (`message_held`).
+
+Found on the way, not fixed (outside this PR): a hook-confirmed Codex
+session whose tmux session is killed stays "working" (no SessionEnd, and
+`discover` doesn't watch hooked sessions' panes) until it is restarted or
+the daemon restarts.
+
 ## Owed
+
+- Linux: check that the overlord's read-only sandbox refuses a connection
+  to rlord's tmux socket (`tmux -L rlord list-sessions` from the overlord).
+  If it doesn't, find a Codex setting that does (a permissions profile's
+  network rules, or an execpolicy rule), since `"untrusted"` is gone.
+- `codex queue --thread <id> --message …` could deliver to a busy Codex
+  session without typing; `send_to_session` types for every agent today.
+- Moving an existing overlord to another agent (the agent is fixed when it
+  is first set up).
+- A Codex subagent can't be given a narrower tool list or a cheaper model
+  by name (only a lower effort); revisit if Codex's agent files grow that.
 
 - Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
   demo session and the form's Agent hint.

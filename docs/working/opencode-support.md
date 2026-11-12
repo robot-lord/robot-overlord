@@ -1,4 +1,4 @@
-**Status:** in progress (sessions built on `opencode-support`, 0.20.0-dev.1; import, messaging and the overlord on OpenCode to come)
+**Status:** in progress (sessions built, 0.20.0-dev.1; the overlord on OpenCode and `send_to_session` built on `codex-overlord`, 0.22.0-dev.3; import to come)
 
 # OpenCode support
 
@@ -28,8 +28,9 @@ v2.2.7 (Homebrew `anomalyco/tap/opencode-v2`; v1 differs: require v2).
 - **Summaries**: `POST /api/session/{id}/generate` (session context, no fork;
   unverified that it appends nothing), else `run -s <id> --fork --archived`
   then delete the fork. No ephemeral flag.
-- **Overlord**: config in the overlord folder's `opencode.jsonc`
-  (`mcp.servers.rlord`, an agent with deny-all + allow `rlord_*`), not flags.
+- **Overlord**: config in the overlord folder's `opencode.json`
+  (`mcp.servers.rlord`, and `permissions` rules), not flags. Built: see
+  "The overlord on OpenCode".
 - **Messaging**: `POST /api/session/{id}/prompt {text, delivery: queue}`.
 - **TUI**: full-screen (no scrollback mode); `opencode mini` is inline with
   scrollback. Alt-O/Alt-M unbound; Alt-D deletes a word forward. It takes
@@ -149,6 +150,110 @@ Sessions work end to end (the scope of Codex's phase 2).
   server) and one OpenCode session. Its status comes from the session row;
   the demo can't show an OpenCode session that needs you.
 
+## The overlord on OpenCode (branch `codex-overlord`)
+
+How it works is in `docs/architecture.md` ("The overlord") and the guide.
+Facts found, against OpenCode 2.2.7 and its docs (opencode.ai/docs/config,
+/mcp-servers, /permissions, /agents):
+
+- `opencode mcp add` writes `{"mcp": {"servers": {"<name>": {"type":
+  "local", "command": [...]}}}}` to the project's `opencode.json`; a
+  server takes `environment`, added to the shared server's own.
+- MCP tools are named `<server>_<tool>` for permissions. Rules are
+  `{action, resource, effect}`; **the last match wins**, and every agent
+  starts from "allow everything", so the overlord's config sets `*` to ask
+  first, then allows `read`, `glob`, `grep`, rlord's own subagents (by
+  name) and `rlord_*` (`opencode::overlord_config`), and repeats the rules
+  under `agents.<name>` (see the #10 review below).
+- OpenCode calls MCP tools from a Code Mode script (`execute`): the pane
+  showed `✓ execute › rlord.list_sessions`.
+- Subagents: `.opencode/agents/<name>.md` (`description`, `mode:
+  subagent`, body = instructions); they run as child sessions and use the
+  folder's rules. OpenCode reads `{agent,agents}/**/*.md` (in its binary),
+  and `opencode debug agents` in the folder lists `rlord-tidy` and
+  `rlord-import`.
+- No effort setting, no flags: `write_files` returns no arguments.
+
+Verified live (one throwaway overlord in a scratch rlord with its own XDG
+dirs, tmux socket and OpenCode service on its own port; no credentials
+there, so only the free models existed; `opencode/glm-5.3-flash-free`):
+
+- `rlord overlord ask` → `rlord.list_sessions` ran with no permission
+  prompt and was answered by the scratch daemon; status went working, then
+  your turn, from the server's events.
+- "Run `touch probe.txt`" → OpenCode asked ("Permission required"), rlord
+  showed "needs you" (`permission_request` from the event stream, then
+  `answered` when rejected), nothing was written. This is also the first
+  real permission prompt seen through the event stream: it maps as written.
+
+Not exercised: the idle fresh restart.
+
+### PR #10 review (checked live, OpenCode 2.2.7, `glm-5.3-flash-free`)
+
+- **Code Mode (`execute`)**: no longer allowed by name (it falls to `*`
+  ask). It needs no rule: `execute › rlord.list_sessions` still ran with
+  no prompt, so OpenCode checks the tools a script calls, not the script.
+  Inside a script, `import "fs"` / `"child_process"` fail ("isn't
+  available in Code Mode"), the built-in shell and write tools aren't in
+  its catalog, and `fetch` asked ("Permission required: WebFetch").
+- **The user's global config**: `opencode debug config` / `debug agents`
+  show the merge. Top-level rules from the user's global config come
+  before the folder's (a global `bash: allow` lost to the folder's `*`
+  ask: `touch` asked). But agent-level rules (`agent.build.permission` or
+  `agents.build.permissions`) are applied after every file's top-level
+  rules, so a global agent-level `bash: allow` came last and would have
+  won. Mitigated: the folder repeats its rules under `agents.build`,
+  `agents.plan`, `agents.rlord-tidy`, `agents.rlord-import` (folder after
+  global at that level too); with a global `agent.build` shell allow in
+  place, `touch` still asked. Also `subagent` is allowed only for rlord's
+  own: starting `general` asked. Not covered: a custom primary agent the
+  user switches to by hand in the overlord's TUI.
+- **A subagent pass**: "a tidy pass with rlord-tidy" → `Rlord-Tidy
+  Subagent` ran `triage` with no prompt.
+- **`rlord mcp --socket`**: the scratch OpenCode service had been started
+  with another `XDG_RUNTIME_DIR` than the daemon's; the overlord's tool
+  calls reached the daemon anyway.
+- **Found: `overlord ask` approved a permission prompt.** Typed while the
+  overlord was waiting on one, its Enter landed on "Allow once" and the
+  command ran. `ask` now refuses while the overlord needs you (checked:
+  refused with a message; the prompt stayed).
+- **`send_to_session`**: the overlord passed "reply with only the word
+  PONG" to an OpenCode session (answered). By the RPC directly: to a
+  working session it was refused; with `when_idle` it was queued, a second
+  replaced it (`replaced_pending: true`), and the second was delivered when
+  the turn ended (`message_delivered`); to the overlord itself, refused.
+
+All throwaway OpenCode sessions (overlord, target, tidy child) were
+deleted and the scratch service stopped.
+
+### PR #10 review 2 (checked live, OpenCode 2.2.7, free model "Big Pickle")
+
+Scratch HOME and XDG dirs (no credentials), own service port.
+
+- **Dialogs on screen** (`opencode::dialog_shown`), as captured: a
+  permission request ("△ Permission required", `Allow once  Always allow
+  Reject`, "⇆ select  enter confirm") and a question (numbered options
+  with no marker, "↑↓ select  enter submit  esc dismiss"). Live: with the
+  overlord's status forced to working over a permission request, `rlord
+  overlord ask` was refused and the dialog stayed.
+- **Every agent gets the folder's rules**: `general` and `explore` added,
+  plus the user's global agents by name (`opencode::user_agents`). Where
+  OpenCode 2.2.7 reads global agents from (checked with `debug config` /
+  `debug agents`): `opencode.json` and `opencode.jsonc` in its config
+  folder (not `config.json`), the Markdown files under `agent/` and
+  `agents/` (nested ones named by path, `team/nested`), and
+  `$OPENCODE_CONFIG`, `$OPENCODE_CONFIG_DIR`, `$OPENCODE_CONFIG_CONTENT`.
+  Live, with a global `agent.general.permission.bash = allow` (and the same
+  on `build` and a Markdown subagent `shelly`): `debug agents` in the
+  overlord's folder put the folder's `*` ask after the user's `shell`
+  allow for each; asked to have `general` run `touch probe-general.txt`,
+  OpenCode asked to start `general`, then asked again for the `touch`
+  (rejected; nothing written).
+- `confirm_sends`: an ask rule for `rlord_send_to_session` after
+  `rlord_*` (unit-tested; not run live).
+
+The scratch service, its sessions and data were deleted.
+
 ## Verified against OpenCode 2.2.7 (throwaway sessions, all deleted)
 
 - `opencode -s <minted id> --prompt …` creates the session under that id
@@ -227,8 +332,9 @@ and without a model and a restart of a session OpenCode no longer had.
   sessions by the id it minted, never by environment, and has no OpenCode
   hooks; the MCP bridge's `caller` only decides whether the mastermind may
   `hand_off`, and neither overlord session could run on OpenCode. (Since
-  PR #7 the overlord is one session, with no `hand_off`; it still can't
-  run on OpenCode.)
+  PR #7 the overlord is one session, with no `hand_off`. It can run on
+  OpenCode now: the bridge's `caller` is then whatever session's pane
+  started the shared server, and is only logged.)
 - (Batch 2) Creating the session from the daemon through `Service` when
   `service.json` answers: launches run under the DB lock, so a request
   there would stall every other call; the bounded wrapper covers it.
@@ -237,20 +343,25 @@ and without a model and a restart of a session OpenCode no longer had.
   over when OpenCode's database surely lacks it, so the deferred model is
   only ever applied to a session rlord's launch made.
 
+### PR #10 review 3
+
+- `opencode::dialog_shown` reads only the bottom box (the last run of
+  `┃` lines and the line under it) and needs a dialog's own line
+  (`△ Permission required` opening a line, `Allow once` with `Reject`,
+  `enter submit` with `esc dismiss`, `⇆ select` with `enter confirm`), so
+  the same words in the transcript don't hold sends (PR #10 review 3).
+
 ## Owed
 
-- Import (`session_v2` has directory, title, model), messaging through
-  the API (`POST …/prompt`, already used for the deferred prompt),
-  an OpenCode overlord (`opencode.jsonc` in the overlord's folder). The
-  overlord is one session now, and its OpenCode defaults are in place
-  (default model, no effort: `OverlordConfig::defaults_for`); what's
-  missing is the MCP and tool wiring, then `Agent::runs_overlord`.
-  Brandon's decision: the overlord running on Codex is required before
-  the repo goes public, and preferably on OpenCode too; it is the next
-  work after PR #7 (one overlord), with the Codex one first
-  (`codex-support.md`, phase 4).
+- Import (`session_v2` has directory, title, model).
+- `send_to_session` types into the pane; `POST …/prompt {delivery:
+  queue}` could deliver to a busy OpenCode session without typing.
+- A draft in OpenCode's prompt box isn't detected (Claude's and Codex's
+  are): a send would be added to it. Needs a capture of the box with
+  attributes (its placeholder is drawn differently from typed text).
 - Sub-agent tracking (child sessions: `parent_id`).
-- A real permission prompt and question form, checked by hand.
+- A question form, checked by hand (a real permission prompt was: see
+  "The overlord on OpenCode").
 - Screenshots not retaken with the OpenCode demo session.
 - `docs/architecture.md` got the OpenCode facts in its agent section; the
   larger reconcile owed by the Codex doc still stands.

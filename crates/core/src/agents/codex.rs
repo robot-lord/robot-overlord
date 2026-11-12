@@ -79,6 +79,160 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
+/// A TOML basic string (for a `-c key=value` override's value).
+pub fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The flags a Codex overlord always runs with (in `dir`, its own folder):
+/// rlord's MCP server, its tools called without a prompt, and nothing else
+/// loosened. All as `-c` overrides: nothing is written to `~/.codex`.
+///
+/// - `mcp_servers.rlord.*`: the server (`rlord mcp --socket <socket>`: the
+///   daemon that launched it, whatever the environment says), with
+///   `default_tools_approval_mode = "approve"` (Codex's per-server
+///   counterpart of an allow-list) and `env_vars` passing on what it reads
+///   (`MCP_ENV`; Codex starts a server with a short environment).
+/// - `sandbox_mode = "read-only"`, `approval_policy = "on-request"`:
+///   commands run in the read-only sandbox without a prompt, and anything
+///   that needs more (a write, the network, leaving the sandbox) asks the
+///   user. ("untrusted", which would ask before every command not known to
+///   be read-only, is refused by Codex 0.167: "no longer supported".) The
+///   sandbox stops a shell command reaching rlord's tmux socket (on macOS
+///   it refuses the connection, checked live; on Linux that is
+///   unverified). It does not stop the overlord typing into other
+///   sessions: rlord's own `send_to_session` does that, and like rlord's
+///   other tools it runs without a prompt, by design. rlord expects to be
+///   run by its user on a machine they trust, or over a remote connection
+///   they trust; little untrusted text reaches the overlord (it works from
+///   rlord's own data and the user's requests), so it can type into
+///   sessions without asking, which is what lets it orchestrate.
+/// - `confirm_sends` (`[overlord] confirm_sends`, off by default):
+///   `mcp_servers.rlord.tools.send_to_session.approval_mode = "prompt"`,
+///   so that one tool asks each time (for anyone who wants that).
+/// - `check_for_update_on_startup = false`: no update prompt in front of
+///   the composer (rlord types into it once it is up).
+/// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
+///   rlord's own, so Codex doesn't stop to ask about it, and reads the
+///   sub-agents rlord writes to its `.codex/agents`.
+pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str, confirm_sends: bool) -> Vec<String> {
+    let args: Vec<String> = super::mcp_args(socket)
+        .iter()
+        .map(|a| toml_str(a))
+        .collect();
+    let env: Vec<String> = super::MCP_ENV.iter().map(|v| toml_str(v)).collect();
+    [
+        format!("mcp_servers.rlord.command={}", toml_str(rlord_bin)),
+        format!("mcp_servers.rlord.args=[{}]", args.join(",")),
+        format!("mcp_servers.rlord.env_vars=[{}]", env.join(",")),
+        "mcp_servers.rlord.default_tools_approval_mode=\"approve\"".to_string(),
+        // This replaces the user's whole `projects` table, for this run
+        // only: their other folders' trust is unknown to this process (it
+        // is still in ~/.codex/config.toml, untouched). The overlord works
+        // in its own folder, so nothing it does needs theirs. (A whole
+        // table because a dotted override path can't hold a quoted key: it
+        // is accepted and ignored, and Codex asks about the folder at every
+        // start.)
+        format!("projects={{{}={{trust_level=\"trusted\"}}}}", toml_str(dir)),
+        "sandbox_mode=\"read-only\"".to_string(),
+        "approval_policy=\"on-request\"".to_string(),
+        "check_for_update_on_startup=false".to_string(),
+    ]
+    .into_iter()
+    .chain(
+        confirm_sends.then(|| {
+            "mcp_servers.rlord.tools.send_to_session.approval_mode=\"prompt\"".to_string()
+        }),
+    )
+    .flat_map(|kv| ["-c".to_string(), kv])
+    .collect()
+}
+
+/// Codex's screen shows its composer, ready for a prompt. Only the bottom
+/// input area counts (its last few lines: the composer and the footer
+/// under it): the lowest line there that starts with `›` (its prompt mark)
+/// must not be a numbered choice. The same mark points at the picked
+/// option in a dialog (trust this folder, update now, approve a command),
+/// which Codex draws in place of the composer; a `›` higher up is a prompt
+/// in the history, not the input. Startup screens before it (an update
+/// prompt, a login, a trust question) and an approval don't count.
+pub fn composer_shown(screen: &str) -> bool {
+    // A dialog's footer sits under its choices: only lines below the
+    // lowest `›` count (the same words in the transcript above don't).
+    let mut footer = false;
+    for l in super::bottom_lines(screen, 6) {
+        if let Some(rest) = l.strip_prefix('›') {
+            return !footer && !super::numbered_choice(rest.trim_start());
+        }
+        footer |= dialog_footer(l);
+    }
+    false
+}
+
+/// A dialog's own footer ("Press enter to confirm or esc to cancel", an
+/// MCP approval's "enter to submit | esc to cancel"). The composer's says
+/// "esc to interrupt" while a turn runs.
+fn dialog_footer(line: &str) -> bool {
+    ["Press enter to confirm", "enter to submit", "esc to cancel"]
+        .iter()
+        .any(|m| line.contains(m))
+}
+
+/// What is typed in the composer (`screen` captured with attributes,
+/// `capture-pane -e`), if anything: the text after the lowest `›` in the
+/// input area. Its placeholder ("Ask Codex to do anything") is drawn dim
+/// and isn't a draft.
+pub fn draft(screen: &str) -> Option<String> {
+    let line = screen
+        .lines()
+        .rev()
+        .filter(|l| !super::strip_ansi(l).trim().is_empty())
+        .take(6)
+        .find(|l| super::strip_ansi(l).starts_with('›'))?;
+    let rest = line.split_once('›')?.1;
+    let text = super::undimmed(rest);
+    let text = text.trim_matches([' ', '\u{a0}']);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// A numbered-choice dialog is at the bottom of Codex's screen: an
+/// approval, a trust or update question, the login choice (marked `›` or
+/// `>` at the picked option), or a dialog's footer (`dialog_footer`).
+pub fn dialog_shown(screen: &str) -> bool {
+    super::bottom_lines(screen, 12).any(|l| {
+        dialog_footer(l)
+            || l.trim_start()
+                .strip_prefix(['›', '>'])
+                .is_some_and(|rest| super::numbered_choice(rest.trim_start()))
+    })
+}
+
+/// A sub-agent file for Codex (`.codex/agents/<name>.toml`): its name, when
+/// to use it, and its instructions. It inherits the overlord's MCP servers
+/// and approvals (a file can't narrow them), and runs at low effort: the
+/// passes it is for are routine.
+pub fn subagent_toml(name: &str, description: &str, instructions: &str) -> String {
+    format!(
+        "name = {}\ndescription = {}\nmodel_reasoning_effort = \"low\"\ndeveloper_instructions = {}\n",
+        toml_str(name),
+        toml_str(description),
+        toml_str(instructions.trim()),
+    )
+}
+
 /// Map a Codex hook event to (event kind for our log, what it does to the
 /// status). A permission prompt is its "needs you"; it ends when the tool
 /// it was for has run (PostToolUse).
@@ -588,6 +742,14 @@ pub fn summary_argv(model: &str, fork: Option<(&str, &str)>, out: &Path) -> Vec<
 mod tests {
     use super::super::transcript::{self, Format};
     use super::*;
+
+    #[test]
+    fn footer_words_in_the_transcript_dont_hide_the_composer() {
+        let idle = "• Press esc to cancel, or enter to submit.\n\n› \n\n  ? for shortcuts    100% context left";
+        assert!(composer_shown(idle));
+        let dialog = "Allow it?\n› 1. Yes\n  2. No\n  Press enter to confirm or esc to cancel";
+        assert!(!composer_shown(dialog));
+    }
     use serde_json::json;
 
     /// A rollout as Codex 0.167 writes one: two turns, a tool call, the
@@ -752,6 +914,167 @@ mod tests {
                 "--search"
             ]
         );
+    }
+
+    /// The overlord's overrides are each valid TOML as Codex parses a
+    /// `-c key=value` (the value alone), whatever the paths hold.
+    #[test]
+    fn overlord_overrides_are_toml() {
+        let args = overlord_args(
+            "/opt/my \"apps\"/rlord",
+            "/run/r\"lord/daemon.sock",
+            "/data/o'lord\\x",
+            true,
+        );
+        assert_eq!(args.len() % 2, 0);
+        let mut seen = std::collections::HashMap::new();
+        for pair in args.chunks(2) {
+            assert_eq!(pair[0], "-c");
+            let (k, v) = pair[1].split_once('=').unwrap();
+            let doc: toml::Value = format!("v = {v}").parse().unwrap_or_else(|e| {
+                panic!("{k}: {v}: {e}");
+            });
+            seen.insert(k.to_string(), doc["v"].clone());
+        }
+        assert_eq!(
+            seen["mcp_servers.rlord.command"].as_str(),
+            Some("/opt/my \"apps\"/rlord")
+        );
+        let args: Vec<&str> = seen["mcp_servers.rlord.args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ["mcp", "--socket", "/run/r\"lord/daemon.sock"]);
+        let env = seen["mcp_servers.rlord.env_vars"].as_array().unwrap();
+        assert_eq!(env.len(), crate::agents::MCP_ENV.len());
+        assert!(env.iter().any(|v| v.as_str() == Some("RLORD_SESSION_ID")));
+        assert_eq!(
+            seen["mcp_servers.rlord.default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(seen["sandbox_mode"].as_str(), Some("read-only"));
+        // ("untrusted" is refused by Codex 0.167.)
+        assert_eq!(seen["approval_policy"].as_str(), Some("on-request"));
+        assert_eq!(seen["check_for_update_on_startup"].as_bool(), Some(false));
+        // Sends confirmed: that one tool asks.
+        assert_eq!(
+            seen["mcp_servers.rlord.tools.send_to_session.approval_mode"].as_str(),
+            Some("prompt")
+        );
+        let off = overlord_args("/r", "/s", "/d", false);
+        assert!(!off.iter().any(|a| a.contains("approval_mode=\"prompt\"")));
+        // The folder's trust: one table keyed by the path itself.
+        assert_eq!(
+            seen["projects"]["/data/o'lord\\x"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn the_composer_is_told_from_a_dialog() {
+        // As captured from codex-cli 0.167.2 (folder trusted, no prompt).
+        let ready = "\n  >_ OpenAI Codex (v0.167.2)\n     /tmp/x\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · /tmp/x  ⚠ 1 warning · f2 to view\n\n";
+        assert!(composer_shown(ready));
+        let typed = "› what is on my list\n\n  ? for shortcuts";
+        assert!(composer_shown(typed));
+        let dialog =
+            "  Update available!\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n";
+        assert!(!composer_shown(dialog));
+        let trust =
+            "  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit\n";
+        assert!(!composer_shown(trust));
+        assert!(!composer_shown(""));
+        for d in [dialog, trust] {
+            assert!(dialog_shown(d));
+        }
+        assert!(!dialog_shown(ready) && !dialog_shown(typed));
+    }
+
+    /// An approval during a turn, as captured from codex-cli 0.167.2: the
+    /// user's prompt (`›`) is in the history above it.
+    #[test]
+    fn an_approval_is_not_the_composer() {
+        let approval = "› Run the shell command: touch probe.txt\n\n\n\
+            • I'll run touch probe.txt, requesting approval.\n\n\
+            • Running touch probe.txt\n\n\n\
+              Would you like to run the following command?\n\n\
+              Reason: Allow creating probe.txt in this read-only workspace?\n\n\
+              $ touch probe.txt\n\n\n\
+            › 1. Yes, proceed (y)\n\
+              2. Yes, and don't ask again for commands that start with `touch probe.txt` (p)\n\
+              3. No, and tell Codex what to do differently (esc)\n\n\
+              Press enter to confirm or esc to cancel\n";
+        assert!(!composer_shown(approval));
+        assert!(dialog_shown(approval));
+        // The user moved to another option: still a dialog.
+        let moved = approval
+            .replace("› 1. Yes", "  1. Yes")
+            .replace("  2. Yes, and", "› 2. Yes, and");
+        assert!(!composer_shown(&moved) && dialog_shown(&moved));
+        // A short dialog under a prompt in the history: the history's `›`
+        // doesn't count.
+        let short = "› fix the tests\n\n› 1. Update now\n  2. Skip\n";
+        assert!(!composer_shown(short) && dialog_shown(short));
+        // Working, as captured: the composer is up under the status line.
+        let working = "› Count slowly from 1 to 5.\n\n\n\
+            • Working (1s • esc to interrupt)\n\n\n\
+            › Ask Codex to do anything\n\n\
+              GPT-6.1-Sol medium · /tmp/x\n\
+              ← for agents · ? for shortcuts      ⚠ 1 warning · f2 to view\n";
+        assert!(composer_shown(working) && !dialog_shown(working));
+        // An MCP tool's approval (`approval_mode = "prompt"`), as captured:
+        // its choices are indented.
+        let mcp = "• Calling\n  └ rlord.send_to_session({\"session\":\"cxt2\"})\n\n\
+              Field 1/1\n\n  Allow the rlord MCP server to run tool \"send_to_session\"?\n\n\
+              session: cxt2\n  text: Reply with the word PONG.\n\n\
+              › 1. Allow   Run the tool and continue\n\
+                2. Cancel  Cancel this tool call\n\n\
+              enter to submit | esc to cancel\n";
+        assert!(!composer_shown(mcp) && dialog_shown(mcp));
+        // The login screen marks its choice with `>`.
+        let login = "  Choose how you want to use Codex.\n\n> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n\n  Press enter to continue\n";
+        assert!(!composer_shown(login) && dialog_shown(login));
+        // A dialog's footer alone, with a `›` choice that isn't numbered:
+        // not the composer.
+        for footer in ["enter to submit | esc to cancel", "  esc to cancel"] {
+            let s = format!("  Allow it?\n\n› Allow\n  Cancel\n\n{footer}\n");
+            assert!(!composer_shown(&s) && dialog_shown(&s), "{footer}");
+        }
+    }
+
+    /// The composer as captured with attributes from codex-cli 0.167.2:
+    /// the placeholder is dim, typed text isn't.
+    #[test]
+    fn a_draft_in_the_composer() {
+        let footer = "\n  \x1b[38;2;246;226;183mGPT-6.1-Sol medium\x1b[39m · /tmp/x\n\
+            \x1b[39m  \x1b[1m←\x1b[0m for agents · \x1b[1m?\x1b[0m for shortcuts\n";
+        let empty = format!("\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n{footer}");
+        assert_eq!(draft(&empty), None);
+        let typed = format!("› old prompt\n\n• Done.\n\n\x1b[1m›\x1b[0m half a draft\n{footer}");
+        assert_eq!(draft(&typed).as_deref(), Some("half a draft"));
+        // A prompt in the history above an empty composer isn't a draft.
+        let history = format!("› old prompt\n\n• Done.\n\n{empty}");
+        assert_eq!(draft(&history), None);
+        assert_eq!(draft(""), None);
+    }
+
+    #[test]
+    fn a_subagent_file_is_toml() {
+        let text = subagent_toml(
+            "rlord-tidy",
+            "Tidy \"the\" list",
+            "Line one.\n\nUse `triage`.\n",
+        );
+        let doc: toml::Value = text.parse().unwrap();
+        assert_eq!(doc["name"].as_str(), Some("rlord-tidy"));
+        assert_eq!(doc["description"].as_str(), Some("Tidy \"the\" list"));
+        assert_eq!(
+            doc["developer_instructions"].as_str(),
+            Some("Line one.\n\nUse `triage`.")
+        );
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("low"));
     }
 
     #[test]

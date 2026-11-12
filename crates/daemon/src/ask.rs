@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use rlord_core::agents::Agent;
 use rlord_core::tmux;
 use rlord_core::types::Status;
 
+use crate::send::{type_into, Checks, Typed};
 use crate::{overlord, Daemon};
 
 /// How long to wait for a just-(re)started overlord to accept input.
@@ -53,7 +55,7 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
             // Not while an idle overlord is being restarted fresh. (Lock
             // order: this, then the DB.)
             let _send = d.overlord_send.lock().expect("overlord send lock");
-            let Some(s) = d.db().overlord()? else {
+            let Some(id) = d.db().overlord()?.map(|s| s.id) else {
                 if started {
                     bail!("overlord vanished");
                 }
@@ -62,6 +64,10 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     rlord_core::keys::alt_name()
                 );
             };
+            // Its session's lock (locks.rs: after the send lock, before the
+            // DB), then a fresh look.
+            let _session = d.sessions.lock(&id);
+            let s = d.db().overlord()?.context("overlord vanished")?;
             let running = s.status != Status::Stopped
                 && s.tmux_session.as_deref().is_some_and(tmux::has_session);
             let s = if !started || !running {
@@ -82,15 +88,40 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
             } else {
                 s
             };
+            // Blocked on the user (a permission prompt, a question): the
+            // paste's Enter would answer it (OpenCode's dialog takes Enter
+            // as "Allow once"). They answer it themselves.
+            if s.status == Status::WaitingInput {
+                bail!(
+                    "the overlord is waiting on you (a permission prompt or a question): \
+                     answer it first ({}-O)",
+                    rlord_core::keys::alt_name()
+                );
+            }
             if s.status != Status::Starting {
-                let pane = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
-                // Out of copy mode first (left there by the overlay): its
-                // keys would take the Enter that submits this.
-                let _ = tmux::cancel_mode(pane);
-                tmux::paste(pane, text)?;
-                // Let the paste land before submitting it.
-                std::thread::sleep(Duration::from_millis(150));
-                tmux::send_keys(pane, &["Enter"])?;
+                let name = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
+                // Its agent pane (not whichever pane is active); out of
+                // copy mode first (left there by the overlay).
+                let pane = tmux::pane_id(name)?;
+                // Its screen, right before: a dialog takes the Enter as its
+                // answer, whatever the status says (a Codex overlord
+                // without hooks shows working while it asks). It may be
+                // working: Claude and Codex take a message mid-turn.
+                let checks = Checks {
+                    agent: Agent::named(&s.agent)?,
+                    settle: false,
+                    attached: None,
+                    overlay: None,
+                    // (The user's own message: a draft of theirs in the
+                    // overlord's pane is theirs to merge.)
+                    draft: false,
+                };
+                if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
+                    bail!(
+                        "not sent to the overlord: {why}. Answer it first ({}-O)",
+                        rlord_core::keys::alt_name()
+                    );
+                }
                 return Ok(json!({"sent": true}));
             }
         }

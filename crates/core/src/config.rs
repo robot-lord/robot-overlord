@@ -157,7 +157,7 @@ impl TmuxKeys {
 
 /// The overlord: the long-running session you talk to in order to drive
 /// rlord itself (launch sessions, search, navigate, set views). One session:
-/// a strong model at low effort, which does light work itself and sends
+/// a strong model at medium effort, which does light work itself and sends
 /// anything heavier to a subagent or a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "OverlordToml")]
@@ -176,17 +176,21 @@ pub struct OverlordConfig {
     /// cell count.
     pub width: String,
     pub height: String,
+    /// Ask the user before each `send_to_session` (the overlord typing into
+    /// another session). Off by default: like rlord's other tools, it runs
+    /// unasked.
+    pub confirm_sends: bool,
 }
 
 impl OverlordConfig {
     /// The overlord's default (model, effort) on `agent`: a strong model at
-    /// low effort. Claude: Opus / low. Codex: its own default model with
-    /// `model_reasoning_effort = "low"`. OpenCode: its default model; it has
+    /// medium effort. Claude: Opus / medium. Codex: its own default model with
+    /// `model_reasoning_effort = "medium"`. OpenCode: its default model; it has
     /// no effort to set.
     pub fn defaults_for(agent: &str) -> (&'static str, &'static str) {
         match agent.trim() {
-            "claude" | "" => ("opus", "low"),
-            "codex" => ("", "low"),
+            "claude" | "" => ("opus", "medium"),
+            "codex" => ("", "medium"),
             _ => ("", ""),
         }
     }
@@ -221,6 +225,7 @@ struct OverlordToml {
     width: Option<String>,
     #[serde(alias = "popup_height")]
     height: Option<String>,
+    confirm_sends: Option<bool>,
 }
 
 impl From<OverlordToml> for OverlordConfig {
@@ -246,6 +251,7 @@ impl From<OverlordToml> for OverlordConfig {
                 .unwrap_or(15),
             width: t.width.unwrap_or_else(|| "90%".into()),
             height: t.height.unwrap_or_else(|| "85%".into()),
+            confirm_sends: t.confirm_sends.unwrap_or(false),
             agent,
         }
     }
@@ -688,17 +694,17 @@ claude_tui = "default"          # Claude's renderer here: "default" (inline: tmu
 # launch sessions, search, jump around, set the list's sort/filter. It gets
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
-# One session (Alt-O; Option-O on a Mac): a strong model at low effort. It
-# does light work itself (look-ups, small edits, short answers) and sends
-# anything heavier to a subagent or a new session. Too shallow for you?
-# Raise the effort to "medium".
+# One session (Alt-O; Option-O on a Mac): a strong model at medium effort.
+# It does light work itself (look-ups, small edits, short answers) and sends
+# anything heavier to a subagent or a new session.
 [overlord]
 agent = "claude"
 model = "opus"
-effort = "low"
+effort = "medium"
 fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
+confirm_sends = false   # ask you before it types into another session
 
 # Easiest: ask your overlord to change a key (or `:keys` in the list). It
 # opens the key screen, which tests that the key reaches rlord and checks it
@@ -828,7 +834,7 @@ mod tests {
         assert!(c.session.workspace);
         assert_eq!(c.session.workspace_dir, ".worktrees");
         assert_eq!(c.overlord.model, "opus");
-        assert_eq!(c.overlord.effort, "low");
+        assert_eq!(c.overlord.effort, "medium");
         assert_eq!(c.overlord.fresh_after_mins, 15);
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
@@ -853,7 +859,7 @@ mod tests {
         let o = |t: &str| toml::from_str::<Config>(t).unwrap().overlord;
         // Nothing set: the new defaults.
         let d = o("");
-        assert_eq!((d.model.as_str(), d.effort.as_str()), ("opus", "low"));
+        assert_eq!((d.model.as_str(), d.effort.as_str()), ("opus", "medium"));
         // The old template, as written: the mastermind carries over.
         let t = o("[overlord]\nmodel = \"sonnet\"\neffort = \"low\"\n\
                    mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
@@ -874,7 +880,7 @@ mod tests {
         assert_eq!(o("[overlord]\nmodel = \"sonnet\"\n").model, "sonnet");
         // Another agent: its own defaults; an old tmux key is ignored.
         let c = o("[overlord]\nagent = \"codex\"\n[tmux]\nmastermind = \"M-m\"\n");
-        assert_eq!((c.model.as_str(), c.effort.as_str()), ("", "low"));
+        assert_eq!((c.model.as_str(), c.effort.as_str()), ("", "medium"));
         assert_eq!(OverlordConfig::defaults_for("opencode"), ("", ""));
         assert!(OverlordConfig::efforts_for("opencode").is_empty());
     }

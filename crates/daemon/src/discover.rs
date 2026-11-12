@@ -54,13 +54,19 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-/// Live sessions of agents that assign their own id, not confirmed by a hook.
+/// Live sessions of agents that assign their own id, not confirmed by a
+/// hook; and confirmed ones that are still "starting" (a resumed Codex runs
+/// no hook until its next prompt: see `follow`).
 fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
     Ok(d.db()
         .running_sessions()?
         .into_iter()
         .filter(|s| Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()))
-        .filter(|s| s.agent_session.is_none() || s.agent_session_trust != "hook")
+        .filter(|s| {
+            s.agent_session.is_none()
+                || s.agent_session_trust != "hook"
+                || s.status == Status::Starting
+        })
         .collect())
 }
 
@@ -83,7 +89,7 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
             let others = sessions.iter().any(|o| {
                 o.id != s.id && o.agent_session.is_none() && o.project_path == s.project_path
             });
-            changed |= bind(d, s, others)?;
+            changed |= bind(d, s, others)? || first_prompt_due(d, s)?;
         } else {
             changed |= follow(d, s)?;
         }
@@ -122,29 +128,146 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     Ok(true)
 }
 
-/// Find the conversation a session launched, in its agent's index (see
-/// `pick_thread`). `others`: another session waits for one in this folder.
-fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
-    let (since, prompt, tracked) = {
+/// How long after a launch without a prompt the agent's screen is taken
+/// to be up.
+const UP_AFTER_MS: i64 = 4_000;
+
+/// A session launched without a prompt has nothing to report until its
+/// first one: Codex creates the conversation (and runs SessionStart) only
+/// then. So once its pane has been up a moment it is the user's turn, not
+/// "starting" for ever. (The overlord starts this way: `ask` waits for it
+/// to leave "starting" before typing into it.) Returns whether it changed.
+fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
+    if s.status != Status::Starting {
+        return Ok(false);
+    }
+    let (launched_bare, since) = {
         let db = d.db();
+        let launched_bare = db
+            .kv_get(&methods::bind_prompt_key(&s.id))?
+            .is_some_and(|p| p.trim().is_empty());
         let since = db
             .kv_get(&methods::bind_since_key(&s.id))?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(s.created_at);
-        let prompt = db
-            .kv_get(&methods::bind_prompt_key(&s.id))?
-            .filter(|p| !p.trim().is_empty());
-        (since, prompt, db.agent_session_ids()?)
+            .and_then(|v| v.parse::<i64>().ok());
+        (launched_bare, since)
     };
-    let candidates: Vec<codex::Thread> =
-        codex::threads_started_in(&codex::home(), &s.project_path, since)
-            .into_iter()
-            .filter(|t| !tracked.contains(&t.id))
-            .collect();
-    let Some(t) = pick_thread(&candidates, prompt.as_deref(), others) else {
+    let now = now_ms();
+    if !launched_bare || !since.is_some_and(|t| up_long_enough(t, now)) {
+        return Ok(false);
+    }
+    // Up means its composer is on screen, not a startup dialog in front of
+    // it (where typed text would land on the wrong thing). Read without
+    // the DB lock.
+    let Some(composer_seen) = screen_settles(s, since, now) else {
         return Ok(false);
     };
     let db = d.db();
+    // Moved on meanwhile (a hook, a restart): not ours to say.
+    let cur = db.resolve_ref(&s.id)?;
+    if cur.status != Status::Starting || cur.agent_session.is_some() {
+        return Ok(false);
+    }
+    db.set_status(&s.id, Status::Idle, now)?;
+    db.insert_event(
+        &s.id,
+        now,
+        "awaiting_first_prompt",
+        &json!({"from": "pane", "composer_seen": composer_seen}).to_string(),
+    )?;
+    Ok(true)
+}
+
+fn up_long_enough(launched_ms: i64, now_ms: i64) -> bool {
+    now_ms - launched_ms >= UP_AFTER_MS
+}
+
+/// How long a starting Codex session waits for its composer to be
+/// recognised before it settles on any screen without a dialog.
+const SETTLE_ANYWAY_MS: i64 = 20_000;
+
+/// Whether a starting session (up since `since`, epoch ms) may settle,
+/// from its agent pane: Some(true) when Codex's composer is shown
+/// (`codex::composer_shown`); Some(false) once it has been up
+/// `SETTLE_ANYWAY_MS` with no numbered-choice dialog on screen (a composer
+/// drawn in a way `composer_shown` doesn't know must not leave it starting
+/// for ever; logged); None: not yet.
+fn screen_settles(s: &Session, since: Option<i64>, now: i64) -> Option<bool> {
+    let screen = s
+        .tmux_session
+        .as_deref()
+        .and_then(|t| tmux::capture_pane(t).ok())?;
+    let r = settles(&screen, since.map(|t| now - t));
+    if r == Some(false) {
+        tracing::info!(
+            session = %s.name,
+            "no Codex composer seen after {}s, and no dialog: settling anyway",
+            SETTLE_ANYWAY_MS / 1000
+        );
+    }
+    r
+}
+
+/// `screen_settles` for a screen up for `up_ms`.
+fn settles(screen: &str, up_ms: Option<i64>) -> Option<bool> {
+    if codex::composer_shown(screen) {
+        return Some(true);
+    }
+    let long = up_ms.is_some_and(|ms| ms >= SETTLE_ANYWAY_MS);
+    (long && !codex::dialog_shown(screen)).then_some(false)
+}
+
+/// Find the conversation a session launched, in its agent's index (see
+/// `pick_thread`). `others`: another session waits for one in this folder.
+fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
+    let (since, prompt, tracked) = bind_inputs(&d.db(), s)?;
+    // (Codex's index is read without the DB lock.)
+    let candidates = untracked_threads(s, since, &tracked);
+    let Some(t) = pick_thread(&candidates, prompt.as_deref(), others) else {
+        return Ok(false);
+    };
+    record_bind(&d.db(), s, t)
+}
+
+/// `bind`, once, under the caller's DB lock: for a stopped session about to
+/// be started again (the overlord), whose thread may have turned up after
+/// rlord last looked. Nobody else waits in the folder it is asked for.
+pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
+    let (since, prompt, tracked) = bind_inputs(db, s)?;
+    let candidates = untracked_threads(s, since, &tracked);
+    match pick_thread(&candidates, prompt.as_deref(), false) {
+        Some(t) => record_bind(db, s, t),
+        None => Ok(false),
+    }
+}
+
+/// What the search for a session's thread goes by: started since when,
+/// with which first prompt (if any), and the threads already taken.
+fn bind_inputs(
+    db: &Db,
+    s: &Session,
+) -> Result<(i64, Option<String>, std::collections::HashSet<String>)> {
+    let since = db
+        .kv_get(&methods::bind_since_key(&s.id))?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(s.created_at);
+    let prompt = db
+        .kv_get(&methods::bind_prompt_key(&s.id))?
+        .filter(|p| !p.trim().is_empty());
+    Ok((since, prompt, db.agent_session_ids()?))
+}
+
+fn untracked_threads(
+    s: &Session,
+    since: i64,
+    tracked: &std::collections::HashSet<String>,
+) -> Vec<codex::Thread> {
+    codex::threads_started_in(&codex::home(), &s.project_path, since)
+        .into_iter()
+        .filter(|t| !tracked.contains(&t.id))
+        .collect()
+}
+
+fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
     // A hook may have bound it meanwhile.
     if db.resolve_ref(&s.id)?.agent_session.is_some() {
         return Ok(false);
@@ -202,18 +325,50 @@ fn pick_thread<'a>(
 }
 
 /// Read a session's status from its transcript (incrementally).
+///
+/// A session the hooks have confirmed is theirs, except while it is still
+/// "starting": Codex runs SessionStart for a resumed conversation only
+/// with its next prompt, so a resume would stay "starting" until then (and
+/// the overlord, which is typed into only once it has left "starting",
+/// could not be asked anything). Once its pane has been up a moment, its
+/// transcript says whether a turn is open.
 fn follow(d: &Daemon, s: &Session) -> Result<bool> {
+    let hooked = s.agent_session_trust == "hook";
+    if hooked
+        && (s.status != Status::Starting
+            || !s
+                .last_state_change_at
+                .is_some_and(|t| up_long_enough(t, now_ms())))
+    {
+        return Ok(false);
+    }
     let Some(src) = d.db().transcript_source(&s.id)? else {
         return Ok(false);
     };
-    let Some(next) = next_status(s.status, transcript::working(Path::new(&src))) else {
+    let path = Path::new(&src);
+    // Still starting (just launched or resumed): only what the agent has
+    // written since counts. A conversation killed mid-turn ends on a turn
+    // that never closes; resumed, it waits for the user.
+    let working = match (s.status, s.last_state_change_at) {
+        (Status::Starting, Some(t)) => transcript::working_since(path, t),
+        _ => transcript::working(path),
+    };
+    // Settling a start with nothing in the transcript: only once the
+    // composer is up (not an update or trust prompt in front of it).
+    if s.status == Status::Starting
+        && working.is_none()
+        && screen_settles(s, s.last_state_change_at, now_ms()).is_none()
+    {
+        return Ok(false);
+    }
+    let Some(next) = next_status(s.status, working) else {
         return Ok(false);
     };
     let db = d.db();
     methods::save_cursors(&db);
     // The hooks started reporting meanwhile: theirs stands.
     let cur = db.resolve_ref(&s.id)?;
-    if cur.agent_session_trust == "hook" || cur.status != s.status {
+    if (cur.agent_session_trust == "hook" && !hooked) || cur.status != s.status {
         return Ok(false);
     }
     let now = now_ms();
@@ -256,6 +411,26 @@ fn next_status(cur: Status, working: Option<bool>) -> Option<Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_is_up_after_a_moment() {
+        assert!(!up_long_enough(10_000, 10_000 + UP_AFTER_MS - 1));
+        assert!(up_long_enough(10_000, 10_000 + UP_AFTER_MS));
+    }
+
+    #[test]
+    fn a_start_settles_on_the_composer_or_after_a_while() {
+        let composer = "› Ask Codex to do anything\n\n  ? for shortcuts\n";
+        let dialog = "  Update available!\n\n› 1. Update now\n  2. Skip\n";
+        let unknown = "  something Codex drew that rlord doesn't know\n";
+        assert_eq!(settles(composer, Some(0)), Some(true));
+        assert_eq!(settles(unknown, Some(SETTLE_ANYWAY_MS - 1)), None);
+        assert_eq!(settles(unknown, None), None);
+        // Long enough, and no dialog: settled anyway.
+        assert_eq!(settles(unknown, Some(SETTLE_ANYWAY_MS)), Some(false));
+        // A dialog never settles it.
+        assert_eq!(settles(dialog, Some(10 * SETTLE_ANYWAY_MS)), None);
+    }
 
     #[test]
     fn status_follows_the_open_turn() {

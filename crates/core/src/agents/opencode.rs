@@ -199,6 +199,310 @@ pub fn resume_argv(
     }
 }
 
+/// The overlord folder's `opencode.json`: rlord's MCP server, and the
+/// rules that let the overlord call its tools (and read) without a prompt
+/// while everything else asks. OpenCode has no flags for these; its server
+/// reads the config of the folder a session runs in.
+///
+/// - `mcp.servers.rlord`: `rlord mcp --socket <socket>`. The server process
+///   belongs to OpenCode's shared server, whose environment is whatever
+///   first started it (another rlord's, or none), so where the daemon is
+///   is given, never looked up; and what `rlord mcp` would read from its
+///   environment (`MCP_ENV`: the calling session) is blanked rather than
+///   inherited from some other pane.
+/// - `permissions`: the last matching rule wins, and an agent starts from
+///   "allow everything", so everything is set to ask first, then reading,
+///   rlord's tools (named `rlord_<tool>`) and rlord's own sub-agents
+///   (`subagents`, by name: any other agent asks before it is started) are
+///   allowed. Code Mode (`execute`, the script OpenCode calls MCP tools
+///   from) is not allowed by name: OpenCode checks each tool a script
+///   calls (an rlord tool runs unasked, `fetch` asks as a web fetch), not
+///   the script, and a script can't import `fs` or `child_process`.
+/// - `agents.<name>.permissions`: the same rules again, for every agent a
+///   conversation in the folder can run as: OpenCode's built-in ones
+///   (`build`, `plan`, `general`, `explore`), rlord's sub-agents, and the
+///   agents the user defined globally (`user_agents`, names only).
+///   OpenCode applies every file's top-level rules first and the
+///   agent-level ones after, so a user's own global agent rule (an `allow`
+///   for the shell under `agent.build` or `agent.general`) would otherwise
+///   come last and win. Folder rules come after the user's global ones at
+///   each level.
+/// - `confirm_sends` (`[overlord] confirm_sends`): `send_to_session` asks
+///   each time (a rule after `rlord_*`), instead of running unasked like
+///   rlord's other tools.
+pub fn overlord_config(
+    rlord_bin: &str,
+    socket: &str,
+    subagents: &[&str],
+    user_agents: &[String],
+    confirm_sends: bool,
+) -> Value {
+    let rule = |action: &str, resource: &str, effect: &str| serde_json::json!({"action": action, "resource": resource, "effect": effect});
+    let mut rules = vec![
+        rule("*", "*", "ask"),
+        rule("read", "*", "allow"),
+        rule("glob", "*", "allow"),
+        rule("grep", "*", "allow"),
+    ];
+    rules.extend(subagents.iter().map(|n| rule("subagent", n, "allow")));
+    rules.push(rule("rlord_*", "*", "allow"));
+    if confirm_sends {
+        rules.push(rule("rlord_send_to_session", "*", "ask"));
+    }
+    let mut agents = serde_json::Map::new();
+    for a in OVERLORD_AGENTS
+        .iter()
+        .chain(subagents)
+        .map(|a| a.to_string())
+        .chain(user_agents.iter().cloned())
+    {
+        agents.insert(a, serde_json::json!({"permissions": rules}));
+    }
+    let environment: serde_json::Map<String, Value> = super::MCP_ENV
+        .iter()
+        .map(|k| (k.to_string(), Value::String(String::new())))
+        .collect();
+    let mut command = vec![rlord_bin.to_string()];
+    command.extend(super::mcp_args(socket));
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {"servers": {"rlord": {
+            "type": "local",
+            "command": command,
+            "environment": environment,
+        }}},
+        "permissions": rules,
+        "agents": agents,
+    })
+}
+
+/// OpenCode's own agents a conversation in the overlord's folder can run
+/// as: the primary ones (the default, and the one Tab switches to) and the
+/// built-in sub-agents.
+const OVERLORD_AGENTS: &[&str] = &["build", "plan", "general", "explore"];
+
+/// Most agent names taken from the user's config (a bound on files rlord
+/// doesn't own).
+const USER_AGENTS_MAX: usize = 200;
+
+/// The names of the agents the user defined for every folder: the keys of
+/// `agent` / `agents` in OpenCode's global config (`opencode.json`,
+/// `opencode.jsonc` in its config folder or `$OPENCODE_CONFIG_DIR`, the
+/// file `$OPENCODE_CONFIG`, the text `$OPENCODE_CONFIG_CONTENT`) and the
+/// Markdown agents under its `agent/` and `agents/` folders (by path, as
+/// OpenCode names them: `team/reviewer`). Read only: the files are parsed
+/// and only those keys' names are kept (nothing else in them, which may
+/// hold provider keys, is looked at or logged); Markdown agents by file
+/// name only. Whatever can't be read is skipped.
+pub fn user_agents() -> Vec<String> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    let global = env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("opencode"));
+    let dirs: Vec<PathBuf> = global
+        .into_iter()
+        .chain(env("OPENCODE_CONFIG_DIR").map(PathBuf::from))
+        .collect();
+    let files: Vec<PathBuf> = env("OPENCODE_CONFIG")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    let content = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
+    user_agents_in(&dirs, &files, content.as_deref())
+}
+
+/// `user_agents`, from these config folders, extra config files and inline
+/// config text.
+pub fn user_agents_in(dirs: &[PathBuf], files: &[PathBuf], content: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |n: String| {
+        let ok = !n.is_empty()
+            && n.len() <= 100
+            && n.chars()
+                .all(|c| c.is_alphanumeric() || "-_./ ".contains(c));
+        if ok && !names.contains(&n) && names.len() < USER_AGENTS_MAX {
+            names.push(n);
+        }
+    };
+    let texts = dirs
+        .iter()
+        .flat_map(|d| [d.join("opencode.json"), d.join("opencode.jsonc")])
+        .chain(files.iter().cloned())
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .chain(content.map(str::to_string));
+    for text in texts {
+        let Some(v) = parse_jsonc(&text) else {
+            continue;
+        };
+        for key in ["agent", "agents"] {
+            if let Some(m) = v.get(key).and_then(Value::as_object) {
+                m.keys().cloned().for_each(&mut add);
+            }
+        }
+    }
+    for d in dirs {
+        for sub in ["agent", "agents"] {
+            let root = d.join(sub);
+            let mut found = Vec::new();
+            md_names(&root, &root, 0, &mut found);
+            found.sort();
+            found.into_iter().for_each(&mut add);
+        }
+    }
+    names
+}
+
+/// The Markdown files under `dir` (a few levels down, a bounded count), as
+/// paths relative to `root` without `.md`.
+fn md_names(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten().take(USER_AGENTS_MAX) {
+        let path = e.path();
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() && depth < 3 {
+            md_names(root, &path, depth + 1, out);
+        } else if kind.is_file() && path.extension().is_some_and(|x| x == "md") {
+            if let Ok(rel) = path.with_extension("").strip_prefix(root) {
+                let parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                out.push(parts.join("/"));
+            }
+        }
+    }
+}
+
+/// JSON with comments (`//`, `/* */`) and trailing commas, as OpenCode
+/// reads its config.
+fn parse_jsonc(text: &str) -> Option<Value> {
+    // Comments out (outside strings).
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('/', Some('/')) => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                out.push(' ');
+            }
+            _ => {
+                in_str = c == '"';
+                out.push(c);
+            }
+        }
+    }
+    // Trailing commas out: a `,` followed (past whitespace) by `}` or `]`.
+    let chars: Vec<char> = out.chars().collect();
+    let mut clean = String::with_capacity(out.len());
+    let (mut in_str, mut escaped) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if c == ',' {
+            let next = chars[i + 1..].iter().find(|n| !n.is_whitespace());
+            if matches!(next, Some('}' | ']')) {
+                continue;
+            }
+        }
+        clean.push(c);
+    }
+    serde_json::from_str(&clean).ok()
+}
+
+/// A dialog is on OpenCode's screen, where its prompt box was: a
+/// permission request ("△ Permission required", then `Allow once  Always
+/// allow  Reject`, where Enter allows) or a question (numbered options,
+/// `↑↓ select  enter submit  esc dismiss`), as OpenCode 2.2.7 draws them.
+///
+/// Only the bottom box is read: the last run of `┃`-bordered lines (no
+/// gap) and the line under it. The transcript above is drawn with the same
+/// border, and a reply may quote these words, so each mark must be a
+/// dialog's own line: `△ Permission required` opening a box line, or the
+/// choices or keys together on one line.
+pub fn dialog_shown(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let boxed = |l: &str| l.trim_start().starts_with('┃');
+    let Some(last) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .take(25)
+        .find(|(_, l)| boxed(l))
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    let first = lines[..=last]
+        .iter()
+        .rposition(|l| !boxed(l))
+        .map_or(0, |i| i + 1);
+    let under = lines[last + 1..].iter().find(|l| !l.trim().is_empty());
+    lines[first..=last]
+        .iter()
+        .chain(under)
+        .any(|l| dialog_line(l))
+}
+
+/// A line only a dialog draws (its `┃` border allowed for).
+fn dialog_line(line: &str) -> bool {
+    let text = line.trim_start_matches(|c: char| c.is_whitespace() || c == '┃');
+    let has = |a: &str, b: &str| text.contains(a) && text.contains(b);
+    text.starts_with("△ Permission required")
+        || has("Allow once", "Reject")
+        || has("enter submit", "esc dismiss")
+        || has("⇆ select", "enter confirm")
+}
+
+/// A sub-agent file for OpenCode (`.opencode/agents/<name>.md`): when to
+/// use it, then its instructions as the body. It gets the folder's rules
+/// (`overlord_config`), like the overlord.
+pub fn subagent_md(description: &str, instructions: &str) -> String {
+    format!(
+        "---\ndescription: {}\nmode: subagent\n---\n\n{}\n",
+        serde_json::Value::String(description.to_string()),
+        instructions.trim()
+    )
+}
+
 /// `provider/model[#variant]` as the server names a model:
 /// `{providerID, id[, variant]}`. (A model id may itself contain `/`.)
 pub fn model_ref(model: &str) -> Option<Value> {
@@ -1105,6 +1409,114 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn the_users_global_agents_are_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("opencode");
+        std::fs::create_dir_all(d.join("agents/team")).unwrap();
+        std::fs::create_dir_all(d.join("agent")).unwrap();
+        std::fs::write(
+            d.join("opencode.json"),
+            r#"{"provider": {"x": {"options": {"apiKey": "secret"}}},
+                "agent": {"general": {"permission": {"bash": "allow"}}, "mine": {}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("opencode.jsonc"),
+            "// mine\n{\"agents\": {\"review\": {\"prompt\": \"a // not a comment\",},}, /* x */}\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("agents/team/nested.md"), "---\nmode: primary\n---\n").unwrap();
+        std::fs::write(d.join("agent/solo.md"), "x").unwrap();
+        std::fs::write(d.join("agent/notes.txt"), "x").unwrap();
+        let extra = tmp.path().join("extra.json");
+        std::fs::write(&extra, r#"{"agent": {"fromfile": {}}}"#).unwrap();
+        let names = user_agents_in(
+            &[d.clone(), tmp.path().join("missing")],
+            &[extra],
+            Some(r#"{"agent": {"inline": {}, "mine": {}}}"#),
+        );
+        assert_eq!(
+            names,
+            [
+                "general",
+                "mine",
+                "review",
+                "fromfile",
+                "inline",
+                "solo",
+                "team/nested"
+            ]
+        );
+        // Nothing else from the files.
+        assert!(!names.iter().any(|n| n.contains("secret") || n == "x"));
+        // A broken file is skipped.
+        std::fs::write(d.join("opencode.json"), "{ not json").unwrap();
+        assert!(!user_agents_in(&[d], &[], None).contains(&"mine".to_string()));
+    }
+
+    #[test]
+    fn every_agent_gets_the_rules() {
+        let users = vec!["mine".to_string()];
+        let cfg = overlord_config("/bin/rlord", "/s", &["rlord-tidy"], &users, false);
+        for a in ["build", "plan", "general", "explore", "rlord-tidy", "mine"] {
+            assert_eq!(cfg["agents"][a]["permissions"], cfg["permissions"], "{a}");
+        }
+        let last = |c: &Value| {
+            c["permissions"]
+                .as_array()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(last(&cfg)["action"], "rlord_*");
+        // Sends confirmed: asked, after rlord's tools are allowed.
+        let cfg = overlord_config("/bin/rlord", "/s", &[], &users, true);
+        assert_eq!(last(&cfg)["action"], "rlord_send_to_session");
+        assert_eq!(last(&cfg)["effect"], "ask");
+        assert_eq!(cfg["agents"]["mine"]["permissions"], cfg["permissions"]);
+    }
+
+    /// OpenCode 2.2.7's screens, as captured (the sidebar cut off).
+    #[test]
+    fn a_dialog_is_told_from_the_prompt_box() {
+        let idle = "  ┃  $ touch probe.txt\n  ┃  The user declined this tool call\n\n\
+                 Build · Big Pickle · 31.7s · interrupted\n\n\n\
+              ┃\n  ┃\n  ┃  Build · Big Pickle OpenCode\n  ╹▀▀▀▀▀▀▀▀▀▀\n\
+              /tmp/proj  5.5K (3%)  ctrl+p commands\n";
+        assert!(!dialog_shown(idle));
+        let permission = "  ┃  ⠴ touch probe.txt\n\n\
+                 Press ctrl+b to move running work to the background\n\n\n\
+              ┃\n  ┃  △ Permission required\n  ┃\n  ┃  $ touch probe.txt\n  ┃\n\
+              ┃   Allow once   Always allow   Reject           ctrl+f fullscreen  ⇆ select  enter confirm\n\
+              ┃                                                  /tmp/proj\n";
+        assert!(dialog_shown(permission));
+        let question = "     → Asked 1 question\n\n\
+              ┃\n  ┃  Questions\n  ┃\n  ┃  Which colour would you like to pick?\n  ┃\n\
+              ┃  1. Red\n  ┃     Choose red\n  ┃  2. Green\n  ┃     Choose green\n\
+              ┃  3. Type your own answer\n  ┃\n  ┃  ↑↓ select  enter submit  esc dismiss\n\
+              ┃                                                  /tmp/proj\n";
+        assert!(dialog_shown(question));
+        for s in [permission, question] {
+            assert!(!crate::agents::Agent::OpenCode.at_prompt(s));
+        }
+        // The same words in the transcript above the prompt box (a reply
+        // quoting them, the user's own prompt): not a dialog.
+        let quoted = "  ┃  △ Permission required\n  ┃  Allow once   Always allow   Reject\n\
+              ┃  ↑↓ select  enter submit  esc dismiss\n\n\
+                 Build · Big Pickle · 3.1s\n\n\n";
+        let quoted = format!("{quoted}{idle}");
+        assert!(!dialog_shown(&quoted));
+        // One mark alone in the box isn't enough: "Reject" in a draft.
+        let draft = idle.replace(
+            "┃  Build · Big Pickle OpenCode",
+            "┃  Reject the PR. Build · Big Pickle",
+        );
+        assert!(!dialog_shown(&draft));
+        assert!(crate::agents::Agent::OpenCode.at_prompt(idle));
+    }
+
     pub(crate) const SES: &str = "ses_e3192cfeeffeUElN5gOL3f5nhg";
 
     /// A database as OpenCode 2.2.7 keeps one (the columns rlord reads),
@@ -1311,6 +1723,58 @@ pub(crate) mod tests {
         for argv in [&a, &b] {
             assert!(!argv.iter().any(|x| x == "--auto" || x == "--standalone"));
         }
+    }
+
+    /// The overlord's folder config: rlord's server, and rules that end
+    /// with its tools allowed after everything was set to ask.
+    #[test]
+    fn overlord_config_allows_only_what_it_names() {
+        let cfg = overlord_config("/bin/rlord", "/run/d.sock", &["rlord-tidy"], &[], false);
+        let server = &cfg["mcp"]["servers"]["rlord"];
+        assert_eq!(server["type"], "local");
+        assert_eq!(
+            server["command"],
+            serde_json::json!(["/bin/rlord", "mcp", "--socket", "/run/d.sock"])
+        );
+        // The caller's id isn't inherited from whichever pane started
+        // OpenCode's shared server.
+        assert_eq!(server["environment"]["RLORD_SESSION_ID"], "");
+        let rules = cfg["permissions"].as_array().unwrap();
+        // The last matching rule wins: "ask" for everything comes first.
+        assert_eq!(
+            rules[0],
+            serde_json::json!({"action": "*", "resource": "*", "effect": "ask"})
+        );
+        let effect = |action: &str| {
+            rules
+                .iter()
+                .rev()
+                .find(|r| r["action"] == action)
+                .map(|r| r["effect"].as_str().unwrap().to_string())
+        };
+        assert_eq!(effect("rlord_*").as_deref(), Some("allow"));
+        assert_eq!(effect("read").as_deref(), Some("allow"));
+        // Nothing that writes or runs commands is named: it asks. Code Mode
+        // (`execute`) too.
+        for a in ["shell", "edit", "webfetch", "external_directory", "execute"] {
+            assert_eq!(effect(a), None, "{a}");
+        }
+        assert!(rules.iter().all(|r| r["effect"] != "deny"));
+        // Only rlord's own sub-agents start unasked.
+        let sub: Vec<&Value> = rules.iter().filter(|r| r["action"] == "subagent").collect();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0]["resource"], "rlord-tidy");
+        // The same rules at agent level (applied after every file's
+        // top-level rules), for the overlord's agents and rlord's.
+        for a in ["build", "plan", "rlord-tidy"] {
+            assert_eq!(cfg["agents"][a]["permissions"], cfg["permissions"], "{a}");
+        }
+    }
+
+    #[test]
+    fn a_subagent_file_has_its_description_up_front() {
+        let md = subagent_md("Tidy: names, \"tags\"", "Do the pass.\n");
+        assert!(md.starts_with("---\ndescription: \"Tidy: names, \\\"tags\\\"\"\nmode: subagent\n---\n\nDo the pass.\n"));
     }
 
     #[test]

@@ -433,6 +433,7 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     rlord_core::agents::install::warm();
     // Nothing may be pasted into the pane while it's being replaced.
     let _send = d.overlord_send.lock().expect("overlord send lock");
+    let _session = d.lock_overlord();
     let (o, _, earlier) = load(d)?;
     let c = find(&earlier, params["id"].as_str().unwrap_or(""))?;
     if !matches!(

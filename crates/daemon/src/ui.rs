@@ -269,9 +269,12 @@ pub fn show_list(d: &Daemon) -> Result<Value> {
 
 pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
     let r = methods::p_str(params, "ref")?;
+    let id = d.db().resolve_ref(r)?.id;
     let s = {
+        // (Its lock before the DB: a start or restart may follow.)
+        let _session = d.sessions.lock(&id);
         let db = d.db();
-        let s = db.resolve_ref(r)?;
+        let s = db.resolve_ref(&id)?;
         if overlord::is_overlord_role(&s.role) {
             overlord::ensure(&db, &d.config(), &json!({}))?;
         } else if s.status == Status::Stopped
