@@ -27,7 +27,7 @@ npm run preview    # serves dist/
 
 ## Deploy on Vercel
 
-1. Import the `ayersb/robot-overlord` repository in Vercel.
+1. Import the `robot-lord/robot-overlord` repository in Vercel.
 2. Set **Root Directory** to `site`.
 3. Leave **Framework Preset** on **Astro**. Vercel detects it and uses
    `npm run build` with `dist` as the output folder. No `vercel.json` is
