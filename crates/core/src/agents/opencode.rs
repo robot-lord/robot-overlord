@@ -199,6 +199,55 @@ pub fn resume_argv(
     }
 }
 
+/// The overlord folder's `opencode.json`: rlord's MCP server, and the
+/// rules that let the overlord call its tools (and read) without a prompt
+/// while everything else asks. OpenCode has no flags for these; its server
+/// reads the config of the folder a session runs in.
+///
+/// - `mcp.servers.rlord`: `environment` carries `env` (where the daemon's
+///   socket is). The server process belongs to OpenCode's shared server,
+///   whose own environment is whatever first started it.
+/// - `permissions`: the last matching rule wins, and an agent starts from
+///   "allow everything", so everything is set to ask first, then reading,
+///   rlord's tools (named `rlord_<tool>`), sub-agents and Code Mode (the
+///   script OpenCode calls MCP tools from; each tool in it is still
+///   checked) are allowed.
+pub fn overlord_config(rlord_bin: &str, env: &[(String, String)]) -> Value {
+    let rule = |action: &str, effect: &str| serde_json::json!({"action": action, "resource": "*", "effect": effect});
+    let environment: serde_json::Map<String, Value> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {"servers": {"rlord": {
+            "type": "local",
+            "command": [rlord_bin, "mcp"],
+            "environment": environment,
+        }}},
+        "permissions": [
+            rule("*", "ask"),
+            rule("read", "allow"),
+            rule("glob", "allow"),
+            rule("grep", "allow"),
+            rule("subagent", "allow"),
+            rule("execute", "allow"),
+            rule("rlord_*", "allow"),
+        ],
+    })
+}
+
+/// A sub-agent file for OpenCode (`.opencode/agents/<name>.md`): when to
+/// use it, then its instructions as the body. It gets the folder's rules
+/// (`overlord_config`), like the overlord.
+pub fn subagent_md(description: &str, instructions: &str) -> String {
+    format!(
+        "---\ndescription: {}\nmode: subagent\n---\n\n{}\n",
+        serde_json::Value::String(description.to_string()),
+        instructions.trim()
+    )
+}
+
 /// `provider/model[#variant]` as the server names a model:
 /// `{providerID, id[, variant]}`. (A model id may itself contain `/`.)
 pub fn model_ref(model: &str) -> Option<Value> {

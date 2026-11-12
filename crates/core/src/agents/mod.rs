@@ -435,16 +435,13 @@ impl Agent {
         matches!(self, Agent::Claude)
     }
 
-    /// It can run the overlord (rlord's MCP server, tool allow-list,
-    /// effort). Why not, when it can't.
+    /// It can run the overlord (rlord's MCP server with its tools
+    /// pre-allowed, its instructions, effort where it has one). Why not,
+    /// when it can't. Every agent can today; an agent added without that
+    /// wiring says so here.
     pub fn runs_overlord(self) -> Result<()> {
         match self {
-            Agent::Claude => Ok(()),
-            Agent::Codex | Agent::OpenCode => bail!(
-                "the overlord runs on Claude Code only for now (a {} overlord isn't built yet); \
-                 set `[overlord] agent = \"claude\"`",
-                self.label()
-            ),
+            Agent::Claude | Agent::Codex | Agent::OpenCode => Ok(()),
         }
     }
 

@@ -54,13 +54,19 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-/// Live sessions of agents that assign their own id, not confirmed by a hook.
+/// Live sessions of agents that assign their own id, not confirmed by a
+/// hook; and confirmed ones that are still "starting" (a resumed Codex runs
+/// no hook until its next prompt: see `follow`).
 fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
     Ok(d.db()
         .running_sessions()?
         .into_iter()
         .filter(|s| Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()))
-        .filter(|s| s.agent_session.is_none() || s.agent_session_trust != "hook")
+        .filter(|s| {
+            s.agent_session.is_none()
+                || s.agent_session_trust != "hook"
+                || s.status == Status::Starting
+        })
         .collect())
 }
 
@@ -83,7 +89,7 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
             let others = sessions.iter().any(|o| {
                 o.id != s.id && o.agent_session.is_none() && o.project_path == s.project_path
             });
-            changed |= bind(d, s, others)?;
+            changed |= bind(d, s, others)? || first_prompt_due(d, s)?;
         } else {
             changed |= follow(d, s)?;
         }
@@ -120,6 +126,44 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
     Ok(true)
+}
+
+/// How long after a launch without a prompt the agent's screen is taken
+/// to be up.
+const UP_AFTER_MS: i64 = 4_000;
+
+/// A session launched without a prompt has nothing to report until its
+/// first one: Codex creates the conversation (and runs SessionStart) only
+/// then. So once its pane has been up a moment it is the user's turn, not
+/// "starting" for ever. (The overlord starts this way: `ask` waits for it
+/// to leave "starting" before typing into it.) Returns whether it changed.
+fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
+    if s.status != Status::Starting {
+        return Ok(false);
+    }
+    let db = d.db();
+    let launched_bare = db
+        .kv_get(&methods::bind_prompt_key(&s.id))?
+        .is_some_and(|p| p.trim().is_empty());
+    let since = db
+        .kv_get(&methods::bind_since_key(&s.id))?
+        .and_then(|v| v.parse::<i64>().ok());
+    let now = now_ms();
+    if !launched_bare || !since.is_some_and(|t| up_long_enough(t, now)) {
+        return Ok(false);
+    }
+    // Moved on meanwhile (a hook, a restart): not ours to say.
+    let cur = db.resolve_ref(&s.id)?;
+    if cur.status != Status::Starting || cur.agent_session.is_some() {
+        return Ok(false);
+    }
+    db.set_status(&s.id, Status::Idle, now)?;
+    db.insert_event(&s.id, now, "awaiting_first_prompt", r#"{"from":"pane"}"#)?;
+    Ok(true)
+}
+
+fn up_long_enough(launched_ms: i64, now_ms: i64) -> bool {
+    now_ms - launched_ms >= UP_AFTER_MS
 }
 
 /// Find the conversation a session launched, in its agent's index (see
@@ -202,7 +246,23 @@ fn pick_thread<'a>(
 }
 
 /// Read a session's status from its transcript (incrementally).
+///
+/// A session the hooks have confirmed is theirs, except while it is still
+/// "starting": Codex runs SessionStart for a resumed conversation only
+/// with its next prompt, so a resume would stay "starting" until then (and
+/// the overlord, which is typed into only once it has left "starting",
+/// could not be asked anything). Once its pane has been up a moment, its
+/// transcript says whether a turn is open.
 fn follow(d: &Daemon, s: &Session) -> Result<bool> {
+    let hooked = s.agent_session_trust == "hook";
+    if hooked
+        && (s.status != Status::Starting
+            || !s
+                .last_state_change_at
+                .is_some_and(|t| up_long_enough(t, now_ms())))
+    {
+        return Ok(false);
+    }
     let Some(src) = d.db().transcript_source(&s.id)? else {
         return Ok(false);
     };
@@ -213,7 +273,7 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
     methods::save_cursors(&db);
     // The hooks started reporting meanwhile: theirs stands.
     let cur = db.resolve_ref(&s.id)?;
-    if cur.agent_session_trust == "hook" || cur.status != s.status {
+    if (cur.agent_session_trust == "hook" && !hooked) || cur.status != s.status {
         return Ok(false);
     }
     let now = now_ms();

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::{transcript, Agent};
+use rlord_core::agents::{codex, opencode, transcript, Agent};
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::themes;
@@ -43,11 +43,16 @@ pub const FRESH_AT: &str = "overlord_fresh_at";
 pub const DEFAULT_DECLINED: &str = "default_declined:overlord";
 
 const INSTRUCTIONS: &str = include_str!("overlord.md");
-/// Subagents it delegates to (written to its `.claude/agents/`).
+/// Subagents it delegates to, in Claude's format (written to its
+/// `.claude/agents/`, and converted for the other agents: `write_files`).
 const SUBAGENTS: &[(&str, &str)] = &[
     ("rlord-tidy.md", include_str!("tidy.md")),
     ("rlord-import.md", include_str!("import.md")),
 ];
+
+/// Where the subagents' instructions are also written as plain files, in
+/// the overlord's folder (`overlord.md` points at it).
+const SUBAGENT_DIR: &str = "subagents";
 
 /// The second session's role, tmux name and folder, from when the overlord
 /// was two (see `migrate`).
@@ -158,17 +163,57 @@ fn effort_in_args(args: &[&str]) -> String {
     String::new()
 }
 
-/// Write the overlord's folder (instruction files, mcp.json, subagents);
-/// return the adapter flags it must always be launched with.
+/// A subagent definition (`tidy.md`, `import.md`: Claude's format) taken
+/// apart: (name, description, instructions).
+fn subagent_parts(text: &str) -> (String, String, String) {
+    let (head, body) = text
+        .strip_prefix("---\n")
+        .and_then(|t| t.split_once("\n---\n"))
+        .unwrap_or(("", text));
+    let field = |k: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    (
+        field("name:"),
+        field("description:"),
+        body.trim().to_string(),
+    )
+}
+
+/// What `rlord mcp` must find in its environment to reach this daemon,
+/// for an agent that doesn't start it from the pane's environment.
+fn mcp_env() -> Vec<(String, String)> {
+    ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+        .into_iter()
+        .filter_map(|k| {
+            let v = std::env::var(k).ok().filter(|v| !v.is_empty())?;
+            Some((k.to_string(), v))
+        })
+        .collect()
+}
+
+/// Write the overlord's folder (instruction files, each agent's MCP config
+/// and subagents); return the adapter flags `agent` must always be
+/// launched with. Every agent's files are written, whichever runs it: they
+/// don't read each other's.
 fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
     std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    let bin = methods::rlord_bin();
     let mcp_path = d.join("mcp.json");
     let mcp = json!({"mcpServers": {"rlord": {
         "type": "stdio",
-        "command": methods::rlord_bin(),
+        "command": bin,
         "args": ["mcp"],
     }}});
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)?;
+    // OpenCode: no flags, the folder's config (see `overlord_config`).
+    std::fs::write(
+        d.join("opencode.json"),
+        serde_json::to_string_pretty(&opencode::overlord_config(&bin, &mcp_env()))?,
+    )?;
 
     let mut md = format!("{GENERATED_NOTE}{INSTRUCTIONS}");
     if let Ok(user) = std::fs::read_to_string(user_instructions_path()) {
@@ -181,24 +226,53 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
     for name in CONTEXT_FILES {
         std::fs::write(d.join(name), &md)?;
     }
-    // Subagents it delegates to (Claude's project agents dir).
-    let agents = d.join(".claude").join("agents");
-    std::fs::create_dir_all(&agents)?;
+    // Subagents it delegates to, in each agent's own place and format, and
+    // as plain instructions (`SUBAGENT_DIR`) for an overlord that can't
+    // start one and does the pass itself.
+    let dirs = [
+        d.join(".claude").join("agents"),
+        d.join(".codex").join("agents"),
+        d.join(".opencode").join("agents"),
+        d.join(SUBAGENT_DIR),
+    ];
+    for dir in &dirs {
+        std::fs::create_dir_all(dir)?;
+    }
     for (file, text) in SUBAGENTS {
-        std::fs::write(agents.join(file), text)?;
+        let (name, description, body) = subagent_parts(text);
+        std::fs::write(dirs[0].join(file), text)?;
+        std::fs::write(
+            dirs[1].join(format!("{name}.toml")),
+            codex::subagent_toml(&name, &description, &body),
+        )?;
+        std::fs::write(
+            dirs[2].join(file),
+            opencode::subagent_md(&description, &body),
+        )?;
+        std::fs::write(dirs[3].join(file), format!("{body}\n"))?;
     }
 
-    let mut args = vec![
-        "--mcp-config".into(),
-        mcp_path.to_string_lossy().into_owned(),
-        // The whole point is a cheap, prompt-free control surface. Read-only
-        // file tools are pre-allowed for groundwork (reading a repo's README
-        // or the files a request names), and Claude's peer messaging for
-        // passing work to a session; anything that writes or runs commands
-        // still asks.
-        "--allowedTools".into(),
-        "mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage".into(),
-    ];
+    let mut args = match agent {
+        Agent::Claude => vec![
+            "--mcp-config".into(),
+            mcp_path.to_string_lossy().into_owned(),
+            // The whole point is a cheap, prompt-free control surface. Read-only
+            // file tools are pre-allowed for groundwork (reading a repo's README
+            // or the files a request names), and Claude's peer messaging for
+            // passing work to a session; anything that writes or runs commands
+            // still asks.
+            "--allowedTools".into(),
+            "mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage".into(),
+        ],
+        // The same surface in Codex's terms: rlord's tools without a
+        // prompt, reading free, writes ask. (Its folder as Codex sees it:
+        // the resolved path.)
+        Agent::Codex => {
+            let dir = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+            codex::overlord_args(&bin, &dir.to_string_lossy())
+        }
+        Agent::OpenCode => Vec::new(),
+    };
     args.extend(effort_args(agent, effort));
     Ok(args)
 }
@@ -322,6 +396,13 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                 .unwrap_or(false);
             if alive && s.status != Status::Stopped {
                 return Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?);
+            }
+            // Nothing to resume: an agent that assigns the conversation id
+            // itself (Codex) stopped before rlord learned it. Start anew.
+            if s.agent_session.is_none() && s.tmux_session.is_some() {
+                let v = methods::session_fresh(db, &json!({"ref": s.id, "reason": "unbound"}))?;
+                db.kv_set(FRESH_AT, &rlord_core::types::now_ms().to_string())?;
+                return Ok(v);
             }
             methods::session_restart(db, &json!({"ref": s.id}))
         }

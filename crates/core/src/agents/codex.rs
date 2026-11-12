@@ -79,6 +79,78 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
+/// A TOML basic string (for a `-c key=value` override's value).
+fn toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// What `rlord mcp` reads from its environment. Codex starts an MCP server
+/// with a short list of its own, so these are named to be passed on: where
+/// the daemon's socket is, and which session is calling.
+pub const MCP_ENV: &[&str] = &[
+    "RLORD_SESSION_ID",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+];
+
+/// The flags a Codex overlord always runs with (in `dir`, its own folder):
+/// rlord's MCP server, its tools called without a prompt, and nothing else
+/// loosened. All as `-c` overrides: nothing is written to `~/.codex`.
+///
+/// - `mcp_servers.rlord.*`: the server, with `default_tools_approval_mode =
+///   "approve"` (Codex's per-server counterpart of an allow-list).
+/// - `sandbox_mode = "read-only"`, `approval_policy = "on-request"`:
+///   commands read freely, and anything that writes or leaves the sandbox
+///   asks the user.
+/// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
+///   rlord's own, so Codex doesn't stop to ask about it, and reads the
+///   sub-agents rlord writes to its `.codex/agents`. For this run only:
+///   nothing is saved to the user's config.
+pub fn overlord_args(rlord_bin: &str, dir: &str) -> Vec<String> {
+    let env: Vec<String> = MCP_ENV.iter().map(|v| toml_str(v)).collect();
+    [
+        format!("mcp_servers.rlord.command={}", toml_str(rlord_bin)),
+        "mcp_servers.rlord.args=[\"mcp\"]".to_string(),
+        format!("mcp_servers.rlord.env_vars=[{}]", env.join(",")),
+        "mcp_servers.rlord.default_tools_approval_mode=\"approve\"".to_string(),
+        // (A whole table: a dotted override path can't hold a quoted key,
+        // and Codex then asks about the folder at every start.)
+        format!("projects={{{}={{trust_level=\"trusted\"}}}}", toml_str(dir)),
+        "sandbox_mode=\"read-only\"".to_string(),
+        "approval_policy=\"on-request\"".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|kv| ["-c".to_string(), kv])
+    .collect()
+}
+
+/// A sub-agent file for Codex (`.codex/agents/<name>.toml`): its name, when
+/// to use it, and its instructions. It inherits the overlord's MCP servers
+/// and approvals (a file can't narrow them), and runs at low effort: the
+/// passes it is for are routine.
+pub fn subagent_toml(name: &str, description: &str, instructions: &str) -> String {
+    format!(
+        "name = {}\ndescription = {}\nmodel_reasoning_effort = \"low\"\ndeveloper_instructions = {}\n",
+        toml_str(name),
+        toml_str(description),
+        toml_str(instructions.trim()),
+    )
+}
+
 /// Map a Codex hook event to (event kind for our log, what it does to the
 /// status). A permission prompt is its "needs you"; it ends when the tool
 /// it was for has run (PostToolUse).
