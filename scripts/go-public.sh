@@ -2,7 +2,7 @@
 # GitHub settings that only exist for public repositories. Run once, right
 # after making the repository public (docs/working/public-launch.md).
 set -euo pipefail
-repo=${1:-ayersb/robot-overlord}
+repo=${1:-robot-lord/robot-overlord}
 [[ $(gh repo view "$repo" --json visibility -q .visibility) == PUBLIC ]] || {
   echo "go-public: $repo isn't public yet" >&2; exit 1; }
 gh api -X PATCH "repos/$repo" --input - >/dev/null <<'JSON'
