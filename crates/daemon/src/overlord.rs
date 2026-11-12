@@ -167,16 +167,21 @@ pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     Ok(v)
 }
 
-/// The overlay popup's style: the theme's overlay background.
-pub fn overlay_style(cfg: &Config) -> String {
+/// A seat's overlay popup style: a wash of the seat's colour.
+pub fn overlay_style(cfg: &Config, seat: &Seat) -> String {
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
-    format!("bg={}", p.overlay_bg().tmux())
+    format!("bg={}", p.overlay_bg_for(seat.key).tmux())
 }
 
 /// The overlord's color in the current theme (tmux spelling).
 pub fn color(cfg: &Config) -> String {
+    seat_color(cfg, &FRONT)
+}
+
+/// A seat's own colour (the mastermind's differs from the overlord's).
+pub fn seat_color(cfg: &Config, seat: &Seat) -> String {
     themes::resolve(&cfg.theme, themes::system_is_dark())
-        .overlord
+        .seat(seat.key)
         .tmux()
 }
 
@@ -218,7 +223,7 @@ pub fn style(cfg: &Config) {
         }
         if let Err(e) = tmux::style_session(
             seat.tmux,
-            &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
+            &format!("bg={},fg={}", p.seat(seat.key).tmux(), p.on_accent.tmux()),
             &label,
         ) {
             tracing::debug!(error = %e, seat = seat.key, "styling overlord session");

@@ -1077,10 +1077,16 @@ impl App {
                 let status = get("status");
                 let is_overlord = is_overlord_role(s);
                 let is_mastermind = s["role"] == "mastermind";
+                // Each seat in its own colour, as in its bar and overlay.
+                let seat_color = if is_mastermind {
+                    theme::mastermind()
+                } else {
+                    theme::overlord()
+                };
                 let num = i.saturating_sub(self.overlord_rows);
                 let mut cells = vec![
                     if is_overlord {
-                        Cell::from("◆").fg(theme::overlord())
+                        Cell::from("◆").fg(seat_color)
                     } else {
                         Cell::from(if num < 9 {
                             ((b'1' + num as u8) as char).to_string()
@@ -1148,7 +1154,7 @@ impl App {
                 }
                 let row = Row::new(cells);
                 if is_overlord {
-                    row.style(Style::default().fg(theme::overlord()).bold())
+                    row.style(Style::default().fg(seat_color).bold())
                 } else {
                     row.style(Style::default().fg(theme::text()))
                 }

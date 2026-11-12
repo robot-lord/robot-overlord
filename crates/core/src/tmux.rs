@@ -588,10 +588,13 @@ fn screen_selection(f: &str) -> Option<((u16, u16), (u16, u16))> {
         .split(',')
         .map(|v| v.parse().ok())
         .collect::<Option<_>>()?;
-    let [sx, sy, ex, ey, hist, pos, h] = n[..] else {
+    // The selection's end is the copy cursor, whose screen row is known:
+    // that ties history lines to rows (the live history size moves while
+    // copy mode's snapshot doesn't).
+    let [sx, sy, ex, ey, cursor_row, h] = n[..] else {
         return None;
     };
-    let top = hist - pos; // history line shown on screen row 0
+    let top = ey - cursor_row; // history line shown on screen row 0
     let a = (sy - top, sx);
     let b = (ey - top, ex);
     let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
@@ -623,8 +626,8 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
              #{?pane_in_mode,#{copy_cursor_y},#{cursor_y}} \
              #{?pane_in_mode,1,#{cursor_flag}} #{pane_in_mode} \
              #{?selection_present,#{selection_start_x}#,#{selection_start_y}#,\
-             #{selection_end_x}#,#{selection_end_y}#,#{history_size}#,\
-             #{scroll_position}#,#{pane_height},-}",
+             #{selection_end_x}#,#{selection_end_y}#,#{copy_cursor_y}#,\
+             #{pane_height},-}",
             ";",
             "capture-pane",
             "-p",
@@ -654,6 +657,31 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
         selection: head.split_whitespace().nth(4).and_then(screen_selection),
         ansi: ansi.to_string(),
     })
+}
+
+/// Leave copy mode (or any mode) if the pane is in one.
+pub fn cancel_mode(pane: &str) -> Result<()> {
+    let cmd = format!("send-keys -t {pane} -X cancel");
+    run(&["if-shell", "-F", "-t", pane, "#{pane_in_mode}", &cmd])?;
+    Ok(())
+}
+
+/// Run a copy-mode command on a pane (`search-backward`, `jump-forward`, …).
+pub fn copy_command(pane: &str, cmd: &str, arg: &str) -> Result<()> {
+    run(&["send-keys", "-t", pane, "-X", cmd, "--", arg])?;
+    Ok(())
+}
+
+/// The newest paste buffer's name, if any.
+pub fn newest_buffer() -> Option<String> {
+    run(&["list-buffers", "-F", "#{buffer_name}"])
+        .ok()
+        .and_then(|o| o.lines().next().map(str::to_string))
+}
+
+/// A paste buffer's contents.
+pub fn buffer_text(name: &str) -> Result<String> {
+    run(&["show-buffer", "-b", name])
 }
 
 /// Put a pane in copy mode (no-op if it already is).
@@ -1105,17 +1133,14 @@ mod tests {
     #[test]
     fn selection_maps_history_lines_to_the_screen() {
         // 191 history lines, at the bottom, 10 rows: line 200 is row 9.
-        assert_eq!(
-            screen_selection("0,200,2,198,191,0,10"),
-            Some(((2, 7), (0, 9)))
-        );
+        assert_eq!(screen_selection("0,200,2,198,7,10"), Some(((2, 7), (0, 9))));
         // Scrolled up 1: the lines sit a row lower, the end runs off the
         // bottom (clipped to the last row); scrolled up 5, all off-screen.
         assert_eq!(
-            screen_selection("0,200,2,198,191,1,10"),
+            screen_selection("0,200,2,198,8,10"),
             Some(((2, 8), (u16::MAX, 9)))
         );
-        assert_eq!(screen_selection("0,200,2,198,191,5,10"), None);
+        assert_eq!(screen_selection("0,300,2,298,-5,10"), None);
         assert_eq!(screen_selection("-"), None);
     }
 

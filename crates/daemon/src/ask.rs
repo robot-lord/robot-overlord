@@ -61,6 +61,9 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+    // Out of copy mode first (left there by the overlay): its keys would
+    // take the Enter that submits this.
+    let _ = tmux::cancel_mode(&pane);
     tmux::paste(&pane, text)?;
     // Let the paste land before submitting it.
     std::thread::sleep(Duration::from_millis(150));

@@ -50,6 +50,9 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
         .ok()
         .and_then(|p| parse_key(&p));
     let r = run_loop(&mut terminal, &pane, seat, &keys, prefix);
+    // Never leave the seat in copy mode: what's sent to it next would be
+    // taken by the mode's keys.
+    let _ = tmux::cancel_mode(&pane);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
@@ -74,6 +77,14 @@ fn run_loop(
     // to the mode (the user's copy bindings: select, yank, search, q).
     let mut in_mode = false;
     let mut after_prefix = false;
+    // vi copy mode's prompts (search, jump) draw on the client, under the
+    // popup: the overlay reads them itself.
+    let vi = tmux::session_option(seat.tmux, "mode-keys").is_ok_and(|m| m == "vi");
+    let mut prompt: Option<Prompt> = None;
+    // The newest paste buffer when copy mode began: a new one when it ends
+    // goes to the clipboard (a yank to tmux's buffer alone would otherwise
+    // reach no client: none shows the seat's window).
+    let mut buffer_at_entry: Option<Option<String>> = None;
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
@@ -94,6 +105,17 @@ fn run_loop(
             last = Instant::now();
             match tmux::capture_frame(pane) {
                 Ok(f) => {
+                    if f.in_mode && !in_mode {
+                        buffer_at_entry = Some(tmux::newest_buffer());
+                    } else if !f.in_mode && in_mode {
+                        prompt = None;
+                        if let Some(before) = buffer_at_entry.take() {
+                            let now = tmux::newest_buffer();
+                            if now.is_some() && now != before {
+                                copy_to_clipboard(now.as_deref().unwrap_or_default());
+                            }
+                        }
+                    }
                     in_mode = f.in_mode;
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
                     if let Some(sel) = f.selection {
@@ -116,6 +138,22 @@ fn run_loop(
                 ),
                 None => {
                     f.render_widget(Paragraph::new(screen.clone()), a);
+                    if let Some(p) = &prompt {
+                        let row = ratatui::layout::Rect::new(
+                            a.x,
+                            a.y + a.height.saturating_sub(1),
+                            a.width,
+                            1,
+                        );
+                        f.render_widget(
+                            Paragraph::new(p.label()).style(
+                                ratatui::style::Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Yellow),
+                            ),
+                            row,
+                        );
+                    }
                     if let Some((x, y)) = cursor.filter(|(x, y)| *x < a.width && *y < a.height) {
                         f.set_cursor_position((a.x + x, a.y + y));
                     }
@@ -127,8 +165,24 @@ fn run_loop(
         }
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
-                // Prefix, then `[`: copy mode (another key after the prefix
-                // goes to the agent, prefix first).
+                // A prompt open in copy mode takes the keys.
+                if let Some(p) = prompt.as_mut() {
+                    match p.key(&k) {
+                        PromptStep::Typing => {}
+                        PromptStep::Cancel => prompt = None,
+                        PromptStep::Run(cmd, arg) => {
+                            prompt = None;
+                            if let Err(e) = tmux::copy_command(pane, cmd, &arg) {
+                                error = Some(format!("{e:#}"));
+                            }
+                        }
+                    }
+                    last = Instant::now() - Duration::from_secs(1);
+                    continue;
+                }
+                // Prefix, then `[`: copy mode. Prefix twice sends one prefix
+                // to the agent; any other key after it is taken as itself (the
+                // prefix is dropped, as tmux drops an unbound one).
                 let is_prefix = prefix.is_some_and(|p| {
                     let KeyCode::Char(c) = k.code else {
                         return false;
@@ -142,26 +196,35 @@ fn run_loop(
                 if after_prefix {
                     after_prefix = false;
                     if k.code == KeyCode::Char('[') {
-                        if let Err(e) = tmux::copy_mode(pane) {
-                            error = Some(format!("{e:#}"));
+                        if !in_mode {
+                            if let Err(e) = tmux::copy_mode(pane) {
+                                error = Some(format!("{e:#}"));
+                            }
                         }
                         last = Instant::now() - Duration::from_secs(1);
                         continue;
                     }
-                    if let Some((a, c, ch)) = prefix {
-                        let mut n = String::new();
-                        if c {
-                            n.push_str("C-");
+                    if is_prefix {
+                        if !in_mode {
+                            if let Some(TmuxKey::Named(n)) = tmux_key(&k) {
+                                let _ = tmux::send_keys(pane, &[n.as_str()]);
+                            }
                         }
-                        if a {
-                            n.push_str("M-");
-                        }
-                        n.push(ch);
-                        let _ = tmux::send_keys(pane, &[n.as_str()]);
+                        continue;
                     }
-                } else if is_prefix && !in_mode {
+                } else if is_prefix {
                     after_prefix = true;
                     continue;
+                }
+                // vi copy mode's prompt keys.
+                if in_mode && vi && k.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                    if let KeyCode::Char(c) = k.code {
+                        if let Some(p) = Prompt::for_key(c) {
+                            prompt = Some(p);
+                            last = Instant::now() - Duration::from_secs(1);
+                            continue;
+                        }
+                    }
                 }
                 match keys.seat_key(&k) {
                     // This seat's key (or Option-D) closes the overlay.
@@ -169,9 +232,11 @@ fn run_loop(
                     // The other seat's key switches to it (the daemon opens
                     // its overlay in place of this one).
                     Some(other) => {
-                        // Hand this seat's window its size back first: the
-                        // new overlay replaces (kills) this one.
+                        // Hand this seat's window its size back first, and out
+                        // of copy mode: the new overlay replaces (kills) this
+                        // one.
                         let _ = tmux::auto_size_window(seat.tmux);
+                        let _ = tmux::cancel_mode(pane);
                         match client_call(
                             &paths::socket_path(),
                             "ui.overlord",
@@ -200,11 +265,12 @@ fn run_loop(
             }
             // The wheel scrolls the pane's history (entering copy mode, as
             // tmux's own wheel binding does).
+            // (Motion and clicks are ignored: no redraw for them.)
             Event::Mouse(m) => {
                 let r = match m.kind {
                     MouseEventKind::ScrollUp => tmux::scroll(pane, true),
                     MouseEventKind::ScrollDown if in_mode => tmux::scroll(pane, false),
-                    _ => Ok(()),
+                    _ => continue,
                 };
                 if let Err(e) = r {
                     error = Some(format!("{e:#}"));
@@ -219,6 +285,100 @@ fn run_loop(
             }
             _ => {}
         }
+    }
+}
+
+/// A vi copy-mode prompt the overlay reads itself (tmux would draw it on the
+/// client, under the popup).
+enum Prompt {
+    Search { forward: bool, text: String },
+    Jump(&'static str),
+}
+
+enum PromptStep {
+    Typing,
+    Cancel,
+    Run(&'static str, String),
+}
+
+impl Prompt {
+    /// vi copy mode's prompt keys: / ? (search), f F t T (jump).
+    fn for_key(c: char) -> Option<Prompt> {
+        Some(match c {
+            '/' => Prompt::Search {
+                forward: true,
+                text: String::new(),
+            },
+            '?' => Prompt::Search {
+                forward: false,
+                text: String::new(),
+            },
+            'f' => Prompt::Jump("jump-forward"),
+            'F' => Prompt::Jump("jump-backward"),
+            't' => Prompt::Jump("jump-to-forward"),
+            'T' => Prompt::Jump("jump-to-backward"),
+            _ => return None,
+        })
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Prompt::Search { forward, text } => {
+                format!(
+                    "{}{text}▏",
+                    if *forward {
+                        "(search down) "
+                    } else {
+                        "(search up) "
+                    }
+                )
+            }
+            Prompt::Jump(cmd) => format!("({}) ", cmd.replace('-', " ")),
+        }
+    }
+
+    fn key(&mut self, k: &KeyEvent) -> PromptStep {
+        match (self, k.code) {
+            (_, KeyCode::Esc) => PromptStep::Cancel,
+            (Prompt::Jump(cmd), KeyCode::Char(c)) => PromptStep::Run(cmd, c.to_string()),
+            (Prompt::Jump(_), _) => PromptStep::Cancel,
+            (Prompt::Search { forward, text }, KeyCode::Enter) => PromptStep::Run(
+                if *forward {
+                    "search-forward"
+                } else {
+                    "search-backward"
+                },
+                std::mem::take(text),
+            ),
+            (Prompt::Search { text, .. }, KeyCode::Backspace) => {
+                if text.pop().is_none() {
+                    return PromptStep::Cancel;
+                }
+                PromptStep::Typing
+            }
+            (Prompt::Search { text, .. }, KeyCode::Char(c)) => {
+                text.push(c);
+                PromptStep::Typing
+            }
+            _ => PromptStep::Typing,
+        }
+    }
+}
+
+/// Put a paste buffer on the Mac clipboard (best effort).
+fn copy_to_clipboard(buffer: &str) {
+    let Ok(text) = tmux::buffer_text(buffer) else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut c) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut i) = c.stdin.take() {
+            let _ = i.write_all(text.as_bytes());
+        }
+        let _ = c.wait();
     }
 }
 
@@ -299,6 +459,10 @@ fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
         } else {
             break;
         }
+    }
+    // `Space` (a common prefix: C-Space) is a space.
+    if rest == "Space" {
+        return Some((alt, ctrl, ' '));
     }
     let mut chars = rest.chars();
     let c = chars.next()?;
