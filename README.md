@@ -271,9 +271,10 @@ lets you continue a session from the Claude app (Code tab) or claude.ai while
 it keeps running on this machine. rlord manages it per session:
 
 - **Ask the overlord**: "turn on remote control for the web app". It
-  replies with the link, or with the reason it can't. The overlord itself can
-  have it too (offered once, and in the first-run setup): then you can talk
-  to the overlord from your phone. The mastermind goes with it.
+  replies with the link, or with the reason it can't. The overlord has it
+  too (offered once, and in the first-run setup), on the **mastermind**: the
+  front desk stays fast, and rlord keeps the mastermind running so it's
+  always there when you're away ("rlord mastermind" in the app).
 - **By hand**: `rlord remote` lists what's connected; `rlord remote <session>
   on|off [--now|--when-idle]` turns it on or off.
 - It's a launch flag, so turning it on or off restarts the session (the

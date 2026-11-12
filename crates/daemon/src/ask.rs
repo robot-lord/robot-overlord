@@ -204,15 +204,20 @@ fn show_mastermind(d: &Daemon) -> String {
         .iter()
         .any(|c| c.session == overlord::FRONT.tmux);
     if on_front {
-        if let Ok(Some(m)) = overlord::MASTERMIND.session(&d.db()).and_then(|m| match m {
-            Some(m) => Ok(Some(m)),
-            None => overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))
-                .map(|v| v["id"].as_str().map(str::to_string))
-                .and_then(|id| match id {
-                    Some(id) => d.db().resolve_ref(&id).map(Some),
-                    None => Ok(None),
-                }),
-        }) {
+        // One guard, held for the lookup, the start and the re-read (never
+        // a second lock while one is alive).
+        let mind = {
+            let db = d.db();
+            match overlord::MASTERMIND.session(&db) {
+                Ok(Some(m)) => Some(m),
+                Ok(None) => overlord::ensure(&db, &d.config, &json!({"seat": "mastermind"}))
+                    .ok()
+                    .and_then(|v| v["id"].as_str().map(str::to_string))
+                    .and_then(|id| db.resolve_ref(&id).ok()),
+                Err(_) => None,
+            }
+        };
+        if let Some(m) = mind {
             if crate::ui::goto(d, &json!({"ref": m.id})).is_ok() {
                 return "the user now sees the mastermind (full screen)".into();
             }

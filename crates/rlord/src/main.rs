@@ -959,7 +959,8 @@ fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
         Some(r) => r,
         // resolve_ref accepts the tmux session name too.
         None => tmux::current_session()
-            .filter(|s| s.starts_with("rlord-"))
+            // rlord's tmux sessions: `<name>-rlord` (older: `rlord-…`).
+            .filter(|s| s.ends_with("-rlord") || s.starts_with("rlord-"))
             .context("not in an rlord session: give a session REF")?,
     };
     let mut params = json!({"ref": r});

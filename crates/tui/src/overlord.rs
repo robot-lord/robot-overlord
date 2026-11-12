@@ -474,12 +474,12 @@ impl App {
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "    Talk to the overlord from the Claude app (Code tab) or claude.ai,",
+                    "    Reach the mastermind from the Claude app (Code tab) or claude.ai,",
                     theme::muted(),
                 )));
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "    away from this terminal.{}",
+                        "    away from here: it's kept running for that.{}",
                         why.as_deref()
                             .map(|w| format!(" Note: {w}."))
                             .unwrap_or_default()
@@ -577,11 +577,11 @@ impl App {
                 "remote.set",
                 // Don't hold the list up waiting for the link: the list
                 // shows it (⇄) once connected.
-                json!({"seat": "overlord", "on": true, "wait": false}),
+                json!({"seat": "mastermind", "on": true, "wait": false}),
             ) {
                 Ok(r) => {
                     self.status_line = format!(
-                        "overlord: Remote Control on — {}",
+                        "mastermind: Remote Control on — {}",
                         r["note"].as_str().unwrap_or("connecting")
                     );
                     self.dirty = true;
@@ -601,7 +601,7 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Reach your overlord from your phone?",
+                "  Reach your overlord's mastermind from your phone?",
                 Style::default().bold(),
             )),
             Line::from(Span::styled(

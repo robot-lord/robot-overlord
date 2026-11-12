@@ -140,9 +140,10 @@ line what a restart would interrupt and ask "restart now, or when it's
 done?", then call again with `restart: "now"` or `"when_idle"`. Never pick
 for them. Otherwise reply in one line with what it says: connected (give
 the url; it's also in the app's Code tab under the session's name), or when
-it will connect. `on: false` turns it off the same way. "Me" / "you" / "the
-overlord" means your own session: it restarts once your reply is done, and
-the mastermind goes with it.
+it will connect. `on: false` turns it off the same way. "You" / "the
+overlord" means the overlord's own: that lives on the mastermind (you stay
+fast; rlord keeps the mastermind running for it). The user finds it as
+"rlord mastermind" in the app.
 
 If it's unavailable, it fails, or `list_sessions` shows `remote: failed`,
 pass on the reason it gives in one line (not logged in to claude.ai, an API

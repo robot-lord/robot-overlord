@@ -471,7 +471,7 @@ from the user's default server, but only for the real socket.
 ## The overlord (built 2026-11-10)
 
 The product's primary control surface: a singleton agent session
-(`role = 'overlord'`, fixed tmux name `rlord_overlord`) that the user talks to,
+(`role = 'overlord'`, fixed tmux name `overlord-rlord`) that the user talks to,
 wired to rlord's MCP server. It lives in `<data>/overlord/`. Each `ensure`
 regenerates that folder's `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` (the same
 standing instructions under each agent's file name: the built-in

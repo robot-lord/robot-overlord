@@ -98,12 +98,18 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
         "renamed",
         &json!({"from": old, "to": name.trim()}).to_string(),
     )?;
+    // Its tmux session follows the name.
+    let s = db.resolve_ref(&s.id)?;
+    if let Err(e) = sync_tmux_name(db, &s) {
+        tracing::warn!(error = %e, "renaming tmux session");
+    }
+    let s = db.resolve_ref(&s.id)?;
     if let Some(t) = s.tmux_session.as_deref().filter(|t| tmux::has_session(t)) {
         if let Err(e) = tmux::name_agent_window(t, name.trim()) {
             tracing::debug!(error = %e, "renaming tmux window");
         }
     }
-    Ok(json!({"renamed": s.id, "name": name.trim()}))
+    Ok(json!({"renamed": s.id, "name": name.trim(), "tmux": s.tmux_session}))
 }
 
 pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
@@ -390,7 +396,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     );
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
-        None => mint_tmux_name(db),
+        None => tmux_name_for(db, &name, None),
     };
     let launch_spec = spec.to_string();
     let now = now_ms();
@@ -547,33 +553,73 @@ pub(crate) fn import_candidate(
 }
 
 /// A fresh `rlord-adjective-noun`, unused in the database and on tmux.
-fn mint_tmux_name(db: &Db) -> String {
+/// A tmux name for a session called `name` (see `names::tmux_name_for`),
+/// not taken by another session or live tmux session; `own` is the
+/// session's current one (free for itself).
+fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
-    // own check below still catches. Counting it as taken would loop forever.
-    rlord_core::names::tmux_name(|n| db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
+    // own check still catches.
+    // The seats' fixed names are reserved, even before the seats exist.
+    let reserved =
+        |n: &str| n == crate::overlord::FRONT.tmux || n == crate::overlord::MASTERMIND.tmux;
+    rlord_core::names::tmux_name_for(name, |n| {
+        Some(n) != own
+            && (reserved(n) || db.tmux_name_taken(n).unwrap_or(false) || tmux::has_session(n))
+    })
 }
 
-/// Give sessions from before Docker-style names (`rlord_<id>`) a new one,
-/// renaming the live tmux session in place. Idempotent.
-pub fn rename_legacy_tmux(db: &Db) -> Result<()> {
+/// The tmux name a session should have: a seat's fixed one, else its name
+/// plus `-rlord`.
+fn wanted_tmux_name(db: &Db, s: &rlord_core::types::Session) -> Option<String> {
+    if crate::overlord::is_overlord_role(&s.role) {
+        return Some(crate::overlord::seat(&s.role).tmux.to_string());
+    }
+    let cur = s.tmux_session.as_deref();
+    if cur.is_some_and(|c| rlord_core::names::is_tmux_name_for(c, &s.name)) {
+        return None; // already named after it
+    }
+    Some(tmux_name_for(db, &s.name, cur))
+}
+
+/// Give a session the tmux name it should have, renaming its live tmux
+/// session in place.
+fn sync_tmux_name(db: &Db, s: &rlord_core::types::Session) -> Result<()> {
+    let Some(new) = wanted_tmux_name(db, s) else {
+        return Ok(());
+    };
+    let Some(old) = s.tmux_session.as_deref() else {
+        return Ok(()); // gets one when it starts
+    };
+    if old == new {
+        return Ok(());
+    }
+    if tmux::has_session(old) {
+        if tmux::has_session(&new) {
+            bail!("tmux session {new} already exists");
+        }
+        tmux::rename_session(old, &new)?;
+    }
+    db.set_tmux_session(&s.id, &new)?;
+    tracing::info!(session = %s.id, from = %old, to = %new, "renamed tmux session");
+    Ok(())
+}
+
+/// Name every session's tmux session after it (older ones had random or
+/// `rlord_<id>` names). Idempotent.
+pub fn sync_tmux_names(db: &Db) -> Result<()> {
     let all = db.sessions(&SessionQuery {
         archived: rlord_core::db::ArchivedMode::All,
+        include_overlord: true,
         ..Default::default()
     })?;
-    for s in all {
-        let Some(old) = s
-            .tmux_session
-            .as_deref()
-            .filter(|n| n.starts_with("rlord_"))
-        else {
-            continue;
-        };
-        let new = mint_tmux_name(db);
-        if tmux::has_session(old) {
-            tmux::rename_session(old, &new)?;
+    // The seats first: their fixed names must never be taken by another.
+    let (seats, rest): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|s| crate::overlord::is_overlord_role(&s.role));
+    for s in seats.into_iter().chain(rest) {
+        if let Err(e) = sync_tmux_name(db, &s) {
+            tracing::warn!(session = %s.id, error = %e, "renaming tmux session");
         }
-        db.set_tmux_session(&s.id, &new)?;
-        tracing::info!(session = %s.id, from = %old, to = %new, "renamed tmux session");
     }
     Ok(())
 }
@@ -607,7 +653,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
         None => {
-            let n = mint_tmux_name(db);
+            let n = tmux_name_for(db, &s.name, None);
             db.set_tmux_session(&s.id, &n)?;
             n
         }
