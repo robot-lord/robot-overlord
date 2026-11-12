@@ -44,6 +44,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("overlord", "open the overlord", Cmd::Act(Action::Overlord)),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
     (
+        "archive",
+        "archive the selected session (asks first)",
+        Cmd::Act(Action::Archive),
+    ),
+    (
         "sort last message",
         "newest message from you or the agent first",
         Cmd::Sort(SortMode::Activity),

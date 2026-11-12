@@ -60,11 +60,11 @@ source "$d/env.sh"
 
 cat > "$d/config/robot-overlord/config.toml" <<'EOF'
 [overlord]
-model = "sonnet"
-mastermind_model = "opus"
+model = "opus"
+effort = "low"
 EOF
 
-B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' C=$'\e[36m' M=$'\e[35m'
+B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
 box() { printf '%s\n' "${D}────────────────────────────────────────────────────────────────────────${R}" "> $1" "${D}────────────────────────────────────────────────────────────────────────${R}" "  ${D}? for shortcuts${R}"; }
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
@@ -219,7 +219,7 @@ set_times onboarding-emails 55 50 240
 set_times search-indexer-migration 10080 10070 14400
 sql "update sessions set pinned=1 where name='checkout-redesign'"
 
-# The overlord and the mastermind (the stand-in draws their screens).
+# The overlord (the stand-in draws its screen).
 cat > "$d/screens/overlord.txt" <<EOF
 ${M}${B}◆ overlord${R}
 
@@ -236,15 +236,10 @@ ${M}${B}◆ overlord${R}
 
 > start a session on the slow product search page
 
-● Handed to the mastermind.
+● Launched ${B}slow-product-search${R} in acme-web, on its own worktree,
+  tagged web and perf.
 
 $(box "")
-EOF
-cat > "$d/screens/mastermind.txt" <<EOF
-${C}${B}↳ mastermind${R}
-
-● Launching a session for the slow product search page in acme-web, on its
-  own worktree, tagged web and perf.
 EOF
 python3 - "$d/run/robot-overlord/daemon.sock" <<'PY'
 import json, socket, sys

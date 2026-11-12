@@ -460,14 +460,18 @@ impl Daemon {
             }
             // The overlord's session (null: not set up), with when its
             // conversation started and how many came before.
-            "overlord.get" => overlord::session(&self.db()).and_then(|o| {
-                let Some(o) = o else {
-                    return Ok(Value::Null);
-                };
-                let mut v = serde_json::to_value(&o)?;
-                v["conversations"] = recall::summary(&self.db(), &o);
-                Ok(v)
-            }),
+            "overlord.get" => {
+                // One guard for both reads (std's Mutex isn't reentrant).
+                let db = self.db();
+                overlord::session(&db).and_then(|o| {
+                    let Some(o) = o else {
+                        return Ok(Value::Null);
+                    };
+                    let mut v = serde_json::to_value(&o)?;
+                    v["conversations"] = recall::summary(&db, &o);
+                    Ok(v)
+                })
+            }
             "overlord.conversations" => recall::conversations_rpc(self),
             "overlord.conversation" => recall::conversation(self, params),
             "overlord.recall" => recall::recall(self, params),
@@ -1182,6 +1186,71 @@ mod tests {
         // A tool finishing while it's your turn changes nothing either.
         assert_eq!(emit("PostToolUse", json!({}))["unchanged"], true);
         assert_eq!(status(), Status::Idle);
+    }
+
+    /// A user's `/clear` in the overlord: recorded as a fresh conversation
+    /// with its reason, like an idle restart, so the list of its earlier
+    /// conversations is complete. A resume is an ordinary switch.
+    #[test]
+    fn a_clear_is_a_fresh_conversation() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01over",
+            name: "overlord",
+            agent: "claude",
+            agent_session: Some("conv-1"),
+            project_path: "/tmp/o",
+            tmux_session: Some("rlord_01over_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "overlord",
+        })
+        .unwrap();
+        db.set_status("01over", rlord_core::types::Status::Idle, 1)
+            .unwrap();
+        let emit = |sid: &str, source: &str| {
+            methods::hook_emit_with(
+                &db,
+                &json!({"instance": "01over", "agent": "claude", "event": "SessionStart",
+                        "payload": {"session_id": sid, "hook_event_name": "SessionStart",
+                                    "source": source}}),
+                &|_, _| rlord_core::agents::Indexed::NoIndex,
+            )
+            .unwrap()
+        };
+        emit("conv-2", "clear");
+        emit("conv-3", "resume");
+        let o = db.overlord().unwrap().unwrap();
+        assert_eq!(o.agent_session.as_deref(), Some("conv-3"));
+        let changes = db.conversation_changes("01over").unwrap();
+        let got: Vec<(&str, &str, Option<&str>)> = changes
+            .iter()
+            .map(|(_, k, p)| (k.as_str(), p["to"].as_str().unwrap(), p["reason"].as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("fresh_conversation", "conv-2", Some("clear")),
+                ("agent_session_changed", "conv-3", None),
+            ]
+        );
+        // The overlord's "fresh" clock restarts with a clear.
+        assert!(db.kv_get(overlord::FRESH_AT).unwrap().is_some());
+        let (cur, earlier) = recall::list(&db, &o).unwrap();
+        assert_eq!(cur.unwrap().id, "conv-3");
+        assert_eq!(recall::why(&earlier[1]), "you cleared it with /clear");
+        assert_eq!(recall::summary(&db, &o)["earlier"], 2);
+        assert_eq!(db.past_agent_sessions("01over").unwrap().len(), 2);
+        // The list's row for it: the session, with that summary (one db
+        // guard for both reads: a second lock would never return).
+        let d = Daemon::new(db, Config::default());
+        let o = d.rpc("overlord.get", json!({})).unwrap();
+        assert_eq!(o["role"], "overlord");
+        assert_eq!(o["conversations"]["earlier"], 2);
+        assert_eq!(o["conversations"]["reason"], "switched");
     }
 
     /// Codex assigns its own conversation id: the first hook binds it.

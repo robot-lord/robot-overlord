@@ -16,51 +16,68 @@ Contents: [The overlord](#the-overlord) · [Creating sessions](#creating-session
 
 ## The overlord
 
-The primary way to drive rlord is the **overlord**, and it's two sessions
-that work together, each with rlord's MCP tools (pre-allowed; they act on
-the real UI you're looking at):
+The primary way to drive rlord is the **overlord**: one long-running agent
+session with rlord's MCP tools (pre-allowed; they act on the real UI you're
+looking at). **Option-O** opens it as an overlay over whatever you're
+looking at; say what you want.
 
-- **◆ Overlord (Option-O)**: a quick front desk on a fast model (`sonnet`,
-  low effort, by default). Summon it, say what you want, get it done in
-  seconds: find and jump to sessions (`goto_session`, `show_list`), shape the
-  list (`set_list_view`, groups), edit names, tags, notes and descriptions,
-  answer from rlord's data ("what's waiting on me?"), and run the tidy and
-  import passes. Anything that needs thought, it hands off (`hand_off`).
+- **A strong model at low effort** (`opus` / `low` by default). It does
+  light work itself, in seconds: find and jump to sessions (`goto_session`,
+  `show_list`), shape the list (`set_list_view`, groups), edit names, tags,
+  notes and descriptions, answer from rlord's data ("what's waiting on
+  me?"). Anything heavier it delegates: routine passes over many sessions
+  go to cheaper subagents (tidy, import), research goes to a subagent, and
+  work in a repo becomes a new session. If low effort proves too shallow
+  for you, set `[overlord] effort = "medium"`.
 - **Starting a session**: just tell the overlord ("start a session in ai to
   fix the flaky login tests"). The list's `n` form is a thin wrapper around
-  the same thing, with optional hints; `ctrl-e` in it opens the description in
-  your `$EDITOR` (e.g. vim).
-- **↳ Mastermind (Option-M inside the overlay)**: the overlord's deeper half on a strong model
-  (`opus`, medium effort, by default). It launches sessions (the list's `n`
-  form goes straight to it; describe → confirm via `confirm_new_session`) and
-  takes one-off questions that need reasoning, research or reading code. A
-  hand-off switches the overlay to it, so you watch it work and carry on
-  there. It starts the first time it's needed, does its groundwork in
-  subagents to keep its context small, and after 15 idle minutes (while
-  you're not looking at it) restarts on a fresh conversation
-  (`mastermind_fresh_after_mins`; not while its last turn asked you
-  something). `[tmux] mastermind = "M-m"` makes Option-M reach it from any
-  pane too.
+  the same thing, with optional hints (describe → confirm via
+  `confirm_new_session`); `ctrl-e` in it opens the description in your
+  `$EDITOR` (e.g. vim).
+- **It starts fresh after sitting idle.** After 15 idle minutes (while
+  you're not looking at it, and not while its last turn asked you
+  something) rlord restarts it on a fresh conversation, so its context
+  doesn't grow without end (`[overlord] fresh_after_mins`; 0 = never).
+  Nothing is carried over: when you refer to something from before, it
+  looks it up in its own earlier conversations (`recall`).
+- **You can see that.** The overlord's row and its overlay's title say when
+  the current conversation started and how many came before ("fresh 2h ago ·
+  14 earlier"). With its row selected, the details pane lists the earlier
+  conversations (when each ended, its turns, how it ended: an idle restart,
+  your own `/clear`, a restart; its first prompt). `[` and `]` (or a click)
+  show one in the preview; `enter` on one continues it (the overlord goes
+  back to that conversation, and the current one joins the list); `esc`
+  returns to the live pane.
 
-Both float as an overlay over whatever you're looking at. Inside it, Option-O
-and Option-M switch between them, and the key of the one shown (or Option-D)
-closes it. Both sit at the top of the list (◆ overlord, ↳ mastermind);
-`enter` opens either full screen with its own lavender bar. Models and
-efforts live in `config.toml` under `[overlord]`; the first-run dialog sets
-the models. When either moves you somewhere (a session, the list, a form) it
+Inside the overlay, Option-O (or Option-D) closes it. The overlord sits at
+the top of the list (◆ overlord); `enter` opens it full screen with its own
+lavender bar. When it moves you somewhere (a session, the list, a form) it
 closes itself first. `rlord` always runs its TUI inside tmux (it starts a
 `rlord` tmux session if you're outside one).
 
 Quitting the list takes **Shift-Q** plus a confirmation. `q` and Ctrl-C only show
 that hint.
 
-First start with no overlord shows a setup dialog with both seats defaulted
-(and why), so `enter` launches it. On every start rlord checks the overlord's model: it
-reads what the agent actually ran from its transcript and compares it with a
-per-tool table of latest models (`crates/core/src/models.rs`). If either seat is
-on an older model, a dialog offers to switch and restart, and the conversation
-resumes.
+First start with no overlord shows a setup dialog, everything defaulted, so
+`enter` launches it. Its rows can be changed with ←/→: the **agent** (the
+installed ones that can run the overlord; changing it resets the next two
+to that agent's defaults), the **model**, the **effort**, and **Remote
+Control**. What you pick is saved to `config.toml` under `[overlord]`, so
+later starts reuse it; change it there any time. On every start rlord
+checks the overlord's model: it reads what the agent actually ran from its
+transcript and compares it with a per-tool table of latest models
+(`crates/core/src/models.rs`). If it is on an older model, a dialog offers
+to switch and restart, and the conversation resumes.
 `rlord overlord status|model <m>|restart|open` does the same from the CLI.
+
+**Coming from the two-session overlord** (a front desk plus a "mastermind",
+before 0.21): nothing to do. The mastermind's conversation carries on as
+the overlord's, and the old front desk is stopped and archived (as
+`overlord-front-desk`). `mastermind_model`, `mastermind_effort` and
+`mastermind_fresh_after_mins` in `config.toml` still work as the overlord's
+`model`, `effort` and `fresh_after_mins`; a `model` or `effort` you set
+yourself wins over them. Only the default effort changed, to low.
+`[tmux] mastermind` is ignored.
 
 `enter` on a stopped session resumes it and attaches.
 
@@ -147,7 +164,7 @@ with `--everywhere`), triage excerpts, archive summaries (written by Codex
 itself, read-only and without saving anything; `[archive]
 codex_summary_model`).
 
-Not yet: the overlord and mastermind on Codex, importing Codex
+Not yet: the overlord on Codex, importing Codex
 conversations started outside rlord, passing a message to a Codex session
 from the overlord, sub-agent tracking, Remote Control. A session blocked
 on a permission prompt shows "needs you" only with trusted hooks.
@@ -196,7 +213,7 @@ Good to know:
 - A turn runs in the server: closing the screen stops the rlord session,
   not necessarily the turn.
 
-Not yet: the overlord and mastermind on OpenCode, importing OpenCode
+Not yet: the overlord on OpenCode, importing OpenCode
 conversations started outside rlord, passing a message to an OpenCode
 session from the overlord, sub-agent tracking, Remote Control.
 
@@ -205,7 +222,8 @@ session from the overlord, sub-agent tracking, Remote Control.
 The preview is the session's live pane, in colour (captured with ANSI
 attributes), refreshed every `preview_refresh_ms`; `l` swaps it for the event
 log. Under it sits the **details** card — agent/model/status, repo and branch,
-working dir, the four timestamps, tags and group — plus two fields you write:
+working dir, the four timestamps, tags and group (all of them, wrapped
+over as many lines as they need) — plus two fields you write:
 a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
 free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
 `rlord show <ref>` prints the same card. The list always wins on space: it
@@ -267,9 +285,11 @@ summaries too. To search what sessions actually said and did:
 It searches each session's transcripts in place (including the ones before
 a `/clear`), with ripgrep's engine built in: nothing to install, and a
 search over hundreds of MB takes well under a second. The overlord has the
-same as `search_history` / `read_history` ("we did this before, find it"),
-and the mastermind uses them to carry earlier decisions into a new
-session. Any session can run `rlord search` itself.
+same as `search_history` / `read_history` ("we did this before, find it";
+with one session, "what happened in X?"), and uses them to carry earlier
+decisions into a new session. Its own conversations aren't in these
+results: it reads those with `recall`. Any session can run `rlord search`
+itself.
 
 ## Remote Control (from your phone)
 
@@ -279,9 +299,8 @@ it keeps running on this machine. rlord manages it per session:
 
 - **Ask the overlord**: "turn on remote control for the web app". It
   replies with the link, or with the reason it can't. The overlord has it
-  too (offered once, and in the first-run setup), on the **mastermind**: the
-  front desk stays fast, and rlord keeps the mastermind running so it's
-  always there when you're away ("rlord mastermind" in the app).
+  too (offered once, and in the first-run setup): rlord keeps it running so
+  it's always there when you're away ("rlord overlord" in the app).
 - **By hand**: `rlord remote` lists what's connected; `rlord remote <session>
   on|off [--now|--when-idle]` turns it on or off.
 - It's a launch flag, so turning it on or off restarts the session (the
@@ -362,6 +381,9 @@ in the config).
 - **Filter bar:** above both tabs, a line always shows the current filter,
   sort and live/archived, with the keys that change them.
 - **Editing tags:** `#` edits the selected session's tags (space-separated).
+- **The list's Groups column** shows a session's tags when they fit, else
+  how many groups it is in ("3 groups"); the details pane and the groups
+  tab always show them all.
 - **The overlord** is expected to do most of the organizing:
   - `organize` tags, renames and describes many sessions in one call;
   - `list_groups` lists groups and counts;
@@ -417,7 +439,10 @@ uses hooks added later (and Codex asks you to trust changed hooks again).
 The TUI is the hub. `enter` on a session switches your tmux client into its
 pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
 TUI. It's a home-row key, because you press it constantly. Stopped sessions
-resume on `enter`. Quit the list with Shift-Q, then confirm.
+resume on `enter`. Quit the list with Shift-Q, then confirm. Archiving from
+the list (`x`, the right-click menu, `:archive`) asks first: `y` or `enter`
+archives, `n` or `esc` doesn't. (The overlord archives without asking you
+twice: you already told it to.)
 
 Jumping is search-driven, not cycling: `/` filters as you type and `Enter`
 attaches to the top match (`Tab` keeps the filter, ↑/↓ move within matches);

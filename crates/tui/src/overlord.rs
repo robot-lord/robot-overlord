@@ -795,3 +795,129 @@ impl App {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(agents: Value, remote: bool) -> Value {
+        json!({"exists": false, "default_agent": "claude", "default_model": "opus",
+               "default_effort": "low", "agents": agents,
+               "remote": {"available": remote}})
+    }
+
+    fn claude() -> Value {
+        json!({"name": "claude", "label": "Claude Code", "model": "opus", "effort": "low",
+               "models": ["opus", "sonnet", "haiku"],
+               "efforts": ["low", "medium", "high", "max"], "remote_control": true})
+    }
+
+    #[test]
+    fn setup_defaults_and_rows() {
+        // One agent: Opus at low effort, Remote Control on; the first row
+        // with a choice is the model.
+        let s = Setup::from_status(&status(json!([claude()]), true));
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("claude", "opus", "low")
+        );
+        assert_eq!(
+            s.rows(),
+            [
+                SetupRow::Agent,
+                SetupRow::Model,
+                SetupRow::Effort,
+                SetupRow::Remote
+            ]
+        );
+        assert_eq!(s.rows()[s.row], SetupRow::Model);
+        assert_eq!(s.remote, Some(true));
+        // Remote Control not available here: no row for it.
+        let s = Setup::from_status(&status(json!([claude()]), false));
+        assert_eq!(
+            s.rows(),
+            [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
+        );
+    }
+
+    #[test]
+    fn setup_rows_are_pickable_and_an_agent_change_resets_them() {
+        let codex = json!({"name": "codex", "label": "Codex", "model": "", "effort": "low",
+                           "models": ["gpt-x"], "efforts": ["low", "medium", "high"],
+                           "remote_control": false});
+        let opencode = json!({"name": "opencode", "label": "OpenCode", "model": "",
+                              "effort": "", "models": [], "efforts": [],
+                              "remote_control": false});
+        let mut s = Setup::from_status(&status(json!([claude(), codex, opencode]), true));
+        // Several agents: the agent row comes first.
+        assert_eq!(s.rows()[s.row], SetupRow::Agent);
+        // Model and effort are pickable.
+        s.row = 1;
+        s.step(true);
+        assert_eq!(s.model(), "sonnet");
+        s.row = 2;
+        s.step(true);
+        s.step(true);
+        assert_eq!(s.effort(), "high");
+        s.step(false);
+        assert_eq!(s.effort(), "medium");
+        // Remote Control toggles.
+        s.row = 3;
+        s.step(true);
+        assert_eq!(s.remote, Some(false));
+        // Another agent: its own default model and effort; Codex has no
+        // Remote Control row.
+        s.row = 0;
+        s.step(true);
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("codex", "", "low")
+        );
+        assert_eq!(
+            s.rows(),
+            [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
+        );
+        // OpenCode: its default model, and no effort row at all.
+        s.step(true);
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("opencode", "", "")
+        );
+        assert_eq!(s.rows(), [SetupRow::Agent, SetupRow::Model]);
+        // Back to Claude: its defaults again, not what was picked before.
+        s.step(true);
+        assert_eq!((s.model(), s.effort()), ("opus", "low"));
+    }
+
+    #[test]
+    fn setup_draws_one_overlord() {
+        use ratatui::backend::TestBackend;
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let app = App::new(rx, Config::default(), keys);
+        let s = Setup::from_status(&status(json!([claude()]), true));
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 34)).unwrap();
+        term.draw(|f| app.draw_setup(f, &s)).unwrap();
+        let buf = term.backend().buffer();
+        let out: String = (0..34)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        for want in [
+            "Agent",
+            "Claude Code",
+            "Model",
+            "◀ opus ▶",
+            "Effort",
+            "◀ low ▶",
+            "Remote",
+        ] {
+            assert!(out.contains(want), "{want:?} missing:\n{out}");
+        }
+        assert!(!out.to_lowercase().contains("mastermind"), "{out}");
+    }
+}

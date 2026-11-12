@@ -1542,7 +1542,7 @@ impl App {
         };
         let what = if self.preview == Preview::Pane && self.conv_sel > 0 {
             format!(
-                "earlier conversation {} of {} · [ older · ] newer · {} continue it · {} back",
+                "earlier conversation {} of {} · [ ] step · {} continue it · {} back",
                 self.conv_sel,
                 self.convs["total_earlier"]
                     .as_u64()
@@ -1886,7 +1886,7 @@ impl App {
                 Span::styled(
                     match rlord_daemon::recall::fresh_label(c) {
                         Some(l) => format!(
-                            "{}  ({})",
+                            "{}  —  {}",
                             l.trim_start_matches("fresh "),
                             c["why"].as_str().unwrap_or("a fresh conversation")
                         ),
@@ -1951,7 +1951,13 @@ impl App {
                     format!("{:>4} ago  ", rel_age(c["ended_at"].as_i64())),
                     theme::muted(),
                 ),
-                Span::styled(format!("{turns:>3} turns  "), theme::faint()),
+                Span::styled(
+                    format!(
+                        "{turns:>3} {:<7}",
+                        if turns == 1 { "turn" } else { "turns" }
+                    ),
+                    theme::faint(),
+                ),
                 Span::styled(format!("{ended:<9}"), theme::faint()),
                 Span::styled(
                     match c["first_prompt"].as_str() {
@@ -2830,6 +2836,74 @@ mod tests {
             }
         }
         theme::set(rlord_core::themes::by_name("rlord-dark").unwrap());
+    }
+
+    #[test]
+    fn groups_column_never_cuts_a_tag() {
+        let text = |tags: &[&str]| -> String {
+            tags_cell(tags, 15)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(text(&[]), "");
+        assert_eq!(text(&["web", "wip"]), "#web #wip");
+        // Exactly the column's width still fits.
+        assert_eq!(text(&["release", "tools"]), "#release #tools");
+        // Too wide: how many, not "#release #tooli".
+        assert_eq!(text(&["release", "tooling"]), "2 groups");
+        assert_eq!(text(&["release", "tooling", "wip"]), "3 groups");
+        assert_eq!(text(&["a-very-long-group-name"]), "1 group");
+        assert_eq!(fresh_short(&json!({"earlier": 0})), "");
+        let c = json!({"earlier": 3, "fresh_at": rlord_core::types::now_ms() - 7_200_000});
+        assert_eq!(fresh_short(&c), "fresh 2h · 3");
+    }
+
+    /// `x` (and so the menu and the launcher, which run the same action)
+    /// asks before archiving: y / Enter archive, anything else doesn't.
+    #[test]
+    fn archive_asks_first() {
+        use ratatui::backend::TestBackend;
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![json!({"id": "01a", "name": "web-fix", "status": "idle",
+            "archived_at": null, "pinned": false, "role": "", "agent": "claude"})];
+        app.table.select(Some(0));
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // (Never drawn to: the key handlers only take it to hand the
+        // screen to an editor or tmux. A fixed viewport asks no tty.)
+        let mut real = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.handle_key(x, &mut real).unwrap();
+        assert!(matches!(app.mode, Mode::Confirm(_)), "x opens the confirm");
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let out: String = (0..24)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(out.contains("Archive web-fix?"), "{out}");
+        // n / Esc: nothing happens.
+        for no in [KeyCode::Char('n'), KeyCode::Esc] {
+            app.mode = Mode::Normal;
+            app.handle_key(x, &mut real).unwrap();
+            app.handle_key(KeyEvent::new(no, KeyModifiers::NONE), &mut real)
+                .unwrap();
+            assert!(matches!(app.mode, Mode::Normal));
+            assert_eq!(app.status_line, "cancelled");
+        }
+        // The overlord's row has nothing to archive.
+        app.sessions[0]["role"] = json!("overlord");
+        app.handle_key(x, &mut real).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

@@ -146,7 +146,7 @@ pub fn why(c: &Conv) -> String {
             Some(m) => format!("idle {m}m, restarted on a fresh conversation"),
             None => "idle, restarted on a fresh conversation".into(),
         },
-        Some("clear") => "you cleared it (/clear)".into(),
+        Some("clear") => "you cleared it with /clear".into(),
         Some("manual") => "restarted on a fresh conversation".into(),
         Some("continued") => "you went back to an earlier conversation".into(),
         Some(_) => "the overlord moved to another conversation".into(),
@@ -490,7 +490,7 @@ mod tests {
             "idle 15m, restarted on a fresh conversation"
         );
         assert_eq!(earlier[1].ended.as_deref(), Some("switched"));
-        assert_eq!(why(&earlier[2]), "you cleared it (/clear)");
+        assert_eq!(why(&earlier[2]), "you cleared it with /clear");
         assert_eq!(earlier[3].ended.as_deref(), Some("idle"));
         assert_eq!(
             (earlier[3].started_at, earlier[3].ended_at),

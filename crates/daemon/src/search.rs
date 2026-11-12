@@ -48,7 +48,7 @@ fn matched_fields(s: &Session, ws: &[String]) -> Vec<&'static str> {
 /// The overlord's session, or one that ran in an overlord's folder (the
 /// retired front desk of a two-session overlord).
 fn is_overlords(s: &Session, dirs: &[String]) -> bool {
-    crate::overlord::is_overlord_role(&s.role) || dirs.iter().any(|d| *d == s.project_path)
+    crate::overlord::is_overlord_role(&s.role) || dirs.contains(&s.project_path)
 }
 
 pub fn search(d: &Daemon, params: &Value) -> Result<Value> {

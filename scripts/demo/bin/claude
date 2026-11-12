@@ -37,7 +37,6 @@ say() { python3 -c 'import json,sys; t=sys.argv[1]; r=sys.argv[2]; print(json.du
 
 if [[ -n $overlord ]]; then
   screen=$demo/screens/overlord.txt
-  [[ $overlord == *mastermind* ]] && screen=$demo/screens/mastermind.txt
   state=idle
 else
   screen=$demo/screens/$key.txt
