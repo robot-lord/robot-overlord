@@ -22,6 +22,9 @@ use rlord_core::usage::UsageMetric;
 use crate::{methods, overlord, Daemon};
 
 const DEFAULT_VIEW_KEY: &str = "default_view";
+/// The Usage column's measure as the user (or the overlord) last picked it:
+/// sticky across TUI and daemon restarts, over config `usage`.
+const USAGE_KEY: &str = "ui_usage";
 /// tmux session created to host the TUI when none is running.
 const HOME_SESSION: &str = "rlord";
 
@@ -46,11 +49,38 @@ fn normalize_view(v: &Value) -> Value {
 }
 
 pub fn default_view(d: &Daemon) -> Result<Value> {
-    let db = d.db();
-    Ok(match db.kv_get(DEFAULT_VIEW_KEY)? {
-        Some(s) => normalize_view(&serde_json::from_str(&s).unwrap_or(json!({}))),
-        None => normalize_view(&json!({})),
-    })
+    let saved = d.db().kv_get(DEFAULT_VIEW_KEY)?;
+    let mut view = normalize_view(
+        &saved
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(json!({})),
+    );
+    // The last measure picked wins over one saved with the default view.
+    if let Some(m) = usage_pref(d) {
+        view["usage"] = json!(m.label());
+    }
+    Ok(view)
+}
+
+/// The Usage column's saved measure (None: never picked; config `usage`).
+pub fn usage_pref(d: &Daemon) -> Option<UsageMetric> {
+    d.db()
+        .kv_get(USAGE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(UsageMetric::parse)
+}
+
+/// `ui.usage`: save the Usage column's measure with `usage`; without it,
+/// read it back (null: never picked).
+pub fn usage(d: &Daemon, params: &Value) -> Result<Value> {
+    if let Some(u) = params.get("usage").and_then(Value::as_str) {
+        let m = UsageMetric::parse(u)
+            .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?;
+        d.db().kv_set(USAGE_KEY, m.label())?;
+    }
+    Ok(json!({"usage": usage_pref(d).map(UsageMetric::label)}))
 }
 
 /// What the user is looking at right now.
@@ -319,6 +349,8 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
         let m = UsageMetric::parse(u)
             .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?;
         obj.insert("usage".into(), json!(m.label()));
+        // Sticky, as when the user picks it.
+        d.db().kv_set(USAGE_KEY, m.label())?;
     }
     if let Some(r) = params.get("reverse").and_then(Value::as_bool) {
         obj.insert("reverse".into(), json!(r));
@@ -639,5 +671,39 @@ mod provenance_tests {
         );
         assert_eq!(p["chosen"], json!([]));
         assert_eq!(p["resolved"], json!(["repo"]));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use rlord_core::db::Db;
+
+    /// The measure is sticky: whoever picks it (the TUI, or the overlord's
+    /// `set_list_view usage`), the next start's default view has it, and
+    /// list requests without one use it over config `usage`.
+    #[test]
+    fn the_usage_measure_is_sticky() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Default::default());
+        assert_eq!(usage(&d, &json!({})).unwrap()["usage"], Value::Null);
+        assert_eq!(default_view(&d).unwrap()["usage"], Value::Null);
+        assert_eq!(crate::usage::metric(&d, &json!({})), UsageMetric::Turns);
+        usage(&d, &json!({"usage": "tokens"})).unwrap();
+        assert_eq!(default_view(&d).unwrap()["usage"], "tokens");
+        assert_eq!(crate::usage::metric(&d, &json!({})), UsageMetric::Tokens);
+        assert!(usage(&d, &json!({"usage": "bogus"})).is_err());
+        // The overlord's set_list_view (not shown: no tmux here).
+        set_view(&d, &json!({"usage": "context", "show": false})).unwrap();
+        assert_eq!(usage(&d, &json!({})).unwrap()["usage"], "context");
+        assert_eq!(default_view(&d).unwrap()["usage"], "context");
+        // Over a measure saved with an older default view, too.
+        d.db()
+            .kv_set(DEFAULT_VIEW_KEY, r#"{"usage": "turns", "sort": "name"}"#)
+            .unwrap();
+        let v = default_view(&d).unwrap();
+        assert_eq!(
+            (v["usage"].as_str(), v["sort"].as_str()),
+            (Some("context"), Some("name"))
+        );
     }
 }

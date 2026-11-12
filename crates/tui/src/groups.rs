@@ -298,13 +298,14 @@ impl App {
         ];
 
         // The toolbar, roomy, then tighter (narrow separators, no
-        // placeholder words), then without keycaps: the first that fits.
+        // placeholder words), then the Usage measure's name goes (its Σ
+        // and keycap stay), then without keycaps: the first that fits.
         // Each piece is also something to click: a tab switches to it, a
         // setting (with its keycap) presses the key that changes it.
         type Piece = (Span<'static>, Option<mouse::Hit>);
         let press = |a: Action| self.keys.event(a).map(mouse::Hit::Key);
         let build = |tier: u8| -> Vec<Piece> {
-            let key = |a: Action| -> Option<Piece> { (tier < 2).then(|| (key(a), press(a))) };
+            let key = |a: Action| -> Option<Piece> { (tier < 3).then(|| (key(a), press(a))) };
             let sep = || {
                 (
                     Span::styled(
@@ -358,7 +359,8 @@ impl App {
                     } else {
                         format!("{} ", self.sort.title())
                     },
-                    Style::default().fg(theme::text()),
+                    // (The quieter accent of the headers it switches.)
+                    Style::default().fg(theme::accent_dim()),
                 ),
                 sort,
             ));
@@ -377,6 +379,21 @@ impl App {
                 bar.push(k);
             }
             bar.push(sep());
+            // What the Usage column shows; a click (or its key) moves it on:
+            // turns → tokens → context.
+            let usage = press(Action::Usage);
+            bar.push((Span::styled("Σ ", theme::muted()), usage.clone()));
+            if tier < 2 {
+                bar.push((
+                    Span::styled(
+                        format!("{} ", self.usage.label()),
+                        Style::default().fg(theme::accent_dim()),
+                    ),
+                    usage,
+                ));
+            }
+            bar.extend(key(Action::Usage));
+            bar.push(sep());
             let archived = press(Action::ToggleArchived);
             bar.push((Span::styled("◷ ", theme::muted()), archived.clone()));
             bar.push((
@@ -394,10 +411,10 @@ impl App {
         let left = if compact { 1 } else { 8 };
         let room = area.width.saturating_sub(left) as usize;
         let width = |b: &[Piece]| b.iter().map(|(s, _)| s.width()).sum::<usize>();
-        let pieces = (0..3)
+        let pieces = (0..4)
             .map(build)
             .find(|b| width(b) <= room)
-            .unwrap_or_else(|| build(2));
+            .unwrap_or_else(|| build(3));
         // The toolbar is on the logo's last row (wide) or the one above.
         let bar_row = if compact {
             0

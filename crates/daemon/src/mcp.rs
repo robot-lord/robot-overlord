@@ -111,7 +111,7 @@ pub fn tools() -> Value {
                 "query": s("Filter text (same syntax as list_sessions query); \"\" clears it"),
                 "sort": sort,
                 "usage": {"type": "string", "enum": ["turns", "tokens", "context"],
-                          "description": "What the list's Usage column shows (and sort usage sorts by): turns, tokens or context %. Only when the user asks to see another one."},
+                          "description": "What the list's Usage column shows (and sort usage sorts by): turns, tokens or context %. Remembered across restarts, like the user's own pick. Only when the user asks to see another one."},
                 "reverse": b("Reverse the sort"),
                 "archived": {"type": "string", "enum": ["live", "only"], "description": "Show live or archived sessions"},
                 "select": s("Session to highlight in the list"),

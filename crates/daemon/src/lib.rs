@@ -595,6 +595,7 @@ impl Daemon {
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),
             "ui.view.default" => ui::default_view(self),
+            "ui.usage" => ui::usage(self, params),
             // The list's selected session: set with `id`, read without.
             "ui.selected" => match params.get("id").and_then(Value::as_str) {
                 Some(id) => self

@@ -954,6 +954,10 @@ mod tests {
         assert_eq!(at("Name", 1), Some(Hit::SortBy(SortMode::Name)));
         // The toolbar's direction arrow flips it.
         assert_eq!(at("▼ ", 0), press(Action::ReverseSort));
+        // The Usage measure: its Σ, its name and its keycap all cycle it.
+        assert_eq!(at("Σ turns  U ", 0), press(Action::Usage));
+        assert_eq!(at("Σ turns  U ", 3), press(Action::Usage));
+        assert_eq!(at("Σ turns  U ", 9), press(Action::Usage));
         // The footer: a keycap's label presses its key; so do row keys.
         assert_eq!(at(" quit", 2), press(Action::Quit));
         assert_eq!(at(" help", 2), press(Action::Help));
@@ -977,12 +981,15 @@ mod tests {
             "context": 5_000, "window": null, "context_pct": null});
         // Wide: every column.
         let rows = drawn_at(&mut app, 220, 34);
-        let (ux, uy) = find(&rows, "Usage");
+        // The header names the measure shown.
+        let (ux, uy) = find(&rows, "Turns");
         let (gx, _) = find(&rows, "Groups");
         assert!(ux < gx, "Usage sits before Groups");
+        assert!(!rows.iter().any(|r| r.contains("Usage")));
         // The header sorts by usage; values sit right-aligned under it, 4
         // wide.
         assert_eq!(app.hits.at(ux + 2, uy), Some(Hit::SortBy(SortMode::Usage)));
+        assert_eq!(app.hits.at(ux + 7, uy), Some(Hit::SortBy(SortMode::Usage)));
         let row = |name: &str| rows[find(&rows, name).1 as usize].clone();
         let cell = |r: &str| -> String { r.chars().skip(ux as usize).take(5).collect() };
         assert_eq!(cell(&row("✻  login-flake")), "   12");
@@ -992,36 +999,127 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.contains("12 turns · 1.2M tokens · 42% of 200k context")));
+        // Another measure: the header says so, in the same place, with the
+        // values right-aligned under its label.
+        let under = |rows: &[String], label: &str, name: &str| -> String {
+            let (x, _) = find(rows, label);
+            assert_eq!(x, ux, "{label}: the column doesn't move");
+            rows[find(rows, name).1 as usize]
+                .chars()
+                .skip(x as usize)
+                .take(label.chars().count())
+                .collect()
+        };
         app.usage = UsageMetric::Tokens;
         let rows = drawn_at(&mut app, 220, 34);
-        assert_eq!(
-            cell(&rows[find(&rows, "✻  login-flake").1 as usize]),
-            " 1.2M"
-        );
+        assert_eq!(under(&rows, "Tokens", "✻  login-flake"), "  1.2M");
         app.usage = UsageMetric::Context;
         let rows = drawn_at(&mut app, 220, 34);
-        assert_eq!(
-            cell(&rows[find(&rows, "✻  login-flake").1 as usize]),
-            "  42%"
-        );
-        assert_eq!(
-            cell(&rows[find(&rows, ">_ image-pipe").1 as usize]),
-            "    –"
-        );
-        // Sorted by usage: the arrow is on Usage, not the time column.
+        assert_eq!(under(&rows, "Context", "✻  login-flake"), "    42%");
+        assert_eq!(under(&rows, "Context", ">_ image-pipe"), "      –");
+        // Sorted by usage: the arrow is on the measure, not the time
+        // column; "Context ▼" wouldn't fit its 8 cells.
         app.sort = SortMode::Usage;
         let rows = drawn_at(&mut app, 220, 34);
-        find(&rows, "Usage ▼");
+        let (cx, cy) = find(&rows, "Ctx % ▼");
+        assert_eq!(cx, ux);
+        assert_eq!(app.hits.at(cx + 6, cy), Some(Hit::SortBy(SortMode::Usage)));
         assert!(!rows.iter().any(|r| r.contains("Last message ▼")));
+        app.usage = UsageMetric::Tokens;
+        let rows = drawn_at(&mut app, 220, 34);
+        assert_eq!(find(&rows, "Tokens ▼").0, ux);
+        app.usage = UsageMetric::Turns;
+        let rows = drawn_at(&mut app, 220, 34);
+        assert_eq!(find(&rows, "Turns ▼").0, ux);
         // Narrowing: Usage goes before Groups, never the other way round.
         let mut groups_alone = false;
         for w in (100..=220).step_by(2) {
             let rows = drawn_at(&mut app, w, 34);
             let list = |t: &str| rows.iter().any(|r| r.contains(t));
-            assert!(!list("Usage") || list("Groups"), "width {w}");
-            groups_alone |= list("Groups") && !list("Usage");
+            assert!(!list("Turns") || list("Groups"), "width {w}");
+            groups_alone |= list("Groups") && !list("Turns");
         }
         assert!(groups_alone);
+    }
+
+    /// Headers whose content can be switched read differently: the sorted
+    /// one in the accent with its arrow, the other switchable one (the
+    /// time column, Usage) in the quieter accent, fixed ones plain. The
+    /// toolbar's sort and Usage controls share the quieter accent.
+    #[test]
+    fn switchable_headers_read_differently() {
+        use ratatui::style::Modifier;
+        let mut app = fleet();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(220, 34)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..34)
+            .map(|y| (0..220).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let style = |text: &str| {
+            let (x, y) = find(&rows, text);
+            let c = &buf[(x, y)];
+            (c.fg, c.modifier.contains(Modifier::BOLD))
+        };
+        let (accent, dim) = (theme::accent(), theme::accent_dim());
+        assert_ne!(accent, dim);
+        // Active sort: the time column.
+        assert_eq!(style("Last message ▼"), (accent, true));
+        // Switchable, not the sort.
+        assert_eq!(style("Turns"), (dim, false));
+        // Fixed.
+        for fixed in ["Name", "Status", "Groups"] {
+            let (fg, bold) = style(fixed);
+            assert!(fg != accent && fg != dim && !bold, "{fixed}");
+        }
+        // The toolbar's values that switch them.
+        assert_eq!(style("turns  U ").0, dim);
+        assert_eq!(style("last message ").0, dim);
+        // Sorted by usage: Usage is the accent; the time column dims.
+        app.sort = rlord_core::db::SortMode::Usage;
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..34)
+            .map(|y| (0..220).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let style = |text: &str| {
+            let (x, y) = find(&rows, text);
+            (
+                buf[(x, y)].fg,
+                buf[(x, y)].modifier.contains(Modifier::BOLD),
+            )
+        };
+        assert_eq!(style("Turns ▼"), (accent, true));
+        assert_eq!(style("Last message"), (dim, false));
+    }
+
+    /// The toolbar narrows in steps: the Usage measure's name goes before
+    /// any keycap does; then keycaps go and its Σ stays. What's drawn is
+    /// still what's clicked.
+    #[test]
+    fn the_usage_control_gives_way_label_first() {
+        let mut app = fleet();
+        let press = |app: &App| app.keys.event(Action::Usage).map(Hit::Key);
+        let mut seen = [false; 3];
+        for w in (60..=200).rev() {
+            let rows = drawn_at(&mut app, w, 34);
+            let bar = rows.iter().find(|r| r.contains('Σ')).cloned();
+            let bar = bar.unwrap_or_else(|| panic!("width {w}: no Σ\n{}", rows.join("\n")));
+            let label = bar.contains("Σ turns");
+            let keycap = bar.contains(" U ");
+            assert!(!label || keycap, "width {w}: the label goes first\n{bar}");
+            let (x, y) = find(&rows, "Σ");
+            assert_eq!(app.hits.at(x, y), press(&app), "width {w}");
+            if label {
+                assert_eq!(app.hits.at(x + 3, y), press(&app), "width {w}");
+            }
+            if keycap {
+                let (kx, ky) = find(&rows, " U ");
+                assert_eq!(app.hits.at(kx + 1, ky), press(&app), "width {w}");
+            }
+            seen[usize::from(!label) + usize::from(!keycap)] = true;
+        }
+        assert_eq!(seen, [true; 3], "every step shows at some width");
     }
 
     #[test]

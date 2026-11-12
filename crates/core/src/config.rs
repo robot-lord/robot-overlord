@@ -41,6 +41,8 @@ pub struct Keys {
     pub toggle_archived: String,
     pub sort: String,
     pub reverse_sort: String,
+    /// Cycle what the Usage column shows: turns, tokens, context.
+    pub usage: String,
     pub filter: String,
     pub toggle_log: String,
     pub describe: String,
@@ -84,6 +86,7 @@ impl Default for Keys {
             toggle_archived: "a".into(),
             sort: "o".into(),
             reverse_sort: "O".into(),
+            usage: "U".into(),
             filter: "/".into(),
             toggle_log: "l".into(),
             describe: "D".into(),
@@ -730,6 +733,7 @@ pin = "p"
 toggle_archived = "a"
 sort = "o"
 reverse_sort = "O"
+usage = "U"             # Usage column: turns -> tokens -> context (remembered)
 filter = "/"
 toggle_log = "l"
 describe = "D"          # edit the one-line description

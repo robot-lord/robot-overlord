@@ -201,11 +201,7 @@ impl App {
                 self.sort = s;
                 self.dirty = true;
             }
-            Cmd::Usage(m) => {
-                self.usage = m;
-                self.status_line = format!("Usage column: {}", m.title());
-                self.dirty = true;
-            }
+            Cmd::Usage(m) => self.set_usage(m),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(
@@ -318,6 +314,7 @@ impl App {
             row(k(Action::Notes), "notes in $EDITOR"),
             row(k(Action::Sort), "next sort"),
             row(k(Action::ReverseSort), "reverse sort"),
+            row(k(Action::Usage), "Usage: turns/tokens/context"),
             row(k(Action::ToggleArchived), "show archived"),
             row(k(Action::ToggleLog), "pane ⇄ log preview"),
             row(k(Action::Quit), "quit"),

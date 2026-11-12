@@ -38,7 +38,9 @@ macro_rules! colors {
         }
     )*};
 }
-colors!(surface, chip, border, text, on_accent, accent, overlord, green, yellow, red, cyan);
+colors!(
+    surface, chip, border, text, on_accent, accent, accent_dim, overlord, green, yellow, red, cyan
+);
 
 pub fn faint_c() -> Color {
     color(palette().faint)

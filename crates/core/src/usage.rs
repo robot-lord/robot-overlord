@@ -33,6 +33,15 @@ impl UsageMetric {
         UsageMetric::Context,
     ];
 
+    /// The next one along (the toolbar's cycle): turns → tokens → context.
+    pub fn next(self) -> Self {
+        match self {
+            UsageMetric::Turns => UsageMetric::Tokens,
+            UsageMetric::Tokens => UsageMetric::Context,
+            UsageMetric::Context => UsageMetric::Turns,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim().to_lowercase().as_str() {
             "turns" | "turn" | "prompts" => UsageMetric::Turns,

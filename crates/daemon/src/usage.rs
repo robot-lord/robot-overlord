@@ -22,11 +22,13 @@ use crate::{methods, Daemon};
 /// More than this left to read: the warm-up reads it, not the request.
 const READ_INLINE_MAX: u64 = 4 << 20;
 
-/// The metric a request asks for (`usage`), else the configured one.
+/// The metric a request asks for (`usage`), else the one the user last
+/// picked (`ui::usage_pref`), else the configured one.
 pub fn metric(d: &Daemon, params: &Value) -> UsageMetric {
     params["usage"]
         .as_str()
         .and_then(UsageMetric::parse)
+        .or_else(|| crate::ui::usage_pref(d))
         .unwrap_or(d.config().usage)
 }
 

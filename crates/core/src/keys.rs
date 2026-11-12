@@ -134,6 +134,7 @@ pub const SLOTS: &[Slot] = &[
     l("toggle_archived", "show archived"),
     l("sort", "sort"),
     l("reverse_sort", "reverse sort"),
+    l("usage", "Usage column: turns/tokens/context"),
     l("toggle_log", "log preview"),
     l("help", "cheat sheet"),
     l("command", "command launcher"),

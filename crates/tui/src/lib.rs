@@ -285,6 +285,17 @@ impl App {
         }
     }
 
+    /// Show `m` in the Usage column (the toolbar, its key, `:usage`), and
+    /// save it with the daemon: it is kept across restarts, over config
+    /// `usage`.
+    fn set_usage(&mut self, m: UsageMetric) {
+        self.usage = m;
+        self.dirty = true;
+        if self.call("ui.usage", json!({"usage": m.label()})).is_some() {
+            self.status_line = format!("Usage column: {}", m.title());
+        }
+    }
+
     fn query(&self) -> Value {
         let mut q = SessionQuery {
             sort: self.sort,
@@ -817,6 +828,7 @@ impl App {
                 self.reverse = !self.reverse;
                 self.dirty = true;
             }
+            Action::Usage => self.set_usage(self.usage.next()),
             Action::ToggleLog => {
                 self.preview = match self.preview {
                     Preview::Pane => Preview::Log,
@@ -1284,8 +1296,9 @@ impl App {
         // column with its arrow); the name gets the rest up to 26; groups
         // and the project only show while names keep a readable width.
         const TAGS_W: u16 = 15;
-        // "Usage ▼": the values (4 wide) right-aligned under "Usage".
-        const USAGE_W: u16 = 7;
+        // The Usage column, headed by its measure: "Tokens ▼" at most
+        // (fixed, so changing the measure moves nothing).
+        const USAGE_W: u16 = 8;
         let sel_w = theme::SELECT_BAR.chars().count() as u16;
         // borders + padding + highlight symbol + number, pin, status + 4 gaps
         let base = 2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4;
@@ -1322,20 +1335,35 @@ impl App {
         // (descending).
         let ascending = arrow_on_name != self.reverse;
         let arrow = if ascending { " ▲" } else { " ▼" };
-        let head = |label: &str, sorted: bool| -> Cell<'static> {
+        // The sorted column: accent, bold, with its arrow. A column whose
+        // content can be switched (the time column follows the sort, Usage
+        // its measure) otherwise reads in the quieter accent; fixed ones
+        // (Name, Status, Groups) plain.
+        let head = |label: &str, sorted: bool, variable: bool| -> Cell<'static> {
             if sorted {
                 Cell::from(format!("{label}{arrow}"))
                     .style(Style::default().fg(theme::accent()).bold())
+            } else if variable {
+                Cell::from(label.to_string()).style(Style::default().fg(theme::accent_dim()))
             } else {
                 Cell::from(label.to_string())
             }
         };
+        // The header names what the column shows ("Usage" alone says
+        // nothing); "Context ▼" wouldn't fit, so sorted it's "Ctx % ▼".
+        let usage_label = match self.usage {
+            UsageMetric::Turns => "Turns",
+            UsageMetric::Tokens => "Tokens",
+            UsageMetric::Context if arrow_on_usage => "Ctx %",
+            UsageMetric::Context => "Context",
+        };
+        let usage_label_w = usage_label.chars().count();
         let mut header = vec![
             Cell::from(""),
             Cell::from(""),
-            head("Name", arrow_on_name),
+            head("Name", arrow_on_name, false),
             Cell::from("Status"),
-            head(time_label, !arrow_on_name && !arrow_on_usage),
+            head(time_label, !arrow_on_name && !arrow_on_usage, true),
         ];
         let mut widths = vec![
             Constraint::Length(1),
@@ -1345,7 +1373,7 @@ impl App {
             Constraint::Length(time_w),
         ];
         if show_usage {
-            header.push(head("Usage", arrow_on_usage));
+            header.push(head(usage_label, arrow_on_usage, true));
             widths.push(Constraint::Length(USAGE_W));
         }
         if show_tags {
@@ -1427,8 +1455,8 @@ impl App {
                     )),
                 ];
                 if show_usage {
-                    // Right-aligned under "Usage"; 4 wide whatever the
-                    // number, so the column never shifts.
+                    // Right-aligned under the header's label; 4 wide
+                    // whatever the number, so the column never shifts.
                     let u = Usage::from_json(&s["usage"]);
                     let text = match &u {
                         Some(u) => u.cell(metric),
@@ -1436,11 +1464,13 @@ impl App {
                         None if s["usage_loading"] == true => format!("{:>4}", "…"),
                         None => rlord_core::usage::cell(None, metric),
                     };
-                    cells.push(Cell::from(format!(" {text}")).fg(if u.is_some() {
-                        theme::text()
-                    } else {
-                        theme::faint_c()
-                    }));
+                    cells.push(
+                        Cell::from(format!("{text:>usage_label_w$}")).fg(if u.is_some() {
+                            theme::text()
+                        } else {
+                            theme::faint_c()
+                        }),
+                    );
                 }
                 if show_tags {
                     let tags = s["tags"]
@@ -2514,6 +2544,8 @@ enum Action {
     ToggleArchived,
     Sort,
     ReverseSort,
+    /// Cycle the Usage column's measure (turns → tokens → context).
+    Usage,
     Filter,
     ToggleLog,
     Describe,
@@ -2656,6 +2688,7 @@ impl KeyMap {
             (Action::ToggleArchived, &k.toggle_archived),
             (Action::Sort, &k.sort),
             (Action::ReverseSort, &k.reverse_sort),
+            (Action::Usage, &k.usage),
             (Action::Filter, &k.filter),
             (Action::ToggleLog, &k.toggle_log),
             (Action::Describe, &k.describe),
@@ -2680,12 +2713,13 @@ impl KeyMap {
                 .any(|(a, o)| *a != me && o.code == b.code && o.ctrl == b.ctrl && o.alt == b.alt)
         };
         let snapshot = bindings.clone();
-        // So do `?` and `:` (help, commands), newer still.
+        // So do `?` and `:` (help, commands) and `U` (usage), newer still.
         let default_step = |a: &Action| {
             (*a == Action::SessionsTab && k.sessions_tab == "H")
                 || (*a == Action::GroupsTab && k.groups_tab == "L")
                 || (*a == Action::Help && k.help == "?")
                 || (*a == Action::Command && k.command == ":")
+                || (*a == Action::Usage && k.usage == "U")
         };
         // Only the defaults give way; a step key the user set is theirs.
         bindings.retain(|(a, b)| !default_step(a) || !taken(b, *a, &snapshot));
