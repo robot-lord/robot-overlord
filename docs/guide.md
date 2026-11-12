@@ -21,7 +21,13 @@ session with rlord's MCP tools (pre-allowed; they act on the real UI you're
 looking at). **Option-O** opens it as an overlay over whatever you're
 looking at; say what you want.
 
-- **A strong model at low effort** (`opus` / `low` by default). It does
+It runs on any of the agents rlord runs: Claude Code, Codex or OpenCode
+(`[overlord] agent`, or the setup dialog's first row). See "Which agent
+runs the overlord" below for what differs.
+
+- **A strong model at low effort** (`opus` / `low` by default on Claude
+  Code; Codex's own default model at `low`; OpenCode's default model, which
+  has no effort setting). It does
   light work itself, in seconds: find and jump to sessions (`goto_session`,
   `show_list`), shape the list (`set_list_view`, groups), edit names, tags,
   notes and descriptions, answer from rlord's data ("what's waiting on
@@ -69,6 +75,36 @@ transcript and compares it with a per-tool table of latest models
 (`crates/core/src/models.rs`). If it is on an older model, a dialog offers
 to switch and restart, and the conversation resumes.
 `rlord overlord status|model <m>|restart|open` does the same from the CLI.
+
+### Which agent runs the overlord
+
+Each agent gets the same thing in its own terms: rlord's tools without a
+prompt, reading without a prompt, and a prompt for anything that writes or
+runs a command.
+
+| | Claude Code | Codex | OpenCode |
+|---|---|---|---|
+| rlord's tools | `--mcp-config` + `--allowedTools` | `-c mcp_servers.rlord.*`, approved by default | `opencode.json` in its folder (`mcp.servers.rlord`) |
+| Everything else | asks (reading is allowed) | read-only sandbox; writes and anything outside it ask | asks (reading is allowed) |
+| Instructions | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` |
+| Subagents (tidy, import) | `.claude/agents` | `.codex/agents` | `.opencode/agents` |
+| Effort | `--effort` | `model_reasoning_effort` | none |
+| Remote Control | yes | no | no |
+| Messaging another session | yes (Claude sessions) | no: it takes you there instead | no: it takes you there instead |
+
+- Nothing is written to your own agent config: Codex gets its settings as
+  command-line overrides (its folder is trusted for that run only), and
+  OpenCode reads the config file in the overlord's own folder.
+- **Codex** runs its hooks only once you've trusted them (`/hooks`); without
+  that the overlord still works, and its status comes from Codex's own
+  files a little later. Codex reports a conversation only with its first
+  prompt, so a just-started overlord shows "your turn" once its screen is
+  up.
+- **OpenCode** runs the overlord's turns in its shared background server,
+  like any OpenCode session.
+- The agent is chosen when the overlord is first set up. An existing
+  overlord keeps its agent: `[overlord] agent` applies only while there is
+  none yet. Moving an existing overlord to another agent isn't built.
 
 **Coming from the two-session overlord** (a front desk plus a "mastermind",
 before 0.21): nothing to do. The mastermind's conversation carries on as
@@ -164,7 +200,9 @@ with `--everywhere`), triage excerpts, archive summaries (written by Codex
 itself, read-only and without saving anything; `[archive]
 codex_summary_model`).
 
-Not yet: the overlord on Codex, importing Codex
+The overlord can run on Codex (see "Which agent runs the overlord").
+
+Not yet: importing Codex
 conversations started outside rlord, passing a message to a Codex session
 from the overlord, sub-agent tracking, Remote Control. A session blocked
 on a permission prompt shows "needs you" only with trusted hooks.
@@ -213,7 +251,9 @@ Good to know:
 - A turn runs in the server: closing the screen stops the rlord session,
   not necessarily the turn.
 
-Not yet: the overlord on OpenCode, importing OpenCode
+The overlord can run on OpenCode (see "Which agent runs the overlord").
+
+Not yet: importing OpenCode
 conversations started outside rlord, passing a message to an OpenCode
 session from the overlord, sub-agent tracking, Remote Control.
 

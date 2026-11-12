@@ -1,4 +1,4 @@
-**Status:** in progress (phases 1 and 2 built on `codex-support`, 0.19.0-dev.1; phases 3 and 4 to come)
+**Status:** in progress (phases 1 and 2 built, 0.19.0-dev.1; phase 4, the overlord on Codex, built on `codex-overlord`, 0.22.0-dev.1; phase 3 to come)
 
 # Codex CLI support
 
@@ -39,13 +39,10 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
    read, excerpts, stats; archive summaries.
 3. **Codex extras.** Import from `threads`; models catalog; `send_to_session`
    via `codex queue` (and the Claude path); sub-agents.
-4. **A Codex overlord.** `[overlord] agent = "codex"`. (The overlord is one
-   session now. Its Codex defaults are in place: Codex's default model
-   with `-c model_reasoning_effort="low"`, `overlord::effort_args`. What's
-   missing is the MCP and tool-approval wiring, then `Agent::runs_overlord`.)
-   **Requirement before the repo goes public (Brandon's decision):** the
-   overlord must run on Codex, and preferably on OpenCode too. That is the
-   next work after the single-overlord PR (#7).
+4. **A Codex overlord.** `[overlord] agent = "codex"`. Built: see "Phase 4"
+   under Progress. **Requirement before the repo goes public (Brandon's
+   decision):** the overlord must run on Codex, and preferably on OpenCode
+   too. Both do now.
 5. Later: Codex Remote Control, key shadows, Gemini.
 
 ## Decisions (with Brandon)
@@ -157,6 +154,65 @@ After the PR's code review:
 - Clicks that stop, restart or archive ask first; menus and double-clicks
   go by session id.
 
+### Phase 4: the overlord on Codex (branch `codex-overlord`)
+
+How it works is in `docs/architecture.md` ("The overlord") and the guide
+("Which agent runs the overlord"). What was found on the way, against
+codex-cli 0.167.2:
+
+- **Wiring** (`codex::overlord_args`, all `-c` overrides, nothing written
+  under `~/.codex`): `mcp_servers.rlord.command` / `args` / `env_vars`,
+  `mcp_servers.rlord.default_tools_approval_mode="approve"` (values
+  `auto | prompt | writes | approve`, from `codex app-server
+  generate-json-schema`), `sandbox_mode="read-only"`,
+  `approval_policy="on-request"`, and the folder's trust.
+- **Folder trust**: `-c 'projects."<dir>".trust_level="trusted"'` is
+  accepted and ignored (Codex still shows "Trust this folder?"). The whole
+  table works: `-c 'projects={"<dir>"={trust_level="trusted"}}'`.
+- **Environment**: Codex starts an MCP server with a short list of
+  variables; `env_vars` passes on `RLORD_SESSION_ID` and the XDG dirs.
+- **AGENTS.md** in the folder is loaded (`codex debug prompt-input` shows
+  it, with no model call; that command takes `-c` only, not `-s` / `-a`).
+- **Subagents**: `.codex/agents/<name>.toml` (`name`, `description`,
+  `developer_instructions`; `model_reasoning_effort = "low"`). They
+  inherit the overlord's MCP servers and approvals and can't narrow them.
+  A hyphen in the name is fine.
+- **Codex reports nothing until a prompt**: no thread, no SessionStart,
+  for a new conversation before its first prompt or a resumed one before
+  its next. The overlord starts without a prompt and `ask` waits for it to
+  leave "starting", so `discover` now settles both (a promptless launch
+  becomes "your turn" once its pane has been up 4s; a hook-confirmed
+  session still "starting" is read from its transcript). This also fixes
+  ordinary promptless and resumed Codex sessions, which stayed "starting".
+- An overlord that stopped with no conversation bound starts fresh.
+- The setup dialog lists Codex when installed; its Remote Control row is
+  only shown for an agent that has it.
+
+Verified live (one throwaway overlord in a scratch rlord, its own XDG dirs
+and tmux socket; the three Codex threads deleted afterwards):
+
+- `rlord overlord ask` → `rlord.list_sessions` called with no approval
+  prompt, answered from the scratch daemon (so the socket's environment
+  reached the server); the call's `caller` was the overlord's session id.
+- Hooks: SessionStart bound the thread; UserPromptSubmit / Stop gave
+  working / your turn.
+- `rlord overlord restart` → `codex resume <id>` with the same overrides;
+  the conversation was back; status settled to "your turn".
+- `/clear` → the next prompt's SessionStart carried `source: "clear"`:
+  logged as `fresh_conversation` (`reason: clear`), new thread bound.
+- "Start a tidy pass" → `spawn_agent` with `agent_type: "rlord-tidy"`
+  (Codex's index: `agent_role = rlord-tidy`, `thread_source = subagent`);
+  it called `triage` and `list_groups` with no prompt, and its thread did
+  not rebind the overlord.
+- "Run `touch probe.txt`" → Codex asked ("Would you like to run the
+  following command?"), rlord showed "needs you", nothing was written.
+
+Not exercised: the idle fresh restart by the keeper (it is `session_fresh`,
+the same call the unbound start made live), "continue it" from the list
+(`codex resume <earlier id>`, the same argv as restart), a Codex overlord
+whose hooks aren't trusted (bound from the index, like any Codex session),
+and `rlord-import`.
+
 Unverified against a real Codex run: that hooks fire with these payload
 fields for an interactive session, that SessionStart is not fired for
 sub-agent threads, `thread_source = 'user'` for user threads only, and the
@@ -181,6 +237,15 @@ Known limits, accepted:
   scratch setups set it, with a stand-in `SHELL`).
 
 ## Owed
+
+- The overlord on Codex can't pass a message to another session (it has no
+  peer tools; `overlord.md` tells it to take the user there). `codex queue
+  --thread <id> --message …` as an rlord tool (phase 3) would give every
+  overlord that, whichever agent it runs on.
+- Moving an existing overlord to another agent (the agent is fixed when it
+  is first set up).
+- A Codex subagent can't be given a narrower tool list or a cheaper model
+  by name (only a lower effort); revisit if Codex's agent files grow that.
 
 - Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
   demo session and the form's Agent hint.

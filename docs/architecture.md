@@ -181,8 +181,8 @@ facts live in its module) is what the rest of rlord asks:
   questions from the database (opened read-only; only those two tables,
   since the database also holds OpenCode's credentials).
 - **Capabilities**: `has_remote_control`, `tracks_subagents`,
-  `runs_overlord`, `importable` (all Claude-only today; callers ask instead
-  of comparing names).
+  `runs_overlord`, `importable` (callers ask instead of comparing names).
+  Every agent runs the overlord; the other three are Claude-only today.
 
 Status has more than one source, and that is not part of `Agent`: hook
 events (`methods::hook_emit`); for agents not reporting through hooks
@@ -498,12 +498,50 @@ resumes: the folder is the session's `project_path`, never assumed). Each
 `ensure`
 regenerates that folder's `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` (the same
 standing instructions under each agent's file name: the built-in
-`daemon/src/overlord.md` plus the user's `overlord.md`) and `mcp.json`. These
-are project files, so each agent still loads the user's own global
-instructions too. Its adapter flags (`--mcp-config`,
-`--allowedTools mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage`, `--effort`) ride in
-`launch_spec.extra_args`, so resume reuses them; they are rewritten on every
-`ensure` and fresh restart, so a config change reaches it at its next start.
+`daemon/src/overlord.md` plus the user's `overlord.md`), each agent's MCP
+config and each agent's subagent files (`overlord::write_files`; every
+agent's are written, whichever runs it). These are project files, so each
+agent still loads the user's own global instructions too. Its adapter flags
+ride in `launch_spec.extra_args`, so resume reuses them; they are rewritten
+on every `ensure` and fresh restart, so a config change reaches it at its
+next start.
+
+Any agent can run it (`Agent::runs_overlord`). The surface is the same for
+each, in its own terms: rlord's tools without a prompt, reading without a
+prompt, a prompt for anything that writes or runs a command.
+
+| | MCP server and its tools | Everything else | Subagents |
+|---|---|---|---|
+| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage` | asks | `.claude/agents/*.md` |
+| Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"` | `.codex/agents/*.toml` |
+| OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`/`subagent`/`execute`/`rlord_*` allow (last match wins) | `.opencode/agents/*.md` |
+
+Things that are not visible at the call site:
+
+- **Codex gives an MCP server only a short list of environment variables.**
+  `env_vars` names the ones `rlord mcp` needs (`codex::MCP_ENV`: the
+  session id and the XDG dirs that locate the daemon's socket).
+- **Codex's folder trust is passed as a whole table**
+  (`-c 'projects={"<dir>"={trust_level="trusted"}}'`): a dotted override
+  path can't hold a quoted key, and without trust Codex stops at a "trust
+  this folder?" screen and ignores `.codex/agents`. It applies to that run
+  only; nothing is written under `~/.codex`.
+- **OpenCode's MCP server process belongs to its shared server**, not the
+  pane, so `opencode.json` carries the daemon's XDG dirs in `environment`.
+  OpenCode calls MCP tools from a Code Mode script (`execute`), hence that
+  rule; each tool in the script is still checked.
+- **Codex reports nothing until a prompt.** It creates the conversation,
+  and runs SessionStart, with the first prompt of a new conversation and
+  the next prompt of a resumed one. `ask` types into the overlord only once
+  it has left `starting`, so `daemon::discover` settles such a session once
+  its pane has been up a moment (`first_prompt_due`, and `follow` for a
+  hook-confirmed session that is still starting). An overlord that stopped
+  with no conversation bound starts fresh rather than failing to resume.
+- Subagent definitions are kept once, in Claude's format (`tidy.md`,
+  `import.md`), and converted (`overlord::subagent_parts`). A Codex or
+  OpenCode subagent inherits the overlord's tools: only Claude's file can
+  narrow them. A plain copy goes to `<folder>/subagents/` for an overlord
+  that can't start one.
 
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's pane (bracketed paste, then Enter), waiting out `starting` after
@@ -543,8 +581,9 @@ instructions too. Its adapter flags (`--mcp-config`,
   the head and tail of the file). Overlord edits through `update_session` /
   `organize`, and `overlord.mark_reviewed`, advance the watermark.
   The overlord delegates tidy passes to the `rlord-tidy` subagent
-  (`daemon/src/tidy.md`, written to `<data>/overlord/.claude/agents/`), which
-  runs in the background with its own context and a narrow tool list.
+  (`daemon/src/tidy.md`, written to the overlord's folder in each agent's
+  subagent format), which runs in the background with its own context (and,
+  on Claude, a narrow tool list).
 - **Import** (`core/src/import.rs`, `daemon/src/import.rs`): finds agent
   conversations rlord doesn't track, from the agents' own transcripts (Claude:
   `~/.claude/projects/<cwd slug>/<uuid>.jsonl`), with no AI and nothing
