@@ -52,33 +52,31 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let ws = words(query);
     let everywhere = params["scope"].as_str() == Some("all");
     let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
-    let (sessions, sources) = {
-        let db = d.db();
+    let sessions = {
         let q = SessionQuery {
             archived: ArchivedMode::All,
             ..Default::default()
         };
-        (db.sessions(&q)?, db.transcript_sources()?)
+        d.db().sessions(&q)?
     };
-    let sources: HashMap<String, String> = sources.into_iter().collect();
-    // Each session's transcript (known, or where Claude would write it).
-    // Each session's transcripts: the current one and any from before a
-    // `/clear`.
+    // Each session's transcripts: the current one, then any from before a
+    // `/clear`. Searched in that order, so a session's hits start with its
+    // current transcript. (Not the overlord's own.)
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut paths_of: HashMap<usize, Vec<PathBuf>> = HashMap::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for (i, s) in sessions.iter().enumerate() {
-        let mut ps = summary::transcripts_of(d, s);
-        if ps.is_empty() {
-            if let Some(p) = sources.get(&s.id).map(PathBuf::from).filter(|p| p.exists()) {
-                ps.push(p);
-            }
+        if crate::overlord::is_overlord_role(&s.role) {
+            continue;
         }
+        let ps = summary::transcripts_of(d, s);
         for p in &ps {
-            by_path.insert(p.clone(), i);
+            if by_path.insert(p.clone(), i).is_none() {
+                paths.push(p.clone());
+            }
         }
         paths_of.insert(i, ps);
     }
-    let mut paths: Vec<PathBuf> = by_path.keys().cloned().collect();
     if everywhere {
         paths.extend(
             history::all_claude_transcripts()

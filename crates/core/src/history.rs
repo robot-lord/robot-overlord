@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::sinks::UTF8;
+use grep_searcher::sinks::Lossy;
 use grep_searcher::SearcherBuilder;
 use serde::Serialize;
 use serde_json::Value;
@@ -117,14 +117,18 @@ fn words(query: &str) -> Vec<String> {
 /// `text` around the first word, about `width` characters.
 fn snippet(text: &str, first: &str, width: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = flat.to_lowercase();
+    let chars: Vec<char> = flat.chars().collect();
+    // Lowercase one character for one (some grow, e.g. İ), so positions
+    // in it are positions in `chars`.
+    let lower: String = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
     let Some(byte) = lower.find(first) else {
         return clip(&flat, width);
     };
-    // Lowercasing can change byte lengths: work in characters.
     let at = lower[..byte].chars().count();
-    let start = at.saturating_sub(width / 3);
-    let chars: Vec<char> = flat.chars().collect();
+    let start = at.saturating_sub(width / 3).min(chars.len());
     let end = (start + width).min(chars.len());
     format!(
         "{}{}{}",
@@ -143,17 +147,22 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
         return Vec::new();
     }
     // The rarest word would be ideal; the longest is a fine stand-in: the
-    // searcher finds lines with it, the JSON check confirms the rest.
+    // searcher finds lines with it, the JSON check confirms the rest. A
+    // word with `"` or `\` is spelled differently in the raw JSON line, so
+    // it can't be the one; with no other, every line is checked.
     let key = ws
         .iter()
+        .filter(|w| !w.contains(['"', '\\']))
         .max_by_key(|w| w.len())
-        .cloned()
-        .unwrap_or_default();
-    let Ok(matcher) = RegexMatcherBuilder::new()
-        .case_insensitive(true)
-        .fixed_strings(true)
-        .build(&key)
-    else {
+        .cloned();
+    let built = match &key {
+        Some(k) => RegexMatcherBuilder::new()
+            .case_insensitive(true)
+            .fixed_strings(true)
+            .build(k),
+        None => RegexMatcherBuilder::new().build("^"),
+    };
+    let Ok(matcher) = built else {
         return Vec::new();
     };
     let mut searcher = SearcherBuilder::new().line_number(true).build();
@@ -167,7 +176,8 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
         let _ = searcher.search_path(
             &matcher,
             path,
-            UTF8(|line, raw| {
+            // Lossy: one bad byte mustn't end the file's search.
+            Lossy(|line, raw| {
                 let Ok(v) = serde_json::from_str::<Value>(raw) else {
                     return Ok(true);
                 };
@@ -254,14 +264,26 @@ pub fn read(
     } else {
         all.len()
     };
+    let window: Vec<Message> = all.drain(start..end).collect();
+    // Over budget, keep what matters: from the line on, or (no line) the
+    // newest messages.
+    let newest_first = line.is_none();
     let mut out = Vec::new();
     let mut used = 0;
-    for m in all.drain(start..end) {
+    let ordered: Box<dyn Iterator<Item = Message>> = if newest_first {
+        Box::new(window.into_iter().rev())
+    } else {
+        Box::new(window.into_iter())
+    };
+    for m in ordered {
         used += m.text.len();
         if used > budget && !out.is_empty() {
             break;
         }
         out.push(m);
+    }
+    if newest_first {
+        out.reverse();
     }
     Ok(out)
 }
@@ -345,8 +367,11 @@ mod tests {
         // No line: the last ones.
         let w = read(&p, None, 2, 0, 10_000).unwrap();
         assert_eq!(w.iter().map(|m| m.line).collect::<Vec<_>>(), [3, 5]);
-        // The budget stops it (one message always comes back).
-        assert_eq!(read(&p, Some(1), 0, 10, 10).unwrap().len(), 1);
+        // The budget stops it (one message always comes back): from the
+        // line on, or the newest without one.
+        assert_eq!(read(&p, Some(1), 0, 10, 10).unwrap()[0].line, 1);
+        let w = read(&p, None, 10, 0, 10).unwrap();
+        assert_eq!(w.iter().map(|m| m.line).collect::<Vec<_>>(), [5]);
     }
 
     #[test]
@@ -354,5 +379,8 @@ mod tests {
         let long = format!("{} needle {}", "a ".repeat(300), "b ".repeat(300));
         let s = snippet(&long, "needle", 60);
         assert!(s.starts_with('…') && s.ends_with('…') && s.contains("needle"));
+        // Characters that grow when lowercased don't throw it off.
+        let turkish = format!("{} needle", "İ".repeat(400));
+        assert!(snippet(&turkish, "needle", 60).contains("needle"));
     }
 }

@@ -386,7 +386,8 @@ impl Daemon {
         // Archived: write down what it did (once, in the background).
         if method == "session.archive" && r.is_ok() && self.config().archive.summary {
             if let Ok(s) = self.db().resolve_ref(params["ref"].as_str().unwrap_or("")) {
-                summary::enqueue(self, &s.id, false);
+                // Archived again after more work: a new summary.
+                summary::enqueue(self, &s.id, true);
             }
         }
         if method == "session.unarchive" && r.is_ok() {
@@ -529,10 +530,7 @@ impl Daemon {
                     .db()
                     .kv_set("ui_selected", id)
                     .map(|_| json!({"id": id})),
-                None => self
-                    .db()
-                    .kv_get("ui_selected")
-                    .map(|v| json!({"id": v})),
+                None => self.db().kv_get("ui_selected").map(|v| json!({"id": v})),
             },
             "ui.view.report" => {
                 *self.ui_view.lock().expect("ui mutex") =

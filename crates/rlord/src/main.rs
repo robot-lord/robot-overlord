@@ -1255,6 +1255,10 @@ fn print_search(v: &Value) {
                 x["who"].as_str().unwrap_or(""),
                 x["snippet"].as_str().unwrap_or("")
             );
+            // A hit in an older (pre-/clear) transcript: read it by path.
+            if let Some(t) = x["transcript"].as_str() {
+                println!("           in {t}");
+            }
         }
     };
     for r in &rows {
@@ -1296,7 +1300,7 @@ fn print_search(v: &Value) {
         );
         hits(&r["hits"]);
     }
-    println!("\nread around a hit: rlord history <session> --around <line>");
+    println!("\nread around a hit: rlord history <session or transcript path> --around <line>");
 }
 
 fn call(method: &str, params: Value) -> Result<Value> {
