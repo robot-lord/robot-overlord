@@ -50,7 +50,11 @@ if gh release view "$tag" -R "$repo" >/dev/null 2>&1 || git ls-remote --exit-cod
   echo "$tag already exists — bump the version in Cargo.toml" >&2; exit 1
 fi
 
-stage=$(mktemp -d)
+# Under the checkout, not the system temp dir: Docker on the Mac (colima)
+# only sees the home folder, and the smoke test mounts these files. (macOS
+# mktemp ignores TMPDIR.)
+mkdir -p target
+stage=$(mktemp -d "$PWD/target/release.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 dist=$stage/dist
 mkdir -p "$dist"
@@ -86,12 +90,14 @@ if [[ $dev == 0 ]]; then
     cargo deb -p robot-overlord --target "$t" --no-build --no-strip --output "$dist/" >/dev/null
     cargo generate-rpm -p crates/rlord --target "$t" --auto-req disabled -o "$dist/" >/dev/null
   done
-  if [[ $smoke == 1 ]]; then
-    scripts/smoke-linux.sh "$dist"
-  fi
 fi
 
+# Checksums before the smoke test: the installer it runs verifies them.
 (cd "$dist" && shasum -a 256 -- * > SHA256SUMS)
+
+if [[ $dev == 0 && $smoke == 1 ]]; then
+  scripts/smoke-linux.sh "$dist"
+fi
 
 flags=(--generate-notes --title "$tag" --target "$head")
 [[ $dev == 1 ]] && flags+=(--prerelease)
