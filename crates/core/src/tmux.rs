@@ -719,6 +719,34 @@ pub fn buffer_text(name: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The keys a key table binds to entering copy mode (`copy-mode`, with
+/// at most `-u`/`-e`): (key spec as tmux lists it, whether it scrolls up a
+/// page on entry). The user's own bindings, honoured by the overlay.
+pub fn copy_mode_bindings(table: &str) -> Vec<(String, bool)> {
+    let Ok(out) = run(&["list-keys", "-T", table]) else {
+        return vec![];
+    };
+    out.lines()
+        .filter_map(|l| {
+            let mut t = l.split_whitespace();
+            t.next().filter(|w| *w == "bind-key")?;
+            let mut w = t.next()?;
+            if w == "-r" {
+                w = t.next()?;
+            }
+            (w == "-T").then_some(())?;
+            t.next()?; // the table
+            let key = t.next()?.replace('\\', "");
+            (t.next()? == "copy-mode").then_some(())?;
+            let flags: Vec<&str> = t.collect();
+            flags
+                .iter()
+                .all(|f| matches!(*f, "-u" | "-e" | "-eu" | "-ue"))
+                .then(|| (key, flags.iter().any(|f| f.contains('u'))))
+        })
+        .collect()
+}
+
 /// Put a pane in copy mode (no-op if it already is).
 pub fn copy_mode(pane: &str) -> Result<()> {
     run(&["copy-mode", "-t", pane])?;

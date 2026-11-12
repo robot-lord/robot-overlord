@@ -1065,7 +1065,8 @@ impl App {
         let arrow = if ascending { " ▲" } else { " ▼" };
         let head = |label: &str, sorted: bool| -> Cell<'static> {
             if sorted {
-                Cell::from(format!("{label}{arrow}")).style(Style::default().fg(theme::accent()).bold())
+                Cell::from(format!("{label}{arrow}"))
+                    .style(Style::default().fg(theme::accent()).bold())
             } else {
                 Cell::from(label.to_string())
             }

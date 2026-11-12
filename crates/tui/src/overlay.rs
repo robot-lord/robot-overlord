@@ -81,6 +81,15 @@ fn run_loop(
     // popup: the overlay reads them itself.
     let vi = tmux::session_option(seat.tmux, "mode-keys").is_ok_and(|m| m == "vi");
     let mut prompt: Option<Prompt> = None;
+    // The user's own keys into copy mode: the session's key table (e.g.
+    // M-a) and after the prefix (e.g. a, PPage; `[` always).
+    let table = tmux::session_option(seat.tmux, "key-table")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "root".into());
+    let direct_copy = tmux::copy_mode_bindings(&table);
+    let mut prefixed_copy = tmux::copy_mode_bindings("prefix");
+    prefixed_copy.push(("[".into(), false));
     // The newest paste buffer when copy mode began: a new one when it ends
     // goes to the clipboard (a yank to tmux's buffer alone would otherwise
     // reach no client: none shows the seat's window).
@@ -89,6 +98,46 @@ fn run_loop(
     // which its selection lines count in (taken just before the overlay
     // enters it; on first sight if it was entered elsewhere).
     let mut history_at_entry: Option<i64> = None;
+    // Where copy mode is in the history (tmux draws its own `[n/m]`
+    // marker on the client, not into a capture): shown in the mode's bar.
+    let mut position = (0i64, 0i64);
+    // `touch <runtime dir>/overlay-debug` logs the events the overlay gets
+    // (to find why a key does nothing on some terminal setup).
+    let debug_log = {
+        let dir = paths::runtime_dir();
+        dir.join("overlay-debug")
+            .exists()
+            .then(|| dir.join("overlay-debug.log"))
+    };
+    let log = |what: &str| {
+        if let Some(p) = &debug_log {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let _ = writeln!(f, "{what}");
+            }
+        }
+    };
+    log(&format!(
+        "start: prefix={prefix:?} vi={vi} copy keys: {direct_copy:?} prefix+{prefixed_copy:?}"
+    ));
+    // Enter copy mode (scrolled up a page for `copy-mode -u`).
+    let enter = |up: bool, history_at_entry: &mut Option<i64>, error: &mut Option<String>| {
+        *history_at_entry = tmux::history_size(pane);
+        let r = tmux::copy_mode(pane).and_then(|_| {
+            if up {
+                tmux::send_keys(pane, &["-X", "page-up"])
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = r {
+            *error = Some(format!("{e:#}"));
+        }
+    };
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
@@ -133,7 +182,11 @@ fn run_loop(
                             }
                         }
                     }
+                    if f.in_mode != in_mode {
+                        log(&format!("pane in_mode={}", f.in_mode));
+                    }
                     in_mode = f.in_mode;
+                    position = (f.scroll, history_at_entry.unwrap_or(f.history));
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
                     let on_screen = f
                         .selection
@@ -159,7 +212,17 @@ fn run_loop(
                 ),
                 None => {
                     f.render_widget(Paragraph::new(screen.clone()), a);
-                    if let Some(p) = &prompt {
+                    // Copy mode looks like the live screen at the bottom of
+                    // the history: say so, with its keys.
+                    let bar = match &prompt {
+                        Some(p) => Some(p.label()),
+                        None if in_mode => Some(format!(
+                            " COPY [{}/{}]  space/v select · y copy · / ? search · q leave",
+                            position.0, position.1,
+                        )),
+                        None => None,
+                    };
+                    if let Some(text) = bar {
                         let row = ratatui::layout::Rect::new(
                             a.x,
                             a.y + a.height.saturating_sub(1),
@@ -167,7 +230,7 @@ fn run_loop(
                             1,
                         );
                         f.render_widget(
-                            Paragraph::new(p.label()).style(
+                            Paragraph::new(text).style(
                                 ratatui::style::Style::default()
                                     .fg(Color::Black)
                                     .bg(Color::Yellow),
@@ -184,7 +247,13 @@ fn run_loop(
         if !event::poll(Duration::from_millis(FRAME_MS / 2))? {
             continue;
         }
-        match event::read()? {
+        let ev = event::read()?;
+        if !matches!(ev, Event::Mouse(_)) {
+            log(&format!(
+                "event {ev:?} after_prefix={after_prefix} in_mode={in_mode}"
+            ));
+        }
+        match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 // A prompt open in copy mode takes the keys.
                 if let Some(p) = prompt.as_mut() {
@@ -216,12 +285,11 @@ fn run_loop(
                 });
                 if after_prefix {
                     after_prefix = false;
-                    if k.code == KeyCode::Char('[') {
+                    if let Some((_, up)) =
+                        prefixed_copy.iter().find(|(spec, _)| key_matches(spec, &k))
+                    {
                         if !in_mode {
-                            history_at_entry = tmux::history_size(pane);
-                            if let Err(e) = tmux::copy_mode(pane) {
-                                error = Some(format!("{e:#}"));
-                            }
+                            enter(*up, &mut history_at_entry, &mut error);
                         }
                         last = Instant::now() - Duration::from_secs(1);
                         continue;
@@ -237,6 +305,15 @@ fn run_loop(
                 } else if is_prefix {
                     after_prefix = true;
                     continue;
+                } else if !in_mode {
+                    // The user's direct key into copy mode (e.g. M-a).
+                    if let Some((_, up)) =
+                        direct_copy.iter().find(|(spec, _)| key_matches(spec, &k))
+                    {
+                        enter(*up, &mut history_at_entry, &mut error);
+                        last = Instant::now() - Duration::from_secs(1);
+                        continue;
+                    }
                 }
                 // vi copy mode's prompt keys.
                 if in_mode && vi && k.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -485,6 +562,42 @@ struct SeatKeys {
     overlord: Option<(bool, bool, char)>,
     mastermind: Option<(bool, bool, char)>,
     close: Option<(bool, bool, char)>,
+}
+
+/// Whether a key event is the tmux key `spec` (`M-a`, `a`, `[`, `C-Space`,
+/// `PPage`, …).
+fn key_matches(spec: &str, k: &KeyEvent) -> bool {
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let named = |rest: &str| match rest {
+        "PPage" | "PageUp" => Some(KeyCode::PageUp),
+        "NPage" | "PageDown" => Some(KeyCode::PageDown),
+        "Enter" => Some(KeyCode::Enter),
+        "Escape" => Some(KeyCode::Esc),
+        "Home" => Some(KeyCode::Home),
+        "End" => Some(KeyCode::End),
+        _ => None,
+    };
+    // Modifiers, then a character or a named key.
+    let (mut a, mut c, mut rest) = (false, false, spec);
+    loop {
+        if let Some(r) = rest.strip_prefix("M-") {
+            a = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("C-") {
+            c = true;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    if (a, c) != (alt, ctrl) {
+        return false;
+    }
+    if let Some(code) = named(rest) {
+        return k.code == code;
+    }
+    parse_key(rest).is_some_and(|(_, _, ch)| k.code == KeyCode::Char(ch))
 }
 
 /// A tmux key spec (`M-o`, `C-g`, `M-C-x`) as (alt, ctrl, char).
