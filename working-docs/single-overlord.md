@@ -7,7 +7,11 @@ Opus mastermind) was overcomplicated. Go back to one overlord session.
 
 ## Shape
 
-- The current **mastermind becomes the overlord**: Opus, medium effort, fresh
+- The current **mastermind becomes the overlord**: Opus, **low effort**
+  (an experiment the user asked for: a smart model at low effort feels like
+  the right balance for the overlord; if it proves too dumb, go back to
+  Opus at medium). Same idea for other agents: Codex
+  `model_reasoning_effort = "low"`, OpenCode the matching low variant. Fresh
   restart after idle (`mastermind_fresh_after_mins` → the overlord's),
   Remote Control always available (shown as "rlord overlord").
 - Removed: the Sonnet front desk seat, `hand_off`, Option-M / seat switching
@@ -16,7 +20,8 @@ Opus mastermind) was overcomplicated. Go back to one overlord session.
 - Migration: the mastermind's conversation becomes the overlord's (role and
   tmux name renamed); the old front-desk session is stopped and archived.
   Old config keys (`mastermind_model`, `mastermind_effort`) map onto the
-  overlord's; an explicit `[overlord] model` still wins.
+  overlord's; an explicit `[overlord] model` / `effort` still wins. A user's
+  explicit `mastermind_effort` carries over; only the default changes to low.
 - `n` (new session) goes straight to the overlord.
 
 ## How the overlord routes a request (the heart of overlord.md)
