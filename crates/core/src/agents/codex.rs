@@ -170,14 +170,16 @@ pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str, confirm_sends: bo
 /// in the history, not the input. Startup screens before it (an update
 /// prompt, a login, a trust question) and an approval don't count.
 pub fn composer_shown(screen: &str) -> bool {
-    let bottom: Vec<&str> = super::bottom_lines(screen, 6).collect();
-    if bottom.iter().any(|l| dialog_footer(l)) {
-        return false;
+    // A dialog's footer sits under its choices: only lines below the
+    // lowest `›` count (the same words in the transcript above don't).
+    let mut footer = false;
+    for l in super::bottom_lines(screen, 6) {
+        if let Some(rest) = l.strip_prefix('›') {
+            return !footer && !super::numbered_choice(rest.trim_start());
+        }
+        footer |= dialog_footer(l);
     }
-    bottom
-        .iter()
-        .find_map(|l| l.strip_prefix('›'))
-        .is_some_and(|rest| !super::numbered_choice(rest.trim_start()))
+    false
 }
 
 /// A dialog's own footer ("Press enter to confirm or esc to cancel", an
@@ -740,6 +742,14 @@ pub fn summary_argv(model: &str, fork: Option<(&str, &str)>, out: &Path) -> Vec<
 mod tests {
     use super::super::transcript::{self, Format};
     use super::*;
+
+    #[test]
+    fn footer_words_in_the_transcript_dont_hide_the_composer() {
+        let idle = "• Press esc to cancel, or enter to submit.\n\n› \n\n  ? for shortcuts    100% context left";
+        assert!(composer_shown(idle));
+        let dialog = "Allow it?\n› 1. Yes\n  2. No\n  Press enter to confirm or esc to cancel";
+        assert!(!composer_shown(dialog));
+    }
     use serde_json::json;
 
     /// A rollout as Codex 0.167 writes one: two turns, a tool call, the
