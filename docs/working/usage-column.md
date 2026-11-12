@@ -1,4 +1,4 @@
-**Status:** in progress (built on `usage-column`, 0.22.0-dev.2; PR #9 open, review fixes in)
+**Status:** shipped (0.22.0-dev.2, PR #9; toggle and persistence 0.22.0-dev.5, PR #12). Owed items are tracked in `public-launch.md`.
 
 # Usage column
 

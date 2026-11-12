@@ -1,0 +1,8 @@
+# cargo-deny (CI's `advisories` job): known-vulnerable dependencies fail
+# the build. An exception needs a reason and should be revisited.
+[advisories]
+ignore = [
+  # `paste` is unmaintained, not vulnerable: a compile-time proc macro
+  # pulled in by ratatui 0.29. Drop this once ratatui no longer uses it.
+  { id = "RUSTSEC-2024-0436", reason = "build-time proc macro via ratatui; no known vulnerability" },
+]
