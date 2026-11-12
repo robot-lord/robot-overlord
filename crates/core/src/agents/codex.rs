@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use super::transcript::{clip, Title, Usage};
-use super::Effect;
+use super::{Effect, Indexed};
 use crate::types::Status;
 
 /// `~/.codex` or `$CODEX_HOME`.
@@ -184,17 +184,37 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
     }
 }
 
-/// Whether thread `id` is one the user drives (not a sub-agent's), from
-/// the index. None when the index doesn't know it (yet).
-pub fn is_user_thread(home: &Path, id: &str) -> Option<bool> {
-    open_state(home)?
+/// What the index says about thread `id`: the user's, or a sub-agent's.
+/// An older Codex's index doesn't say whose a thread is: there a listed
+/// thread counts as the user's.
+pub fn thread_kind(home: &Path, id: &str) -> Indexed {
+    use rusqlite::OptionalExtension;
+    let Some(c) = open_state(home) else {
+        return Indexed::NoIndex;
+    };
+    let source = c
         .query_row(
             "SELECT thread_source FROM threads WHERE id = ?1",
             [id],
             |r| r.get::<_, Option<String>>(0),
         )
-        .ok()
-        .map(|source| source.is_none_or(|s| s == "user"))
+        .optional();
+    match source {
+        Ok(Some(source)) if source.as_deref().is_none_or(|s| s == "user") => Indexed::User,
+        Ok(Some(_)) => Indexed::SubAgent,
+        Ok(None) => Indexed::NotListed,
+        // No such column: is the thread there at all?
+        Err(_) => {
+            let listed = c
+                .query_row("SELECT 1 FROM threads WHERE id = ?1", [id], |_| Ok(()))
+                .optional();
+            match listed {
+                Ok(Some(())) => Indexed::User,
+                Ok(None) => Indexed::NotListed,
+                Err(_) => Indexed::NoIndex, // not an index rlord can read
+            }
+        }
+    }
 }
 
 /// The folder each indexed rollout's conversation ran in (one query).
@@ -883,9 +903,13 @@ mod tests {
                 .as_deref(),
             Some("fix it")
         );
-        assert_eq!(is_user_thread(dir.path(), "mine"), Some(true));
-        assert_eq!(is_user_thread(dir.path(), "sub"), Some(false));
-        assert_eq!(is_user_thread(dir.path(), "unknown"), None);
+        assert_eq!(thread_kind(dir.path(), "mine"), Indexed::User);
+        assert_eq!(thread_kind(dir.path(), "sub"), Indexed::SubAgent);
+        assert_eq!(thread_kind(dir.path(), "unknown"), Indexed::NotListed);
+        assert_eq!(
+            thread_kind(&dir.path().join("absent"), "mine"),
+            Indexed::NoIndex
+        );
         let folders = rollout_folders(dir.path()).unwrap();
         assert_eq!(folders[Path::new("/r/other.jsonl")], "/src/web");
         assert_eq!(folders.len(), 6);
@@ -903,6 +927,9 @@ mod tests {
         let found = threads_started_in(old.path(), "/src/app", 4000);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].first_user_message, None);
+        // It doesn't say whose a thread is: one it lists is the user's.
+        assert_eq!(thread_kind(old.path(), "a"), Indexed::User);
+        assert_eq!(thread_kind(old.path(), "b"), Indexed::NotListed);
         assert!(threads_started_in(dir.path(), "/src/none", 0).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0).is_empty());

@@ -391,6 +391,8 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     if overlay_on_it || attached {
         return Ok(());
     }
+    // (Where the agent's command is: asked before any lock is taken.)
+    rlord_core::agents::install::warm();
     {
         // No hand-off may paste into the pane while it's being replaced.
         let _send = d.mastermind_send.lock().expect("mastermind send lock");

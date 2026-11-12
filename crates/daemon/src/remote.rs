@@ -461,6 +461,8 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
             return Ok(false);
         }
     }
+    // (Where the agent's command is: asked before the DB lock is taken.)
+    rlord_core::agents::install::warm();
     methods::session_restart(&d.db(), &json!({"ref": id}))?;
     d.changed();
     Ok(true)

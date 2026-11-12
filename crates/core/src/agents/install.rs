@@ -189,8 +189,14 @@ static ASKED: std::sync::LazyLock<std::sync::Mutex<Asked>> =
 const ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn asked(bin: &str, max_age: Option<std::time::Duration>) -> Option<Option<PathBuf>> {
-    let asked = ASKED.lock().ok()?;
+    let mut asked = ASKED.lock().ok()?;
     let (at, found) = asked.get(bin)?;
+    // A path that has since gone (uninstalled, moved) is no answer: forget
+    // it, so the shell is asked again.
+    if found.as_ref().is_some_and(|p| !p.is_file()) {
+        asked.remove(bin);
+        return None;
+    }
     max_age
         .is_none_or(|max| at.elapsed() < max)
         .then(|| found.clone())
@@ -226,9 +232,18 @@ pub fn resolved(bin: &str) -> Option<PathBuf> {
 /// have (outside any lock: at daemon start, and before a launch), so
 /// `resolved` knows.
 pub fn warm() {
-    for t in TOOLS.iter().filter(|t| t.agent.is_some()) {
-        resolve(t.name);
-    }
+    // Only the ones PATH lacks need the shell, and those at the same time:
+    // a slow shell costs its limit once, not once per agent.
+    let ask: Vec<&str> = TOOLS
+        .iter()
+        .filter(|t| t.agent.is_some() && on_path(t.name).is_none())
+        .map(|t| t.name)
+        .collect();
+    std::thread::scope(|s| {
+        for name in ask {
+            s.spawn(move || resolve(name));
+        }
+    });
 }
 
 /// The program a session's pane should run for `bin`: None when the bare
@@ -722,6 +737,19 @@ mod tests {
             None
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        // A remembered answer is dropped once the file is gone.
+        let name = "rlord-test-stale-agent";
+        ASKED.lock().unwrap().insert(
+            name.to_string(),
+            (std::time::Instant::now(), Some(bin.clone())),
+        );
+        assert_eq!(resolved(name).as_deref(), Some(bin.as_path()));
+        std::fs::remove_file(&bin).unwrap();
+        assert_eq!(resolved(name), None);
+        assert!(
+            !ASKED.lock().unwrap().contains_key(name),
+            "forgotten: the next resolve asks the shell again"
+        );
         // The switch that keeps scratch setups to what is on their PATH.
         assert!(login_shell_off(Some("1")) && login_shell_off(Some("yes")));
         assert!(

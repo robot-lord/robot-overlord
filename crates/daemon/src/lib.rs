@@ -323,6 +323,8 @@ impl Daemon {
             method,
             "session.new"
                 | "session.restart"
+                // (Enter on a stopped session resumes it.)
+                | "ui.goto"
                 | "session.defaults"
                 | "overlord.ensure"
                 | "overlord.set_model"
@@ -1132,6 +1134,24 @@ mod tests {
             json!({"tool_name": "Edit", "agent_id": "agent-8"}),
         );
         assert_eq!(status(), Status::WaitingInput);
+        // A permission notification names nobody (it has no agent id, and
+        // comes before or after the request): it doesn't claim the wait
+        // for the main agent, so the sub-agent's tool still clears it.
+        emit("PostToolUse", json!({"tool_name": "Bash"}));
+        emit(
+            "PermissionRequest",
+            json!({"tool_name": "Edit", "agent_id": "agent-9"}),
+        );
+        emit(
+            "Notification",
+            json!({"notification_type": "permission_prompt"}),
+        );
+        emit(
+            "PostToolUse",
+            json!({"tool_name": "Edit", "agent_id": "agent-9"}),
+        );
+        assert_eq!(status(), Status::Working);
+        emit("PermissionRequest", json!({"tool_name": "Bash"}));
         // A cut-off payload names nobody: it can't clear the wait.
         emit("PostToolUse", json!({"truncated": true}));
         assert_eq!(status(), Status::WaitingInput);
@@ -1176,13 +1196,14 @@ mod tests {
             .unwrap();
         // Codex's index, as the test has it: `thread-sub…` are sub-agents'
         // threads, `thread-new…` aren't indexed yet, the rest are the user's.
+        use rlord_core::agents::Indexed;
         let index = |_: rlord_core::agents::Agent, id: &str| {
             if id.starts_with("thread-sub") {
-                Some(false)
+                Indexed::SubAgent
             } else if id.starts_with("thread-new") {
-                None
+                Indexed::NotListed
             } else {
-                Some(true)
+                Indexed::User
             }
         };
         let emit = |event: &str, sid: &str| {
@@ -1286,7 +1307,23 @@ mod tests {
         assert_eq!(s.agent_session.as_deref(), Some("thread-3"));
         assert_eq!(s.agent_session_trust, "hook");
         assert_eq!(s.status, rlord_core::types::Status::Working);
-        emit("Stop", "thread-3");
+        // A thread that asked for permission before the index listed it
+        // (so as "another conversation"), then became the session's: its
+        // own tool running clears the wait.
+        emit("PermissionRequest", "thread-new-4");
+        assert_eq!(get().status, rlord_core::types::Status::WaitingInput);
+        db.set_agent_session("01codex", "thread-new-4", "hook")
+            .unwrap();
+        assert_eq!(emit("PostToolUse", "thread-new-4")["unchanged"], true);
+        db.set_agent_session("01codex", "thread-3", "hook").unwrap();
+        db.kv_set("needs_you_by:01codex", r#"["thread-5"]"#)
+            .unwrap();
+        emit("PostToolUse", "thread-5"); // listed now: adopted, and it moved on
+        let s = get();
+        assert_eq!(s.agent_session.as_deref(), Some("thread-5"));
+        assert_eq!(s.status, rlord_core::types::Status::Working);
+        emit("Stop", "thread-5");
+        db.set_agent_session("01codex", "thread-3", "hook").unwrap();
         // Claude's hooks from a Codex session's pane are only logged.
         methods::hook_emit(
             &db,

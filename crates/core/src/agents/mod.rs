@@ -67,6 +67,19 @@ impl Effect {
     }
 }
 
+/// What an agent's index of its conversations says about one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indexed {
+    /// There is no index to ask.
+    NoIndex,
+    /// The index doesn't list it (yet).
+    NotListed,
+    /// A conversation the user drives.
+    User,
+    /// A sub-agent's own thread.
+    SubAgent,
+}
+
 /// A new conversation's command, and what is known about it before it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
@@ -244,14 +257,13 @@ impl Agent {
         }
     }
 
-    /// Whether conversation `id` is one the user drives, not a sub-agent's
-    /// own thread in the same pane. None when it can't be told (Claude's
-    /// sub-agents report under the session's id; Codex's index may not
-    /// know the thread yet).
-    pub fn is_user_conversation(self, id: &str) -> Option<bool> {
+    /// What the agent's own index says about conversation `id`: one the
+    /// user drives, or a sub-agent's own thread in the same pane. (Claude
+    /// keeps no such index: its sub-agents report under the session's id.)
+    pub fn indexed(self, id: &str) -> Indexed {
         match self {
-            Agent::Claude => None,
-            Agent::Codex => codex::is_user_thread(&codex::home(), id),
+            Agent::Claude => Indexed::NoIndex,
+            Agent::Codex => codex::thread_kind(&codex::home(), id),
         }
     }
 

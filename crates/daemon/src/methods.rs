@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::{claude, install, transcript, Agent, Effect};
+use rlord_core::agents::{claude, install, transcript, Agent, Effect, Indexed};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Status, Subagent};
@@ -342,8 +342,11 @@ pub fn rlord_bin() -> String {
 /// command isn't on the PATH rlord's tmux panes get (the daemon's), but the
 /// user's login shell has it, the pane runs that path. On PATH: the bare
 /// name, as always.
-fn pane_program(agent: Agent, argv: &mut [String]) {
-    program_at(argv, install::pane_program(agent.name()));
+/// Returns that path, when the login shell's was used.
+fn pane_program(agent: Agent, argv: &mut [String]) -> Option<std::path::PathBuf> {
+    let at = install::pane_program(agent.name());
+    program_at(argv, at.clone());
+    at
 }
 
 fn program_at(argv: &mut [String], at: Option<std::path::PathBuf>) {
@@ -352,8 +355,26 @@ fn program_at(argv: &mut [String], at: Option<std::path::PathBuf>) {
     }
 }
 
-fn pane_env(session_id: &str) -> Vec<(String, String)> {
-    vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())]
+/// The pane's environment: which session it is, and, when its program was
+/// found only by the login shell (`program`), that program's directory at
+/// the front of PATH. Such an install often needs what sits beside it: an
+/// npm or nvm install is a `#!/usr/bin/env node` script, with `node` in
+/// the same directory.
+fn pane_env(session_id: &str, program: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let mut env = vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())];
+    let path = std::env::var("PATH").unwrap_or_default();
+    env.extend(path_with(program, &path).map(|p| ("PATH".to_string(), p)));
+    env
+}
+
+/// `path` with `program`'s directory in front (None: nothing to add).
+fn path_with(program: Option<&std::path::Path>, path: &str) -> Option<String> {
+    let dir = program?.parent()?.to_str().filter(|d| !d.is_empty())?;
+    Some(if path.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{dir}:{path}")
+    })
 }
 
 pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
@@ -450,7 +471,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         model.as_deref(),
         &spec_args(agent, &spec),
     );
-    pane_program(agent, &mut launch.argv);
+    let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
@@ -486,7 +507,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         db.kv_set(&bind_prompt_key(&id), prompt.as_deref().unwrap_or(""))?;
     }
 
-    let cmd = tmux::pane_command(&pane_env(&id), argv);
+    let cmd = tmux::pane_command(&pane_env(&id, program.as_deref()), argv);
     tmux::new_session(&tmux_name, &project_path, &cmd)?;
     db.insert_event(
         &id,
@@ -717,7 +738,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         model.as_deref(),
         &spec_args(agent, &spec),
     )?;
-    pane_program(agent, &mut argv);
+    let program = pane_program(agent, &mut argv);
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
         None => {
@@ -726,7 +747,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             n
         }
     };
-    let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
+    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), &argv);
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
@@ -753,13 +774,13 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
     let mut launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
-    pane_program(agent, &mut launch.argv);
+    let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = s
         .tmux_session
         .clone()
         .context("session has no tmux session")?;
-    let cmd = tmux::pane_command(&pane_env(&s.id), argv);
+    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), argv);
     let now = now_ms();
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
@@ -825,7 +846,7 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
 
 /// Ingest one agent hook event (from `rlord hook emit`, live or spooled).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
-    hook_emit_with(db, params, &|agent, id| agent.is_user_conversation(id))
+    hook_emit_with(db, params, &|agent, id| agent.indexed(id))
 }
 
 /// `hook_emit`, with how to ask an agent's own index whether a
@@ -833,7 +854,7 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
 pub(crate) fn hook_emit_with(
     db: &Db,
     params: &Value,
-    is_user_conversation: &dyn Fn(Agent, &str) -> Option<bool>,
+    indexed: &dyn Fn(Agent, &str) -> Indexed,
 ) -> Result<Value> {
     let instance = p_str(params, "instance")?;
     let agent = p_str(params, "agent")?;
@@ -876,9 +897,9 @@ pub(crate) fn hook_emit_with(
                 s.agent_session.as_deref(),
                 sid,
                 if other {
-                    is_user_conversation(agent, sid)
+                    indexed(agent, sid)
                 } else {
-                    None
+                    Indexed::NoIndex
                 },
             )
         });
@@ -911,6 +932,19 @@ pub(crate) fn hook_emit_with(
             // What binding from the agent's index would have needed.
             db.kv_delete(&bind_since_key(&s.id))?;
             db.kv_delete(&bind_prompt_key(&s.id))?;
+        }
+        // A thread that was blocked as "another conversation" and is now
+        // the session's own: it is the session's own agent that waits.
+        if let (Whose::Adopt, Some(sid)) = (whose, sid) {
+            let key = needs_you_key(&s.id);
+            let was: Vec<String> = db
+                .kv_get(&key)?
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_default();
+            let now_own = adopted(was.clone(), sid);
+            if now_own != was {
+                db.kv_set(&key, &json!(now_own).to_string())?;
+            }
         }
         let (kind, effect) = agent.map_hook_event(event, &payload);
         if whose != Whose::Other {
@@ -1021,6 +1055,10 @@ enum Block {
 fn block_change(other: bool, kind: &str, effect: Effect, party: Option<&str>) -> Block {
     let party = party.map(str::to_string);
     match effect {
+        // A notification says someone is blocked, not who (Claude's carries
+        // no agent id, and comes before or after the request it is about):
+        // the status follows, the set is left to the events that name one.
+        Effect::Set(Status::WaitingInput) if kind == "notification" => Block::Keep,
         Effect::Set(Status::WaitingInput) => party.map_or(Block::Keep, Block::Add),
         Effect::Resume => party.map_or(Block::Keep, Block::MovedOn),
         // A sub-agent's thread ended its turn or its session.
@@ -1084,6 +1122,19 @@ fn blocked_after(
     }
 }
 
+/// The blocked set once thread `sid` has become the session's own: its
+/// entry is the session's own agent ("").
+fn adopted(blocked: Vec<String>, sid: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in blocked {
+        let p = if p == sid { String::new() } else { p };
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Whose conversation a hook event speaks for, relative to the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Whose {
@@ -1101,15 +1152,13 @@ enum Whose {
 }
 
 /// Decide whose conversation `sid` is. `bound`: the session's current one.
-/// `user`: what the agent's own index says about `sid` when it differs
-/// (Some(true): one the user drives; Some(false): a sub-agent's thread;
-/// None: not indexed, or the agent has no such index).
+/// `indexed`: what the agent's own index says about `sid` when it differs.
 fn conversation(
     agent: Agent,
     event: &str,
     bound: Option<&str>,
     sid: &str,
-    user: Option<bool>,
+    indexed: Indexed,
 ) -> Whose {
     match bound {
         Some(cur) if cur == sid => Whose::Ours,
@@ -1125,10 +1174,16 @@ fn conversation(
         // The agent assigns ids, and sub-agents have threads of their own
         // in the same pane: the session moves only to a thread the index
         // says the user drives (whether rlord's own guess from the index
-        // or an earlier hook bound the current one). Not indexed yet:
-        // wait for a later event.
-        Some(_) if user == Some(true) => Whose::Adopt,
-        Some(_) => Whose::Other,
+        // or an earlier hook bound the current one). Listed as a
+        // sub-agent's: never. Not listed yet: wait for a later event.
+        Some(_) => match indexed {
+            Indexed::User => Whose::Adopt,
+            Indexed::SubAgent | Indexed::NotListed => Whose::Other,
+            // No index to ask at all: a new conversation in the pane is
+            // what starts one.
+            Indexed::NoIndex if agent.adopts_new_id_on(event) => Whose::Adopt,
+            Indexed::NoIndex => Whose::Other,
+        },
     }
 }
 
@@ -1314,30 +1369,65 @@ mod tests {
     #[test]
     fn whose_conversation_a_hook_speaks_for() {
         use Whose::*;
-        let codex = |event: &str, bound: Option<&str>, user: Option<bool>| {
-            conversation(Agent::Codex, event, bound, "t-2", user)
+        let codex = |event: &str, bound: Option<&str>, indexed: Indexed| {
+            conversation(Agent::Codex, event, bound, "t-2", indexed)
         };
-        assert_eq!(codex("Stop", Some("t-2"), None), Ours);
+        assert_eq!(codex("Stop", Some("t-2"), Indexed::NoIndex), Ours);
         // Nothing bound: a SessionStart binds; a late event from the
         // process just replaced (a fresh start) does not.
-        assert_eq!(codex("SessionStart", None, None), Bind);
-        assert_eq!(codex("SessionEnd", None, None), Unbound);
-        assert_eq!(codex("Stop", None, None), Unbound);
+        assert_eq!(codex("SessionStart", None, Indexed::NotListed), Bind);
+        assert_eq!(codex("SessionEnd", None, Indexed::NotListed), Unbound);
+        assert_eq!(codex("Stop", None, Indexed::NotListed), Unbound);
         // Bound: the session moves only to a thread the index says the
         // user drives, on any event (so an index-bound guess is corrected).
-        assert_eq!(codex("SessionStart", Some("t-1"), Some(true)), Adopt);
-        assert_eq!(codex("Stop", Some("t-1"), Some(true)), Adopt);
-        // A sub-agent's never; one the index doesn't know yet: wait.
-        assert_eq!(codex("SessionStart", Some("t-1"), Some(false)), Other);
-        assert_eq!(codex("SessionStart", Some("t-1"), None), Other);
-        assert_eq!(codex("Stop", Some("t-1"), None), Other);
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::User), Adopt);
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::User), Adopt);
+        // A sub-agent's never; one the index doesn't list yet: wait.
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::SubAgent), Other);
+        assert_eq!(
+            codex("SessionStart", Some("t-1"), Indexed::NotListed),
+            Other
+        );
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::NotListed), Other);
+        // No index at all: a SessionStart is what starts a conversation.
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::NoIndex), Adopt);
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::NoIndex), Other);
         // Claude chose its id and reports what it writes on every event.
         let claude = |event: &str, bound: Option<&str>| {
-            conversation(Agent::Claude, event, bound, "t-2", None)
+            conversation(Agent::Claude, event, bound, "t-2", Indexed::NoIndex)
         };
         assert_eq!(claude("Stop", None), Bind);
         assert_eq!(claude("Stop", Some("t-1")), Adopt);
         assert_eq!(claude("Stop", Some("t-2")), Ours);
+    }
+
+    #[test]
+    fn a_program_found_by_the_login_shell_brings_its_directory() {
+        // On the panes' PATH already: nothing added.
+        assert_eq!(path_with(None, "/usr/bin:/bin"), None);
+        // An nvm install: `node` sits beside the `codex` script.
+        let program = std::path::Path::new("/home/a/.nvm/versions/node/v22/bin/codex");
+        assert_eq!(
+            path_with(Some(program), "/usr/bin:/bin").as_deref(),
+            Some("/home/a/.nvm/versions/node/v22/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            path_with(Some(program), "").as_deref(),
+            Some("/home/a/.nvm/versions/node/v22/bin")
+        );
+        let env = pane_env("01s", Some(program));
+        assert_eq!(env[0], ("RLORD_SESSION_ID".to_string(), "01s".to_string()));
+        assert_eq!(env[1].0, "PATH");
+        assert!(env[1].1.starts_with("/home/a/.nvm/versions/node/v22/bin"));
+        assert_eq!(pane_env("01s", None).len(), 1);
+    }
+
+    #[test]
+    fn an_adopted_thread_waits_as_the_sessions_own_agent() {
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(adopted(set(&["t-9", "a-7"]), "t-9"), set(&["", "a-7"]));
+        assert_eq!(adopted(set(&["", "t-9"]), "t-9"), set(&[""]));
+        assert_eq!(adopted(set(&["a-7"]), "t-9"), set(&["a-7"]));
     }
 
     #[test]
@@ -1425,6 +1515,14 @@ mod tests {
         assert_eq!((b, st), (set(&[""]), None));
         let (b, st) = step(&[], Block::Keep, needs, Working);
         assert_eq!((b, st), (set(&[]), Some(WaitingInput)));
+        // A notification says someone is blocked, not who: the status
+        // follows, the set is left to the events that name a party.
+        assert_eq!(
+            block_change(false, "notification", needs, Some("")),
+            Block::Keep
+        );
+        let (b, st) = step(&["a-7"], Block::Keep, needs, WaitingInput);
+        assert_eq!((b, st), (set(&["a-7"]), None));
         // What each event means.
         assert_eq!(
             block_change(false, "subagent_stopped", Effect::Nothing, Some("a-7")),

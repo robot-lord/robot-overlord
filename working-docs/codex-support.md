@@ -161,6 +161,16 @@ greps files. The consumer seam is `agents::transcript`'s functions and
 answer those from its storage; status would be a third source next to hooks
 and `discover` (an SSE listener writing the same status events).
 
+Known limits, accepted:
+
+- A hook event the daemon handled but died before answering is delivered
+  again from the spool at the next start.
+- When the login shell leaves something holding its output open, the
+  thread reading it lives until that ends (the answer is given up on at
+  the time limit).
+- `RLORD_NO_LOGIN_SHELL=1` turns login-shell resolution off (the demo and
+  scratch setups set it, with a stand-in `SHELL`).
+
 ## Owed
 
 - Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
