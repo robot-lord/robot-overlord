@@ -271,7 +271,6 @@ impl App {
                 Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
-        let sep = || Span::styled("  │  ", Style::default().fg(theme::border()));
         // The logo: a stern robot (dark red, heavy outline) with a crown
         // (dark gold) set into its head, four rows tall.
         let (crown, robot, eye) = theme::logo();
@@ -296,40 +295,65 @@ impl App {
             vec![Span::styled(" ┗━━━┛", red)],
         ];
 
-        let mut bar = vec![tab(Tab::Sessions), tab(Tab::Groups), Span::raw(" ")];
-        bar.push(key(Action::SwitchTab));
-        bar.push(sep());
-        bar.push(Span::styled("⌕ ", theme::muted()));
-        if self.filter.trim().is_empty() {
-            bar.push(Span::styled("search ", theme::faint()));
-        } else {
+        // The toolbar, roomy, then tighter (narrow separators, no
+        // placeholder words), then without keycaps: the first that fits.
+        let build = |tier: u8| -> Vec<Span<'static>> {
+            let key = |a: Action| -> Option<Span<'static>> { (tier < 2).then(|| key(a)) };
+            let sep = || {
+                Span::styled(
+                    if tier == 0 { "  │  " } else { " │ " },
+                    Style::default().fg(theme::border()),
+                )
+            };
+            let mut bar = vec![tab(Tab::Sessions), tab(Tab::Groups)];
+            if let Some(k) = key(Action::SwitchTab) {
+                bar.push(Span::raw(" "));
+                bar.push(k);
+            }
+            bar.push(sep());
+            bar.push(Span::styled("⌕ ", theme::muted()));
+            if self.filter.trim().is_empty() {
+                if tier == 0 {
+                    bar.push(Span::styled("search ", theme::faint()));
+                }
+            } else {
+                bar.push(Span::styled(
+                    format!("{} ", self.filter),
+                    Style::default().fg(theme::yellow()).bold(),
+                ));
+                if let Some(k) = key(Action::Cancel) {
+                    bar.push(k);
+                    bar.push(Span::styled(" clear ", theme::faint()));
+                }
+            }
+            bar.extend(key(Action::Filter));
+            bar.push(sep());
+            bar.push(Span::styled("⇅ ", theme::muted()));
             bar.push(Span::styled(
-                format!("{} ", self.filter),
-                Style::default().fg(theme::yellow()).bold(),
+                format!(
+                    "{}{} ",
+                    self.sort.label(),
+                    if self.reverse { " ↑" } else { "" }
+                ),
+                Style::default().fg(theme::text()),
             ));
-            bar.push(key(Action::Cancel));
-            bar.push(Span::styled(" clear ", theme::faint()));
-        }
-        bar.push(key(Action::Filter));
-        bar.push(sep());
-        bar.push(Span::styled("⇅ ", theme::muted()));
-        bar.push(Span::styled(
-            format!(
-                "{}{} ",
-                self.sort.label(),
-                if self.reverse { " ↑" } else { "" }
-            ),
-            Style::default().fg(theme::text()),
-        ));
-        bar.push(key(Action::Sort));
-        bar.push(sep());
-        bar.push(Span::styled("◷ ", theme::muted()));
-        bar.push(if self.show_archived {
-            Span::styled("archived ", Style::default().fg(theme::yellow()).bold())
-        } else {
-            Span::styled("live ", Style::default().fg(theme::text()))
-        });
-        bar.push(key(Action::ToggleArchived));
+            bar.extend(key(Action::Sort));
+            bar.push(sep());
+            bar.push(Span::styled("◷ ", theme::muted()));
+            bar.push(if self.show_archived {
+                Span::styled("archived ", Style::default().fg(theme::yellow()).bold())
+            } else {
+                Span::styled("live ", Style::default().fg(theme::text()))
+            });
+            bar.extend(key(Action::ToggleArchived));
+            bar
+        };
+        // Beside the 6-column logo and its gap.
+        let room = area.width.saturating_sub(8) as usize;
+        let bar = (0..3)
+            .map(build)
+            .find(|b| Line::from(b.clone()).width() <= room)
+            .unwrap_or_else(|| build(2));
 
         // The name: ROBOT in the robot's red, OVERLORD in the crown's gold.
         // Box-drawn letters three rows tall where they fit, else one
