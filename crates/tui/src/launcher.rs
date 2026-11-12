@@ -2,12 +2,13 @@
 //!
 //! - **Command launcher** (`:`): type a few letters of a command, Enter runs
 //!   it. Everything a key does is here too, by name, plus what has no key
-//!   (the key screen, a specific sort).
+//!   (the key screen, a specific sort, what the Usage column shows).
 //! - **Cheat sheet** (`?`): every key, and what to ask the overlord instead.
 
 use super::*;
 use ratatui::widgets::Clear;
 use rlord_core::db::SortMode;
+use rlord_core::usage::UsageMetric;
 
 #[derive(Default)]
 pub(crate) struct Launcher {
@@ -20,6 +21,7 @@ enum Cmd {
     Act(Action),
     Keys,
     Sort(SortMode),
+    Usage(UsageMetric),
     Summarize,
 }
 
@@ -65,6 +67,26 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ),
     ("sort created", "newest first", Cmd::Sort(SortMode::Created)),
     ("sort name", "by name", Cmd::Sort(SortMode::Name)),
+    (
+        "sort usage",
+        "most used first (what the Usage column shows)",
+        Cmd::Sort(SortMode::Usage),
+    ),
+    (
+        "usage turns",
+        "Usage column: prompts you typed",
+        Cmd::Usage(UsageMetric::Turns),
+    ),
+    (
+        "usage tokens",
+        "Usage column: tokens taken in or written",
+        Cmd::Usage(UsageMetric::Tokens),
+    ),
+    (
+        "usage context",
+        "Usage column: how full the context window is",
+        Cmd::Usage(UsageMetric::Context),
+    ),
     ("reverse", "reverse the sort", Cmd::Act(Action::ReverseSort)),
     (
         "archived",
@@ -177,6 +199,11 @@ impl App {
                     self.reverse = false;
                 }
                 self.sort = s;
+                self.dirty = true;
+            }
+            Cmd::Usage(m) => {
+                self.usage = m;
+                self.status_line = format!("Usage column: {}", m.title());
                 self.dirty = true;
             }
             Cmd::Summarize => {

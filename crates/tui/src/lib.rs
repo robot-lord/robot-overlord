@@ -34,6 +34,7 @@ use rlord_core::db::{SessionQuery, SortMode};
 use rlord_core::paths;
 use rlord_core::timefmt::{fmt_ts, rel_age};
 use rlord_core::tmux;
+use rlord_core::usage::{Usage, UsageMetric};
 use rlord_daemon::client_call;
 
 pub fn run(config: Config) -> Result<()> {
@@ -168,6 +169,8 @@ struct App {
     show_archived: bool,
     sort: SortMode,
     reverse: bool,
+    /// What the Usage column shows (and the usage sort sorts by).
+    usage: UsageMetric,
     filter: String,
     mode: Mode,
     preview: Preview,
@@ -226,6 +229,7 @@ struct App {
 impl App {
     fn new(rx: mpsc::Receiver<Push>, config: Config, keys: KeyMap) -> Self {
         App {
+            usage: config.usage,
             rx,
             config,
             keys,
@@ -292,6 +296,7 @@ impl App {
             "archived": if self.show_archived { "only" } else { "live" },
             "sort": q.sort.label(),
             "reverse": q.reverse,
+            "usage": self.usage.label(),
             "status": q.status,
             "tag": q.tag,
             "agent": q.agent,
@@ -1279,6 +1284,8 @@ impl App {
         // column with its arrow); the name gets the rest up to 26; groups
         // and the project only show while names keep a readable width.
         const TAGS_W: u16 = 15;
+        // "Usage ▼": the values (4 wide) right-aligned under "Usage".
+        const USAGE_W: u16 = 7;
         let sel_w = theme::SELECT_BAR.chars().count() as u16;
         // borders + padding + highlight symbol + number, pin, status + 4 gaps
         let base = 2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4;
@@ -1290,25 +1297,29 @@ impl App {
         let room = area.width.saturating_sub(fixed);
         let show_tags = room >= TAGS_W + 2 + 18;
         let room = if show_tags { room - TAGS_W - 2 } else { room };
+        // Usage goes before Groups as the list narrows (after the
+        // project): groups say what a session is, usage only how big.
+        let show_usage = show_tags && room >= USAGE_W + 2 + 18;
+        let room = if show_usage { room - USAGE_W - 2 } else { room };
         let name_w = room.clamp(10, 26);
         let show_project = room >= 26 + 2 + 12;
 
         // The sort shows on its column: an arrow (▲ ascending, ▼
         // descending; `reverse` flips it), and the time column shows the time
-        // being sorted by.
-        let (time_label, arrow_on_name) = match self.sort {
-            SortMode::Activity | SortMode::Name if compact => {
-                ("Message", self.sort == SortMode::Name)
-            }
-            SortMode::User if compact => ("Prompt", false),
-            SortMode::State if compact => ("Status", false),
-            SortMode::Activity => ("Last message", false),
-            SortMode::User => ("Last prompt", false),
-            SortMode::State => ("Status change", false),
-            SortMode::Created => ("Created", false),
-            SortMode::Name => ("Last message", true),
+        // being sorted by (the last message when the sort isn't a time).
+        let arrow_on_name = self.sort == SortMode::Name;
+        let arrow_on_usage = self.sort == SortMode::Usage;
+        let time_label = match self.sort {
+            SortMode::Activity | SortMode::Name | SortMode::Usage if compact => "Message",
+            SortMode::User if compact => "Prompt",
+            SortMode::State if compact => "Status",
+            SortMode::Activity | SortMode::Name | SortMode::Usage => "Last message",
+            SortMode::User => "Last prompt",
+            SortMode::State => "Status change",
+            SortMode::Created => "Created",
         };
-        // Names run A→Z (ascending); times newest first (descending).
+        // Names run A→Z (ascending); times newest first, usage most first
+        // (descending).
         let ascending = arrow_on_name != self.reverse;
         let arrow = if ascending { " ▲" } else { " ▼" };
         let head = |label: &str, sorted: bool| -> Cell<'static> {
@@ -1324,7 +1335,7 @@ impl App {
             Cell::from(""),
             head("Name", arrow_on_name),
             Cell::from("Status"),
-            head(time_label, !arrow_on_name),
+            head(time_label, !arrow_on_name && !arrow_on_usage),
         ];
         let mut widths = vec![
             Constraint::Length(1),
@@ -1333,6 +1344,10 @@ impl App {
             Constraint::Length(13),
             Constraint::Length(time_w),
         ];
+        if show_usage {
+            header.push(head("Usage", arrow_on_usage));
+            widths.push(Constraint::Length(USAGE_W));
+        }
         if show_tags {
             header.push(Cell::from("Groups"));
             widths.push(Constraint::Length(TAGS_W));
@@ -1343,6 +1358,7 @@ impl App {
         }
         let header = Row::new(header).style(theme::muted()).bottom_margin(1);
         let sort = self.sort;
+        let metric = self.usage;
         let home = std::env::var("HOME").unwrap_or_default();
         let rows: Vec<Row> = self
             .sessions
@@ -1410,6 +1426,20 @@ impl App {
                         theme::muted(),
                     )),
                 ];
+                if show_usage {
+                    // Right-aligned under "Usage"; 4 wide whatever the
+                    // number, so the column never shifts.
+                    let u = Usage::from_json(&s["usage"]);
+                    let text = match &u {
+                        Some(u) => u.cell(metric),
+                        None => rlord_core::usage::cell(None, metric),
+                    };
+                    cells.push(Cell::from(format!(" {text}")).fg(if u.is_some() {
+                        theme::text()
+                    } else {
+                        theme::faint_c()
+                    }));
+                }
                 if show_tags {
                     let tags = s["tags"]
                         .as_array()
@@ -1546,7 +1576,7 @@ impl App {
         let (name_x, name_w) = (cols[2].x, cols[2].width);
         let (time_x, time_hw) = (cols[4].x, cols[4].width);
         let time_sort = match self.sort {
-            SortMode::Name => SortMode::Activity,
+            SortMode::Name | SortMode::Usage => SortMode::Activity,
             m => m,
         };
         let head_y = area.y + 1;
@@ -1558,6 +1588,12 @@ impl App {
             Rect::new(time_x, head_y, time_hw, 1),
             mouse::Hit::SortBy(time_sort),
         );
+        if show_usage {
+            self.hits.add(
+                Rect::new(cols[5].x, head_y, cols[5].width, 1),
+                mouse::Hit::SortBy(SortMode::Usage),
+            );
+        }
     }
 
     /// Archived sessions are a record: they open again only once unarchived.
@@ -1768,6 +1804,10 @@ impl App {
                     ),
                     theme::muted(),
                 ),
+            ]),
+            Line::from(vec![
+                key("usage"),
+                Span::styled(usage_details(&s["usage"]), theme::muted()),
             ]),
         ];
         if let Some(st) = s["remote"]["state"].as_str() {
@@ -2278,6 +2318,24 @@ fn updated_at(s: &Value) -> Option<i64> {
         .iter()
         .filter_map(|k| s[*k].as_i64())
         .max()
+}
+
+/// The details pane's usage line: all three, whatever the column shows
+/// (`12 turns · 1.2M tokens · 42% of 200k context`).
+fn usage_details(u: &Value) -> String {
+    use rlord_core::usage::compact;
+    let Some(u) = Usage::from_json(u) else {
+        return "–".into();
+    };
+    let context = match (u.context_pct(), u.window) {
+        (Some(p), Some(w)) => format!("{p}% of {} context", compact(w)),
+        _ => format!("{} context (window unknown)", compact(u.context)),
+    };
+    format!(
+        "{} turns · {} tokens · {context}",
+        u.turns,
+        compact(u.tokens)
+    )
 }
 
 /// The list's Remote Control mark: ⇄ connected (green), connecting (dim),

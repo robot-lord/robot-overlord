@@ -967,6 +967,64 @@ mod tests {
     }
 
     #[test]
+    fn the_usage_column_shows_sorts_and_gives_way_before_groups() {
+        use rlord_core::db::SortMode;
+        use rlord_core::usage::UsageMetric;
+        let mut app = fleet();
+        app.sessions[0]["usage"] = json!({"turns": 12, "tokens": 1_234_567,
+            "context": 84_000, "window": 200_000, "context_pct": 42});
+        app.sessions[1]["usage"] = json!({"turns": 3, "tokens": 999,
+            "context": 5_000, "window": null, "context_pct": null});
+        // Wide: every column.
+        let rows = drawn_at(&mut app, 220, 34);
+        let (ux, uy) = find(&rows, "Usage");
+        let (gx, _) = find(&rows, "Groups");
+        assert!(ux < gx, "Usage sits before Groups");
+        // The header sorts by usage; values sit right-aligned under it, 4
+        // wide.
+        assert_eq!(app.hits.at(ux + 2, uy), Some(Hit::SortBy(SortMode::Usage)));
+        let row = |name: &str| rows[find(&rows, name).1 as usize].clone();
+        let cell = |r: &str| -> String { r.chars().skip(ux as usize).take(5).collect() };
+        assert_eq!(cell(&row("✻  login-flake")), "   12");
+        assert_eq!(cell(&row(">_ image-pipe")), "    3");
+        assert_eq!(cell(&row("✻  old-migration")), "    –", "unknown");
+        // The details pane has all three, whatever the column shows.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("12 turns · 1.2M tokens · 42% of 200k context")));
+        app.usage = UsageMetric::Tokens;
+        let rows = drawn_at(&mut app, 220, 34);
+        assert_eq!(
+            cell(&rows[find(&rows, "✻  login-flake").1 as usize]),
+            " 1.2M"
+        );
+        app.usage = UsageMetric::Context;
+        let rows = drawn_at(&mut app, 220, 34);
+        assert_eq!(
+            cell(&rows[find(&rows, "✻  login-flake").1 as usize]),
+            "  42%"
+        );
+        assert_eq!(
+            cell(&rows[find(&rows, ">_ image-pipe").1 as usize]),
+            "    –"
+        );
+        // Sorted by usage: the arrow is on Usage, not the time column.
+        app.sort = SortMode::Usage;
+        let rows = drawn_at(&mut app, 220, 34);
+        find(&rows, "Usage ▼");
+        assert!(!rows.iter().any(|r| r.contains("Last message ▼")));
+        // Narrowing: Usage goes before Groups, never the other way round.
+        let mut groups_alone = false;
+        for w in (100..=220).step_by(2) {
+            let rows = drawn_at(&mut app, w, 34);
+            let list = |t: &str| rows.iter().any(|r| r.contains(t));
+            assert!(!list("Usage") || list("Groups"), "width {w}");
+            groups_alone |= list("Groups") && !list("Usage");
+        }
+        assert!(groups_alone);
+    }
+
+    #[test]
     fn the_right_click_menu_offers_what_the_row_can_do() {
         let labels = |app: &App| -> Vec<&'static str> {
             match &app.mode {

@@ -1,5 +1,6 @@
-//! Warm-up: bring every live session's sub-agent data up to date from disk
-//! in the background, so moving through the list never waits on it.
+//! Warm-up: bring every live session's sub-agent data and usage (the
+//! Usage column) up to date from disk in the background, so moving through
+//! the list never waits on it.
 //!
 //! On start the daemon queues every live (not archived) session, most
 //! recently active first; an unarchived session is queued then. A queued
@@ -25,7 +26,21 @@ pub struct Warm {
     /// Sessions queued and not yet loaded, with how many loads are queued
     /// (one queued again mid-load stays loading until its last load ends).
     pending: Mutex<HashMap<String, usize>>,
-    queue: Mutex<Option<mpsc::Sender<String>>>,
+    queue: Mutex<Option<mpsc::Sender<(String, Job)>>>,
+    /// Sessions queued for their usage alone (`enqueue_usage`), once each
+    /// per daemon run: a transcript that can't be read isn't queued again
+    /// on every list.
+    usage_tried: Mutex<HashSet<String>>,
+}
+
+/// What a queued session needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+    /// Sub-agents and usage.
+    Full,
+    /// Only its usage (a session the list shows whose transcript rlord
+    /// hasn't read yet, e.g. an archived one).
+    Usage,
 }
 
 impl Warm {
@@ -43,19 +58,37 @@ impl Warm {
 
     /// Queue a session for loading (e.g. just unarchived).
     pub fn enqueue(&self, id: &str) {
-        let Ok(q) = self.queue.lock() else { return };
-        if let Some(tx) = q.as_ref() {
-            if let Ok(mut p) = self.pending.lock() {
-                *p.entry(id.to_string()).or_default() += 1;
-            }
-            let _ = tx.send(id.to_string());
+        self.send(id, Job::Full);
+    }
+
+    /// Queue a session to read its usage, unless that was tried before in
+    /// this run. False: it was (the caller reads it itself, or goes
+    /// without).
+    pub fn enqueue_usage(&self, id: &str) -> bool {
+        let first = self
+            .usage_tried
+            .lock()
+            .is_ok_and(|mut t| t.insert(id.to_string()));
+        first && self.send(id, Job::Usage)
+    }
+
+    fn send(&self, id: &str, job: Job) -> bool {
+        let Ok(q) = self.queue.lock() else {
+            return false;
+        };
+        let Some(tx) = q.as_ref() else {
+            return false;
+        };
+        if let Ok(mut p) = self.pending.lock() {
+            *p.entry(id.to_string()).or_default() += 1;
         }
+        tx.send((id.to_string(), job)).is_ok()
     }
 }
 
 /// Start the worker and queue every live session (most recent first).
 pub fn start(d: &Arc<Daemon>) {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<(String, Job)>();
     let ids: Vec<String> = d
         .db()
         .sessions(&SessionQuery::default())
@@ -69,7 +102,7 @@ pub fn start(d: &Arc<Daemon>) {
         }
     }
     for id in ids {
-        let _ = tx.send(id);
+        let _ = tx.send((id, Job::Full));
     }
     if let Ok(mut q) = d.warm.queue.lock() {
         *q = Some(tx);
@@ -77,10 +110,14 @@ pub fn start(d: &Arc<Daemon>) {
     let d = Arc::clone(d);
     std::thread::spawn(move || {
         let mut since_notify = std::time::Instant::now();
-        while let Ok(id) = rx.recv() {
+        while let Ok((id, job)) = rx.recv() {
             // A panic on one session (odd transcript data) must not end the
             // worker and leave every other session "loading" for good.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh(&d, &id))) {
+            let run = || match job {
+                Job::Full => refresh(&d, &id).map(drop),
+                Job::Usage => read_usage(&d, &id),
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
                 Ok(Err(e)) => tracing::debug!(session = %id, error = %e, "warming session"),
                 Err(_) => tracing::warn!(session = %id, "warming session panicked"),
                 Ok(Ok(_)) => {}
@@ -104,8 +141,25 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-/// Bring one session's sub-agents up to date from disk. The transcript
-/// reads run without the DB lock; returns the session's sub-agent rows.
+/// Read one session's usage (its transcript, without the DB lock), so
+/// the list has it at hand.
+fn read_usage(d: &Daemon, r: &str) -> Result<()> {
+    let (s, src) = {
+        let db = d.db();
+        let s = db.resolve_ref(r)?;
+        let src = db.transcript_source(&s.id)?;
+        (s, src)
+    };
+    if let Some(src) = src {
+        rlord_core::usage::of(std::path::Path::new(&src), s.model.as_deref());
+        methods::save_cursors(&d.db());
+    }
+    Ok(())
+}
+
+/// Bring one session's sub-agents and usage up to date from disk. The
+/// transcript reads run without the DB lock; returns the session's
+/// sub-agent rows.
 pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
     let (s, src) = {
         let db = d.db();
@@ -113,10 +167,17 @@ pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
         let src = db.transcript_source(&s.id)?;
         (s, src)
     };
+    // Its usage (every agent): after this, the list reads only what's
+    // appended.
+    if let Some(src) = &src {
+        rlord_core::usage::of(std::path::Path::new(src), s.model.as_deref());
+    }
     // (Only Claude's sub-agents are tracked so far.)
     let tracked = Agent::parse(&s.agent).is_some_and(Agent::tracks_subagents);
     let Some(src) = src.filter(|_| tracked) else {
-        return d.db().subagents(&s.id);
+        let db = d.db();
+        methods::save_cursors(&db);
+        return db.subagents(&s.id);
     };
     // Cheap per call: transcript stats are incremental (only appended bytes
     // are read). Every agent is checked, finished or not (a finished one may

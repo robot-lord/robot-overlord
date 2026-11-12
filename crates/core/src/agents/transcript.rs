@@ -68,8 +68,14 @@ pub struct Usage {
     pub output: i64,
     /// The whole context sent with that request.
     pub context: u64,
-    /// `input`/`output` are the conversation's running totals (Codex), not
-    /// this one request's (Claude).
+    /// Tokens the agent took in new or wrote: input not read from a cache
+    /// (cache writes count), plus output. What the Usage column's
+    /// "tokens" adds up.
+    pub fresh: i64,
+    /// The model's context window, when the agent reports it (Codex).
+    pub window: Option<u64>,
+    /// `input`/`output`/`fresh` are the conversation's running totals
+    /// (Codex), not this one request's (Claude).
     pub cumulative: bool,
 }
 
@@ -143,6 +149,16 @@ impl<'a> Line<'a> {
             Format::Codex => codex::usage(self.v),
             // (Never lines: see `Format::OpenCode`.)
             Format::OpenCode => None,
+        }
+    }
+
+    /// Which API message a usage line belongs to, when one message is
+    /// written over several lines that each repeat its usage (Claude: one
+    /// line per content block). Its usage counts once.
+    pub fn message_id(&self) -> Option<&'a str> {
+        match self.format {
+            Format::Claude => self.v["message"]["id"].as_str(),
+            Format::Codex | Format::OpenCode => None,
         }
     }
 
@@ -420,13 +436,37 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
                 c.first.get_or_insert(ts);
                 c.last = Some(ts);
             }
-            match l.usage() {
-                Some(u) if u.cumulative => (c.input, c.output) = (u.input, u.output),
+            let usage = l.usage().filter(|_| match l.message_id() {
+                // (Not persisted: a message split across a daemon restart
+                // could count twice; rare and small.)
+                Some(id) if c.last_message.as_deref() == Some(id) => false,
+                Some(id) => {
+                    c.last_message = Some(id.to_string());
+                    true
+                }
+                None => true,
+            });
+            match usage {
+                Some(u) if u.cumulative => {
+                    (c.input, c.output, c.tokens) = (u.input, u.output, u.fresh);
+                    c.context = u.context;
+                    c.window = u.window.or(c.window);
+                }
                 Some(u) => {
                     c.input += u.input;
                     c.output += u.output;
+                    c.tokens += u.fresh;
+                    c.context = u.context;
                 }
                 None => {}
+            }
+            if l.prompt().is_some() {
+                c.turns += 1;
+            }
+            if let Some(m) = l.model() {
+                if c.model.as_deref() != Some(m) {
+                    c.model = Some(m.to_string());
+                }
             }
             // Done when the latest turn is a final reply (no tool call
             // pending); a tool result or new prompt reopens it.
@@ -457,11 +497,36 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     Some(stats)
 }
 
+/// How much of a transcript `transcript_stats` has yet to read: None
+/// when it has never read it (all of it, then), else the bytes appended
+/// since (0 for an OpenCode conversation: nothing to read through). For
+/// callers that must not stall on a first full read.
+pub fn unread_bytes(path: &Path) -> Option<u64> {
+    if opencode::locate(path).is_some() {
+        return Some(0);
+    }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = cursors.get(path)?;
+    (c.ino == meta.ino() && meta.len() >= c.offset).then(|| meta.len() - c.offset)
+}
+
 /// What `transcript_stats` knows about a transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptStats {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Prompts the human typed.
+    pub turns: u64,
+    /// Tokens taken in new or written (`Usage::fresh`, summed).
+    pub tokens: i64,
+    /// The latest request's whole context.
+    pub context: u64,
+    /// The context window the agent reported (Codex), if any.
+    pub window: Option<u64>,
+    /// The latest turn's model.
+    pub model: Option<String>,
     pub first: Option<i64>,
     pub last: Option<i64>,
     /// The latest turn is a final reply: the agent finished.
@@ -484,6 +549,13 @@ struct StatsCursor {
     offset: u64,
     input: i64,
     output: i64,
+    turns: u64,
+    tokens: i64,
+    context: u64,
+    window: Option<u64>,
+    model: Option<String>,
+    /// The API message whose usage was counted last (see `Line::message_id`).
+    last_message: Option<String>,
     first: Option<i64>,
     last: Option<i64>,
     used: std::time::Instant,
@@ -499,6 +571,12 @@ impl Default for StatsCursor {
             offset: 0,
             input: 0,
             output: 0,
+            turns: 0,
+            tokens: 0,
+            context: 0,
+            window: None,
+            model: None,
+            last_message: None,
             first: None,
             last: None,
             used: std::time::Instant::now(),
@@ -511,6 +589,11 @@ impl StatsCursor {
         TranscriptStats {
             input_tokens: self.input,
             output_tokens: self.output,
+            turns: self.turns,
+            tokens: self.tokens,
+            context: self.context,
+            window: self.window,
+            model: self.model.clone(),
             first: self.first,
             last: self.last,
             ended: self.ended,
@@ -528,6 +611,11 @@ pub struct CursorState {
     pub offset: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub turns: u64,
+    pub tokens: i64,
+    pub context: u64,
+    pub window: Option<u64>,
+    pub model: Option<String>,
     pub first: Option<i64>,
     pub last: Option<i64>,
     pub ended: bool,
@@ -535,7 +623,7 @@ pub struct CursorState {
 
 /// Bump when `transcript_stats` counts differently: saved positions from an
 /// older version are dropped and their transcripts recounted.
-pub const STATS_PARSE_VERSION: i64 = 1;
+pub const STATS_PARSE_VERSION: i64 = 2;
 
 /// How many saved positions are loaded at startup (the most recent).
 pub const STATS_CURSOR_SEED: usize = STATS_CURSOR_CAP;
@@ -550,6 +638,11 @@ pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
             offset: st.offset,
             input: st.input_tokens,
             output: st.output_tokens,
+            turns: st.turns,
+            tokens: st.tokens,
+            context: st.context,
+            window: st.window,
+            model: st.model,
             first: st.first,
             last: st.last,
             ended: st.ended,
@@ -576,6 +669,11 @@ pub fn take_dirty_cursors() -> Vec<(PathBuf, CursorState)> {
                     offset: c.offset,
                     input_tokens: c.input,
                     output_tokens: c.output,
+                    turns: c.turns,
+                    tokens: c.tokens,
+                    context: c.context,
+                    window: c.window,
+                    model: c.model.clone(),
                     first: c.first,
                     last: c.last,
                     ended: c.ended,

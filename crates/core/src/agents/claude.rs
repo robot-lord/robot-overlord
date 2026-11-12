@@ -313,6 +313,8 @@ pub(crate) fn usage(v: &Value) -> Option<Usage> {
         .iter()
         .filter_map(|k| u.get(*k).and_then(Value::as_u64))
         .sum(),
+        fresh: n("input_tokens") + n("cache_creation_input_tokens") + n("output_tokens"),
+        window: None,
         cumulative: false,
     })
 }

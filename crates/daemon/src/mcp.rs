@@ -31,8 +31,10 @@ fn b(desc: &str) -> Value {
 const SESSION_REF: &str = "Session id, id prefix, or name";
 
 pub fn tools() -> Value {
-    let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name"],
-                      "description": "updated = last message (from the user or the agent; a resume or status flip alone does not count); user = the user's last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change"});
+    let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name", "usage"],
+                      "description": "updated = last message (from the user or the agent; a resume or status flip alone does not count); user = the user's last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change; usage = most used first, by the usage measure (see `usage`)"});
+    let usage = json!({"type": "string", "enum": ["turns", "tokens", "context"],
+                       "description": "The usage measure: turns (prompts the user typed), tokens (taken in new or written), context (% of the context window in use). Default: the user's configured one."});
     let new_session_props = json!({
         "repo": s("Git repo path to work in (see find_repos). Omit to use the configured default repo."),
         "project": s("Plain folder instead of a repo (no worktree)"),
@@ -53,6 +55,7 @@ pub fn tools() -> Value {
                 "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
                 "sort": sort.clone(),
+                "usage": usage,
                 "reverse": b("Reverse the sort"),
             }), &[]),
         tool("get_session",
@@ -107,6 +110,8 @@ pub fn tools() -> Value {
                 "group": s("On the groups tab, the group (tag) to open; \"\" = untagged. Implies tab groups."),
                 "query": s("Filter text (same syntax as list_sessions query); \"\" clears it"),
                 "sort": sort,
+                "usage": {"type": "string", "enum": ["turns", "tokens", "context"],
+                          "description": "What the list's Usage column shows (and sort usage sorts by): turns, tokens or context %. Only when the user asks to see another one."},
                 "reverse": b("Reverse the sort"),
                 "archived": {"type": "string", "enum": ["live", "only"], "description": "Show live or archived sessions"},
                 "select": s("Session to highlight in the list"),
@@ -256,6 +261,10 @@ fn summarize(s: &Value) -> Value {
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
         "subagents_running": s["agents_running"],
+        // Turns, tokens, context % (null while unknown).
+        "usage": rlord_core::usage::Usage::from_json(&s["usage"]).map(|u| json!({
+            "turns": u.turns, "tokens": u.tokens, "context_pct": u.context_pct(),
+        })),
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
     });
@@ -328,6 +337,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 json!({
                     "archived": arg_str(args, "archived").unwrap_or("live"),
                     "sort": q.sort.label(),
+                    "usage": arg_str(args, "usage"),
                     "reverse": args.get("reverse").and_then(Value::as_bool).unwrap_or(false),
                     "status": q.status, "tag": q.tag, "agent": q.agent,
                     "project": q.project, "group": q.group, "search": q.search,
@@ -373,7 +383,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "open_keys" => d.rpc("ui.keys", args.clone()),
         "set_list_view" => {
             let mut p = Map::new();
-            for k in ["query", "sort", "archived", "select", "tab", "group"] {
+            for k in [
+                "query", "sort", "usage", "archived", "select", "tab", "group",
+            ] {
                 if let Some(v) = args.get(k).and_then(Value::as_str) {
                     p.insert(k.into(), json!(v));
                 }

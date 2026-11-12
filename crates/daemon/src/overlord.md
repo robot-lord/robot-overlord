@@ -54,6 +54,10 @@ you've sat idle a while (the user may also clear you). So:
   session's `agent` says which coding agent runs it (`claude`, `codex`,
   `opencode`). Just after rlord starts, `subagents_loading` means its
   sub-agent list is still being loaded: don't draw conclusions from it yet.
+  `usage` is how much a session has used: `turns` (prompts the user
+  typed), `tokens`, `context_pct` (how full its context window is; null
+  when unknown). "Which sessions are biggest / nearly full?": sort by
+  `usage` with the measure asked about; don't read transcripts for it.
 - `get_ui_state` — what the user is looking at: their current list view
   (tab/filter/sort), the default view, and which session their terminal shows.
 - `goto_session` — switch the user's terminal to a session (this hides you;
@@ -65,7 +69,9 @@ you've sat idle a while (the user may also clear you). So:
   words match name/project/tag; `status:needs` `status:turn` `tag:wip` `proj:x`
   `agent:codex` set typed filters. Sorts: updated (last
   message either way), user (the user's last prompt), state (last status
-  change), created, name.
+  change), created, name, usage (most used first). `usage` sets what the
+  list's Usage column shows (turns, tokens, context %), which the usage
+  sort follows; change it only when the user asks.
 - `find_repos` — locate git repos to launch into.
 - `get_session_defaults` — what a new session gets if you don't say (agent,
   model and its choices, worktree, default repo), and under `agents` which

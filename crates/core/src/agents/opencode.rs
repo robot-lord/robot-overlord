@@ -798,6 +798,8 @@ pub fn stats(db: &Path, id: &str) -> Option<TranscriptStats> {
                     SystemTime::UNIX_EPOCH
                         + Duration::from_millis(updated.max(idle.unwrap_or(0)).max(0) as u64),
                 ),
+                // (The Usage column's numbers: `usage`.)
+                ..Default::default()
             })
         },
     )
@@ -824,6 +826,81 @@ pub fn context_tokens(db: &Path, id: &str) -> u64 {
             .sum()
     })
     .unwrap_or(0)
+}
+
+/// The Usage column's numbers for a conversation: prompts typed (its
+/// `user` rows), tokens (the session row's input and output totals), the
+/// latest request's context and model. Three indexed look-ups, only in
+/// `session_v2` and `session_message`; the answer is kept until the
+/// database or its write-ahead log changes (size or time), so a list that
+/// asks again and again costs a `stat`. None: no such session (yet).
+pub fn usage(db: &Path, id: &str) -> Option<TranscriptStats> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    type Stamp = [(u64, Option<SystemTime>); 2];
+    static CACHE: LazyLock<Mutex<HashMap<String, (Stamp, TranscriptStats)>>> =
+        LazyLock::new(Default::default);
+    let stamp_of = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| (m.len(), m.modified().ok()))
+            .unwrap_or((0, None))
+    };
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let stamp: Stamp = [stamp_of(db), stamp_of(Path::new(&wal))];
+    let key = format!("{}/{id}", db.display());
+    if let Some((s, st)) = CACHE.lock().ok()?.get(&key) {
+        if *s == stamp {
+            return Some(st.clone());
+        }
+    }
+    let c = open(db)?;
+    let (input, output): (i64, i64) = c
+        .query_row(
+            "SELECT tokens_input, tokens_output FROM session_v2 WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    let turns: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM session_message WHERE session_id = ?1 AND type = 'user'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let last = one_data(
+        &c,
+        "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'assistant' \
+         ORDER BY seq DESC LIMIT 1",
+        id,
+    );
+    let st = TranscriptStats {
+        input_tokens: input,
+        output_tokens: output,
+        turns: turns.max(0) as u64,
+        tokens: input + output,
+        context: last
+            .as_ref()
+            .map(|v| {
+                let t = &v["tokens"];
+                [&t["input"], &t["cache"]["read"], &t["cache"]["write"]]
+                    .iter()
+                    .filter_map(|n| n.as_u64())
+                    .sum()
+            })
+            .unwrap_or(0),
+        model: last.as_ref().and_then(|v| model_name(&v["model"])),
+        ..Default::default()
+    };
+    if let Ok(mut cache) = CACHE.lock() {
+        // (Bounded: one entry per OpenCode session rlord has listed.)
+        if cache.len() > 1000 {
+            cache.clear();
+        }
+        cache.insert(key, (stamp, st.clone()));
+    }
+    Some(st)
 }
 
 /// The model of the latest turn (`provider/model`); before any, the one
@@ -1310,6 +1387,16 @@ pub(crate) mod tests {
             observed_model(&db, SES).as_deref(),
             Some("opencode/deepseek-v4.1-flash-free")
         );
+        // The Usage column: one prompt, the row's totals, the last request's
+        // context; a model with no known window.
+        let u = crate::usage::of(&db.join(SES), None).unwrap();
+        assert_eq!(
+            (u.turns, u.tokens, u.context),
+            (1, 18736 + 1545, 1517 + 20736)
+        );
+        assert_eq!(u.window, None);
+        // Asked again with nothing changed: the cached answer.
+        assert_eq!(crate::usage::of(&db.join(SES), None), Some(u));
         assert_eq!(
             (exists(&db, SES), exists(&db, "ses_none")),
             (Some(true), Some(false))

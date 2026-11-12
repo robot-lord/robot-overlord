@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_overlord.sql"),
     include_str!("../migrations/0006_transcript_cursors.sql"),
     include_str!("../migrations/0007_summary.sql"),
+    include_str!("../migrations/0008_usage.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
@@ -77,6 +78,10 @@ pub enum SortMode {
     State,
     Created,
     Name,
+    /// Most used first, by what the Usage column shows (turns, tokens or
+    /// context %; `SessionQuery::usage`). Not SQL: the daemon sorts the
+    /// rows once their usage is read (`rlord_daemon::usage`).
+    Usage,
 }
 
 impl SortMode {
@@ -89,6 +94,7 @@ impl SortMode {
             "state" | "status" | "changed" | "status-change" | "status_change" => SortMode::State,
             "created" | "age" => SortMode::Created,
             "name" => SortMode::Name,
+            "usage" | "use" | "used" => SortMode::Usage,
             _ => return None,
         })
     }
@@ -100,6 +106,7 @@ impl SortMode {
             SortMode::State => "status change",
             SortMode::Created => "created",
             SortMode::Name => "name",
+            SortMode::Usage => "usage",
         }
     }
 
@@ -111,6 +118,7 @@ impl SortMode {
             SortMode::State => "state",
             SortMode::Created => "created",
             SortMode::Name => "name",
+            SortMode::Usage => "usage",
         }
     }
     pub fn next(self) -> Self {
@@ -119,7 +127,8 @@ impl SortMode {
             SortMode::User => SortMode::State,
             SortMode::State => SortMode::Created,
             SortMode::Created => SortMode::Name,
-            SortMode::Name => SortMode::Activity,
+            SortMode::Name => SortMode::Usage,
+            SortMode::Usage => SortMode::Activity,
         }
     }
 }
@@ -143,6 +152,9 @@ pub struct SessionQuery {
     pub search: Option<String>,
     pub sort: SortMode,
     pub reverse: bool,
+    /// What the usage sort sorts by (and the rows' Usage column shows);
+    /// None: the configured `usage`.
+    pub usage: Option<crate::usage::UsageMetric>,
     /// Include the overlord session (excluded by default: clients show it
     /// as a special row, not as one of the fleet).
     pub include_overlord: bool,
@@ -472,7 +484,9 @@ impl Db {
         let (expr, natural) = match q.sort {
             // Messages only: a resume or an idle notification changes the
             // state (the State sort), not the conversation.
-            SortMode::Activity => (
+            // (Usage: in this order until the daemon sorts by usage, which
+            // keeps it among equals.)
+            SortMode::Activity | SortMode::Usage => (
                 "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
                  COALESCE(last_user_msg_at, 0))",
                 "DESC",
@@ -643,7 +657,8 @@ impl Db {
     /// parse version.
     pub fn transcript_cursors(&self, limit: usize) -> Result<Vec<(PathBuf, CursorState)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended \
+            "SELECT path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
+                    turns, tokens, context, window, model \
              FROM transcript_cursors WHERE version = ?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![STATS_PARSE_VERSION, limit as i64], |r| {
@@ -657,6 +672,11 @@ impl Db {
                     first: r.get(5)?,
                     last: r.get(6)?,
                     ended: r.get::<_, i64>(7)? != 0,
+                    turns: r.get::<_, i64>(8)? as u64,
+                    tokens: r.get(9)?,
+                    context: r.get::<_, i64>(10)? as u64,
+                    window: r.get::<_, Option<i64>>(11)?.map(|w| w as u64),
+                    model: r.get(12)?,
                 },
             ))
         })?;
@@ -674,8 +694,8 @@ impl Db {
             tx.execute(
                 "INSERT OR REPLACE INTO transcript_cursors \
                    (path, ino, offset, input_tokens, output_tokens, first_at, last_at, ended, \
-                    version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    version, turns, tokens, context, window, model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     p.to_string_lossy(),
                     c.ino as i64,
@@ -685,7 +705,12 @@ impl Db {
                     c.first,
                     c.last,
                     c.ended as i64,
-                    STATS_PARSE_VERSION
+                    STATS_PARSE_VERSION,
+                    c.turns as i64,
+                    c.tokens,
+                    c.context as i64,
+                    c.window.map(|w| w as i64),
+                    c.model
                 ],
             )?;
         }
@@ -1342,6 +1367,11 @@ mod tests {
             first: Some(1),
             last: Some(9),
             ended: true,
+            turns: 3,
+            tokens: 4567,
+            context: 890,
+            window: Some(272_000),
+            model: Some("gpt-5".into()),
         };
         db.save_transcript_cursors(&[(PathBuf::from("/t/a.jsonl"), c.clone())])
             .unwrap();
@@ -1364,7 +1394,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
         for table in [
             "sessions",
             "tags",
@@ -1392,7 +1422,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 7);
+        assert_eq!(db.schema_version().unwrap(), 8);
     }
 
     #[test]

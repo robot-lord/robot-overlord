@@ -14,6 +14,7 @@ pub mod search;
 pub mod summary;
 pub mod triage;
 pub mod ui;
+pub mod usage;
 pub mod warm;
 
 use std::os::unix::fs::PermissionsExt;
@@ -400,11 +401,13 @@ impl Daemon {
                     row["summarizing"] = json!(summarizing.contains(&id));
                 }
                 remote::annotate(self, &mut rows);
+                usage::list(self, &params, &mut rows, &loading);
                 Ok(Value::Array(rows))
             }
             ("session.get", Ok(row)) => {
                 let mut rows = [row];
                 remote::annotate(self, &mut rows);
+                usage::annotate(self, &mut rows, &self.warm.loading(), true);
                 let [row] = rows;
                 Ok(row)
             }
@@ -898,6 +901,84 @@ mod tests {
         .unwrap();
         assert_eq!(list, json!([]));
 
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_list_carries_usage_and_sorts_by_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        // a: 3 prompts, little output; b: 1 prompt, a lot; c: no transcript.
+        let transcript = |name: &str, prompts: usize, output: u64| {
+            let p = dir.path().join(format!("{name}.jsonl"));
+            let mut text = String::new();
+            for i in 0..prompts {
+                text += &format!(
+                    "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"p{i}\"}}}}\n\
+                     {{\"type\":\"assistant\",\"message\":{{\"id\":\"{name}{i}\",\
+                     \"model\":\"claude-opus-5-5\",\"content\":[],\"usage\":{{\"input_tokens\":1,\
+                     \"cache_read_input_tokens\":1000,\"output_tokens\":{output}}}}}}}\n"
+                );
+            }
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        {
+            let db = daemon.db.lock().unwrap();
+            for (id, t) in [
+                ("01a", Some(transcript("a", 3, 10))),
+                ("01b", Some(transcript("b", 1, 50_000))),
+                ("01c", None),
+            ] {
+                db.insert_session(&rlord_core::db::NewSession {
+                    id,
+                    name: id,
+                    agent: "claude",
+                    agent_session: Some(id),
+                    project_path: "/tmp",
+                    tmux_session: None,
+                    launch_spec: "{}",
+                    created_at: 1,
+                    repo_path: None,
+                    workspace_path: None,
+                    branch: None,
+                    role: "",
+                })
+                .unwrap();
+                if let Some(t) = t {
+                    db.upsert_transcript_source(id, &t.to_string_lossy())
+                        .unwrap();
+                }
+            }
+        }
+        let listener = Daemon::bind(&sock).unwrap();
+        let server = tokio::spawn(daemon.clone().serve(listener));
+        let list = |params: Value| {
+            let sock = sock.clone();
+            tokio::task::spawn_blocking(move || client_call(&sock, "session.list", params).unwrap())
+        };
+        let ids = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let v = list(json!({"sort": "usage"})).await.unwrap();
+        assert_eq!(ids(&v), ["01a", "01b", "01c"], "most turns first: {v}");
+        assert_eq!(v[0]["usage"]["turns"], 3);
+        assert_eq!(v[0]["usage"]["context_pct"], 1);
+        assert!(v[2]["usage"].is_null(), "no transcript: unknown");
+        let v = list(json!({"sort": "usage", "usage": "tokens"}))
+            .await
+            .unwrap();
+        assert_eq!(ids(&v), ["01b", "01a", "01c"], "most tokens first: {v}");
+        assert_eq!(v[0]["usage"]["tokens"], 50_001);
+        let v = list(json!({"sort": "usage", "usage": "tokens", "reverse": true}))
+            .await
+            .unwrap();
+        assert_eq!(ids(&v), ["01a", "01b", "01c"], "unknown stays last: {v}");
         server.abort();
     }
 
