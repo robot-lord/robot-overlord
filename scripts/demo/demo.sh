@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # A throwaway rlord full of made-up sessions, for screenshots and trying the
 # UI. Fully separate from a real install: its own data, config and tmux
-# server (rlord-demo); "claude" and "codex" are stand-ins (scripts/demo/bin)
-# that draw a screen and report state through rlord's hooks, with no model.
+# server (rlord-demo); "claude", "codex" and "opencode" are stand-ins
+# (scripts/demo/bin) that draw a screen and report state as the real ones
+# would (rlord's hooks; OpenCode: its session database), with no model.
 #
 #   scripts/demo/demo.sh [DIR]     # set up (DIR default: a new temp dir)
 #   source DIR/env.sh && rlord     # look around
@@ -24,11 +25,17 @@ fi
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
 mkdir -p "$d"/{data,config/robot-overlord,run,state,claude,codex,bin,src,screens,states,summaries}
 d=$(cd "$d" && pwd)
+# The daemon's socket lives under it, and a unix socket's path is short
+# (about 100 bytes): say so here, not as a daemon that "isn't answering".
+if (( $(printf '%s' "$d/run/robot-overlord/daemon.sock" | wc -c) > 100 )); then
+  echo "demo dir path too long for a unix socket; use a shorter DIR: $d" >&2
+  exit 1
+fi
 
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
-cp "$here/bin/claude" "$here/bin/codex" "$d/bin/"
+cp "$here/bin/claude" "$here/bin/codex" "$here/bin/opencode" "$d/bin/"
 # A stand-in login shell that sees only the demo's programs: rlord asks the
 # login shell where an agent is when its PATH doesn't have it, and the
 # demo must never find (and launch) a real agent that way.
@@ -61,7 +68,7 @@ B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' C=$'\e[36m' M=$'\e[35m'
 box() { printf '%s\n' "${D}────────────────────────────────────────────────────────────────────────${R}" "> $1" "${D}────────────────────────────────────────────────────────────────────────${R}" "  ${D}? for shortcuts${R}"; }
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
-# AGENT=codex add …: a Codex session.
+# AGENT=codex add …: a Codex session; AGENT=opencode: an OpenCode one.
 add() {
   local name=$1 proj=$2 state=$3 tags=$4 desc=$5 prompt=$6 dir=$d/src/$1
   mkdir -p "$dir"
@@ -150,6 +157,15 @@ AGENT=codex add image-pipeline acme-api idle "api perf" "Resize product images o
 • Done. The old inline resize is removed; thumbnails backfill on first view.
 EOF
 
+# An OpenCode session. (No stand-in server: rlord reads working / your
+# turn from OpenCode's session row; "needs you" would need its events.)
+AGENT=opencode add onboarding-emails acme-api idle "api growth" "Welcome email sequence for new sellers" "Draft the three-email welcome sequence for new sellers" <<EOF
+• Drafted the sequence in emails/onboarding/: welcome, first listing, payouts.
+• Each email has a plain-text twin and one call to action.
+
+• Ready for review. Subject lines are in emails/onboarding/README.md.
+EOF
+
 # An archived session, with its summary (written by the stand-in claude
 # through the real archive path).
 name=search-indexer-migration
@@ -177,6 +193,13 @@ for _ in $(seq 20); do
   sleep 0.5
 done
 
+# The OpenCode session's status comes from rlord's own look at OpenCode's
+# database (every few seconds): wait for it, so the times below stand.
+for _ in $(seq 20); do
+  [[ $(sqlite3 "$d/data/robot-overlord/state.db" "select status from sessions where name='onboarding-emails'") == idle ]] && break
+  sleep 0.5
+done
+
 # Spread the times out, as if the fleet had been running for a while.
 now=$(($(date +%s) * 1000))
 ago() { echo $((now - $1 * 60000)); }
@@ -192,6 +215,7 @@ set_times docs-navigation 75 64 1500
 set_times terraform-upgrade 1440 1430 2900
 set_times push-notifications 2880 2870 4400
 set_times image-pipeline 200 190 420
+set_times onboarding-emails 55 50 240
 set_times search-indexer-migration 10080 10070 14400
 sql "update sessions set pinned=1 where name='checkout-redesign'"
 

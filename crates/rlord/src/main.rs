@@ -34,7 +34,7 @@ enum Command {
     Search {
         #[arg(required = true)]
         words: Vec<String>,
-        /// Also agent conversations (Claude Code, Codex) started outside rlord
+        /// Also agent conversations (Claude Code, Codex, OpenCode) started outside rlord
         #[arg(long)]
         everywhere: bool,
         /// Sessions to show
@@ -108,10 +108,10 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
         /// Model passed to the agent (default: [session].model, or
-        /// codex_model for Codex)
+        /// codex_model for Codex, opencode_model for OpenCode: provider/model)
         #[arg(long)]
         model: Option<String>,
-        /// Coding agent to run: claude or codex (default: [session].agent)
+        /// Coding agent to run: claude, codex or opencode (default: [session].agent)
         #[arg(long)]
         agent: Option<String>,
         /// Display name (default: <repo>-<id suffix>)
@@ -272,7 +272,8 @@ enum Command {
     #[command(subcommand)]
     Codex(AgentCmd),
     /// Install rlord's hook handler for every agent that is installed
-    /// (Claude Code, Codex): how rlord sees what each session is doing
+    /// (Claude Code, Codex): how rlord sees what each session is doing.
+    /// (OpenCode needs none: rlord follows its background server.)
     InstallHooks,
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
@@ -1040,7 +1041,11 @@ fn main() -> Result<()> {
         Command::Claude(AgentCmd::InstallHooks) => install_hooks(&[Agent::Claude]),
         Command::Codex(AgentCmd::InstallHooks) => install_hooks(&[Agent::Codex]),
         Command::InstallHooks => {
-            let found: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.installed()).collect();
+            // (OpenCode has no hooks: rlord follows its server's events.)
+            let found: Vec<Agent> = Agent::ALL
+                .into_iter()
+                .filter(|a| a.uses_hooks() && a.installed())
+                .collect();
             if found.is_empty() {
                 anyhow::bail!("neither `claude` nor `codex` is on PATH: `rlord agents` shows how to install one");
             }
@@ -1089,7 +1094,7 @@ fn install_hooks(agents: &[Agent]) -> Result<()> {
                     }
                 }
             }
-            Agent::Claude => {}
+            Agent::Claude | Agent::OpenCode => {}
         }
     }
     Ok(())
@@ -1480,6 +1485,8 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
         rlord_daemon::discover::start(&daemon);
+        // OpenCode sessions: status from its background server's events.
+        rlord_daemon::opencode::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
         // before the first launch needs it.
         std::thread::spawn(rlord_core::agents::install::warm);
@@ -1747,6 +1754,11 @@ fn print_coding_agents(v: &Value) {
         );
         if a["hooks_outdated"] == true {
             println!("  rlord hooks: out of date — run `rlord install-hooks` again");
+        } else if let Some(why) = a["too_old"].as_str() {
+            println!("  {why}");
+        } else if a["installed"] == true && a["supported"] == true && a["hooks_installed"].is_null()
+        {
+            println!("  no hooks needed: rlord follows its background server's events");
         } else if a["installed"] == true && a["supported"] == true {
             let trusted = match a["hooks_trusted"].as_bool() {
                 Some(_) => format!(" · trusted in Codex: {}", yes_no("hooks_trusted")),
@@ -1755,7 +1767,12 @@ fn print_coding_agents(v: &Value) {
             println!("  rlord hooks: {}{trusted}", yes_no("hooks_installed"));
         }
         if let Some(cmd) = a["install"]["command"].as_str() {
-            println!("  to install it, run:  {cmd}");
+            let what = if a["installed"] == true {
+                "upgrade"
+            } else {
+                "install"
+            };
+            println!("  to {what} it, run:  {cmd}");
             for alt in a["install"]["alternatives"]
                 .as_array()
                 .into_iter()
@@ -1773,7 +1790,10 @@ fn print_coding_agents(v: &Value) {
             println!("  next: {next}");
         }
     }
-    println!("\nrlord never installs an agent for you. After installing one: rlord install-hooks");
+    println!(
+        "\nrlord never installs an agent for you. After installing Claude Code or Codex: \
+         rlord install-hooks"
+    );
 }
 
 fn print_agents(list: &Value) {

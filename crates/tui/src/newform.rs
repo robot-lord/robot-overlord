@@ -418,11 +418,20 @@ impl NewForm {
                 cmd,
             ));
         }
+        // Installed, but a version rlord can't run (OpenCode before v2).
+        if let Some(why) = a["too_old"].as_str() {
+            return Some((format!("{why}. Upgrade it yourself:"), cmd));
+        }
         (a["installed"] == false).then(|| {
             (
-                format!(
-                    "{label} isn't installed. Install it yourself, then `rlord install-hooks`:"
-                ),
+                // (Only an agent rlord follows through hooks has that step.)
+                if a["hooks"] == false {
+                    format!("{label} isn't installed. Install it yourself:")
+                } else {
+                    format!(
+                        "{label} isn't installed. Install it yourself, then `rlord install-hooks`:"
+                    )
+                },
                 cmd,
             )
         })
@@ -965,6 +974,8 @@ impl App {
                         a["label"].as_str().unwrap_or("?"),
                         if a["supported"] == false {
                             "  (rlord support coming)"
+                        } else if a["too_old"].is_string() {
+                            "  (too old for rlord: pick it to see how to upgrade)"
                         } else if a["installed"] == false {
                             "  (not installed: pick it to see how)"
                         } else {
@@ -1833,7 +1844,11 @@ mod tests {
             json!({"name": "codex", "label": "Codex", "installed": false, "supported": true,
                    "model": "", "models": [],
                    "install": {"via": "homebrew", "command": "brew install --cask codex"}}),
-            json!({"name": "opencode", "label": "OpenCode", "installed": true,
+            json!({"name": "opencode", "label": "OpenCode", "installed": true, "hooks": false,
+                   "supported": true, "model": "", "models": [],
+                   "too_old": "rlord needs OpenCode v2 or newer (this is 1.4.3)",
+                   "install": {"via": "homebrew", "command": "brew install anomalyco/tap/opencode-v2"}}),
+            json!({"name": "gemini", "label": "Gemini", "installed": true,
                    "supported": false, "model": "", "models": []}),
         ];
         f.agent.clear();
@@ -1850,7 +1865,26 @@ mod tests {
         let f = app.submit_form(f).unwrap().expect("still open");
         assert!(f.error.as_deref().unwrap().contains("isn't installed"));
         let mut f = f;
+        // Installed, but too old to run: the command that upgrades it.
         f.set_agent("opencode");
+        let (why, cmd) = f.agent_blocker().unwrap();
+        assert!(
+            why.contains("OpenCode v2") && why.contains("Upgrade"),
+            "{why}"
+        );
+        assert_eq!(
+            cmd.as_deref(),
+            Some("brew install anomalyco/tap/opencode-v2")
+        );
+        // Missing, and one rlord follows without hooks: no install-hooks step.
+        f.agents[2]["too_old"] = Value::Null;
+        f.agents[2]["installed"] = json!(false);
+        let (why, _) = f.agent_blocker().unwrap();
+        assert!(
+            why.contains("isn't installed") && !why.contains("install-hooks"),
+            "{why}"
+        );
+        f.set_agent("gemini");
         let (why, cmd) = f.agent_blocker().unwrap();
         assert!(why.contains("support coming") && cmd.is_none(), "{why}");
     }

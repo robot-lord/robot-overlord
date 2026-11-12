@@ -8,6 +8,7 @@ pub mod keys;
 pub mod models;
 pub mod names;
 pub mod paths;
+pub mod process;
 pub mod themes;
 pub mod timefmt;
 pub mod tmux;

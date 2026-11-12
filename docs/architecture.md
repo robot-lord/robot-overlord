@@ -160,31 +160,56 @@ facts live in its module) is what the rest of rlord asks:
   session's folder since launch; `trust = minted`, rlord's own attribution,
   confirmed by a later hook). Only `minted` or `hook` ids resume; a
   `scavenged` one never does. A Codex session with no bound id can't resume.
+  OpenCode takes a caller-chosen id too, but its TUI creates a session
+  only with the first message and has no model flag: the pane command
+  first creates the session through OpenCode's server (`opencode api POST
+  /api/session`, with the id, folder and model), then execs the TUI on it
+  (`opencode -s <ses_…> [--prompt …]`). `Launch::deferred` names the model
+  for `daemon::opencode` to confirm afterwards (set it if the create step
+  didn't take; log it if it can't be).
 - **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
   agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same
   shape, others' hooks kept, one backup), `map_hook_event` turns an event
   into (log kind, status). Codex hooks need the user's trust (`/hooks`);
-  rlord never bypasses it.
+  rlord never bypasses it. OpenCode has none (`uses_hooks` is false).
 - **Transcripts**: where a conversation is written (`transcript_path`,
   `all_transcripts`), read through `agents::transcript` into one shape for
   every consumer (excerpts, stats, search/read, context size, model, turn
-  state).
+  state). An OpenCode conversation is rows in OpenCode's SQLite database
+  (`session_v2`, `session_message`), not a file: its "path" is
+  `<opencode.db>/<session id>`, and `agents::opencode` answers the same
+  questions from the database (opened read-only; only those two tables,
+  since the database also holds OpenCode's credentials).
 - **Capabilities**: `has_remote_control`, `tracks_subagents`,
   `overlord_seat`, `importable` (all Claude-only today; callers ask instead
   of comparing names).
 
 Status has more than one source, and that is not part of `Agent`: hook
-events (`methods::hook_emit`), and for agents not reporting through hooks
+events (`methods::hook_emit`); for agents not reporting through hooks
 `daemon::discover` (the agent's own index and transcript tail, a slow
-tick). Archive summaries are written by the session's own agent
+tick); and for OpenCode `daemon::opencode`. OpenCode v2 runs one
+background server per user (address and password in its `service.json`,
+re-read on every connect) and the TUI in the pane is a client of it, so
+that task holds one connection to the server's event stream
+(`agents::opencode_service`: filtered event types, no replay), matches
+events to sessions by the minted id, resyncs after each connect from
+OpenCode's session rows, checked against the turns the server says are
+running (`GET /api/session/active`: a row left "busy" by a server that
+died mid-turn is over), and the server's pending permissions and forms,
+falls back to the session rows alone while no server is reachable, and
+takes "stopped" from the pane. It runs only while there are live OpenCode
+sessions. Archive summaries are written by the session's own agent
 (`claude::summary_argv`, `codex::summary_argv`: one-shot, nothing saved,
-nothing it could change).
+nothing it could change; OpenCode: its server's `generate` call, which
+adds nothing to the conversation, else a throwaway archived session that
+is deleted afterwards).
 
 ## Status engine
 
 Same three-tier degradation the research validated, implemented once:
 
-1. **Native events** (Claude and Codex hooks), freshness-windowed.
+1. **Native events** (Claude and Codex hooks; OpenCode's server events),
+   freshness-windowed.
    Vocabulary: `starting | working | waiting_input | idle | stopped | error`.
 2. **Pane hints** — OSC pane-title spinner check (zero-capture fast path).
 3. **Pane capture + patterns** — via the control-mode stream where possible;

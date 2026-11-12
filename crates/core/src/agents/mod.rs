@@ -4,8 +4,8 @@
 //! fresh, where the conversation id comes from, how hooks are installed and
 //! what each hook event means, where transcripts live, and what the agent
 //! can't do (Remote Control, sub-agents, an overlord seat). Each agent's
-//! own facts live in its module (`claude`, `codex`); transcripts are read
-//! through `transcript`, whichever agent wrote them.
+//! own facts live in its module (`claude`, `codex`, `opencode`);
+//! transcripts are read through `transcript`, whichever agent wrote them.
 //!
 //! Adding an agent: a module with its argv and its own facts, a variant
 //! here, and a `transcript::Format`.
@@ -16,17 +16,19 @@
 //! - **Where status comes from.** Command hooks (`map_hook_event`) are one
 //!   source; the daemon's `discover` (the agent's own files) is another. A
 //!   source turns what the agent says into a `Status` and writes it the
-//!   same way; an agent with an event stream instead of hooks adds a
-//!   source, not a hook mapping.
+//!   same way. OpenCode has no hooks: its source is its server's event
+//!   stream (`opencode_service`, followed by the daemon's `opencode`).
 //! - **How a conversation is stored.** Consumers ask `transcript` for
 //!   common shapes (excerpts, messages, stats, context size, model, turn
 //!   state), never for lines. Claude and Codex both keep JSON lines, so
-//!   both are read through `transcript::Line`; a store that isn't a JSONL
-//!   file answers those same functions its own way.
+//!   both are read through `transcript::Line`; OpenCode keeps a database,
+//!   and answers those same functions from it.
 
 pub mod claude;
 pub mod codex;
 pub mod install;
+pub mod opencode;
+pub mod opencode_service;
 pub mod remote;
 pub mod transcript;
 
@@ -43,6 +45,7 @@ use transcript::Format;
 pub enum Agent {
     Claude,
     Codex,
+    OpenCode,
 }
 
 /// What a hook event does to a session's status.
@@ -89,10 +92,23 @@ pub struct Launch {
     pub session_id: Option<String>,
     /// Where its transcript will be written, when that follows from the id.
     pub transcript: Option<PathBuf>,
+    /// What should be checked once the conversation exists (see `Deferred`).
+    pub deferred: Option<Deferred>,
+}
+
+/// What a launch asked for that the agent's own command line can't carry,
+/// to be confirmed once its conversation exists by whatever follows that
+/// agent. OpenCode's TUI has no model flag: the launch creates the session
+/// with its model through OpenCode's server first; if that step didn't
+/// take (no server could be reached), the model is set afterwards, and the
+/// session's log says when it couldn't be.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Deferred {
+    pub model: String,
 }
 
 impl Agent {
-    pub const ALL: [Agent; 2] = [Agent::Claude, Agent::Codex];
+    pub const ALL: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::OpenCode];
 
     pub fn parse(name: &str) -> Option<Agent> {
         Agent::ALL.into_iter().find(|a| a.name() == name.trim())
@@ -111,6 +127,7 @@ impl Agent {
         match self {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
+            Agent::OpenCode => "opencode",
         }
     }
 
@@ -119,6 +136,7 @@ impl Agent {
         match self {
             Agent::Claude => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::OpenCode => "OpenCode",
         }
     }
 
@@ -131,6 +149,7 @@ impl Agent {
         match self {
             Agent::Claude => Format::Claude,
             Agent::Codex => Format::Codex,
+            Agent::OpenCode => Format::OpenCode,
         }
     }
 
@@ -140,7 +159,7 @@ impl Agent {
     /// is known from the first second). Otherwise the agent assigns it and
     /// rlord learns it afterwards.
     pub fn mints_id(self) -> bool {
-        matches!(self, Agent::Claude)
+        matches!(self, Agent::Claude | Agent::OpenCode)
     }
 
     /// Whether a hook event may move a session to another conversation id.
@@ -151,6 +170,8 @@ impl Agent {
         match self {
             Agent::Claude => true,
             Agent::Codex => event == "SessionStart",
+            // (No hooks: nothing ever reports another id.)
+            Agent::OpenCode => false,
         }
     }
 
@@ -172,14 +193,33 @@ impl Agent {
                     argv: claude::launch_argv(&id, prompt, model, extra),
                     transcript: Some(claude::transcript_path(project, &id)),
                     session_id: Some(id),
+                    deferred: None,
                 }
             }
             Agent::Codex => Launch {
                 argv: codex::launch_argv(prompt, model, extra),
                 session_id: None,
                 transcript: None,
+                deferred: None,
             },
+            Agent::OpenCode => {
+                let id = opencode::mint_session_id();
+                Launch {
+                    argv: opencode::launch_argv(&id, project, model, prompt, extra),
+                    transcript: Some(opencode::transcript_path(&id)),
+                    session_id: Some(id),
+                    deferred: self.deferred(model),
+                }
+            }
         }
+    }
+
+    /// What must be confirmed after a start with `model` (see `Deferred`).
+    pub fn deferred(self, model: Option<&str>) -> Option<Deferred> {
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        (self == Agent::OpenCode).then(|| Deferred {
+            model: model.to_string(),
+        })
     }
 
     /// Continue conversation `id`: the command, and whether it resumes
@@ -213,6 +253,16 @@ impl Agent {
                 }
                 Ok((codex::resume_argv(id, model, extra), true))
             }
+            Agent::OpenCode => {
+                let id = id.context("session has no agent session id; cannot resume")?;
+                if trust == "scavenged" || !opencode::is_session_id(id) {
+                    bail!("refusing to resume a session id rlord didn't choose ({id})");
+                }
+                // Opened as it is, or created anew (see `resume_argv`).
+                // Opened, nothing is held to confirm afterwards.
+                let has = opencode::exists(&opencode::db_path(), id);
+                Ok(opencode::resume_argv(id, has, project, model, extra))
+            }
         }
     }
 
@@ -223,7 +273,16 @@ impl Agent {
         match self {
             Agent::Claude => claude::map_hook_event(event, payload),
             Agent::Codex => codex::map_hook_event(event),
+            // (No hooks; an event sent by hand changes nothing.)
+            Agent::OpenCode => ("hook_other", Effect::Nothing),
         }
+    }
+
+    /// rlord follows it through command hooks it installs. False: the
+    /// agent has none, and its status comes from another source (OpenCode:
+    /// its server's events), with nothing to install.
+    pub fn uses_hooks(self) -> bool {
+        !self.hook_events().is_empty()
     }
 
     /// The file the agent reads its hooks from.
@@ -231,6 +290,8 @@ impl Agent {
         match self {
             Agent::Claude => claude::config_dir().join("settings.json"),
             Agent::Codex => codex::home().join("hooks.json"),
+            // (None are installed there: see `uses_hooks`.)
+            Agent::OpenCode => opencode::db_path().with_file_name("hooks.json"),
         }
     }
 
@@ -246,6 +307,9 @@ impl Agent {
     }
 
     pub fn install_hooks_in(self, file: &Path, rlord_bin: &str) -> Result<bool> {
+        if !self.uses_hooks() {
+            return Ok(false);
+        }
         merge_hooks(file, &self.hook_command(rlord_bin), self.hook_events())
     }
 
@@ -254,6 +318,7 @@ impl Agent {
         match self {
             Agent::Claude => claude::HOOK_EVENTS,
             Agent::Codex => codex::HOOK_EVENTS,
+            Agent::OpenCode => &[],
         }
     }
 
@@ -264,13 +329,14 @@ impl Agent {
         match self {
             Agent::Claude => Indexed::NoIndex,
             Agent::Codex => codex::thread_kind(&codex::home(), id),
+            Agent::OpenCode => Indexed::NoIndex,
         }
     }
 
     /// What the user must still do after the hooks are installed, if anything.
     pub fn hooks_next_step(self) -> Option<&'static str> {
         match self {
-            Agent::Claude => None,
+            Agent::Claude | Agent::OpenCode => None,
             Agent::Codex => Some(
                 "Codex runs a hook only once you've trusted it. Trust rlord's once:\n\
                  \x20 1. start Codex (any folder): `codex`\n\
@@ -291,14 +357,17 @@ impl Agent {
         match self {
             Agent::Claude => Some(claude::transcript_path(project, id)),
             Agent::Codex => codex::rollout_of(&codex::home(), id),
+            Agent::OpenCode => opencode::is_session_id(id).then(|| opencode::transcript_path(id)),
         }
     }
 
-    /// The directory all of this agent's transcripts live under.
+    /// The directory all of this agent's transcripts live under (OpenCode:
+    /// its database, which a conversation's path names as its parent).
     pub fn transcripts_root(self) -> PathBuf {
         match self {
             Agent::Claude => claude::config_dir().join("projects"),
             Agent::Codex => codex::sessions_dir(),
+            Agent::OpenCode => opencode::db_path(),
         }
     }
 
@@ -327,12 +396,19 @@ impl Agent {
                 v
             }
             Agent::Codex => codex::rollouts_in(&self.transcripts_root()),
+            Agent::OpenCode => {
+                let db = self.transcripts_root();
+                opencode::sessions(&db)
+                    .into_iter()
+                    .map(|(t, id)| (t, db.join(id)))
+                    .collect()
+            }
         }
     }
 
     /// The folder a transcript's conversation ran in, as well as it can be
     /// told (Claude: its project directory's name, the path with `/` as
-    /// `-`; Codex: the folder itself).
+    /// `-`; Codex and OpenCode: the folder itself).
     pub fn transcript_folder(self, transcript: &Path) -> String {
         match self {
             Agent::Claude => transcript
@@ -341,6 +417,9 @@ impl Agent {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             Agent::Codex => codex::rollout_cwd(transcript).unwrap_or_default(),
+            Agent::OpenCode => opencode::locate(transcript)
+                .and_then(|(db, id)| opencode::directory(db, id))
+                .unwrap_or_default(),
         }
     }
 
@@ -361,9 +440,10 @@ impl Agent {
     pub fn overlord_seat(self) -> Result<()> {
         match self {
             Agent::Claude => Ok(()),
-            Agent::Codex => bail!(
-                "the overlord runs on Claude Code only for now (Codex seats aren't built yet); \
-                 set `[overlord] agent = \"claude\"`"
+            Agent::Codex | Agent::OpenCode => bail!(
+                "the overlord runs on Claude Code only for now ({} seats aren't built yet); \
+                 set `[overlord] agent = \"claude\"`",
+                self.label()
             ),
         }
     }
@@ -379,6 +459,7 @@ pub fn agent_of(transcript: &Path) -> Agent {
     match Format::of(transcript) {
         Format::Claude => Agent::Claude,
         Format::Codex => Agent::Codex,
+        Format::OpenCode => Agent::OpenCode,
     }
 }
 
@@ -491,7 +572,7 @@ mod tests {
         }
         assert_eq!(Agent::parse("gemini"), None);
         let e = Agent::named("gemini").unwrap_err().to_string();
-        assert!(e.contains("claude, codex"), "{e}");
+        assert!(e.contains("claude, codex, opencode"), "{e}");
     }
 
     #[test]
@@ -507,6 +588,72 @@ mod tests {
         assert_eq!(l.argv, ["codex", "--no-daemon", "--no-alt-screen", "hi"]);
         assert_eq!((l.session_id, l.transcript), (None, None));
         assert!(Agent::Claude.mints_id() && !Agent::Codex.mints_id());
+    }
+
+    #[test]
+    fn opencode_mints_its_id_and_creates_the_session_with_its_model() {
+        assert!(Agent::OpenCode.mints_id() && !Agent::OpenCode.uses_hooks());
+        let l = Agent::OpenCode.launch("/src/app", Some("hi"), None, &[]);
+        let id = l.session_id.clone().expect("minted");
+        assert!(opencode::is_session_id(&id));
+        // Created through OpenCode's server first, then opened.
+        assert_eq!(l.argv[..2], ["sh", "-c"]);
+        assert_eq!(l.argv[3], "opencode");
+        assert_eq!(l.argv[5..], ["-s", id.as_str(), "--prompt", "hi"]);
+        assert_eq!(l.deferred, None);
+        // Its transcript is that conversation in OpenCode's database.
+        let t = l.transcript.unwrap();
+        assert_eq!(opencode::locate(&t).map(|(_, i)| i), Some(id.as_str()));
+        assert_eq!(agent_of(&t), Agent::OpenCode);
+        assert_eq!(Agent::OpenCode.transcript_path("/src/app", &id), Some(t));
+        // With a model: created with it (the prompt still rides along),
+        // and noted for a check afterwards.
+        let l = Agent::OpenCode.launch("/src/app", Some("hi"), Some("opencode/x-free"), &[]);
+        let body: Value = serde_json::from_str(&l.argv[4]).unwrap();
+        assert_eq!(
+            body["model"],
+            json!({"providerID": "opencode", "id": "x-free"})
+        );
+        assert_eq!(l.argv.last().map(String::as_str), Some("hi"));
+        assert_eq!(
+            l.deferred,
+            Some(Deferred {
+                model: "opencode/x-free".into()
+            })
+        );
+        assert_eq!(Agent::Claude.deferred(Some("opus")), None);
+        // Resuming a session OpenCode doesn't have starts it under the
+        // same id, created with the launch's model; one it has, or one it
+        // can't tell about, is opened as it is.
+        let m = Some("opencode/x-free");
+        let (argv, resumed) = opencode::resume_argv(&id, Some(false), "/src/app", m, &[]);
+        assert!(!resumed);
+        assert_eq!(argv[..2], ["sh", "-c"]);
+        assert_eq!(argv[5..], ["-s", id.as_str()]);
+        assert!(argv[4].contains("x-free"));
+        for has in [Some(true), None] {
+            let (argv, resumed) = opencode::resume_argv(&id, has, "/src/app", m, &[]);
+            assert!(resumed);
+            assert_eq!(argv, ["opencode", "-s", id.as_str()]);
+        }
+        // An id rlord didn't mint is refused.
+        assert!(Agent::OpenCode
+            .resume(Some("--standalone"), "minted", "/src/app", None, &[])
+            .is_err());
+        assert!(Agent::OpenCode
+            .resume(None, "minted", "/src/app", None, &[])
+            .is_err());
+        // No hooks to install, and no hook event means anything.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hooks.json");
+        assert!(!Agent::OpenCode
+            .install_hooks_in(&file, "/bin/rlord")
+            .unwrap());
+        assert!(!file.exists());
+        assert_eq!(
+            Agent::OpenCode.map_hook_event("Stop", &json!({})),
+            ("hook_other", Effect::Nothing)
+        );
     }
 
     #[test]

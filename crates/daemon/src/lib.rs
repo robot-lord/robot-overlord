@@ -4,6 +4,7 @@ pub mod discover;
 pub mod import;
 pub mod mcp;
 pub mod methods;
+pub mod opencode;
 pub mod overlord;
 pub mod profile;
 pub mod remote;
@@ -332,6 +333,13 @@ impl Daemon {
         ) {
             rlord_core::agents::install::warm();
         }
+        // The user is about to choose a model, or is looking at their
+        // agents: lists that must be asked for (OpenCode's) are, here
+        // only. In the background (it can take seconds): this answer has
+        // the list as last listed, the next one the fresh list.
+        if matches!(method, "session.defaults" | "agents.list") && params["no_listing"] != true {
+            refresh_models();
+        }
         if let Some(r) = self.call_ui(method, &params) {
             return r.map_err(MethodError::Internal);
         }
@@ -597,6 +605,19 @@ impl Daemon {
 enum MethodError {
     NotFound,
     Internal(anyhow::Error),
+}
+
+/// List OpenCode's models (`install::list_models`) on a thread of its
+/// own, one at a time: a request never waits on it.
+fn refresh_models() {
+    static LISTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LISTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = std::panic::catch_unwind(rlord_core::agents::install::list_models);
+        LISTING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Canonical path of the binary this process was started from (pinned when

@@ -70,7 +70,8 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     // Whole folders: each seat runs in its own, so every conversation it
     // ever had is in there, known to rlord or not.
     // (Claude keeps a folder's conversations together, so its transcript
-    // directory stands for the folder; a Codex rollout says its folder.)
+    // directory stands for the folder; a Codex rollout and an OpenCode
+    // session say their folder.)
     let seat_dirs: Vec<String> = crate::overlord::SEATS
         .iter()
         .map(|seat| seat.dir().to_string_lossy().into_owned())
@@ -110,12 +111,13 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let is_seat = |cwd: &str| seat_dirs.iter().chain(&seat_real).any(|d| d == cwd);
-        let in_seat_folder = |p: &Path| {
-            agents::agent_of(p) == Agent::Codex
-                && match folders.get(p) {
-                    Some(cwd) => is_seat(cwd),
-                    None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
-                }
+        let in_seat_folder = |p: &Path| match agents::agent_of(p) {
+            Agent::Claude => false, // (by its directory: `skip`)
+            Agent::Codex => match folders.get(p) {
+                Some(cwd) => is_seat(cwd),
+                None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
+            },
+            Agent::OpenCode => is_seat(&Agent::OpenCode.transcript_folder(p)),
         };
         paths.extend(history::all_transcripts().into_iter().filter(|p| {
             !by_path.contains_key(p)
@@ -233,6 +235,15 @@ pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
                     .context("that session has no transcript on disk")?,
             };
             (json!({"session": s.name, "id": s.id}), p)
+        }
+        // A conversation in OpenCode's database (its path isn't a file).
+        (_, Some(t)) if agents::opencode::is_transcript(Path::new(t)) => {
+            let p = PathBuf::from(t);
+            let ours = p.parent() == Some(Agent::OpenCode.transcripts_root().as_path());
+            if !ours || !agents::transcript::exists(&p) {
+                bail!("not an agent's transcript");
+            }
+            (json!({"transcript": p}), p)
         }
         (_, Some(t)) => {
             // Only the agents' own transcripts.
