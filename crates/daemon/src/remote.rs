@@ -608,7 +608,7 @@ fn keep_mastermind_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     *last = Some(Instant::now());
     // Not while a hand-off is being pasted into it.
     let _send = d.mastermind_send.lock().expect("mastermind send lock");
-    overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))?;
+    overlord::ensure(&d.db(), &d.config(), &json!({"seat": "mastermind"}))?;
     tracing::info!("started the mastermind for Remote Control");
     d.changed();
     Ok(())
@@ -714,7 +714,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             Some(m) => m,
             // Not started yet: start it now (with the flag, from the kv).
             None if on => {
-                overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))?;
+                overlord::ensure(&d.db(), &d.config(), &json!({"seat": "mastermind"}))?;
                 started_now = true;
                 overlord::MASTERMIND
                     .session(&d.db())?

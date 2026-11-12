@@ -44,7 +44,14 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ =
         ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
-    let keys = SeatKeys::from_config(&rlord_core::config::Config::load().unwrap_or_default());
+    let cfg = rlord_core::config::Config::load().unwrap_or_default();
+    let keys = SeatKeys::from_config(&cfg);
+    // The overlay draws in the user's theme: the copy bar wears the seat's
+    // colour.
+    crate::theme::set(rlord_core::themes::resolve(
+        &cfg.theme,
+        rlord_core::themes::system_is_dark(),
+    ));
     // The user's tmux prefix there (prefix then `[` enters copy mode).
     let prefix = tmux::session_option(seat.tmux, "prefix")
         .ok()
@@ -224,17 +231,21 @@ fn run_loop(
                     // Copy mode looks like the live screen at the bottom of
                     // the history: say so, with its keys.
                     let bar = match &prompt {
-                        Some(p) => Some(p.label()),
-                        None if in_mode => Some(format!(
-                            " COPY [{}/{}]{}  {}",
-                            position.0,
-                            position.1,
-                            repeat.map(|n| format!(" ×{n}")).unwrap_or_default(),
-                            mode_keys.hints,
+                        Some(p) => Some(bar_line(seat, "COPY", p.label(), String::new())),
+                        None if in_mode => Some(bar_line(
+                            seat,
+                            "COPY",
+                            format!(
+                                "{}/{}{}",
+                                position.0,
+                                position.1,
+                                repeat.map(|n| format!(" ×{n}")).unwrap_or_default(),
+                            ),
+                            mode_keys.hints.clone(),
                         )),
                         None => None,
                     };
-                    if let Some(text) = bar {
+                    if let Some(line) = bar {
                         let row = ratatui::layout::Rect::new(
                             a.x,
                             a.y + a.height.saturating_sub(1),
@@ -242,10 +253,10 @@ fn run_loop(
                             1,
                         );
                         f.render_widget(
-                            Paragraph::new(text).style(
+                            Paragraph::new(line).style(
                                 ratatui::style::Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Yellow),
+                                    .fg(crate::theme::text())
+                                    .bg(crate::theme::chip()),
                             ),
                             row,
                         );
@@ -666,6 +677,33 @@ fn copy_to_clipboard(buffer: &str) {
         }
         let _ = c.wait();
     }
+}
+
+/// The copy bar: a chip in the seat's colour naming the mode, then what
+/// it's at, then the user's keys, quieter.
+fn bar_line(seat: &Seat, mode: &str, what: String, hints: String) -> ratatui::text::Line<'static> {
+    use crate::theme;
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    let hue = if seat.key == "mastermind" {
+        theme::mastermind()
+    } else {
+        theme::overlord()
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {mode} "),
+            Style::default().bold().fg(theme::on_accent()).bg(hue),
+        ),
+        Span::styled(format!(" {what}"), Style::default().fg(hue)),
+    ];
+    if !hints.trim().is_empty() {
+        spans.push(Span::styled(
+            format!("   {}", hints.trim()),
+            Style::default().fg(theme::muted_c()),
+        ));
+    }
+    ratatui::text::Line::from(spans)
 }
 
 /// Draw copy mode's selection (tmux leaves it out of a capture): reversed

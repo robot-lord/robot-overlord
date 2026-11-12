@@ -403,6 +403,21 @@ and `status:waiting` `tag:wip` `proj:wait2` `agent:claude`
 Option send Alt, e.g. kitty `macos_option_as_alt both`.) Option-D and
 Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).
 
+The footer shows only the everyday keys. `?` opens a cheat sheet of every
+key; `:` opens a command launcher for the rest (`:keys`, `:sort created`,
+`:archived`, `:log`, …).
+
+**Changing keys:** ask the overlord ("change my keys", "Option-D is
+awkward"), or `:keys`. The key screen lists every key rlord binds and what
+stands in each one's way: another rlord key or your tmux prefix (taken), or
+something rlord takes it from in every session: Claude Code's keys
+(including `~/.claude/keybindings.json`), your shell's line editing, your
+imported tmux bindings (shadows). To change one, press the new key: that
+tests it actually reaches rlord. A key your terminal, macOS or another app
+takes never arrives; Option typing `∂` instead of sending Option-D is caught
+and the terminal setting to fix it named. Saved keys go into `config.toml`
+(the rest of the file stays as you wrote it) and apply at once.
+
 Everything is configurable in `~/.config/robot-overlord/config.toml`
 (`rlord config init` writes a commented template; `rlord config show` prints
 the effective values): the layout (`side` — list left, live preview right — or

@@ -1140,9 +1140,63 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
     Ok(conflicts)
 }
 
+/// `(key, command)` pairs of one key table.
+pub type Bindings = Vec<(String, String)>;
+
+/// What else is bound on rlord's server, for the key checks: the root
+/// table, the user's imported table, and the user's prefixes (theirs from
+/// the profile, and the server's if it has one).
+pub fn key_env() -> (Bindings, Bindings, Vec<String>) {
+    let table = |t: &str| {
+        table_bindings(t)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default()
+    };
+    let mut prefixes: Vec<String> = Vec::new();
+    for opt in ["prefix", "prefix2"] {
+        if let Ok(p) = run(&["show-options", "-gv", opt]) {
+            prefixes.push(p);
+        }
+    }
+    let session = std::fs::read_to_string(crate::tmux_profile::session_path()).unwrap_or_default();
+    for line in session.lines() {
+        if let Some(rest) = line.strip_prefix("set-option ") {
+            let (opt, val) = rest.split_once(' ').unwrap_or((rest, ""));
+            if matches!(opt, "prefix" | "prefix2") {
+                prefixes.push(val.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    prefixes.retain(|p| !p.is_empty() && p != "None");
+    prefixes.dedup();
+    (table("root"), table(PROFILE_TABLE), prefixes)
+}
+
+/// Point a session at another key table (`None`: back to its default).
+/// The key screen points the list at an empty one while it listens, so the
+/// key it tests reaches it even if rlord already binds it.
+pub fn set_key_table(session: &str, table: Option<&str>) -> Result<()> {
+    let t = format!("{}:", exact(session));
+    match table {
+        Some(tb) => run(&["set-option", "-t", &t, "key-table", tb])?,
+        None => run(&["set-option", "-u", "-t", &t, "key-table"])?,
+    };
+    Ok(())
+}
+
+/// The terminal the user's client runs in (`iTerm2 3.5.0`; may be empty).
+pub fn client_termtype() -> String {
+    run(&["display-message", "-p", "#{client_termtype}"]).unwrap_or_default()
+}
+
 /// `key → command` for every root-table binding on the server.
 fn root_bindings() -> Result<std::collections::HashMap<String, String>> {
-    let out = match run(&["list-keys", "-T", "root"]) {
+    table_bindings("root")
+}
+
+/// `key → command` for every binding in one key table.
+fn table_bindings(table: &str) -> Result<std::collections::HashMap<String, String>> {
+    let out = match run(&["list-keys", "-T", table]) {
         Ok(o) => o,
         Err(_) => return Ok(Default::default()), // no server
     };

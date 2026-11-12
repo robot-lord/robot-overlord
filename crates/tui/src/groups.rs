@@ -247,7 +247,8 @@ impl App {
         true
     }
 
-    /// Header: brand and tabs, then the view (search, sort, live/archived).
+    /// Header: the logo and the name beside it, then one toolbar under the
+    /// name: tabs │ search │ sort │ live/archived, each with its key.
     pub(crate) fn draw_bars(&self, f: &mut Frame, area: Rect) {
         let tab = |t: Tab| -> Span<'static> {
             let active = self.tab == t;
@@ -270,8 +271,9 @@ impl App {
                 Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
+        let sep = || Span::styled("  │  ", Style::default().fg(theme::border()));
         // The logo: a stern robot (dark red, heavy outline) with a crown
-        // (dark gold) set into its head, four rows tall. No name beside it: the logo is the brand.
+        // (dark gold) set into its head, four rows tall.
         let (crown, robot, eye) = theme::logo();
         let red = Style::default().fg(robot);
         let eyes = Style::default().fg(eye);
@@ -293,75 +295,88 @@ impl App {
             ],
             vec![Span::styled(" ┗━━━┛", red)],
         ];
-        // Beside the face, centred on it: the tabs (row 2) and the view
-        // (row 3).
-        let gap = Span::raw("    ");
-        let mut top = vec![tab(Tab::Sessions), Span::raw("  "), tab(Tab::Groups)];
-        top.push(Span::raw("     "));
-        top.push(key(Action::SwitchTab));
-        // The step keys (H / L), unless the user's own bindings took them.
-        let steps: Vec<Action> = [Action::SessionsTab, Action::GroupsTab]
-            .into_iter()
-            .filter(|a| !self.keys.label(*a).is_empty())
-            .collect();
-        if !steps.is_empty() {
-            top.push(Span::styled(" or ", theme::faint()));
-            for (i, a) in steps.into_iter().enumerate() {
-                if i > 0 {
-                    top.push(Span::raw(" "));
-                }
-                top.push(key(a));
-            }
-        }
 
-        let mut view = vec![Span::raw(" "), Span::styled("⌕ ", theme::muted())];
+        let mut bar = vec![tab(Tab::Sessions), tab(Tab::Groups), Span::raw(" ")];
+        bar.push(key(Action::SwitchTab));
+        bar.push(sep());
+        bar.push(Span::styled("⌕ ", theme::muted()));
         if self.filter.trim().is_empty() {
-            view.push(Span::styled("search", theme::faint()));
+            bar.push(Span::styled("search ", theme::faint()));
         } else {
-            view.push(Span::styled(
-                self.filter.clone(),
+            bar.push(Span::styled(
+                format!("{} ", self.filter),
                 Style::default().fg(theme::yellow()).bold(),
             ));
-            view.push(Span::raw(" "));
-            view.push(key(Action::Cancel));
-            view.push(Span::styled(" clear", theme::faint()));
+            bar.push(key(Action::Cancel));
+            bar.push(Span::styled(" clear ", theme::faint()));
         }
-        view.push(Span::raw(" "));
-        view.push(key(Action::Filter));
-        view.push(Span::styled("      ⇅ ", theme::muted()));
-        view.push(Span::styled(
+        bar.push(key(Action::Filter));
+        bar.push(sep());
+        bar.push(Span::styled("⇅ ", theme::muted()));
+        bar.push(Span::styled(
             format!(
-                "{}{}",
+                "{}{} ",
                 self.sort.label(),
                 if self.reverse { " ↑" } else { "" }
             ),
             Style::default().fg(theme::text()),
         ));
-        view.push(Span::raw(" "));
-        view.push(key(Action::Sort));
-        view.push(Span::styled("      ◷ ", theme::muted()));
-        view.push(if self.show_archived {
-            Span::styled("archived", Style::default().fg(theme::yellow()).bold())
+        bar.push(key(Action::Sort));
+        bar.push(sep());
+        bar.push(Span::styled("◷ ", theme::muted()));
+        bar.push(if self.show_archived {
+            Span::styled("archived ", Style::default().fg(theme::yellow()).bold())
         } else {
-            Span::styled("live", Style::default().fg(theme::text()))
+            Span::styled("live ", Style::default().fg(theme::text()))
         });
-        view.push(Span::raw(" "));
-        view.push(key(Action::ToggleArchived));
-        let [l0, l1, l2, l3] = logo;
+        bar.push(key(Action::ToggleArchived));
+
+        // The name: ROBOT in the robot's red, OVERLORD in the crown's gold.
+        // Box-drawn letters three rows tall where they fit, else one
+        // spaced line.
+        const BIG: [(&str, &str); 3] = [
+            ("╦═╗╔═╗╔╗ ╔═╗╔╦╗", "  ╔═╗╦  ╦╔═╗╦═╗╦  ╔═╗╦═╗╔╦╗"),
+            ("╠╦╝║ ║╠╩╗║ ║ ║ ", "  ║ ║╚╗╔╝║╣ ╠╦╝║  ║ ║╠╦╝ ║║"),
+            ("╩╚═╚═╝╚═╝╚═╝ ╩ ", "  ╚═╝ ╚╝ ╚═╝╩╚═╩═╝╚═╝╩╚══╩╝"),
+        ];
+        let robot_s = Style::default().fg(robot).bold();
+        let crown_s = Style::default().fg(crown).bold();
+        let gap = || Span::raw("  ");
         let beside = |mut l: Vec<Span<'static>>, rest: Vec<Span<'static>>| {
-            l.push(gap.clone());
+            l.push(gap());
             l.extend(rest);
             Line::from(l)
         };
-        f.render_widget(
-            Paragraph::new(vec![
+        let [l0, l1, l2, l3] = logo;
+        let lines = if area.width >= 52 {
+            let big = |(a, b): (&str, &str)| {
+                vec![
+                    Span::styled(a.to_string(), robot_s),
+                    Span::styled(b.to_string(), crown_s),
+                ]
+            };
+            vec![
+                beside(l0, big(BIG[0])),
+                beside(l1, big(BIG[1])),
+                beside(l2, big(BIG[2])),
+                beside(l3, bar),
+            ]
+        } else {
+            vec![
                 Line::from(l0),
-                beside(l1, top),
-                beside(l2, view),
+                beside(
+                    l1,
+                    vec![
+                        Span::styled("R O B O T", robot_s),
+                        Span::raw("   "),
+                        Span::styled("O V E R L O R D", crown_s),
+                    ],
+                ),
+                beside(l2, bar),
                 Line::from(l3),
-            ]),
-            area,
-        );
+            ]
+        };
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     /// The groups tab: group column + the selected group's sessions.

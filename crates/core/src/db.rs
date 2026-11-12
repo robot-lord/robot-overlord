@@ -408,9 +408,11 @@ impl Db {
             format!("WHERE {}", conds.join(" AND "))
         };
         let (expr, natural) = match q.sort {
+            // Messages only: a resume or an idle notification changes the
+            // state (the State sort), not the conversation.
             SortMode::Activity => (
                 "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
-                 COALESCE(last_user_msg_at, 0), COALESCE(last_state_change_at, 0))",
+                 COALESCE(last_user_msg_at, 0))",
                 "DESC",
             ),
             SortMode::User => ("COALESCE(last_user_msg_at, created_at)", "DESC"),

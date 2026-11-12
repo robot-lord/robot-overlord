@@ -32,16 +32,13 @@ fn reviewed_at(db: &Db, id: &str) -> Option<i64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Latest activity: the same "updated" the list shows.
+/// Latest activity: the same "updated" the list shows. Messages only: a
+/// resume or Claude's idle notification changes the state, not the work.
 pub fn updated_at(s: &Session) -> i64 {
-    [
-        s.last_agent_msg_at,
-        s.last_user_msg_at,
-        s.last_state_change_at,
-    ]
-    .into_iter()
-    .flatten()
-    .fold(s.created_at, i64::max)
+    [s.last_agent_msg_at, s.last_user_msg_at]
+        .into_iter()
+        .flatten()
+        .fold(s.created_at, i64::max)
 }
 
 /// What's missing from a session's meta-context.
@@ -212,9 +209,12 @@ mod tests {
         let t = triage_db(&db, &json!({"all": true})).unwrap();
         assert_eq!(t["sessions"][0]["changed_since_review"], false);
 
-        // New activity after the review brings it back.
+        // A state change alone (a resume) isn't new work.
         db.set_status(&s.id, Status::Working, now_ms() + 1000)
             .unwrap();
+        assert_eq!(triage_db(&db, &json!({})).unwrap()["needing_review"], 0);
+        // New activity after the review brings it back.
+        db.touch_last_agent_msg(&s.id, now_ms() + 2000).unwrap();
         assert_eq!(triage_db(&db, &json!({})).unwrap()["needing_review"], 1);
     }
 }

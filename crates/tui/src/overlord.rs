@@ -351,6 +351,10 @@ impl App {
                 self.status_line = "overlord set the view".into();
             }
             Some("overlord_setup") => self.check_overlord(),
+            Some("keys") => {
+                self.open_keys(cmd["row"].as_str());
+                self.status_line = "the overlord opened the key screen".into();
+            }
             Some("confirm_new_session") => {
                 self.open_new_form(newform::FormKind::Overlord);
                 if let Mode::NewSession(form) = &mut self.mode {

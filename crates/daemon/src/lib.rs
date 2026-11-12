@@ -28,7 +28,9 @@ use rpc::{Request, Response};
 
 pub struct Daemon {
     db: Mutex<Db>,
-    config: Config,
+    /// The user's config; `config.reload` swaps it after the key screen
+    /// saves (read it with `config()`).
+    config: std::sync::RwLock<Arc<Config>>,
     /// Repo-finder scan cache (the scan walks the home dir; a minute is plenty).
     repo_scan: Mutex<Option<(std::time::Instant, Vec<String>)>>,
     /// Push stream to subscribers, one JSON line per message:
@@ -63,7 +65,7 @@ impl Daemon {
         let (notify, _) = tokio::sync::broadcast::channel(64);
         Arc::new(Daemon {
             db: Mutex::new(db),
-            config,
+            config: std::sync::RwLock::new(Arc::new(config)),
             repo_scan: Mutex::new(None),
             notify,
             ui_view: Mutex::new(Value::Null),
@@ -91,6 +93,22 @@ impl Daemon {
     }
 
     /// Push a UI command to TUIs; park it for the next TUI if none is up.
+    /// The config as last loaded.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.read().expect("config lock").clone()
+    }
+
+    /// Re-read config.toml (the key screen saved it) and re-apply what
+    /// depends on it: the global keys and each session's key hints.
+    pub(crate) fn reload_config(&self) -> Result<Value> {
+        let cfg = Config::load()?;
+        *self.config.write().expect("config lock") = Arc::new(cfg);
+        self.bind_nav_keys();
+        profile::sync_all(self, false);
+        overlord::style(&self.config());
+        Ok(json!({"reloaded": true}))
+    }
+
     pub(crate) fn ui_cmd(&self, cmd: Value) {
         if self.tui_count() == 0 {
             *self.pending_ui.lock().expect("ui mutex") =
@@ -119,8 +137,8 @@ impl Daemon {
             }
         }
         let v = rlord_core::git::find_repos(
-            &self.config.session.repo_roots,
-            self.config.session.repo_scan_depth,
+            &self.config().session.repo_roots,
+            self.config().session.repo_scan_depth,
         );
         *cache = Some((std::time::Instant::now(), v.clone()));
         v
@@ -130,7 +148,8 @@ impl Daemon {
     /// server yet (nothing running) is normal at daemon start; we retry on
     /// every session launch.
     pub fn bind_nav_keys(&self) {
-        let bindings = self.config.tmux.bindings();
+        let cfg = self.config();
+        let bindings = cfg.tmux.bindings();
         match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
             Ok(conflicts) => {
                 for c in conflicts {
@@ -145,7 +164,7 @@ impl Daemon {
     /// Startup housekeeping: drain spooled hook events, then reconcile
     /// DB state against the live tmux server.
     pub fn startup(&self) -> Result<()> {
-        methods::set_claude_tui(&self.config);
+        methods::set_claude_tui(&self.config());
         let db = self.db.lock().expect("db mutex poisoned");
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
@@ -307,13 +326,13 @@ impl Daemon {
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
-            "session.new" => methods::session_new(&db, &self.config, &params),
-            "repo.list" => methods::repo_list(&db, &self.config),
+            "session.new" => methods::session_new(&db, &self.config(), &params),
+            "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
                 let scanned = self.scanned_repos();
-                methods::repo_find(&db, &self.config, scanned)
+                methods::repo_find(&db, &self.config(), scanned)
             }
-            "session.defaults" => methods::session_defaults(&self.config),
+            "session.defaults" => methods::session_defaults(&self.config()),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),
             "session.stop" => methods::session_stop(&db, &params),
@@ -387,7 +406,7 @@ impl Daemon {
     fn call_ui(&self, method: &str, params: &Value) -> Option<Result<Value>> {
         let r = match method {
             "overlord.ensure" => {
-                let r = overlord::ensure(&self.db(), &self.config, params);
+                let r = overlord::ensure(&self.db(), &self.config(), params);
                 // (ensure syncs the seat's tmux keys itself.)
                 if r.is_ok() {
                     self.changed();
@@ -413,7 +432,7 @@ impl Daemon {
                 .and_then(|o| Ok(serde_json::to_value(o)?)),
             "overlord.status" => {
                 // The db guard must drop before offer() locks it again.
-                let st = overlord::status(&self.db(), &self.config);
+                let st = overlord::status(&self.db(), &self.config());
                 st.map(|mut v| {
                     v["remote"] = remote::offer(self);
                     v
@@ -437,7 +456,7 @@ impl Daemon {
             "remote.status" => remote::status(self, params),
             "remote.set" => remote::set(self, params),
             "overlord.style" => {
-                overlord::style(&self.config);
+                overlord::style(&self.config());
                 Ok(json!({"styled": true}))
             }
             "session.import_scan" => import::scan(self, params),
@@ -457,7 +476,7 @@ impl Daemon {
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
-                let r = overlord::set_model(&self.db(), &self.config, params);
+                let r = overlord::set_model(&self.db(), &self.config(), params);
                 if r.is_ok() {
                     self.changed();
                 }
@@ -483,6 +502,9 @@ impl Daemon {
                 Ok(json!({"ok": true}))
             }
             "ui.show_list" => ui::show_list(self),
+            "ui.keys" => ui::keys_open(self, params),
+            "keys.list" => ui::keys_list(self),
+            "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),
             "ui.view.default" => ui::default_view(self),
             "ui.view.report" => {

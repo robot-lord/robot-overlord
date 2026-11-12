@@ -146,7 +146,7 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         switch_user_to(&home)?;
         return Ok(json!({"setup": true}));
     }
-    overlord::ensure(&d.db(), &d.config, &json!({"seat": seat.key}))?;
+    overlord::ensure(&d.db(), &d.config(), &json!({"seat": seat.key}))?;
     d.changed();
     // The open overlay's terminal, when asked from inside it (switching seats).
     let open_client = d
@@ -191,8 +191,8 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
     );
     let key = |k: &str| tmux::key_label(k);
     let (o, m) = (
-        key(&d.config.tmux.overlord),
-        key(d.config.tmux.mastermind_switch()),
+        key(&d.config().tmux.overlord),
+        key(d.config().tmux.mastermind_switch()),
     );
     let title = if seat.key == overlord::MASTERMIND.key {
         format!(" ◆ mastermind · {o} overlord · {m} close ")
@@ -201,11 +201,11 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
     };
     tmux::open_popup(
         &client,
-        &d.config.overlord.width,
-        &d.config.overlord.height,
+        &d.config().overlord.width,
+        &d.config().overlord.height,
         &title,
-        &format!("fg={}", crate::overlord::seat_color(&d.config, seat)),
-        &crate::overlord::overlay_style(&d.config, seat),
+        &format!("fg={}", crate::overlord::seat_color(&d.config(), seat)),
+        &crate::overlord::overlay_style(&d.config(), seat),
         &cmd,
     )?;
     *d.overlay.lock().expect("ui mutex") = Some((client, token));
@@ -241,13 +241,13 @@ pub fn reset(d: &Daemon, params: &Value) -> Result<Value> {
         .overlord()?
         .is_some_and(|o| o.tmux_session.as_deref().is_some_and(tmux::has_session));
     if overlord_running {
-        let _ = overlord::ensure(&d.db(), &d.config, &json!({})); // restyle
+        let _ = overlord::ensure(&d.db(), &d.config(), &json!({})); // restyle
     }
     let mastermind_running = overlord::MASTERMIND
         .session(&d.db())?
         .is_some_and(|o| o.tmux_session.as_deref().is_some_and(tmux::has_session));
     if mastermind_running {
-        let _ = overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}));
+        let _ = overlord::ensure(&d.db(), &d.config(), &json!({"seat": "mastermind"}));
     }
     d.changed();
     let all = d.db().sessions(&SessionQuery {
@@ -285,7 +285,7 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         let db = d.db();
         let s = db.resolve_ref(r)?;
         if overlord::is_overlord_role(&s.role) {
-            overlord::ensure(&db, &d.config, &json!({"seat": s.role}))?;
+            overlord::ensure(&db, &d.config(), &json!({"seat": s.role}))?;
         } else if s.status == Status::Stopped
             || !s.tmux_session.as_deref().is_some_and(tmux::has_session)
         {
@@ -539,6 +539,53 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
     show_list(d)?;
     Ok(json!({"shown": prefill,
               "note": "the form is open on the user's screen; nothing is launched until they send it back (confirmed: yes)"}))
+}
+
+/// Every key rlord binds, as set now, with what stands in each one's way
+/// (plain code: the config, rlord's tmux server, Claude Code's key file).
+pub fn keys_list(d: &Daemon) -> Result<Value> {
+    use rlord_core::keys::{self, Env, Key, SLOTS};
+    let cfg = d.config();
+    let env = Env::read();
+    let rows: Vec<Value> = SLOTS
+        .iter()
+        .map(|s| {
+            let spec = s.current(&cfg);
+            let key = Key::parse(&spec);
+            let findings: Vec<Value> = key
+                .as_ref()
+                .map(|k| keys::check(&cfg, &env, s, k))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| json!({"level": f.level.name(), "text": f.text}))
+                .collect();
+            json!({
+                "id": s.id(),
+                "does": s.does,
+                "where": s.scope.name(),
+                "key": key.as_ref().map(Key::label).unwrap_or_else(|| "off".into()),
+                "default": s.default_spec(),
+                "findings": findings,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "keys": rows,
+        "note": "taken = doesn't work as set; shadows = rlord takes it from something else. Keys change only on the user's key screen (open_keys): only they can test a key reaches rlord.",
+    }))
+}
+
+/// Open the key screen in the list (at one key, if given) and show it.
+pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
+    let row = params.get("key").and_then(Value::as_str).unwrap_or("");
+    if !row.is_empty() && rlord_core::keys::slot(row).is_none() {
+        bail!("unknown key id '{row}' (see keys_list)");
+    }
+    d.ui_cmd(json!({"cmd": "keys", "row": row}));
+    show_list(d)?;
+    Ok(
+        json!({"shown": "key screen", "note": "the user presses the new key there; it's tested and saved to config.toml when they confirm"}),
+    )
 }
 
 #[cfg(test)]

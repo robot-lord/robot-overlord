@@ -320,7 +320,7 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
 /// conversation. Its instructions tell it to keep nothing durable only in its
 /// conversation.
 pub fn start_fresh_keeper(d: &std::sync::Arc<crate::Daemon>) {
-    let mins = d.config.overlord.mastermind_fresh_after_mins;
+    let mins = d.config().overlord.mastermind_fresh_after_mins;
     if mins == 0 {
         return;
     }
@@ -402,7 +402,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
             return Ok(());
         }
         // Current instructions and flags (effort may have changed).
-        let extra_args = write_files(&MASTERMIND, &d.config)?;
+        let extra_args = write_files(&MASTERMIND, &d.config())?;
         let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
         spec["extra_args"] = json!(extra_args);
         db.set_launch_spec(&s.id, &spec.to_string())?;
