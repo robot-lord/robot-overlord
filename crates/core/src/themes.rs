@@ -27,34 +27,13 @@ impl Palette {
     /// colour over the theme's background, so the overlay reads as its own
     /// place without a heavy block of grey.
     pub fn overlay_bg(&self) -> Rgb {
-        self.overlay_bg_for("overlord")
-    }
-
-    /// Each overlord seat's own colour, so switching between them reads at
-    /// a glance: the overlord the theme's overlord purple, the mastermind its
-    /// cyan.
-    pub fn seat(&self, seat: &str) -> Rgb {
-        if seat == "mastermind" {
-            self.cyan
-        } else {
-            self.overlord
-        }
-    }
-
-    /// A seat's overlay background: a faint wash of its colour.
-    pub fn overlay_bg_for(&self, seat: &str) -> Rgb {
         let base = match self.bg {
             Some(Rgb::Hex(r, g, b)) => (r, g, b),
             _ if self.dark => (20, 18, 26),
             _ => (250, 249, 252),
         };
-        let Rgb::Hex(r, g, b) = self.seat(seat) else {
-            return match (seat == "mastermind", self.dark) {
-                (true, true) => h(0x14201f),
-                (true, false) => h(0xeef8f7),
-                (false, true) => h(0x1d1828),
-                (false, false) => h(0xf4effb),
-            };
+        let Rgb::Hex(r, g, b) = self.overlord else {
+            return if self.dark { h(0x1d1828) } else { h(0xf4effb) };
         };
         // About a tenth of the overlord colour.
         let mix = |a: u8, o: u8| ((a as u16 * 9 + o as u16) / 10) as u8;

@@ -7,17 +7,20 @@ main way users drive rlord, and it does most of the upkeep: tagging sessions
 into groups, writing descriptions and notes, organizing the list. It only
 knows what its instructions and tool descriptions tell it.
 
-The overlord is two sessions: the **overlord** (quick front desk, fast
-model) and the **mastermind** (launches and questions that need thought,
-strong model). Their built-in instructions are
-`crates/daemon/src/overlord.md` and `crates/daemon/src/mastermind.md`. They
-are compiled in and written to each one's folder as `CLAUDE.md`, `AGENTS.md`
-and `GEMINI.md` on every start, with the user's
-`~/.config/robot-overlord/overlord.md` appended.
+The overlord is one session, on a strong model at low effort. Its built-in
+instructions are `crates/daemon/src/overlord.md`. They are compiled in and
+written to its folder as `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` on every
+start, with the user's `~/.config/robot-overlord/overlord.md` appended.
+
+Because it runs at low effort, `overlord.md` opens with one rule that every
+feature must respect: the overlord does only light work itself (look-ups,
+small edits to rlord's metadata, short answers); anything heavier goes to a
+subagent or a new session. A feature that needs the overlord to think hard
+in its own conversation is designed wrong: give it a cheap tool, a subagent,
+or a session to launch instead.
 
 When a change touches anything the overlord can see or do, update
-`overlord.md` and/or `mastermind.md` (whichever seat does it) in the same
-change:
+`overlord.md` in the same change:
 
 - **New or changed MCP tool** (`crates/daemon/src/mcp.rs`): describe what it's
   for and when to use it. A test fails if a tool isn't mentioned.
@@ -27,7 +30,10 @@ change:
 - **New list/UI concept** the overlord can set (tabs, filters, sorts, views):
   update the syntax and values it's told about.
 - **Removed or renamed features**: delete them from `overlord.md`; stale
-  instructions make it call tools that don't exist.
+  instructions make it call tools that don't exist. A test fails if its
+  tool list names one that is gone.
+- **Where a new kind of request goes**: add it to the routing table at the
+  top (itself, a subagent, a new session, an existing session).
 
 What belongs in `overlord.md`:
 
@@ -51,6 +57,11 @@ The overlord's AI time is the expensive part. Anything that can be decided
 by ordinary code should be: give the overlord a cheap rlord tool that does
 the deterministic part and hands it only what needs judgment.
 
+- Example: `recall` (`crates/daemon/src/recall.rs`). The overlord restarts
+  on a fresh conversation after sitting idle, so it can't carry its past.
+  Rather than summarize it with a model or preload it, rlord searches the
+  overlord's earlier transcripts and hands back short dated snippets, only
+  when asked.
 - Example: `triage` (`crates/daemon/src/triage.rs`). Instead of asking every
   session's agent for a report, rlord works out which sessions changed since
   the overlord last reviewed them, what their meta-context is missing, and

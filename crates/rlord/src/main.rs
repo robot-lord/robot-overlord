@@ -316,9 +316,6 @@ enum Command {
     Overlay {
         #[arg(long)]
         token: Option<u64>,
-        /// Which overlord seat to show: overlord (default) or mastermind
-        #[arg(long, default_value = "overlord")]
-        seat: String,
     },
 }
 
@@ -381,7 +378,9 @@ enum NavCmd {
     Prev,
     /// Toggle the overlord overlay (Alt-O; Option-O on a Mac)
     Overlord,
-    /// Toggle the mastermind overlay (Alt-M; Option-M on a Mac)
+    /// The overlord, for a key still bound from when it had a second
+    /// session (the mastermind): the overlord is one session now
+    #[command(hide = true)]
     Mastermind,
 }
 
@@ -493,14 +492,8 @@ fn main() -> Result<()> {
         Command::Nav(NavCmd::Home) => nav_home(),
         Command::Nav(NavCmd::Next) => nav_step(1),
         Command::Nav(NavCmd::Prev) => nav_step(-1),
-        Command::Nav(NavCmd::Mastermind) => {
-            if let Err(e) = nav_overlord("mastermind") {
-                let _ = tmux::display_message(&format!("rlord: {e:#}"));
-            }
-            Ok(())
-        }
-        Command::Nav(NavCmd::Overlord) => {
-            if let Err(e) = nav_overlord("overlord") {
+        Command::Nav(NavCmd::Overlord | NavCmd::Mastermind) => {
+            if let Err(e) = nav_overlord() {
                 let _ = tmux::display_message(&format!("rlord: {e:#}"));
             }
             Ok(())
@@ -512,10 +505,10 @@ fn main() -> Result<()> {
             channel,
         } => update(tag, force, channel),
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
-        Command::Overlay { token, seat } => rlord_tui::run_overlay(token, &seat),
+        Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
-                nav_overlord("overlord")
+                nav_overlord()
             } else {
                 // Not in tmux: the overlay needs a tmux terminal to pop up
                 // over, so start (or rejoin) rlord there first.
@@ -1480,7 +1473,7 @@ fn run_daemon() -> Result<()> {
         // Load every live session's sub-agent data in the background.
         rlord_daemon::warm::start(&daemon);
         rlord_daemon::summary::start(&daemon);
-        // Restart an idle mastermind on a fresh conversation (context hygiene).
+        // Restart an idle overlord on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
@@ -1565,18 +1558,19 @@ fn nav_home() -> Result<()> {
 
 /// `nav overlord` (Option-O): in the TUI, toggle the overlord overlay;
 /// anywhere else, bring the user to the TUI with it open.
-/// Option-O / Option-M: show that overlord seat over this terminal.
-fn nav_overlord(seat: &str) -> Result<()> {
+fn nav_overlord() -> Result<()> {
     // Say where the key was pressed (run-shell runs in that client's
     // context), rather than making the daemon guess which terminal it was.
     let r = call(
         "ui.overlord",
-        json!({"client": tmux::current_client(), "from": tmux::current_session(), "seat": seat}),
+        json!({"client": tmux::current_client(), "from": tmux::current_session()}),
     )?;
     if r["overlord"] == "already here" {
         let back = Config::load().map(|c| c.tmux.back).unwrap_or_default();
         let back = tmux::key_label(if back.trim().is_empty() { "M-d" } else { &back });
-        let _ = tmux::display_message(&format!("you're in the {seat} · {back}: back to the list"));
+        let _ = tmux::display_message(&format!(
+            "you're in the overlord · {back}: back to the list"
+        ));
     }
     Ok(())
 }

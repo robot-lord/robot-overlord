@@ -3,7 +3,7 @@
 //! `Agent` is what the rest of rlord asks: how to launch, resume and start
 //! fresh, where the conversation id comes from, how hooks are installed and
 //! what each hook event means, where transcripts live, and what the agent
-//! can't do (Remote Control, sub-agents, an overlord seat). Each agent's
+//! can't do (Remote Control, sub-agents, running the overlord). Each agent's
 //! own facts live in its module (`claude`, `codex`, `opencode`);
 //! transcripts are read through `transcript`, whichever agent wrote them.
 //!
@@ -435,13 +435,13 @@ impl Agent {
         matches!(self, Agent::Claude)
     }
 
-    /// It can run the overlord's seats (rlord's MCP server, tool
-    /// allow-list, effort). Why not, when it can't.
-    pub fn overlord_seat(self) -> Result<()> {
+    /// It can run the overlord (rlord's MCP server, tool allow-list,
+    /// effort). Why not, when it can't.
+    pub fn runs_overlord(self) -> Result<()> {
         match self {
             Agent::Claude => Ok(()),
             Agent::Codex | Agent::OpenCode => bail!(
-                "the overlord runs on Claude Code only for now ({} seats aren't built yet); \
+                "the overlord runs on Claude Code only for now (a {} overlord isn't built yet); \
                  set `[overlord] agent = \"claude\"`",
                 self.label()
             ),

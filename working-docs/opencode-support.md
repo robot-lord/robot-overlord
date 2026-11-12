@@ -1,4 +1,4 @@
-**Status:** in progress (sessions built on `opencode-support`, 0.20.0-dev.1; import, messaging and overlord seats to come)
+**Status:** in progress (sessions built on `opencode-support`, 0.20.0-dev.1; import, messaging and the overlord on OpenCode to come)
 
 # OpenCode support
 
@@ -28,7 +28,7 @@ v2.2.7 (Homebrew `anomalyco/tap/opencode-v2`; v1 differs: require v2).
 - **Summaries**: `POST /api/session/{id}/generate` (session context, no fork;
   unverified that it appends nothing), else `run -s <id> --fork --archived`
   then delete the fork. No ephemeral flag.
-- **Overlord seat**: config in the seat folder's `opencode.jsonc`
+- **Overlord**: config in the overlord folder's `opencode.jsonc`
   (`mcp.servers.rlord`, an agent with deny-all + allow `rlord_*`), not flags.
 - **Messaging**: `POST /api/session/{id}/prompt {text, delivery: queue}`.
 - **TUI**: full-screen (no scrollback mode); `opencode mini` is inline with
@@ -47,7 +47,7 @@ v2.2.7 (Homebrew `anomalyco/tap/opencode-v2`; v1 differs: require v2).
 3. Transcripts: a SQLite-backed reader into the common shape (excerpts,
    stats, search, read); search "everywhere" over `session_v2`.
 4. Summaries via `/generate`, fallback fork + delete.
-5. Later: import, messaging via the API, OpenCode overlord seats.
+5. Later: import, messaging via the API, the overlord on OpenCode.
 
 ## Decisions (with Brandon)
 
@@ -226,7 +226,9 @@ and without a model and a restart of a session OpenCode no longer had.
   (`RLORD_SESSION_ID`): OpenCode's design. rlord attributes OpenCode
   sessions by the id it minted, never by environment, and has no OpenCode
   hooks; the MCP bridge's `caller` only decides whether the mastermind may
-  `hand_off`, and a seat can't run on OpenCode.
+  `hand_off`, and neither overlord session could run on OpenCode. (Since
+  PR #7 the overlord is one session, with no `hand_off`; it still can't
+  run on OpenCode.)
 - (Batch 2) Creating the session from the daemon through `Service` when
   `service.json` answers: launches run under the DB lock, so a request
   there would stall every other call; the bounded wrapper covers it.
@@ -239,7 +241,14 @@ and without a model and a restart of a session OpenCode no longer had.
 
 - Import (`session_v2` has directory, title, model), messaging through
   the API (`POST …/prompt`, already used for the deferred prompt),
-  OpenCode overlord seats (`opencode.jsonc` in the seat folder).
+  an OpenCode overlord (`opencode.jsonc` in the overlord's folder). The
+  overlord is one session now, and its OpenCode defaults are in place
+  (default model, no effort: `OverlordConfig::defaults_for`); what's
+  missing is the MCP and tool wiring, then `Agent::runs_overlord`.
+  Brandon's decision: the overlord running on Codex is required before
+  the repo goes public, and preferably on OpenCode too; it is the next
+  work after PR #7 (one overlord), with the Codex one first
+  (`codex-support.md`, phase 4).
 - Sub-agent tracking (child sessions: `parent_id`).
 - A real permission prompt and question form, checked by hand.
 - Screenshots not retaken with the OpenCode demo session.
@@ -252,4 +261,4 @@ Codex's Remote Control is machine-wide (`codex remote-control start/pair`)
 and reaches threads run by Codex's background app-server, not rlord's
 in-pane (`--no-daemon`) sessions. Supporting it means running remote Codex
 sessions through the app-server and matching their hooks by conversation
-id; it pairs naturally with Codex overlord seats.
+id; it pairs naturally with a Codex overlord.

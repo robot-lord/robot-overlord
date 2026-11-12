@@ -2,7 +2,7 @@
 //!
 //! - **Command launcher** (`:`): type a few letters of a command, Enter runs
 //!   it. Everything a key does is here too, by name, plus what has no key
-//!   (the key screen, a specific sort, the mastermind).
+//!   (the key screen, a specific sort).
 //! - **Cheat sheet** (`?`): every key, and what to ask the overlord instead.
 
 use super::*;
@@ -20,7 +20,6 @@ enum Cmd {
     Act(Action),
     Keys,
     Sort(SortMode),
-    Mastermind,
     Summarize,
 }
 
@@ -43,8 +42,12 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         Cmd::Act(Action::NewManual),
     ),
     ("overlord", "open the overlord", Cmd::Act(Action::Overlord)),
-    ("mastermind", "open the mastermind", Cmd::Mastermind),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
+    (
+        "archive",
+        "archive the selected session (asks first)",
+        Cmd::Act(Action::Archive),
+    ),
     (
         "sort last message",
         "newest message from you or the agent first",
@@ -176,7 +179,6 @@ impl App {
                 self.sort = s;
                 self.dirty = true;
             }
-            Cmd::Mastermind => self.show_seat("mastermind"),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(
@@ -310,13 +312,11 @@ impl App {
             head("Anywhere (every session)"),
             row(tk(&t.back), "home to this list"),
             row(tk(&t.overlord), "the overlord"),
-            row(tk(&t.mastermind), "the mastermind"),
             row(tk(&t.next), "next session"),
             row(tk(&t.prev), "previous session"),
             Line::from(""),
             head("In the overlay"),
-            row(tk(t.mastermind_switch()), "overlord ⇄ mastermind"),
-            row(tk(&t.back), "close"),
+            row(tk(&t.overlord), "close"),
             Line::styled(
                 "    your tmux copy-mode keys work there too",
                 theme::muted(),

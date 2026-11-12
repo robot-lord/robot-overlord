@@ -1,12 +1,14 @@
+<p align="center"><img src="docs/images/logo.jpg" alt="Robot Overlord" width="100%"></p>
+
 <div align="center">
 
 # Robot Overlord
 
-**Run a fleet of AI coding agents from one place, and talk to it.**
+**Manage your AI coding agents with AI.**
 
-`rlord` keeps every Claude Code session you have running in tmux, in one
-list you can sort, search and organize, and gives you an **overlord**: an AI
-session that drives rlord for you.
+`rlord` keeps every AI coding session you have (Claude Code, Codex,
+OpenCode) running in tmux, in one list you can sort, search and organize,
+and gives you an **overlord**: an AI session that drives rlord for you.
 
 [Install](#install) · [How it works](#how-it-works) · [User guide](docs/guide.md) · [Contributing](CONTRIBUTING.md)
 
@@ -20,10 +22,13 @@ Starting AI coding sessions is easy. Keeping track of ten of them isn't:
 which one was fixing the login bug, which is waiting on you, what did that
 session from last week decide? rlord is built around a few ideas:
 
-- **Talk to it.** Most of the time you don't press keys to manage sessions,
-  you ask: *"start a session on the flaky login tests"*, *"what's waiting on
-  me?"*, *"tag everything about billing"*, *"we fixed this before, find it"*.
-  The overlord does it.
+- **AI manages your AI sessions.** Organizing, tagging, describing and
+  digging through dozens of agent sessions is tedious work, and it's
+  exactly the kind of work AI is good at. So rlord is built around the
+  overlord first: *"start a session on the flaky login tests"*, *"what's
+  waiting on me?"*, *"tag everything about billing"*, *"we fixed this
+  before, find it"*. The keys and the list are still there when you want
+  them.
 - **Plain code does the bookkeeping.** Tracking, sorting, searching and
   organizing are ordinary, fast code. The AI is spent where it earns its
   cost, not on every keypress.
@@ -35,11 +40,16 @@ session from last week decide? rlord is built around a few ideas:
 
 ## Features
 
-- **The overlord.** A Claude session wired to rlord's tools, one keypress
+- **The overlord.** One Claude session wired to rlord's tools, one keypress
   away from anywhere (Option-O / Alt-O). It finds and jumps to sessions,
-  launches new ones, renames, tags and describes them, answers questions
-  about your fleet, and hands anything that needs real thought to its
-  partner, the **mastermind**, on a stronger model.
+  launches new ones, renames, tags and describes them, and answers
+  questions about your fleet. It runs a strong model (Opus) at low effort,
+  so it answers quickly, and it delegates anything heavy: bulk upkeep and
+  research go to subagents, real work becomes a session of its own.
+- **An overlord that doesn't bloat.** After sitting idle it starts a fresh
+  conversation, and looks up what you talked about before only when you
+  refer to it. The list shows when it last started fresh and keeps its
+  earlier conversations, which you can read or go back to.
 - **One list for everything.** Live status (working, waiting on you, idle),
   sorting by your last message or the agent's, groups by tag, favourites,
   search, and a live preview of the selected session.
@@ -126,35 +136,38 @@ from the last week"*.
          ┌───────┴────────┐
          │                │ Option-O
          ▼                ▼
-   ┌───────────┐    ┌────────────┐  hands off  ┌──────────────┐
-   │ the list  │    │  overlord  │ ──────────▶ │  mastermind  │
-   │   (TUI)   │    │ fast model │             │ strong model │
-   └─────┬─────┘    └─────┬──────┘             └──────┬───────┘
-         │                │ MCP tools                 │
-         ▼                ▼                           ▼
+   ┌───────────┐    ┌──────────────────┐  delegates  ┌─────────────────┐
+   │ the list  │    │     overlord     │ ──────────▶ │    subagents    │
+   │   (TUI)   │    │ Opus, low effort │             │ (tidy, import,  │
+   └─────┬─────┘    └────────┬─────────┘             │    research)    │
+         │                   │ MCP tools             └─────────────────┘
+         ▼                   ▼
    ┌──────────────────────────────────────────────────────────┐
    │      rlord daemon: sessions, status, search, summaries   │
    └─────────────────────────────┬────────────────────────────┘
                                  │ its own tmux server
           ┌──────────────┬───────┴──────┬──────────────┐
           ▼              ▼              ▼              ▼
-       claude         claude         claude           …
+       claude          codex        opencode          …
 ```
 
 - **A daemon owns everything.** It keeps the session database, follows each
-  agent's state through Claude Code's hooks, and serves the list, the CLI and
-  the overlord over one local socket. It starts by itself the first time you
+  agent's state (through Claude Code's and Codex's hooks, and OpenCode's
+  own server), and serves the list, the CLI and the overlord over one local
+  socket. It starts by itself the first time you
   run `rlord`.
-- **Sessions are ordinary Claude Code**, each in a pane of rlord's own tmux
-  server (`tmux -L rlord`); your own tmux is never touched. Stopping and
-  resuming uses Claude's own `--resume`.
-- **The overlord is two Claude sessions with rlord's tools** (an MCP
-  server): a quick front desk on a fast model for everyday asks, and the
-  mastermind on a strong model for launches and anything that needs
-  judgment. Both float over whatever you're looking at.
+- **Sessions are the ordinary agent CLIs**, each in a pane of rlord's own
+  tmux server (`tmux -L rlord`); your own tmux is never touched. Stopping
+  and resuming uses the agent's own resume (`claude --resume`).
+- **The overlord is one Claude session with rlord's tools** (an MCP
+  server), floating over whatever you're looking at. It runs Opus at low
+  effort: look-ups, small edits and short answers it does itself; anything
+  that takes more goes to a subagent or a new session, so it stays quick
+  and its own conversation stays small.
 - **The expensive part stays small.** Questions like "which sessions changed
-  since I last looked?" are answered by plain code; the overlord only spends
-  tokens on what needs judgment.
+  since I last looked?" or "what did we say about this earlier?" are
+  answered by plain code; the overlord only spends tokens on what needs
+  judgment.
 
 The [user guide](docs/guide.md) covers each part in detail;
 [architecture](docs/architecture.md) explains the design.
@@ -163,7 +176,7 @@ The [user guide](docs/guide.md) covers each part in detail;
 
 Everything is optional. `rlord config init` writes a commented
 `~/.config/robot-overlord/config.toml`: layout, theme, keys, the overlord's
-models, archive summaries, update channel. Standing instructions for the
+model and effort, archive summaries, update channel. Standing instructions for the
 overlord go in `~/.config/robot-overlord/overlord.md`.
 
 ## Updating

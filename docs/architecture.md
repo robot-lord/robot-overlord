@@ -181,7 +181,7 @@ facts live in its module) is what the rest of rlord asks:
   questions from the database (opened read-only; only those two tables,
   since the database also holds OpenCode's credentials).
 - **Capabilities**: `has_remote_control`, `tracks_subagents`,
-  `overlord_seat`, `importable` (all Claude-only today; callers ask instead
+  `runs_overlord`, `importable` (all Claude-only today; callers ask instead
   of comparing names).
 
 Status has more than one source, and that is not part of `Agent`: hook
@@ -488,14 +488,22 @@ from the user's default server, but only for the real socket.
 
 The product's primary control surface: a singleton agent session
 (`role = 'overlord'`, fixed tmux name `overlord-rlord`) that the user talks to,
-wired to rlord's MCP server. It lives in `<data>/overlord/`. Each `ensure`
+wired to rlord's MCP server. One session, on a strong model at low effort
+(`[overlord] model` / `effort`; the effort is a launch flag, per agent:
+`overlord::effort_args`): it does light work itself and sends the rest to
+subagents and new sessions, which `overlord.md` states first. It lives in
+`<data>/overlord/` (an overlord that began as the "mastermind" of the
+former two-session design keeps `<data>/mastermind/`, so its conversation
+resumes: the folder is the session's `project_path`, never assumed). Each
+`ensure`
 regenerates that folder's `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` (the same
 standing instructions under each agent's file name: the built-in
 `daemon/src/overlord.md` plus the user's `overlord.md`) and `mcp.json`. These
 are project files, so each agent still loads the user's own global
 instructions too. Its adapter flags (`--mcp-config`,
-`--allowedTools mcp__rlord,Read,Grep,Glob`) ride in `launch_spec.extra_args`, so resume reuses
-them.
+`--allowedTools mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage`, `--effort`) ride in
+`launch_spec.extra_args`, so resume reuses them; they are rewritten on every
+`ensure` and fresh restart, so a config change reaches it at its next start.
 
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's pane (bracketed paste, then Enter), waiting out `starting` after
@@ -507,6 +515,27 @@ them.
   `confirm_new_session` command) with corrected hints marked; sending it
   back says `confirmed: yes`. This describe → propose → confirm loop is the
   pattern for config-style input (CLAUDE.md). `rlord overlord ask` is the CLI.
+- **Fresh restarts** (`overlord::start_fresh_keeper`): once a minute, an
+  overlord idle past `[overlord] fresh_after_mins` is restarted on a fresh
+  conversation (`session_fresh`), so its context doesn't grow without end.
+  Only between turns, when its transcript ends in a final reply, that reply
+  didn't ask the user anything (a `?`, or a form out for confirming), and
+  nobody is looking at it (no overlay, no attached client). `ask::send` and
+  the keeper share a lock (`Daemon::overlord_send`): text is never pasted
+  into a pane that is being replaced.
+- **Its past** (`daemon/src/recall.rs`): every move to another conversation
+  is an event on the overlord's session, and those events are the one
+  source for what its earlier conversations are. `fresh_conversation`
+  carries a `reason`: `idle` (the keeper), `clear` (the user's `/clear`,
+  from Claude's SessionStart `source: "clear"`, recorded in `hook_emit`),
+  `manual`, `continued`; any other switch is `agent_session_changed`. Two
+  readers use it and so agree: the overlord's `recall` tool (search its
+  earlier transcripts, or a clipped digest of the previous one; search
+  proper skips the overlord's folders) and the list ("fresh 2h ago · N
+  earlier" on its row and overlay title, the earlier conversations in its
+  details pane, one in the preview, `overlord.continue` to go back to one).
+  Nothing is preloaded into a fresh conversation; it fetches on demand.
+  kv `overlord_fresh_at` is when the current one started.
 - **Triage** (`daemon/src/triage.rs`): the cheap first pass for the
   overlord's upkeep. `overlord.triage` lists live sessions updated since
   their per-session `reviewed:<id>` kv watermark, with missing-metadata flags

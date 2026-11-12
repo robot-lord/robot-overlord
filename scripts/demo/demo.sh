@@ -35,6 +35,9 @@ fi
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
+# tmux by itself (not its whole folder, which may hold a real agent): the
+# stand-in login shell below runs rlord's own panes, the list included.
+ln -sf "$(command -v tmux)" "$d/bin/tmux"
 cp "$here/bin/claude" "$here/bin/codex" "$here/bin/opencode" "$d/bin/"
 # A stand-in login shell that sees only the demo's programs: rlord asks the
 # login shell where an agent is when its PATH doesn't have it, and the
@@ -60,11 +63,11 @@ source "$d/env.sh"
 
 cat > "$d/config/robot-overlord/config.toml" <<'EOF'
 [overlord]
-model = "sonnet"
-mastermind_model = "opus"
+model = "opus"
+effort = "low"
 EOF
 
-B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' C=$'\e[36m' M=$'\e[35m'
+B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
 box() { printf '%s\n' "${D}────────────────────────────────────────────────────────────────────────${R}" "> $1" "${D}────────────────────────────────────────────────────────────────────────${R}" "  ${D}? for shortcuts${R}"; }
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
@@ -219,7 +222,7 @@ set_times onboarding-emails 55 50 240
 set_times search-indexer-migration 10080 10070 14400
 sql "update sessions set pinned=1 where name='checkout-redesign'"
 
-# The overlord and the mastermind (the stand-in draws their screens).
+# The overlord (the stand-in draws its screen).
 cat > "$d/screens/overlord.txt" <<EOF
 ${M}${B}◆ overlord${R}
 
@@ -236,15 +239,10 @@ ${M}${B}◆ overlord${R}
 
 > start a session on the slow product search page
 
-● Handed to the mastermind.
+● Launched ${B}slow-product-search${R} in acme-web, on its own worktree,
+  tagged web and perf.
 
 $(box "")
-EOF
-cat > "$d/screens/mastermind.txt" <<EOF
-${C}${B}↳ mastermind${R}
-
-● Launching a session for the slow product search page in acme-web, on its
-  own worktree, tagged web and perf.
 EOF
 python3 - "$d/run/robot-overlord/daemon.sock" <<'PY'
 import json, socket, sys
@@ -252,6 +250,39 @@ s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
 s.sendall((json.dumps({"id": 1, "method": "overlord.ensure", "params": {}}) + "\n").encode())
 s.recv(65536)
 PY
+
+# Earlier overlord conversations (it restarts fresh after idle): transcripts
+# next to the current one, and the restart events that chain them.
+for _ in $(seq 20); do
+  src=$(sql "select t.source_path from transcripts t join sessions s on s.id=t.session_id where s.role='overlord'" 2>/dev/null)
+  [[ -n $src ]] && break
+  sleep 0.5
+done
+oid=$(sql "select id from sessions where role='overlord'")
+cur=$(sql "select agent_session from sessions where role='overlord'")
+if [[ -n ${src:-} && -n $oid && -n $cur ]]; then
+  tdir=$(dirname "$src")
+  past() { # minutes_ago turns first_prompt reply
+    local id
+    id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    python3 - "$tdir/$id.jsonl" "$2" "$3" "$4" <<'PY2'
+import json, sys
+path, turns, first, reply = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(path, "w") as f:
+    for i in range(turns):
+        f.write(json.dumps({"type": "user", "message": {"content": first if i == 0 else "and then?"}, "timestamp": "2026-01-01T00:00:00Z"}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}, "timestamp": "2026-01-01T00:00:05Z"}) + "\n")
+PY2
+    echo "$id"
+  }
+  c1=$(past 1500 4 "what did everything do overnight?" "Three sessions finished; terraform-upgrade's plan is clean.")
+  c2=$(past 400 6 "tag the api sessions and tidy their descriptions" "Tagged 4 sessions api; rewrote two descriptions.")
+  c3=$(past 130 2 "is anything stuck?" "No: billing-webhooks is waiting on you, the rest are working.")
+  ev() { sql "insert into events (session_id, ts, kind, payload) values ('$oid', $(ago "$1"), 'fresh_conversation', '{\"from\":\"$2\",\"to\":\"$3\",\"reason\":\"idle\",\"idle_mins\":15}')"; }
+  ev 1490 "$c1" "$c2"
+  ev 380 "$c2" "$c3"
+  ev 115 "$c3" "$cur"
+fi
 
 echo "demo ready in $d"
 echo "  source $d/env.sh && rlord"

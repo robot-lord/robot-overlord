@@ -1,6 +1,6 @@
 [package]
 name = "robot-overlord"
-description = "rlord: run and organize many AI coding-agent sessions (Claude Code) in tmux, with an AI overlord to drive it"
+description = "rlord: manage your AI coding agents (Claude Code, Codex, OpenCode) with AI, in tmux"
 readme = "../../README.md"
 keywords = ["tmux", "claude", "ai", "agents", "tui"]
 categories = ["command-line-utilities", "development-tools"]
@@ -44,7 +44,7 @@ assets = [
 
 [package.metadata.generate-rpm]
 name = "rlord"
-summary = "Run and organize many AI coding-agent sessions in tmux"
+summary = "Manage your AI coding agents with AI, in tmux"
 license = "MIT OR Apache-2.0"
 assets = [
     { source = "target/release/rlord", dest = "/usr/bin/rlord", mode = "755" },

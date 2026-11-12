@@ -248,8 +248,10 @@ impl App {
     }
 
     /// Header: the logo and the name beside it, then one toolbar under the
-    /// name: tabs │ search │ sort │ live/archived, each with its key.
+    /// name: tabs │ search │ sort │ live/archived, each with its key. In a
+    /// one-row `area` (a short window), the toolbar alone.
     pub(crate) fn draw_bars(&self, f: &mut Frame, area: Rect) {
+        let compact = area.height < 4;
         let tab = |t: Tab| -> Span<'static> {
             let active = self.tab == t;
             Span::styled(
@@ -382,21 +384,38 @@ impl App {
             bar.extend(key(Action::ToggleArchived));
             bar
         };
-        // Beside the 6-column logo and its gap.
-        let room = area.width.saturating_sub(8) as usize;
+        // Beside the 6-column logo and its gap (compact: one cell in).
+        let left = if compact { 1 } else { 8 };
+        let room = area.width.saturating_sub(left) as usize;
         let width = |b: &[Piece]| b.iter().map(|(s, _)| s.width()).sum::<usize>();
         let pieces = (0..3)
             .map(build)
             .find(|b| width(b) <= room)
             .unwrap_or_else(|| build(2));
         // The toolbar is on the logo's last row (wide) or the one above.
-        let bar_row = if area.width >= 52 { 3 } else { 2 };
+        let bar_row = if compact {
+            0
+        } else if area.width >= 52 {
+            3
+        } else {
+            2
+        };
         self.hits.spans(
-            area.x + 8,
+            area.x + left,
             area.y + bar_row,
             pieces.iter().map(|(s, h)| (s.width() as u16, h.clone())),
         );
         let bar: Vec<Span<'static>> = pieces.into_iter().map(|(s, _)| s).collect();
+        if compact {
+            let row = Rect {
+                x: area.x + left,
+                width: area.width.saturating_sub(left),
+                height: 1,
+                ..area
+            };
+            f.render_widget(Paragraph::new(Line::from(bar)), row);
+            return;
+        }
 
         // The name, in the robot's red.
         // Box-drawn letters three rows tall where they fit, else one

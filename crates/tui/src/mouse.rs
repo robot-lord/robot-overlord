@@ -30,6 +30,9 @@ pub(crate) enum Hit {
     /// A sortable column header: sort by it, or flip the direction if the
     /// list is already sorted by it.
     SortBy(rlord_core::db::SortMode),
+    /// One of the overlord's earlier conversations in the details pane
+    /// (1: the newest): show it in the preview.
+    Conv(usize),
     /// Wheel areas: the session table, the group column, the preview.
     List,
     Groups,
@@ -198,14 +201,26 @@ pub(crate) enum Target {
     Group(String),
 }
 
-/// "Stop web-fix?": asked before a click stops, restarts or archives a
-/// session (a key does it at once, as always).
+/// "Stop web-fix?": asked before a click stops or restarts a session (a
+/// key does it at once, as always), before a session is archived however
+/// that was asked (key, click, menu, launcher), and before the overlord
+/// goes back to an earlier conversation.
 pub(crate) struct Confirm {
     question: String,
     /// What it does, for the button ("stop").
     verb: &'static str,
     target: Target,
-    key: KeyEvent,
+    /// What a yes does.
+    then: Then,
+}
+
+/// What a confirmation does once answered yes.
+enum Then {
+    /// Press this key on the target (a click's stop or restart).
+    Key(KeyEvent),
+    Archive,
+    /// Continue the overlord's earlier conversation with this id.
+    Continue(String),
 }
 
 /// The right-click menu: what the row (or group) under the pointer offers,
@@ -316,6 +331,10 @@ impl App {
                     self.group_focus = self.sessions.is_empty();
                 }
             }
+            // The same one again: back to the live pane.
+            Hit::Conv(i) if !right => {
+                self.show_conversation(if self.conv_sel == i { 0 } else { i })
+            }
             Hit::Pick(i) if !right => return self.pick(i, double, terminal),
             // Around a light modal: close it. (A form or a setup dialog
             // stays: a stray click mustn't lose what was entered.)
@@ -389,8 +408,9 @@ impl App {
         found
     }
 
-    /// A click asked for `k`: if that stops, restarts or archives the
-    /// highlighted session, ask first (true: a confirmation is now open).
+    /// A click asked for `k`: if that stops or restarts the highlighted
+    /// session, ask first (true: a confirmation is now open). (Archiving
+    /// asks by itself, however it was asked for: `confirm_archive`.)
     fn confirm_first(&mut self, k: KeyEvent) -> bool {
         if self.tab == Tab::Groups && self.group_focus {
             return false;
@@ -398,7 +418,6 @@ impl App {
         let verb = match self.keys.action(&k) {
             Some(Action::Stop) => "stop",
             Some(Action::Restart) => "restart",
-            Some(Action::Archive) => "archive",
             _ => return false,
         };
         let Some(s) = self.selected() else {
@@ -415,9 +434,50 @@ impl App {
             question,
             verb,
             target: Target::Session(id.to_string()),
-            key: k,
+            then: Then::Key(k),
         }));
         true
+    }
+
+    /// Archive the highlighted session, once the user says yes: `x` is
+    /// too easy to hit by accident. (Bulk archiving goes through the
+    /// overlord, which doesn't ask.)
+    pub(crate) fn confirm_archive(&mut self) {
+        let Some(s) = self.selected() else {
+            return;
+        };
+        let (Some(id), name) = (s["id"].as_str(), s["name"].as_str().unwrap_or("it")) else {
+            return;
+        };
+        self.mode = Mode::Confirm(Box::new(Confirm {
+            question: format!("Archive {name}?"),
+            verb: "archive",
+            target: Target::Session(id.to_string()),
+            then: Then::Archive,
+        }));
+    }
+
+    /// Go back to the overlord's earlier conversation shown in the
+    /// preview, once the user says yes.
+    pub(crate) fn confirm_continue(&mut self) {
+        let Some(conv) = self
+            .conv_sel
+            .checked_sub(1)
+            .and_then(|i| self.earlier_convs().get(i))
+            .and_then(|c| c["id"].as_str())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.mode = Mode::Confirm(Box::new(Confirm {
+            question: "Continue this conversation in the overlord? (Its current one ends.)".into(),
+            verb: "continue",
+            target: Target::Session(id),
+            then: Then::Continue(conv),
+        }));
     }
 
     /// Returns true to quit.
@@ -437,7 +497,21 @@ impl App {
         if !self.reselect(&c.target) {
             return Ok(false);
         }
-        self.handle_key(c.key, terminal)
+        match c.then {
+            Then::Key(k) => return self.handle_key(k, terminal),
+            Then::Archive => self.action("session.archive", "archived"),
+            Then::Continue(conv) => {
+                if self
+                    .call("overlord.continue", json!({"id": conv}))
+                    .is_some()
+                {
+                    self.status_line = "the overlord is back on that conversation".into();
+                }
+                self.conv_sel = 0;
+                self.dirty = true;
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn draw_confirm(&self, f: &mut Frame, c: &Confirm) {
@@ -450,7 +524,7 @@ impl App {
             Line::from(""),
             keys_line(&[
                 ("y/enter", c.verb, Cap::Context),
-                ("any key", "cancel", Cap::Global),
+                ("n/esc", "cancel", Cap::Global),
             ]),
         ];
         self.modal_hits(f.area(), area, &lines);
@@ -467,7 +541,8 @@ impl App {
         if !self.reselect(target) {
             return Ok(false);
         }
-        // (The menu came from a click: stop, restart, archive ask first.)
+        // (The menu came from a click: stop and restart ask first; archive
+        // asks by itself.)
         if self.confirm_first(key) {
             return Ok(false);
         }
@@ -748,6 +823,105 @@ mod tests {
         app.all = app.sessions.clone();
         app.table.select(Some(0));
         app
+    }
+
+    fn drawn_at(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    /// The overlord's row and ten sessions.
+    fn long_fleet() -> App {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![json!({"id": "o", "name": "overlord", "role": "overlord",
+                                   "status": "idle", "agent": "claude", "tags": [],
+                                   "archived_at": null})];
+        app.sessions.extend((0..10).map(|i| {
+            json!({"id": format!("s{i}"), "name": format!("sess-{i:02}"), "status": "idle",
+                   "agent": "claude", "tags": [], "archived_at": null})
+        }));
+        app.overlord_rows = 1;
+        app.all = app.sessions.clone();
+        app.table.select(Some(1));
+        app
+    }
+
+    /// The list's half of the screen (the preview names sessions too).
+    fn list_half(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|r| r.chars().take(75).collect()).collect()
+    }
+
+    /// The "↑ n more" / "↓ n more" counts on the list's border, and how
+    /// many sessions show.
+    fn more_and_shown(rows: &[String]) -> (usize, usize, usize) {
+        let rows = list_half(rows);
+        let count = |arrow: &str| {
+            rows.iter()
+                .find_map(|r| {
+                    let i = r.find(&format!("{arrow} "))?;
+                    let rest = &r[i + arrow.len() + 1..];
+                    rest.split(' ').next()?.parse().ok()
+                })
+                .unwrap_or(0)
+        };
+        let shown = rows.iter().filter(|r| r.contains("sess-")).count();
+        (count("↑"), shown, count("↓"))
+    }
+
+    /// A short window gives up the header art, then the toolbar and key
+    /// hints, then list rows; rows off screen are always counted on the
+    /// border, and what's drawn is still what's clicked.
+    #[test]
+    fn a_short_window_keeps_the_list() {
+        let has = |rows: &[String], t: &str| rows.iter().any(|r| r.contains(t));
+        let press = |app: &App, a: Action| app.keys.event(a).map(Hit::Key);
+        // 24 rows: everything, every session in view.
+        let mut app = long_fleet();
+        let rows = drawn_at(&mut app, 150, 24);
+        assert!(has(&rows, "╦═╗╔═╗") && has(&rows, "⌕ search") && has(&rows, " quit"));
+        assert_eq!(more_and_shown(&rows), (0, 10, 0));
+        // 16: the art is gone, the toolbar and the key hints stay.
+        let rows = drawn_at(&mut app, 150, 16);
+        assert!(!has(&rows, "╦═╗╔═╗"), "{}", rows.join("\n"));
+        assert!(has(&rows, "⌕ search") && has(&rows, " quit"));
+        assert_eq!(more_and_shown(&rows), (0, 7, 3));
+        let (x, y) = find(&rows, "⌕ search");
+        assert_eq!(app.hits.at(x + 3, y), press(&app, Action::Filter));
+        let (x, y) = find(&rows, " groups ");
+        assert_eq!(app.hits.at(x + 2, y), Some(Hit::Tab(Tab::Groups)));
+        let (x, y) = find(&list_half(&rows), "sess-02");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(3)));
+        let (x, y) = find(&rows, " quit");
+        assert_eq!(app.hits.at(x + 2, y), press(&app, Action::Quit));
+        // 12: the toolbar and key hints go before the list drops below
+        // five sessions.
+        let rows = drawn_at(&mut app, 150, 12);
+        assert!(
+            !has(&rows, "⌕") && !has(&rows, " quit"),
+            "{}",
+            rows.join("\n")
+        );
+        assert_eq!(more_and_shown(&rows), (0, 5, 5));
+        let (x, y) = find(&list_half(&rows), "sess-04");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(5)));
+        // 8: only now does the list shrink, still counting what's hidden.
+        let rows = drawn_at(&mut app, 150, 8);
+        assert_eq!(more_and_shown(&rows), (0, 1, 9), "{}", rows.join("\n"));
+        // Scrolled to the end: the count moves to the top.
+        app.table.select(Some(10));
+        let rows = drawn_at(&mut app, 150, 12);
+        let (up, shown, down) = more_and_shown(&rows);
+        assert!(up > 0 && down == 0, "{}", rows.join("\n"));
+        // (The overlord's row is one of those above.)
+        assert_eq!(up + shown, 11, "{}", rows.join("\n"));
+        let (x, y) = find(&list_half(&rows), "sess-09");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(10)));
     }
 
     #[test]

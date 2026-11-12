@@ -45,6 +45,12 @@ fn matched_fields(s: &Session, ws: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
+/// The overlord's session, or one that ran in an overlord's folder (the
+/// retired front desk of a two-session overlord).
+fn is_overlords(s: &Session, dirs: &[String]) -> bool {
+    crate::overlord::is_overlord_role(&s.role) || dirs.contains(&s.project_path)
+}
+
 pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let query = params["query"].as_str().unwrap_or("").trim();
     if query.is_empty() {
@@ -53,12 +59,28 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let ws = words(query);
     let everywhere = params["scope"].as_str() == Some("all");
     let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 25) as usize;
-    let sessions = {
-        let q = SessionQuery {
-            archived: ArchivedMode::All,
-            ..Default::default()
-        };
-        d.db().sessions(&q)?
+    // One session ("what happened in X?"): only it, and its transcripts.
+    let one = match params["session"].as_str().map(str::trim) {
+        Some(r) if !r.is_empty() => {
+            let s = d.db().resolve_ref(r)?;
+            if crate::overlord::is_overlord_role(&s.role) {
+                bail!("the overlord's own conversations are searched with recall");
+            }
+            Some(s)
+        }
+        _ => None,
+    };
+    let named = one.is_some();
+    let everywhere = everywhere && !named;
+    let sessions = match one {
+        Some(s) => vec![s],
+        None => {
+            let q = SessionQuery {
+                archived: ArchivedMode::All,
+                ..Default::default()
+            };
+            d.db().sessions(&q)?
+        }
     };
     // Each session's transcripts: the current one, then any from before a
     // `/clear`. Searched in that order, so a session's hits start with its
@@ -66,17 +88,18 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut paths_of: HashMap<usize, Vec<PathBuf>> = HashMap::new();
     let mut paths: Vec<PathBuf> = Vec::new();
-    // The overlord's own conversations are full of searches: never results.
-    // Whole folders: each seat runs in its own, so every conversation it
-    // ever had is in there, known to rlord or not.
+    // The overlord's own conversations are full of searches: never results
+    // (it looks its own past up with `recall`).
+    // Whole folders: it runs in its own, so every conversation it ever had
+    // is in there, known to rlord or not.
     // (Claude keeps a folder's conversations together, so its transcript
     // directory stands for the folder; a Codex rollout and an OpenCode
     // session say their folder.)
-    let seat_dirs: Vec<String> = crate::overlord::SEATS
+    let own_dirs: Vec<String> = crate::overlord::dirs()
         .iter()
-        .map(|seat| seat.dir().to_string_lossy().into_owned())
+        .map(|dir| dir.to_string_lossy().into_owned())
         .collect();
-    let skip: std::collections::HashSet<PathBuf> = seat_dirs
+    let skip: std::collections::HashSet<PathBuf> = own_dirs
         .iter()
         .filter_map(|dir| {
             Agent::Claude
@@ -85,13 +108,20 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                 .map(Path::to_path_buf)
         })
         .collect();
+    // A session that ran in an overlord's folder (the retired front desk)
+    // is searched only when named: then its own transcripts are what was
+    // asked for.
+    let dropped = |s: &Session| !named && is_overlords(s, &own_dirs);
     for (i, s) in sessions.iter().enumerate() {
-        if crate::overlord::is_overlord_role(&s.role) {
+        if dropped(s) {
             // (Its folder is skipped whole, above: no need to look its
             // transcripts up one by one.)
             continue;
         }
         let ps = summary::transcripts_of(d, s);
+        if named && ps.is_empty() && is_overlords(s, &own_dirs) {
+            bail!("{} has no transcript left on disk to search", s.name);
+        }
         for p in &ps {
             if by_path.insert(p.clone(), i).is_none() {
                 paths.push(p.clone());
@@ -103,26 +133,26 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         // Codex rollouts sit together by date: which folder each ran in is
         // one question to Codex's index; a rollout it doesn't list (older
         // than the index, or no index at all) says so in its first bytes.
-        // A seat's folder may be recorded as given or resolved (symlinks).
+        // Its folder may be recorded as given or resolved (symlinks).
         let folders = agents::codex::rollout_folders(&agents::codex::home()).unwrap_or_default();
-        let seat_real: Vec<String> = seat_dirs
+        let own_real: Vec<String> = own_dirs
             .iter()
             .filter_map(|d| std::fs::canonicalize(d).ok())
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let is_seat = |cwd: &str| seat_dirs.iter().chain(&seat_real).any(|d| d == cwd);
-        let in_seat_folder = |p: &Path| match agents::agent_of(p) {
+        let is_own = |cwd: &str| own_dirs.iter().chain(&own_real).any(|d| d == cwd);
+        let in_own_folder = |p: &Path| match agents::agent_of(p) {
             Agent::Claude => false, // (by its directory: `skip`)
             Agent::Codex => match folders.get(p) {
-                Some(cwd) => is_seat(cwd),
-                None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
+                Some(cwd) => is_own(cwd),
+                None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_own(&cwd)),
             },
-            Agent::OpenCode => is_seat(&Agent::OpenCode.transcript_folder(p)),
+            Agent::OpenCode => is_own(&Agent::OpenCode.transcript_folder(p)),
         };
         paths.extend(history::all_transcripts().into_iter().filter(|p| {
             !by_path.contains_key(p)
                 && !p.parent().is_some_and(|d| skip.contains(d))
-                && !in_seat_folder(p)
+                && !in_own_folder(p)
         }));
     }
     let found = history::search(&paths, query, PER_FILE);
@@ -153,7 +183,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut rows: Vec<(usize, Vec<&'static str>, usize)> = sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| !crate::overlord::is_overlord_role(&s.role))
+        .filter(|(_, s)| !dropped(s))
         .map(|(i, s)| (i, matched_fields(s, &ws), hits.get(&i).map_or(0, |h| h.0)))
         .filter(|(_, f, n)| !f.is_empty() || *n > 0)
         .collect();
@@ -311,4 +341,66 @@ pub fn summarize(d: &Daemon, params: &Value) -> Result<Value> {
     }
     Ok(json!({"queued": queued, "skipped": skipped,
               "note": "summaries are written in the background, one at a time; list_sessions shows them when done"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlord_core::config::Config;
+    use rlord_core::db::{Db, NewSession};
+
+    /// The retired front desk ran in the overlord's folder: left out of a
+    /// search across sessions, searched when named.
+    #[test]
+    fn the_front_desk_is_searched_when_named() {
+        let dir = std::env::temp_dir().join(format!("rlord-search-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("conv-fd.jsonl");
+        std::fs::write(
+            &t,
+            json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                   "message": {"role": "user", "content": "launch the zebracorn report"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let folder = crate::overlord::dirs()[0].to_string_lossy().into_owned();
+        db.insert_session(&NewSession {
+            id: "01FRONT",
+            name: "overlord-front-desk",
+            agent: "claude",
+            agent_session: Some("conv-fd"),
+            project_path: &folder,
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_archived("01FRONT", Some(2)).unwrap();
+        db.upsert_transcript_source("01FRONT", &t.to_string_lossy())
+            .unwrap();
+        let d = Daemon::new(db, Config::default());
+        let all = search(&d, &json!({"query": "zebracorn"})).unwrap();
+        assert_eq!(all["sessions"], json!([]), "{all}");
+        let one = search(
+            &d,
+            &json!({"query": "zebracorn", "session": "overlord-front-desk"}),
+        )
+        .unwrap();
+        assert_eq!(one["sessions"][0]["id"], "01FRONT", "{one}");
+        assert_eq!(one["sessions"][0]["transcript_hits"], 1, "{one}");
+        // Its transcript gone: a clear error, not an empty answer.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let e = search(
+            &d,
+            &json!({"query": "zebracorn", "session": "overlord-front-desk"}),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no transcript"), "{e}");
+    }
 }

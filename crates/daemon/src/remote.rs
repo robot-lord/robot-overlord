@@ -13,8 +13,8 @@
 //!   turn running, sub-agents, a permission prompt, unsent text in its input)
 //!   isn't restarted unasked: `remote.set` answers `needs_confirm` with the
 //!   reasons, and the caller picks `restart: "now"` or `"when_idle"` (the
-//!   keeper restarts it as soon as nothing is going on). The overlord's own
-//!   seats always wait for idle: restarting mid-reply would cut it off.
+//!   keeper restarts it as soon as nothing is going on). The overlord itself
+//!   always waits for idle: restarting mid-reply would cut it off.
 //! - **The keeper** (every few seconds) runs those deferred restarts and
 //!   works out each session's state from Claude's own live-state files. A
 //!   session started with the flag that never connects is reported with the
@@ -63,7 +63,7 @@ pub struct Remote {
     tick: Mutex<()>,
 }
 
-/// Every live session, the overlord's two seats included.
+/// Every live session, the overlord included.
 fn all_sessions() -> SessionQuery {
     SessionQuery {
         include_overlord: true,
@@ -71,14 +71,10 @@ fn all_sessions() -> SessionQuery {
     }
 }
 
-/// kv: whether the mastermind carries Remote Control ("1") — kept so a new
-/// or fresh mastermind gets it, and the keeper keeps it running.
-pub const MASTERMIND_REMOTE: &str = "mastermind_remote";
-
 /// The name a session shows in the Claude app.
 pub fn remote_name(name: &str, role: &str) -> String {
     let n = match role {
-        "overlord" | "mastermind" => format!("rlord {role}"),
+        "overlord" => "rlord overlord".to_string(),
         _ => name.trim().to_string(),
     };
     // Never mistaken for a flag.
@@ -152,6 +148,11 @@ fn turned_off_spec(db: &Db, id: &str) -> bool {
         .ok()
         .and_then(|sp| serde_json::from_str::<Value>(&sp).ok())
         .is_some_and(|sp| sp["remote_control_off"] == true)
+}
+
+/// Record that `s` should have Remote Control from its next start.
+pub(crate) fn want(db: &Db, s: &Session) -> Result<()> {
+    set_wanted(db, s, true)
 }
 
 fn set_wanted(db: &Db, s: &Session, on: bool) -> Result<()> {
@@ -444,12 +445,10 @@ fn dequeue(d: &Daemon, id: &str) {
 /// `only_if_quiet`: check again, right before, that nothing is going on
 /// (and has been for a few seconds); false means it wasn't restarted.
 fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
-    // Not while a hand-off is being pasted into the mastermind (and checked
-    // under that lock, after any hand-off that held it).
-    let is_mastermind = overlord::MASTERMIND
-        .session(&d.db())?
-        .is_some_and(|m| m.id == id);
-    let _send = is_mastermind.then(|| d.mastermind_send.lock().expect("mastermind send lock"));
+    // Not while a request is being pasted into the overlord (and checked
+    // under that lock, after any request that held it).
+    let is_overlord = overlord::session(&d.db())?.is_some_and(|o| o.id == id);
+    let _send = is_overlord.then(|| d.overlord_send.lock().expect("overlord send lock"));
     if only_if_quiet {
         let s = d.db().resolve_ref(id)?;
         let live = live();
@@ -576,11 +575,8 @@ pub fn start(d: &std::sync::Arc<Daemon>) {
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Each step on its own: one failing never stalls the rest.
-                if let Err(e) = move_front_desk_remote(&d) {
-                    tracing::warn!(error = %e, "remote control: moving the front desk's");
-                }
-                if let Err(e) = keep_mastermind_up(&d, &mut last_ensure) {
-                    tracing::warn!(error = %e, "remote control: starting the mastermind");
+                if let Err(e) = keep_overlord_up(&d, &mut last_ensure) {
+                    tracing::warn!(error = %e, "remote control: starting the overlord");
                 }
                 pass(&d).map(|_| ())
             }))
@@ -593,46 +589,28 @@ pub fn start(d: &std::sync::Arc<Daemon>) {
     });
 }
 
-/// An overlord set up when Remote Control lived on the front desk: move it
-/// to the mastermind (the front desk is turned off once it's idle).
-fn move_front_desk_remote(d: &Daemon) -> Result<()> {
-    let Some(front) = overlord::FRONT.session(&d.db())? else {
-        return Ok(());
-    };
-    if wanted(&d.db(), &front.id)?.is_none() {
-        return Ok(());
-    }
-    tracing::info!("moving the overlord's Remote Control to the mastermind");
-    // The choice moves to the mastermind whatever happens next, and the
-    // front desk's wish goes (so this runs once, not every tick).
-    d.db().kv_set(MASTERMIND_REMOTE, "1")?;
-    set_wanted(&d.db(), &front, false)?;
-    // Its running link (if any) drops when it next restarts idle.
-    enqueue(d, &front.id);
-    Ok(())
-}
-
-/// With Remote Control on the mastermind, keep it running: it's what the
+/// With Remote Control on the overlord, keep it running: it's what the
 /// user reaches from the Claude app, so it must be there when they're away.
 /// (Started lazily otherwise; retried at most once a minute.)
-fn keep_mastermind_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
-    if d.db().kv_get(MASTERMIND_REMOTE)?.as_deref() != Some("1") {
+fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
+    let Some(o) = overlord::session(&d.db())? else {
+        return Ok(()); // no overlord set up
+    };
+    if wanted(&d.db(), &o.id)?.is_none() {
         return Ok(());
     }
-    if overlord::FRONT.session(&d.db())?.is_none() {
-        return Ok(()); // no overlord set up
-    }
-    let up = overlord::MASTERMIND.session(&d.db())?.is_some_and(|m| {
-        m.status != Status::Stopped && m.tmux_session.as_deref().is_some_and(tmux::has_session)
-    });
+    let up =
+        o.status != Status::Stopped && o.tmux_session.as_deref().is_some_and(tmux::has_session);
     if up || last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
         return Ok(());
     }
     *last = Some(Instant::now());
-    // Not while a hand-off is being pasted into it.
-    let _send = d.mastermind_send.lock().expect("mastermind send lock");
-    overlord::ensure(&d.db(), &d.config(), &json!({"seat": "mastermind"}))?;
-    tracing::info!("started the mastermind for Remote Control");
+    // (Where the agent's command is: asked before any lock is taken.)
+    rlord_core::agents::install::warm();
+    // Not while a request is being pasted into it.
+    let _send = d.overlord_send.lock().expect("overlord send lock");
+    overlord::ensure(&d.db(), &d.config(), &json!({}))?;
+    tracing::info!("started the overlord for Remote Control");
     d.changed();
     Ok(())
 }
@@ -675,32 +653,22 @@ pub fn status(d: &Daemon, params: &Value) -> Result<Value> {
 }
 
 /// `remote.set {ref, on, restart?: "now" | "when_idle"}`: turn Remote
-/// Control on or off for a session. Remembered for every future start; a
-/// running session is restarted (resumed) with or without the flag. With
-/// work going and no `restart` given, nothing changes: the answer is
-/// `needs_confirm` with the reasons, for the user to pick. The overlord's
-/// two seats go together and always restart when idle.
+/// Control on or off for a session (`overlord: true` instead of `ref`: the
+/// overlord). Remembered for every future start; a running session is
+/// restarted (resumed) with or without the flag. With work going and no
+/// `restart` given, nothing changes: the answer is `needs_confirm` with the
+/// reasons, for the user to pick. The overlord always restarts when idle.
 pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     let on = params["on"]
         .as_bool()
         .context("missing 'on' (true or false)")?;
-    // `seat` (overlord / mastermind) names a seat unambiguously.
-    let s = match params["seat"].as_str() {
-        // (The mastermind may not have started yet: either seat will do,
-        // both lead to it below.)
-        Some(seat) => {
-            // Bound first: a guard in a match scrutinee lives through the arms.
-            let found = overlord::seat(seat).session(&d.db())?;
-            match found {
-                Some(s) => s,
-                None => overlord::FRONT
-                    .session(&d.db())?
-                    .context("no overlord yet")?,
-            }
-        }
-        None => d
-            .db()
-            .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?,
+    let s = if params["overlord"] == true {
+        // Bound first: a guard in a scrutinee lives through the block.
+        let found = overlord::session(&d.db())?;
+        found.context("no overlord yet")?
+    } else {
+        d.db()
+            .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?
     };
     if on {
         if !has_remote_control(&s.agent) {
@@ -717,54 +685,16 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             );
         }
     }
-    let seats = overlord::is_overlord_role(&s.role);
+    let is_overlord = overlord::is_overlord_role(&s.role);
     let mode = match params["restart"].as_str() {
         None | Some("") => None,
         Some(m @ ("now" | "when_idle")) => Some(m),
         Some(m) => bail!("restart must be \"now\" or \"when_idle\", not {m:?}"),
     };
-    // The overlord's Remote Control lives on the mastermind (the front desk
-    // stays fast; the mastermind is kept running for it). Asked for either
-    // seat, it's the mastermind's; the front desk is always turned off.
-    let mut started_now = false;
-    let (s, mut targets) = if seats {
-        d.db()
-            .kv_set(MASTERMIND_REMOTE, if on { "1" } else { "0" })?;
-        // Bound first: a guard in a match scrutinee lives through the arms
-        // (ensure() below locks the db again).
-        let found = overlord::MASTERMIND.session(&d.db())?;
-        let mind = match found {
-            Some(m) => m,
-            // Not started yet: start it now (with the flag, from the kv).
-            None if on => {
-                overlord::ensure(&d.db(), &d.config(), &json!({"seat": "mastermind"}))?;
-                started_now = true;
-                overlord::MASTERMIND
-                    .session(&d.db())?
-                    .context("the mastermind didn't start")?
-            }
-            None => s.clone(),
-        };
-        let mut t = vec![(mind.clone(), on)];
-        if let Some(f) = overlord::FRONT.session(&d.db())? {
-            if f.id != mind.id {
-                t.push((f, false));
-            }
-        }
-        (mind, t)
-    } else {
-        (s.clone(), vec![(s, on)])
-    };
-    // (A front desk that has nothing to turn off is left alone below.)
-    targets.retain(|(t, want)| {
-        *want || t.role != overlord::FRONT.key || {
-            let db = d.db();
-            wanted(&db, &t.id).ok().flatten().is_some() || !turned_off_spec(&db, &t.id)
-        }
-    });
+    let targets = [(s.clone(), on)];
     let live = live();
-    // What a restart now would interrupt (the overlord's seats never restart
-    // now: the overlord is mid-reply while it asks for this).
+    // What a restart now would interrupt (the overlord never restarts now:
+    // it is mid-reply while it asks for this).
     let lv = |t: &Session| t.agent_session.as_deref().and_then(|a| live.get(a));
     // Running: Claude reports it, or its pane is up and it isn't stopped.
     let running = |t: &Session| {
@@ -778,7 +708,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         let connected = lv(t).is_some_and(|l| l.bridge.is_some());
         Ok(running(t) && !(on && connected) && !(before == on && connected == on))
     };
-    let going: Vec<String> = if seats || !needs_restart(&s)? {
+    let going: Vec<String> = if is_overlord || !needs_restart(&s)? {
         Vec::new()
     } else {
         work_going(&s, lv(&s))
@@ -794,17 +724,13 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         }));
     }
     // The user said no for the overlord: don't offer it again.
-    if !on && seats {
+    if !on && is_overlord {
         d.db().kv_set("remote_offer_declined", "1")?;
     }
     let mut restarted = Vec::new();
     let mut deferred = Vec::new();
     for (t, on) in &targets {
         let (t, on) = (t, *on);
-        // Just launched with the flag: nothing to restart.
-        if started_now && t.role == overlord::MASTERMIND.key {
-            continue;
-        }
         let before = wanted(&d.db(), &t.id)?;
         let connected = lv(t).is_some_and(|l| l.bridge.is_some());
         // Already as asked: nothing to restart. Off is still recorded (a
@@ -823,7 +749,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         if on && connected {
             continue;
         }
-        if seats || mode == Some("when_idle") {
+        if is_overlord || mode == Some("when_idle") {
             enqueue(d, &t.id);
             deferred.push(t.name.clone());
         } else {
@@ -885,19 +811,24 @@ pub fn offer(d: &Daemon) -> Value {
         return Value::Null;
     };
     let db = d.db();
-    let front = overlord::FRONT.session(&db).ok().flatten();
-    // It lives on the mastermind.
-    let on = db.kv_get(MASTERMIND_REMOTE).ok().flatten().as_deref() == Some("1");
-    let claude = front.as_ref().is_none_or(|f| has_remote_control(&f.agent));
+    let o = overlord::session(&db).ok().flatten();
+    let on = o
+        .as_ref()
+        .is_some_and(|o| wanted(&db, &o.id).ok().flatten().is_some());
+    // (No overlord yet: whether the configured agent could have it.)
+    let agent = o
+        .as_ref()
+        .map_or_else(|| d.config().overlord.agent.clone(), |o| o.agent.clone());
+    let can = has_remote_control(&agent);
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()
         .flatten()
         .is_some_and(|v| v == "1");
     json!({
-        "available": a.available && claude, "reason": a.reason, "note": a.note,
+        "available": a.available && can, "reason": a.reason, "note": a.note,
         "on": on,
-        "offer": a.available && claude && front.is_some() && !on && !declined,
+        "offer": a.available && can && o.is_some() && !on && !declined,
     })
 }
 

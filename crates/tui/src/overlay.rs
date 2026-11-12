@@ -23,16 +23,15 @@ use serde_json::json;
 use rlord_core::paths;
 use rlord_core::tmux;
 use rlord_daemon::client_call;
-use rlord_daemon::overlord::{self, Seat};
+use rlord_daemon::overlord;
 
 /// Frame interval: how often the overlord's pane is re-captured.
 const FRAME_MS: u64 = 40;
 
 /// `token` identifies this overlay to the daemon (it was minted when the
 /// daemon opened the popup).
-pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
-    let seat = overlord::seat(seat);
-    let pane = tmux::pane_id(seat.tmux)?;
+pub fn run(token: Option<u64>) -> Result<()> {
+    let pane = tmux::pane_id(overlord::TMUX_NAME)?;
     let report = |open: bool| {
         let _ = client_call(
             &paths::socket_path(),
@@ -45,19 +44,19 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     let _ =
         ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let cfg = rlord_core::config::Config::load().unwrap_or_default();
-    let keys = SeatKeys::from_config(&cfg);
-    // The overlay draws in the user's theme: the copy bar wears the seat's
-    // colour.
+    let keys = OverlayKeys::from_config(&cfg);
+    // The overlay draws in the user's theme: the copy bar wears the
+    // overlord's colour.
     crate::theme::set(rlord_core::themes::resolve(
         &cfg.theme,
         rlord_core::themes::system_is_dark(),
     ));
     // The user's tmux prefix there (prefix then `[` enters copy mode).
-    let prefix = tmux::session_option(seat.tmux, "prefix")
+    let prefix = tmux::session_option(overlord::TMUX_NAME, "prefix")
         .ok()
         .and_then(|p| parse_key(&p));
-    let r = run_loop(&mut terminal, &pane, seat, &keys, prefix);
-    // Never leave the seat in copy mode: what's sent to it next would be
+    let r = run_loop(&mut terminal, &pane, &keys, prefix);
+    // Never leave the overlord in copy mode: what's sent to it next would be
     // taken by the mode's keys.
     let _ = tmux::cancel_mode(&pane);
     let _ = ratatui::crossterm::execute!(
@@ -68,29 +67,28 @@ pub fn run(token: Option<u64>, seat: &str) -> Result<()> {
     ratatui::restore();
     report(false);
     // The window follows clients again once nobody is embedding it.
-    let _ = tmux::auto_size_window(seat.tmux);
+    let _ = tmux::auto_size_window(overlord::TMUX_NAME);
     r
 }
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     pane: &str,
-    seat: &Seat,
-    keys: &SeatKeys,
+    keys: &OverlayKeys,
     prefix: Option<(bool, bool, char)>,
 ) -> Result<()> {
-    // tmux's copy mode on the seat's pane: the overlay isn't a pane, so it
+    // tmux's copy mode on the overlord's pane: the overlay isn't a pane, so it
     // puts the real pane in copy mode, draws that mode's screen, and keys go
     // to the mode (the user's copy bindings: select, yank, search, q).
     let mut in_mode = false;
     let mut after_prefix = false;
     // vi copy mode's prompts (search, jump) draw on the client, under the
     // popup: the overlay reads them itself.
-    let vi = tmux::session_option(seat.tmux, "mode-keys").is_ok_and(|m| m == "vi");
+    let vi = tmux::session_option(overlord::TMUX_NAME, "mode-keys").is_ok_and(|m| m == "vi");
     let mut prompt: Option<Prompt> = None;
     // The user's own keys into copy mode: the session's key table (e.g.
     // M-a) and after the prefix (e.g. a, PPage; `[` always).
-    let table = tmux::session_option(seat.tmux, "key-table")
+    let table = tmux::session_option(overlord::TMUX_NAME, "key-table")
         .ok()
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "root".into());
@@ -107,7 +105,7 @@ fn run_loop(
     let mut repeat: Option<u32> = None;
     // The newest paste buffer when copy mode began: a new one when it ends
     // goes to the clipboard (a yank to tmux's buffer alone would otherwise
-    // reach no client: none shows the seat's window).
+    // reach no client: none shows the overlord's window).
     let mut buffer_at_entry: Option<Option<String>> = None;
     // The pane's history size when copy mode began: the mode's snapshot,
     // which its selection lines count in (taken just before the overlay
@@ -157,8 +155,6 @@ fn run_loop(
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
     let mut error: Option<String> = None;
-    // An error worth reading (a failed seat switch) stays up a few seconds.
-    let mut hold_error_until = Instant::now();
     let mut last = Instant::now() - Duration::from_secs(1);
     loop {
         let area = terminal.size()?;
@@ -173,7 +169,7 @@ fn run_loop(
                 let _ = tmux::cancel_mode(pane);
                 history_at_entry = None;
             }
-            if let Err(e) = tmux::resize_window(seat.tmux, size.0, size.1) {
+            if let Err(e) = tmux::resize_window(overlord::TMUX_NAME, size.0, size.1) {
                 error = Some(format!("{e:#}"));
             }
             last = Instant::now() - Duration::from_secs(1);
@@ -212,9 +208,7 @@ fn run_loop(
                         highlight(&mut screen, sel);
                     }
                     cursor = f.cursor_visible.then_some((f.cursor_x, f.cursor_y));
-                    if Instant::now() >= hold_error_until {
-                        error = None;
-                    }
+                    error = None;
                 }
                 Err(e) => error = Some(format!("{e:#}")),
             }
@@ -231,9 +225,8 @@ fn run_loop(
                     // Copy mode looks like the live screen at the bottom of
                     // the history: say so, with its keys.
                     let bar = match &prompt {
-                        Some(p) => Some(bar_line(seat, "COPY", p.label(), String::new())),
+                        Some(p) => Some(bar_line("COPY", p.label(), String::new())),
                         None if in_mode => Some(bar_line(
-                            seat,
                             "COPY",
                             format!(
                                 "{}/{}{}",
@@ -365,32 +358,9 @@ fn run_loop(
                         continue;
                     }
                 }
-                match keys.seat_key(&k) {
-                    // This seat's key (or Option-D) closes the overlay.
-                    Some(s) if s == seat.key || s == "close" => return Ok(()),
-                    // The other seat's key switches to it (the daemon opens
-                    // its overlay in place of this one).
-                    Some(other) => {
-                        // Hand this seat's window its size back first, and out
-                        // of copy mode: the new overlay replaces (kills) this
-                        // one.
-                        let _ = tmux::auto_size_window(seat.tmux);
-                        let _ = tmux::cancel_mode(pane);
-                        match client_call(
-                            &paths::socket_path(),
-                            "ui.overlord",
-                            json!({"seat": other, "show": true}),
-                        ) {
-                            Ok(_) => return Ok(()),
-                            // Stay, and say why the switch didn't happen.
-                            Err(e) => {
-                                error = Some(format!("couldn't switch to the {other}: {e:#}"));
-                                hold_error_until = Instant::now() + Duration::from_secs(4);
-                            }
-                        }
-                        continue;
-                    }
-                    None => {}
+                // The overlord's key (or the back key) closes the overlay.
+                if keys.closes(&k) {
+                    return Ok(());
                 }
                 let r = match (tmux_key(&k), repeat.take().filter(|_| in_mode)) {
                     (Some(TmuxKey::Text(t)), Some(n)) => tmux::send_key_repeat(pane, n, &t, true),
@@ -717,17 +687,13 @@ fn pipe_to(cmd: &mut std::process::Command, text: &str) -> bool {
     c.wait().is_ok_and(|s| s.success())
 }
 
-/// The copy bar: a chip in the seat's colour naming the mode, then what
-/// it's at, then the user's keys, quieter.
-fn bar_line(seat: &Seat, mode: &str, what: String, hints: String) -> ratatui::text::Line<'static> {
+/// The copy bar: a chip in the overlord's colour naming the mode, then
+/// what it's at, then the user's keys, quieter.
+fn bar_line(mode: &str, what: String, hints: String) -> ratatui::text::Line<'static> {
     use crate::theme;
     use ratatui::style::Style;
     use ratatui::text::Span;
-    let hue = if seat.key == "mastermind" {
-        theme::mastermind()
-    } else {
-        theme::overlord()
-    };
+    let hue = theme::overlord();
     let mut spans = vec![
         Span::styled(
             format!(" {mode} "),
@@ -800,11 +766,10 @@ fn highlight(text: &mut Text<'static>, (a, b): ((u16, u16), (u16, u16))) {
 
 /// Option-O (the key that opened it) or Option-D (the "back" key) closes it.
 /// The overlay's own keys, from the configured tmux keys: the overlord's
-/// (Option-O), the mastermind's (Option-M) and back (Option-D, closes).
+/// (Option-O) and back (Option-D); both close it.
 /// Inside a popup, keys reach this program, not tmux's key table.
-struct SeatKeys {
+struct OverlayKeys {
     overlord: Option<rlord_core::keys::Key>,
-    mastermind: Option<rlord_core::keys::Key>,
     close: Option<rlord_core::keys::Key>,
 }
 
@@ -867,32 +832,22 @@ fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
     chars.next().is_none().then_some((alt, ctrl, c))
 }
 
-impl SeatKeys {
+impl OverlayKeys {
     fn from_config(cfg: &rlord_core::config::Config) -> Self {
         // An empty or unreadable key falls back to the default.
         // The same notation the key screen saves (F-keys and named keys too).
         use rlord_core::keys::Key;
-        let or = |k: &str, d: &str| Key::parse(k).or_else(|| Key::parse(d));
-        SeatKeys {
-            overlord: or(&cfg.tmux.overlord, "M-o"),
-            mastermind: or(cfg.tmux.mastermind_switch(), "M-m"),
-            // Off is off (the seat keys still close it).
+        OverlayKeys {
+            overlord: Key::parse(&cfg.tmux.overlord).or_else(|| Key::parse("M-o")),
+            // Off is off (the overlord's key still closes it).
             close: Key::parse(&cfg.tmux.back),
         }
     }
 
-    fn seat_key(&self, k: &KeyEvent) -> Option<&'static str> {
+    /// Whether this key closes the overlay.
+    fn closes(&self, k: &KeyEvent) -> bool {
         let got = crate::keyscreen::key_of(k);
-        got.as_ref()?;
-        if self.overlord == got {
-            Some(overlord::FRONT.key)
-        } else if self.mastermind == got {
-            Some(overlord::MASTERMIND.key)
-        } else if self.close == got {
-            Some("close")
-        } else {
-            None
-        }
+        got.is_some() && (self.overlord == got || self.close == got)
     }
 }
 
@@ -1048,14 +1003,15 @@ mod tests {
     }
 
     #[test]
-    fn option_keys_pick_the_seat_or_close() {
-        let keys = SeatKeys::from_config(&rlord_core::config::Config::default());
-        let k = |c, m| keys.seat_key(&ev(KeyCode::Char(c), m));
-        assert_eq!(k('o', KeyModifiers::ALT), Some("overlord"));
-        assert_eq!(k('m', KeyModifiers::ALT), Some("mastermind"));
-        assert_eq!(k('d', KeyModifiers::ALT), Some("close"));
-        assert_eq!(k('o', KeyModifiers::NONE), None);
-        assert_eq!(keys.seat_key(&ev(KeyCode::Esc, KeyModifiers::NONE)), None);
+    fn option_keys_close_the_overlay() {
+        let keys = OverlayKeys::from_config(&rlord_core::config::Config::default());
+        let k = |c, m| keys.closes(&ev(KeyCode::Char(c), m));
+        assert!(k('o', KeyModifiers::ALT));
+        assert!(k('d', KeyModifiers::ALT));
+        // (Once the overlord's other session's key: now the overlord's own.)
+        assert!(!k('m', KeyModifiers::ALT));
+        assert!(!k('o', KeyModifiers::NONE));
+        assert!(!keys.closes(&ev(KeyCode::Esc, KeyModifiers::NONE)));
         assert_eq!(parse_key("M-C-x"), Some((true, true, 'x')));
         assert_eq!(parse_key("M-xy"), None);
     }
