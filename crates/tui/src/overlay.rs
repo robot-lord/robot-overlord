@@ -103,7 +103,9 @@ fn run_loop(
             // Resizing reflows copy mode's snapshot, so its line numbers no
             // longer match what was recorded on entry: leave the mode
             // rather than draw a wrong selection.
-            if in_mode {
+            // (Or just entered by the overlay: `in_mode` lags a frame,
+            // `history_at_entry` doesn't.)
+            if in_mode || history_at_entry.is_some() {
                 let _ = tmux::cancel_mode(pane);
                 history_at_entry = None;
             }
