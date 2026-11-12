@@ -42,14 +42,18 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
 4. **Codex overlord seats.** `[overlord] agent = "codex"` per seat.
 5. Later: Codex Remote Control, key shadows, Gemini.
 
-## Open decisions
+## Decisions (with Brandon)
 
-- Hook trust: user trusts once (rlord guides it, with a status fallback
-  when untrusted) vs. `--dangerously-bypass-hook-trust` on every launch
-  (also runs untrusted repo hooks: no).
-- Codex's shared background app-server (`--no-daemon` to isolate each pane?).
-- Summaries: summarize Codex sessions with Codex, or one summary agent for all.
-- Default agent for new sessions; whether the overlord picks per request.
+- Hook trust: rlord installs its Codex hooks and guides the user to trust
+  them once (`/hooks` in Codex); until trusted, status falls back to Codex's
+  SQLite (`threads` / `thread_turns`). Never `--dangerously-bypass-hook-trust`
+  (it would also run untrusted repo hooks).
+- Summaries: by the session's own agent (Codex: `codex exec fork` ephemeral,
+  read-only; excerpts to `codex exec --ephemeral` when too big).
+- New sessions: `[session] agent` is the default; the form gets an agent hint
+  and the overlord picks Codex when asked.
+- First round: phases 1 and 2 in one PR (0.19.0-dev.1). Import, messaging,
+  sub-agents and Codex overlord seats follow.
 
 ## Owed
 
