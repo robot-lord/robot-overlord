@@ -447,7 +447,9 @@ pub fn expand_tilde(p: &str) -> String {
 #[serde(default)]
 pub struct Config {
     pub layout: Layout,
-    /// Width of the session list in `side` layout, percent of the terminal.
+    /// Width of the session list in `side` layout, percent of the terminal:
+    /// the least it gets (it borrows from the preview when that is too
+    /// narrow for its core columns).
     pub list_width_pct: u16,
     /// How often the pane preview re-captures, in milliseconds.
     pub preview_refresh_ms: u64,

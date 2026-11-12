@@ -1244,9 +1244,7 @@ impl App {
                 // (configured share, but never below what its columns need);
                 // the preview takes the remainder and simply drops out when
                 // that remainder is too small to be useful.
-                let pct = self.config.list_width_pct.clamp(20, 80) as u32;
-                let want = (main_area.width as u32 * pct / 100) as u16;
-                let list_w = want.max(60).min(main_area.width);
+                let list_w = side_list_width(main_area.width, self.config.list_width_pct);
                 let rest = main_area.width - list_w;
                 if rest >= 32 {
                     let [l, r] =
@@ -1300,31 +1298,17 @@ impl App {
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
-        // Drop the wide, least-essential columns first as the list narrows.
-        // Fixed columns take what they need (number, pin, status, the time
-        // column with its arrow); the name gets the rest up to 26; groups
-        // and the project only show while names keep a readable width.
-        const TAGS_W: u16 = 15;
-        // The Usage column, headed by its measure: "Tokens ▼" at most
-        // (fixed, so changing the measure moves nothing).
-        const USAGE_W: u16 = 8;
+        // Which columns fit, and how wide: `ListCols::for_width`.
+        let ListCols {
+            compact,
+            time_w,
+            name_w,
+            usage: show_usage,
+            tags_w,
+            project: show_project,
+        } = ListCols::for_width(area.width);
+        let show_tags = tags_w > 0;
         let sel_w = theme::SELECT_BAR.chars().count() as u16;
-        // borders + padding + highlight symbol + number, pin, status + 4 gaps
-        let base = 2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4;
-        // The time column's header names its sort; where even a 14-wide
-        // name wouldn't fit beside it, the short form.
-        let compact = area.width < base + 15 + 14;
-        let time_w: u16 = if compact { 10 } else { 15 };
-        let fixed = base + time_w;
-        let room = area.width.saturating_sub(fixed);
-        let show_tags = room >= TAGS_W + 2 + 18;
-        let room = if show_tags { room - TAGS_W - 2 } else { room };
-        // Usage goes before Groups as the list narrows (after the
-        // project): groups say what a session is, usage only how big.
-        let show_usage = show_tags && room >= USAGE_W + 2 + 18;
-        let room = if show_usage { room - USAGE_W - 2 } else { room };
-        let name_w = room.clamp(10, 26);
-        let show_project = room >= 26 + 2 + 12;
 
         // The sort shows on its column: an arrow (▲ ascending, ▼
         // descending; `reverse` flips it), and the time column shows the time
@@ -1382,11 +1366,12 @@ impl App {
         ];
         if show_usage {
             header.push(head(usage_label, arrow_on_usage, true));
-            widths.push(Constraint::Length(USAGE_W));
+            widths.push(Constraint::Length(list_cols::USAGE_W));
         }
         if show_tags {
-            header.push(Cell::from("Groups"));
-            widths.push(Constraint::Length(TAGS_W));
+            // (Squeezed to a count, `#3`, the header too.)
+            header.push(Cell::from(if tags_w >= 6 { "Groups" } else { "#" }));
+            widths.push(Constraint::Length(tags_w));
         }
         if show_project {
             header.push(Cell::from("Project"));
@@ -1494,11 +1479,11 @@ impl App {
                         Cell::from(if show_project {
                             String::new()
                         } else {
-                            fresh_short(&s["conversations"])
+                            fresh_short(&s["conversations"], tags_w as usize)
                         })
                         .fg(theme::faint_c())
                     } else {
-                        Cell::from(tags_cell(&tags, TAGS_W as usize))
+                        Cell::from(tags_cell(&tags, tags_w as usize))
                     });
                 }
                 if show_project {
@@ -2475,6 +2460,102 @@ fn edit_in_editor(
 /// many groups it is in ("3 groups", or just "3" when that doesn't fit
 /// either, "…" when not even that does), never a tag cut mid-word. All of
 /// them show in the details pane and the groups tab.
+/// The session list's column widths, shared by the list (what to draw) and
+/// the side layout (how much width the list needs).
+mod list_cols {
+    /// The Groups column at its widest; it shrinks to `TAGS_MIN` (room
+    /// for a count, `#12`) before a name gives up its readable width.
+    pub const TAGS_W: u16 = 15;
+    pub const TAGS_MIN: u16 = 4;
+    /// The Usage column, headed by its measure: "Tokens ▼" at most (fixed,
+    /// so changing the measure moves nothing).
+    pub const USAGE_W: u16 = 8;
+    /// The narrowest a name gets (its agent marker and a few letters).
+    pub const NAME_MIN: u16 = 10;
+    /// A readable name: Groups show only while names get this much, and
+    /// the side layout lends the list width to reach it.
+    pub const NAME_OK: u16 = 18;
+    /// The widest a name column gets.
+    pub const NAME_MAX: u16 = 26;
+    /// The time column: its full header ("Last message ▼"), or the short
+    /// one ("Message ▼").
+    pub const TIME_W: u16 = 15;
+    pub const TIME_W_COMPACT: u16 = 10;
+    /// Everything but the name, Usage and the time column: borders and
+    /// padding, the highlight symbol, number, pin, status, 4 gaps.
+    pub fn base() -> u16 {
+        let sel_w = crate::theme::SELECT_BAR.chars().count() as u16;
+        2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4
+    }
+    /// What the list needs to show a readable name, Status, the full time
+    /// column and Usage: the side layout widens the list to this when its
+    /// configured share falls short.
+    pub fn core_width() -> u16 {
+        base() + TIME_W + NAME_OK + USAGE_W + 2
+    }
+}
+
+/// Which list columns show at a width, and how wide. Usage comes first
+/// after the fixed columns, then a readable name, then Groups, then the
+/// rest of the name, then Project. As the list narrows the least
+/// essential go first: Project, then the name back to readable, then
+/// Groups shrinks (full tags, then `#N`) and goes, then the name shrinks
+/// to its minimum (the time header shortens on the way), and Usage goes
+/// last, only once a name would get less than its minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListCols {
+    compact: bool,
+    time_w: u16,
+    name_w: u16,
+    usage: bool,
+    /// The Groups column's width (0: not shown).
+    tags_w: u16,
+    project: bool,
+}
+
+impl ListCols {
+    fn for_width(width: u16) -> Self {
+        use list_cols::*;
+        let base = base();
+        // The time column's header names its sort; where a 14-wide name
+        // wouldn't fit beside it and Usage, the short form.
+        let compact = width < base + TIME_W + 14 + USAGE_W + 2;
+        let time_w = if compact { TIME_W_COMPACT } else { TIME_W };
+        let room = width.saturating_sub(base + time_w);
+        let usage = room >= USAGE_W + 2 + NAME_MIN;
+        let room = if usage { room - USAGE_W - 2 } else { room };
+        let tags_w = if room >= NAME_OK + 2 + TAGS_MIN {
+            (room - NAME_OK - 2).min(TAGS_W)
+        } else {
+            0
+        };
+        let room = if tags_w > 0 { room - tags_w - 2 } else { room };
+        let name_w = room.clamp(NAME_MIN, NAME_MAX);
+        let project = room >= NAME_MAX + 2 + 12;
+        ListCols {
+            compact,
+            time_w,
+            name_w,
+            usage,
+            tags_w,
+            project,
+        }
+    }
+}
+
+/// The list's width in the side layout. Its configured share
+/// (`list_width_pct`) first, never under 60; where that's too narrow for
+/// the core columns (`list_cols::core_width`), it borrows from the
+/// preview up to that, leaving the preview at least 40 columns or 30%.
+/// It never takes less than the configured share gives.
+fn side_list_width(total: u16, list_width_pct: u16) -> u16 {
+    let pct = list_width_pct.clamp(20, 80) as u32;
+    let want = ((total as u32 * pct / 100) as u16).max(60).min(total);
+    let right_min = 40u16.max((total as u32 * 30 / 100) as u16);
+    let cap = total.saturating_sub(right_min);
+    want.max(list_cols::core_width().min(cap))
+}
+
 fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
     // `#a #b`: a `#` each, a space between.
@@ -2483,12 +2564,9 @@ fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
     if need <= width {
         return Line::from(theme::tag_spans(tags.iter().copied()));
     }
-    let n = tags.len();
-    let count = match n {
-        1 => "1 group".to_string(),
-        n => format!("{n} groups"),
-    };
-    let text = [count, n.to_string(), "…".to_string()]
+    // Too many to list: how many, as a tag would read (`#3`), dim so it
+    // isn't taken for a tag of its own.
+    let text = [format!("#{}", tags.len()), "…".to_string()]
         .into_iter()
         .find(|t| t.width() <= width)
         .unwrap_or_default();
@@ -2496,10 +2574,23 @@ fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
 }
 
 /// The overlord's conversation in a narrow column: "fresh 2h · 14" (when
-/// it started, how many came before); empty when it has never restarted.
-fn fresh_short(c: &Value) -> String {
+/// it started, how many came before), or as short as the column needs
+/// (`↻2h · 14`, `↻2h`); empty when it has never restarted. The details
+/// card has it in full.
+fn fresh_short(c: &Value, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
     match c["earlier"].as_u64() {
-        Some(n) if n > 0 => format!("fresh {} · {n}", rel_age(c["fresh_at"].as_i64())),
+        Some(n) if n > 0 => {
+            let age = rel_age(c["fresh_at"].as_i64());
+            [
+                format!("fresh {age} · {n}"),
+                format!("↻{age} · {n}"),
+                format!("↻{age}"),
+            ]
+            .into_iter()
+            .find(|t| t.width() <= width)
+            .unwrap_or_default()
+        }
         _ => String::new(),
     }
 }
@@ -3051,11 +3142,14 @@ mod tests {
         assert_eq!(text(&["web", "wip"]), "#web #wip");
         // Exactly the column's width still fits.
         assert_eq!(text(&["release", "tools"]), "#release #tools");
-        // Too wide: how many, not "#release #tooli".
-        assert_eq!(text(&["release", "tooling"]), "2 groups");
-        assert_eq!(text(&["release", "tooling", "wip"]), "3 groups");
-        assert_eq!(text(&["a-very-long-group-name"]), "1 group");
-        // A column too narrow for the count's words: the number, then "…".
+        // Too wide: how many, as a tag reads (`#2`), not "#release #tooli".
+        assert_eq!(text(&["release", "tooling"]), "#2");
+        assert_eq!(text(&["release", "tooling", "wip"]), "#3");
+        assert_eq!(text(&["a-very-long-group-name"]), "#1");
+        // The count is dim, not a tag's colour.
+        let cell = tags_cell(&["release", "tooling"], 15);
+        assert_eq!(cell.spans[0].style, theme::muted());
+        // Squeezed: the count fits 3 cells (4 for 10 or more), then "…".
         let narrow = |tags: &[&str], w| -> String {
             tags_cell(tags, w)
                 .spans
@@ -3063,12 +3157,17 @@ mod tests {
                 .map(|s| s.content.to_string())
                 .collect()
         };
-        assert_eq!(narrow(&["release", "tooling"], 5), "2");
+        assert_eq!(narrow(&["release", "tooling"], 3), "#2");
+        assert_eq!(narrow(&["a"; 12], 4), "#12");
         assert_eq!(narrow(&["a"; 12], 1), "…");
         assert_eq!(narrow(&["release"], 0), "");
-        assert_eq!(fresh_short(&json!({"earlier": 0})), "");
+        // The overlord's conversation: in full where it fits, then short.
+        assert_eq!(fresh_short(&json!({"earlier": 0}), 15), "");
         let c = json!({"earlier": 3, "fresh_at": rlord_core::types::now_ms() - 7_200_000});
-        assert_eq!(fresh_short(&c), "fresh 2h · 3");
+        assert_eq!(fresh_short(&c, 15), "fresh 2h · 3");
+        assert_eq!(fresh_short(&c, 8), "↻2h · 3");
+        assert_eq!(fresh_short(&c, 4), "↻2h");
+        assert_eq!(fresh_short(&c, 2), "");
     }
 
     /// `x` (and so the menu and the launcher, which run the same action)

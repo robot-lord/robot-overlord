@@ -191,8 +191,12 @@ shows, so nothing jumps. Clicking its header sorts by it (again: reverses);
 the usage sort is a sort like the others, by whichever measure the column
 shows (sorted by context, the header shortens to `Ctx % ▼`; the values
 stay put). The details
-card always has all three. In a narrow list the Usage column goes before
-Groups does.
+card always has all three.
+
+As the list narrows, its columns give way in this order: Project first,
+then Groups (shrinking to a count, `#3`, before it goes), then names
+shrink to their minimum (the time column's header shortens on the way),
+and Usage only at the smallest widths.
 
 Headers that can change read in a quieter blue: the time column (it
 follows the sort) and the Usage column (it follows `U`). The one the list
@@ -342,6 +346,11 @@ a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
 free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
 `rlord show <ref>` prints the same card. The list always wins on space: it
 keeps its width and the preview drops out first when the terminal is narrow.
+Where its `list_width_pct` share is too narrow for a readable name, Status,
+the time column and Usage, the list borrows that much from the preview,
+leaving the preview at least 40 columns or 30% of the width. It never takes
+less than its share. With the default 50%, Usage shows at any usable
+width, and beside a readable name from about 120 columns.
 
 **Sub-agents** are tracked from outside the pane: Claude Code's `SubagentStart`
 / `SubagentStop` hooks plus the per-agent `meta.json` and transcript Claude
@@ -496,8 +505,12 @@ in the config).
   sort and live/archived, with the keys that change them.
 - **Editing tags:** `#` edits the selected session's tags (space-separated).
 - **The list's Groups column** shows a session's tags when they fit, else
-  how many groups it is in ("3 groups"); the details pane and the groups
-  tab always show them all.
+  how many groups it is in, dimmed (`#3`); the details pane and the groups
+  tab always show them all. It's at most 15 cells wide, and only gets
+  width the Usage column and a readable name don't need; squeezed, it
+  shrinks to the count before names do. On the overlord's row the same
+  column says when its conversation started fresh, shortened to `↻2h`
+  when narrow (the details pane has it in full).
 - **The overlord** is expected to do most of the organizing:
   - `organize` tags, renames and describes many sessions in one call;
   - `list_groups` lists groups and counts;
