@@ -204,8 +204,8 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         &d.config.overlord.width,
         &d.config.overlord.height,
         &title,
-        &format!("fg={}", crate::overlord::color(&d.config)),
-        &crate::overlord::overlay_style(&d.config),
+        &format!("fg={}", crate::overlord::seat_color(&d.config, seat)),
+        &crate::overlord::overlay_style(&d.config, seat),
         &cmd,
     )?;
     *d.overlay.lock().expect("ui mutex") = Some((client, token));

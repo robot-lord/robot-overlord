@@ -208,6 +208,9 @@ fn tmux_cmd() -> Command {
     // means; anywhere else it would point at the user's own tmux.
     if !inside_rlord() {
         c.env_remove("TMUX");
+        // A pane id from another server: never let it reach rlord's server
+        // (a server started from here would keep it in its environment).
+        c.env_remove("TMUX_PANE");
     }
     c.args(["-L", &socket_name(), "-f"]);
     c.arg(conf_path());
@@ -571,6 +574,56 @@ pub struct PaneFrame {
     pub cursor_x: u16,
     pub cursor_y: u16,
     pub cursor_visible: bool,
+    /// The pane is in a mode (copy mode): the screen and cursor are the
+    /// mode's.
+    pub in_mode: bool,
+    /// Copy mode's selection, in its history-line coordinates
+    /// `[start_x, start_y, end_x, end_y]` (tmux doesn't draw it into a
+    /// capture): see `screen_selection`.
+    pub selection: Option<[i64; 4]>,
+    /// Copy mode's scroll position, the pane's live history size and its
+    /// height.
+    pub scroll: i64,
+    pub history: i64,
+    pub height: i64,
+}
+
+/// The pane's history size now (copy mode works on a snapshot of it taken
+/// when the mode begins: record it then, see `screen_selection`).
+pub fn history_size(pane: &str) -> Option<i64> {
+    run(&["display-message", "-p", "-t", pane, "#{history_size}"])
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// The selection on screen, ends inclusive and in reading order:
+/// ((col, row), (col, row)). Copy mode numbers lines in the snapshot it took
+/// on entry, whose history size was `history_at_entry`: screen row 0 shows
+/// line `history_at_entry - scroll`. (The live history size moves while the
+/// agent prints; the snapshot doesn't.)
+pub fn screen_selection(
+    sel: [i64; 4],
+    history_at_entry: i64,
+    scroll: i64,
+    h: i64,
+) -> Option<((u16, u16), (u16, u16))> {
+    let [sx, sy, ex, ey] = sel;
+    let top = history_at_entry - scroll; // history line shown on screen row 0
+    let a = (sy - top, sx);
+    let b = (ey - top, ex);
+    let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+    if r1 < 0 || r0 >= h {
+        return None;
+    }
+    // Clipped to the screen: a part above starts at the top-left.
+    let (r0, c0) = if r0 < 0 { (0, 0) } else { (r0, c0) };
+    let (r1, c1) = if r1 >= h {
+        (h - 1, i64::from(u16::MAX))
+    } else {
+        (r1, c1)
+    };
+    let u = |v: i64| v.clamp(0, i64::from(u16::MAX)) as u16;
+    Some(((u(c0), u(r0)), (u(c1), u(r1))))
 }
 
 pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
@@ -581,11 +634,19 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
             "-p",
             "-t",
             pane,
-            "#{cursor_x} #{cursor_y} #{cursor_flag}",
+            // In copy mode: its cursor, and (-M) its screen with the
+            // selection.
+            "#{?pane_in_mode,#{copy_cursor_x},#{cursor_x}} \
+             #{?pane_in_mode,#{copy_cursor_y},#{cursor_y}} \
+             #{?pane_in_mode,1,#{cursor_flag}} #{pane_in_mode} \
+             #{?selection_present,#{selection_start_x}#,#{selection_start_y}#,\
+             #{selection_end_x}#,#{selection_end_y},-} \
+             #{?pane_in_mode,#{scroll_position},0} #{history_size} #{pane_height}",
             ";",
             "capture-pane",
             "-p",
             "-e",
+            "-M",
             "-t",
             pane,
         ])
@@ -599,15 +660,89 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let (head, ansi) = text.split_once('\n').unwrap_or((&text, ""));
-    let mut f = head
-        .split_whitespace()
-        .map(|v| v.parse::<u16>().unwrap_or(0));
+    let fields: Vec<&str> = head.split_whitespace().collect();
+    let num = |i: usize| -> i64 { fields.get(i).and_then(|v| v.parse().ok()).unwrap_or(0) };
+    let mut f = fields.iter().map(|v| v.parse::<u16>().unwrap_or(0));
     Ok(PaneFrame {
         cursor_x: f.next().unwrap_or(0),
         cursor_y: f.next().unwrap_or(0),
         cursor_visible: f.next().unwrap_or(0) == 1,
+        in_mode: f.next().unwrap_or(0) == 1,
+        selection: fields.get(4).and_then(|f| {
+            let n: Vec<i64> = f
+                .split(',')
+                .map(|v| v.parse().ok())
+                .collect::<Option<_>>()?;
+            n.try_into().ok()
+        }),
+        scroll: num(5),
+        history: num(6),
+        height: num(7),
         ansi: ansi.to_string(),
     })
+}
+
+/// Leave copy mode (or any mode) if the pane is in one.
+pub fn cancel_mode(pane: &str) -> Result<()> {
+    let cmd = format!("send-keys -t {pane} -X cancel");
+    run(&["if-shell", "-F", "-t", pane, "#{pane_in_mode}", &cmd])?;
+    Ok(())
+}
+
+/// Run a copy-mode command on a pane (`search-backward`, `jump-forward`, …).
+pub fn copy_command(pane: &str, cmd: &str, arg: &str) -> Result<()> {
+    run(&["send-keys", "-t", pane, "-X", cmd, "--", arg])?;
+    Ok(())
+}
+
+/// The newest paste buffer's name, if any (rlord's own `rlord_…` buffers,
+/// used for pasting into panes, aren't the user's).
+pub fn newest_buffer() -> Option<String> {
+    run(&["list-buffers", "-F", "#{buffer_name}"])
+        .ok()
+        .and_then(|o| {
+            o.lines()
+                .find(|n| !n.starts_with("rlord_"))
+                .map(str::to_string)
+        })
+}
+
+/// A paste buffer's contents, exactly (whitespace kept).
+pub fn buffer_text(name: &str) -> Result<String> {
+    let out = tmux_cmd()
+        .args(["show-buffer", "-b", name])
+        .output()
+        .context("running tmux")?;
+    if !out.status.success() {
+        bail!("tmux show-buffer failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Put a pane in copy mode (no-op if it already is).
+pub fn copy_mode(pane: &str) -> Result<()> {
+    run(&["copy-mode", "-t", pane])?;
+    Ok(())
+}
+
+/// Scroll a pane's history a few lines: up enters copy mode (leaving it at
+/// the bottom, `-e`), as tmux's wheel binding does; down only in the mode.
+pub fn scroll(pane: &str, up: bool) -> Result<()> {
+    if up {
+        run(&["copy-mode", "-e", "-t", pane])?;
+    }
+    let dir = if up { "scroll-up" } else { "scroll-down" };
+    run(&["send-keys", "-t", pane, "-X", "-N", "3", dir])?;
+    Ok(())
+}
+
+/// A session option's value (`prefix`, …), as the session sees it
+/// (inherited from the global value when not set on it: `-A`).
+pub fn session_option(session: &str, name: &str) -> Result<String> {
+    // (show-options takes the plain name: `=name` isn't accepted there.)
+    Ok(run(&["show-options", "-Aqv", "-t", session, name])?
+        .trim()
+        .to_string())
 }
 
 /// Send tmux key names (`Enter`, `C-c`, `M-x`, `Up`, …) to a pane.
@@ -993,9 +1128,22 @@ pub fn current_session() -> Option<String> {
     if !inside_rlord() {
         return None;
     }
-    run(&["display-message", "-p", "#{session_name}"])
-        .ok()
-        .filter(|s| !s.is_empty())
+    // This process's own pane ($TMUX_PANE), not whatever the active client
+    // shows: a TUI restarted by `rlord reset` while the terminal is on an
+    // agent session must still record its own session as home.
+    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+    let own = pane.as_deref().and_then(|p| {
+        run(&["display-message", "-p", "-t", p, "#{session_name}"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    // No pane, or a stale one (a key binding's job can inherit an id that
+    // isn't on this server): the current client's session, as before.
+    own.or_else(|| {
+        run(&["display-message", "-p", "#{session_name}"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// Flash a message on the current client's status line.
@@ -1016,6 +1164,28 @@ pub fn detach_client() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn selection_maps_history_lines_to_the_screen() {
+        // Snapshot of 191 history lines, at the bottom, 10 rows: line 200 is
+        // row 9, whichever end the cursor is on.
+        assert_eq!(
+            screen_selection([0, 200, 2, 198], 191, 0, 10),
+            Some(((2, 7), (0, 9)))
+        );
+        assert_eq!(
+            screen_selection([2, 198, 0, 200], 191, 0, 10),
+            Some(((2, 7), (0, 9)))
+        );
+        // Scrolled up 1: a row lower, the end clipped to the last row.
+        assert_eq!(
+            screen_selection([0, 200, 2, 198], 191, 1, 10),
+            Some(((2, 8), (u16::MAX, 9)))
+        );
+        // Scrolled up 5: all below the screen.
+        assert_eq!(screen_selection([0, 200, 2, 198], 191, 5, 10), None);
+    }
+
     use super::*;
 
     #[test]

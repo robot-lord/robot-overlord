@@ -40,6 +40,11 @@ macro_rules! colors {
 }
 colors!(surface, chip, border, text, on_accent, accent, overlord, green, yellow, red, cyan);
 
+/// The mastermind's own colour (the overlord's is `overlord()`).
+pub fn mastermind() -> Color {
+    color(palette().seat("mastermind"))
+}
+
 pub fn faint_c() -> Color {
     color(palette().faint)
 }
