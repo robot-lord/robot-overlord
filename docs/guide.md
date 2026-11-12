@@ -6,6 +6,7 @@ Mac way (Option-O); on Linux that's Alt-O. Every key can be changed (`:keys`,
 or ask the overlord).
 
 Contents: [The overlord](#the-overlord) · [Creating sessions](#creating-sessions) ·
+[Codex sessions](#codex-sessions) · [OpenCode sessions](#opencode-sessions) ·
 [The right-hand side](#the-right-hand-side-preview--details) ·
 [Bringing in existing sessions](#bringing-in-existing-sessions) ·
 [Archived sessions and past work](#archived-sessions-and-past-work) ·
@@ -568,9 +569,10 @@ the effective values): the layout (`side` — list left, live preview right — 
 `stack`), the preview refresh rate, every TUI key under `[keys]`, and the tmux
 bindings under `[tmux]` (set one to `""` to disable it).
 
-Sessions survive reboots: the minted Claude session id lives in SQLite, so
-`rlord restart` brings the conversation back via `claude --resume` even
-after the tmux server is gone.
+Sessions survive reboots: each session's agent conversation id lives in
+SQLite, so `rlord restart` brings the conversation back through the agent's
+own resume (`claude --resume`, `codex resume`, OpenCode's `-s`) even after
+the tmux server is gone.
 
 ## Updating
 

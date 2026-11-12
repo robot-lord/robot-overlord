@@ -61,10 +61,14 @@ EOF
 # shellcheck disable=SC1091
 source "$d/env.sh"
 
+# list_width_pct: wide enough for the Usage column beside Groups in the
+# screenshots (scripts/demo/screenshots.sh's terminal).
 cat > "$d/config/robot-overlord/config.toml" <<'EOF'
+list_width_pct = 62
+
 [overlord]
 model = "opus"
-effort = "low"
+effort = "medium"
 EOF
 
 B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
@@ -179,16 +183,13 @@ mkdir -p "$d/src/$name"
 printf idle > "$d/states/$name"
 printf '%s\n' "27 132000" > "$d/usage/$name"
 printf '%s\n' "● Migrated the indexer to the new queue." > "$d/screens/$name.txt"
+# One line per paragraph: the pane wraps them to its width.
 cat > "$d/summaries/$name.txt" <<'EOF'
-Moved the search indexer from cron batches to the event queue, so new
-listings are searchable within seconds instead of every 15 minutes.
+Moved the search indexer from cron batches to the event queue, so new listings are searchable within seconds instead of every 15 minutes.
 
-Done: queue consumer (src/indexer/consumer.rs), backfill command
-(`indexer backfill --since`), dashboards for lag. The old cron job is
-disabled but not deleted.
+Done: queue consumer (src/indexer/consumer.rs), backfill command (`indexer backfill --since`), dashboards for lag. The old cron job is disabled but not deleted.
 
-Left: delete the cron job and its IAM role once a week of lag stays under
-5s; the backfill still loads everything into memory for large tenants.
+Left: delete the cron job and its IAM role once a week of lag stays under 5s; the backfill still loads everything into memory for large tenants.
 EOF
 rlord new --project "$d/src/$name" --name "$name" "Move the search indexer onto the event queue" >/dev/null
 rlord tag "$name" search >/dev/null
