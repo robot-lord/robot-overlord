@@ -43,5 +43,5 @@ case ":$PATH:" in
   *) echo "note: $dest_dir is not on your PATH" ;;
 esac
 if [[ ! -f "$HOME/.claude/settings.json" ]] || ! grep -q "rlord hook" "$HOME/.claude/settings.json" 2>/dev/null; then
-  echo "first install? run: $dest claude install-hooks"
+  echo "first install? run: $dest install-hooks"
 fi

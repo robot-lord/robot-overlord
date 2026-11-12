@@ -7,10 +7,12 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{bail, Result};
+use serde_json::Value;
 
-use crate::types::Status;
+use super::transcript::{transcript_stats, Title, Usage};
+use super::Effect;
+use crate::types::{Status, Subagent};
 
 pub fn mint_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -101,240 +103,82 @@ pub fn resume_argv(
     Ok(argv)
 }
 
-/// Map a Claude hook event to (event kind for our log, optional new status).
-pub fn map_hook_event(event: &str) -> (&'static str, Option<Status>) {
+/// Map a Claude hook event to (event kind for our log, what it does to the
+/// status).
+///
+/// "Needs you" (blocked mid-turn on the user) comes from a permission
+/// request, a question (`AskUserQuestion`, seen as its PreToolUse), or a
+/// notification that says so; it ends when the agent moves on (a tool
+/// finished or failed, an elicitation answered). The idle notification
+/// Claude sends a minute after a turn ends is not that: the session is
+/// already "your turn".
+pub fn map_hook_event(event: &str, payload: &Value) -> (&'static str, Effect) {
+    use Effect::{Nothing, Resume, Set};
     match event {
-        "SessionStart" => ("session_start", Some(Status::Idle)),
-        "UserPromptSubmit" => ("prompt_submitted", Some(Status::Working)),
-        "Stop" => ("agent_stopped", Some(Status::Idle)),
-        "Notification" => ("notification", Some(Status::WaitingInput)),
-        "SessionEnd" => ("session_end", Some(Status::Stopped)),
-        "PreCompact" => ("pre_compact", None),
-        "SubagentStart" => ("subagent_started", None),
-        "SubagentStop" => ("subagent_stopped", None),
-        _ => ("hook_other", None),
+        "SessionStart" => ("session_start", Set(Status::Idle)),
+        "UserPromptSubmit" => ("prompt_submitted", Set(Status::Working)),
+        "Stop" => ("agent_stopped", Set(Status::Idle)),
+        "PermissionRequest" => ("permission_request", Set(Status::WaitingInput)),
+        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
+            ("question_asked", Set(Status::WaitingInput))
+        }
+        "PreToolUse" => ("tool", Nothing),
+        "PostToolUse" | "PostToolUseFailure" => ("tool", Resume),
+        "Notification" => ("notification", notification_effect(payload)),
+        "SessionEnd" => ("session_end", Set(Status::Stopped)),
+        "PreCompact" => ("pre_compact", Nothing),
+        "SubagentStart" => ("subagent_started", Nothing),
+        "SubagentStop" => ("subagent_stopped", Nothing),
+        _ => ("hook_other", Nothing),
     }
 }
 
-const HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "UserPromptSubmit",
-    "Stop",
-    "Notification",
-    "SessionEnd",
-    "PreCompact",
-    "SubagentStart",
-    "SubagentStop",
-];
-
-/// Merge our hook command into Claude's settings.json, preserving everything
-/// already there (including other tools' hooks). Idempotent. Returns true if
-/// the file was modified.
-pub fn install_hooks(settings_path: &Path, hook_cmd: &str) -> Result<bool> {
-    let mut root: Value = match std::fs::read_to_string(settings_path) {
-        Ok(s) if !s.trim().is_empty() => {
-            serde_json::from_str(&s).context("parsing existing settings.json")?
-        }
-        _ => json!({}),
-    };
-    if !root.is_object() {
-        bail!("settings.json is not a JSON object; refusing to modify");
-    }
-    let hooks = root
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
-        bail!("settings.json 'hooks' is not an object; refusing to modify");
-    }
-    let mut changed = false;
-    for event in HOOK_EVENTS {
-        let arr = hooks
-            .as_object_mut()
-            .unwrap()
-            .entry(*event)
-            .or_insert_with(|| json!([]));
-        if !arr.is_array() {
-            bail!("settings.json hooks.{event} is not an array; refusing to modify");
-        }
-        // Our entry is any command of the form `<path> hook emit ...` from a
-        // current or former binary name. If it exists with a stale path
-        // (moved/renamed binary), fix it in place; otherwise append.
-        // ("overlord", the pre-rename binary, also contains "rlord".)
-        let is_ours = |h: &Value| {
-            h["command"]
-                .as_str()
-                .is_some_and(|c| c.contains("hook emit") && c.contains("rlord"))
-        };
-        let mut found = false;
-        for entry in arr.as_array_mut().unwrap().iter_mut() {
-            if let Some(hs) = entry["hooks"].as_array_mut() {
-                for h in hs.iter_mut() {
-                    if is_ours(h) {
-                        found = true;
-                        if h["command"].as_str() != Some(hook_cmd) {
-                            h["command"] = json!(hook_cmd);
-                            changed = true;
-                        }
-                    }
-                }
+/// What a notification means, from its `notification_type` (older Claude
+/// Code sends none: then from its message).
+fn notification_effect(payload: &Value) -> Effect {
+    match payload["notification_type"].as_str() {
+        // (agent_needs_input: a background session of this one waits on
+        // the user.)
+        Some(
+            "permission_prompt"
+            | "elicitation_dialog"
+            | "elicitation_url_dialog"
+            | "agent_needs_input",
+        ) => Effect::Set(Status::WaitingInput),
+        Some("elicitation_complete" | "elicitation_response") => Effect::Resume,
+        // idle_prompt, auth, quota, agent view, plugins: not this session
+        // blocked on the user.
+        Some(_) => Effect::Nothing,
+        None => {
+            let m = payload["message"].as_str().unwrap_or("").to_lowercase();
+            if m.contains("permission") || m.contains("approval") {
+                Effect::Set(Status::WaitingInput)
+            } else {
+                Effect::Nothing
             }
         }
-        if !found {
-            arr.as_array_mut()
-                .unwrap()
-                .push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
-            changed = true;
-        }
-    }
-    if changed {
-        if let Some(dir) = settings_path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let backup = settings_path.with_extension("json.pre-rlord.bak");
-        if settings_path.exists() && !backup.exists() {
-            std::fs::copy(settings_path, &backup)?;
-        }
-        let tmp = settings_path.with_extension("json.rlord-tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&root)? + "\n")?;
-        std::fs::rename(&tmp, settings_path)?;
-    }
-    Ok(changed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slug_matches_observed_claude_encoding() {
-        assert_eq!(
-            project_slug("/home/alice/src/myapp"),
-            "-home-alice-src-myapp"
-        );
-        assert_eq!(
-            project_slug("/home/alice/src/myapp/.worktrees/feature/x"),
-            "-home-alice-src-myapp--worktrees-feature-x"
-        );
-    }
-
-    #[test]
-    fn launch_and_resume_argv() {
-        let argv = launch_argv("u-1", Some("hello"), None, &[]);
-        assert_eq!(argv, ["claude", "--session-id", "u-1", "hello"]);
-        let argv = launch_argv("u-1", None, Some("opus"), &[]);
-        assert_eq!(argv, ["claude", "--session-id", "u-1", "--model", "opus"]);
-        // No transcript on disk for this fake id → re-declare, don't resume.
-        let argv = resume_argv(
-            "00000000-0000-0000-0000-000000000000",
-            "minted",
-            "/nonexistent",
-            None,
-            &["--strict-mcp-config".to_string()],
-        )
-        .unwrap();
-        assert_eq!(argv[1], "--session-id");
-        assert_eq!(argv.last().unwrap(), "--strict-mcp-config");
-        assert!(resume_argv("u-1", "scavenged", "/tmp", None, &[]).is_err());
-    }
-
-    #[test]
-    fn hook_install_is_idempotent_and_preserving() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"other-tool hook-handler"}]}]}}"#,
-        )
-        .unwrap();
-        assert!(install_hooks(&path, "/bin/rlord hook emit claude").unwrap());
-        assert!(!install_hooks(&path, "/bin/rlord hook emit claude").unwrap());
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v["model"], "opus"); // untouched
-        let stop = v["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2); // the other tool's entry preserved, ours appended
-        assert!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len() == 1);
-        assert!(path.with_extension("json.pre-rlord.bak").exists());
     }
 }
 
-// ---- sub-agents on disk ----
+/// (event, matcher): the events rlord's hook is installed for. The tool
+/// events fire on every tool call (the handler does nothing unless the
+/// session's status changes); PreToolUse only for the question tool.
+pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("Stop", None),
+    ("Notification", None),
+    ("PermissionRequest", None),
+    ("PreToolUse", Some("AskUserQuestion")),
+    ("PostToolUse", None),
+    ("PostToolUseFailure", None),
+    ("SessionEnd", None),
+    ("PreCompact", None),
+    ("SubagentStart", None),
+    ("SubagentStop", None),
+];
 
-use crate::types::Subagent;
-
-/// `<project dir>/<session uuid>/subagents/` for a session transcript path.
-pub fn subagents_dir(transcript_path: &str) -> PathBuf {
-    let p = Path::new(transcript_path);
-    let stem = p.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
-    p.with_file_name(stem).join("subagents")
-}
-
-/// Parse ISO-8601 `2026-10-27T17:03:44.498Z` to ms epoch (lenient).
-pub(crate) fn parse_iso_ms(s: &str) -> Option<i64> {
-    let (date, rest) = s.split_once('T')?;
-    let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    let time = rest.trim_end_matches('Z');
-    let mut t = time.split(':');
-    let h: i64 = t.next()?.parse().ok()?;
-    let mi: i64 = t.next()?.parse().ok()?;
-    let sec: f64 = t.next()?.parse().ok()?;
-    // days from civil (Howard Hinnant)
-    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * m2 + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + (sec * 1000.0) as i64)
-}
-
-/// What a session is about, read cheaply from its transcript (no AI): the
-/// prompt that started it, the latest real prompt, the latest reply text,
-/// and the title Claude gave the conversation. For the overlord's triage.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct Excerpts {
-    pub first_prompt: Option<String>,
-    pub last_prompt: Option<String>,
-    pub last_reply: Option<String>,
-    pub title: Option<String>,
-}
-
-/// Bytes read from each end of a transcript; they can be many MB.
-const EXCERPT_WINDOW: u64 = 256 * 1024;
-
-pub(crate) fn read_window(path: &Path, from_end: bool) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = if from_end {
-        len.saturating_sub(EXCERPT_WINDOW)
-    } else {
-        0
-    };
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.take(EXCERPT_WINDOW).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    // A tail window starts mid-line: drop the partial first line.
-    Some(if start > 0 {
-        text.split_once('\n')
-            .map(|(_, r)| r.to_string())
-            .unwrap_or_default()
-    } else {
-        text
-    })
-}
-
-pub fn clip(s: &str, max: usize) -> String {
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() <= max {
-        s
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
-}
+// ---- reading transcript lines (see `transcript::Line`) ----
 
 /// A prompt the human typed (not tool results, meta, summaries, or command
 /// wrappers like `<command-name>`).
@@ -360,7 +204,7 @@ pub(crate) fn human_prompt(v: &Value) -> Option<String> {
     (!t.is_empty() && !t.starts_with('<') && !t.starts_with("Caveat:")).then(|| t.to_string())
 }
 
-fn reply_text(v: &Value) -> Option<String> {
+pub(crate) fn reply_text(v: &Value) -> Option<String> {
     if v["type"] != "assistant" {
         return None;
     }
@@ -374,307 +218,159 @@ fn reply_text(v: &Value) -> Option<String> {
     (!t.trim().is_empty()).then_some(t)
 }
 
-pub fn transcript_excerpts(path: &Path) -> Excerpts {
-    let (head, tail) = read_head_tail(path);
-    excerpts_from(&head, &tail)
-}
-
-/// Parsed JSON lines from the start and the end of a transcript (each at
-/// most `EXCERPT_WINDOW` bytes; a small file is read once and used for both).
-pub fn read_head_tail(path: &Path) -> (Vec<Value>, Vec<Value>) {
-    let parse = |s: String| -> Vec<Value> {
-        s.lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect()
-    };
-    let head = read_window(path, false).map(parse).unwrap_or_default();
-    let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= EXCERPT_WINDOW);
-    let tail = if small {
-        head.clone()
-    } else {
-        read_window(path, true).map(parse).unwrap_or_default()
-    };
-    (head, tail)
-}
-
-pub(crate) fn excerpts_from(head: &[Value], tail: &[Value]) -> Excerpts {
-    let mut e = Excerpts {
-        first_prompt: head.iter().find_map(human_prompt).map(|t| clip(&t, 300)),
-        ..Default::default()
-    };
-    for v in tail.iter().rev() {
-        if e.last_prompt.is_none() {
-            e.last_prompt = human_prompt(v).map(|t| clip(&t, 300));
-        }
-        if e.last_reply.is_none() {
-            e.last_reply = reply_text(v).map(|t| clip(&t, 500));
-        }
-        // A title the user set wins over the one Claude generated.
-        if e.title.is_none() && v["type"] == "custom-title" {
-            e.title = v["customTitle"].as_str().map(str::to_string);
-        }
-        if e.last_prompt.is_some() && e.last_reply.is_some() && e.title.is_some() {
-            break;
-        }
+/// A message's text and who said it, from one transcript line. None for
+/// lines that aren't conversation (titles, snapshots, meta).
+pub(crate) fn message(v: &Value) -> Option<(&'static str, String)> {
+    if v["isMeta"] == true || v["isVisibleInTranscriptOnly"] == true {
+        return None;
     }
-    if e.title.is_none() {
-        e.title = tail
-            .iter()
-            .rev()
-            .filter(|v| v["type"] == "ai-title")
-            .find_map(|v| v["aiTitle"].as_str())
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| clip(t, 120));
-    }
-    // Long tool-heavy turns push the last typed prompt out of the tail
-    // window; Claude also records it in `last-prompt` entries.
-    if e.last_prompt.is_none() {
-        e.last_prompt = tail
-            .iter()
-            .rev()
-            .filter(|v| v["type"] == "last-prompt")
-            .find_map(|v| v["lastPrompt"].as_str())
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| clip(t, 300));
-    }
-    // One prompt so far: don't repeat it. Claude's `last-prompt` record may
-    // be a truncated copy ("…"), so a clipped one matches by prefix; an
-    // unclipped one must match exactly (a short "continue" is a new prompt).
-    if let (Some(l), Some(f)) = (&e.last_prompt, &e.first_prompt) {
-        let same = match l.strip_suffix('…') {
-            Some(clipped) => f.starts_with(clipped),
-            None => l == f,
-        };
-        if same {
-            e.last_prompt = None;
-        }
-    }
-    e
-}
-
-/// Token totals and time span from a sub-agent transcript.
-///
-/// Incremental: a running agent's transcript is polled again and again while
-/// it grows, so the totals so far and the offset read up to are kept per
-/// file, and each call parses only the bytes appended since. A trailing line
-/// without its newline counts once it parses as complete JSON. A file that
-/// was replaced (new inode) or shrank is read again from the start.
-pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    let (len, ino) = (meta.len(), meta.ino());
-    let modified = meta.modified().ok();
-    // Copy the cursor out: the (possibly large) read happens unlocked, so one
-    // slow file never holds up stats for another.
-    let mut c = {
-        let cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
-        cursors.get(path).cloned().unwrap_or_default()
-    };
-    let before = (c.ino, c.offset);
-    if c.ino != ino || len < c.offset {
-        c = StatsCursor {
-            ino,
-            ..Default::default()
-        };
-    }
-    if len > c.offset {
-        let mut f = std::fs::File::open(path).ok()?;
-        f.seek(SeekFrom::Start(c.offset)).ok()?;
-        let mut buf = Vec::with_capacity((len - c.offset) as usize);
-        f.take(len - c.offset).read_to_end(&mut buf).ok()?;
-        // Complete lines, plus a trailing one if it is already whole JSON
-        // (a final record may never get its newline).
-        let mut end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |e| e + 1);
-        let tail = &buf[end..];
-        if !tail.is_empty() && serde_json::from_slice::<Value>(tail).is_ok() {
-            end = buf.len();
-        }
-        for line in buf[..end].split(|&b| b == b'\n') {
-            let Ok(v) = serde_json::from_slice::<Value>(line) else {
-                continue;
-            };
-            if let Some(ts) = v["timestamp"].as_str().and_then(parse_iso_ms) {
-                c.first.get_or_insert(ts);
-                c.last = Some(ts);
-            }
-            if let Some(u) = v["message"]["usage"].as_object() {
-                c.input += u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
-                c.output += u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
-            }
-            // Done when the latest turn is a final reply (no tool call
-            // pending); a tool result or new prompt reopens it.
-            match v["type"].as_str() {
-                // Any final stop reason (end_turn, max_tokens, …); not a
-                // tool call, nor a partial message without one.
-                Some("assistant") => {
-                    c.ended = v["message"]["stop_reason"]
-                        .as_str()
-                        .is_some_and(|r| r != "tool_use")
+    let content = &v["message"]["content"];
+    match v["type"].as_str()? {
+        "user" => match content {
+            Value::String(s) => Some(("you", s.clone())),
+            Value::Array(a) => {
+                // Tool results come back as user lines.
+                let mut text = Vec::new();
+                let mut tool = false;
+                for x in a {
+                    match x["type"].as_str() {
+                        Some("text") => text.extend(x["text"].as_str().map(str::to_string)),
+                        Some("tool_result") => {
+                            tool = true;
+                            match &x["content"] {
+                                Value::String(s) => text.push(s.clone()),
+                                Value::Array(c) => text.extend(
+                                    c.iter()
+                                        .filter_map(|y| y["text"].as_str())
+                                        .map(str::to_string),
+                                ),
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                Some("user") => c.ended = false,
-                _ => {}
+                let t = text.join("\n");
+                (!t.trim().is_empty()).then_some((if tool { "tool" } else { "you" }, t))
             }
+            _ => None,
+        },
+        "assistant" => {
+            let a = content.as_array()?;
+            let mut text = Vec::new();
+            for x in a {
+                match x["type"].as_str() {
+                    Some("text") => text.extend(x["text"].as_str().map(str::to_string)),
+                    // What it ran: the tool and its main argument.
+                    Some("tool_use") => {
+                        let input = &x["input"];
+                        let arg = ["command", "file_path", "pattern", "url", "description"]
+                            .iter()
+                            .find_map(|k| input[*k].as_str())
+                            .unwrap_or("");
+                        text.push(format!("[{}] {arg}", x["name"].as_str().unwrap_or("tool")));
+                    }
+                    _ => {}
+                }
+            }
+            let t = text.join("\n");
+            (!t.trim().is_empty()).then_some(("agent", t))
         }
-        c.offset += end as u64;
-    }
-    let mut stats = c.stats();
-    stats.modified = modified;
-    c.used = std::time::Instant::now();
-    if (c.ino, c.offset) != before {
-        c.dirty = true;
-    }
-    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
-    cursors.insert(path.to_path_buf(), c);
-    // Bounded: forget the least recently used files past the cap.
-    if cursors.len() > STATS_CURSOR_CAP {
-        let mut by_age: Vec<(std::time::Instant, PathBuf)> =
-            cursors.iter().map(|(p, c)| (c.used, p.clone())).collect();
-        by_age.sort();
-        for (_, p) in by_age.into_iter().take(cursors.len() - STATS_CURSOR_CAP) {
-            cursors.remove(&p);
-        }
-    }
-    Some(stats)
-}
-
-/// What `transcript_stats` knows about a transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TranscriptStats {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub first: Option<i64>,
-    pub last: Option<i64>,
-    /// The latest turn is a final reply: the agent finished.
-    pub ended: bool,
-    /// When the file was last written.
-    pub modified: Option<std::time::SystemTime>,
-}
-
-/// How far `transcript_stats` has read a file, and the totals so far.
-#[derive(Clone)]
-struct StatsCursor {
-    /// Moved since last saved (`take_dirty_cursors`).
-    dirty: bool,
-    ended: bool,
-    ino: u64,
-    offset: u64,
-    input: i64,
-    output: i64,
-    first: Option<i64>,
-    last: Option<i64>,
-    used: std::time::Instant,
-}
-
-impl Default for StatsCursor {
-    fn default() -> Self {
-        StatsCursor {
-            dirty: false,
-            ended: false,
-            ino: 0,
-            offset: 0,
-            input: 0,
-            output: 0,
-            first: None,
-            last: None,
-            used: std::time::Instant::now(),
-        }
+        _ => None,
     }
 }
 
-impl StatsCursor {
-    fn stats(&self) -> TranscriptStats {
-        TranscriptStats {
-            input_tokens: self.input,
-            output_tokens: self.output,
-            first: self.first,
-            last: self.last,
-            ended: self.ended,
-            modified: None,
-        }
+pub(crate) fn title(v: &Value) -> Option<Title> {
+    match v["type"].as_str()? {
+        "custom-title" => v["customTitle"]
+            .as_str()
+            .map(|t| Title::User(t.to_string())),
+        "ai-title" => v["aiTitle"]
+            .as_str()
+            .map(|t| Title::Generated(t.to_string())),
+        _ => None,
     }
 }
 
-/// A transcript's read position and totals, as saved in the DB so a
-/// restarted daemon reads forward instead of from the start.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CursorState {
-    pub ino: u64,
-    pub offset: u64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub first: Option<i64>,
-    pub last: Option<i64>,
-    pub ended: bool,
+pub(crate) fn last_prompt(v: &Value) -> Option<&str> {
+    (v["type"] == "last-prompt")
+        .then(|| v["lastPrompt"].as_str())
+        .flatten()
 }
 
-/// Bump when `transcript_stats` counts differently: saved positions from an
-/// older version are dropped and their transcripts recounted.
-pub const STATS_PARSE_VERSION: i64 = 1;
+/// One request's usage; its context is everything it sent, cached or not.
+pub(crate) fn usage(v: &Value) -> Option<Usage> {
+    let u = v["message"]["usage"].as_object()?;
+    let n = |k: &str| u.get(k).and_then(Value::as_i64).unwrap_or(0);
+    Some(Usage {
+        input: n("input_tokens"),
+        output: n("output_tokens"),
+        context: [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+        .sum(),
+        cumulative: false,
+    })
+}
 
-/// How many saved positions are loaded at startup (the most recent).
-pub const STATS_CURSOR_SEED: usize = STATS_CURSOR_CAP;
+pub(crate) fn model(v: &Value) -> Option<&str> {
+    v["message"]["model"]
+        .as_str()
+        .filter(|m| m.starts_with("claude"))
+}
 
-/// Load saved positions (daemon start). Files already read this run keep
-/// their in-memory position.
-pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
-    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
-    for (path, st) in saved {
-        cursors.entry(path).or_insert_with(|| StatsCursor {
-            ino: st.ino,
-            offset: st.offset,
-            input: st.input_tokens,
-            output: st.output_tokens,
-            first: st.first,
-            last: st.last,
-            ended: st.ended,
-            ..Default::default()
-        });
+/// Any final stop reason (end_turn, max_tokens, …) ends the turn; not a
+/// tool call, nor a partial message without one. A user line (a prompt or
+/// a tool result) reopens it.
+pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
+    match v["type"].as_str()? {
+        "assistant" => Some(
+            v["message"]["stop_reason"]
+                .as_str()
+                .is_some_and(|r| r != "tool_use"),
+        ),
+        "user" => Some(false),
+        _ => None,
     }
 }
 
-/// Positions that moved since the last call, to save.
-pub fn take_dirty_cursors() -> Vec<(PathBuf, CursorState)> {
-    let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
-    cursors
-        .iter_mut()
-        .filter(|(_, c)| c.dirty)
-        .map(|(p, c)| {
-            c.dirty = false;
-            (
-                p.clone(),
-                CursorState {
-                    ino: c.ino,
-                    offset: c.offset,
-                    input_tokens: c.input,
-                    output_tokens: c.output,
-                    first: c.first,
-                    last: c.last,
-                    ended: c.ended,
-                },
-            )
-        })
-        .collect()
+// ---- archive summaries ----
+
+/// `claude -p` flags for a one-shot answer with no tools and nothing saved.
+/// `fork`: the conversation to read in full (a fork of it; the session is
+/// untouched) with the question as the prompt; without one the prompt
+/// arrives on stdin. The answer is JSON on stdout (`result`).
+pub fn summary_argv(model: &str, fork: Option<(&str, &str)>) -> Vec<String> {
+    let mut a: Vec<String> = ["claude", "-p", "--output-format", "json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    a.extend(["--no-session-persistence", "--tools", ""].map(String::from));
+    if !model.is_empty() {
+        a.extend(["--model".to_string(), model.to_string()]);
+    }
+    if let Some((id, ask)) = fork {
+        a.extend(["--resume", id, "--fork-session", ask].map(String::from));
+    }
+    a
 }
 
-/// Forget every position: the next reads start from the top (`--rescan`).
-pub fn clear_cursors() {
-    STATS_CURSORS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+// ---- sub-agents on disk ----
+
+/// `<project dir>/<session uuid>/subagents/` for a session transcript path.
+pub fn subagents_dir(transcript_path: &str) -> PathBuf {
+    let p = Path::new(transcript_path);
+    let stem = p.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
+    p.with_file_name(stem).join("subagents")
 }
 
 /// A sub-agent whose transcript hasn't been written for this long has
 /// stopped, whatever its meta file says.
 const AGENT_QUIET: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-
-/// Transcripts whose read position is remembered (most recently used).
-const STATS_CURSOR_CAP: usize = 1000;
-
-static STATS_CURSORS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, StatsCursor>>,
-> = std::sync::LazyLock::new(Default::default);
 
 /// Every sub-agent described by a `*.meta.json` in the session's subagents
 /// dir (the Agent tool writes one per real sub-agent; Claude's internal
@@ -753,114 +449,77 @@ pub fn scan_subagents_where(
 }
 
 #[cfg(test)]
-mod subagent_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn excerpts_skip_tool_results_and_wrappers() {
-        let dir = std::env::temp_dir().join(format!("rlord-excerpt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        let lines = [
-            json!({"type":"user","message":{"content":"<command-name>/clear</command-name>"}}),
-            json!({"type":"user","message":{"content":"fix the   flaky login test"}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use"}]}}),
-            json!({"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}),
-            json!({"type":"user","isCompactSummary":true,"message":{"content":"summary"}}),
-            json!({"type":"user","message":{"content":[{"type":"text","text":"now add a retry"}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Added retry."}]}}),
-            json!({"type":"custom-title","customTitle":"login-flake"}),
-        ];
-        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        std::fs::write(&p, body).unwrap();
-        let e = transcript_excerpts(&p);
-        assert_eq!(e.first_prompt.as_deref(), Some("fix the flaky login test"));
-        assert_eq!(e.last_prompt.as_deref(), Some("now add a retry"));
-        assert_eq!(e.last_reply.as_deref(), Some("Added retry."));
-        assert_eq!(e.title.as_deref(), Some("login-flake"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn iso_to_ms() {
-        assert_eq!(parse_iso_ms("1970-01-01T00:00:00.000Z"), Some(0));
+    fn slug_matches_observed_claude_encoding() {
         assert_eq!(
-            parse_iso_ms("2026-09-11T20:20:47.939Z"),
-            Some(1_789_158_047_939)
+            project_slug("/home/alice/src/myapp"),
+            "-home-alice-src-myapp"
+        );
+        assert_eq!(
+            project_slug("/home/alice/src/myapp/.worktrees/feature/x"),
+            "-home-alice-src-myapp--worktrees-feature-x"
         );
     }
 
     #[test]
-    fn transcript_stats_reads_only_what_was_appended() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("agent-x.jsonl");
-        let line = |ts: &str, i: i64| {
-            format!(
-                "{{\"timestamp\":\"2026-10-27T17:03:{ts}.000Z\",\"message\":{{\"usage\":{{\"input_tokens\":{i},\"output_tokens\":1}}}}}}\n"
-            )
-        };
-        std::fs::write(&p, line("00", 10)).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 10);
-        // Appended: a full line and half of the next.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        let next = line("05", 7);
-        write!(f, "{}{}", line("02", 5), &next[..10]).unwrap();
-        let st = transcript_stats(&p).unwrap();
+    fn launch_and_resume_argv() {
+        let argv = launch_argv("u-1", Some("hello"), None, &[]);
+        assert_eq!(argv, ["claude", "--session-id", "u-1", "hello"]);
+        let argv = launch_argv("u-1", None, Some("opus"), &[]);
+        assert_eq!(argv, ["claude", "--session-id", "u-1", "--model", "opus"]);
+        // No transcript on disk for this fake id → re-declare, don't resume.
+        let argv = resume_argv(
+            "00000000-0000-0000-0000-000000000000",
+            "minted",
+            "/nonexistent",
+            None,
+            &["--strict-mcp-config".to_string()],
+        )
+        .unwrap();
+        assert_eq!(argv[1], "--session-id");
+        assert_eq!(argv.last().unwrap(), "--strict-mcp-config");
+        assert!(resume_argv("u-1", "scavenged", "/tmp", None, &[]).is_err());
+    }
+
+    #[test]
+    fn needs_you_is_a_block_mid_turn_not_an_idle_reminder() {
+        use serde_json::json;
+        let note = |ty: &str| map_hook_event("Notification", &json!({"notification_type": ty})).1;
+        assert_eq!(note("permission_prompt"), Effect::Set(Status::WaitingInput));
         assert_eq!(
-            (st.input_tokens, st.output_tokens),
-            (15, 2),
-            "the half line isn't counted yet"
+            note("elicitation_dialog"),
+            Effect::Set(Status::WaitingInput)
         );
-        assert_eq!(st.last.unwrap() - st.first.unwrap(), 2_000);
-        write!(f, "{}", &next[10..]).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 22);
-        // Rewritten shorter: read again from the start.
-        std::fs::write(&p, line("00", 3)).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 3);
-        // A final record without its newline still counts, once.
-        let whole = line("09", 4);
-        write!(
-            std::fs::OpenOptions::new().append(true).open(&p).unwrap(),
-            "{}",
-            whole.trim_end()
-        )
-        .unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 7);
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 7);
-        assert!(!transcript_stats(&p).unwrap().ended);
-        // A final reply ends it; a later tool result reopens it.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        writeln!(f).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"stop_reason":"end_turn"}}}}"#
-        )
-        .unwrap();
-        assert!(transcript_stats(&p).unwrap().ended);
-        writeln!(f, r#"{{"type":"user","message":{{}}}}"#).unwrap();
-        assert!(!transcript_stats(&p).unwrap().ended);
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"stop_reason":"tool_use"}}}}"#
-        )
-        .unwrap();
-        assert!(!transcript_stats(&p).unwrap().ended);
-        writeln!(
-            f,
-            r#"{{"type":"assistant","message":{{"stop_reason":"max_tokens"}}}}"#
-        )
-        .unwrap();
-        assert!(transcript_stats(&p).unwrap().ended);
-        // Replaced by a different, longer file: start over.
-        let q = dir.path().join("other.jsonl");
-        std::fs::write(
-            &q,
-            format!("{}{}{}", line("00", 1), line("01", 1), line("02", 1)),
-        )
-        .unwrap();
-        std::fs::rename(&q, &p).unwrap();
-        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 3);
+        assert_eq!(note("agent_needs_input"), Effect::Set(Status::WaitingInput));
+        // A minute after the turn ended: still "your turn".
+        assert_eq!(note("idle_prompt"), Effect::Nothing);
+        assert_eq!(note("auth_success"), Effect::Nothing);
+        assert_eq!(note("elicitation_response"), Effect::Resume);
+        // Older Claude Code: no type, only the text.
+        let old = |m: &str| map_hook_event("Notification", &json!({"message": m})).1;
+        assert_eq!(
+            old("Claude needs your permission to use Bash"),
+            Effect::Set(Status::WaitingInput)
+        );
+        assert_eq!(old("Claude is waiting for your input"), Effect::Nothing);
+        // A question mid-turn blocks; any other tool starting doesn't.
+        let pre = |tool: &str| map_hook_event("PreToolUse", &json!({"tool_name": tool}));
+        assert_eq!(
+            pre("AskUserQuestion"),
+            ("question_asked", Effect::Set(Status::WaitingInput))
+        );
+        assert_eq!(pre("Bash").1, Effect::Nothing);
+        assert_eq!(
+            map_hook_event("PermissionRequest", &json!({})).1,
+            Effect::Set(Status::WaitingInput)
+        );
+        // The agent moved on.
+        for e in ["PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(map_hook_event(e, &json!({})), ("tool", Effect::Resume));
+        }
     }
 
     #[test]

@@ -31,6 +31,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::agents::remote::{self, Availability, Live};
+use rlord_core::agents::Agent;
 use rlord_core::db::{Db, SessionQuery};
 use rlord_core::tmux;
 use rlord_core::types::{Session, Status};
@@ -356,7 +357,7 @@ fn state_of(
         }
         _ if url.is_some() => ("on", None),
         (None, _) => ("off", None),
-        _ if s.agent != "claude" => (
+        _ if !has_remote_control(&s.agent) => (
             "unavailable",
             Some(format!("{} has no Remote Control", s.agent)),
         ),
@@ -460,6 +461,8 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
             return Ok(false);
         }
     }
+    // (Where the agent's command is: asked before the DB lock is taken.)
+    rlord_core::agents::install::warm();
     methods::session_restart(&d.db(), &json!({"ref": id}))?;
     d.changed();
     Ok(true)
@@ -558,6 +561,11 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         d.changed();
     }
     Ok(out)
+}
+
+/// Whether sessions of this agent can have Remote Control at all.
+fn has_remote_control(agent: &str) -> bool {
+    Agent::parse(agent).is_some_and(Agent::has_remote_control)
 }
 
 /// Start the keeper.
@@ -695,7 +703,7 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
             .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?,
     };
     if on {
-        if s.agent != "claude" {
+        if !has_remote_control(&s.agent) {
             bail!(
                 "Remote Control is a Claude Code feature; {} has none",
                 s.agent
@@ -880,7 +888,7 @@ pub fn offer(d: &Daemon) -> Value {
     let front = overlord::FRONT.session(&db).ok().flatten();
     // It lives on the mastermind.
     let on = db.kv_get(MASTERMIND_REMOTE).ok().flatten().as_deref() == Some("1");
-    let claude = front.as_ref().is_none_or(|f| f.agent == "claude");
+    let claude = front.as_ref().is_none_or(|f| has_remote_control(&f.agent));
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()

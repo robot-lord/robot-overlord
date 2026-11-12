@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use rlord_core::agents::{transcript, Agent};
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::themes;
@@ -371,7 +372,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     let ended = d
         .db()
         .transcript_source(&s.id)?
-        .and_then(|p| rlord_core::agents::claude::transcript_stats(std::path::Path::new(&p)))
+        .and_then(|p| rlord_core::agents::transcript::transcript_stats(std::path::Path::new(&p)))
         .is_some_and(|st| st.ended);
     if !ended {
         return Ok(());
@@ -390,6 +391,8 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     if overlay_on_it || attached {
         return Ok(());
     }
+    // (Where the agent's command is: asked before any lock is taken.)
+    rlord_core::agents::install::warm();
     {
         // No hand-off may paste into the pane while it's being replaced.
         let _send = d.mastermind_send.lock().expect("mastermind send lock");
@@ -429,7 +432,7 @@ fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<
     let Some(src) = d.db().transcript_source(&s.id)? else {
         return Ok(false);
     };
-    let ex = rlord_core::agents::claude::transcript_excerpts(std::path::Path::new(&src));
+    let ex = rlord_core::agents::transcript::transcript_excerpts(std::path::Path::new(&src));
     Ok(ex
         .last_reply
         .is_some_and(|r| r.trim_end_matches(['…', ' ', '*', '`']).ends_with('?')))
@@ -448,7 +451,13 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
     };
     let mut out = seat_status(db, cfg, &FRONT)?;
     if out["exists"] != true {
-        out["agents"] = json!(["claude"]);
+        // The agents a seat can run on.
+        let seats: Vec<&str> = Agent::ALL
+            .into_iter()
+            .filter(|a| a.overlord_seat().is_ok())
+            .map(Agent::name)
+            .collect();
+        out["agents"] = json!(seats);
         out["catalog"] = catalog(&cfg.overlord.agent);
     } else {
         let agent = out["agent"].as_str().unwrap_or("claude").to_string();
@@ -487,12 +496,9 @@ fn seat_status(db: &Db, cfg: &Config, seat: &Seat) -> Result<Value> {
         v["exists"] = json!(false);
         return Ok(v);
     };
-    let observed = match s.agent.as_str() {
-        "claude" => db
-            .transcript_source(&s.id)?
-            .and_then(|p| models::observed_claude_model(std::path::Path::new(&p))),
-        _ => None,
-    };
+    let observed = db
+        .transcript_source(&s.id)?
+        .and_then(|p| transcript::observed_model(std::path::Path::new(&p)));
     let fresh = models::check(&s.agent, s.model.as_deref(), observed.as_deref());
     let running =
         s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session);

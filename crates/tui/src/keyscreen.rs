@@ -101,6 +101,13 @@ impl KeyScreen {
             .collect();
     }
 
+    /// Highlight key `i` (a click on its row), while browsing.
+    pub(crate) fn select(&mut self, i: usize) {
+        if matches!(self.phase, Phase::Browse) && i < SLOTS.len() {
+            self.sel = i;
+        }
+    }
+
     pub(crate) fn listening(&self) -> bool {
         // Review too: it's still on the empty table, every key is "try
         // another" (Ctrl-C included).
@@ -345,7 +352,11 @@ impl App {
                 _ => Span::raw("   "),
             }
         };
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
         let mut lines: Vec<Line> = Vec::new();
+        // Which line each key's row is on (for the mouse).
+        let mut row_line: Vec<usize> = Vec::with_capacity(SLOTS.len());
         let mut sel_line = 0usize;
         let mut scope = None;
         for (i, s) in SLOTS.iter().enumerate() {
@@ -380,10 +391,21 @@ impl App {
                 sel_line = lines.len();
                 line = line.style(theme::selected());
             }
+            row_line.push(lines.len());
             lines.push(line);
         }
         let h = list_area.height as usize;
         let top = (sel_line + 2).saturating_sub(h);
+        // Click a row to select it, twice to change it (as Enter).
+        for (i, at) in row_line.into_iter().enumerate() {
+            if at >= top {
+                self.hits.row(
+                    list_area,
+                    list_area.y + (at - top) as u16,
+                    mouse::Hit::Pick(i),
+                );
+            }
+        }
         f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), list_area);
 
         // Details: what's going on with the selected key.
@@ -497,6 +519,7 @@ impl App {
                 }
             }
         }
+        self.hits.keycaps(detail_area.x, detail_area.y, &d);
         f.render_widget(
             Paragraph::new(d).wrap(ratatui::widgets::Wrap { trim: false }),
             detail_area,

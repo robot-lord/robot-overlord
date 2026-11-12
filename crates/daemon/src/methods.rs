@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::claude;
+use rlord_core::agents::{claude, install, transcript, Agent, Effect, Indexed};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Status, Subagent};
@@ -57,8 +57,39 @@ pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
     Ok(json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth}))
 }
 
+/// `[session]` as configured, plus what each agent offers: `agents` lists
+/// every agent rlord can run with its default model and picker choices
+/// (`models` empty: no catalog, the model is typed in).
 pub fn session_defaults(cfg: &Config) -> Result<Value> {
-    Ok(serde_json::to_value(&cfg.session)?)
+    let mut v = serde_json::to_value(&cfg.session)?;
+    v["agents"] = install::status(false)
+        .into_iter()
+        .map(|st| {
+            let agent = Agent::parse(st.name);
+            json!({
+                "name": st.name, "label": st.label, "installed": st.installed,
+                // false: rlord knows it but can't run sessions on it yet.
+                "supported": st.supported,
+                // How to install it (the user runs it; rlord never does).
+                "install": st.install,
+                "model": agent.map(|a| cfg.session.model_for(a)).unwrap_or(""),
+                "models": agent.map(|a| cfg.session.models_for(a)).unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(v)
+}
+
+/// `agents.list`: every coding agent rlord knows, whether it's installed
+/// (and its version), whether rlord's hooks are in place (and, for Codex,
+/// trusted), and the install command to suggest when it's missing. Plain
+/// look-ups; rlord never installs anything.
+pub fn agents_list() -> Result<Value> {
+    Ok(json!({
+        "agents": install::status(true),
+        "note": "rlord never installs an agent: give the user `install.command` to run themselves; \
+                 after installing, `rlord install-hooks` (and for Codex, trust them with /hooks)",
+    }))
 }
 
 pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
@@ -221,12 +252,15 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
 }
 
 /// A session's agent flags from its launch spec: the adapter flags it was
-/// created with, plus `--remote-control <name>` while Remote Control is on
-/// (so every start, resume and fresh start reconnects it). Turned off, it
-/// stays off with a settings override: `--resume` would otherwise reconnect
-/// a conversation that was last connected.
-pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
+/// created with, plus (Claude) `--remote-control <name>` while Remote
+/// Control is on (so every start, resume and fresh start reconnects it).
+/// Turned off, it stays off with a settings override: `--resume` would
+/// otherwise reconnect a conversation that was last connected.
+pub(crate) fn spec_args(agent: Agent, spec: &Value) -> Vec<String> {
     let mut a = str_list(spec, "extra_args");
+    if agent != Agent::Claude {
+        return a;
+    }
     // One --settings override for everything rlord sets.
     let mut settings = serde_json::Map::new();
     if let Some(n) = spec["remote_control"].as_str().filter(|n| !n.is_empty()) {
@@ -304,8 +338,43 @@ pub fn rlord_bin() -> String {
         .unwrap_or_else(|| "rlord".to_string())
 }
 
-fn pane_env(session_id: &str) -> Vec<(String, String)> {
-    vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())]
+/// Make the pane run the agent the "is it installed" check found: when its
+/// command isn't on the PATH rlord's tmux panes get (the daemon's), but the
+/// user's login shell has it, the pane runs that path. On PATH: the bare
+/// name, as always.
+/// Returns that path, when the login shell's was used.
+fn pane_program(agent: Agent, argv: &mut [String]) -> Option<std::path::PathBuf> {
+    let at = install::pane_program(agent.name());
+    program_at(argv, at.clone());
+    at
+}
+
+fn program_at(argv: &mut [String], at: Option<std::path::PathBuf>) {
+    if let (Some(first), Some(p)) = (argv.first_mut(), at) {
+        *first = p.to_string_lossy().into_owned();
+    }
+}
+
+/// The pane's environment: which session it is, and, when its program was
+/// found only by the login shell (`program`), that program's directory at
+/// the front of PATH. Such an install often needs what sits beside it: an
+/// npm or nvm install is a `#!/usr/bin/env node` script, with `node` in
+/// the same directory.
+fn pane_env(session_id: &str, program: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let mut env = vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())];
+    let path = std::env::var("PATH").unwrap_or_default();
+    env.extend(path_with(program, &path).map(|p| ("PATH".to_string(), p)));
+    env
+}
+
+/// `path` with `program`'s directory in front (None: nothing to add).
+fn path_with(program: Option<&std::path::Path>, path: &str) -> Option<String> {
+    let dir = program?.parent()?.to_str().filter(|d| !d.is_empty())?;
+    Some(if path.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{dir}:{path}")
+    })
 }
 
 pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
@@ -317,12 +386,29 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(String::from)
     };
-    let agent = p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone());
-    if agent != "claude" {
-        bail!("agent '{agent}' not supported yet (claude only)");
+    let agent = Agent::named(&p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone()))?;
+    // Internal-only knobs (the overlord uses them; the MCP surface never
+    // forwards them): adapter flags that must survive restarts, a role, and a
+    // fixed tmux name.
+    let extra_args = str_list(params, "extra_args");
+    let role = p_opt("role").unwrap_or_default();
+    if crate::overlord::is_overlord_role(&role) {
+        agent.overlord_seat()?;
     }
+    // Not installed: say how to get it, rather than fail in the pane.
+    if let Some(why) = install::missing(agent) {
+        bail!("{why}");
+    }
+    let remote_control = params["remote_control"].as_bool().unwrap_or(false);
+    if remote_control && !agent.has_remote_control() {
+        bail!(
+            "Remote Control is a Claude Code feature; {} has none",
+            agent.label()
+        );
+    }
+    // Each agent has its own models: the default is that agent's.
     let model = p_opt("model").or_else(|| {
-        let m = cfg.session.model.trim();
+        let m = cfg.session.model_for(agent).trim();
         (!m.is_empty()).then(|| m.to_string())
     });
     let prompt = p_opt("prompt");
@@ -372,28 +458,21 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         _ => (project, None, None),
     };
 
-    // Internal-only knobs (the overlord uses them; the MCP surface never
-    // forwards them): adapter flags that must survive restarts, a role, and a
-    // fixed tmux name.
-    let extra_args = str_list(params, "extra_args");
-    let role = p_opt("role").unwrap_or_default();
     // Remote Control from the start (the caller checked it's available).
-    let remote = params["remote_control"]
-        .as_bool()
-        .unwrap_or(false)
-        .then(|| crate::remote::remote_name(&name, &role));
-    let mut spec = json!({"agent": agent, "model": model, "prompt": prompt,
+    let remote = remote_control.then(|| crate::remote::remote_name(&name, &role));
+    let mut spec = json!({"agent": agent.name(), "model": model, "prompt": prompt,
                           "extra_args": extra_args});
     if let Some(n) = &remote {
         spec["remote_control"] = json!(n);
     }
-    let claude_sid = claude::mint_session_id();
-    let argv = claude::launch_argv(
-        &claude_sid,
+    let mut launch = agent.launch(
+        &project_path,
         prompt.as_deref(),
         model.as_deref(),
-        &spec_args(&spec),
+        &spec_args(agent, &spec),
     );
+    let program = pane_program(agent, &mut launch.argv);
+    let argv = &launch.argv;
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
@@ -404,8 +483,8 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     db.insert_session(&NewSession {
         id: &id,
         name: &name,
-        agent: &agent,
-        agent_session: Some(&claude_sid),
+        agent: agent.name(),
+        agent_session: launch.session_id.as_deref(),
         project_path: &project_path,
         tmux_session: Some(&tmux_name),
         launch_spec: &launch_spec,
@@ -418,14 +497,17 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(r) = &repo {
         db.touch_repo(r, now)?;
     }
-    db.upsert_transcript_source(
-        &id,
-        claude::transcript_path(&project_path, &claude_sid)
-            .to_str()
-            .unwrap_or(""),
-    )?;
+    if let Some(t) = &launch.transcript {
+        db.upsert_transcript_source(&id, &t.to_string_lossy())?;
+    }
+    if !agent.mints_id() {
+        // Its conversation is bound once the agent reports it (or it turns
+        // up in the agent's own index): one started from now on.
+        db.kv_set(&bind_since_key(&id), &now.to_string())?;
+        db.kv_set(&bind_prompt_key(&id), prompt.as_deref().unwrap_or(""))?;
+    }
 
-    let cmd = tmux::pane_command(&pane_env(&id), &argv);
+    let cmd = tmux::pane_command(&pane_env(&id, program.as_deref()), argv);
     tmux::new_session(&tmux_name, &project_path, &cmd)?;
     db.insert_event(
         &id,
@@ -433,7 +515,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         "launched",
         &json!({"argv": argv, "workspace": workspace_path, "branch": branch}).to_string(),
     )?;
-    tracing::info!(session = %id, name = %name, workspace = ?workspace_path, "launched claude session");
+    tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
@@ -643,25 +725,20 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     if s.archived_at.is_some() {
         bail!("{} is archived: unarchive it first", s.name);
     }
-    if s.agent != "claude" {
-        bail!("restart not supported for agent '{}'", s.agent);
-    }
-    let sid = s
-        .agent_session
-        .as_deref()
-        .context("session has no agent session id; cannot resume")?;
+    let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let argv = claude::resume_argv(
-        sid,
+    let (mut argv, resumed) = agent.resume(
+        s.agent_session.as_deref(),
         &s.agent_session_trust,
         &s.project_path,
         model.as_deref(),
-        &spec_args(&spec),
+        &spec_args(agent, &spec),
     )?;
+    let program = pane_program(agent, &mut argv);
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
         None => {
@@ -670,8 +747,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             n
         }
     };
-    let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
-    let resumed = argv.iter().any(|a| a == "--resume");
+    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), &argv);
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
@@ -694,37 +770,44 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
 /// can still be resumed with the agent's own `--resume`.
 pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    if s.agent != "claude" {
-        bail!("fresh start not supported for agent '{}'", s.agent);
-    }
+    let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
-    let sid = claude::mint_session_id();
-    let argv = claude::launch_argv(&sid, None, model, &spec_args(&spec));
+    let mut launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
+    let program = pane_program(agent, &mut launch.argv);
+    let argv = &launch.argv;
     let tmux_name = s
         .tmux_session
         .clone()
         .context("session has no tmux session")?;
-    let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
+    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), argv);
+    let now = now_ms();
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    let now = now_ms();
-    db.set_agent_session(&s.id, &sid, "minted")?;
-    db.upsert_transcript_source(
-        &s.id,
-        claude::transcript_path(&s.project_path, &sid)
-            .to_str()
-            .unwrap_or(""),
-    )?;
+    match (&launch.session_id, &launch.transcript) {
+        (Some(sid), transcript) => {
+            db.set_agent_session(&s.id, sid, "minted")?;
+            if let Some(t) = transcript {
+                db.upsert_transcript_source(&s.id, &t.to_string_lossy())?;
+            }
+        }
+        // The agent assigns the new id: nothing is bound until it reports
+        // one started from now on.
+        (None, _) => {
+            db.clear_agent_session(&s.id)?;
+            db.kv_set(&bind_since_key(&s.id), &now.to_string())?;
+            db.kv_set(&bind_prompt_key(&s.id), "")?;
+        }
+    }
     db.set_status(&s.id, Status::Starting, now)?;
     db.insert_event(
         &s.id,
         now,
         "fresh_conversation",
-        &json!({"from": s.agent_session, "to": sid}).to_string(),
+        &json!({"from": s.agent_session, "to": launch.session_id}).to_string(),
     )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
@@ -735,6 +818,7 @@ pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
         tmux::kill_session(t)?;
     }
     let now = now_ms();
+    db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "stopped", "{}")?;
     Ok(json!({"stopped": s.id}))
@@ -747,6 +831,7 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
         tmux::kill_session(t)?;
     }
     let now = now_ms();
+    db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
     db.set_archived(&s.id, Some(now))?;
     db.insert_event(&s.id, now, "archived", "{}")?;
@@ -761,6 +846,16 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
 
 /// Ingest one agent hook event (from `rlord hook emit`, live or spooled).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
+    hook_emit_with(db, params, &|agent, id| agent.indexed(id))
+}
+
+/// `hook_emit`, with how to ask an agent's own index whether a
+/// conversation is one the user drives (tests answer it themselves).
+pub(crate) fn hook_emit_with(
+    db: &Db,
+    params: &Value,
+    indexed: &dyn Fn(Agent, &str) -> Indexed,
+) -> Result<Value> {
     let instance = p_str(params, "instance")?;
     let agent = p_str(params, "agent")?;
     let event = p_str(params, "event")?;
@@ -771,6 +866,16 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         return Ok(json!({"ignored": true}));
     };
     let now = now_ms();
+    // Events that fire often (every tool call, every notification) and
+    // change nothing for this session: done, with no tmux call, no write
+    // and no log line.
+    let own_agent = Agent::parse(agent).filter(|a| a.name() == s.agent);
+    if let Some(a) = own_agent {
+        let (kind, effect) = a.map_hook_event(event, &payload);
+        if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() {
+            return Ok(json!({"ok": true, "unchanged": true}));
+        }
+    }
     if let Some(why) = foreign_hook(&s, params) {
         // Same RLORD_SESSION_ID, another process (e.g. Claude's background
         // daemon forked the conversation out of the pane): it must not
@@ -779,31 +884,116 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         return Ok(json!({"ignored": why}));
     }
 
-    if agent == "claude" {
-        if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
-            match s.agent_session.as_deref() {
-                None => db.set_agent_session(&s.id, sid, "hook")?,
-                Some(cur) if cur != sid => {
-                    // Claude is the truth about what it's writing; adopt, but log it.
-                    db.insert_event(
-                        &s.id,
-                        now,
-                        "agent_session_changed",
-                        &json!({"from": cur, "to": sid}).to_string(),
-                    )?;
-                    db.set_agent_session(&s.id, sid, "hook")?;
-                }
-                Some(_) if s.agent_session_trust == "minted" => {
-                    db.set_agent_session(&s.id, sid, "hook")? // confirmed
-                }
-                _ => {}
+    // The hooks of the agent the session runs (another agent started by
+    // hand in its pane inherits RLORD_SESSION_ID: logged, nothing more).
+    if let Some(agent) = own_agent {
+        let sid = payload.get("session_id").and_then(Value::as_str);
+        let whose = sid.map_or(Whose::Ours, |sid| {
+            // (Asked of the agent's index only when the ids differ.)
+            let other = s.agent_session.as_deref().is_some_and(|cur| cur != sid);
+            conversation(
+                agent,
+                event,
+                s.agent_session.as_deref(),
+                sid,
+                if other {
+                    indexed(agent, sid)
+                } else {
+                    Indexed::NoIndex
+                },
+            )
+        });
+        let bound = matches!(whose, Whose::Bind | Whose::Adopt);
+        match (whose, sid) {
+            (Whose::Bind, Some(sid)) => db.set_agent_session(&s.id, sid, "hook")?,
+            // rlord's own claim (minted at launch, or read from the agent's
+            // index), now confirmed by the agent.
+            (Whose::Ours, Some(sid))
+                if s.agent_session.is_some() && s.agent_session_trust == "minted" =>
+            {
+                db.set_agent_session(&s.id, sid, "hook")?
+            }
+            (Whose::Adopt, Some(sid)) => {
+                // The agent is the truth about what it's writing; adopt, but log it.
+                db.insert_event(
+                    &s.id,
+                    now,
+                    "agent_session_changed",
+                    &json!({"from": s.agent_session, "to": sid}).to_string(),
+                )?;
+                db.set_agent_session(&s.id, sid, "hook")?;
+            }
+            (Whose::Unbound, _) => {
+                return Ok(json!({"ignored": "no conversation bound yet"}));
+            }
+            _ => {}
+        }
+        if bound {
+            // What binding from the agent's index would have needed.
+            db.kv_delete(&bind_since_key(&s.id))?;
+            db.kv_delete(&bind_prompt_key(&s.id))?;
+        }
+        // A thread that was blocked as "another conversation" and is now
+        // the session's own: it is the session's own agent that waits.
+        if let (Whose::Adopt, Some(sid)) = (whose, sid) {
+            let key = needs_you_key(&s.id);
+            let was: Vec<String> = db
+                .kv_get(&key)?
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_default();
+            let now_own = adopted(was.clone(), sid);
+            if now_own != was {
+                db.kv_set(&key, &json!(now_own).to_string())?;
             }
         }
-        if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
-            db.upsert_transcript_source(&s.id, tp)?;
+        let (kind, effect) = agent.map_hook_event(event, &payload);
+        if whose != Whose::Other {
+            if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
+                db.upsert_transcript_source(&s.id, tp)?;
+            }
         }
-        let (kind, status) = claude::map_hook_event(event);
+        // Who this event is about, when it blocks or unblocks: a sub-agent
+        // (Claude names it; Codex's has its own thread), else the
+        // session's own agent (""). Unknown when the payload was cut off.
+        let party: Option<&str> = (payload["truncated"] != true).then(|| {
+            payload["agent_id"]
+                .as_str()
+                .or(sid.filter(|_| whose == Whose::Other))
+                .unwrap_or("")
+        });
+        let change = block_change(whose == Whose::Other, kind, effect, party);
+        // Another conversation in the pane (a sub-agent's thread) never
+        // ends the session's turn or stops it; only a prompt it is blocked
+        // on, and its moving on or ending, concern the session.
+        if whose == Whose::Other && change == Block::Keep {
+            return Ok(json!({"ignored": "another conversation in the pane"}));
+        }
+        let was: Vec<String> = db
+            .kv_get(&needs_you_key(&s.id))?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        let (blocked, status) = blocked_after(was.clone(), &change, effect, s.status);
+        if (effect == Effect::Resume || whose == Whose::Other) && status.is_none() {
+            // Someone moved on or ended, but not (all of) who the session
+            // waits for.
+            if blocked != was {
+                db.kv_set(&needs_you_key(&s.id), &json!(blocked).to_string())?;
+            }
+            return Ok(json!({"ok": true, "unchanged": true}));
+        }
+        // Kept only while the session needs someone.
+        let waiting = status.unwrap_or(s.status) == Status::WaitingInput;
+        if blocked.is_empty() || !waiting {
+            if !was.is_empty() {
+                db.kv_delete(&needs_you_key(&s.id))?;
+            }
+        } else if blocked != was {
+            db.kv_set(&needs_you_key(&s.id), &json!(blocked).to_string())?;
+        }
+        // Only a prompt and a finished turn are messages: a permission
+        // prompt, a question or a tool call never moves "updated".
         match kind {
+            _ if whose == Whose::Other => {}
             "prompt_submitted" => db.touch_last_user_msg(&s.id, now)?,
             "agent_stopped" => db.touch_last_agent_msg(&s.id, now)?,
             _ => {}
@@ -816,10 +1006,16 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }
-        if kind.starts_with("subagent_") {
+        if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
         } else {
-            // Keep the log light: the event name only.
+            // Keep the log light: the event name only. (Another thread's
+            // event is logged as what it did to this session.)
+            let kind = match (whose, status) {
+                (Whose::Other, Some(Status::WaitingInput)) => "permission_request",
+                (Whose::Other, _) => "tool",
+                _ => kind,
+            };
             db.insert_event(&s.id, now, kind, &json!({"hook": event}).to_string())?;
         }
     } else {
@@ -831,6 +1027,164 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         )?;
     }
     Ok(json!({"ok": true}))
+}
+
+/// kv key: who the session's "needs you" is for, as a JSON list ("" its
+/// own agent, else a sub-agent's id or thread). Present only while it
+/// waits on someone.
+fn needs_you_key(id: &str) -> String {
+    format!("needs_you_by:{id}")
+}
+
+/// What an event does to the set of parties a session is blocked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Block {
+    Keep,
+    /// This party is blocked on the user.
+    Add(String),
+    /// This party moved on (a tool ran): no longer blocked.
+    MovedOn(String),
+    /// This party ended (a sub-agent stopped): it can't be blocked.
+    Ended(String),
+    /// The session's own turn started or ended: nobody is blocked.
+    Clear,
+}
+
+/// `other`: the event is from another conversation in the pane. `party`:
+/// who it is about (None: not known, the payload was cut off).
+fn block_change(other: bool, kind: &str, effect: Effect, party: Option<&str>) -> Block {
+    let party = party.map(str::to_string);
+    match effect {
+        // A notification says someone is blocked, not who (Claude's carries
+        // no agent id, and comes before or after the request it is about):
+        // the status follows, the set is left to the events that name one.
+        Effect::Set(Status::WaitingInput) if kind == "notification" => Block::Keep,
+        Effect::Set(Status::WaitingInput) => party.map_or(Block::Keep, Block::Add),
+        Effect::Resume => party.map_or(Block::Keep, Block::MovedOn),
+        // A sub-agent's thread ended its turn or its session.
+        Effect::Set(_) if other => party.map_or(Block::Keep, Block::Ended),
+        // The session's own prompt, end of turn, start or end.
+        Effect::Set(_) => Block::Clear,
+        // Claude: a sub-agent stopped (it reports under the session's id).
+        Effect::Nothing if kind == "subagent_stopped" => party
+            .filter(|p| !p.is_empty())
+            .map_or(Block::Keep, Block::Ended),
+        Effect::Nothing => Block::Keep,
+    }
+}
+
+/// The blocked set after `change`, and the status the session goes to (if
+/// it changes). It needs you while anyone in the set is blocked. An empty
+/// set with the session waiting is a wait whose party isn't known (set
+/// before parties were tracked, or from a cut-off payload): any tool
+/// running clears that.
+fn blocked_after(
+    mut blocked: Vec<String>,
+    change: &Block,
+    effect: Effect,
+    current: Status,
+) -> (Vec<String>, Option<Status>) {
+    let waiting = current == Status::WaitingInput;
+    let freed = |blocked: &[String]| (waiting && blocked.is_empty()).then_some(Status::Working);
+    match change {
+        Block::Add(p) => {
+            if !blocked.contains(p) {
+                blocked.push(p.clone());
+            }
+            (blocked, effect.apply(current))
+        }
+        Block::MovedOn(p) => {
+            let unknown = blocked.is_empty();
+            let was_in = blocked.contains(p);
+            blocked.retain(|b| b != p);
+            let status = if unknown || was_in {
+                freed(&blocked)
+            } else {
+                None
+            };
+            (blocked, status)
+        }
+        Block::Ended(p) => {
+            let was_in = blocked.contains(p);
+            blocked.retain(|b| b != p);
+            let status = if was_in { freed(&blocked) } else { None };
+            (blocked, status)
+        }
+        Block::Clear => (Vec::new(), effect.apply(current)),
+        // (A cut-off payload: the status follows, the set is left alone.)
+        Block::Keep => {
+            let status = match effect {
+                Effect::Resume => None,
+                _ => effect.apply(current),
+            };
+            (blocked, status)
+        }
+    }
+}
+
+/// The blocked set once thread `sid` has become the session's own: its
+/// entry is the session's own agent ("").
+fn adopted(blocked: Vec<String>, sid: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in blocked {
+        let p = if p == sid { String::new() } else { p };
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Whose conversation a hook event speaks for, relative to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Whose {
+    /// The session's bound conversation (or the event names none).
+    Ours,
+    /// Nothing was bound: this is the session's conversation from now on.
+    Bind,
+    /// The session moved to this conversation.
+    Adopt,
+    /// Another conversation in the pane (a sub-agent's thread, or one the
+    /// agent's index doesn't know yet).
+    Other,
+    /// Nothing is bound and this event can't bind: not the session's.
+    Unbound,
+}
+
+/// Decide whose conversation `sid` is. `bound`: the session's current one.
+/// `indexed`: what the agent's own index says about `sid` when it differs.
+fn conversation(
+    agent: Agent,
+    event: &str,
+    bound: Option<&str>,
+    sid: &str,
+    indexed: Indexed,
+) -> Whose {
+    match bound {
+        Some(cur) if cur == sid => Whose::Ours,
+        // An agent that assigns its own id starts a conversation with a
+        // SessionStart: until one arrives (after a launch or a fresh start)
+        // an event is a late one from the process that was just replaced,
+        // and must not bind its old conversation or stop the session.
+        None if agent.mints_id() || agent.adopts_new_id_on(event) => Whose::Bind,
+        None => Whose::Unbound,
+        // rlord chose the id and the agent reports what it writes on every
+        // event (a /clear, a resume): follow it.
+        Some(_) if agent.mints_id() => Whose::Adopt,
+        // The agent assigns ids, and sub-agents have threads of their own
+        // in the same pane: the session moves only to a thread the index
+        // says the user drives (whether rlord's own guess from the index
+        // or an earlier hook bound the current one). Listed as a
+        // sub-agent's: never. Not listed yet: wait for a later event.
+        Some(_) => match indexed {
+            Indexed::User => Whose::Adopt,
+            Indexed::SubAgent | Indexed::NotListed => Whose::Other,
+            // No index to ask at all: a new conversation in the pane is
+            // what starts one.
+            Indexed::NoIndex if agent.adopts_new_id_on(event) => Whose::Adopt,
+            Indexed::NoIndex => Whose::Other,
+        },
+    }
 }
 
 /// Why a hook isn't from the session's own agent process, if it isn't:
@@ -911,7 +1265,7 @@ fn ingest_subagent_hook(
             a.finished_at = Some(now);
             if let Some(tp) = payload["agent_transcript_path"].as_str() {
                 a.transcript_path = Some(tp.to_string());
-                if let Some(st) = claude::transcript_stats(std::path::Path::new(tp)) {
+                if let Some(st) = transcript::transcript_stats(std::path::Path::new(tp)) {
                     a.input_tokens = st.input_tokens;
                     a.output_tokens = st.output_tokens;
                 }
@@ -934,7 +1288,7 @@ fn ingest_subagent_hook(
 
 /// Save transcript read positions that moved (so a restart reads forward).
 pub(crate) fn save_cursors(db: &Db) {
-    let dirty = claude::take_dirty_cursors();
+    let dirty = transcript::take_dirty_cursors();
     if let Err(e) = db.save_transcript_cursors(&dirty) {
         tracing::warn!(error = %e, "saving transcript read positions");
     }
@@ -965,10 +1319,17 @@ pub fn reconcile(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// The hook command installed into Claude settings: absolute path, so hooks
-/// work regardless of PATH.
-pub fn hook_command() -> String {
-    format!("{} hook emit claude", rlord_bin())
+/// kv key: when a session whose agent assigns its own conversation id was
+/// last launched on a new conversation (ms). The conversation bound to it
+/// must have started since.
+pub(crate) fn bind_since_key(id: &str) -> String {
+    format!("bind_since:{id}")
+}
+
+/// kv key: the prompt that conversation was launched with ("" for none):
+/// how its thread is told from another started in the same folder.
+pub(crate) fn bind_prompt_key(id: &str) -> String {
+    format!("bind_prompt:{id}")
 }
 
 #[cfg(test)]
@@ -977,17 +1338,209 @@ mod tests {
     #[test]
     fn remote_control_flags_follow_the_spec() {
         let on = json!({"extra_args": ["--x"], "remote_control": "web"});
-        assert_eq!(spec_args(&on), ["--x", "--remote-control", "web"]);
+        assert_eq!(
+            spec_args(Agent::Claude, &on),
+            ["--x", "--remote-control", "web"]
+        );
+        // Remote Control and the renderer are Claude's: not Codex flags.
+        assert_eq!(spec_args(Agent::Codex, &on), ["--x"]);
         let off = json!({"remote_control_off": true});
         // (No renderer set in tests: CLAUDE_TUI is unset.)
         assert_eq!(
-            spec_args(&off),
+            spec_args(Agent::Claude, &off),
             ["--settings", r#"{"disableRemoteControl":true}"#]
         );
-        assert!(spec_args(&json!({})).is_empty());
+        assert!(spec_args(Agent::Claude, &json!({})).is_empty());
     }
 
     use super::*;
+
+    #[test]
+    fn the_pane_runs_the_program_the_check_found() {
+        // On the panes' PATH: the bare name, as always.
+        let mut argv = vec!["codex".to_string(), "--no-daemon".to_string()];
+        program_at(&mut argv, None);
+        assert_eq!(argv, ["codex", "--no-daemon"]);
+        // Only the login shell has it: its path, the arguments as they were.
+        program_at(&mut argv, Some("/opt/tools/bin/codex".into()));
+        assert_eq!(argv, ["/opt/tools/bin/codex", "--no-daemon"]);
+    }
+
+    #[test]
+    fn whose_conversation_a_hook_speaks_for() {
+        use Whose::*;
+        let codex = |event: &str, bound: Option<&str>, indexed: Indexed| {
+            conversation(Agent::Codex, event, bound, "t-2", indexed)
+        };
+        assert_eq!(codex("Stop", Some("t-2"), Indexed::NoIndex), Ours);
+        // Nothing bound: a SessionStart binds; a late event from the
+        // process just replaced (a fresh start) does not.
+        assert_eq!(codex("SessionStart", None, Indexed::NotListed), Bind);
+        assert_eq!(codex("SessionEnd", None, Indexed::NotListed), Unbound);
+        assert_eq!(codex("Stop", None, Indexed::NotListed), Unbound);
+        // Bound: the session moves only to a thread the index says the
+        // user drives, on any event (so an index-bound guess is corrected).
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::User), Adopt);
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::User), Adopt);
+        // A sub-agent's never; one the index doesn't list yet: wait.
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::SubAgent), Other);
+        assert_eq!(
+            codex("SessionStart", Some("t-1"), Indexed::NotListed),
+            Other
+        );
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::NotListed), Other);
+        // No index at all: a SessionStart is what starts a conversation.
+        assert_eq!(codex("SessionStart", Some("t-1"), Indexed::NoIndex), Adopt);
+        assert_eq!(codex("Stop", Some("t-1"), Indexed::NoIndex), Other);
+        // Claude chose its id and reports what it writes on every event.
+        let claude = |event: &str, bound: Option<&str>| {
+            conversation(Agent::Claude, event, bound, "t-2", Indexed::NoIndex)
+        };
+        assert_eq!(claude("Stop", None), Bind);
+        assert_eq!(claude("Stop", Some("t-1")), Adopt);
+        assert_eq!(claude("Stop", Some("t-2")), Ours);
+    }
+
+    #[test]
+    fn a_program_found_by_the_login_shell_brings_its_directory() {
+        // On the panes' PATH already: nothing added.
+        assert_eq!(path_with(None, "/usr/bin:/bin"), None);
+        // An nvm install: `node` sits beside the `codex` script.
+        let program = std::path::Path::new("/home/a/.nvm/versions/node/v22/bin/codex");
+        assert_eq!(
+            path_with(Some(program), "/usr/bin:/bin").as_deref(),
+            Some("/home/a/.nvm/versions/node/v22/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            path_with(Some(program), "").as_deref(),
+            Some("/home/a/.nvm/versions/node/v22/bin")
+        );
+        let env = pane_env("01s", Some(program));
+        assert_eq!(env[0], ("RLORD_SESSION_ID".to_string(), "01s".to_string()));
+        assert_eq!(env[1].0, "PATH");
+        assert!(env[1].1.starts_with("/home/a/.nvm/versions/node/v22/bin"));
+        assert_eq!(pane_env("01s", None).len(), 1);
+    }
+
+    #[test]
+    fn an_adopted_thread_waits_as_the_sessions_own_agent() {
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(adopted(set(&["t-9", "a-7"]), "t-9"), set(&["", "a-7"]));
+        assert_eq!(adopted(set(&["", "t-9"]), "t-9"), set(&[""]));
+        assert_eq!(adopted(set(&["a-7"]), "t-9"), set(&["a-7"]));
+    }
+
+    #[test]
+    fn it_needs_you_while_anyone_is_blocked() {
+        use Status::*;
+        let needs = Effect::Set(WaitingInput);
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let step = |blocked: &[&str], change: Block, effect: Effect, cur: Status| {
+            blocked_after(set(blocked), &change, effect, cur)
+        };
+        // The main agent, then a sub-agent, are blocked.
+        let (b, st) = step(&[], Block::Add("".into()), needs, Working);
+        assert_eq!((b.clone(), st), (set(&[""]), Some(WaitingInput)));
+        let (b, st) = step(&[""], Block::Add("a-7".into()), needs, WaitingInput);
+        assert_eq!((b, st), (set(&["", "a-7"]), None));
+        // One moves on: still needs you for the other. Then the other.
+        let (b, st) = step(
+            &["", "a-7"],
+            Block::MovedOn("a-7".into()),
+            Effect::Resume,
+            WaitingInput,
+        );
+        assert_eq!((b, st), (set(&[""]), None));
+        let (b, st) = step(
+            &[""],
+            Block::MovedOn("".into()),
+            Effect::Resume,
+            WaitingInput,
+        );
+        assert_eq!((b, st), (set(&[]), Some(Working)));
+        // Someone who wasn't blocked moving on changes nothing.
+        let (b, st) = step(
+            &[""],
+            Block::MovedOn("a-9".into()),
+            Effect::Resume,
+            WaitingInput,
+        );
+        assert_eq!((b, st), (set(&[""]), None));
+        // A blocked sub-agent that ends without another tool frees it too.
+        let (b, st) = step(
+            &["a-7"],
+            Block::Ended("a-7".into()),
+            Effect::Nothing,
+            WaitingInput,
+        );
+        assert_eq!((b, st), (set(&[]), Some(Working)));
+        // Its ending while the main agent is blocked doesn't.
+        let (b, st) = step(
+            &["", "a-7"],
+            Block::Ended("a-7".into()),
+            Effect::Nothing,
+            WaitingInput,
+        );
+        assert_eq!((b, st), (set(&[""]), None));
+        // The session's own turn ending clears everyone.
+        let (b, st) = step(&["", "a-7"], Block::Clear, Effect::Set(Idle), WaitingInput);
+        assert_eq!((b, st), (set(&[]), Some(Idle)));
+        // A wait whose party isn't known: any tool running clears it; a
+        // sub-agent merely ending doesn't.
+        let (_, st) = step(
+            &[],
+            Block::MovedOn("a-1".into()),
+            Effect::Resume,
+            WaitingInput,
+        );
+        assert_eq!(st, Some(Working));
+        let (_, st) = step(
+            &[],
+            Block::Ended("a-1".into()),
+            Effect::Nothing,
+            WaitingInput,
+        );
+        assert_eq!(st, None);
+        // A cut-off payload: it can set "needs you" but names nobody, and
+        // can't clear anybody.
+        assert_eq!(
+            block_change(false, "permission_request", needs, None),
+            Block::Keep
+        );
+        assert_eq!(
+            block_change(false, "tool", Effect::Resume, None),
+            Block::Keep
+        );
+        let (b, st) = step(&[""], Block::Keep, Effect::Resume, WaitingInput);
+        assert_eq!((b, st), (set(&[""]), None));
+        let (b, st) = step(&[], Block::Keep, needs, Working);
+        assert_eq!((b, st), (set(&[]), Some(WaitingInput)));
+        // A notification says someone is blocked, not who: the status
+        // follows, the set is left to the events that name a party.
+        assert_eq!(
+            block_change(false, "notification", needs, Some("")),
+            Block::Keep
+        );
+        let (b, st) = step(&["a-7"], Block::Keep, needs, WaitingInput);
+        assert_eq!((b, st), (set(&["a-7"]), None));
+        // What each event means.
+        assert_eq!(
+            block_change(false, "subagent_stopped", Effect::Nothing, Some("a-7")),
+            Block::Ended("a-7".into())
+        );
+        assert_eq!(
+            block_change(true, "agent_stopped", Effect::Set(Idle), Some("t-sub")),
+            Block::Ended("t-sub".into())
+        );
+        assert_eq!(
+            block_change(false, "agent_stopped", Effect::Set(Idle), Some("")),
+            Block::Clear
+        );
+        assert_eq!(
+            block_change(false, "pre_compact", Effect::Nothing, Some("")),
+            Block::Keep
+        );
+    }
 
     #[test]
     fn overlord_row_is_fixed() {

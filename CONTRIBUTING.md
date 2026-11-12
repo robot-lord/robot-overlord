@@ -36,7 +36,10 @@ rlord search <words> / rlord history <ref>        # past work
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
 (its own data, config and tmux server; a stand-in `claude` that needs no
-model), for trying the UI. `scripts/demo/screenshots.sh DIR` retakes the
+model), for trying the UI. It sets `RLORD_NO_LOGIN_SHELL=1` (rlord then
+never asks your login shell where an agent is, so only the stand-ins on the
+demo's PATH exist) and a stand-in `SHELL`: set both in any scratch rlord you
+build yourself, so it can never launch a real agent. `scripts/demo/screenshots.sh DIR` retakes the
 README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs).
 
 ## Tests

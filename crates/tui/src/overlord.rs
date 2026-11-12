@@ -50,6 +50,18 @@ pub(crate) struct Upgrade {
     error: Option<String>,
 }
 
+impl Setup {
+    /// A click on row `i`: select it. True when it already was (the click
+    /// then changes it, as → does).
+    pub(crate) fn click_row(&mut self, i: usize) -> bool {
+        if self.row == i {
+            return true;
+        }
+        self.row = i;
+        false
+    }
+}
+
 fn catalog_of(st: &Value) -> Vec<(String, String)> {
     st["catalog"]
         .as_array()
@@ -130,7 +142,10 @@ impl App {
                 // On by default where it works: the point is to reach the
                 // overlord from the Claude app.
                 remote: (st["remote"]["available"] == true
-                    && st["default_agent"].as_str().is_none_or(|a| a == "claude"))
+                    && st["default_agent"].as_str().is_none_or(|a| {
+                        rlord_core::agents::Agent::parse(a)
+                            .is_some_and(rlord_core::agents::Agent::has_remote_control)
+                    }))
                 .then_some(true),
                 remote_why: st["remote"]["reason"]
                     .as_str()
@@ -532,6 +547,16 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
+        self.modal_hits(f.area(), area, &lines);
+        // Each row (three lines, from the fourth line on, a blank between):
+        // click selects it; again changes it.
+        let rows = if s.remote.is_some() { 3 } else { 2 };
+        for i in 0..rows {
+            for l in 0..3 {
+                self.hits
+                    .row(area, area.y + 1 + 3 + 4 * i as u16 + l, mouse::Hit::Pick(i));
+            }
+        }
         f.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 theme::modal("◆ Start your overlord")
@@ -569,6 +594,7 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
+        self.modal_hits(f.area(), area, &lines);
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -654,6 +680,7 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
+        self.modal_hits(f.area(), area, &lines);
         f.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })

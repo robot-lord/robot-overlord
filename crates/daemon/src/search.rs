@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::claude;
+use rlord_core::agents::transcript::clip;
+use rlord_core::agents::{self, Agent};
 use rlord_core::db::{ArchivedMode, SessionQuery};
 use rlord_core::history;
 use rlord_core::types::Session;
@@ -68,26 +69,25 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     // The overlord's own conversations are full of searches: never results.
     // Whole folders: each seat runs in its own, so every conversation it
     // ever had is in there, known to rlord or not.
-    let mut skip: std::collections::HashSet<PathBuf> = crate::overlord::SEATS
+    // (Claude keeps a folder's conversations together, so its transcript
+    // directory stands for the folder; a Codex rollout says its folder.)
+    let seat_dirs: Vec<String> = crate::overlord::SEATS
         .iter()
-        .filter_map(|seat| {
-            claude::transcript_path(&seat.dir().to_string_lossy(), "x")
+        .map(|seat| seat.dir().to_string_lossy().into_owned())
+        .collect();
+    let skip: std::collections::HashSet<PathBuf> = seat_dirs
+        .iter()
+        .filter_map(|dir| {
+            Agent::Claude
+                .transcript_path(dir, "x")?
                 .parent()
                 .map(Path::to_path_buf)
         })
         .collect();
     for (i, s) in sessions.iter().enumerate() {
         if crate::overlord::is_overlord_role(&s.role) {
-            skip.extend(
-                summary::transcripts_of(d, s)
-                    .iter()
-                    .filter_map(|p| p.parent().map(Path::to_path_buf)),
-            );
-            if let Some(a) = &s.agent_session {
-                if let Some(dir) = claude::transcript_path(&s.project_path, a).parent() {
-                    skip.insert(dir.to_path_buf());
-                }
-            }
+            // (Its folder is skipped whole, above: no need to look its
+            // transcripts up one by one.)
             continue;
         }
         let ps = summary::transcripts_of(d, s);
@@ -99,11 +99,29 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         paths_of.insert(i, ps);
     }
     if everywhere {
-        paths.extend(
-            history::all_claude_transcripts().into_iter().filter(|p| {
-                !by_path.contains_key(p) && !p.parent().is_some_and(|d| skip.contains(d))
-            }),
-        );
+        // Codex rollouts sit together by date: which folder each ran in is
+        // one question to Codex's index; a rollout it doesn't list (older
+        // than the index, or no index at all) says so in its first bytes.
+        // A seat's folder may be recorded as given or resolved (symlinks).
+        let folders = agents::codex::rollout_folders(&agents::codex::home()).unwrap_or_default();
+        let seat_real: Vec<String> = seat_dirs
+            .iter()
+            .filter_map(|d| std::fs::canonicalize(d).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let is_seat = |cwd: &str| seat_dirs.iter().chain(&seat_real).any(|d| d == cwd);
+        let in_seat_folder = |p: &Path| {
+            agents::agent_of(p) == Agent::Codex
+                && match folders.get(p) {
+                    Some(cwd) => is_seat(cwd),
+                    None => agents::codex::rollout_cwd(p).is_some_and(|cwd| is_seat(&cwd)),
+                }
+        };
+        paths.extend(history::all_transcripts().into_iter().filter(|p| {
+            !by_path.contains_key(p)
+                && !p.parent().is_some_and(|d| skip.contains(d))
+                && !in_seat_folder(p)
+        }));
     }
     let found = history::search(&paths, query, PER_FILE);
     // A session's hits across its transcripts (current first); each hit
@@ -160,7 +178,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                 "session": s.name, "id": s.id,
                 "archived": s.archived_at.is_some(),
                 "status": s.status.as_str(),
-                "about": claude::clip(about, 240),
+                "about": clip(about, 240),
                 "matched_in": fields,
                 "transcript_hits": n,
                 "hits": hits.get(&i).map(|h| json!(h.1)).unwrap_or(json!([])),
@@ -175,7 +193,8 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         .map(|fh| {
             json!({
                 "transcript": fh.path,
-                "folder": project_of(&fh.path),
+                "agent": agents::agent_of(&fh.path).name(),
+                "folder": agents::agent_of(&fh.path).transcript_folder(&fh.path),
                 "transcript_hits": fh.total,
                 "hits": fh.hits,
             })
@@ -192,15 +211,6 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         v["more_outside"] = json!(outside_total.saturating_sub(limit));
     }
     Ok(v)
-}
-
-/// The folder a Claude transcript belongs to (its project directory name,
-/// which is the path with `/` as `-`).
-fn project_of(p: &Path) -> String {
-    p.parent()
-        .and_then(|d| d.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
@@ -225,11 +235,13 @@ pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
             (json!({"session": s.name, "id": s.id}), p)
         }
         (_, Some(t)) => {
-            // Only Claude Code's own transcripts.
-            let root = std::fs::canonicalize(claude::config_dir().join("projects"))?;
+            // Only the agents' own transcripts.
             let p = std::fs::canonicalize(t).context("no such transcript")?;
-            if !p.starts_with(&root) || p.extension().is_none_or(|x| x != "jsonl") {
-                bail!("not a Claude Code transcript");
+            let known = Agent::ALL.into_iter().any(|a| {
+                std::fs::canonicalize(a.transcripts_root()).is_ok_and(|root| p.starts_with(root))
+            });
+            if !known || p.extension().is_none_or(|x| x != "jsonl") {
+                bail!("not an agent's transcript");
             }
             (json!({"transcript": p}), p)
         }
@@ -270,8 +282,8 @@ pub fn summarize(d: &Daemon, params: &Value) -> Result<Value> {
                 continue;
             }
         };
-        let why = if s.agent != "claude" {
-            Some("not a Claude Code session")
+        let why = if Agent::parse(&s.agent).is_none() {
+            Some("its agent can't write one")
         } else if !force && !s.summary.trim().is_empty() {
             Some("already has one (force to redo)")
         } else if summary::transcript_of(d, &s).is_none() {

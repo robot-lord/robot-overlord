@@ -1,4 +1,4 @@
-use crate::agents::claude::{CursorState, STATS_PARSE_VERSION};
+use crate::agents::transcript::{CursorState, STATS_PARSE_VERSION};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -167,10 +167,14 @@ impl SessionQuery {
     }
 }
 
-/// Accept friendly status spellings (`waiting` → `waiting_input`).
+/// Accept friendly status spellings: the labels people see (`needs you`,
+/// `your turn`; one word in a filter: `needs`, `needs-you`, `your-turn`,
+/// `turn`) and older words (`waiting` → `waiting_input`).
 pub fn normalize_status(s: &str) -> String {
-    match s.trim() {
-        "waiting" | "wait" | "input" => "waiting_input".to_string(),
+    match s.trim().to_lowercase().replace(['_', ' '], "-").as_str() {
+        "waiting" | "wait" | "input" | "waiting-input" | "needs" | "needs-you" | "needsyou"
+        | "blocked" => "waiting_input".to_string(),
+        "your-turn" | "yourturn" | "turn" | "yours" => "idle".to_string(),
         "run" | "busy" => "working".to_string(),
         other => other.to_string(),
     }
@@ -327,6 +331,12 @@ impl Db {
             .conn
             .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
             .optional()?)
+    }
+
+    pub fn kv_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
@@ -832,6 +842,20 @@ impl Db {
             "UPDATE sessions SET agent_session = ?2, agent_session_trust = ?3 WHERE id = ?1",
             params![id, agent_session, trust],
         )?;
+        Ok(())
+    }
+
+    /// Forget a session's conversation (it starts a new one whose id the
+    /// agent assigns: bound again when the agent reports it) and where its
+    /// transcript was.
+    pub fn clear_agent_session(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET agent_session = NULL, agent_session_trust = 'minted' \
+             WHERE id = ?1",
+            params![id],
+        )?;
+        self.conn
+            .execute("DELETE FROM transcripts WHERE session_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -1459,6 +1483,18 @@ mod tests {
         let mut q = SessionQuery::default();
         q.apply_search_text("status:waiting");
         assert_eq!(q.status, ["waiting_input"]);
+        // The words people see are accepted too.
+        for (word, stored) in [
+            ("needs", "waiting_input"),
+            ("needs-you", "waiting_input"),
+            ("waiting_input", "waiting_input"),
+            ("your-turn", "idle"),
+            ("turn", "idle"),
+            ("idle", "idle"),
+            ("working", "working"),
+        ] {
+            assert_eq!(normalize_status(word), stored, "{word}");
+        }
         assert_eq!(db.sessions(&q).unwrap()[0].id, "01bbb");
 
         let mut q = SessionQuery::default();

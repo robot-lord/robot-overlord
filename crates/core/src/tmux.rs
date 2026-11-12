@@ -42,7 +42,6 @@ set -g status off
 set -g prefix None
 set -g prefix2 None
 unbind-key -a -T prefix
-set -g mouse on
 set -g escape-time 10
 set -g history-limit 50000
 set -g focus-events on
@@ -63,6 +62,13 @@ pub fn write_conf() -> Result<()> {
     }
     let local = p.with_file_name("tmux.local.conf");
     let mut conf = CONF.to_string();
+    // `[tmux] mouse` (on unless turned off; unreadable config: on).
+    let mouse = crate::config::Config::load().map_or(true, |c| c.tmux.mouse);
+    conf.push_str(if mouse {
+        "set -g mouse on\n"
+    } else {
+        "set -g mouse off\n"
+    });
     // The user's imported tmux profile: its bindings live in tables only
     // sessions with the profile on can reach (see tmux_profile.rs).
     let profile = crate::tmux_profile::keys_path();

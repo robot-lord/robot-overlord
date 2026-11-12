@@ -2,7 +2,7 @@
 //!
 //! - `n` — **describe it to the overlord**: what the session should do (as
 //!   long as you like, including instructions for the overlord), plus
-//!   optional hints (repo, model, worktree, tags). The description wins over
+//!   optional hints (repo, agent, model, worktree, tags). The description wins over
 //!   the hints. Sent as a `[rlord new-session request]` message; the overlord
 //!   names the session, writes its prompt and launches it, or, when the
 //!   description contradicts a hint, reopens this form with the hints
@@ -21,6 +21,7 @@ use rlord_core::git::sanitize_branch;
 pub(crate) enum Field {
     Repo,
     Name,
+    Agent,
     Model,
     Workspace,
     Branch,
@@ -36,18 +37,20 @@ pub(crate) enum FormKind {
     Manual,
 }
 
-const OVERLORD_FIELDS: [Field; 6] = [
+const OVERLORD_FIELDS: [Field; 7] = [
     Field::Prompt,
     Field::Repo,
+    Field::Agent,
     Field::Model,
     Field::Workspace,
     Field::Tags,
     Field::Launch,
 ];
 
-const FIELDS: [Field; 7] = [
+const FIELDS: [Field; 8] = [
     Field::Repo,
     Field::Name,
+    Field::Agent,
     Field::Model,
     Field::Workspace,
     Field::Branch,
@@ -66,6 +69,7 @@ impl Field {
         match self {
             Field::Repo => "Repo",
             Field::Name => "Name",
+            Field::Agent => "Agent",
             Field::Model => "Model",
             Field::Workspace if kind == FormKind::Overlord => "Worktree",
             Field::Workspace => "Workspace",
@@ -89,12 +93,15 @@ pub(crate) enum Location {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
     Repo,
+    Agent,
     Model,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextPrompt {
     Folder,
+    /// A model that isn't in the picker's list.
+    Model,
 }
 
 /// The repo finder: every known + discovered repo, filtered as you type.
@@ -173,6 +180,11 @@ pub(crate) struct NewForm {
     focus: usize,
     location: Location,
     name: String,
+    /// The coding agent (`claude`, `codex`).
+    agent: String,
+    /// What each agent offers (`session.defaults`' `agents`): its label,
+    /// default model and model choices.
+    agents: Vec<Value>,
     model: String,
     workspace: bool,
     branch: String,
@@ -185,6 +197,7 @@ pub(crate) struct NewForm {
     /// Overlord form: which hints the user set (vs. defaults), so the
     /// overlord knows what was a choice.
     repo_chosen: bool,
+    agent_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
     tags_chosen: bool,
@@ -231,6 +244,9 @@ impl NewForm {
         } else if !self.name.is_empty() && !self.branch_touched {
             self.branch = sanitize_branch(&self.name);
         }
+        if let Some(a) = get("agent") {
+            self.set_agent(&a);
+        }
         if let Some(m) = get("model") {
             if !self.models.contains(&m) {
                 self.models.insert(0, m.clone());
@@ -271,6 +287,9 @@ impl NewForm {
             }
             (None, None) => self.location = Location::Auto,
         }
+        if let Some(a) = get("agent") {
+            self.set_agent(&a);
+        }
         // "" is the agent default (the overlord reset the model).
         if let Some(m) = p["model"].as_str().map(|m| m.trim().to_string()) {
             if !m.is_empty() && !self.models.contains(&m) {
@@ -293,7 +312,7 @@ impl NewForm {
         // Whose each hint is, as rlord worked it out from the request it
         // last delivered: `chosen` the user's, `resolved` the overlord's,
         // the rest defaults.
-        let keys = ["repo", "model", "worktree", "tags"];
+        let keys = ["repo", "agent", "model", "worktree", "tags"];
         let list = |name: &str| -> Vec<&'static str> {
             keys.into_iter()
                 .filter(|k| {
@@ -305,6 +324,7 @@ impl NewForm {
         };
         let chosen = list("chosen");
         self.repo_chosen = chosen.contains(&"repo");
+        self.agent_chosen = chosen.contains(&"agent");
         self.model_chosen = chosen.contains(&"model");
         self.workspace_chosen = chosen.contains(&"worktree");
         self.tags_chosen = chosen.contains(&"tags");
@@ -348,7 +368,96 @@ impl NewForm {
         self.location = loc;
     }
 
-    /// The user picked a hint (`repo` / `model` / `worktree` / `tags`). On a fresh form
+    /// Switch to another agent: its models are the picker's choices, and the
+    /// model becomes its default (one agent's model means nothing to
+    /// another). The same agent again changes nothing.
+    fn set_agent(&mut self, name: &str) {
+        if self.agent == name {
+            return;
+        }
+        self.agent = name.to_string();
+        let info = self.agents.iter().find(|a| a["name"] == name);
+        self.models = info
+            .and_then(|a| a["models"].as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.model = info
+            .and_then(|a| a["model"].as_str())
+            .unwrap_or("")
+            .to_string();
+        if !self.model.is_empty() && !self.models.contains(&self.model) {
+            self.models.insert(0, self.model.clone());
+        }
+        self.model_chosen = false;
+        self.resolved.retain(|k| *k != "model");
+    }
+
+    /// Why the chosen agent can't launch (rlord can't run it yet, or it
+    /// isn't installed), and the install command to suggest. rlord never
+    /// runs that command: the user does.
+    fn agent_blocker(&self) -> Option<(String, Option<String>)> {
+        let a = self
+            .agents
+            .iter()
+            .find(|a| a["name"] == self.agent.as_str())?;
+        let label = a["label"].as_str().unwrap_or(&self.agent);
+        let cmd = a["install"]["command"].as_str().map(str::to_string);
+        if a["supported"] == false {
+            let have = if a["installed"] == false {
+                "isn't installed, and "
+            } else {
+                ""
+            };
+            return Some((
+                format!("{label} {have}can't run rlord sessions yet (support coming)"),
+                cmd,
+            ));
+        }
+        (a["installed"] == false).then(|| {
+            (
+                format!(
+                    "{label} isn't installed. Install it yourself, then `rlord install-hooks`:"
+                ),
+                cmd,
+            )
+        })
+    }
+
+    /// The lines that say so on the form (empty when the agent is ready).
+    fn agent_blocker_lines(&self, indent: &str) -> Vec<Line<'static>> {
+        let Some((why, cmd)) = self.agent_blocker() else {
+            return Vec::new();
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            format!("{indent}{why}"),
+            Style::default().fg(theme::yellow()),
+        ))];
+        if let Some(cmd) = cmd {
+            lines.push(Line::from(vec![
+                Span::raw(format!("{indent}  ")),
+                Span::styled(cmd, Style::default().fg(theme::text()).bold()),
+                Span::styled("   ^Y copy", theme::faint()),
+            ]));
+        }
+        lines
+    }
+
+    /// The agent's name as shown ("Claude Code", "Codex").
+    fn agent_label(&self) -> String {
+        self.agents
+            .iter()
+            .find(|a| a["name"] == self.agent.as_str())
+            .and_then(|a| a["label"].as_str())
+            .unwrap_or(&self.agent)
+            .to_string()
+    }
+
+    /// The user picked a hint (`repo` / `agent` / `model` / `worktree` / `tags`). On a fresh form
     /// any pick is theirs (pinning the default counts); on a form the
     /// overlord reopened only a real change is, and it drops the overlord's
     /// label and confirmation.
@@ -356,6 +465,7 @@ impl NewForm {
         if changed || !self.reopened {
             match key {
                 "repo" => self.repo_chosen = true,
+                "agent" => self.agent_chosen = true,
                 "model" => self.model_chosen = true,
                 "tags" => self.tags_chosen = true,
                 "worktree" => self.workspace_chosen = true,
@@ -377,6 +487,32 @@ impl NewForm {
             self.changed.clear();
             self.note = None;
         }
+    }
+
+    /// A list is open over the form (a picker or the repo finder): the
+    /// wheel moves in it.
+    pub(crate) fn has_list(&self) -> bool {
+        self.picker.is_some() || self.finder.is_some()
+    }
+
+    /// A click on item `i`: of the open list (selects it), else field `i`
+    /// (focuses it). True when Enter should follow: a list item is chosen,
+    /// a pick/toggle field or the send button is activated. A text field
+    /// only takes the focus.
+    pub(crate) fn click(&mut self, i: usize) -> bool {
+        if let Some((_, items, state)) = &mut self.picker {
+            state.select(Some(i.min(items.len().saturating_sub(1))));
+            return true;
+        }
+        if let Some(finder) = &mut self.finder {
+            finder.state.select(Some(i));
+            return true;
+        }
+        if self.text_prompt.is_some() || i >= self.fields().len() {
+            return false;
+        }
+        self.focus = i;
+        !self.current().is_text()
     }
 
     fn fields(&self) -> &'static [Field] {
@@ -425,31 +561,29 @@ impl App {
                 },
             },
         };
-        let mut models: Vec<String> = defaults["models"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let model = defaults["model"].as_str().unwrap_or("").to_string();
-        if !model.is_empty() && !models.contains(&model) {
-            models.insert(0, model.clone());
-        }
+        // Each agent's default model and choices; the form opens on the
+        // configured agent (`set_agent` below fills its models in).
+        let default_agent = defaults["agent"].as_str().unwrap_or("claude").to_string();
+        let agents = defaults["agents"].as_array().cloned().unwrap_or_else(|| {
+            vec![
+                json!({"name": default_agent, "label": default_agent, "installed": true,
+                        "model": defaults["model"], "models": defaults["models"]}),
+            ]
+        });
         // On the groups tab, a new session joins the group being viewed.
         let tags = match (&self.tab, &self.group_sel) {
             (groups::Tab::Groups, Some(g)) if g != groups::UNTAGGED => g.clone(),
             _ => String::new(),
         };
         let from_group = !tags.is_empty();
-        self.mode = Mode::NewSession(Box::new(NewForm {
+        let mut form = Box::new(NewForm {
             kind,
             focus: 0,
             location,
             name: String::new(),
-            model,
+            agent: String::new(),
+            agents,
+            model: String::new(),
             workspace: defaults["workspace"].as_bool().unwrap_or(true),
             default_workspace: defaults["workspace"].as_bool().unwrap_or(true),
             before_folder: None,
@@ -458,8 +592,9 @@ impl App {
             prompt: String::new(),
             tags,
             repos,
-            models,
+            models: Vec::new(),
             repo_chosen: false,
+            agent_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
             // Opened from a group: joining it is the user's choice.
@@ -473,7 +608,9 @@ impl App {
             finder: None,
             text_prompt: None,
             error: None,
-        }));
+        });
+        form.set_agent(&default_agent);
+        self.mode = Mode::NewSession(form);
     }
 
     /// Returns the form to keep it open, or None once it closed.
@@ -491,6 +628,16 @@ impl App {
                 KeyCode::Enter => {
                     let path = rlord_core::config::expand_tilde(buf.trim());
                     match kind {
+                        TextPrompt::Model => {
+                            let m = buf.trim().to_string();
+                            if !m.is_empty() {
+                                f.mark_picked("model", m != f.model);
+                                if !f.models.contains(&m) {
+                                    f.models.insert(0, m.clone());
+                                }
+                                f.model = m;
+                            }
+                        }
                         TextPrompt::Folder => {
                             if std::path::Path::new(&path).is_dir() {
                                 let moved =
@@ -607,6 +754,17 @@ impl App {
                     f.picker = Some((kind, items, state));
                 }
                 KeyCode::Enter => match kind {
+                    PickerKind::Agent => {
+                        // One that isn't installed can be picked: the form
+                        // then says how to get it (and won't send).
+                        let picked = f.agents[i]["name"].as_str().unwrap_or("").to_string();
+                        f.mark_picked("agent", picked != f.agent);
+                        f.set_agent(&picked);
+                        f.error = None;
+                    }
+                    PickerKind::Model if items[i] == OTHER_MODEL => {
+                        f.text_prompt = Some((TextPrompt::Model, String::new()));
+                    }
                     PickerKind::Model => {
                         let picked = if items[i] == "(agent default)" {
                             String::new()
@@ -653,6 +811,15 @@ impl App {
         if shift_enter || (ctrl && code == KeyCode::Char('s')) {
             return self.submit_form(f);
         }
+        // ctrl-y: copy the suggested install command (the user runs it).
+        if ctrl && code == KeyCode::Char('y') {
+            if let Some((_, Some(cmd))) = f.agent_blocker() {
+                overlay::copy_text("rlord-install", &cmd);
+                self.status_line = format!("copied: {cmd}");
+                f.error = None;
+            }
+            return Ok(Some(f));
+        }
         // ctrl-e (the overlord form): edit the description in $EDITOR, e.g.
         // your vim; it comes back into the box.
         if ctrl && code == KeyCode::Char('e') && f.kind == FormKind::Overlord {
@@ -693,6 +860,7 @@ impl App {
             }
             KeyCode::Enter => match field {
                 Field::Repo => self.open_picker(&mut f, PickerKind::Repo),
+                Field::Agent => self.open_picker(&mut f, PickerKind::Agent),
                 Field::Model => self.open_picker(&mut f, PickerKind::Model),
                 Field::Workspace => {
                     // A plain folder has no worktree to toggle.
@@ -788,9 +956,28 @@ impl App {
                 }
                 v
             }
+            PickerKind::Agent => f
+                .agents
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}{}",
+                        a["label"].as_str().unwrap_or("?"),
+                        if a["supported"] == false {
+                            "  (rlord support coming)"
+                        } else if a["installed"] == false {
+                            "  (not installed: pick it to see how)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect(),
+            // The agent's own choices (none known: type one).
             PickerKind::Model => {
                 let mut v = f.models.clone();
                 v.push("(agent default)".to_string());
+                v.push(OTHER_MODEL.to_string());
                 v
             }
         };
@@ -805,7 +992,17 @@ impl App {
                 Location::Folder(_) => f.repos.len() + 1,
                 Location::Auto => items.len() - 1,
             },
-            PickerKind::Model => f.models.iter().position(|m| *m == f.model).unwrap_or(0),
+            PickerKind::Agent => f
+                .agents
+                .iter()
+                .position(|a| a["name"] == f.agent.as_str())
+                .unwrap_or(0),
+            // No model set is "(agent default)", right after the choices.
+            PickerKind::Model => f
+                .models
+                .iter()
+                .position(|m| *m == f.model)
+                .unwrap_or(f.models.len()),
         };
         f.picker = Some((kind, items, ListState::default().with_selected(Some(sel))));
     }
@@ -828,7 +1025,15 @@ impl App {
         });
     }
 
-    fn submit_form(&mut self, f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+    fn submit_form(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+        // Nothing to launch it with: say so here, not in a dead pane.
+        if let Some((why, _)) = f.agent_blocker() {
+            f.error = Some(format!(
+                "{} (pick another agent, or install it and reopen this form)",
+                why.trim_end_matches(':')
+            ));
+            return Ok(Some(f));
+        }
         match f.kind {
             FormKind::Overlord => self.submit_request(f),
             FormKind::Manual => self.submit_manual(f),
@@ -845,6 +1050,7 @@ impl App {
         }
         let chosen: Vec<&str> = [
             ("repo", f.repo_chosen),
+            ("agent", f.agent_chosen),
             ("model", f.model_chosen),
             ("worktree", f.workspace_chosen),
             ("tags", f.tags_chosen && !f.tags.trim().is_empty()),
@@ -854,6 +1060,7 @@ impl App {
         .collect();
         let mut params = json!({
             "description": f.prompt,
+            "agent": f.agent,
             "model": f.model,
             "workspace": f.workspace,
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
@@ -901,6 +1108,7 @@ impl App {
         let mut params = json!({
             "name": if f.name.trim().is_empty() { None } else { Some(f.name.trim()) },
             "prompt": if f.prompt.trim().is_empty() { None } else { Some(f.prompt.trim()) },
+            "agent": f.agent,
             "model": f.model,
             "workspace": f.workspace,
             "branch": if f.branch.trim().is_empty() { None } else { Some(f.branch.trim()) },
@@ -939,10 +1147,12 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 26), "New session"),
-            FormKind::Manual => (centered(f.area(), 76, 17), "New session · manual"),
+            FormKind::Overlord => (centered(f.area(), 82, 28), "New session"),
+            FormKind::Manual => (centered(f.area(), 76, 20), "New session · manual"),
         };
         f.render_widget(Clear, area);
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
         let block = theme::modal(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -978,11 +1188,20 @@ impl App {
                 .highlight_symbol(theme::SELECT_BAR);
             let mut st = finder.state.clone();
             f.render_stateful_widget(list, list_area, &mut st);
+            // Click a repo to pick it.
+            for i in st.offset()..rows.len().min(st.offset() + list_area.height as usize) {
+                self.hits.row(
+                    list_area,
+                    list_area.y + (i - st.offset()) as u16,
+                    mouse::Hit::Pick(i),
+                );
+            }
             return;
         }
         if let Some((kind, items, state)) = &form.picker {
             let title = match kind {
                 PickerKind::Repo => " Repo ",
+                PickerKind::Agent => " Agent ",
                 PickerKind::Model => " Model ",
             };
             let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
@@ -993,6 +1212,17 @@ impl App {
                 .highlight_symbol(theme::SELECT_BAR);
             let mut st = state.clone();
             f.render_stateful_widget(list, inner, &mut st);
+            // Click a choice to pick it (inside the list's own border).
+            let body = Rect {
+                x: inner.x + 1,
+                y: inner.y + 1,
+                width: inner.width.saturating_sub(2),
+                height: inner.height.saturating_sub(2),
+            };
+            for i in st.offset()..items.len().min(st.offset() + body.height as usize) {
+                self.hits
+                    .row(body, body.y + (i - st.offset()) as u16, mouse::Hit::Pick(i));
+            }
             return;
         }
 
@@ -1005,16 +1235,20 @@ impl App {
             } else {
                 tmux::key_label(k)
             };
-            draw_describe_form(f, inner, form, &overlord_key);
+            draw_describe_form(f, inner, form, &overlord_key, &self.hits);
             return;
         }
         let mut lines: Vec<Line> = Vec::new();
         for (i, field) in form.fields().iter().enumerate() {
+            // Click a field to focus it (a pick, toggle or Launch: to use it).
+            self.hits
+                .row(inner, inner.y + lines.len() as u16, mouse::Hit::Pick(i));
             let focused = i == form.focus;
             let marker = if focused { "▶ " } else { "  " };
             let value = match field {
                 Field::Repo => form.location_label(),
                 Field::Name => form.name.clone(),
+                Field::Agent => form.agent_label(),
                 Field::Model => {
                     if form.model.is_empty() {
                         "(agent default)".into()
@@ -1104,6 +1338,7 @@ impl App {
                 lines.push(Line::raw(""));
             }
         }
+        lines.extend(form.agent_blocker_lines(""));
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {e}"),
@@ -1113,6 +1348,7 @@ impl App {
         if let Some((kind, buf)) = &form.text_prompt {
             let label = match kind {
                 TextPrompt::Folder => "folder (no repo)",
+                TextPrompt::Model => "model",
             };
             lines.push(Line::from(Span::styled(
                 format!("{label}: {buf}▏   (enter · esc)"),
@@ -1125,7 +1361,18 @@ impl App {
 
 /// The overlord form: a description box up top (the part that matters),
 /// then the optional hints, visibly secondary, then send.
-fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: &str) {
+fn draw_describe_form(
+    f: &mut Frame,
+    inner: Rect,
+    form: &NewForm,
+    overlord_key: &str,
+    hits: &mouse::Hits,
+) {
+    // The index of a field in this form (what a click on it picks).
+    let pick = |fld: Field| {
+        let i = OVERLORD_FIELDS.iter().position(|x| *x == fld).unwrap_or(0);
+        mouse::Hit::Pick(i)
+    };
     let dim = theme::faint();
     let gray = theme::muted();
     let accent = Style::default().fg(theme::accent());
@@ -1208,6 +1455,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         width: box_area.width.saturating_sub(4),
         ..box_area
     };
+    hits.add(box_area, pick(Field::Prompt));
     let border = if focus(Field::Prompt) {
         Style::default().fg(theme::yellow())
     } else {
@@ -1249,7 +1497,9 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             ),
         ]),
     ];
-    let hint = |fld: Field, key: &str, value: String, chosen: bool| -> Line<'static> {
+    // (Each hint is one line of `rest`; `row` is the line it will be on.)
+    let hint = |row: usize, fld: Field, key: &str, value: String, chosen: bool| -> Line<'static> {
+        hits.row(rest, rest.y + row as u16, pick(fld));
         let focused = focus(fld);
         let changed = form.changed.iter().any(|c| c == key);
         let label_style = if focused {
@@ -1288,12 +1538,21 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     };
     let auto = matches!(form.location, Location::Auto);
     lines.push(hint(
+        lines.len(),
         Field::Repo,
         "repo",
         form.location_label(),
         form.repo_chosen && !auto,
     ));
     lines.push(hint(
+        lines.len(),
+        Field::Agent,
+        "agent",
+        form.agent_label(),
+        form.agent_chosen,
+    ));
+    lines.push(hint(
+        lines.len(),
         Field::Model,
         "model",
         if form.model.is_empty() {
@@ -1304,6 +1563,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         form.model_chosen,
     ));
     lines.push(hint(
+        lines.len(),
         Field::Workspace,
         "worktree",
         match (&form.location, form.workspace) {
@@ -1320,12 +1580,17 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         format!("{}{}", form.tags, if tags_focused { "▏" } else { "" })
     };
     lines.push(hint(
+        lines.len(),
         Field::Tags,
         "tags",
         tags,
         form.tags_chosen && !form.tags.is_empty(),
     ));
-    lines.push(Line::raw(""));
+    let blocker = form.agent_blocker_lines("    ");
+    if blocker.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(blocker);
 
     let send_focused = focus(Field::Launch);
     let send = if form.confirmed {
@@ -1333,6 +1598,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     } else {
         " Send to mastermind "
     };
+    hits.row(rest, rest.y + lines.len() as u16, pick(Field::Launch));
     lines.push(Line::from(vec![
         Span::raw(if send_focused { "  ▶ " } else { "    " }),
         Span::styled(
@@ -1350,7 +1616,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     lines.push(Line::raw(""));
     let enter = match form.current() {
         Field::Prompt => "new line",
-        Field::Repo | Field::Model => "pick",
+        Field::Repo | Field::Agent | Field::Model => "pick",
         Field::Workspace => "toggle",
         Field::Launch => "send",
         _ => "next",
@@ -1371,12 +1637,15 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     if let Some((kind, buf)) = &form.text_prompt {
         let label = match kind {
             TextPrompt::Folder => "folder (no repo)",
+            TextPrompt::Model => "model",
         };
         lines.push(Line::from(Span::styled(
             format!("  {label}: {buf}▏   (enter · esc)"),
             Style::default().fg(theme::yellow()),
         )));
     }
+    // The key hints under the form are buttons too.
+    hits.keycaps(rest.x, rest.y, &lines);
     f.render_widget(Paragraph::new(lines), rest);
 }
 
@@ -1404,6 +1673,7 @@ fn wrapped_rows(line: &str, width: usize) -> usize {
     rows
 }
 
+const OTHER_MODEL: &str = "  another model…";
 const OTHER_REPO: &str = "  find another repo…";
 const NO_REPO: &str = "  no repo — plain folder…";
 const AUTO_REPO: &str = "  let the overlord pick (from the description)";
@@ -1505,6 +1775,84 @@ mod tests {
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
         assert_eq!(f.resolved, ["repo"]);
         assert_eq!(f.model, "", "reset to the agent default");
+    }
+
+    #[test]
+    fn the_agent_hint_brings_its_own_models() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = form(&mut app);
+        f.agents = vec![
+            json!({"name": "claude", "label": "Claude Code", "installed": true,
+                   "model": "opus", "models": ["opus", "sonnet"]}),
+            json!({"name": "codex", "label": "Codex", "installed": true,
+                   "model": "", "models": ["gpt-6-luna"]}),
+        ];
+        f.agent.clear();
+        f.set_agent("claude");
+        assert_eq!((f.model.as_str(), f.models.len()), ("opus", 2));
+        let out = render(&app, &f);
+        let line = out.lines().find(|l| l.contains("Agent")).unwrap();
+        assert!(
+            line.contains("Claude Code") && line.contains("default"),
+            "{line}"
+        );
+        // Another agent: its models, its default; a model picked for the
+        // first one doesn't carry over.
+        f.model_chosen = true;
+        f.set_agent("codex");
+        assert_eq!(f.models, ["gpt-6-luna"]);
+        assert!(f.model.is_empty() && !f.model_chosen);
+        // The overlord reopens the form on Codex with a model.
+        f.set_agent("claude");
+        f.prefill_confirm(&json!({
+            "description": "x", "agent": "codex", "model": "gpt-6-luna",
+            "resolved": ["agent", "model"], "changed": ["agent", "model"], "note": "n",
+        }));
+        assert_eq!(
+            (f.agent.as_str(), f.model.as_str()),
+            ("codex", "gpt-6-luna")
+        );
+        assert_eq!(f.resolved, ["agent", "model"]);
+        let out = render(&app, &f);
+        let line = out.lines().find(|l| l.contains("Agent")).unwrap();
+        assert!(line.contains("Codex") && line.contains("updated"), "{line}");
+    }
+
+    #[test]
+    fn a_missing_agent_shows_how_to_install_it_and_blocks_sending() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = form(&mut app);
+        f.prompt = "fix it".into();
+        f.agents = vec![
+            json!({"name": "claude", "label": "Claude Code", "installed": true,
+                   "supported": true, "model": "opus", "models": ["opus"]}),
+            json!({"name": "codex", "label": "Codex", "installed": false, "supported": true,
+                   "model": "", "models": [],
+                   "install": {"via": "homebrew", "command": "brew install --cask codex"}}),
+            json!({"name": "opencode", "label": "OpenCode", "installed": true,
+                   "supported": false, "model": "", "models": []}),
+        ];
+        f.agent.clear();
+        f.set_agent("claude");
+        assert!(f.agent_blocker().is_none());
+        f.set_agent("codex");
+        let out = render(&app, &f);
+        assert!(
+            out.contains("Codex isn't installed. Install it yourself"),
+            "{out}"
+        );
+        assert!(out.contains("brew install --cask codex") && out.contains("^Y copy"));
+        // Sending is refused, with the reason; the form stays open.
+        let f = app.submit_form(f).unwrap().expect("still open");
+        assert!(f.error.as_deref().unwrap().contains("isn't installed"));
+        let mut f = f;
+        f.set_agent("opencode");
+        let (why, cmd) = f.agent_blocker().unwrap();
+        assert!(why.contains("support coming") && cmd.is_none(), "{why}");
     }
 
     #[test]

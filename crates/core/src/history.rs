@@ -10,7 +10,7 @@
 //! - **read**: a window of messages around one of those hits, text only,
 //!   tool output clipped: enough to carry into another session.
 //!
-//! Claude Code's JSONL format; other agents' transcripts aren't read yet.
+//! Any agent's transcript: lines are read through `agents::transcript`.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,8 @@ use grep_searcher::SearcherBuilder;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::agents::claude::clip;
+use super::agents::transcript::{clip, Format};
+use super::agents::Agent;
 
 /// One message that matched.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -41,68 +42,6 @@ pub struct FileHits {
     pub path: PathBuf,
     pub hits: Vec<Hit>,
     pub total: usize,
-}
-
-/// A message's text and who said it, from one transcript line. None for
-/// lines that aren't conversation (titles, snapshots, meta).
-pub fn message(v: &Value) -> Option<(&'static str, String)> {
-    if v["isMeta"] == true || v["isVisibleInTranscriptOnly"] == true {
-        return None;
-    }
-    let content = &v["message"]["content"];
-    match v["type"].as_str()? {
-        "user" => match content {
-            Value::String(s) => Some(("you", s.clone())),
-            Value::Array(a) => {
-                // Tool results come back as user lines.
-                let mut text = Vec::new();
-                let mut tool = false;
-                for x in a {
-                    match x["type"].as_str() {
-                        Some("text") => text.extend(x["text"].as_str().map(str::to_string)),
-                        Some("tool_result") => {
-                            tool = true;
-                            match &x["content"] {
-                                Value::String(s) => text.push(s.clone()),
-                                Value::Array(c) => text.extend(
-                                    c.iter()
-                                        .filter_map(|y| y["text"].as_str())
-                                        .map(str::to_string),
-                                ),
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let t = text.join("\n");
-                (!t.trim().is_empty()).then_some((if tool { "tool" } else { "you" }, t))
-            }
-            _ => None,
-        },
-        "assistant" => {
-            let a = content.as_array()?;
-            let mut text = Vec::new();
-            for x in a {
-                match x["type"].as_str() {
-                    Some("text") => text.extend(x["text"].as_str().map(str::to_string)),
-                    // What it ran: the tool and its main argument.
-                    Some("tool_use") => {
-                        let input = &x["input"];
-                        let arg = ["command", "file_path", "pattern", "url", "description"]
-                            .iter()
-                            .find_map(|k| input[*k].as_str())
-                            .unwrap_or("");
-                        text.push(format!("[{}] {arg}", x["name"].as_str().unwrap_or("tool")));
-                    }
-                    _ => {}
-                }
-            }
-            let t = text.join("\n");
-            (!t.trim().is_empty()).then_some(("agent", t))
-        }
-        _ => None,
-    }
 }
 
 /// The words of a query, lowercased (every one must appear in a message).
@@ -169,6 +108,7 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
     let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut out = Vec::new();
     for path in paths {
+        let format = Format::of(path);
         let mut fh = FileHits {
             path: path.clone(),
             hits: Vec::new(),
@@ -182,7 +122,8 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
                 let Ok(v) = serde_json::from_str::<Value>(raw) else {
                     return Ok(true);
                 };
-                let Some((who, text)) = message(&v) else {
+                let l = format.line(&v);
+                let Some((who, text)) = l.message() else {
                     return Ok(true);
                 };
                 let lower = text.to_lowercase();
@@ -194,7 +135,7 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
                     fh.hits.push(Hit {
                         line,
                         who,
-                        at: v["timestamp"].as_str().map(str::to_string),
+                        at: l.at().map(str::to_string),
                         snippet: snippet(&text, &ws[0], 220),
                     });
                 }
@@ -229,6 +170,7 @@ pub fn read(
     budget: usize,
 ) -> std::io::Result<Vec<Message>> {
     use std::io::BufRead;
+    let format = Format::of(path);
     let f = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut all: Vec<Message> = Vec::new();
     let mut target: Option<usize> = None;
@@ -244,7 +186,8 @@ pub fn read(
         let Ok(v) = serde_json::from_str::<Value>(&l) else {
             continue;
         };
-        let Some((who, text)) = message(&v) else {
+        let l = format.line(&v);
+        let Some((who, text)) = l.message() else {
             continue;
         };
         if target.is_none() && line.is_some_and(|t| n >= t) {
@@ -254,7 +197,7 @@ pub fn read(
         all.push(Message {
             line: n,
             who,
-            at: v["timestamp"].as_str().map(str::to_string),
+            at: l.at().map(str::to_string),
             text: clip_keep_lines(&text, max),
         });
     }
@@ -299,23 +242,13 @@ fn clip_keep_lines(s: &str, max: usize) -> String {
     }
 }
 
-/// Every Claude Code transcript on this machine (for searching outside
+/// Every agent's transcripts on this machine (for searching outside
 /// rlord's own sessions too), newest first.
-pub fn all_claude_transcripts() -> Vec<PathBuf> {
-    let root = super::agents::claude::config_dir().join("projects");
-    let mut v: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for d in std::fs::read_dir(root).into_iter().flatten().flatten() {
-        for f in std::fs::read_dir(d.path()).into_iter().flatten().flatten() {
-            let p = f.path();
-            if p.extension().is_some_and(|x| x == "jsonl") {
-                let t = f
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                v.push((t, p));
-            }
-        }
-    }
+pub fn all_transcripts() -> Vec<PathBuf> {
+    let mut v: Vec<(std::time::SystemTime, PathBuf)> = Agent::ALL
+        .into_iter()
+        .flat_map(Agent::all_transcripts)
+        .collect();
     v.sort_by_key(|x| std::cmp::Reverse(x.0));
     v.into_iter().map(|(_, p)| p).collect()
 }

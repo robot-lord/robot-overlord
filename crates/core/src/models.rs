@@ -128,24 +128,6 @@ pub fn check(agent: &str, configured: Option<&str>, observed: Option<&str>) -> F
     out
 }
 
-/// The model of the last assistant turn in a Claude transcript (JSONL),
-/// reading only the file's tail.
-pub fn observed_claude_model(transcript: &std::path::Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(transcript).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(512 * 1024);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    text.lines().rev().find_map(|line| {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        let m = v.get("message")?.get("model")?.as_str()?;
-        m.starts_with("claude").then(|| m.to_string())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use rlord_core::agents::{transcript, Agent};
 use rlord_core::config::Config;
 use rlord_core::timefmt::{fmt_ts, rel_age};
-use rlord_core::{agents::claude, paths, tmux};
+use rlord_core::{paths, tmux};
 use rlord_daemon::{autostart, client_call, methods, spool_hook_event, Daemon};
 
 #[derive(Parser)]
@@ -33,7 +34,7 @@ enum Command {
     Search {
         #[arg(required = true)]
         words: Vec<String>,
-        /// Also Claude Code conversations started outside rlord
+        /// Also agent conversations (Claude Code, Codex) started outside rlord
         #[arg(long)]
         everywhere: bool,
         /// Sessions to show
@@ -54,7 +55,8 @@ enum Command {
         json: bool,
     },
     /// List sessions. QUERY uses the search syntax: free words match
-    /// name/project/group/tag; `status:waiting` `tag:wip` `proj:x` `agent:x`
+    /// name/project/group/tag; `status:needs` (needs you) `status:turn` (your
+    /// turn) `tag:wip` `proj:x` `agent:x`
     /// `group:x` `sort:user` set filters.
     Ls {
         query: Vec<String>,
@@ -64,7 +66,9 @@ enum Command {
         /// Show live and archived sessions
         #[arg(long)]
         all: bool,
-        /// Filter by status (comma-separated: working,idle,waiting_input,stopped,error,starting)
+        /// Filter by status (comma-separated: working, needs-you, your-turn,
+        /// stopped, error, starting; the stored names waiting_input and idle
+        /// work too)
         #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// Filter by tag
@@ -103,9 +107,13 @@ enum Command {
         /// Branch / workspace name (default: derived from the session name)
         #[arg(long)]
         branch: Option<String>,
-        /// Model passed to the agent (default: [session].model)
+        /// Model passed to the agent (default: [session].model, or
+        /// codex_model for Codex)
         #[arg(long)]
         model: Option<String>,
+        /// Coding agent to run: claude or codex (default: [session].agent)
+        #[arg(long)]
+        agent: Option<String>,
         /// Display name (default: <repo>-<id suffix>)
         #[arg(long)]
         name: Option<String>,
@@ -196,9 +204,21 @@ enum Command {
     Show {
         r#ref: String,
     },
-    /// List the sub-agents a session has spawned
+    /// The coding agents on this machine (Claude Code, Codex, OpenCode):
+    /// installed? rlord's hooks in place? and how to install one that's
+    /// missing
     Agents {
+        /// (Moved: `rlord subagents <session>`.)
+        #[arg(hide = true)]
+        r#ref: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the sub-agents a session has spawned
+    Subagents {
         r#ref: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Show a session's event log
     Log {
@@ -247,7 +267,13 @@ enum Command {
     Hook(HookCmd),
     /// Claude Code integration management
     #[command(subcommand)]
-    Claude(ClaudeCmd),
+    Claude(AgentCmd),
+    /// Codex integration management
+    #[command(subcommand)]
+    Codex(AgentCmd),
+    /// Install rlord's hook handler for every agent that is installed
+    /// (Claude Code, Codex): how rlord sees what each session is doing
+    InstallHooks,
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
@@ -365,8 +391,10 @@ enum HookCmd {
 }
 
 #[derive(Subcommand)]
-enum ClaudeCmd {
-    /// Install rlord's hook handler into Claude Code's settings.json
+enum AgentCmd {
+    /// Install rlord's hook handler into the agent's hooks (Claude Code's
+    /// settings.json, Codex's hooks.json): how rlord sees what its
+    /// sessions are doing
     InstallHooks,
 }
 
@@ -672,6 +700,7 @@ fn main() -> Result<()> {
             no_workspace,
             branch,
             model,
+            agent,
             name,
             attach,
         } => {
@@ -699,7 +728,7 @@ fn main() -> Result<()> {
                 "session.new",
                 json!({
                     "repo": repo, "project": project, "name": name, "prompt": prompt,
-                    "branch": branch, "model": model,
+                    "branch": branch, "model": model, "agent": agent,
                     "workspace": if no_workspace { Some(false) } else { None },
                 }),
             )?;
@@ -853,9 +882,32 @@ fn main() -> Result<()> {
             println!("notes saved");
             Ok(())
         }
-        Command::Agents { r#ref } => {
-            let r = call("session.subagents", json!({"ref": r#ref}))?;
-            print_agents(&r);
+        Command::Agents {
+            r#ref: Some(r),
+            json,
+        }
+        | Command::Subagents { r#ref: r, json } => {
+            // (`rlord agents <session>` was this before `rlord agents`
+            // listed the coding agents.)
+            if std::env::args().nth(1).as_deref() == Some("agents") {
+                eprintln!("note: sub-agents moved to `rlord subagents {r}`");
+            }
+            let r = call("session.subagents", json!({"ref": r}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print_agents(&r);
+            }
+            Ok(())
+        }
+        Command::Agents { r#ref: None, json } => {
+            // Asked of the daemon: its PATH is the one sessions launch with.
+            let r = call("agents.list", json!({}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print_coding_agents(&r);
+            }
             Ok(())
         }
         Command::Remote {
@@ -945,7 +997,7 @@ fn main() -> Result<()> {
             };
             println!("{} ({})", g("name"), g("id"));
             println!(
-                "  agent      {} · model {} · status {}",
+                "  agent      {} · model {} · {}",
                 g("agent"),
                 g("model"),
                 g("status")
@@ -985,21 +1037,62 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Hook(HookCmd::Emit { agent }) => hook_emit(&agent),
-        Command::Claude(ClaudeCmd::InstallHooks) => {
-            let settings = claude::config_dir().join("settings.json");
-            let changed = claude::install_hooks(&settings, &methods::hook_command())?;
-            println!(
-                "{} ({})",
-                if changed {
-                    "hooks installed"
-                } else {
-                    "hooks already installed"
-                },
-                settings.display()
-            );
-            Ok(())
+        Command::Claude(AgentCmd::InstallHooks) => install_hooks(&[Agent::Claude]),
+        Command::Codex(AgentCmd::InstallHooks) => install_hooks(&[Agent::Codex]),
+        Command::InstallHooks => {
+            let found: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.installed()).collect();
+            if found.is_empty() {
+                anyhow::bail!("neither `claude` nor `codex` is on PATH: `rlord agents` shows how to install one");
+            }
+            install_hooks(&found)
         }
     }
+}
+
+/// Merge rlord's hook command into each agent's hooks file, and say what
+/// the user still has to do (Codex: trust them).
+fn install_hooks(agents: &[Agent]) -> Result<()> {
+    let bin = methods::rlord_bin();
+    for (i, agent) in agents.iter().enumerate() {
+        let changed = agent.install_hooks(&bin)?;
+        if agents.len() > 1 {
+            if i > 0 {
+                println!();
+            }
+            println!("{}:", agent.label());
+        }
+        println!(
+            "{} ({})",
+            if changed {
+                "hooks installed"
+            } else {
+                "hooks already installed"
+            },
+            agent.hooks_file().display()
+        );
+        match agent {
+            Agent::Codex => {
+                let trusted = rlord_core::agents::install::codex_hooks_trusted(
+                    &rlord_core::agents::codex::home(),
+                );
+                if trusted == Some(true) && !changed {
+                    println!("trusted in Codex: yes");
+                } else {
+                    if changed {
+                        println!(
+                            "\nrlord's hooks are new or changed: Codex needs you to trust them \
+                             (again, if you had before)."
+                        );
+                    }
+                    if let Some(next) = agent.hooks_next_step() {
+                        println!("\n{next}");
+                    }
+                }
+            }
+            Agent::Claude => {}
+        }
+    }
+    Ok(())
 }
 
 fn tmux_import(dry_run: bool, remove: bool) -> Result<()> {
@@ -1144,7 +1237,7 @@ fn import_cmd(
                 rel_age(c["last_active_at"].as_i64()),
                 dir,
                 flags,
-                claude::clip(what, 100),
+                transcript::clip(what, 100),
             );
         }
         println!(
@@ -1385,6 +1478,11 @@ fn run_daemon() -> Result<()> {
         // Restart an idle mastermind on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
         rlord_daemon::remote::start(&daemon);
+        // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
+        rlord_daemon::discover::start(&daemon);
+        // Where each agent's command is (may ask the login shell): known
+        // before the first launch needs it.
+        std::thread::spawn(rlord_core::agents::install::warm);
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;
@@ -1411,9 +1509,11 @@ fn hook_emit(agent: &str) -> Result<()> {
     let Ok(instance) = std::env::var("RLORD_SESSION_ID") else {
         return Ok(()); // not an rlord-managed session
     };
-    let mut raw = String::new();
-    std::io::stdin().take(1 << 20).read_to_string(&mut raw).ok();
-    let payload: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+    // Only what rlord uses goes on (not a tool's whole input and output);
+    // stdin cut off at the limit still yields the event's name.
+    let mut raw = Vec::new();
+    std::io::stdin().take(1 << 20).read_to_end(&mut raw).ok();
+    let payload = rlord_daemon::slim_hook_payload(&String::from_utf8_lossy(&raw));
     let event = payload
         .get("hook_event_name")
         .and_then(Value::as_str)
@@ -1428,7 +1528,10 @@ fn hook_emit(agent: &str) -> Result<()> {
         .and_then(|t| t.split(',').next().map(str::to_string));
     let params = json!({"instance": instance, "agent": agent, "event": event,
                         "payload": payload, "pane": pane, "tmux": socket});
-    if client_call(&paths::socket_path(), "hook.emit", params.clone()).is_err() {
+    // Bounded: a stalled daemon never holds up the agent's tool call.
+    if rlord_daemon::send_hook_event(&paths::socket_path(), &params)
+        == rlord_daemon::HookSent::Unreachable
+    {
         spool_hook_event(&params).ok();
     }
     Ok(())
@@ -1620,6 +1723,59 @@ fn attach_tmux(tmux_name: &str) -> Result<()> {
     Err(err).context("exec tmux failed")
 }
 
+/// `rlord agents`: one block per coding agent.
+fn print_coding_agents(v: &Value) {
+    for a in v["agents"].as_array().into_iter().flatten() {
+        let yes_no = |k: &str| match a[k].as_bool() {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        };
+        let state = if a["installed"] == true {
+            a["version"].as_str().unwrap_or("installed").to_string()
+        } else {
+            "not installed".to_string()
+        };
+        println!(
+            "{:<12} {state}{}",
+            a["label"].as_str().unwrap_or("?"),
+            if a["supported"] == false {
+                "  (rlord support coming)"
+            } else {
+                ""
+            }
+        );
+        if a["hooks_outdated"] == true {
+            println!("  rlord hooks: out of date — run `rlord install-hooks` again");
+        } else if a["installed"] == true && a["supported"] == true {
+            let trusted = match a["hooks_trusted"].as_bool() {
+                Some(_) => format!(" · trusted in Codex: {}", yes_no("hooks_trusted")),
+                None => String::new(),
+            };
+            println!("  rlord hooks: {}{trusted}", yes_no("hooks_installed"));
+        }
+        if let Some(cmd) = a["install"]["command"].as_str() {
+            println!("  to install it, run:  {cmd}");
+            for alt in a["install"]["alternatives"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "    or ({}):  {}",
+                    alt["via"].as_str().unwrap_or("?"),
+                    alt["command"].as_str().unwrap_or("?")
+                );
+            }
+            println!("    more: {}", a["install"]["docs"].as_str().unwrap_or(""));
+        }
+        if let Some(next) = a["next"].as_str().filter(|_| a["installed"] == true) {
+            println!("  next: {next}");
+        }
+    }
+    println!("\nrlord never installs an agent for you. After installing one: rlord install-hooks");
+}
+
 fn print_agents(list: &Value) {
     let Some(rows) = list.as_array() else {
         return;
@@ -1692,7 +1848,7 @@ fn print_session_table(list: &Value) {
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
-            get("status"),
+            rlord_core::types::Status::label_of(get("status")),
             rel_age(
                 [
                     "last_agent_msg_at",

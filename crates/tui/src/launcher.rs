@@ -91,6 +91,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
 ];
 
 impl Launcher {
+    /// Highlight the `i`th match (a click on it).
+    pub(crate) fn select(&mut self, i: usize) {
+        self.sel = i;
+    }
+
     /// Commands matching what's typed: every word a substring of the name
     /// or what it does; names that start with it first.
     fn matches(&self) -> Vec<usize> {
@@ -199,6 +204,9 @@ impl App {
             height: (rows + 2).min(a.height),
         };
         f.render_widget(Clear, area);
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
+        let inner = theme::modal("Commands").inner(area);
         let sel = l.sel.min(m.len().saturating_sub(1));
         let lines: Vec<Line> = if m.is_empty() {
             vec![Line::styled("no matching command", theme::muted())]
@@ -207,7 +215,11 @@ impl App {
                 .enumerate()
                 .skip(sel.saturating_sub(rows as usize - 1))
                 .take(rows as usize)
-                .map(|(j, &i)| {
+                .enumerate()
+                .map(|(row, (j, &i))| {
+                    // Click it to run it.
+                    self.hits
+                        .row(inner, inner.y + row as u16, mouse::Hit::Pick(j));
                     let (n, d, _) = COMMANDS[i];
                     let name = Span::styled(format!("{n:<14}"), Style::default().bold());
                     let about = Span::styled(d.to_string(), theme::muted());
@@ -309,6 +321,31 @@ impl App {
             head("Commands"),
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
+            Line::from(""),
+            head("Mouse"),
+            Line::styled(
+                "  click selects · double-click attaches · right-click: menu",
+                theme::muted(),
+            ),
+            Line::styled(
+                "  keycaps, tabs and fields are clickable; the wheel scrolls",
+                theme::muted(),
+            ),
+            Line::from(""),
+            head("Agents"),
+            Line::from({
+                // Each agent's marker in the list, then its name.
+                let mut l = vec![Span::raw("  ")];
+                for t in &rlord_core::agents::install::TOOLS {
+                    l.extend(theme::agent_marker(t.name));
+                    l.push(Span::styled(format!("{}   ", t.label), theme::muted()));
+                }
+                l
+            }),
+            Line::from(""),
+            head("Status"),
+            row("needs you".into(), "blocked on a prompt or question"),
+            row("your turn".into(), "finished: the next prompt is yours"),
         ];
         // Side by side when wide, else stacked (both heights).
         let wide = f.area().width >= 84;
@@ -320,6 +357,9 @@ impl App {
             + 3;
         let area = newform::centered(f.area(), 96, h);
         f.render_widget(Clear, area);
+        // A click anywhere closes it, as any key does.
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
         let block = theme::modal("Help");
         let inner = block.inner(area);
         f.render_widget(block, area);

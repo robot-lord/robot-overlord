@@ -18,6 +18,7 @@ use ratatui::{DefaultTerminal, Frame};
 mod groups;
 mod keyscreen;
 mod launcher;
+mod mouse;
 mod newform;
 mod overlay;
 mod overlord;
@@ -53,12 +54,21 @@ pub fn run(config: Config) -> Result<()> {
 /// it ignore the request; Shift-Enter then reads as Enter.
 fn init_terminal() -> DefaultTerminal {
     let t = ratatui::init();
+    // The mouse: clicks and the wheel reach the list (see mouse.rs).
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
     let _ = write!(std::io::stdout(), "\x1b[>4;1m");
     let _ = std::io::stdout().flush();
     t
 }
 
 fn restore_terminal() {
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    );
     let _ = write!(std::io::stdout(), "\x1b[>4;0m");
     let _ = std::io::stdout().flush();
     ratatui::restore();
@@ -129,6 +139,10 @@ enum Mode {
     Command(Box<launcher::Launcher>),
     /// The key screen (`:keys`, or the overlord's `open_keys`).
     Keys(Box<keyscreen::KeyScreen>),
+    /// The right-click menu of a row or a group.
+    Menu(Box<mouse::Menu>),
+    /// "Stop web-fix?", before a click does something hard to undo.
+    Confirm(Box<mouse::Confirm>),
 }
 
 struct App {
@@ -187,6 +201,16 @@ struct App {
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
     reported_view: Value,
+    /// What is where on screen, rebuilt each frame (see mouse.rs).
+    hits: mouse::Hits,
+    /// The last left click, for telling a double-click.
+    last_click: Option<(Instant, String)>,
+    /// Preview: lines scrolled up from the bottom (0: following the end),
+    /// how far it can go (set when drawn), and the text's length when last
+    /// loaded (so new output doesn't move a scrolled view).
+    preview_scroll: usize,
+    preview_scroll_max: std::cell::Cell<usize>,
+    preview_len: usize,
 }
 
 impl App {
@@ -225,6 +249,11 @@ impl App {
             pending_select: None,
             saved_sel: None,
             reported_view: Value::Null,
+            hits: Default::default(),
+            last_click: None,
+            preview_scroll: 0,
+            preview_scroll_max: Default::default(),
+            preview_len: 0,
         }
     }
 
@@ -340,7 +369,17 @@ impl App {
                 ("any key", "stay", Cap::Global),
             ]),
         ];
+        self.modal_hits(f.area(), area, &lines);
         f.render_widget(Paragraph::new(lines).block(theme::modal("Quit")), area);
+    }
+
+    /// For the mouse: a modal drawn in `area` over the screen, its text
+    /// `lines` starting inside the border and padding. Nothing under it
+    /// can be clicked; its keycaps can.
+    pub(crate) fn modal_hits(&self, screen: Rect, area: Rect, lines: &[Line]) {
+        self.hits.add(screen, mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
+        self.hits.keycaps(area.x + 2, area.y + 1, lines);
     }
 
     fn selected_is_overlord(&self) -> bool {
@@ -366,6 +405,10 @@ impl App {
     fn refresh_preview(&mut self) {
         self.last_preview = Instant::now();
         self.preview_due = None;
+        // Another session: its preview starts at the end again.
+        if self.preview_for != self.selected_id() {
+            self.preview_scroll = 0;
+        }
         self.preview_for = self.selected_id();
         // Remember where the user is (once the highlight settles), so a
         // restarted list comes back to it.
@@ -454,6 +497,15 @@ impl App {
                 }
             }
         };
+        // Scrolled up: new output arrives below, the view stays where it is.
+        let len = match &self.preview_rich {
+            Some(rich) => rich.lines.len(),
+            None => self.preview_text.lines().count(),
+        };
+        if self.preview_scroll > 0 {
+            self.preview_scroll += len.saturating_sub(self.preview_len);
+        }
+        self.preview_len = len;
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -477,60 +529,15 @@ impl App {
                 tick = tick.min(due.saturating_duration_since(Instant::now()));
             }
             if event::poll(tick)? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
+                let quit = match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        self.handle_key(k, terminal)?
                     }
-                    // Quitting rlord takes the real quit key; the reflexive
-                    // ones (Ctrl-C, and q in the list) just say what it is.
-                    let listening = matches!(&self.mode, Mode::Keys(ks) if ks.listening());
-                    if !listening
-                        && k.modifiers.contains(KeyModifiers::CONTROL)
-                        && k.code == KeyCode::Char('c')
-                    {
-                        self.quit_hint();
-                        continue;
-                    }
-                    match std::mem::replace(&mut self.mode, Mode::Normal) {
-                        Mode::Normal => {
-                            if self.handle_normal(k, terminal)? {
-                                return Ok(());
-                            }
-                        }
-                        Mode::Filter(buf) => {
-                            self.handle_input(k, buf, InputKind::Filter, terminal)?
-                        }
-                        Mode::Rename(buf) => {
-                            self.handle_input(k, buf, InputKind::Rename, terminal)?
-                        }
-                        Mode::Describe(buf) => {
-                            self.handle_input(k, buf, InputKind::Describe, terminal)?
-                        }
-                        Mode::Tags(buf) => self.handle_input(k, buf, InputKind::Tags, terminal)?,
-                        Mode::RenameGroup(buf) => {
-                            self.handle_input(k, buf, InputKind::RenameGroup, terminal)?
-                        }
-                        Mode::NewSession(form) => {
-                            if let Some(form) = self.handle_form(k, form, terminal)? {
-                                self.mode = Mode::NewSession(form);
-                            }
-                        }
-                        Mode::OverlordSetup(s) => self.handle_setup(k, s),
-                        Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
-                        Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
-                        Mode::Help => {}
-                        Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
-                        Mode::Keys(ks) => self.handle_keys(k, ks),
-                        Mode::ConfirmQuit => {
-                            if matches!(
-                                k.code,
-                                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
-                            ) {
-                                return Ok(());
-                            }
-                            self.status_line.clear();
-                        }
-                    }
+                    Event::Mouse(m) => self.handle_mouse(m, terminal)?,
+                    _ => false,
+                };
+                if quit {
+                    return Ok(());
                 }
             }
             // Daemon pushes: coalesce everything queued into one refresh.
@@ -545,6 +552,52 @@ impl App {
                 self.dirty = true;
             }
         }
+    }
+
+    /// One key press, in whatever mode the list is in (a click on something
+    /// that names a key comes through here too). Returns true to quit.
+    fn handle_key(&mut self, k: KeyEvent, terminal: &mut DefaultTerminal) -> Result<bool> {
+        // Quitting rlord takes the real quit key; the reflexive
+        // ones (Ctrl-C, and q in the list) just say what it is.
+        let listening = matches!(&self.mode, Mode::Keys(ks) if ks.listening());
+        if !listening && k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c')
+        {
+            self.quit_hint();
+            return Ok(false);
+        }
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Normal => return self.handle_normal(k, terminal),
+            Mode::Filter(buf) => self.handle_input(k, buf, InputKind::Filter, terminal)?,
+            Mode::Rename(buf) => self.handle_input(k, buf, InputKind::Rename, terminal)?,
+            Mode::Describe(buf) => self.handle_input(k, buf, InputKind::Describe, terminal)?,
+            Mode::Tags(buf) => self.handle_input(k, buf, InputKind::Tags, terminal)?,
+            Mode::RenameGroup(buf) => {
+                self.handle_input(k, buf, InputKind::RenameGroup, terminal)?
+            }
+            Mode::NewSession(form) => {
+                if let Some(form) = self.handle_form(k, form, terminal)? {
+                    self.mode = Mode::NewSession(form);
+                }
+            }
+            Mode::OverlordSetup(s) => self.handle_setup(k, s),
+            Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
+            Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+            Mode::Help => {}
+            Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
+            Mode::Keys(ks) => self.handle_keys(k, ks),
+            Mode::Menu(m) => return self.handle_menu(k, m, terminal),
+            Mode::Confirm(c) => return self.handle_confirm(k, *c, terminal),
+            Mode::ConfirmQuit => {
+                if matches!(
+                    k.code,
+                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
+                ) {
+                    return Ok(true);
+                }
+                self.status_line.clear();
+            }
+        }
+        Ok(false)
     }
 
     /// Returns true to quit.
@@ -1023,6 +1076,8 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        // What is where, for the mouse: rebuilt as the frame is drawn.
+        self.hits.clear();
         // Themes with their own background paint it under everything.
         if theme::bg().is_some() {
             f.render_widget(Block::default().style(theme::base()), f.area());
@@ -1090,6 +1145,8 @@ impl App {
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
             Mode::Keys(ks) => self.draw_keys(f, ks),
+            Mode::Menu(m) => self.draw_menu(f, m),
+            Mode::Confirm(c) => self.draw_confirm(f, c),
             _ => {}
         }
     }
@@ -1179,11 +1236,16 @@ impl App {
                     } else {
                         Cell::from(" ")
                     },
-                    Cell::from(if is_mastermind {
-                        format!("↳ {}", get("name"))
-                    } else {
-                        get("name")
-                    }),
+                    // Which agent runs it (its marker), then its name.
+                    Cell::from(Line::from({
+                        let mut spans = theme::agent_marker(s["agent"].as_str().unwrap_or(""));
+                        spans.push(Span::raw(if is_mastermind {
+                            format!("↳ {}", get("name"))
+                        } else {
+                            get("name")
+                        }));
+                        spans
+                    })),
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
@@ -1267,6 +1329,20 @@ impl App {
             ))
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
         f.render_stateful_widget(table, area, &mut self.table);
+        // For the mouse: the table (wheel), then each visible row. Rows
+        // start under the border, the header and its margin.
+        self.hits.add(area, mouse::Hit::List);
+        let inner = Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(2),
+            y: area.y + 3,
+            height: area.height.saturating_sub(4),
+        };
+        let top = self.table.offset();
+        for i in top..self.sessions.len().min(top + inner.height as usize) {
+            self.hits
+                .row(inner, inner.y + (i - top) as u16, mouse::Hit::Row(i));
+        }
     }
 
     /// Archived sessions are a record: they open again only once unarchived.
@@ -1296,24 +1372,50 @@ impl App {
             Span::styled(name.to_string(), Style::default().fg(theme::text()).bold()),
             Span::styled(format!(" · {what} "), theme::muted()),
         ]);
-        let switch =
-            Line::from(Span::styled(format!(" {log} {other} "), theme::faint())).right_aligned();
-        // Show the tail that fits: the bottom of a pane is what matters.
+        let switch = Line::from(vec![
+            // Scrolled up with the wheel: say so (it no longer follows).
+            Span::styled(
+                if self.preview_scroll > 0 {
+                    " ↑ scrolled "
+                } else {
+                    ""
+                },
+                Style::default().fg(theme::yellow()),
+            ),
+            Span::styled(format!(" {log} {other} "), theme::faint()),
+        ])
+        .right_aligned();
+        use unicode_width::UnicodeWidthStr;
+        // The pane/log switch in the title, and the wheel over the pane.
+        self.hits.add(area, mouse::Hit::Preview);
+        if let Some(k) = self.keys.event(Action::ToggleLog) {
+            let w = (log.width() + other.width() + 3) as u16;
+            self.hits.add(
+                Rect::new(area.right().saturating_sub(w + 1), area.y, w, 1),
+                mouse::Hit::Key(k),
+            );
+        }
+        // Show the tail that fits: the bottom of a pane is what matters
+        // (the wheel scrolls back from it).
         let inner_h = area.height.saturating_sub(2) as usize;
+        let window = |len: usize| {
+            let max = len.saturating_sub(inner_h);
+            self.preview_scroll_max.set(max);
+            let start = max - self.preview_scroll.min(max);
+            start..(start + inner_h).min(len)
+        };
         // Loaded for another row (the highlight is moving): show nothing
         // rather than the wrong session's screen.
         let current = self.preview_for == self.selected_id();
         let text: Text = match &self.preview_rich {
             _ if !current => Text::from(Span::styled("…", theme::faint())),
             Some(rich) if self.preview == Preview::Pane => {
-                let start = rich.lines.len().saturating_sub(inner_h);
-                Text::from(rich.lines[start..].to_vec())
+                Text::from(rich.lines[window(rich.lines.len())].to_vec())
             }
             _ => {
                 let lines: Vec<&str> = self.preview_text.lines().collect();
-                let start = lines.len().saturating_sub(inner_h);
                 Text::from(
-                    lines[start..]
+                    lines[window(lines.len())]
                         .iter()
                         .map(|l| Line::raw(*l))
                         .collect::<Vec<_>>(),
@@ -1402,17 +1504,21 @@ impl App {
                 key("folder"),
                 Span::styled(tilde(&get("project_path")), theme::muted()),
             ]),
-            Line::from(vec![
-                key("agent"),
-                Span::styled(get("agent"), Style::default().fg(theme::text())),
-                sep(),
-                Span::styled(
-                    s["model"].as_str().unwrap_or("default model").to_string(),
-                    Style::default().fg(theme::text()),
-                ),
-                sep(),
-                Span::styled(format!("id {}", get("id")), theme::faint()),
-            ]),
+            Line::from({
+                let mut l = vec![key("agent")];
+                l.extend(theme::agent_marker(&get("agent")));
+                l.extend([
+                    Span::styled(get("agent"), Style::default().fg(theme::text())),
+                    sep(),
+                    Span::styled(
+                        s["model"].as_str().unwrap_or("default model").to_string(),
+                        Style::default().fg(theme::text()),
+                    ),
+                    sep(),
+                    Span::styled(format!("id {}", get("id")), theme::faint()),
+                ]);
+                l
+            }),
             Line::from(vec![
                 key("activity"),
                 Span::styled(
@@ -1534,7 +1640,7 @@ impl App {
         let prompt = match &self.mode {
             Mode::Normal => None,
             Mode::Filter(b) => Some(format!(
-                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:/tag:/proj:)"
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working · tag: · proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),
@@ -1557,6 +1663,8 @@ impl App {
                 l.buf
             )),
             Mode::Keys(_) => Some("keys — see the key screen".to_string()),
+            // The menu sits over the list; the footer stays as it is.
+            Mode::Menu(_) | Mode::Confirm(_) => None,
         };
         let line2 = if self.status_line.is_empty() {
             Line::raw("")
@@ -1597,21 +1705,39 @@ impl App {
         }
         // Keys that always work sit on the left; keys for what's highlighted
         // sit on the right after a divider, and only the ones that apply.
+        // Each keycap, with its label, is also something to click: it
+        // presses that key.
+        let press = |a: Action| self.keys.event(a).map(mouse::Hit::Key);
+        let mut global_hits = Vec::new();
         let global = Line::from(
             self.keys
                 .global_legend()
                 .into_iter()
-                .flat_map(|(k, label)| keycap(&k, label, Cap::Global))
+                .flat_map(|(a, label)| {
+                    let cap = keycap(&self.keys.label(a), label, Cap::Global);
+                    global_hits.extend(keycap_hits(&cap, press(a)));
+                    cap
+                })
                 .collect::<Vec<_>>(),
         );
-        let mut ctx = self.keys.labelled(&context_legend(
+        let mut ctx: Vec<(String, &'static str, Option<mouse::Hit>)> = context_legend(
             self.tab == Tab::Groups && self.group_focus,
             self.group_sel.as_deref(),
             self.selected(),
-        ));
+        )
+        .into_iter()
+        .map(|(a, label)| (self.keys.label(a), label, press(a)))
+        .collect();
         // Inside a group, say how to get back out.
         if self.tab == Tab::Groups && !self.group_focus {
-            ctx.insert(0, (self.keys.label(Action::Cancel), "groups"));
+            ctx.insert(
+                0,
+                (
+                    self.keys.label(Action::Cancel),
+                    "groups",
+                    press(Action::Cancel),
+                ),
+            );
         }
         // On the group list: favourite it, and reorder favourites.
         if self.tab == Tab::Groups && self.group_focus {
@@ -1620,9 +1746,10 @@ impl App {
                 ctx.push((
                     self.keys.label(Action::Pin),
                     if fav { "unfavourite" } else { "favourite" },
+                    press(Action::Pin),
                 ));
                 if fav {
-                    ctx.push(("J/K".into(), "reorder"));
+                    ctx.push(("J/K".into(), "reorder", None));
                 }
             }
         }
@@ -1639,9 +1766,36 @@ impl App {
             [Constraint::Length(global_w), Constraint::Min(0)]
         };
         let [left, right] = RLayout::horizontal(constraints).areas(line1_area);
+        self.hits.spans(left.x, left.y, global_hits);
+        // (After the divider, "│  ".)
+        let mut ctx_hits = vec![(3, None)];
+        let ctx_line = context_line(
+            ctx.into_iter()
+                .map(|(k, label, hit)| {
+                    ctx_hits.extend(keycap_hits(&keycap(&k, label, Cap::Context), hit));
+                    (k, label)
+                })
+                .collect(),
+        );
+        self.hits.spans(right.x, right.y, ctx_hits);
         f.render_widget(Paragraph::new(global), left);
-        f.render_widget(Paragraph::new(context_line(ctx)), right);
+        f.render_widget(Paragraph::new(ctx_line), right);
     }
+}
+
+/// A keycap's two spans as hit parts: the chip and its label press the
+/// key; the gap after the label doesn't.
+fn keycap_hits(
+    cap: &[Span<'static>; 2],
+    hit: Option<mouse::Hit>,
+) -> [(u16, Option<mouse::Hit>); 3] {
+    use unicode_width::UnicodeWidthStr;
+    let label = cap[1].content.trim_end().width() as u16;
+    [
+        (cap[0].width() as u16, hit.clone()),
+        (label, hit),
+        (cap[1].width() as u16 - label, None),
+    ]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1919,6 +2073,18 @@ impl KeyBinding {
         }
     }
 
+    /// The key press this binding answers to.
+    fn event(&self) -> KeyEvent {
+        let mut mods = KeyModifiers::NONE;
+        if self.ctrl {
+            mods |= KeyModifiers::CONTROL;
+        }
+        if self.alt {
+            mods |= KeyModifiers::ALT;
+        }
+        KeyEvent::new(self.code, mods)
+    }
+
     fn label(&self) -> String {
         let name = match self.code {
             KeyCode::Char(' ') => "space".to_string(),
@@ -2022,18 +2188,27 @@ impl KeyMap {
             .unwrap_or_default()
     }
 
+    /// The key press that runs an action (a click on its keycap sends
+    /// it); None when the action has no key.
+    fn event(&self, a: Action) -> Option<KeyEvent> {
+        self.bindings
+            .iter()
+            .find(|(x, _)| *x == a)
+            .map(|(_, b)| b.event())
+    }
+
     /// Keys that work whatever is highlighted.
-    fn global_legend(&self) -> Vec<(String, &'static str)> {
+    fn global_legend(&self) -> Vec<(Action, &'static str)> {
         // The everyday keys only: the rest are on the cheat sheet (`?`)
         // and in the launcher (`:`).
-        self.labelled(&[
+        vec![
             (Action::Overlord, "overlord"),
             (Action::SwitchTab, "sessions/groups"),
             (Action::New, "new"),
             (Action::Command, "commands"),
             (Action::Help, "help"),
             (Action::Quit, "quit"),
-        ])
+        ]
     }
 
     /// Width of the footer's right slot: the widest row-key set any row can
@@ -2101,7 +2276,12 @@ fn context_legend(
     }
     // Resuming (Enter on a stopped row) and restarting both need a
     // conversation the agent can resume.
-    let resumable = s["agent"] == "claude" && !s["agent_session"].is_null();
+    // (A Codex session gets its conversation id only once Codex reports
+    // it; until then there is nothing to resume.)
+    let known = s["agent"]
+        .as_str()
+        .is_some_and(|a| rlord_core::agents::Agent::parse(a).is_some());
+    let resumable = known && !s["agent_session"].is_null();
     let mut v = Vec::new();
     if !stopped {
         v.push((Action::Attach, "attach"));

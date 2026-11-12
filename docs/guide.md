@@ -107,6 +107,43 @@ first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
 `rlord repos` lists known repos.
 
+## Codex sessions
+
+A session runs on Claude Code or on the Codex CLI. Pick per session: the
+`Agent` hint in the new-session form, "start a Codex session to …" to the
+overlord, or `rlord new --agent codex`. `[session] agent` sets the default,
+`codex_model` Codex's default model (empty: Codex's own); the model picker
+offers Codex's own model list.
+
+No Codex yet? `rlord agents` (or asking the overlord, or picking Codex in
+the form) gives the install command for your machine to run yourself;
+rlord doesn't install agents. Sessions run inline (`--no-alt-screen`), so
+tmux scrollback and copy-mode search work as they do for Claude.
+
+Set up once:
+
+```sh
+rlord codex install-hooks    # or `rlord install-hooks` for every agent
+```
+
+then start `codex`, type `/hooks`, and trust the `rlord hook emit codex`
+entries. Codex runs a hook only after you've trusted it. Until you do,
+Codex sessions still work: rlord finds each conversation in Codex's own
+index and reads working / your turn from its transcript, a few seconds
+late and without "needs you".
+
+What works: launch, attach, stop, resume (`codex resume`), fresh
+conversation, status, the list and its `agent:codex` filter, preview,
+search and history (also over Codex conversations started outside rlord,
+with `--everywhere`), triage excerpts, archive summaries (written by Codex
+itself, read-only and without saving anything; `[archive]
+codex_summary_model`).
+
+Not yet: the overlord and mastermind on Codex, importing Codex
+conversations started outside rlord, passing a message to a Codex session
+from the overlord, sub-agent tracking, Remote Control. A session blocked
+on a permission prompt shows "needs you" only with trusted hooks.
+
 ## The right-hand side: preview + details
 
 The preview is the session's live pane, in colour (captured with ANSI
@@ -122,7 +159,7 @@ keeps its width and the preview drops out first when the terminal is narrow.
 / `SubagentStop` hooks plus the per-agent `meta.json` and transcript Claude
 writes under `~/.claude/projects/<slug>/<session>/subagents/`. The details
 card lists each one (type, description, running/done + duration, result line,
-tokens); the session list shows `⚙N` while any are running; `rlord agents
+tokens); the session list shows `⚙N` while any are running; `rlord subagents
 <ref>` prints them. Sessions that ran before the hooks existed are backfilled
 from disk on first view.
 
@@ -303,6 +340,24 @@ counts look wrong.
 
 ## Navigation and keys
 
+**The mouse works everywhere a key does.** Click a row to select it,
+double-click to attach, right-click for its menu (the same actions as the
+footer, each with its key); the wheel moves through the list, the group
+column and the preview. Tabs, search, sort and live/archived in the header
+are clickable, as is every keycap in the footer and in dialogs, form
+fields and their choices, and the `:` launcher's items. rlord's tmux has
+mouse support on (`[tmux] mouse = false` turns it off), so in agent panes
+the wheel scrolls the pane's scrollback, and selecting text by dragging
+needs Shift held (Option in some macOS terminals). With `rlord tmux
+import`, your own `mouse` setting applies in agent sessions.
+
+A session's status means one thing: **working**; **needs you** (blocked
+mid-turn on a permission prompt or a question, until you answer); **your
+turn** (it finished; the next prompt is yours); **stopped**. Filter with
+`status:needs`, `status:turn`, `status:working`. Run `rlord install-hooks`
+again after updating rlord: "needs you" clearing when the agent moves on
+uses hooks added later (and Codex asks you to trust changed hooks again).
+
 The TUI is the hub. `enter` on a session switches your tmux client into its
 pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
 TUI. It's a home-row key, because you press it constantly. Stopped sessions
@@ -312,7 +367,7 @@ Jumping is search-driven, not cycling: `/` filters as you type and `Enter`
 attaches to the top match (`Tab` keeps the filter, ↑/↓ move within matches);
 digits `1`–`9` attach to the Nth listed session. The search box and
 `rlord ls <query>` share one syntax — free words match name/project/tag,
-and `status:waiting` `tag:wip` `proj:wait2` `agent:claude`
+and `status:needs` `tag:wip` `proj:wait2` `agent:claude`
 `sort:user` set typed filters. `o` cycles sorts, `O` reverses. (macOS: make
 Option send Alt, e.g. kitty `macos_option_as_alt both`.) Option-D and
 Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).

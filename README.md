@@ -89,12 +89,16 @@ distro).
 
 </details>
 
-**Requirements:** tmux 3.2+ and [Claude Code](https://claude.com/claude-code).
+**Requirements:** tmux 3.2+ and [Claude Code](https://claude.com/claude-code)
+(and, for Codex sessions, the Codex CLI). `rlord agents` shows which agents
+you have and the install command for one you don't; rlord never installs
+them itself.
 
 ## Getting started
 
 ```sh
-rlord claude install-hooks   # once: lets rlord see what Claude is doing
+rlord install-hooks          # once: lets rlord see what your agents are doing
+                             # (Claude Code, and Codex if it's installed)
 rlord                        # open the list
 ```
 
@@ -171,9 +175,11 @@ Homebrew and distro packages update the usual way.
 
 ## Status
 
-rlord is young and moves fast; it's used every day with Claude Code. Other
-agent CLIs (Codex, Gemini) are planned behind the same adapter, but Claude
-comes first.
+rlord is young and moves fast; it's used every day with Claude Code. Codex
+sessions run beside Claude's (launch, resume, status, search, summaries; see
+"Codex sessions" in [docs/guide.md](docs/guide.md) for what doesn't work
+yet); the overlord itself runs on Claude Code. Other agent CLIs are planned
+behind the same adapter.
 
 ## Contributing
 

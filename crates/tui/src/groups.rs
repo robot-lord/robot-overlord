@@ -297,63 +297,97 @@ impl App {
 
         // The toolbar, roomy, then tighter (narrow separators, no
         // placeholder words), then without keycaps: the first that fits.
-        let build = |tier: u8| -> Vec<Span<'static>> {
-            let key = |a: Action| -> Option<Span<'static>> { (tier < 2).then(|| key(a)) };
+        // Each piece is also something to click: a tab switches to it, a
+        // setting (with its keycap) presses the key that changes it.
+        type Piece = (Span<'static>, Option<mouse::Hit>);
+        let press = |a: Action| self.keys.event(a).map(mouse::Hit::Key);
+        let build = |tier: u8| -> Vec<Piece> {
+            let key = |a: Action| -> Option<Piece> { (tier < 2).then(|| (key(a), press(a))) };
             let sep = || {
-                Span::styled(
-                    if tier == 0 { "  │  " } else { " │ " },
-                    Style::default().fg(theme::border()),
+                (
+                    Span::styled(
+                        if tier == 0 { "  │  " } else { " │ " },
+                        Style::default().fg(theme::border()),
+                    ),
+                    None,
                 )
             };
-            let mut bar = vec![tab(Tab::Sessions), tab(Tab::Groups)];
+            let mut bar: Vec<Piece> = vec![
+                (tab(Tab::Sessions), Some(mouse::Hit::Tab(Tab::Sessions))),
+                (tab(Tab::Groups), Some(mouse::Hit::Tab(Tab::Groups))),
+            ];
             if let Some(k) = key(Action::SwitchTab) {
-                bar.push(Span::raw(" "));
+                bar.push((Span::raw(" "), None));
                 bar.push(k);
             }
             bar.push(sep());
-            bar.push(Span::styled("⌕ ", theme::muted()));
+            let search = press(Action::Filter);
+            bar.push((Span::styled("⌕ ", theme::muted()), search.clone()));
             if self.filter.trim().is_empty() {
                 if tier == 0 {
-                    bar.push(Span::styled("search ", theme::faint()));
+                    bar.push((Span::styled("search ", theme::faint()), search));
                 }
             } else {
-                bar.push(Span::styled(
-                    format!("{} ", self.filter),
-                    Style::default().fg(theme::yellow()).bold(),
+                bar.push((
+                    Span::styled(
+                        format!("{} ", self.filter),
+                        Style::default().fg(theme::yellow()).bold(),
+                    ),
+                    search,
                 ));
                 if let Some(k) = key(Action::Cancel) {
                     bar.push(k);
-                    bar.push(Span::styled(" clear ", theme::faint()));
+                    bar.push((
+                        Span::styled(" clear ", theme::faint()),
+                        press(Action::Cancel),
+                    ));
                 }
             }
             bar.extend(key(Action::Filter));
             bar.push(sep());
-            bar.push(Span::styled("⇅ ", theme::muted()));
-            bar.push(Span::styled(
-                format!(
-                    "{}{} ",
-                    self.sort.label(),
-                    if self.reverse { " ↑" } else { "" }
+            let sort = press(Action::Sort);
+            bar.push((Span::styled("⇅ ", theme::muted()), sort.clone()));
+            bar.push((
+                Span::styled(
+                    format!(
+                        "{}{} ",
+                        self.sort.label(),
+                        if self.reverse { " ↑" } else { "" }
+                    ),
+                    Style::default().fg(theme::text()),
                 ),
-                Style::default().fg(theme::text()),
+                sort,
             ));
             bar.extend(key(Action::Sort));
             bar.push(sep());
-            bar.push(Span::styled("◷ ", theme::muted()));
-            bar.push(if self.show_archived {
-                Span::styled("archived ", Style::default().fg(theme::yellow()).bold())
-            } else {
-                Span::styled("live ", Style::default().fg(theme::text()))
-            });
+            let archived = press(Action::ToggleArchived);
+            bar.push((Span::styled("◷ ", theme::muted()), archived.clone()));
+            bar.push((
+                if self.show_archived {
+                    Span::styled("archived ", Style::default().fg(theme::yellow()).bold())
+                } else {
+                    Span::styled("live ", Style::default().fg(theme::text()))
+                },
+                archived,
+            ));
             bar.extend(key(Action::ToggleArchived));
             bar
         };
         // Beside the 6-column logo and its gap.
         let room = area.width.saturating_sub(8) as usize;
-        let bar = (0..3)
+        let width = |b: &[Piece]| b.iter().map(|(s, _)| s.width()).sum::<usize>();
+        let pieces = (0..3)
             .map(build)
-            .find(|b| Line::from(b.clone()).width() <= room)
+            .find(|b| width(b) <= room)
             .unwrap_or_else(|| build(2));
+        // The toolbar is on the logo's last row (wide) or the one above.
+        let bar_row = if area.width >= 52 { 3 } else { 2 };
+        self.hits.spans(
+            area.x + 8,
+            area.y + bar_row,
+            pieces.iter().map(|(s, h)| (s.width() as u16, h.clone())),
+        );
+        let bar: Vec<Span<'static>> = pieces.into_iter().map(|(s, _)| s).collect();
 
         // The name, in the robot's red.
         // Box-drawn letters three rows tall where they fit, else one
@@ -466,6 +500,19 @@ impl App {
                 })
                 .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
             f.render_stateful_widget(list, left, &mut self.group_state);
+            // For the mouse: the column (wheel), then each visible group.
+            self.hits.add(left, mouse::Hit::Groups);
+            let inner = Rect {
+                x: left.x + 1,
+                y: left.y + 1,
+                width: left.width.saturating_sub(2),
+                height: left.height.saturating_sub(2),
+            };
+            let top = self.group_state.offset();
+            for i in top..self.groups.len().min(top + inner.height as usize) {
+                self.hits
+                    .row(inner, inner.y + (i - top) as u16, mouse::Hit::Group(i));
+            }
         }
         self.draw_list(f, right);
     }
