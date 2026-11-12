@@ -993,9 +993,16 @@ pub fn current_session() -> Option<String> {
     if !inside_rlord() {
         return None;
     }
-    run(&["display-message", "-p", "#{session_name}"])
-        .ok()
-        .filter(|s| !s.is_empty())
+    // This process's own pane ($TMUX_PANE), not whatever the active client
+    // shows: a TUI restarted by `rlord reset` while the terminal is on an
+    // agent session must still record its own session as home.
+    let mut args = vec!["display-message", "-p"];
+    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+    if let Some(p) = pane.as_deref() {
+        args.extend(["-t", p]);
+    }
+    args.push("#{session_name}");
+    run(&args).ok().filter(|s| !s.is_empty())
 }
 
 /// Flash a message on the current client's status line.
