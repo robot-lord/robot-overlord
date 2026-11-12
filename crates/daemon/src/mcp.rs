@@ -38,7 +38,7 @@ pub fn tools() -> Value {
         "project": s("Plain folder instead of a repo (no worktree)"),
         "name": s("Short display name; also derives the branch"),
         "branch": s("Branch / worktree name (default: derived from name)"),
-        "agent": s("Coding agent to run: claude or codex (default: the configured session agent). Only when the user asks for one."),
+        "agent": s("Coding agent to run: claude, codex or opencode (default: the configured session agent). Only when the user asks for one."),
         "model": s("Model, one of that agent's (default: the configured model for the agent; see get_session_defaults)"),
         "workspace": b("Give the session its own git worktree (default: configured, normally true)"),
         "prompt": s("First prompt for the agent: the full task, it has no other context"),
@@ -75,7 +75,7 @@ pub fn tools() -> Value {
             "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear.",
             json!({
                 "query": s("Words to find (all must appear in one message)"),
-                "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also agent conversations (Claude Code, Codex) started outside rlord"},
+                "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also agent conversations (Claude Code, Codex, OpenCode) started outside rlord"},
                 "limit": {"type": "integer", "description": "Sessions to return (default 8)"},
             }), &["query"]),
         tool("read_history",
@@ -119,7 +119,7 @@ pub fn tools() -> Value {
             "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
         tool("list_agents",
-            "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it, whether rlord's hooks are installed (and, for Codex, trusted), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
+            "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it (`too_old`: installed, but a version rlord can't run), whether rlord's hooks are installed (and, for Codex, trusted; null for OpenCode, which needs none), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
             json!({}), &[]),
         tool("hand_off",
             "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
@@ -137,7 +137,7 @@ pub fn tools() -> Value {
                 "request_id": s("The `request_id:` of the new-session request you're answering (omit if none)"),
                 "repo": s("Repo as you would launch it (omit: you choose at launch)"),
                 "project": s("Plain folder instead of a repo"),
-                "agent": s("Coding agent as you would launch it: claude or codex (omit: the one the user sent)"),
+                "agent": s("Coding agent as you would launch it: claude, codex or opencode (omit: the one the user sent)"),
                 "model": s("Model as you would launch it (\"\" for the agent default)"),
                 "workspace": b("Own git worktree"),
                 "tags": {"type": "array", "items": {"type": "string"}},
@@ -408,7 +408,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 .unwrap_or_default();
             Ok(json!({"repos": repos}))
         }
-        "get_session_defaults" => d.rpc("session.defaults", json!({})),
+        // (Asked before most launches: not the moment to run a command
+        // for a model list. The form and `list_agents` do.)
+        "get_session_defaults" => d.rpc("session.defaults", json!({"no_listing": true})),
         "hand_off" => d.rpc(
             "overlord.hand_off",
             json!({"request": arg_str(args, "request").context("missing 'request'")?,

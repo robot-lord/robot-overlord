@@ -116,7 +116,8 @@ first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 
 ## Codex sessions
 
-A session runs on Claude Code or on the Codex CLI. Pick per session: the
+A session runs on Claude Code, the Codex CLI or OpenCode (next section).
+Pick per session: the
 `Agent` hint in the new-session form, "start a Codex session to …" to the
 overlord, or `rlord new --agent codex`. `[session] agent` sets the default,
 `codex_model` Codex's default model (empty: Codex's own); the model picker
@@ -150,6 +151,54 @@ Not yet: the overlord and mastermind on Codex, importing Codex
 conversations started outside rlord, passing a message to a Codex session
 from the overlord, sub-agent tracking, Remote Control. A session blocked
 on a permission prompt shows "needs you" only with trusted hooks.
+
+## OpenCode sessions
+
+A session can also run on [OpenCode](https://opencode.ai): the `Agent`
+hint in the form, "start an OpenCode session to …" to the overlord, or
+`rlord new --agent opencode`. It needs **OpenCode v2** (`rlord agents`
+says when yours is older, with the command that upgrades it). `[session]
+opencode_model` sets its default model (`provider/model`; empty:
+OpenCode's own choice); the model picker offers what `opencode models`
+lists.
+
+There is nothing to set up: no hooks. OpenCode v2 runs one background
+server for all your sessions and its screen is a client of it, so rlord
+follows the server instead: working, needs you (a permission request or a
+question) and your turn come from its event stream, for the sessions rlord
+launched. If the server isn't running, the session's screen starts it.
+
+What works: launch, attach, stop, resume, fresh conversation, status, the
+list and its `agent:opencode` filter, preview, search and history (also
+over OpenCode conversations started outside rlord, with `--everywhere`),
+triage excerpts, archive summaries (asked of OpenCode's server from the
+session's own context, adding nothing to the conversation; when it is too
+big, from excerpts on `[archive] opencode_summary_model`).
+
+Good to know:
+
+- OpenCode's screen is full-screen, so **tmux has no scrollback for it**:
+  scroll inside OpenCode. rlord's search and history read OpenCode's own
+  database instead.
+- OpenCode's screen takes no model flag and creates a session only with
+  its first message, so rlord creates the session first (through
+  OpenCode's own `opencode api`), with the model you picked, and then
+  opens the screen on it. That step gets ten seconds. If it fails, what
+  OpenCode said shows in the pane for a moment, and the session still
+  starts, on OpenCode's default model; rlord then sets the model once it
+  can, and the session's log (`rlord log`) says so, or says that it
+  couldn't.
+- Resuming keeps the model the conversation has in OpenCode (you may have
+  changed it there), not the one it was launched with. Only a conversation
+  OpenCode doesn't have is created again, with the launch's model.
+- rlord follows the conversation it launched. A new session or tab you
+  open inside OpenCode's screen isn't followed.
+- A turn runs in the server: closing the screen stops the rlord session,
+  not necessarily the turn.
+
+Not yet: the overlord and mastermind on OpenCode, importing OpenCode
+conversations started outside rlord, passing a message to an OpenCode
+session from the overlord, sub-agent tracking, Remote Control.
 
 ## The right-hand side: preview + details
 

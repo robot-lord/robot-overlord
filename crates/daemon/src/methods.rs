@@ -70,6 +70,10 @@ pub fn session_defaults(cfg: &Config) -> Result<Value> {
                 "name": st.name, "label": st.label, "installed": st.installed,
                 // false: rlord knows it but can't run sessions on it yet.
                 "supported": st.supported,
+                // Installed, but a version rlord can't run: why.
+                "too_old": st.too_old,
+                // rlord follows it through hooks it installs (false: none).
+                "hooks": agent.is_some_and(Agent::uses_hooks),
                 // How to install it (the user runs it; rlord never does).
                 "install": st.install,
                 "model": agent.map(|a| cfg.session.model_for(a)).unwrap_or(""),
@@ -88,7 +92,8 @@ pub fn agents_list() -> Result<Value> {
     Ok(json!({
         "agents": install::status(true),
         "note": "rlord never installs an agent: give the user `install.command` to run themselves; \
-                 after installing, `rlord install-hooks` (and for Codex, trust them with /hooks)",
+                 after installing Claude Code or Codex, `rlord install-hooks` (and for Codex, \
+                 trust them with /hooks); OpenCode needs no hooks",
     }))
 }
 
@@ -345,13 +350,21 @@ pub fn rlord_bin() -> String {
 /// Returns that path, when the login shell's was used.
 fn pane_program(agent: Agent, argv: &mut [String]) -> Option<std::path::PathBuf> {
     let at = install::pane_program(agent.name());
-    program_at(argv, at.clone());
+    program_at(agent, argv, at.clone());
     at
 }
 
-fn program_at(argv: &mut [String], at: Option<std::path::PathBuf>) {
-    if let (Some(first), Some(p)) = (argv.first_mut(), at) {
-        *first = p.to_string_lossy().into_owned();
+/// Put the agent's program at `at` in its command. The program is the
+/// command's first word, or (a launch that runs through `sh -c`, as
+/// OpenCode's does) the first word that is the agent's name; never a later
+/// one (a prompt that happens to be that word).
+fn program_at(agent: Agent, argv: &mut [String], at: Option<std::path::PathBuf>) {
+    let Some(p) = at else {
+        return;
+    };
+    let i = argv.iter().position(|a| a == agent.name()).unwrap_or(0);
+    if let Some(program) = argv.get_mut(i) {
+        *program = p.to_string_lossy().into_owned();
     }
 }
 
@@ -500,6 +513,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(t) = &launch.transcript {
         db.upsert_transcript_source(&id, &t.to_string_lossy())?;
     }
+    hold_deferred(db, &id, &launch)?;
     if !agent.mints_id() {
         // Its conversation is bound once the agent reports it (or it turns
         // up in the agent's own index): one started from now on.
@@ -739,6 +753,11 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &spec_args(agent, &spec),
     )?;
     let program = pane_program(agent, &mut argv);
+    // What an earlier start left to confirm is over (its clock too). A
+    // session that starts anew under its id (the agent never had it) is
+    // created with the launch's model: that is confirmed as at launch.
+    let deferred = agent.deferred(model.as_deref()).filter(|_| !resumed);
+    hold(db, &s.id, deferred.as_ref())?;
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
         None => {
@@ -759,7 +778,13 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &s.id,
         now,
         if resumed { "resumed" } else { "restarted" },
-        &json!({"argv": argv}).to_string(),
+        &match (resumed, agent.deferred(model.as_deref())) {
+            // (Resumed: whatever model the conversation has by now.)
+            (true, Some(d)) => json!({"argv": argv,
+                "model": format!("the session keeps its own (launched with {})", d.model)}),
+            _ => json!({"argv": argv}),
+        }
+        .to_string(),
     )?;
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
@@ -787,6 +812,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    hold_deferred(db, &s.id, &launch)?;
     match (&launch.session_id, &launch.transcript) {
         (Some(sid), transcript) => {
             db.set_agent_session(&s.id, sid, "minted")?;
@@ -810,6 +836,26 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
         &json!({"from": s.agent_session, "to": launch.session_id}).to_string(),
     )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+/// Keep what a launch left to confirm once the agent has the conversation
+/// (its `Deferred`: OpenCode's model) for whatever follows that agent
+/// (`opencode::apply_deferred`), which gives up after a while (`at`: when
+/// it was held). A launch without one clears an older one.
+fn hold_deferred(db: &Db, id: &str, launch: &rlord_core::agents::Launch) -> Result<()> {
+    hold(db, id, launch.deferred.as_ref())
+}
+
+fn hold(db: &Db, id: &str, deferred: Option<&rlord_core::agents::Deferred>) -> Result<()> {
+    let key = crate::opencode::deferred_key(id);
+    match deferred {
+        Some(d) => {
+            let mut held = serde_json::to_value(d)?;
+            held["at"] = json!(now_ms());
+            db.kv_set(&key, &held.to_string())
+        }
+        None => db.kv_delete(&key),
+    }
 }
 
 pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
@@ -1359,11 +1405,48 @@ mod tests {
     fn the_pane_runs_the_program_the_check_found() {
         // On the panes' PATH: the bare name, as always.
         let mut argv = vec!["codex".to_string(), "--no-daemon".to_string()];
-        program_at(&mut argv, None);
+        program_at(Agent::Codex, &mut argv, None);
         assert_eq!(argv, ["codex", "--no-daemon"]);
         // Only the login shell has it: its path, the arguments as they were.
-        program_at(&mut argv, Some("/opt/tools/bin/codex".into()));
+        program_at(Agent::Codex, &mut argv, Some("/opt/tools/bin/codex".into()));
         assert_eq!(argv, ["/opt/tools/bin/codex", "--no-daemon"]);
+        // A launch through `sh -c`: the program is where the agent's name
+        // first is, and a prompt that is that word stays a prompt.
+        let mut l = Agent::OpenCode
+            .launch("/src/app", Some("opencode"), None, &[])
+            .argv;
+        program_at(
+            Agent::OpenCode,
+            &mut l,
+            Some("/opt/tools/bin/opencode".into()),
+        );
+        assert_eq!(
+            (l[0].as_str(), l[3].as_str()),
+            ("sh", "/opt/tools/bin/opencode")
+        );
+        assert_eq!(l.last().map(String::as_str), Some("opencode"));
+    }
+
+    #[test]
+    fn what_a_start_left_to_confirm_doesnt_outlive_it() {
+        let db = Db::open_in_memory().unwrap();
+        let key = crate::opencode::deferred_key("01oc");
+        let model = |m: &str| rlord_core::agents::Deferred { model: m.into() };
+        hold(&db, "01oc", Some(&model("opencode/x-free"))).unwrap();
+        let held: Value = serde_json::from_str(&db.kv_get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(held["model"], "opencode/x-free");
+        assert!(held["at"].as_i64().unwrap() > 0);
+        // A later start with nothing to confirm (a resume): the old record
+        // goes, so its clock can't run out on the new start.
+        hold(&db, "01oc", None).unwrap();
+        assert_eq!(db.kv_get(&key).unwrap(), None);
+        // One that has something: a new record, with its own time.
+        db.kv_set(&key, r#"{"model":"opencode/old","at":1}"#)
+            .unwrap();
+        hold(&db, "01oc", Some(&model("opencode/new"))).unwrap();
+        let held: Value = serde_json::from_str(&db.kv_get(&key).unwrap().unwrap()).unwrap();
+        assert_eq!(held["model"], "opencode/new");
+        assert!(held["at"].as_i64().unwrap() > 1);
     }
 
     #[test]

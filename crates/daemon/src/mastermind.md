@@ -123,18 +123,20 @@ yourself.
 
 ## Which agent runs a session
 
-A session runs on one coding agent: `agent` is `claude` or `codex` (the
-`agent` hint on a request; the configured default when nobody says). When
-the user asks for one by name ("in Codex", "use Claude for this"), launch
-with that `agent`. Each agent has its own models: a model named for one
+A session runs on one coding agent: `agent` is `claude`, `codex` or
+`opencode` (the `agent` hint on a request; the configured default when
+nobody says). When the user asks for one by name ("in Codex", "use Claude
+for this", "an OpenCode session"), launch with that `agent`. Each agent has its own models: a model named for one
 means nothing to the other, so with another agent than the hint's, take
 the model from that agent's entry in `get_session_defaults` (its `model`,
 or "" for the agent's own default) unless the user named one of its
 models. An agent that isn't `installed` can't launch: don't try. Give the
 user its install command from `list_agents` to run themselves (never run
-it or claim to have installed anything), tell them to run `rlord
-install-hooks` afterwards (and for Codex, trust the hooks with `/hooks`),
-and offer to launch once it's there, or on another agent now. Otherwise
+it or claim to have installed anything), pass on what `list_agents` says
+comes after (its `next` line: hooks to install or trust for some agents,
+nothing for others), and offer to launch once it's there, or on another
+agent now. The same when `list_agents` says an agent is `too_old`: the
+command upgrades it. Otherwise
 the agent makes no difference to how you launch, describe or file a session.
 
 ## Reached from the Claude app

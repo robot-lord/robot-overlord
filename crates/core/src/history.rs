@@ -11,6 +11,9 @@
 //!   tool output clipped: enough to carry into another session.
 //!
 //! Any agent's transcript: lines are read through `agents::transcript`.
+//! An OpenCode conversation isn't a file but rows in OpenCode's database
+//! (`agents::opencode`): the same two steps ask the database, and a hit's
+//! "line" is its message's sequence number there.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::agents::transcript::{clip, Format};
-use super::agents::Agent;
+use super::agents::{opencode, Agent};
 
 /// One message that matched.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -107,6 +110,9 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
     };
     let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut out = Vec::new();
+    // OpenCode's database, opened once however many of its sessions are
+    // searched.
+    let mut stores: std::collections::HashMap<&Path, Option<opencode::Store>> = Default::default();
     for path in paths {
         let format = Format::of(path);
         let mut fh = FileHits {
@@ -114,6 +120,31 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
             hits: Vec::new(),
             total: 0,
         };
+        if let Some((db, id)) = opencode::locate(path) {
+            // (SQLite's LIKE ignores case for ASCII only.)
+            let key = key.as_deref().filter(|k| k.is_ascii());
+            let store = stores
+                .entry(db)
+                .or_insert_with(|| opencode::Store::open(db));
+            let (hits, total) = match store {
+                Some(store) => store.search(id, &ws, key, per_file),
+                None => (Vec::new(), 0),
+            };
+            if total > 0 {
+                fh.total = total;
+                fh.hits = hits
+                    .into_iter()
+                    .map(|m| Hit {
+                        line: m.seq,
+                        who: m.who,
+                        at: Some(opencode::iso_ms(m.at_ms)),
+                        snippet: snippet(&m.text, &ws[0], 220),
+                    })
+                    .collect();
+                out.push(fh);
+            }
+            continue;
+        }
         let _ = searcher.search_path(
             &matcher,
             path,
@@ -171,9 +202,38 @@ pub fn read(
 ) -> std::io::Result<Vec<Message>> {
     use std::io::BufRead;
     let format = Format::of(path);
-    let f = std::io::BufReader::new(std::fs::File::open(path)?);
     let mut all: Vec<Message> = Vec::new();
     let mut target: Option<usize> = None;
+    if let Some((db, id)) = opencode::locate(path) {
+        match opencode::exists(db, id) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such OpenCode conversation",
+                ))
+            }
+            None => {
+                return Err(std::io::Error::other(
+                    "OpenCode's database can't be read just now",
+                ))
+            }
+        }
+        for m in opencode::conversation(db, id) {
+            if target.is_none() && line.is_some_and(|t| m.seq >= t) {
+                target = Some(all.len());
+            }
+            let max = if m.who == "tool" { 400 } else { 2000 };
+            all.push(Message {
+                line: m.seq,
+                who: m.who,
+                at: Some(opencode::iso_ms(m.at_ms)),
+                text: clip_keep_lines(&m.text, max),
+            });
+        }
+        return Ok(window(all, target, line, before, after, budget));
+    }
+    let f = std::io::BufReader::new(std::fs::File::open(path)?);
     for (i, l) in f.lines().enumerate() {
         let n = i as u64 + 1;
         let Ok(l) = l else { continue };
@@ -201,6 +261,19 @@ pub fn read(
             text: clip_keep_lines(&text, max),
         });
     }
+    Ok(window(all, target, line, before, after, budget))
+}
+
+/// The window of `all` around `target` (the first message at or after
+/// `line`), within `budget` characters.
+fn window(
+    mut all: Vec<Message>,
+    target: Option<usize>,
+    line: Option<u64>,
+    before: usize,
+    after: usize,
+    budget: usize,
+) -> Vec<Message> {
     let t = target.unwrap_or(all.len());
     let start = t.saturating_sub(before);
     let end = if line.is_some() {
@@ -229,7 +302,7 @@ pub fn read(
     if newest_first {
         out.reverse();
     }
-    Ok(out)
+    out
 }
 
 /// Clip to `max` characters, keeping line breaks (code reads better).
@@ -306,6 +379,34 @@ mod tests {
         assert_eq!(read(&p, Some(1), 0, 10, 10).unwrap()[0].line, 1);
         let w = read(&p, None, 10, 0, 10).unwrap();
         assert_eq!(w.iter().map(|m| m.line).collect::<Vec<_>>(), [5]);
+    }
+
+    #[test]
+    fn an_opencode_conversation_is_searched_and_read_in_its_database() {
+        use crate::agents::opencode::tests::{store, SES};
+        let d = tempfile::tempdir().unwrap();
+        let p = store(d.path()).join(SES);
+        // Beside a file transcript, in one search.
+        let file = transcript(d.path());
+        let r = search(&[file, p.clone()], "repo", 5);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].path, p);
+        let hits: Vec<(u64, &str)> = r[0].hits.iter().map(|h| (h.line, h.who)).collect();
+        assert_eq!(hits, [(4, "you"), (7, "agent"), (81, "agent")]);
+        assert!(r[0].hits[0]
+            .at
+            .as_deref()
+            .is_some_and(|t| t.ends_with(".711Z")));
+        assert!(search(std::slice::from_ref(&p), "repo nothing", 5).is_empty());
+        // A hit's line is its message's sequence number: read around it.
+        let w = read(&p, Some(31), 1, 2, 10_000).unwrap();
+        let said: Vec<(u64, &str)> = w.iter().map(|m| (m.line, m.who)).collect();
+        assert_eq!(said, [(7, "tool"), (31, "agent"), (31, "tool")]);
+        assert_eq!(w[1].text, "[read] README.md");
+        // No line: the last ones.
+        let w = read(&p, None, 2, 0, 10_000).unwrap();
+        assert_eq!(w.iter().map(|m| m.line).collect::<Vec<_>>(), [31, 81]);
+        assert!(read(&p.with_file_name("ses_none"), None, 2, 0, 100).is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{codex, Agent};
+use super::{codex, opencode, Agent};
 
 /// A piece of a marker: its text and colour (RGB; None: the theme's text).
 pub type MarkerPiece = (&'static str, Option<(u8, u8, u8)>);
@@ -69,12 +69,12 @@ pub const TOOLS: [Tool; 3] = [
         npm: "npm install -g @openai/codex",
         aur: None,
     },
-    // https://opencode.ai/docs/
+    // https://opencode.ai/docs/ (rlord runs OpenCode v2: `opencode::MIN_MAJOR`)
     Tool {
         name: "opencode",
         label: "OpenCode",
         marker: &[("▣", Some((20, 184, 166)))],
-        agent: None,
+        agent: Some(Agent::OpenCode),
         docs: "https://opencode.ai/docs/",
         script: "curl -fsSL https://opencode.ai/v2/install | bash",
         brew: "brew install anomalyco/tap/opencode-v2",
@@ -230,7 +230,10 @@ pub fn resolved(bin: &str) -> Option<PathBuf> {
 
 /// Ask the login shell about every agent rlord runs that PATH doesn't
 /// have (outside any lock: at daemon start, and before a launch), so
-/// `resolved` knows.
+/// `resolved` knows. Also OpenCode's version (rlord needs v2; remembered,
+/// `version_known`), and its model list when its background server is
+/// already running. Nothing here starts that server: `list_models` is for
+/// when the user asks to see the models.
 pub fn warm() {
     // Only the ones PATH lacks need the shell, and those at the same time:
     // a slow shell costs its limit once, not once per agent.
@@ -244,6 +247,22 @@ pub fn warm() {
             s.spawn(move || resolve(name));
         }
     });
+    if let Some(bin) = resolved(Agent::OpenCode.name()) {
+        version(&bin);
+        opencode::list_models(None);
+    }
+}
+
+/// The model lists that need asking for, brought up to date: OpenCode's,
+/// from its server or, with none running, `opencode models` (which may
+/// start it). For when the user is choosing a model or looking at their
+/// agents (the new-session form, `rlord agents`); never at daemon start
+/// or before a launch. Outside any lock, after `warm`.
+pub fn list_models() {
+    if let Some(bin) = resolved(Agent::OpenCode.name()) {
+        let usable = version_known(&bin).is_none_or(|v| opencode::too_old(&v).is_none());
+        opencode::list_models(usable.then_some(bin.as_path()));
+    }
 }
 
 /// The program a session's pane should run for `bin`: None when the bare
@@ -333,18 +352,11 @@ fn shell_answer(shell: &str, script: &str, limit: std::time::Duration) -> Option
 /// binary changes. Bounded: a command that doesn't answer in two seconds
 /// has no version.
 pub fn version(bin: &Path) -> Option<String> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use std::time::{Duration, Instant, SystemTime};
-    // Per binary: when it was last modified, and what it answered then.
-    type Seen = HashMap<PathBuf, (SystemTime, Option<String>)>;
-    static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(Default::default);
+    use std::time::{Duration, Instant};
     // (Through symlinks: an upgrade replaces what the link points at.)
     let modified = std::fs::metadata(bin).and_then(|m| m.modified()).ok()?;
-    if let Some((at, v)) = SEEN.lock().ok()?.get(bin) {
-        if *at == modified {
-            return v.clone();
-        }
+    if let Some(known) = version_seen(bin, modified) {
+        return known;
     }
     let mut child = std::process::Command::new(bin)
         .arg("--version")
@@ -381,6 +393,34 @@ pub fn version(bin: &Path) -> Option<String> {
         seen.insert(bin.to_path_buf(), (modified, v.clone()));
     }
     v
+}
+
+/// Per binary: when it was last modified, and what `--version` said then.
+type Seen = std::collections::HashMap<PathBuf, (std::time::SystemTime, Option<String>)>;
+static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// What `version` remembers for a binary last modified at `modified`.
+fn version_seen(bin: &Path, modified: std::time::SystemTime) -> Option<Option<String>> {
+    let seen = SEEN.lock().ok()?;
+    let (at, v) = seen.get(bin)?;
+    (*at == modified).then(|| v.clone())
+}
+
+/// `version` without running anything: what the binary last answered, if
+/// it was asked since it last changed (`warm` asks). Safe under a lock.
+pub fn version_known(bin: &Path) -> Option<String> {
+    let modified = std::fs::metadata(bin).and_then(|m| m.modified()).ok()?;
+    version_seen(bin, modified).flatten()
+}
+
+/// Why rlord can't run this install of `agent` (it is older than rlord
+/// supports), as far as is known without running it.
+fn unusable(agent: Agent, bin: &Path) -> Option<String> {
+    match agent {
+        Agent::OpenCode => opencode::too_old(&version_known(bin)?),
+        Agent::Claude | Agent::Codex => None,
+    }
 }
 
 /// The events rlord's hook should be installed for and isn't, in the
@@ -473,13 +513,15 @@ pub struct Status {
     /// From `--version` (only when asked for).
     pub version: Option<String>,
     /// Every hook rlord needs is in its hooks file (None: rlord doesn't
-    /// run it).
+    /// run it, or follows it without hooks, as it does OpenCode).
     pub hooks_installed: Option<bool>,
     /// Some are, some aren't: installed by an older rlord.
     pub hooks_outdated: bool,
     /// Codex only: the user trusted rlord's hooks (`/hooks`).
     pub hooks_trusted: Option<bool>,
-    /// How to install it, when it isn't.
+    /// Installed, but a version rlord can't run: why.
+    pub too_old: Option<String>,
+    /// How to install it, when it isn't (or to upgrade it, when too old).
     pub install: Option<Suggestion>,
     /// What's left to do, in a line (None: ready).
     pub next: Option<String>,
@@ -501,10 +543,16 @@ pub fn status(full: bool) -> Vec<Status> {
                 (false, None) => on_path(t.name),
             };
             let installed = path.is_some();
-            let missing = t.agent.map(|a| hooks_missing(a, &a.hooks_file()));
-            let hooks_installed = missing.as_ref().map(Vec::is_empty);
-            let hooks_outdated = t
+            let hooked = t.agent.filter(|a| a.uses_hooks());
+            let missing = hooked.map(|a| hooks_missing(a, &a.hooks_file()));
+            // (Run first when asked for versions, so the check below knows.)
+            let said = path.as_deref().filter(|_| versions).and_then(version);
+            let too_old = t
                 .agent
+                .zip(path.as_deref())
+                .and_then(|(a, p)| unusable(a, p));
+            let hooks_installed = missing.as_ref().map(Vec::is_empty);
+            let hooks_outdated = hooked
                 .zip(missing.as_ref())
                 .is_some_and(|(a, m)| !m.is_empty() && m.len() < a.hook_events().len());
             let hooks_trusted = match t.agent {
@@ -512,9 +560,12 @@ pub fn status(full: bool) -> Vec<Status> {
                 _ => None,
             };
             let next = match (installed, t.agent, hooks_installed, hooks_trusted) {
+                _ if too_old.is_some() => too_old
+                    .as_ref()
+                    .map(|why| format!("{why}: upgrade it yourself with the install command")),
                 (false, _, _, _) => Some(format!(
                     "not installed: run the install command yourself{}",
-                    if t.agent.is_some() {
+                    if hooked.is_some() {
                         ", then `rlord install-hooks`"
                     } else {
                         ""
@@ -539,12 +590,13 @@ pub fn status(full: bool) -> Vec<Status> {
                 label: t.label,
                 supported: t.agent.is_some(),
                 installed,
-                version: path.as_deref().filter(|_| versions).and_then(version),
+                version: said,
                 path: path.map(|p| p.to_string_lossy().into_owned()),
                 hooks_installed,
                 hooks_outdated,
                 hooks_trusted,
-                install: (!installed).then(|| suggest(t, machine)),
+                install: (!installed || too_old.is_some()).then(|| suggest(t, machine)),
+                too_old,
                 next,
             }
         })
@@ -555,16 +607,32 @@ pub fn status(full: bool) -> Vec<Status> {
 /// None when its command can be found (on PATH, or by the user's login
 /// shell as last asked: see `warm`). Starts nothing.
 pub fn missing(agent: Agent) -> Option<String> {
-    if resolved(agent.name()).is_some() {
+    let found = resolved(agent.name());
+    let old = found.as_deref().and_then(|bin| unusable(agent, bin));
+    if found.is_some() && old.is_none() {
         return None;
     }
     let t = tool(agent.name())?;
     let s = suggest(t, Machine::detect());
-    Some(format!(
-        "{} isn't installed (`{}` isn't on PATH). rlord doesn't install it for you; run this \
-         yourself: {}  (other ways: {}). Then `rlord install-hooks`.",
-        t.label, t.name, s.command, s.docs
-    ))
+    Some(match old {
+        Some(why) => format!(
+            "{why}. rlord doesn't upgrade it for you; run this yourself: {}  (other ways: {}).",
+            s.command, s.docs
+        ),
+        None => format!(
+            "{} isn't installed (`{}` isn't on PATH). rlord doesn't install it for you; run \
+             this yourself: {}  (other ways: {}).{}",
+            t.label,
+            t.name,
+            s.command,
+            s.docs,
+            if agent.uses_hooks() {
+                " Then `rlord install-hooks`."
+            } else {
+                ""
+            }
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -626,14 +694,39 @@ mod tests {
             let t = tool(a.name()).expect("in the table");
             assert_eq!(t.agent, Some(a));
         }
-        // Known, hinted, not runnable yet.
-        assert_eq!(tool("opencode").unwrap().agent, None);
+        // Every agent in the table is one rlord runs.
+        assert!(TOOLS.iter().all(|t| t.agent.is_some()));
         // Nothing here installs with elevated rights or runs unprompted.
         for t in &TOOLS {
             for c in [t.script, t.brew, t.npm] {
                 assert!(!c.contains("sudo"), "{c}");
             }
         }
+    }
+
+    #[test]
+    fn an_opencode_older_than_v2_is_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let install = |name: &str, says: &str| {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        };
+        let old = install("opencode-old", "1.4.3");
+        // Not asked yet: nothing is known, nothing is refused.
+        assert_eq!(version_known(&old), None);
+        assert_eq!(unusable(Agent::OpenCode, &old), None);
+        assert_eq!(version(&old).as_deref(), Some("1.4.3"));
+        assert_eq!(version_known(&old).as_deref(), Some("1.4.3"));
+        let why = unusable(Agent::OpenCode, &old).unwrap();
+        assert!(why.contains("v2") && why.contains("1.4.3"), "{why}");
+        let new = install("opencode-new", "opencode v2.2.7");
+        version(&new);
+        assert_eq!(unusable(Agent::OpenCode, &new), None);
+        // Only OpenCode has a floor.
+        assert_eq!(unusable(Agent::Codex, &old), None);
     }
 
     #[test]
