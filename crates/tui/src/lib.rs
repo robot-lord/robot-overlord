@@ -1154,8 +1154,13 @@ impl App {
                     // The time the list is sorted by (activity otherwise).
                     Cell::from(Span::styled(
                         rel_age(match sort {
-                            SortMode::User => s["last_user_msg_at"].as_i64(),
-                            SortMode::State => s["last_state_change_at"].as_i64(),
+                            // (As the sort: created when there's none.)
+                            SortMode::User => {
+                                s["last_user_msg_at"].as_i64().or(s["created_at"].as_i64())
+                            }
+                            SortMode::State => s["last_state_change_at"]
+                                .as_i64()
+                                .or(s["created_at"].as_i64()),
                             SortMode::Created => s["created_at"].as_i64(),
                             _ => updated_at(s),
                         }),

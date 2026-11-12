@@ -689,9 +689,16 @@ pub fn cancel_mode(pane: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run a copy-mode command on a pane (`search-backward`, `jump-forward`, …).
-pub fn copy_command(pane: &str, cmd: &str, arg: &str) -> Result<()> {
-    run(&["send-keys", "-t", pane, "-X", cmd, "--", arg])?;
+/// Run a copy-mode command on a pane (`search-backward`, `jump-forward`, …),
+/// `count` times.
+pub fn copy_command(pane: &str, cmd: &str, arg: &str, count: Option<u32>) -> Result<()> {
+    let n = count.map(|n| n.to_string());
+    let mut args = vec!["send-keys", "-t", pane];
+    if let Some(n) = n.as_deref() {
+        args.extend(["-N", n]);
+    }
+    args.extend(["-X", cmd, "--", arg]);
+    run(&args)?;
     Ok(())
 }
 

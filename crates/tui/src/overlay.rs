@@ -268,22 +268,34 @@ fn run_loop(
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 // A prompt open in copy mode takes the keys.
                 if let Some(p) = prompt.as_mut() {
-                    match p.key(&k) {
-                        PromptStep::Typing => {}
-                        PromptStep::Cancel => prompt = None,
+                    let step = p.key(&k);
+                    last = Instant::now() - Duration::from_secs(1);
+                    match step {
+                        PromptStep::Typing => continue,
+                        PromptStep::Cancel => {
+                            prompt = None;
+                            continue;
+                        }
                         PromptStep::Run(Action::Copy(cmd), arg) => {
                             prompt = None;
-                            if let Err(e) = tmux::copy_command(pane, &cmd, &arg) {
+                            // A pending count applies to it (3fx: the 3rd x).
+                            if let Err(e) = tmux::copy_command(pane, &cmd, &arg, repeat.take()) {
                                 error = Some(format!("{e:#}"));
                             }
+                            continue;
                         }
                         PromptStep::Run(Action::Repeat, arg) => {
                             prompt = None;
                             repeat = arg.trim().parse().ok().filter(|n| *n > 0);
+                            continue;
+                        }
+                        // A count ended by a non-digit: the count, then that
+                        // key as usual (5j).
+                        PromptStep::CountThen(arg) => {
+                            prompt = None;
+                            repeat = arg.trim().parse().ok().filter(|n| *n > 0);
                         }
                     }
-                    last = Instant::now() - Duration::from_secs(1);
-                    continue;
                 }
                 // Prefix, then `[`: copy mode. Prefix twice sends one prefix
                 // to the agent; any other key after it is taken as itself (the
@@ -426,6 +438,8 @@ struct Prompt {
     text: String,
     /// One key answers it (`command-prompt -1`: jumps).
     single: bool,
+    /// Digits only (`command-prompt -N`: a count); another key ends it.
+    numeric: bool,
     action: Action,
 }
 
@@ -433,6 +447,9 @@ enum PromptStep {
     Typing,
     Cancel,
     Run(Action, String),
+    /// A count prompt ended by another key: keep the count, then handle the
+    /// key itself.
+    CountThen(String),
 }
 
 impl Prompt {
@@ -457,6 +474,20 @@ impl Prompt {
         }
         match k.code {
             KeyCode::Esc => PromptStep::Cancel,
+            KeyCode::Char(c) if self.numeric && c.is_ascii_digit() => {
+                self.text.push(c);
+                PromptStep::Typing
+            }
+            KeyCode::Enter if self.numeric => {
+                PromptStep::Run(self.action.clone(), std::mem::take(&mut self.text))
+            }
+            KeyCode::Backspace if self.numeric => {
+                if self.text.pop().is_none() {
+                    return PromptStep::Cancel;
+                }
+                PromptStep::Typing
+            }
+            _ if self.numeric => PromptStep::CountThen(std::mem::take(&mut self.text)),
             KeyCode::Char(c) if self.single => PromptStep::Run(self.action.clone(), c.to_string()),
             KeyCode::Char(c) => {
                 self.text.push(c);
@@ -482,6 +513,7 @@ struct PromptBinding {
     single: bool,
     /// `-I` initial text (may be a format: `#{pane_search_string}`).
     initial: String,
+    numeric: bool,
     action: Action,
 }
 
@@ -515,6 +547,9 @@ impl ModeKeys {
             }
             // The flag cluster(s) before the body: -1 is single-key.
             let head = cmd.split(" { ").next().unwrap_or(cmd);
+            let numeric = head
+                .split_whitespace()
+                .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('N'));
             let single = head.split_whitespace().any(|w| {
                 w.starts_with('-') && !w.starts_with("--") && w.contains('1') && !w.contains('I')
             });
@@ -532,6 +567,7 @@ impl ModeKeys {
                 label: arg_after(head, "-p").unwrap_or_else(|| "(prompt)".into()),
                 single,
                 initial: arg_after(head, "-I").unwrap_or_default(),
+                numeric,
                 action,
             });
         }
@@ -589,6 +625,7 @@ impl ModeKeys {
             label: b.label.clone(),
             text,
             single: b.single,
+            numeric: b.numeric,
             action: b.action.clone(),
         })
     }
@@ -869,7 +906,11 @@ mod tests {
         assert!(p.single && p.label == "(jump forward)");
         assert!(matches!(p.action, Action::Copy(ref c) if c == "jump-forward"));
         let p = vi.prompt_for(&ev('5'), "%0").unwrap();
-        assert!(!p.single && p.text == "5" && matches!(p.action, Action::Repeat));
+        assert!(!p.single && p.numeric && p.text == "5" && matches!(p.action, Action::Repeat));
+        // 5j: j ends the count.
+        let mut p = vi.prompt_for(&ev('5'), "%0").unwrap();
+        assert!(matches!(p.key(&ev('2')), PromptStep::Typing));
+        assert!(matches!(p.key(&ev('j')), PromptStep::CountThen(ref n) if n == "52"));
         assert!(vi.prompt_for(&ev('j'), "%0").is_none());
 
         // emacs defaults: incremental search runs as a plain search.
