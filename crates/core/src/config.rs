@@ -9,7 +9,7 @@ use crate::paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
-    /// Session list on the left, preview on the right (other-tool style).
+    /// Session list on the left, preview on the right.
     #[default]
     Side,
     /// List on top, preview below.
@@ -45,7 +45,8 @@ pub struct Keys {
     pub toggle_log: String,
     pub describe: String,
     pub notes: String,
-    /// Show/hide the overlord overlay. Defaults to Option-O, the same key
+    /// Show/hide the overlord overlay. Defaults to Alt-O (Option-O on a
+    /// Mac), the same key
     /// that summons it from any pane.
     pub overlord: String,
     /// Switch between the sessions tab (flat list) and the groups tab.
@@ -171,7 +172,7 @@ impl TmuxKeys {
 pub struct OverlordConfig {
     /// Coding tool. Only `claude` today.
     pub agent: String,
-    /// Model for the overlord: the quick front desk you summon with ⌥O.
+    /// Model for the overlord: the quick front desk you summon with Alt-O.
     /// It does mechanical work itself and hands anything that needs thought
     /// to the mastermind, so a fast model fits. Empty = the agent's default.
     pub model: String,
@@ -295,6 +296,24 @@ pub struct Config {
     pub keys: Keys,
     pub tmux: TmuxKeys,
     pub archive: ArchiveConfig,
+    pub update: UpdateConfig,
+}
+
+/// `rlord update`: which releases it installs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// `stable` (X.Y.Z, every platform) or `dev`: the newest release of
+    /// either kind, development builds (X.Y.Z-dev.N, macOS only) included.
+    pub channel: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            channel: "stable".into(),
+        }
+    }
 }
 
 /// Archiving: a summary of what the session did, made once.
@@ -334,6 +353,7 @@ impl Default for Config {
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
             archive: ArchiveConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -442,9 +462,9 @@ claude_tui = "default"          # Claude's renderer here: "default" (inline: tmu
 # launch sessions, search, jump around, set the list's sort/filter. It gets
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
-# The overlord is two sessions. The overlord (Option-O) is a quick front
-# desk: it navigates, organizes and answers from rlord's tools itself, and
-# hands anything that needs thought to the mastermind (Option-M), which
+# The overlord is two sessions. The overlord (Alt-O; Option-O on a Mac) is a
+# quick front desk: it navigates, organizes and answers from rlord's tools
+# itself, and hands anything that needs thought to the mastermind (Alt-M), which
 # launches sessions and takes one-off questions. Fast model up front, a
 # strong one behind.
 [overlord]
@@ -485,7 +505,7 @@ filter = "/"
 toggle_log = "l"
 describe = "D"          # edit the one-line description
 notes = "E"             # edit notes in $EDITOR
-overlord = "M-o"        # show/hide the overlord (same as Option-O everywhere)
+overlord = "M-o"        # show/hide the overlord (same as Alt-O everywhere)
 switch_tab = "tab"      # sessions tab (flat list) <-> groups tab (sessions by tag)
 sessions_tab = "H"      # step left:  sessions tab <- group list <- inside a group
 groups_tab = "L"        # step right: sessions tab -> group list -> inside a group
@@ -505,7 +525,7 @@ next = ""       # e.g. "M-g"
 prev = ""       # e.g. "M-s"
 overlord = "M-o" # from any pane: the overlord (quick front desk) over it
 mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
-                  # overlord's overlay, Option-M always switches to it)
+                  # overlord's overlay, Alt-M (Option-M on a Mac) always switches to it)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 
 # Archiving a session writes a short summary of what it did (once, in the
@@ -514,6 +534,11 @@ profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 summary = true
 summary_model = "haiku"
 summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
+
+# `rlord update`: "stable" releases, or "dev" for the newest of any kind
+# (development builds, macOS only, included).
+[update]
+channel = "stable"
 "##;
 
 #[cfg(test)]
@@ -559,7 +584,7 @@ mod tests {
     fn tilde_expansion() {
         std::env::set_var("HOME", "/h");
         assert_eq!(expand_tilde("~"), "/h");
-        assert_eq!(expand_tilde("~/ko"), "/h/ko");
+        assert_eq!(expand_tilde("~/src"), "/h/src");
         assert_eq!(expand_tilde("/abs"), "/abs");
         assert_eq!(expand_tilde("~user"), "~user");
     }

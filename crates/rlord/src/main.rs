@@ -251,15 +251,19 @@ enum Command {
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
-    /// Install the latest release from GitHub (needs `gh` logged in; no
-    /// compiling), then reset a running rlord onto it. Same as
-    /// scripts/update.sh.
+    /// Install the newest release from GitHub (no compiling), then reset a
+    /// running rlord onto it. Same as scripts/update.sh.
     Update {
-        /// Release tag to install, e.g. v0.4.0 (default: latest)
+        /// Release tag to install, e.g. v0.18.0 (default: the newest on the
+        /// channel)
         tag: Option<String>,
         /// Reinstall even if already on that version; replace a dev symlink
         #[arg(long)]
         force: bool,
+        /// `stable`, or `dev` to include development builds (default:
+        /// `[update] channel` in config.toml)
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Unstick rlord: restart the daemon, close overlays, resync session
     /// state, reload rlord's tmux config and key bindings, restart the list.
@@ -348,9 +352,9 @@ enum NavCmd {
     Home,
     Next,
     Prev,
-    /// Toggle the overlord overlay (Option-O)
+    /// Toggle the overlord overlay (Alt-O; Option-O on a Mac)
     Overlord,
-    /// Toggle the mastermind overlay (Option-M)
+    /// Toggle the mastermind overlay (Alt-M; Option-M on a Mac)
     Mastermind,
 }
 
@@ -473,7 +477,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Mcp => mcp_stdio(),
-        Command::Update { tag, force } => update(tag, force),
+        Command::Update {
+            tag,
+            force,
+            channel,
+        } => update(tag, force, channel),
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
         Command::Overlay { token, seat } => rlord_tui::run_overlay(token, &seat),
         Command::Overlord(OverlordCmd::Open) => {
@@ -482,7 +490,10 @@ fn main() -> Result<()> {
             } else {
                 // Not in tmux: the overlay needs a tmux terminal to pop up
                 // over, so start (or rejoin) rlord there first.
-                eprintln!("rlord: run `rlord`, then press Option-O (or c)");
+                eprintln!(
+                    "rlord: run `rlord`, then press {}-O (or c)",
+                    rlord_core::keys::alt_name()
+                );
                 Ok(())
             }
         }
@@ -543,7 +554,10 @@ fn main() -> Result<()> {
                 text.join(" ")
             };
             call("overlord.ask", json!({"text": text}))?;
-            println!("sent to the overlord (Option-O to see it)");
+            println!(
+                "sent to the overlord ({}-O to see it)",
+                rlord_core::keys::alt_name()
+            );
             Ok(())
         }
         Command::Daemon => run_daemon(),
@@ -1223,11 +1237,19 @@ fn resolve_conversation(id: &str) -> Result<String> {
 }
 
 /// scripts/update.sh, compiled in so updating needs no checkout.
-const UPDATE_SH: &str = include_str!("../../../scripts/update.sh");
+const UPDATE_SH: &str = include_str!("../update.sh");
 
-fn update(tag: Option<String>, force: bool) -> Result<()> {
+fn update(tag: Option<String>, force: bool, channel: Option<String>) -> Result<()> {
+    let channel = channel.unwrap_or_else(|| {
+        Config::load()
+            .map(|c| c.update.channel)
+            .unwrap_or_else(|_| "stable".into())
+    });
     let mut cmd = std::process::Command::new("bash");
-    cmd.arg("-c").arg(UPDATE_SH).arg("rlord-update");
+    cmd.arg("-c")
+        .arg(UPDATE_SH)
+        .arg("rlord-update")
+        .env("RLORD_CHANNEL", channel.trim());
     if force {
         cmd.arg("--force");
     }

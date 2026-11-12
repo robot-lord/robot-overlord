@@ -4,7 +4,7 @@
 //! Pressing the key (rather than typing its name) is the test: while the
 //! screen listens, the list's tmux session is pointed at an empty key table,
 //! so the key reaches rlord unless something before tmux takes it — the
-//! terminal, macOS, another app. Then it's checked (`rlord_core::keys`)
+//! terminal, the OS (macOS especially), another app. Then it's checked (`rlord_core::keys`)
 //! against rlord's other keys, the user's tmux, the shell and Claude Code,
 //! and saved to `config.toml` only once the user confirms.
 
@@ -238,9 +238,13 @@ impl App {
                     // terminal not sending Option as Meta, or a real key
                     // (ç, ß, å on many layouts): take it as typed, and say
                     // how to fix the terminal in case it was the former.
+                    // Only macOS types these for Option.
                     let option_char = match (&k.code, key.ctrl, key.alt) {
-                        (KeyCode::Char(c), false, false) => keys::option_char(*c)
-                            .map(|l| (*c, l, keys::option_as_meta_fix(&tmux::client_termtype()))),
+                        (KeyCode::Char(c), false, false) if cfg!(target_os = "macos") => {
+                            keys::option_char(*c).map(|l| {
+                                (*c, l, keys::option_as_meta_fix(&tmux::client_termtype()))
+                            })
+                        }
                         _ => None,
                     };
                     ks.tested.insert((s.id(), key.clone()));
@@ -450,7 +454,11 @@ impl App {
                 ]));
                 if since.elapsed() > Duration::from_secs(3) {
                     d.push(Line::styled(
-                        "Nothing yet? If pressing it does nothing here, it never reaches rlord: your terminal, macOS or another app takes it (or it's a tmux prefix).",
+                        if cfg!(target_os = "macos") {
+                            "Nothing yet? If pressing it does nothing here, it never reaches rlord: your terminal, macOS or another app takes it (or it's a tmux prefix)."
+                        } else {
+                            "Nothing yet? If pressing it does nothing here, it never reaches rlord: your terminal, your desktop or another app takes it (or it's a tmux prefix)."
+                        },
                         Style::default().fg(theme::yellow()),
                     ));
                 }

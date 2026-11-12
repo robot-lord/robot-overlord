@@ -1,18 +1,24 @@
 [package]
-name = "rlord"
+name = "robot-overlord"
+description = "rlord: run and organize many AI coding-agent sessions (Claude Code) in tmux, with an AI overlord to drive it"
+readme = "../../README.md"
+keywords = ["tmux", "claude", "ai", "agents", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
 [[bin]]
 name = "rlord"
 path = "src/main.rs"
 
 [dependencies]
-rlord-core = { path = "../core" }
-rlord-daemon = { path = "../daemon" }
-rlord-tui = { path = "../tui" }
+rlord-core = { package = "robot-overlord-core", path = "../core" }
+rlord-daemon = { package = "robot-overlord-daemon", path = "../daemon" }
+rlord-tui = { package = "robot-overlord-tui", path = "../tui" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -20,3 +26,32 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
+
+# Distro packages (scripts/release.sh): the static musl binary, needing tmux.
+[package.metadata.deb]
+name = "rlord"
+maintainer = "ayersb <ayersb@users.noreply.github.com>"
+depends = "tmux"
+section = "utils"
+priority = "optional"
+extended-description = "rlord runs many AI coding-agent sessions in its own tmux server and gives you one list to find, jump to and organize them, plus an AI overlord to drive it."
+assets = [
+    ["target/release/rlord", "usr/bin/rlord", "755"],
+    ["../../README.md", "usr/share/doc/rlord/README.md", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/rlord/LICENSE-MIT", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/rlord/LICENSE-APACHE", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "rlord"
+summary = "Run and organize many AI coding-agent sessions in tmux"
+license = "MIT OR Apache-2.0"
+assets = [
+    { source = "target/release/rlord", dest = "/usr/bin/rlord", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/rlord/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/rlord/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/rlord/LICENSE-APACHE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+tmux = "*"

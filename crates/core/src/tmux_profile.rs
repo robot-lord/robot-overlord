@@ -626,7 +626,8 @@ fn classify(user: &Dump, base: &Dump, reserved: &[&str]) -> Profile {
         hook_cmd("client-light-theme"),
     ) {
         keys.push_str(&format!(
-            "if-shell 'defaults read -g AppleInterfaceStyle 2>/dev/null | grep -q Dark' {} {}\n",
+            "if-shell {} {} {}\n",
+            tmux_quote(crate::themes::dark_shell_check()),
             tmux_quote(dark),
             tmux_quote(light)
         ));
@@ -774,9 +775,10 @@ mod tests {
         assert!(p
             .keys
             .contains("set-hook -g client-light-theme 'source-file /h/light.conf'\n"));
-        assert!(p
-            .keys
-            .contains("grep -q Dark' 'source-file /h/dark.conf' 'source-file /h/light.conf'\n"));
+        assert!(p.keys.contains(&format!(
+            "if-shell '{}' 'source-file /h/dark.conf' 'source-file /h/light.conf'\n",
+            crate::themes::dark_shell_check()
+        )));
         assert!(!p.window.contains("window-style"));
         assert_eq!(p.report.dropped.len(), 6);
     }

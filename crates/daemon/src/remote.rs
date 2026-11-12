@@ -275,8 +275,23 @@ fn strip_ansi(s: &str) -> String {
 /// source Claude's shell snapshot; MCP servers, even shell-wrapped ones,
 /// don't).
 fn background_shells(pid: u32) -> usize {
-    std::process::Command::new("pgrep")
-        .args(["-lf", "-P", &pid.to_string()])
+    // `pgrep -P` (children's pids) and `ps -o command= -p` read the same on
+    // macOS and procps; `pgrep -l`/`-a` differ between them.
+    let Ok(kids) = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+    else {
+        return 0;
+    };
+    let pids: Vec<String> = String::from_utf8_lossy(&kids.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if pids.is_empty() {
+        return 0;
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pids.join(",")])
         .output()
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)

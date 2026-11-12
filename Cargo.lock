@@ -848,14 +848,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "rlord"
-version = "0.17.0"
+name = "robot-overlord"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "clap",
- "rlord-core",
- "rlord-daemon",
- "rlord-tui",
+ "robot-overlord-core",
+ "robot-overlord-daemon",
+ "robot-overlord-tui",
  "serde_json",
  "tokio",
  "toml",
@@ -864,8 +864,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlord-core"
-version = "0.17.0"
+name = "robot-overlord-core"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "grep-matcher",
@@ -884,12 +884,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlord-daemon"
-version = "0.17.0"
+name = "robot-overlord-daemon"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "libc",
- "rlord-core",
+ "robot-overlord-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -898,14 +898,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlord-tui"
-version = "0.17.0"
+name = "robot-overlord-tui"
+version = "0.18.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
  "ratatui",
- "rlord-core",
- "rlord-daemon",
+ "robot-overlord-core",
+ "robot-overlord-daemon",
  "serde_json",
  "unicode-width 0.2.0",
 ]

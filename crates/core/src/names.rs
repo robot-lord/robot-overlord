@@ -281,10 +281,7 @@ mod tests {
     #[test]
     fn tmux_names_follow_the_session_name() {
         let none = |_: &str| false;
-        assert_eq!(
-            tmux_name_for("myapp-updates", none),
-            "myapp-updates-rlord"
-        );
+        assert_eq!(tmux_name_for("myapp-updates", none), "myapp-updates-rlord");
         assert_eq!(
             tmux_name_for("fix: auth.flow now", none),
             "fix-auth-flow-now-rlord"

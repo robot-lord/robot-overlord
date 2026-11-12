@@ -399,9 +399,10 @@ pub fn resolve(theme: &str, dark: bool) -> &'static Palette {
         .unwrap_or_else(|| by_name(if dark { "rlord-dark" } else { "rlord-light" }).unwrap())
 }
 
-/// Whether the system is in dark mode. macOS: the global
-/// `AppleInterfaceStyle` (absent = light). `RLORD_APPEARANCE=light|dark`
-/// overrides; elsewhere, dark.
+/// Whether the system is in dark mode. `RLORD_APPEARANCE=light|dark`
+/// overrides. macOS: the global `AppleInterfaceStyle` (absent = light).
+/// Linux: GNOME's `color-scheme` setting (`prefer-dark`), read with
+/// `gsettings` when it's there. Otherwise, dark.
 pub fn system_is_dark() -> bool {
     match std::env::var("RLORD_APPEARANCE").ok().as_deref() {
         Some("light") => return false,
@@ -416,7 +417,29 @@ pub fn system_is_dark() -> bool {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "Dark")
             .unwrap_or(true);
     }
-    true
+    let gsettings = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match gsettings {
+        // `'default'` doesn't say light: many desktops leave it there.
+        Ok(o) if o.status.success() => {
+            let v = String::from_utf8_lossy(&o.stdout);
+            !v.contains("prefer-light")
+        }
+        _ => true,
+    }
+}
+
+/// A shell command that succeeds when the system is in dark mode, for
+/// tmux's `if-shell` (the same checks as [`system_is_dark`]).
+pub fn dark_shell_check() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "defaults read -g AppleInterfaceStyle 2>/dev/null | grep -q Dark"
+    } else {
+        "! gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null | grep -q prefer-light"
+    }
 }
 
 #[cfg(test)]

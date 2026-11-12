@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# A stand-in for Claude Code in rlord's demo (scripts/demo/demo.sh): draws a
+# plausible session screen, writes a small transcript, and reports its state
+# through rlord's hooks like the real thing. Never talks to a model.
+set -u
+demo=${RLORD_DEMO_DIR:?}
+args=("$@")
+sid='' prompt='' print=0 overlord=''
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[$i]} in
+    --session-id | --resume) sid=${args[$((i + 1))]}; i=$((i + 1)) ;;
+    --model | --effort | --settings | --remote-control | --allowedTools | --append-system-prompt | --tools | --output-format) i=$((i + 1)) ;;
+    --mcp-config) overlord=${args[$((i + 1))]}; i=$((i + 1)) ;;
+    -p | --print) print=1 ;;
+    -*) ;;
+    *) prompt=${args[$i]} ;;
+  esac
+done
+key=$(basename "$PWD")
+
+# `claude -p` (archive summaries): answer with the prepared summary.
+if [[ $print == 1 ]]; then
+  text=$(cat "$demo/summaries/$key.txt" 2>/dev/null || echo "A demo session.")
+  python3 -c 'import json,sys; print(json.dumps({"result": sys.argv[1], "is_error": False, "session_id": "demo"}))' "$text"
+  exit 0
+fi
+
+slug=$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+tdir=${CLAUDE_CONFIG_DIR:?}/projects/$slug
+mkdir -p "$tdir"
+tr=$tdir/$sid.jsonl
+hook() {
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name": sys.argv[1], "session_id": sys.argv[2], "transcript_path": sys.argv[3]}))' \
+    "$1" "$sid" "$tr" | rlord hook emit claude >/dev/null 2>&1 || true
+}
+say() { python3 -c 'import json,sys; t=sys.argv[1]; r=sys.argv[2]; print(json.dumps({"type":"user","message":{"content":t},"timestamp":"2026-01-01T00:00:00Z"})); print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":r}]},"timestamp":"2026-01-01T00:00:05Z"}))' "$1" "$2" >>"$tr"; }
+
+if [[ -n $overlord ]]; then
+  screen=$demo/screens/overlord.txt
+  [[ $overlord == *mastermind* ]] && screen=$demo/screens/mastermind.txt
+  state=idle
+else
+  screen=$demo/screens/$key.txt
+  state=$(cat "$demo/states/$key" 2>/dev/null || echo idle)
+fi
+[[ -s $tr ]] || say "${prompt:-continue}" "$(sed -n 's/^● //p' "$screen" 2>/dev/null | head -n 3 | tr '\n' ' ')"
+hook SessionStart
+hook UserPromptSubmit
+case $state in
+  waiting) hook Stop; hook Notification ;;
+  idle) hook Stop ;;
+esac
+clear
+cat "$screen" 2>/dev/null
+while :; do sleep 3600; done

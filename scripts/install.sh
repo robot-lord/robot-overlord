@@ -22,12 +22,15 @@ if [[ -L "$dest" && $force -eq 0 ]]; then
   exit 1
 fi
 
-# Browsers tag downloads with quarantine (gh/curl don't); clear it either way.
-xattr -d com.apple.quarantine "$src" 2>/dev/null || true
-codesign --verify "$src"
+if [[ "$(uname -s)" == Darwin ]]; then
+  # Browsers tag downloads with quarantine (gh/curl don't); clear it either way.
+  xattr -d com.apple.quarantine "$src" 2>/dev/null || true
+  codesign --verify "$src"
+fi
 
 # Copy then rename: overwriting a signed binary in place makes macOS kill it
-# ("Killed: 9") because the kernel caches signatures per inode.
+# ("Killed: 9") because the kernel caches signatures per inode (and on Linux
+# a running binary can't be overwritten: "Text file busy").
 tmp=$(mktemp "$dest_dir/.rlord.XXXXXX")
 trap 'rm -f "$tmp"' EXIT  # no-op once mv has consumed it
 cp "$src" "$tmp"

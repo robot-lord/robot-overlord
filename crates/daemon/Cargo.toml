@@ -1,12 +1,18 @@
 [package]
-name = "rlord-daemon"
+name = "robot-overlord-daemon"
+description = "rlord (Robot Overlord) internals: the daemon and its MCP server. Not a stable API."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rlord_daemon"
 
 [dependencies]
-rlord-core = { path = "../core" }
+rlord-core = { package = "robot-overlord-core", path = "../core" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

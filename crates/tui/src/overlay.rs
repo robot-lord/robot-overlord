@@ -654,29 +654,61 @@ impl ModeKeys {
 }
 
 /// Put a paste buffer on the clipboard (best effort): through tmux's own
-/// `copy-command` if the user set one, else the Mac's `pbcopy`.
+/// `copy-command` if the user set one; else the system's clipboard tool
+/// (`pbcopy` on macOS; `wl-copy` under Wayland, else `xclip` or `xsel`);
+/// else OSC 52 through tmux (`load-buffer -w`), which reaches the user's
+/// terminal even over ssh if it allows clipboard writes.
 fn copy_to_clipboard(buffer: &str) {
     let Ok(text) = tmux::buffer_text(buffer) else {
         return;
     };
-    use std::io::Write;
     let custom = tmux::server_option("copy-command");
-    let mut cmd = if custom.trim().is_empty() {
-        if !cfg!(target_os = "macos") {
+    if !custom.trim().is_empty() {
+        pipe_to(
+            std::process::Command::new("sh").args(["-c", custom.trim()]),
+            &text,
+        );
+        return;
+    }
+    let has = |v: &str| std::env::var_os(v).is_some_and(|x| !x.is_empty());
+    let mut tools: Vec<&[&str]> = Vec::new();
+    if cfg!(target_os = "macos") {
+        tools.push(&["pbcopy"]);
+    } else {
+        if has("WAYLAND_DISPLAY") {
+            tools.push(&["wl-copy"]);
+        }
+        if has("DISPLAY") {
+            tools.push(&["xclip", "-selection", "clipboard"]);
+            tools.push(&["xsel", "-ib"]);
+        }
+    }
+    for t in tools {
+        if pipe_to(std::process::Command::new(t[0]).args(&t[1..]), &text) {
             return;
         }
-        std::process::Command::new("pbcopy")
-    } else {
-        let mut c = std::process::Command::new("sh");
-        c.args(["-c", custom.trim()]);
-        c
-    };
-    if let Ok(mut c) = cmd.stdin(std::process::Stdio::piped()).spawn() {
-        if let Some(mut i) = c.stdin.take() {
-            let _ = i.write_all(text.as_bytes());
-        }
-        let _ = c.wait();
     }
+    let _ = tmux::buffer_to_clipboard(buffer, &text);
+}
+
+/// Run `cmd` with `text` on its stdin; whether it ran and succeeded.
+fn pipe_to(cmd: &mut std::process::Command, text: &str) -> bool {
+    use std::io::Write;
+    use std::process::Stdio;
+    // The clipboard tools may leave a child behind holding the selection:
+    // it must not keep the popup's terminal open.
+    let Ok(mut c) = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut i) = c.stdin.take() {
+        let _ = i.write_all(text.as_bytes());
+    }
+    c.wait().is_ok_and(|s| s.success())
 }
 
 /// The copy bar: a chip in the seat's colour naming the mode, then what

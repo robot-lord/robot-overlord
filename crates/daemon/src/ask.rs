@@ -43,7 +43,10 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
     let _send = (seat.key == overlord::MASTERMIND.key)
         .then(|| d.mastermind_send.lock().expect("mastermind send lock"));
     if d.db().overlord()?.is_none() {
-        bail!("no overlord yet: press Option-O to set one up (or N for the manual form)");
+        bail!(
+            "no overlord yet: press {}-O to set one up (or N for the manual form)",
+            rlord_core::keys::alt_name()
+        );
     }
     let s = overlord::ensure(&d.db(), &d.config(), &json!({"seat": seat.key}))?;
     let pane = s["tmux_session"].as_str().unwrap_or(seat.tmux).to_string();
@@ -198,7 +201,8 @@ fn show_mastermind(d: &Daemon) -> String {
         return match crate::ui::overlord(d, &p) {
             Ok(_) => "the user now sees the mastermind".into(),
             Err(e) => format!(
-                "delivered, but the overlay didn't switch ({e:#}): tell the user to press Option-M in the overlay"
+                "delivered, but the overlay didn't switch ({e:#}): tell the user to press {}-M in the overlay",
+                rlord_core::keys::alt_name()
             ),
         };
     }
