@@ -399,6 +399,12 @@ transcript store so `rlord search` covers them.
 
 ## Inter-session messaging
 
+**Built today:** only the idle-prompt path below, as the overlord's
+`send_to_session` (see "Passing work to a session" under "The overlord"):
+typed into a session whose turn is over, or held (one message per
+session) until it is. The mailbox, pull tool and Stop-hook injection
+described here are the original design and are not built.
+
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,
 keystroke injection last:
 
@@ -561,37 +567,67 @@ ride in `launch_spec.extra_args`, so resume reuses them; they are rewritten
 on every `ensure` and fresh restart, so a config change reaches it at its
 next start.
 
-Any agent can run it (`Agent::runs_overlord`). The surface is the same for
+Any agent can run it (`write_files` matches on `Agent` with no wildcard
+arm, so a new agent doesn't build until it is wired). The surface is the same for
 each, in its own terms: rlord's tools without a prompt, reading without a
 prompt, a prompt for anything that writes or runs a command.
 
 | | MCP server and its tools | Everything else | Subagents |
 |---|---|---|---|
-| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob,ListAgents,SendMessage` | asks | `.claude/agents/*.md` |
-| Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"` | `.codex/agents/*.toml` |
-| OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`/`subagent`/`execute`/`rlord_*` allow (last match wins) | `.opencode/agents/*.md` |
+| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` | asks | `.claude/agents/*.md` |
+| Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"`, `-c check_for_update_on_startup=false` | `.codex/agents/*.toml` |
+| OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`, rlord's own subagents by name, `rlord_*` allow (last match wins); repeated under `agents.<name>` | `.opencode/agents/*.md` |
 
 Things that are not visible at the call site:
 
-- **Codex gives an MCP server only a short list of environment variables.**
-  `env_vars` names the ones `rlord mcp` needs (`codex::MCP_ENV`: the
-  session id and the XDG dirs that locate the daemon's socket).
+- **`rlord mcp --socket <path>`**: every agent's config names the daemon's
+  socket as the daemon resolved it, and `rlord mcp` then never autostarts
+  a daemon. An agent may start the server with another environment
+  (OpenCode's shared server keeps whatever environment first started it,
+  where the XDG dirs could name another socket). What `rlord mcp` still
+  reads from its environment is one list, `agents::MCP_ENV` (the calling
+  session's id, only logged): Codex, which starts a server with a short
+  environment of its own, passes it on in `env_vars`; OpenCode blanks it
+  in `environment`.
+- **Codex's approvals.** `approval_policy="on-request"`: commands run in
+  the read-only sandbox unasked, and anything needing more asks.
+  `"untrusted"` (ask for anything not known to be read-only) would be
+  stricter, but Codex 0.167 refuses it ("no longer supported"). The
+  sandbox is what keeps a command from reaching rlord's tmux socket and
+  typing into another pane: macOS refuses the connection (checked live);
+  Linux is unverified.
 - **Codex's folder trust is passed as a whole table**
   (`-c 'projects={"<dir>"={trust_level="trusted"}}'`): a dotted override
   path can't hold a quoted key, and without trust Codex stops at a "trust
-  this folder?" screen and ignores `.codex/agents`. It applies to that run
-  only; nothing is written under `~/.codex`.
+  this folder?" screen and ignores `.codex/agents`. It replaces the user's
+  whole `projects` table for that run only (their other folders' trust is
+  unknown to it); nothing is written under `~/.codex`.
 - **OpenCode's MCP server process belongs to its shared server**, not the
-  pane, so `opencode.json` carries the daemon's XDG dirs in `environment`.
-  OpenCode calls MCP tools from a Code Mode script (`execute`), hence that
-  rule; each tool in the script is still checked.
+  pane (hence `--socket`). OpenCode calls MCP tools from a Code Mode script
+  (`execute`), which needs no rule of its own: OpenCode checks each tool a
+  script calls (an rlord tool runs unasked; `fetch` asks as a web fetch),
+  and a script can't import `fs` or `child_process` (checked live,
+  OpenCode 2.2.7).
+- **OpenCode merges rules by level, not by file**: the top-level rules of
+  every config file (the user's global ones first, the folder's after),
+  then every file's agent-level rules (`agents.<name>.permissions`). A
+  user's own global agent-level `allow` would otherwise come last and
+  override the overlord's `*` ask, so the folder config repeats its rules
+  under `build`, `plan` and rlord's subagents. A custom primary agent the
+  user switches to by hand in the overlord's TUI isn't covered.
 - **Codex reports nothing until a prompt.** It creates the conversation,
   and runs SessionStart, with the first prompt of a new conversation and
   the next prompt of a resumed one. `ask` types into the overlord only once
   it has left `starting`, so `daemon::discover` settles such a session once
-  its pane has been up a moment (`first_prompt_due`, and `follow` for a
-  hook-confirmed session that is still starting). An overlord that stopped
-  with no conversation bound starts fresh rather than failing to resume.
+  its pane has been up a moment and shows Codex's composer
+  (`codex::composer_shown`, not an update or trust dialog;
+  `first_prompt_due`, and `follow` for a session still starting). While
+  starting, only transcript lines written since the (re)start count
+  (`transcript::working_since`): a conversation killed mid-turn ends on a
+  turn that never closes, and resumed it is the user's turn. An overlord
+  that stopped with no conversation bound looks in Codex's index once more
+  (`discover::bind_now`) and resumes what it finds; only with nothing
+  there does it start fresh.
 - Subagent definitions are kept once, in Claude's format (`tidy.md`,
   `import.md`), and converted (`overlord::subagent_parts`). A Codex or
   OpenCode subagent inherits the overlord's tools: only Claude's file can
@@ -599,8 +635,19 @@ Things that are not visible at the call site:
   that can't start one.
 
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
-  overlord's pane (bracketed paste, then Enter), waiting out `starting` after
-  a (re)start. `overlord.new_session` formats the list's `n` form as a
+  overlord's agent pane (`send::type_into`: bracketed paste, then Enter),
+  waiting out `starting` after a (re)start, and refusing while it needs
+  the user (the Enter would answer a permission dialog).
+- **Passing work to a session** (`daemon/src/send.rs`, MCP
+  `send_to_session`, method `session.send`): the same paste into the
+  target's pinned agent pane, for any agent. Only a session whose turn is
+  over; working or needs-you is refused unless `when_idle`, which keeps one
+  pending message per session (kv `send_pending`, a newer one replaces it)
+  for a 2s tick to deliver once the turn has been over 2s (and not within
+  10s of the last paste). Stopped, starting, error, archived and the
+  overlord itself are refused; a pending message is dropped when its
+  session stops or goes. Logged as `message_sent` / `message_queued` /
+  `message_delivered` / `message_dropped`. `overlord.new_session` formats the list's `n` form as a
   `[rlord new-session request]` message: `confirmed:`, the hints with
   whether each was picked or defaulted, then the description verbatim;
   `overlord.md` defines what the overlord does with one. On a contradiction

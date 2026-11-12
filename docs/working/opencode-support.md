@@ -1,4 +1,4 @@
-**Status:** in progress (sessions built, 0.20.0-dev.1; the overlord on OpenCode built on `codex-overlord`, 0.22.0-dev.1; import and messaging to come)
+**Status:** in progress (sessions built, 0.20.0-dev.1; the overlord on OpenCode and `send_to_session` built on `codex-overlord`, 0.22.0-dev.3; import to come)
 
 # OpenCode support
 
@@ -162,13 +162,16 @@ Facts found, against OpenCode 2.2.7 and its docs (opencode.ai/docs/config,
 - MCP tools are named `<server>_<tool>` for permissions. Rules are
   `{action, resource, effect}`; **the last match wins**, and every agent
   starts from "allow everything", so the overlord's config sets `*` to ask
-  first, then allows `read`, `glob`, `grep`, `subagent`, `execute` and
-  `rlord_*` (`opencode::overlord_config`).
+  first, then allows `read`, `glob`, `grep`, rlord's own subagents (by
+  name) and `rlord_*` (`opencode::overlord_config`), and repeats the rules
+  under `agents.<name>` (see the #10 review below).
 - OpenCode calls MCP tools from a Code Mode script (`execute`): the pane
   showed `✓ execute › rlord.list_sessions`.
 - Subagents: `.opencode/agents/<name>.md` (`description`, `mode:
   subagent`, body = instructions); they run as child sessions and use the
-  folder's rules.
+  folder's rules. OpenCode reads `{agent,agents}/**/*.md` (in its binary),
+  and `opencode debug agents` in the folder lists `rlord-tidy` and
+  `rlord-import`.
 - No effort setting, no flags: `write_files` returns no arguments.
 
 Verified live (one throwaway overlord in a scratch rlord with its own XDG
@@ -183,10 +186,45 @@ there, so only the free models existed; `opencode/glm-5.3-flash-free`):
   `answered` when rejected), nothing was written. This is also the first
   real permission prompt seen through the event stream: it maps as written.
 
-Not exercised: a subagent pass (`rlord-tidy` through `.opencode/agents`),
-the idle fresh restart, and `execute` running something other than a tool
-call (the docs say each tool in a script is checked; only an rlord tool
-and a shell command were tried, each on its own).
+Not exercised: the idle fresh restart.
+
+### PR #10 review (checked live, OpenCode 2.2.7, `glm-5.3-flash-free`)
+
+- **Code Mode (`execute`)**: no longer allowed by name (it falls to `*`
+  ask). It needs no rule: `execute › rlord.list_sessions` still ran with
+  no prompt, so OpenCode checks the tools a script calls, not the script.
+  Inside a script, `import "fs"` / `"child_process"` fail ("isn't
+  available in Code Mode"), the built-in shell and write tools aren't in
+  its catalog, and `fetch` asked ("Permission required: WebFetch").
+- **The user's global config**: `opencode debug config` / `debug agents`
+  show the merge. Top-level rules from the user's global config come
+  before the folder's (a global `bash: allow` lost to the folder's `*`
+  ask: `touch` asked). But agent-level rules (`agent.build.permission` or
+  `agents.build.permissions`) are applied after every file's top-level
+  rules, so a global agent-level `bash: allow` came last and would have
+  won. Mitigated: the folder repeats its rules under `agents.build`,
+  `agents.plan`, `agents.rlord-tidy`, `agents.rlord-import` (folder after
+  global at that level too); with a global `agent.build` shell allow in
+  place, `touch` still asked. Also `subagent` is allowed only for rlord's
+  own: starting `general` asked. Not covered: a custom primary agent the
+  user switches to by hand in the overlord's TUI.
+- **A subagent pass**: "a tidy pass with rlord-tidy" → `Rlord-Tidy
+  Subagent` ran `triage` with no prompt.
+- **`rlord mcp --socket`**: the scratch OpenCode service had been started
+  with another `XDG_RUNTIME_DIR` than the daemon's; the overlord's tool
+  calls reached the daemon anyway.
+- **Found: `overlord ask` approved a permission prompt.** Typed while the
+  overlord was waiting on one, its Enter landed on "Allow once" and the
+  command ran. `ask` now refuses while the overlord needs you (checked:
+  refused with a message; the prompt stayed).
+- **`send_to_session`**: the overlord passed "reply with only the word
+  PONG" to an OpenCode session (answered). By the RPC directly: to a
+  working session it was refused; with `when_idle` it was queued, a second
+  replaced it (`replaced_pending: true`), and the second was delivered when
+  the turn ended (`message_delivered`); to the overlord itself, refused.
+
+All throwaway OpenCode sessions (overlord, target, tidy child) were
+deleted and the scratch service stopped.
 
 ## Verified against OpenCode 2.2.7 (throwaway sessions, all deleted)
 
@@ -279,12 +317,9 @@ and without a model and a restart of a session OpenCode no longer had.
 
 ## Owed
 
-- Import (`session_v2` has directory, title, model), messaging through
-  the API (`POST …/prompt`, already used for the deferred prompt).
-- The overlord on OpenCode: a subagent pass checked by hand; whether a
-  Code Mode script can do anything that the rules don't check.
-- The overlord on OpenCode can't pass a message to another session (no
-  peer tools); the messaging tool above would give it that.
+- Import (`session_v2` has directory, title, model).
+- `send_to_session` types into the pane; `POST …/prompt {delivery:
+  queue}` could deliver to a busy OpenCode session without typing.
 - Sub-agent tracking (child sessions: `parent_id`).
 - A question form, checked by hand (a real permission prompt was: see
   "The overlord on OpenCode").

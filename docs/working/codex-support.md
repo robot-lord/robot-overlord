@@ -1,4 +1,4 @@
-**Status:** in progress (phases 1 and 2 built, 0.19.0-dev.1; phase 4, the overlord on Codex, built on `codex-overlord`, 0.22.0-dev.1; phase 3 to come)
+**Status:** in progress (phases 1 and 2 built, 0.19.0-dev.1; phase 4, the overlord on Codex, and `send_to_session` built on `codex-overlord`, 0.22.0-dev.3; the rest of phase 3 to come)
 
 # Codex CLI support
 
@@ -165,12 +165,15 @@ codex-cli 0.167.2:
   `mcp_servers.rlord.default_tools_approval_mode="approve"` (values
   `auto | prompt | writes | approve`, from `codex app-server
   generate-json-schema`), `sandbox_mode="read-only"`,
-  `approval_policy="on-request"`, and the folder's trust.
+  `approval_policy="on-request"`, `check_for_update_on_startup=false`, and
+  the folder's trust.
 - **Folder trust**: `-c 'projects."<dir>".trust_level="trusted"'` is
   accepted and ignored (Codex still shows "Trust this folder?"). The whole
   table works: `-c 'projects={"<dir>"={trust_level="trusted"}}'`.
 - **Environment**: Codex starts an MCP server with a short list of
-  variables; `env_vars` passes on `RLORD_SESSION_ID` and the XDG dirs.
+  variables. Since the #10 review the server is `rlord mcp --socket
+  <path>` (the daemon's socket, never looked up), and `env_vars` passes on
+  `agents::MCP_ENV` (`RLORD_SESSION_ID`, only logged).
 - **AGENTS.md** in the folder is loaded (`codex debug prompt-input` shows
   it, with no model call; that command takes `-c` only, not `-s` / `-a`).
 - **Subagents**: `.codex/agents/<name>.toml` (`name`, `description`,
@@ -236,12 +239,49 @@ Known limits, accepted:
 - `RLORD_NO_LOGIN_SHELL=1` turns login-shell resolution off (the demo and
   scratch setups set it, with a stand-in `SHELL`).
 
+### PR #10 review (fixes, checked live on this Mac)
+
+- **`approval_policy`**: the review asked for `"untrusted"` (a sandboxed
+  command would run unasked under `"on-request"`; on Linux the read-only
+  sandbox may allow a Unix-socket connect, so `tmux -L rlord send-keys`
+  could type into a pane). Codex 0.167.2 refuses it at startup:
+  `approval_policy = "untrusted" is no longer supported; remove this
+  setting` (the pane died). The policies left are `on-request`, `never`
+  and `granular`. Kept `on-request`. Live: the overlord ran `tmux -L
+  <scratch socket> list-sessions` unasked and the sandbox refused it
+  (`error connecting to … (Operation not permitted)`); rlord's tools ran
+  with no prompt. Linux is unverified: owed below.
+- **Killed mid-turn, then resumed**: the rollout ends on `task_started`.
+  `follow` now counts only lines since the (re)start while a session is
+  starting (`transcript::working_since`), and leaves the incremental
+  reader at the end. Live: a session killed mid-story, restarted: starting,
+  then your turn (`agent_stopped` from the transcript), not working.
+- **Settling a start checks the screen**: `codex::composer_shown` (a `›`
+  line near the bottom that isn't a numbered dialog choice). Live: the
+  overlord and a promptless session settled once the composer showed.
+  `check_for_update_on_startup=false` is accepted (no warning).
+- **Unbound overlord**: `discover::bind_now` once with the old
+  `bind_since`. Live: an overlord's `agent_session` cleared by hand →
+  `ensure` bound the thread from the index (`agent_session_bound`) and
+  resumed it; with no thread, it started fresh (`reason: unbound`).
+- **`send_to_session`** (rlord's own tool, not `codex queue`): typed into
+  the target's agent pane. Live: the Codex overlord sent "reply with only
+  the word PONG" to a promptless Codex session; its hooks then showed
+  SessionStart, UserPromptSubmit, Stop.
+
+Found on the way, not fixed (outside this PR): a hook-confirmed Codex
+session whose tmux session is killed stays "working" (no SessionEnd, and
+`discover` doesn't watch hooked sessions' panes) until it is restarted or
+the daemon restarts.
+
 ## Owed
 
-- The overlord on Codex can't pass a message to another session (it has no
-  peer tools; `overlord.md` tells it to take the user there). `codex queue
-  --thread <id> --message …` as an rlord tool (phase 3) would give every
-  overlord that, whichever agent it runs on.
+- Linux: check that the overlord's read-only sandbox refuses a connection
+  to rlord's tmux socket (`tmux -L rlord list-sessions` from the overlord).
+  If it doesn't, find a Codex setting that does (a permissions profile's
+  network rules, or an execpolicy rule), since `"untrusted"` is gone.
+- `codex queue --thread <id> --message …` could deliver to a busy Codex
+  session without typing; `send_to_session` types for every agent today.
 - Moving an existing overlord to another agent (the agent is fixed when it
   is first set up).
 - A Codex subagent can't be given a narrower tool list or a cheaper model

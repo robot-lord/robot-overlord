@@ -91,7 +91,7 @@ runs a command.
 | Subagents (tidy, import) | `.claude/agents` | `.codex/agents` | `.opencode/agents` |
 | Effort | `--effort` | `model_reasoning_effort` | none |
 | Remote Control | yes | no | no |
-| Messaging another session | yes (Claude sessions) | no: it takes you there instead | no: it takes you there instead |
+| Passing work to a session | `send_to_session` | `send_to_session` | `send_to_session` |
 
 - Nothing is written to your own agent config: Codex gets its settings as
   command-line overrides (its folder is trusted for that run only), and
@@ -103,6 +103,18 @@ runs a command.
   up.
 - **OpenCode** runs the overlord's turns in its shared background server,
   like any OpenCode session.
+- **Passing work to a session** ("tell the web app to also fix the
+  footer"): the overlord sends it with `send_to_session`, whichever agent
+  runs the overlord and whichever the session runs. rlord types it into
+  that session's prompt, as if you had, once its turn is over. A session
+  that is working, or waiting on you, isn't typed into: the overlord says
+  so, or (when you want it delivered anyway) it waits for that turn to end
+  and goes in then (one waiting message per session; a newer one replaces
+  it). Stopped and archived sessions are refused. Each send is in the
+  session's log.
+- `rlord overlord ask` (and the list's `n` form) won't type into the
+  overlord while it waits on you (a permission prompt): its Enter would
+  answer the prompt. Answer it first.
 - The agent is chosen when the overlord is first set up. An existing
   overlord keeps its agent: `[overlord] agent` applies only while there is
   none yet. Moving an existing overlord to another agent isn't built.
@@ -226,8 +238,7 @@ codex_summary_model`).
 The overlord can run on Codex (see "Which agent runs the overlord").
 
 Not yet: importing Codex
-conversations started outside rlord, passing a message to a Codex session
-from the overlord, sub-agent tracking, Remote Control. A session blocked
+conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
 on a permission prompt shows "needs you" only with trusted hooks.
 
 ## OpenCode sessions
@@ -277,8 +288,7 @@ Good to know:
 The overlord can run on OpenCode (see "Which agent runs the overlord").
 
 Not yet: importing OpenCode
-conversations started outside rlord, passing a message to an OpenCode
-session from the overlord, sub-agent tracking, Remote Control.
+conversations started outside rlord, sub-agent tracking, Remote Control.
 
 ## The right-hand side: preview + details
 
