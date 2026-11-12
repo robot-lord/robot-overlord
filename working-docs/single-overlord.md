@@ -73,3 +73,34 @@ cheap to reach without carrying it in context:
 - overlord.md: when the user refers to something not in its context, call
   `recall` first, before asking or searching broadly.
 - Nothing is preloaded into a fresh conversation; it fetches on demand.
+
+## Fresh restarts the user can see (user ask, 2026-11-12)
+
+Today: `start_fresh_keeper` / `fresh_if_idle` (`daemon/src/overlord.rs`)
+checks once a minute. It restarts the seat on a fresh conversation when the
+seat has been idle `mastermind_fresh_after_mins` (default 15; 0 = never)
+since the last exchange, the turn really ended, it isn't waiting on the
+user, and nobody is looking at it (overlay closed, no attached client). It
+records `mastermind_fresh_at` in kv and a `fresh_conversation` event
+`{from, to}` (the old and new agent session ids). So rlord already has the
+full history of past conversations; the UI just doesn't show it.
+
+Make it visible:
+
+- **Overlord bar / row:** "fresh 2h ago · 14 earlier" (when the current
+  conversation started, how many came before). Hover or the details pane
+  says why: "idle 15m, restarted on a fresh conversation".
+- **Details pane:** a list of past conversations: started/ended, turns,
+  first prompt (clipped), why it ended (idle restart / user `/clear` /
+  manual restart). Cheap: events + transcript stats, no model call.
+- **Jump to one:** pick a past conversation, show its transcript excerpt in
+  the preview (same reader as search). Stretch: "continue it" resumes that
+  conversation in the overlord (`claude --resume <id>`, Codex `resume <id>`)
+  and ends the current one the same way an idle restart would.
+- **Count the user's own clears too:** Claude's SessionStart hook reports
+  `source: "clear"`; record a `fresh_conversation` event with
+  `reason: "clear"` so the history is complete. (Idle restarts get
+  `reason: "idle"`.)
+- `recall` (above) reads the same list, so the overlord and the UI agree on
+  what "earlier conversations" are.
+- Rename kv `mastermind_fresh_at` → `overlord_fresh_at` in the migration.
