@@ -1312,6 +1312,11 @@ fn ingest_subagent_hook(
     }
     let agent_type = payload["agent_type"].as_str().unwrap_or("").to_string();
     let source = db.transcript_source(session_id)?;
+    // Its saved read position first, so a position that fell out of memory
+    // doesn't mean re-reading the whole file here (under the DB lock).
+    if let Some(tp) = payload["agent_transcript_path"].as_str() {
+        transcript::seed_cursors(db.transcript_cursors_for(&[tp])?);
+    }
     let from_disk = source
         .as_deref()
         // Only this hook's agent, not every sub-agent of the session.

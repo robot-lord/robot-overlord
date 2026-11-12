@@ -85,3 +85,8 @@ has, read cheaply, no model calls.
 - A list of more archived sessions than `STATS_CURSOR_CAP` (1000) reloads
   evicted positions from the DB on each list (DB reads, no file reads).
   Fine at current sizes; raise the cap or cache per list if it shows.
+- Owed (pre-existing, not a regression): `session.subagents` reads sub-agent
+  transcripts that have no saved position in full inside the request
+  (`warm.rs` `refresh(.., request: true)` → `scan_subagents_read`). Only
+  the main transcript is bounded. Fix: on the request path, read only
+  sub-agents whose unread backlog is ≤ 4 MB and queue the rest.
