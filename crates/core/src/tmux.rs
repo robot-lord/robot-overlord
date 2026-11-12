@@ -208,6 +208,9 @@ fn tmux_cmd() -> Command {
     // means; anywhere else it would point at the user's own tmux.
     if !inside_rlord() {
         c.env_remove("TMUX");
+        // A pane id from another server: never let it reach rlord's server
+        // (a server started from here would keep it in its environment).
+        c.env_remove("TMUX_PANE");
     }
     c.args(["-L", &socket_name(), "-f"]);
     c.arg(conf_path());
@@ -996,13 +999,19 @@ pub fn current_session() -> Option<String> {
     // This process's own pane ($TMUX_PANE), not whatever the active client
     // shows: a TUI restarted by `rlord reset` while the terminal is on an
     // agent session must still record its own session as home.
-    let mut args = vec!["display-message", "-p"];
     let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
-    if let Some(p) = pane.as_deref() {
-        args.extend(["-t", p]);
-    }
-    args.push("#{session_name}");
-    run(&args).ok().filter(|s| !s.is_empty())
+    let own = pane.as_deref().and_then(|p| {
+        run(&["display-message", "-p", "-t", p, "#{session_name}"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    // No pane, or a stale one (a key binding's job can inherit an id that
+    // isn't on this server): the current client's session, as before.
+    own.or_else(|| {
+        run(&["display-message", "-p", "#{session_name}"])
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// Flash a message on the current client's status line.
