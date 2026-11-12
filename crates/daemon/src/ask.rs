@@ -46,6 +46,8 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
     // look that found it ready.
     let start = Instant::now();
     let mut started = false;
+    // Starts asked for: the first, and one more if it stopped meanwhile.
+    let mut starts = 0;
     loop {
         {
             // Not while an idle overlord is being restarted fresh. (Lock
@@ -64,7 +66,15 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                 && s.tmux_session.as_deref().is_some_and(tmux::has_session);
             let s = if !started || !running {
                 // Start it (or pick up fresh flags) once; again only if it
-                // stopped while we waited.
+                // stopped while we waited, and not over and over (an agent
+                // that exits at once would be respawned until the timeout).
+                if starts >= 2 {
+                    bail!(
+                        "the overlord stopped while starting: look at its pane ({}-O)",
+                        rlord_core::keys::alt_name()
+                    );
+                }
+                starts += 1;
                 overlord::ensure(&d.db(), &d.config(), &json!({}))?;
                 started = true;
                 d.changed();

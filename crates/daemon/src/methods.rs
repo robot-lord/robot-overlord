@@ -390,6 +390,16 @@ fn path_with(program: Option<&std::path::Path>, path: &str) -> Option<String> {
     })
 }
 
+/// The argv a session's pane was last started with: what it actually runs
+/// (its launch spec may already hold flags for the next start).
+pub fn launched_args_key(id: &str) -> String {
+    format!("launched_args:{id}")
+}
+
+fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
+    db.kv_set(&launched_args_key(id), &serde_json::to_string(argv)?)
+}
+
 pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let p_opt = |k: &str| {
         params
@@ -522,6 +532,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     }
 
     let cmd = tmux::pane_command(&pane_env(&id, program.as_deref()), argv);
+    note_launch(db, &id, argv)?;
     tmux::new_session(&tmux_name, &project_path, &cmd)?;
     db.insert_event(
         &id,
@@ -766,6 +777,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         }
     };
     let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), &argv);
+    note_launch(db, &s.id, &argv)?;
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
@@ -807,6 +819,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
         .clone()
         .context("session has no tmux session")?;
     let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), argv);
+    note_launch(db, &s.id, argv)?;
     let now = now_ms();
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;

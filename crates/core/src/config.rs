@@ -579,6 +579,10 @@ fn write_config(path: &std::path::Path, out: &str) -> Result<()> {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, out)?;
+    // Keep the file's own permissions (a 0600 config stays 0600).
+    if let Ok(m) = std::fs::metadata(&path) {
+        let _ = std::fs::set_permissions(&tmp, m.permissions());
+    }
     std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

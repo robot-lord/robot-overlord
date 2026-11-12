@@ -120,6 +120,16 @@ fn effort_for(cfg: &Config, agent: Agent) -> String {
 /// The effort the overlord was launched with, from the adapter flags in
 /// its launch spec ("": the agent's default).
 pub fn launched_effort(db: &Db, s: &Session) -> String {
+    // What its pane was started with; the spec only before that's known.
+    if let Some(argv) = db
+        .kv_get(&methods::launched_args_key(&s.id))
+        .ok()
+        .flatten()
+        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+    {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        return effort_in_args(&args);
+    }
     let spec: Value = db
         .launch_spec(&s.id)
         .ok()
