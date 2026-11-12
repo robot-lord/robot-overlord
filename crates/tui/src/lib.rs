@@ -1646,9 +1646,8 @@ fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// When a session last changed: its latest message either way or status
-/// change (creation, failing all of those). The list's "Updated" column.
-/// "Updated": the last message either way (not a resume or a state flip).
+/// The list's "Updated" column: the latest message either way (not a
+/// resume or a state flip), else when it was created.
 fn updated_at(s: &Value) -> Option<i64> {
     ["last_agent_msg_at", "last_user_msg_at", "created_at"]
         .iter()

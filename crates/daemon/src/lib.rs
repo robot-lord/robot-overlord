@@ -92,7 +92,6 @@ impl Daemon {
         self.tui_subscribers.load(Ordering::SeqCst)
     }
 
-    /// Push a UI command to TUIs; park it for the next TUI if none is up.
     /// The config as last loaded.
     pub fn config(&self) -> Arc<Config> {
         self.config.read().expect("config lock").clone()
@@ -109,6 +108,7 @@ impl Daemon {
         Ok(json!({"reloaded": true}))
     }
 
+    /// Push a UI command to TUIs; park it for the next TUI if none is up.
     pub(crate) fn ui_cmd(&self, cmd: Value) {
         if self.tui_count() == 0 {
             *self.pending_ui.lock().expect("ui mutex") =

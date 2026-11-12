@@ -466,9 +466,10 @@ fn claude_chord(s: &str) -> Option<Key> {
 
 /// The keys every slot holds now (`None` when off or unreadable).
 fn bound(cfg: &Config) -> Vec<(&'static Slot, Option<Key>)> {
+    let v = serde_json::to_value(cfg).unwrap_or_default();
     SLOTS
         .iter()
-        .map(|s| (s, Key::parse(&s.current(cfg))))
+        .map(|s| (s, v[s.section][s.field].as_str().and_then(Key::parse)))
         .collect()
 }
 
@@ -550,7 +551,9 @@ pub fn check(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             format!("your shell's line editing uses {label} ({what}); it won't reach the shell"),
         );
     }
-    if !key.ctrl && !key.alt && key.name.chars().count() == 1 {
+    // Without a modifier (bar F-keys) a global key is a key people type.
+    let fkey = key.name.len() > 1 && key.name.starts_with('f');
+    if !key.ctrl && !key.alt && !fkey {
         add(
             Level::Taken,
             format!("a plain {label} everywhere would stop you typing it"),
@@ -657,6 +660,8 @@ mod tests {
         assert_eq!(lv("C-o", back), Some(Level::Shadows)); // Claude's
         assert_eq!(lv("x", back), Some(Level::Taken)); // plain letter
         assert_eq!(lv("M-h", back), None);
+        assert_eq!(lv("enter", back), Some(Level::Taken)); // typed everywhere
+        assert_eq!(lv("F5", back), None);
         let quit = slot("keys.quit").unwrap();
         assert_eq!(lv("j", quit), Some(Level::Taken)); // down
         assert_eq!(lv("M-d", quit), Some(Level::Taken)); // tmux's first

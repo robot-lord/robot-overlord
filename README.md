@@ -181,7 +181,8 @@ resumes.
 `enter` on a stopped session resumes it and attaches.
 
 The list's UPDATED column (and the default sort) is the session's last
-update: the latest message either way, or status change. The details card
+update: the latest message either way (resuming it or a state change
+doesn't count; that's the CHANGED sort). The details card
 breaks it down.
 
 Add standing instructions in `~/.config/robot-overlord/overlord.md`. They're

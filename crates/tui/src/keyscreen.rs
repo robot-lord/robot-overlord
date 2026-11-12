@@ -26,6 +26,8 @@ pub(crate) struct KeyScreen {
     phase: Phase,
     /// The last thing that happened (saved, failed).
     msg: Option<(Level, String)>,
+    /// Each slot's findings for its current key (redone after a save).
+    cache: Vec<Vec<Finding>>,
 }
 
 enum Phase {
@@ -37,8 +39,9 @@ enum Phase {
 struct Review {
     key: Key,
     findings: Vec<Finding>,
-    /// The key arrived as a character Option types (Option isn't Meta).
-    option_char: Option<char>,
+    /// The key arrived as a character Option types (Option isn't Meta),
+    /// and the terminal setting that fixes it.
+    option_char: Option<(char, String)>,
 }
 
 /// While alive, this TUI's tmux session reads keys from an empty table.
@@ -63,17 +66,32 @@ impl Drop for Listening {
 }
 
 impl KeyScreen {
-    pub(crate) fn new(at: Option<&str>) -> Self {
+    pub(crate) fn new(at: Option<&str>, cfg: &Config) -> Self {
         let sel = at
             .and_then(|id| SLOTS.iter().position(|s| s.id() == id))
             .unwrap_or(0);
-        KeyScreen {
+        let mut ks = KeyScreen {
             sel,
             env: Env::read(),
             tested: HashSet::new(),
             phase: Phase::Browse,
             msg: None,
-        }
+            cache: Vec::new(),
+        };
+        ks.recheck(cfg);
+        ks
+    }
+
+    /// Redo every slot's findings (the config changed).
+    fn recheck(&mut self, cfg: &Config) {
+        self.cache = SLOTS
+            .iter()
+            .map(|s| {
+                Key::parse(&s.current(cfg))
+                    .map(|k| keys::check(cfg, &self.env, s, &k))
+                    .unwrap_or_default()
+            })
+            .collect();
     }
 
     pub(crate) fn listening(&self) -> bool {
@@ -84,10 +102,8 @@ impl KeyScreen {
         &SLOTS[self.sel]
     }
 
-    fn findings(&self, cfg: &Config, s: &Slot) -> Vec<Finding> {
-        Key::parse(&s.current(cfg))
-            .map(|k| keys::check(cfg, &self.env, s, &k))
-            .unwrap_or_default()
+    fn findings(&self, i: usize) -> &[Finding] {
+        self.cache.get(i).map(Vec::as_slice).unwrap_or_default()
     }
 }
 
@@ -100,7 +116,6 @@ fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
         KeyCode::Char(c) => Some(Key::char(c, ctrl, alt)),
         KeyCode::Enter => named("enter"),
         KeyCode::Tab => named("tab"),
-        KeyCode::BackTab => Some(Key::named("tab", ctrl, alt)),
         KeyCode::Backspace => named("backspace"),
         KeyCode::Up => named("up"),
         KeyCode::Down => named("down"),
@@ -111,8 +126,8 @@ fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
         KeyCode::PageUp => named("pageup"),
         KeyCode::PageDown => named("pagedown"),
         KeyCode::Delete => named("delete"),
-        KeyCode::Insert => named("insert"),
-        KeyCode::F(n) => named(&format!("f{n}")),
+        // Only what config.toml can spell (no Shift-Tab, Insert, F13+).
+        KeyCode::F(n @ 1..=12) => named(&format!("f{n}")),
         _ => None,
     }
 }
@@ -120,7 +135,10 @@ fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
 impl App {
     /// Open the key screen (at one key's row).
     pub(crate) fn open_keys(&mut self, at: Option<&str>) {
-        self.mode = Mode::Keys(Box::new(KeyScreen::new(at.filter(|s| !s.is_empty()))));
+        self.mode = Mode::Keys(Box::new(KeyScreen::new(
+            at.filter(|s| !s.is_empty()),
+            &self.config,
+        )));
     }
 
     pub(crate) fn handle_keys(
@@ -144,13 +162,22 @@ impl App {
                 KeyCode::Char('d') => {
                     let s = ks.slot();
                     let spec = s.default_spec();
-                    let r = self.save_key(s, &spec);
-                    ks.msg = Some(r);
+                    let taken = Key::parse(&spec).and_then(|k| {
+                        keys::check(&self.config, &ks.env, s, &k)
+                            .into_iter()
+                            .find(|f| f.level == Level::Taken)
+                    });
+                    ks.msg = Some(match taken {
+                        Some(f) => (Level::Taken, format!("default not restored: {}", f.text)),
+                        None => self.save_key(s, &spec),
+                    });
+                    ks.recheck(&self.config);
                 }
                 KeyCode::Char('x') if ks.slot().optional => {
                     let s = ks.slot();
                     let r = self.save_key(s, "");
                     ks.msg = Some(r);
+                    ks.recheck(&self.config);
                 }
                 _ => {}
             },
@@ -158,6 +185,12 @@ impl App {
                 // The guard drops here: the list's keys are back.
                 if k.code == KeyCode::Esc && k.modifiers.is_empty() {
                     ks.msg = None;
+                } else if key_of(&k).is_none() {
+                    ks.msg = Some((
+                        Level::Taken,
+                        "config.toml can't name that key (Shift-Tab, Insert, F13+): try another"
+                            .into(),
+                    ));
                 } else if let Some(key) = key_of(&k) {
                     let s = ks.slot();
                     // Option typed a character: the terminal doesn't send
@@ -170,10 +203,25 @@ impl App {
                     if oc.is_none() {
                         ks.tested.insert(s.id());
                     }
+                    let mut findings = keys::check(&self.config, &ks.env, s, &key);
+                    let option_char = oc.map(|(c, _)| {
+                        // Saving it would trade a key that works for one
+                        // that can't arrive.
+                        findings.insert(
+                            0,
+                            Finding {
+                                level: Level::Taken,
+                                text: format!(
+                                    "it arrived as \"{c}\": fix the terminal, then try again"
+                                ),
+                            },
+                        );
+                        (c, keys::option_as_meta_fix(&tmux::client_termtype()))
+                    });
                     ks.phase = Phase::Review(Review {
-                        findings: keys::check(&self.config, &ks.env, s, &key),
+                        findings,
                         key,
-                        option_char: oc.map(|(c, _)| c),
+                        option_char,
                     });
                 }
             }
@@ -183,6 +231,7 @@ impl App {
                     let spec = s.spell(&r.key);
                     let res = self.save_key(s, &spec);
                     ks.msg = Some(res);
+                    ks.recheck(&self.config);
                 }
                 KeyCode::Esc => {}
                 // Try another key.
@@ -200,6 +249,12 @@ impl App {
     /// Write one key to config.toml and apply it: this TUI's keys now, the
     /// global ones via the daemon.
     fn save_key(&mut self, s: &Slot, spec: &str) -> (Level, String) {
+        // Never write a key the list can't read back (it wouldn't start).
+        if s.section == "keys" {
+            if let Err(e) = KeyBinding::parse(spec) {
+                return (Level::Taken, format!("not saved: {e:#}"));
+            }
+        }
         if let Err(e) = Config::set_value(s.section, s.field, spec) {
             return (Level::Taken, format!("not saved: {e:#}"));
         }
@@ -222,9 +277,9 @@ impl App {
             }
         }
         self.config = cfg;
-        if s.section == "tmux" {
-            self.call("config.reload", json!({}));
-        }
+        // The daemon reads keys too: the global ones it binds, and the
+        // overlord's `keys_list`.
+        self.call("config.reload", json!({}));
         let what = if spec.is_empty() {
             "off".to_string()
         } else {
@@ -278,9 +333,9 @@ impl App {
             let key = Key::parse(&spec)
                 .map(|k| k.label())
                 .unwrap_or_else(|| "off".into());
-            let fs = ks.findings(&self.config, s);
+            let fs = ks.findings(i);
             let mut line = Line::from(vec![
-                mark(&fs, ks.tested.contains(&s.id())),
+                mark(fs, ks.tested.contains(&s.id())),
                 Span::styled(
                     format!("{key:<10}"),
                     Style::default().fg(theme::text()).bold(),
@@ -331,7 +386,7 @@ impl App {
                         text: m.clone(),
                     }));
                 }
-                let fs = ks.findings(&self.config, s);
+                let fs = ks.findings(ks.sel);
                 if fs.is_empty() && ks.msg.is_none() {
                     d.push(Line::styled(
                         if ks.tested.contains(&s.id()) {
@@ -366,11 +421,10 @@ impl App {
             }
             Phase::Review(r) => {
                 let label = r.key.label();
-                if let Some(c) = r.option_char {
+                if let Some((c, fix)) = &r.option_char {
                     d.push(Line::styled(
                         format!(
-                            "Your terminal typed \"{c}\": Option isn't sent as Meta, so {label} can't reach rlord yet. {}",
-                            keys::option_as_meta_fix(&tmux::client_termtype())
+                            "Your terminal typed \"{c}\": Option isn't sent as Meta, so {label} can't reach rlord yet. {fix}"
                         ),
                         Style::default().fg(theme::yellow()),
                     ));

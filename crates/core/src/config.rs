@@ -339,6 +339,8 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // A symlinked config (a dotfiles repo) is written where it points.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, &out)?;
         std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
@@ -356,6 +358,10 @@ fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String>
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", paths::config_path().display()))?;
+    // `keys = { … }` becomes a `[keys]` table with the same values.
+    if let Some(t) = doc.get(section).and_then(|i| i.as_inline_table()).cloned() {
+        doc[section] = toml_edit::Item::Table(t.into_table());
+    }
     if !doc.contains_table(section) {
         doc[section] = toml_edit::table();
     }
@@ -498,6 +504,23 @@ mod tests {
         assert_eq!(c.tmux.next, "M-g");
         assert_eq!(c.tmux.back, "M-d");
         assert!(set_in(t, "keys", "quit", "x").is_ok());
+        // An inline table keeps its values.
+        let out = set_in(
+            "keys = { quit = \"x\", new = \"a\" }\n",
+            "keys",
+            "help",
+            "F1",
+        )
+        .unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            (
+                c.keys.quit.as_str(),
+                c.keys.new.as_str(),
+                c.keys.help.as_str()
+            ),
+            ("x", "a", "F1")
+        );
     }
 
     #[test]

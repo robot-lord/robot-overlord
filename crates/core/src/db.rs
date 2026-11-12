@@ -66,7 +66,7 @@ pub enum ArchivedMode {
 #[serde(rename_all = "snake_case")]
 pub enum SortMode {
     /// Most recently updated first (the default): the latest message either
-    /// way or status change.
+    /// way (a resume or state change alone doesn't count).
     #[default]
     #[serde(alias = "updated")]
     Activity,
