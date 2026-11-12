@@ -224,7 +224,7 @@ impl App {
                 Span::styled(what.to_string(), theme::muted()),
             ])
         };
-        let left = vec![
+        let mut left = vec![
             head("In the list"),
             row(format!("{}/{}", k(Action::Down), k(Action::Up)), "move"),
             row(
@@ -232,7 +232,6 @@ impl App {
                 "top / bottom",
             ),
             row(k(Action::Attach), "attach (resumes a stopped one)"),
-            row("1–9".into(), "attach the Nth session"),
             row(k(Action::Filter), "search"),
             row(k(Action::New), "new session (ask the overlord)"),
             row(k(Action::NewManual), "new session (form)"),
@@ -258,6 +257,9 @@ impl App {
             row(k(Action::ToggleLog), "pane ⇄ log preview"),
             row(k(Action::Quit), "quit"),
         ];
+        if self.config.jump_digits {
+            left.insert(4, row("1–9".into(), "attach the Nth session"));
+        }
         let right = vec![
             head("Ask the overlord"),
             Line::styled(
@@ -288,13 +290,20 @@ impl App {
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
         ];
-        let h = (left.len().max(right.len()) as u16) + 3;
+        // Side by side when wide, else stacked (both heights).
+        let wide = f.area().width >= 84;
+        let h = if wide {
+            left.len().max(right.len())
+        } else {
+            left.len() + right.len() + 1
+        } as u16
+            + 3;
         let area = newform::centered(f.area(), 96, h);
         f.render_widget(Clear, area);
         let block = theme::modal("Help");
         let inner = block.inner(area);
         f.render_widget(block, area);
-        if inner.width >= 80 {
+        if wide {
             let [l, r] =
                 RLayout::horizontal([Constraint::Percentage(48), Constraint::Min(0)]).areas(inner);
             f.render_widget(Paragraph::new(left), l);

@@ -37,6 +37,9 @@ enum Phase {
 }
 
 struct Review {
+    /// Still on the empty key table: the key pressed to try another must
+    /// reach the screen too, not open the overlord.
+    guard: Listening,
     key: Key,
     findings: Vec<Finding>,
     /// The key is a character Option types (∂): (it, the letter, the
@@ -211,8 +214,9 @@ impl App {
                 }
                 _ => {}
             },
-            Phase::Listen { .. } => {
-                // The guard drops here: the list's keys are back.
+            Phase::Listen { _guard: guard, .. } => {
+                // Unless a key moves on to Review, the guard drops here:
+                // the list's keys are back.
                 if k.code == KeyCode::Esc && k.modifiers.is_empty() {
                     ks.msg = None;
                 } else if key_of(&k).is_none() {
@@ -235,6 +239,7 @@ impl App {
                     ks.tested.insert((s.id(), key.clone()));
                     let findings = keys::check(&self.config, &ks.env, s, &key);
                     ks.phase = Phase::Review(Review {
+                        guard,
                         findings,
                         key,
                         option_char,
@@ -254,7 +259,7 @@ impl App {
                 _ => {
                     ks.phase = Phase::Listen {
                         since: Instant::now(),
-                        _guard: Listening::start(),
+                        _guard: r.guard,
                     };
                 }
             },

@@ -32,8 +32,9 @@ fn reviewed_at(db: &Db, id: &str) -> Option<i64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Latest activity: the same "updated" the list shows. Messages only: a
-/// resume or Claude's idle notification changes the state, not the work.
+/// Latest activity: messages (as the list's "updated"; a resume or
+/// Claude's idle notification changes the state, not the work), and for a
+/// session in error, when it failed.
 pub fn updated_at(s: &Session) -> i64 {
     // An error is news, even without a message.
     let failed = (s.status == Status::Error)
