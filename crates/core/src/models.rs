@@ -128,9 +128,57 @@ pub fn check(agent: &str, configured: Option<&str>, observed: Option<&str>) -> F
     out
 }
 
+/// Context window (tokens) per model family, first match wins. A model
+/// none of these name has no known window: its context % shows as "–".
+/// Codex reports its window itself (`model_context_window`), which wins.
+/// Keep current with model releases, like `CLAUDE_LATEST`.
+const CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-5", 272_000),
+    ("codex", 272_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("gemini", 1_048_576),
+    ("claude", 200_000),
+    ("opus", 200_000),
+    ("sonnet", 200_000),
+    ("haiku", 200_000),
+    ("fable", 200_000),
+];
+
+/// The context window of a model id or alias (`provider/model` too), from
+/// `CONTEXT_WINDOWS`; a `[1m]` suffix (Claude's 1M-context variants) is
+/// 1M. None: unknown.
+pub fn context_window(model: &str) -> Option<u64> {
+    let m = model.trim().to_lowercase();
+    if m.ends_with("[1m]") {
+        return Some(1_000_000);
+    }
+    let m = m.rsplit('/').next().unwrap_or("");
+    CONTEXT_WINDOWS
+        .iter()
+        .find(|(fam, _)| m.starts_with(fam) || m.contains(&format!("-{fam}")))
+        .map(|(_, w)| *w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_windows_by_family() {
+        assert_eq!(context_window("claude-opus-5-5"), Some(200_000));
+        assert_eq!(context_window("opus"), Some(200_000));
+        assert_eq!(context_window("sonnet[1m]"), Some(1_000_000));
+        assert_eq!(context_window("anthropic/claude-sonnet-4-5"), Some(200_000));
+        assert_eq!(context_window("gpt-5.1-codex"), Some(272_000));
+        assert_eq!(context_window("openai/gpt-4.1-mini"), Some(1_047_576));
+        assert_eq!(context_window("o3"), Some(200_000));
+        assert_eq!(context_window("google/gemini-2.5-pro"), Some(1_048_576));
+        assert_eq!(context_window("llama-3-70b"), None);
+        assert_eq!(context_window(""), None);
+    }
 
     #[test]
     fn parses_ids_and_aliases() {

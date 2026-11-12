@@ -51,9 +51,11 @@ c.commit()
 PY
 }
 user() { message "$1" user "$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1], "files": [], "agents": []}))' "$2")"; }
+# reply SESSION TEXT [CONTEXT]: the agent's answer, sending CONTEXT tokens.
 reply() {
-  message "$1" assistant "$(python3 -c 'import json,sys; print(json.dumps({"agent": "build", "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"}, "content": [{"type": "text", "text": sys.argv[1]}], "finish": "stop", "tokens": {"input": 14023, "output": 212, "reasoning": 0, "cache": {"read": 0, "write": 0}}}))' "$2")"
-  sql "update session_v2 set tokens_input = tokens_input + 14023, tokens_output = tokens_output + 212 where id='$1'"
+  local ctx=${3:-14023}
+  message "$1" assistant "$(python3 -c 'import json,sys; print(json.dumps({"agent": "build", "model": {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"}, "content": [{"type": "text", "text": sys.argv[1]}], "finish": "stop", "tokens": {"input": int(sys.argv[2]) // 5, "output": 212, "reasoning": 0, "cache": {"read": int(sys.argv[2]) - int(sys.argv[2]) // 5, "write": 0}}}))' "$2" "$ctx")"
+  sql "update session_v2 set tokens_input = tokens_input + $((ctx / 5)), tokens_output = tokens_output + 212 where id='$1'"
 }
 create() { # ID [FORK-OF]
   local now
@@ -111,10 +113,18 @@ state=$(cat "$demo/states/$key" 2>/dev/null || echo idle)
 [[ -n $prompt ]] && create "$sid"
 if [[ -z $(sql "select id from session_message where session_id='$sid' limit 1") ]]; then
   if [[ -n $prompt ]]; then
-    user "$sid" "$prompt"
+    # Earlier turns, as far as $demo/usage/<folder> ("TURNS CONTEXT") says
+    # it has got (the list's Usage column reads them), then the latest.
+    turns=1 ctx=14023
+    [[ -r $demo/usage/$key ]] && read -r turns ctx <"$demo/usage/$key"
+    for ((t = 1; t < turns; t++)); do
+      user "$sid" "$([[ $t == 1 ]] && echo "$prompt" || echo "keep going")"
+      reply "$sid" "Done; on to the next part." $((12000 + (ctx - 12000) * t / turns))
+    done
+    user "$sid" "$([[ $turns == 1 ]] && echo "$prompt" || echo "finish up")"
     sql "update session_v2 set time_busy = $(ms) where id='$sid'"
     if [[ $state != working ]]; then
-      reply "$sid" "$(sed -n 's/^• //p' "$screen" 2>/dev/null | head -n 3 | tr '\n' ' ')"
+      reply "$sid" "$(sed -n 's/^• //p' "$screen" 2>/dev/null | head -n 3 | tr '\n' ' ')" "$ctx"
       sql "update session_v2 set time_idle = $(ms) + 1 where id='$sid'"
     fi
   fi

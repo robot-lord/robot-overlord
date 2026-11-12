@@ -68,11 +68,21 @@ if [[ $sub != resume ]]; then
   line event_msg '{"type": "task_started", "turn_id": "t1"}'
   line response_item "$(msg user input_text "<environment_context><cwd>$PWD</cwd></environment_context>")"
   line turn_context '{"turn_id": "t1", "model": "gpt-6-luna"}'
-  line response_item "$(msg user input_text "${prompt:-continue}")"
+  # Earlier turns, as far as $demo/usage/<folder> ("TURNS CONTEXT") says
+  # it has got (the list's Usage column reads them), then the latest.
+  turns=1 ctx=18000
+  [[ -r $demo/usage/$key ]] && read -r turns ctx <"$demo/usage/$key"
+  for ((t = 1; t < turns; t++)); do
+    line response_item "$(msg user input_text "$([[ $t == 1 ]] && echo "${prompt:-continue}" || echo "keep going")")"
+    line response_item "$(msg assistant output_text "Done; on to the next part.")"
+    c=$((12000 + (ctx - 12000) * t / turns))
+    line event_msg "{\"type\": \"token_count\", \"info\": {\"total_token_usage\": {\"input_tokens\": $((c * t)), \"cached_input_tokens\": $((c * t * 4 / 5)), \"output_tokens\": $((t * 700))}, \"last_token_usage\": {\"input_tokens\": $c, \"output_tokens\": 700}, \"model_context_window\": 272000}}"
+  done
+  line response_item "$(msg user input_text "$([[ $turns == 1 ]] && echo "${prompt:-continue}" || echo "finish up")")"
   hook UserPromptSubmit
   if [[ $state != working ]]; then
     line response_item "$(msg assistant output_text "$(sed -n 's/^• //p' "$screen" 2>/dev/null | head -n 3 | tr '\n' ' ')")"
-    line event_msg '{"type": "token_count", "info": {"total_token_usage": {"input_tokens": 14023, "output_tokens": 212}, "last_token_usage": {"input_tokens": 14023, "output_tokens": 212}}}'
+    line event_msg "{\"type\": \"token_count\", \"info\": {\"total_token_usage\": {\"input_tokens\": $((ctx * turns)), \"cached_input_tokens\": $((ctx * turns * 4 / 5)), \"output_tokens\": $((turns * 700))}, \"last_token_usage\": {\"input_tokens\": $ctx, \"output_tokens\": 700}, \"model_context_window\": 272000}}"
     line event_msg '{"type": "task_complete", "turn_id": "t1"}'
     hook Stop
     [[ $state == waiting ]] && hook PermissionRequest

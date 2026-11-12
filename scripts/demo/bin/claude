@@ -33,7 +33,29 @@ hook() {
   python3 -c 'import json,sys; print(json.dumps({"hook_event_name": sys.argv[1], "session_id": sys.argv[2], "transcript_path": sys.argv[3]}))' \
     "$1" "$sid" "$tr" | rlord hook emit claude >/dev/null 2>&1 || true
 }
-say() { python3 -c 'import json,sys; t=sys.argv[1]; r=sys.argv[2]; print(json.dumps({"type":"user","message":{"content":t},"timestamp":"2026-01-01T00:00:00Z"})); print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":r}]},"timestamp":"2026-01-01T00:00:05Z"}))' "$1" "$2" >>"$tr"; }
+# say PROMPT REPLY: the conversation so far. How far it has got comes from
+# $demo/usage/<folder> ("TURNS CONTEXT", written by demo.sh): that many
+# prompts, each answered with token usage, the last request sending about
+# CONTEXT tokens (the list's Usage column reads these).
+say() {
+  local turns=1 ctx=18000
+  [[ -r $demo/usage/$key ]] && read -r turns ctx <"$demo/usage/$key"
+  python3 - "$tr" "$1" "$2" "$turns" "$ctx" <<'PY'
+import json, sys
+tr, first, reply, turns, ctx = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+asks = ["keep going", "looks good, next step", "run the tests again", "fix that and continue"]
+with open(tr, "a") as f:
+    for i in range(turns):
+        f.write(json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": first if i == 0 else asks[i % len(asks)]}}) + "\n")
+        c = 12000 + (ctx - 12000) * (i + 1) // turns
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-01-01T00:00:05Z",
+            "message": {"id": f"msg_demo{i}", "model": "claude-opus-5-5", "role": "assistant",
+                        "content": [{"type": "text", "text": reply if i == turns - 1 else "Done; on to the next part."}],
+                        "usage": {"input_tokens": 4, "cache_creation_input_tokens": c // 6,
+                                  "cache_read_input_tokens": c - c // 6, "output_tokens": 900}}}) + "\n")
+PY
+}
 
 if [[ -n $overlord ]]; then
   screen=$demo/screens/overlord.txt

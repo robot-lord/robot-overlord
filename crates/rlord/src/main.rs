@@ -80,12 +80,16 @@ enum Command {
         /// Filter by name substring
         #[arg(long)]
         name: Option<String>,
-        /// Sort: activity (default), user, state, created, name
+        /// Sort: activity (default), user, state, created, name, usage
         #[arg(long, default_value = "updated")]
         sort: String,
         /// Reverse the sort order
         #[arg(long)]
         reverse: bool,
+        /// What the USAGE column shows (and `--sort usage` sorts by): turns,
+        /// tokens or context (%); default: `usage` in config.toml
+        #[arg(long)]
+        usage: Option<String>,
         /// Raw JSON output
         #[arg(long)]
         json: bool,
@@ -648,8 +652,14 @@ fn main() -> Result<()> {
             name,
             sort,
             reverse,
+            usage,
             json,
         } => {
+            let usage = match usage {
+                Some(u) => rlord_core::usage::UsageMetric::parse(&u)
+                    .with_context(|| format!("unknown usage '{u}' (turns|tokens|context)"))?,
+                None => Config::load().map(|c| c.usage).unwrap_or_default(),
+            };
             let archived_mode = if archived {
                 "only"
             } else if all {
@@ -677,13 +687,13 @@ fn main() -> Result<()> {
                     "archived": archived_mode, "status": q.status, "tag": q.tag,
                     "agent": q.agent, "project": q.project, "name": q.name,
                     "group": q.group, "search": q.search, "sort": q.sort.label(),
-                    "reverse": q.reverse,
+                    "reverse": q.reverse, "usage": usage.label(),
                 }),
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
             } else {
-                print_session_table(&r);
+                print_session_table(&r, usage);
             }
             Ok(())
         }
@@ -1836,7 +1846,7 @@ fn compact(v: &Value) -> String {
     }
 }
 
-fn print_session_table(list: &Value) {
+fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
     let Some(rows) = list.as_array() else {
         println!("{list}");
         return;
@@ -1846,8 +1856,8 @@ fn print_session_table(list: &Value) {
         return;
     }
     println!(
-        "{:<8} {:<24} {:<13} {:>7}  {:<16} PROJECT",
-        "ID", "NAME", "STATUS", "UPDATED", "TAGS"
+        "{:<8} {:<24} {:<13} {:>7}  {:>5}  {:<16} PROJECT",
+        "ID", "NAME", "STATUS", "UPDATED", "USAGE", "TAGS"
     );
     for s in rows {
         let get = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("-");
@@ -1857,8 +1867,14 @@ fn print_session_table(list: &Value) {
         } else {
             " "
         };
+        let used = match rlord_core::usage::Usage::from_json(&s["usage"]) {
+            Some(u) => u.cell(usage),
+            // (Still being read by the daemon's warm-up.)
+            None if s["usage_loading"] == true => format!("{:>4}", "…"),
+            None => rlord_core::usage::cell(None, usage),
+        };
         println!(
-            "{:<8}{}{:<24} {:<13} {:>7}  {:<16} {}",
+            "{:<8}{}{:<24} {:<13} {:>7}  {:>5}  {:<16} {}",
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
@@ -1874,6 +1890,7 @@ fn print_session_table(list: &Value) {
                 .filter_map(|k| s[*k].as_i64())
                 .max()
             ),
+            used,
             truncate(&tags_of(s).replace("(none)", ""), 16),
             get("project_path")
         );

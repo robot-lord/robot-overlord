@@ -494,6 +494,9 @@ pub(crate) fn usage(v: &Value) -> Option<Usage> {
         context: info["last_token_usage"]["input_tokens"]
             .as_u64()
             .unwrap_or(0),
+        // (Its input counts cached tokens too.)
+        fresh: (n("input_tokens") - n("cached_input_tokens")).max(0) + n("output_tokens"),
+        window: info["model_context_window"].as_u64().filter(|w| *w > 0),
         cumulative: true,
     })
 }
@@ -838,6 +841,11 @@ mod tests {
         assert!(!st.ended, "the second turn is still running");
         assert_eq!(st.last.unwrap() - st.first.unwrap(), 8_728);
         assert_eq!(transcript::context_tokens(&p), 1200);
+        // The Usage column: prompts typed, tokens net of cache reads, and
+        // the window Codex reports.
+        let u = crate::usage::of(&p, None).unwrap();
+        assert_eq!((u.turns, u.tokens, u.context), (2, 2000 + 95, 1200));
+        assert_eq!(u.window, Some(258400));
         assert_eq!(
             transcript::observed_model(&p).as_deref(),
             Some("gpt-6-luna")

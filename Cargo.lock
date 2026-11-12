@@ -849,7 +849,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "robot-overlord"
-version = "0.21.0-dev.2"
+version = "0.22.0-dev.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "robot-overlord-core"
-version = "0.21.0-dev.2"
+version = "0.22.0-dev.2"
 dependencies = [
  "anyhow",
  "grep-matcher",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "robot-overlord-daemon"
-version = "0.21.0-dev.2"
+version = "0.22.0-dev.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "robot-overlord-tui"
-version = "0.21.0-dev.2"
+version = "0.22.0-dev.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
