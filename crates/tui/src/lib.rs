@@ -312,10 +312,7 @@ impl App {
     }
 
     fn quit_hint(&mut self) {
-        self.status_line = format!(
-            "to quit rlord press {} (Shift-Q)",
-            self.keys.label(Action::Quit)
-        );
+        self.status_line = format!("to quit rlord press {}", self.keys.label(Action::Quit));
     }
 
     fn draw_confirm_quit(&self, f: &mut Frame) {
@@ -1950,9 +1947,12 @@ impl KeyMap {
                 .any(|(a, o)| *a != me && o.code == b.code && o.ctrl == b.ctrl && o.alt == b.alt)
         };
         let snapshot = bindings.clone();
+        // So do `?` and `:` (help, commands), newer still.
         let default_step = |a: &Action| {
             (*a == Action::SessionsTab && k.sessions_tab == "H")
                 || (*a == Action::GroupsTab && k.groups_tab == "L")
+                || (*a == Action::Help && k.help == "?")
+                || (*a == Action::Command && k.command == ":")
         };
         // Only the defaults give way; a step key the user set is theirs.
         bindings.retain(|(a, b)| !default_step(a) || !taken(b, *a, &snapshot));

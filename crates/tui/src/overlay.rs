@@ -838,7 +838,8 @@ impl SeatKeys {
         SeatKeys {
             overlord: or(&cfg.tmux.overlord, "M-o"),
             mastermind: or(cfg.tmux.mastermind_switch(), "M-m"),
-            close: or(&cfg.tmux.back, "M-d"),
+            // Off is off (the seat keys still close it).
+            close: Key::parse(&cfg.tmux.back),
         }
     }
 

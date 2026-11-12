@@ -39,9 +39,9 @@ enum Phase {
 struct Review {
     key: Key,
     findings: Vec<Finding>,
-    /// The key arrived as a character Option types (Option isn't Meta),
-    /// and the terminal setting that fixes it.
-    option_char: Option<(char, String)>,
+    /// The key is a character Option types (∂): (it, the letter, the
+    /// terminal setting that makes Option send Meta instead).
+    option_char: Option<(char, char, String)>,
 }
 
 /// While alive, this TUI's tmux session reads keys from an empty table.
@@ -152,6 +152,16 @@ pub(crate) fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
     }
 }
 
+/// A key screen killed while listening (a reset, a crash) leaves the list
+/// on the empty table, every rlord key dead: put it back on start.
+pub(crate) fn clear_stuck_listen() {
+    if let Some(s) = tmux::current_session() {
+        if tmux::session_option(&s, "key-table").is_ok_and(|t| t.trim() == LISTEN_TABLE) {
+            let _ = tmux::set_key_table(&s, None);
+        }
+    }
+}
+
 impl App {
     /// Open the key screen (at one key's row).
     pub(crate) fn open_keys(&mut self, at: Option<&str>) {
@@ -213,31 +223,17 @@ impl App {
                     ));
                 } else if let Some(key) = key_of(&k) {
                     let s = ks.slot();
-                    // Option typed a character: the terminal doesn't send
-                    // Option as Meta. Check the key it was meant to be.
-                    let oc = match (&k.code, key.ctrl, key.alt) {
-                        (KeyCode::Char(c), false, false) => keys::option_char(*c).map(|l| (*c, l)),
+                    // A character Option types (∂ for Option-d) may be a
+                    // terminal not sending Option as Meta, or a real key
+                    // (ç, ß, å on many layouts): take it as typed, and say
+                    // how to fix the terminal in case it was the former.
+                    let option_char = match (&k.code, key.ctrl, key.alt) {
+                        (KeyCode::Char(c), false, false) => keys::option_char(*c)
+                            .map(|l| (*c, l, keys::option_as_meta_fix(&tmux::client_termtype()))),
                         _ => None,
                     };
-                    let key = oc.map(|(_, l)| Key::char(l, false, true)).unwrap_or(key);
-                    if oc.is_none() {
-                        ks.tested.insert((s.id(), key.clone()));
-                    }
-                    let mut findings = keys::check(&self.config, &ks.env, s, &key);
-                    let option_char = oc.map(|(c, _)| {
-                        // Saving it would trade a key that works for one
-                        // that can't arrive.
-                        findings.insert(
-                            0,
-                            Finding {
-                                level: Level::Taken,
-                                text: format!(
-                                    "it arrived as \"{c}\": fix the terminal, then try again"
-                                ),
-                            },
-                        );
-                        (c, keys::option_as_meta_fix(&tmux::client_termtype()))
-                    });
+                    ks.tested.insert((s.id(), key.clone()));
+                    let findings = keys::check(&self.config, &ks.env, s, &key);
                     ks.phase = Phase::Review(Review {
                         findings,
                         key,
@@ -442,14 +438,15 @@ impl App {
             }
             Phase::Review(r) => {
                 let label = r.key.label();
-                if let Some((c, fix)) = &r.option_char {
+                if let Some((c, l, fix)) = &r.option_char {
                     d.push(Line::styled(
                         format!(
-                            "Your terminal typed \"{c}\": Option isn't sent as Meta, so {label} can't reach rlord yet. {fix}"
+                            "If you pressed Option-{l}: your terminal typed \"{c}\" instead of sending Option as Meta, so ⌥{l} can't reach rlord. {fix}"
                         ),
                         Style::default().fg(theme::yellow()),
                     ));
-                } else {
+                }
+                {
                     d.push(Line::from(vec![
                         Span::styled("✓ ", Style::default().fg(theme::green())),
                         Span::styled(

@@ -35,7 +35,11 @@ fn reviewed_at(db: &Db, id: &str) -> Option<i64> {
 /// Latest activity: the same "updated" the list shows. Messages only: a
 /// resume or Claude's idle notification changes the state, not the work.
 pub fn updated_at(s: &Session) -> i64 {
-    [s.last_agent_msg_at, s.last_user_msg_at]
+    // An error is news, even without a message.
+    let failed = (s.status == Status::Error)
+        .then_some(s.last_state_change_at)
+        .flatten();
+    [s.last_agent_msg_at, s.last_user_msg_at, failed]
         .into_iter()
         .flatten()
         .fold(s.created_at, i64::max)

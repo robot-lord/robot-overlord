@@ -522,6 +522,16 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
         };
         add(Level::Taken, text);
     }
+    // In the overlay, ⌥m (or the mastermind key) switches seats.
+    if slot.scope == Scope::Global
+        && slot.field != "mastermind"
+        && Key::parse(cfg.tmux.mastermind_switch()).as_ref() == Some(key)
+    {
+        add(
+            Level::Taken,
+            format!("{label} switches overlord ⇄ mastermind in the overlay"),
+        );
+    }
     if slot.scope == Scope::List
         && cfg.jump_digits
         && !key.ctrl
