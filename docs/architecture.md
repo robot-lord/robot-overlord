@@ -315,7 +315,7 @@ Claude Code exposes sub-agents outside the pane, and rlord consumes all of it:
 `subagents` table rows are upsert-merged from both sources (hooks for
 latency, disk for description/tool-use id/backfill); `sessions` carry
 `agents_running`/`agents_total`. Surfaces: TUI details card + `⚙N` in the
-list, `rlord agents`, `rlord show`. Sub-agent transcripts will join the
+list, `rlord subagents`, `rlord show`. Sub-agent transcripts will join the
 transcript store so `rlord search` covers them.
 
 ## Inter-session messaging

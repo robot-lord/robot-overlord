@@ -138,6 +138,27 @@ pub fn status_parts(status: &str) -> (&'static str, &'static str, Color) {
     }
 }
 
+/// An agent's marker for the list, exactly two columns wide (a
+/// single-glyph one gets a trailing space) so names line up. Two spaces
+/// for an agent rlord has no marker for.
+pub fn agent_marker(agent: &str) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let mut spans: Vec<Span<'static>> = rlord_core::agents::install::tool(agent)
+        .map(|t| {
+            t.marker
+                .iter()
+                .map(|(text, rgb)| {
+                    let color = rgb.map_or_else(self::text, |(r, g, b)| Color::Rgb(r, g, b));
+                    Span::styled(*text, Style::default().fg(color))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    spans.push(Span::raw(" ".repeat(2usize.saturating_sub(used))));
+    spans
+}
+
 /// `● working`, colored.
 pub fn status_chip(status: &str) -> Span<'static> {
     let (glyph, label, color) = status_parts(status);
@@ -175,3 +196,26 @@ pub fn selected() -> Style {
 
 /// The bar drawn left of the selected row.
 pub const SELECT_BAR: &str = "▌ ";
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn every_marker_is_two_columns() {
+        for agent in ["claude", "codex", "opencode", "something-else", ""] {
+            let w: usize = agent_marker(agent).iter().map(|s| s.content.width()).sum();
+            assert_eq!(w, 2, "{agent}");
+        }
+        let text = |a: &str| -> String {
+            agent_marker(a)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(text("claude"), "✻ ");
+        assert_eq!(text("codex"), ">_");
+        assert_eq!(text("opencode"), "▣ ");
+    }
+}

@@ -1179,11 +1179,16 @@ impl App {
                     } else {
                         Cell::from(" ")
                     },
-                    Cell::from(if is_mastermind {
-                        format!("↳ {}", get("name"))
-                    } else {
-                        get("name")
-                    }),
+                    // Which agent runs it (two columns), then its name.
+                    Cell::from(Line::from({
+                        let mut spans = theme::agent_marker(s["agent"].as_str().unwrap_or(""));
+                        spans.push(Span::raw(if is_mastermind {
+                            format!("↳ {}", get("name"))
+                        } else {
+                            get("name")
+                        }));
+                        spans
+                    })),
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
@@ -1402,17 +1407,21 @@ impl App {
                 key("folder"),
                 Span::styled(tilde(&get("project_path")), theme::muted()),
             ]),
-            Line::from(vec![
-                key("agent"),
-                Span::styled(get("agent"), Style::default().fg(theme::text())),
-                sep(),
-                Span::styled(
-                    s["model"].as_str().unwrap_or("default model").to_string(),
-                    Style::default().fg(theme::text()),
-                ),
-                sep(),
-                Span::styled(format!("id {}", get("id")), theme::faint()),
-            ]),
+            Line::from({
+                let mut l = vec![key("agent")];
+                l.extend(theme::agent_marker(&get("agent")));
+                l.extend([
+                    Span::styled(get("agent"), Style::default().fg(theme::text())),
+                    sep(),
+                    Span::styled(
+                        s["model"].as_str().unwrap_or("default model").to_string(),
+                        Style::default().fg(theme::text()),
+                    ),
+                    sep(),
+                    Span::styled(format!("id {}", get("id")), theme::faint()),
+                ]);
+                l
+            }),
             Line::from(vec![
                 key("activity"),
                 Span::styled(

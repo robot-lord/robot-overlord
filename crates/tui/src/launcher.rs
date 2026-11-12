@@ -310,6 +310,17 @@ impl App {
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
             Line::from(""),
+            head("Agents"),
+            Line::from({
+                // Each agent's marker in the list, then its name.
+                let mut l = vec![Span::raw("  ")];
+                for t in &rlord_core::agents::install::TOOLS {
+                    l.extend(theme::agent_marker(t.name));
+                    l.push(Span::styled(format!("{}   ", t.label), theme::muted()));
+                }
+                l
+            }),
+            Line::from(""),
             head("Status"),
             row("needs you".into(), "blocked on a prompt or question"),
             row("your turn".into(), "finished: the next prompt is yours"),

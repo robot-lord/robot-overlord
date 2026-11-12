@@ -206,10 +206,17 @@ enum Command {
     },
     /// The coding agents on this machine (Claude Code, Codex, OpenCode):
     /// installed? rlord's hooks in place? and how to install one that's
-    /// missing. With a session: the sub-agents it has spawned.
+    /// missing
     Agents {
-        /// A session (id, id prefix or name): list its sub-agents instead
+        /// (Moved: `rlord subagents <session>`.)
+        #[arg(hide = true)]
         r#ref: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the sub-agents a session has spawned
+    Subagents {
+        r#ref: String,
         #[arg(long)]
         json: bool,
     },
@@ -878,7 +885,13 @@ fn main() -> Result<()> {
         Command::Agents {
             r#ref: Some(r),
             json,
-        } => {
+        }
+        | Command::Subagents { r#ref: r, json } => {
+            // (`rlord agents <session>` was this before `rlord agents`
+            // listed the coding agents.)
+            if std::env::args().nth(1).as_deref() == Some("agents") {
+                eprintln!("note: sub-agents moved to `rlord subagents {r}`");
+            }
             let r = call("session.subagents", json!({"ref": r}))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);

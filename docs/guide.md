@@ -159,7 +159,7 @@ keeps its width and the preview drops out first when the terminal is narrow.
 / `SubagentStop` hooks plus the per-agent `meta.json` and transcript Claude
 writes under `~/.claude/projects/<slug>/<session>/subagents/`. The details
 card lists each one (type, description, running/done + duration, result line,
-tokens); the session list shows `⚙N` while any are running; `rlord agents
+tokens); the session list shows `⚙N` while any are running; `rlord subagents
 <ref>` prints them. Sessions that ran before the hooks existed are backfilled
 from disk on first view.
 

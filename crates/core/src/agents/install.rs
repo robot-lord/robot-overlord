@@ -4,7 +4,8 @@
 //! and the user runs it. Everything here is plain look-ups (PATH, a few
 //! files, `--version`).
 //!
-//! The install commands live in one table, `TOOLS`. Update it when a
+//! One table, `TOOLS`, has a row per agent: its name, its marker in the
+//! list, and its install commands. Update it when a
 //! vendor changes theirs; each entry names the vendor page it was checked
 //! against.
 
@@ -15,6 +16,9 @@ use serde_json::Value;
 
 use super::{codex, Agent};
 
+/// A piece of a marker: its text and colour (RGB; None: the theme's text).
+pub type MarkerPiece = (&'static str, Option<(u8, u8, u8)>);
+
 /// A coding agent rlord knows about, and its vendor's install commands.
 pub struct Tool {
     /// Name in rlord (and its command on PATH).
@@ -22,6 +26,9 @@ pub struct Tool {
     pub label: &'static str,
     /// The agent rlord runs it as; None: known, not runnable in rlord yet.
     pub agent: Option<Agent>,
+    /// Its marker in the session list: at most two columns wide, as
+    /// coloured pieces (text, RGB; None: the theme's text colour).
+    pub marker: &'static [MarkerPiece],
     /// The vendor's install page.
     pub docs: &'static str,
     /// The vendor's install script (macOS and Linux).
@@ -41,6 +48,7 @@ pub const TOOLS: [Tool; 3] = [
     Tool {
         name: "claude",
         label: "Claude Code",
+        marker: &[("✻", Some((217, 119, 87)))],
         agent: Some(Agent::Claude),
         docs: "https://code.claude.com/docs/en/setup",
         script: "curl -fsSL https://claude.ai/install.sh | bash",
@@ -52,6 +60,7 @@ pub const TOOLS: [Tool; 3] = [
     Tool {
         name: "codex",
         label: "Codex",
+        marker: &[(">", Some((59, 130, 246))), ("_", None)],
         agent: Some(Agent::Codex),
         docs: "https://github.com/openai/codex#readme",
         script: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
@@ -63,6 +72,7 @@ pub const TOOLS: [Tool; 3] = [
     Tool {
         name: "opencode",
         label: "OpenCode",
+        marker: &[("▣", Some((20, 184, 166)))],
         agent: None,
         docs: "https://opencode.ai/docs/",
         script: "curl -fsSL https://opencode.ai/v2/install | bash",

@@ -137,9 +137,14 @@ pub fn map_hook_event(event: &str, payload: &Value) -> (&'static str, Effect) {
 /// Code sends none: then from its message).
 fn notification_effect(payload: &Value) -> Effect {
     match payload["notification_type"].as_str() {
-        Some("permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog") => {
-            Effect::Set(Status::WaitingInput)
-        }
+        // (agent_needs_input: a background session of this one waits on
+        // the user.)
+        Some(
+            "permission_prompt"
+            | "elicitation_dialog"
+            | "elicitation_url_dialog"
+            | "agent_needs_input",
+        ) => Effect::Set(Status::WaitingInput),
         Some("elicitation_complete" | "elicitation_response") => Effect::Resume,
         // idle_prompt, auth, quota, agent view, plugins: not this session
         // blocked on the user.
@@ -488,6 +493,7 @@ mod tests {
             note("elicitation_dialog"),
             Effect::Set(Status::WaitingInput)
         );
+        assert_eq!(note("agent_needs_input"), Effect::Set(Status::WaitingInput));
         // A minute after the turn ended: still "your turn".
         assert_eq!(note("idle_prompt"), Effect::Nothing);
         assert_eq!(note("auth_success"), Effect::Nothing);
