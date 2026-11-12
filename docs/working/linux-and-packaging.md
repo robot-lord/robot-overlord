@@ -16,7 +16,7 @@ CI for releases).
   (colima) before upload.
 - Install paths, first release: `curl -fsSL …/get.sh | sh` (detects
   platform, verifies the checksum, offers to install tmux with the system's
-  package manager after asking), Homebrew tap (`ayersb/homebrew-tap`,
+  package manager after asking), Homebrew tap (`robot-lord/homebrew-tap`,
   `depends_on "tmux"`), `.deb` / `.rpm` (depend on tmux), `SHA256SUMS`.
   crates.io prepared, published once the owner has a token. AUR: later.
 - Release channels:

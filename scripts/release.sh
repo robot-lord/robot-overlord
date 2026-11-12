@@ -16,11 +16,11 @@
 #
 # Needs (stable): rustup targets x86_64/aarch64-unknown-linux-musl, zig,
 # cargo-zigbuild, cargo-deb, cargo-generate-rpm; Docker (colima) for the
-# smoke test; push access to ayersb/homebrew-tap; `cargo login` for crates.io.
+# smoke test; push access to robot-lord/homebrew-tap; `cargo login` for crates.io.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-repo=ayersb/robot-overlord
-tap=ayersb/homebrew-tap
+repo=robot-lord/robot-overlord
+tap=robot-lord/homebrew-tap
 
 smoke=1
 for a in "$@"; do

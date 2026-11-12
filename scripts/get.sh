@@ -2,7 +2,7 @@
 # Install rlord: the newest stable release for this machine (Apple Silicon
 # macOS, or Linux x86_64/aarch64), checksum-verified, into ~/.local/bin.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ayersb/robot-overlord/main/scripts/get.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/robot-lord/robot-overlord/main/scripts/get.sh | sh
 #
 # rlord needs tmux. If it's missing, this offers to install it with the
 # system's package manager (asking first; that usually needs sudo).
@@ -13,7 +13,7 @@
 #   RLORD_YES=1             install tmux without asking
 #   RLORD_DIST=dir          install from local release files (testing)
 set -eu
-repo=ayersb/robot-overlord
+repo=robot-lord/robot-overlord
 dir=${RLORD_INSTALL_DIR:-$HOME/.local/bin}
 
 say() { printf '%s\n' "$*"; }
