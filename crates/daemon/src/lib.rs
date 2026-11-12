@@ -523,6 +523,17 @@ impl Daemon {
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),
             "ui.view.default" => ui::default_view(self),
+            // The list's selected session: set with `id`, read without.
+            "ui.selected" => match params.get("id").and_then(Value::as_str) {
+                Some(id) => self
+                    .db()
+                    .kv_set("ui_selected", id)
+                    .map(|_| json!({"id": id})),
+                None => self
+                    .db()
+                    .kv_get("ui_selected")
+                    .map(|v| json!({"id": v})),
+            },
             "ui.view.report" => {
                 *self.ui_view.lock().expect("ui mutex") =
                     params.get("view").cloned().unwrap_or(Value::Null);

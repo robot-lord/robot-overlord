@@ -183,6 +183,8 @@ struct App {
     overlord_rows: usize,
     /// Session to select once the next refresh lands (set by the overlord).
     pending_select: Option<String>,
+    /// The selection as last saved with the daemon (kept across restarts).
+    saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
     reported_view: Value,
 }
@@ -221,6 +223,7 @@ impl App {
             system_dark: Default::default(),
             overlord_rows: 0,
             pending_select: None,
+            saved_sel: None,
             reported_view: Value::Null,
         }
     }
@@ -257,6 +260,9 @@ impl App {
 
     fn refresh(&mut self) {
         let q = self.query();
+        // The selection follows the session, not the row: a re-sort or the
+        // overlord rows appearing must not move it to another session.
+        let keep = self.selected_id();
         if let Some(v) = self.call("session.list", q) {
             self.all = v.as_array().cloned().unwrap_or_default();
             self.sessions = self.all.clone();
@@ -289,8 +295,14 @@ impl App {
             }
             let n = self.sessions.len();
             let sel = self.table.selected().unwrap_or(0);
-            self.table
-                .select(if n == 0 { None } else { Some(sel.min(n - 1)) });
+            let at = keep
+                .as_deref()
+                .and_then(|id| self.sessions.iter().position(|s| s["id"] == id));
+            self.table.select(if n == 0 {
+                None
+            } else {
+                Some(at.unwrap_or(sel.min(n - 1)))
+            });
             if let Some(id) = self.pending_select.take() {
                 if let Some(i) = self.sessions.iter().position(|s| s["id"] == id.as_str()) {
                     self.table.select(Some(i));
@@ -355,6 +367,12 @@ impl App {
         self.last_preview = Instant::now();
         self.preview_due = None;
         self.preview_for = self.selected_id();
+        // Remember where the user is (once the highlight settles), so a
+        // restarted list comes back to it.
+        if self.preview_for.is_some() && self.preview_for != self.saved_sel {
+            self.saved_sel = self.preview_for.clone();
+            self.call("ui.selected", json!({"id": self.saved_sel}));
+        }
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
