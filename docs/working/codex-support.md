@@ -337,8 +337,8 @@ the daemon restarts.
 - A Codex subagent can't be given a narrower tool list or a cheaper model
   by name (only a lower effort); revisit if Codex's agent files grow that.
 
-- Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
-  demo session and the form's Agent hint.
+- Screenshots retaken with the Codex demo session (README pass,
+  0.22.0-dev.4). None shows the form's Agent hint; the README doesn't need one.
 
 - `docs/architecture.md`: the adapter section now describes the real
   interface; the Stop-hook mailbox and pane-pattern status it describes

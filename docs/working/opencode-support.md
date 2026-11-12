@@ -362,7 +362,7 @@ and without a model and a restart of a session OpenCode no longer had.
 - Sub-agent tracking (child sessions: `parent_id`).
 - A question form, checked by hand (a real permission prompt was: see
   "The overlord on OpenCode").
-- Screenshots not retaken with the OpenCode demo session.
+- Screenshots retaken with the OpenCode demo session (README pass, 0.22.0-dev.4).
 - `docs/architecture.md` got the OpenCode facts in its agent section; the
   larger reconcile owed by the Codex doc still stands.
 

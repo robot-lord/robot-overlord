@@ -43,19 +43,22 @@ session from last week decide? rlord is built around a few ideas:
 - **The overlord.** One agent session (Claude Code, Codex or OpenCode:
   your pick) wired to rlord's tools, one keypress
   away from anywhere (Option-O / Alt-O). It finds and jumps to sessions,
-  launches new ones, renames, tags and describes them, and answers
-  questions about your fleet. It runs a strong model at medium effort
-  and keeps its own work light, delegating anything heavy: bulk upkeep and
-  research go to subagents, real work becomes a session of its own.
+  launches new ones, passes work to ones you already have, renames, tags
+  and describes them, and answers questions about your fleet. It runs a
+  strong model at medium effort and keeps its own work light, delegating
+  anything heavy: bulk upkeep and research go to subagents, real work
+  becomes a session of its own.
 - **An overlord that doesn't bloat.** After sitting idle it starts a fresh
   conversation, and looks up what you talked about before only when you
-  refer to it. The list shows when it last started fresh and keeps its
-  earlier conversations, which you can read or go back to.
-- **One list for everything.** Live status (working, waiting on you, idle),
-  sorting by your last message or the agent's, groups by tag, favourites,
-  search, and a live preview of the selected session.
+  refer to it. The list shows when it last started fresh ("fresh 2h ago ·
+  3 earlier") and keeps its earlier conversations, which you can read or
+  continue.
+- **One list for everything.** Live status (working, needs you, your
+  turn), how much each session has used (turns, tokens or context %),
+  sorting by your last message, the agent's or usage, groups by tag,
+  favourites, search, and a live preview of the selected session.
 
-  <img src="docs/images/waiting.png" alt="The session list, with a session waiting on you" width="800">
+  <img src="docs/images/waiting.png" alt="The session list with its Usage column, Claude Code, Codex and OpenCode sessions, and the live pane of one waiting on you" width="800">
 
 - **Jump around without losing your place.** `enter` attaches; Option-D
   brings you back to the list from inside any session.
@@ -71,8 +74,8 @@ session from last week decide? rlord is built around a few ideas:
   sessions can use your own tmux config (`rlord tmux import`). Every key can
   be rebound, and the key screen tells you whether a key will actually reach
   rlord.
-- **Remote Control.** Pick a session up from the Claude app on your phone
-  while it keeps running at your desk.
+- **Remote Control.** Pick a Claude Code session up from the Claude app on
+  your phone while it keeps running at your desk.
 - **macOS and Linux.**
 
 ## Install
@@ -100,10 +103,11 @@ distro).
 
 </details>
 
-**Requirements:** tmux 3.2+ and [Claude Code](https://claude.com/claude-code)
-(and, for Codex or OpenCode sessions, the Codex CLI or OpenCode v2). `rlord agents` shows which agents
-you have and the install command for one you don't; rlord never installs
-them itself.
+**Requirements:** tmux 3.2+ and at least one agent:
+[Claude Code](https://claude.com/claude-code),
+[Codex CLI](https://github.com/openai/codex) or
+[OpenCode](https://opencode.ai) v2. `rlord agents` shows which you have and
+the install command for one you don't; rlord never installs them itself.
 
 ## Getting started
 
@@ -139,7 +143,7 @@ from the last week"*.
          ▼                ▼
    ┌───────────┐    ┌──────────────────┐  delegates  ┌─────────────────┐
    │ the list  │    │     overlord     │ ──────────▶ │    subagents    │
-   │   (TUI)   │    │ Opus, med effort │             │ (tidy, import,  │
+   │   (TUI)   │    │  medium effort   │             │ (tidy, import,  │
    └─────┬─────┘    └────────┬─────────┘             │    research)    │
          │                   │ MCP tools             └─────────────────┘
          ▼                   ▼
@@ -159,13 +163,19 @@ from the last week"*.
   run `rlord`.
 - **Sessions are the ordinary agent CLIs**, each in a pane of rlord's own
   tmux server (`tmux -L rlord`); your own tmux is never touched. Stopping
-  and resuming uses the agent's own resume (`claude --resume`).
+  and resuming uses the agent's own resume (`claude --resume`, `codex
+  resume`, OpenCode's `-s`).
 - **The overlord is one agent session with rlord's tools** (an MCP
   server), floating over whatever you're looking at, on whichever agent
   you choose (Claude Code, Codex, OpenCode). It runs a strong model at medium
   effort: look-ups, small edits and short answers it does itself; anything
   that takes more goes to a subagent or a new session, so it stays quick
   and its own conversation stays small.
+- **It can pass work to any session** (`send_to_session`), whatever agent
+  runs either: rlord types it in once that session's turn is over. It does
+  so without asking, since rlord expects to be run by its user on a machine
+  they trust, or over a remote connection they trust. `[overlord]
+  confirm_sends = true` makes each send ask.
 - **The expensive part stays small.** Questions like "which sessions changed
   since I last looked?" or "what did we say about this earlier?" are
   answered by plain code; the overlord only spends tokens on what needs
@@ -177,8 +187,9 @@ The [user guide](docs/guide.md) covers each part in detail;
 ## Configuration
 
 Everything is optional. `rlord config init` writes a commented
-`~/.config/robot-overlord/config.toml`: layout, theme, keys, the overlord's
-model and effort, archive summaries, update channel. Standing instructions for the
+`~/.config/robot-overlord/config.toml`: layout, theme, keys, what the
+Usage column shows, the default agent for new sessions, the overlord's
+agent, model and effort, archive summaries, update channel. Standing instructions for the
 overlord go in `~/.config/robot-overlord/overlord.md`.
 
 ## Updating
@@ -193,9 +204,10 @@ Homebrew and distro packages update the usual way.
 
 rlord is young and moves fast; it's used every day with Claude Code. Codex
 and OpenCode (v2) sessions run beside Claude's (launch, resume, status,
-search, summaries; see "Codex sessions" and "OpenCode sessions" in
-[docs/guide.md](docs/guide.md) for what doesn't work yet); the overlord
-itself runs on Claude Code. Other agent CLIs are planned behind the same
+usage, search, summaries; see [Codex sessions](docs/guide.md#codex-sessions)
+and [OpenCode sessions](docs/guide.md#opencode-sessions) in the guide for
+what doesn't work yet), and the overlord
+runs on any of the three. Other agent CLIs are planned behind the same
 adapter.
 
 ## Contributing

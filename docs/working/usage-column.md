@@ -81,7 +81,7 @@ has, read cheaply, no model calls.
   last counted message id isn't persisted). Small; left.
 - The list refetches on daemon change notices (hooks), so tokens/context
   update at turn boundaries, not mid-turn.
-- Screenshots not retaken (demo now produces plausible numbers).
+- Screenshots retaken with the Usage column (README pass, 0.22.0-dev.4).
 - A list of more archived sessions than `STATS_CURSOR_CAP` (1000) reloads
   evicted positions from the DB on each list (DB reads, no file reads).
   Fine at current sizes; raise the cap or cache per list if it shows.
