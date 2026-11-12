@@ -115,10 +115,14 @@ pub fn toml_str(s: &str) -> String {
 ///   it refuses the connection, checked live; on Linux that is
 ///   unverified). It does not stop the overlord typing into other
 ///   sessions: rlord's own `send_to_session` does that, and like rlord's
-///   other tools it runs without a prompt.
+///   other tools it runs without a prompt, by design. rlord expects to be
+///   run by its user on a machine they trust, or over a remote connection
+///   they trust; little untrusted text reaches the overlord (it works from
+///   rlord's own data and the user's requests), so it can type into
+///   sessions without asking, which is what lets it orchestrate.
 /// - `confirm_sends` (`[overlord] confirm_sends`, off by default):
 ///   `mcp_servers.rlord.tools.send_to_session.approval_mode = "prompt"`,
-///   so that one tool asks each time.
+///   so that one tool asks each time (for anyone who wants that).
 /// - `check_for_update_on_startup = false`: no update prompt in front of
 ///   the composer (rlord types into it once it is up).
 /// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
@@ -985,6 +989,15 @@ mod tests {
               GPT-6.1-Sol medium · /tmp/x\n\
               ← for agents · ? for shortcuts      ⚠ 1 warning · f2 to view\n";
         assert!(composer_shown(working) && !dialog_shown(working));
+        // An MCP tool's approval (`approval_mode = "prompt"`), as captured:
+        // its choices are indented.
+        let mcp = "• Calling\n  └ rlord.send_to_session({\"session\":\"cxt2\"})\n\n\
+              Field 1/1\n\n  Allow the rlord MCP server to run tool \"send_to_session\"?\n\n\
+              session: cxt2\n  text: Reply with the word PONG.\n\n\
+              › 1. Allow   Run the tool and continue\n\
+                2. Cancel  Cancel this tool call\n\n\
+              enter to submit | esc to cancel\n";
+        assert!(!composer_shown(mcp) && dialog_shown(mcp));
         // The login screen marks its choice with `>`.
         let login = "  Choose how you want to use Codex.\n\n> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n\n  Press enter to continue\n";
         assert!(!composer_shown(login) && dialog_shown(login));

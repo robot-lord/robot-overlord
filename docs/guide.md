@@ -110,11 +110,29 @@ runs a command.
   that is working, or waiting on you, isn't typed into: the overlord says
   so, or (when you want it delivered anyway) it waits for that turn to end
   and goes in then (one waiting message per session; a newer one replaces
-  it). Stopped and archived sessions are refused. Each send is in the
-  session's log.
+  it, and one sent directly drops it). Stopped and archived sessions are
+  refused. Each send is in the session's log.
+- Right before typing, rlord looks at the session's screen. It holds off
+  (the message waits, or is refused) while a dialog is up there (a
+  permission prompt, a question: Enter would pick an answer), within 10s
+  of the last thing typed into it, or while you are typing in a terminal
+  showing that session (used in the last 5s). A restart, stop or archive
+  of the session waits for a paste in progress, and the other way round.
 - `rlord overlord ask` (and the list's `n` form) won't type into the
-  overlord while it waits on you (a permission prompt): its Enter would
-  answer the prompt. Answer it first.
+  overlord while it waits on you, or while its screen shows a dialog: its
+  Enter would answer it. Answer it first.
+- **It types into sessions without asking.** `send_to_session` runs
+  unprompted, like rlord's other tools; that is what lets the overlord
+  orchestrate. rlord expects to be run by its user on a machine they
+  trust, or over a remote connection they trust. Little untrusted text
+  reaches the overlord: it works from rlord's own data and your requests,
+  not arbitrary content. Prompt injection would take a setup very
+  different from the one rlord is built for. Codex's read-only sandbox
+  stops the overlord's shell commands reaching rlord's tmux socket, but not
+  this tool. `[overlord] confirm_sends = true` makes each send ask, for
+  anyone who wants that (Claude then lists rlord's tools one by one without
+  it; Codex sets that tool's `approval_mode = "prompt"`; OpenCode adds an
+  ask rule for `rlord_send_to_session`).
 - The agent is chosen when the overlord is first set up. An existing
   overlord keeps its agent: `[overlord] agent` applies only while there is
   none yet. Moving an existing overlord to another agent isn't built.

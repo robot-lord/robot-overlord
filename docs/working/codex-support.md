@@ -269,6 +269,39 @@ Known limits, accepted:
   the word PONG" to a promptless Codex session; its hooks then showed
   SessionStart, UserPromptSubmit, Stop.
 
+### PR #10 review 2 (fixes, checked live on this Mac, Codex 0.167.2)
+
+- **Never press Enter into a dialog.** `send::type_into` captures the
+  pinned pane right before every paste (ask, direct send, delivery tick)
+  and needs `Agent::at_prompt`. `codex::composer_shown` now looks only at
+  the bottom input area (the lowest `›` line of the last six, and no
+  "Press enter to confirm"). Captured live and kept as fixtures: an
+  approval (`› 1. Yes, proceed (y)` under the user's `›` prompt), an MCP
+  tool approval (indented `  › 1. Allow`, "enter to submit"), the login
+  choice (`> 1.`), working (status line, composer below). Live: with the
+  overlord's status forced to working over an approval dialog, `rlord
+  overlord ask` was refused ("its screen isn't at its input prompt") and
+  the dialog stayed; nothing was written.
+- **Never stuck in starting.** After 20s a start settles on any screen
+  without a numbered dialog (`codex::dialog_shown`), logged;
+  `awaiting_first_prompt` records `composer_seen`. Live: the overlord
+  settled with `composer_seen: true`.
+- **One paste per session; a direct send replaces the queued one.** Live:
+  a message queued (status forced to working), then a direct send →
+  `replaced_pending: true`, `message_dropped` (replaced), the newer one
+  answered, the older never arrived.
+- **`confirm_sends`** (Brandon's decision: stays off, sends run unasked):
+  `-c mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"` is
+  accepted by 0.167.2 (the variants are `auto`, `prompt`, `writes`,
+  `approve`). Live: the overlord asked "Allow the rlord MCP server to run
+  tool send_to_session?"; allowed, PONG arrived.
+- Not checked live: the attached-client check (no terminal could be
+  attached here; unit-tested) and the per-session lock against a restart
+  (unit-tested). A normal Codex session here (the user's own approval
+  settings) never showed an approval, so the send path's screen check was
+  checked live on the overlord (`ask`, same `type_into`) and on a scratch
+  tmux pane in a gated test.
+
 Found on the way, not fixed (outside this PR): a hook-confirmed Codex
 session whose tmux session is killed stays "working" (no SessionEnd, and
 `discover` doesn't watch hooked sessions' panes) until it is restarted or

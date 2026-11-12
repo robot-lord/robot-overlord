@@ -226,6 +226,34 @@ Not exercised: the idle fresh restart.
 All throwaway OpenCode sessions (overlord, target, tidy child) were
 deleted and the scratch service stopped.
 
+### PR #10 review 2 (checked live, OpenCode 2.2.7, free model "Big Pickle")
+
+Scratch HOME and XDG dirs (no credentials), own service port.
+
+- **Dialogs on screen** (`opencode::dialog_shown`), as captured: a
+  permission request ("△ Permission required", `Allow once  Always allow
+  Reject`, "⇆ select  enter confirm") and a question (numbered options
+  with no marker, "↑↓ select  enter submit  esc dismiss"). Live: with the
+  overlord's status forced to working over a permission request, `rlord
+  overlord ask` was refused and the dialog stayed.
+- **Every agent gets the folder's rules**: `general` and `explore` added,
+  plus the user's global agents by name (`opencode::user_agents`). Where
+  OpenCode 2.2.7 reads global agents from (checked with `debug config` /
+  `debug agents`): `opencode.json` and `opencode.jsonc` in its config
+  folder (not `config.json`), the Markdown files under `agent/` and
+  `agents/` (nested ones named by path, `team/nested`), and
+  `$OPENCODE_CONFIG`, `$OPENCODE_CONFIG_DIR`, `$OPENCODE_CONFIG_CONTENT`.
+  Live, with a global `agent.general.permission.bash = allow` (and the same
+  on `build` and a Markdown subagent `shelly`): `debug agents` in the
+  overlord's folder put the folder's `*` ask after the user's `shell`
+  allow for each; asked to have `general` run `touch probe-general.txt`,
+  OpenCode asked to start `general`, then asked again for the `touch`
+  (rejected; nothing written).
+- `confirm_sends`: an ask rule for `rlord_send_to_session` after
+  `rlord_*` (unit-tested; not run live).
+
+The scratch service, its sessions and data were deleted.
+
 ## Verified against OpenCode 2.2.7 (throwaway sessions, all deleted)
 
 - `opencode -s <minted id> --prompt …` creates the session under that id
