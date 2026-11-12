@@ -271,15 +271,34 @@ impl Key {
         )
     }
 
-    /// How it reads on a Mac: `⌥d`, `⌃q`, `enter`.
+    /// How it reads: `⌥d`, `⌃q`, `enter` on a Mac; `Alt-d`, `Ctrl-q`
+    /// elsewhere.
     pub fn label(&self) -> String {
-        format!(
-            "{}{}{}",
-            if self.ctrl { "⌃" } else { "" },
-            if self.alt { "⌥" } else { "" },
-            self.name
-        )
+        format!("{}{}", mods_label(self.ctrl, self.alt), self.name)
     }
+}
+
+/// What the Alt key is called on this system: `Option` on a Mac, `Alt`
+/// elsewhere. For user-facing words ("press Option-O").
+pub fn alt_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Option"
+    } else {
+        "Alt"
+    }
+}
+
+/// The modifier part of a key label: `⌃⌥` on a Mac, `Ctrl-Alt-` elsewhere.
+pub fn mods_label(ctrl: bool, alt: bool) -> String {
+    let mac = cfg!(target_os = "macos");
+    let mut s = String::new();
+    if ctrl {
+        s.push_str(if mac { "⌃" } else { "Ctrl-" });
+    }
+    if alt {
+        s.push_str(if mac { "⌥" } else { "Alt-" });
+    }
+    s
 }
 
 /// How serious a finding is.
@@ -617,7 +636,8 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
 }
 
 /// macOS types these for Option+letter when the terminal doesn't send
-/// Option as Meta (US layout): the key arrived as a character.
+/// Option as Meta (US layout): the key arrived as a character. Only
+/// consulted on macOS (the key screen's hint).
 pub fn option_char(c: char) -> Option<char> {
     const MAP: &[(char, char)] = &[
         ('å', 'a'),

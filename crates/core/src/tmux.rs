@@ -222,7 +222,14 @@ fn tmux_cmd() -> Command {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
         .is_some_and(|v| v.to_ascii_uppercase().replace('-', "").contains("UTF8"));
     if !utf8 {
-        c.env("LC_CTYPE", "en_US.UTF-8");
+        // C.UTF-8 is the one UTF-8 locale every glibc/musl Linux has; macOS
+        // has no C.UTF-8 but always en_US.UTF-8.
+        let locale = if cfg!(target_os = "macos") {
+            "en_US.UTF-8"
+        } else {
+            "C.UTF-8"
+        };
+        c.env("LC_CTYPE", locale);
     }
     c
 }
@@ -736,6 +743,27 @@ pub fn buffer_text(name: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Load `text` into paste buffer `name` and send it to the attached
+/// client's clipboard with OSC 52 (`load-buffer -w`, tmux 3.2+; the
+/// terminal must allow clipboard writes).
+pub fn buffer_to_clipboard(name: &str, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut c = tmux_cmd()
+        .args(["load-buffer", "-w", "-b", name, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running tmux")?;
+    if let Some(mut i) = c.stdin.take() {
+        i.write_all(text.as_bytes())?;
+    }
+    if !c.wait()?.success() {
+        bail!("tmux load-buffer -w failed");
+    }
+    Ok(())
+}
+
 /// A key table's bindings as (key, command), as `list-keys` prints them
 /// (key unescaped: `\;` is `;`).
 pub fn bindings(table: &str) -> Vec<(String, String)> {
@@ -985,9 +1013,16 @@ pub fn nav_key_bound(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `M-d` → `⌥d`, `C-x` → `⌃x`: how a tmux key reads on a Mac.
+/// How a tmux key reads: `M-d` → `⌥d`, `C-x` → `⌃x` on a Mac; `Alt-d`,
+/// `Ctrl-x` elsewhere.
 pub fn key_label(key: &str) -> String {
-    key.replace("M-", "⌥").replace("C-", "⌃").replace("S-", "⇧")
+    if cfg!(target_os = "macos") {
+        key.replace("M-", "⌥").replace("C-", "⌃").replace("S-", "⇧")
+    } else {
+        key.replace("M-", "Alt-")
+            .replace("C-", "Ctrl-")
+            .replace("S-", "Shift-")
+    }
 }
 
 /// Turn the user's imported tmux profile on or off for one session. Only
@@ -1409,7 +1444,12 @@ mod tests {
         set_hint_bar(name, "⌥d list", true).unwrap();
         set_hint_bar(name, "⌥d list", true).unwrap();
         assert_eq!(opt("status-right").trim(), format!("{HINTS_REF}%H:%M"));
-        assert_eq!(key_label("M-d"), "⌥d");
+        if cfg!(target_os = "macos") {
+            assert_eq!(key_label("M-d"), "⌥d");
+        } else {
+            assert_eq!(key_label("M-d"), "Alt-d");
+            assert_eq!(key_label("C-M-x"), "Ctrl-Alt-x");
+        }
 
         kill_session(name).unwrap();
         assert!(!has_session(name));

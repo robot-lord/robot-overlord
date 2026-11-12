@@ -1932,7 +1932,13 @@ impl KeyBinding {
         format!(
             "{}{}{name}",
             if self.ctrl { "^" } else { "" },
-            if self.alt { "⌥" } else { "" }
+            if !self.alt {
+                ""
+            } else if cfg!(target_os = "macos") {
+                "⌥"
+            } else {
+                "Alt-"
+            }
         )
     }
 }
@@ -2220,14 +2226,14 @@ mod tests {
                    "model": "opus", "agent_session": "o", "pinned": true, "archived_at": null}),
             json!({"name": "login-flake", "status": "working", "agent": "claude",
                    "agent_session": "a", "tags": ["web", "wip"], "pinned": true,
-                   "project_path": "/home/x/src/web/.worktrees/login-flake", "repo_path": "/home/x/src/web",
+                   "project_path": "/home/alice/src/web/.worktrees/login-flake", "repo_path": "/home/alice/src/web",
                    "branch": "login-flake", "description": "fixing the flaky login test",
                    "archived_at": null, "agents_running": 2}),
             json!({"name": "myapp", "status": "waiting_input", "agent": "claude",
-                   "agent_session": "b", "tags": ["myapp"], "project_path": "/home/x/src/myapp",
+                   "agent_session": "b", "tags": ["myapp"], "project_path": "/home/alice/src/myapp",
                    "archived_at": null}),
             json!({"name": "infra-bump", "status": "stopped", "agent": "claude",
-                   "agent_session": "c", "tags": [], "project_path": "/home/x/src/infra",
+                   "agent_session": "c", "tags": [], "project_path": "/home/alice/src/infra",
                    "archived_at": null}),
         ];
         app.all = app.sessions.clone();
