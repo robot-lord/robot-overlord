@@ -6,8 +6,14 @@
 //! what, when), a prompt the human typed, the agent's reply, a title, token
 //! usage, the model, the end of a turn. Everything that reads transcripts
 //! (triage excerpts, token stats, history search and read, archive
-//! summaries, the observed model) goes through it, so a new agent needs a
-//! line reader and nothing else.
+//! summaries, the observed model) goes through it, so a new agent that
+//! keeps JSON lines needs a line reader and nothing else.
+//!
+//! The seam for consumers is this module's functions and their results
+//! (`Excerpts`, `TranscriptStats`, `context_tokens`, `observed_model`,
+//! `working`; `history::search`/`read` for messages), not `Line`: an agent
+//! whose conversations aren't a JSONL file gets a `Format` that those
+//! functions answer without going through lines.
 
 use std::path::{Path, PathBuf};
 

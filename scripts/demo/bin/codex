@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# A stand-in for the Codex CLI in rlord's demo (scripts/demo/demo.sh): draws
+# a plausible session screen, writes a rollout and a row in Codex's thread
+# index under $CODEX_HOME, and reports its state through rlord's hooks like
+# the real thing. Never talks to a model.
+#
+# No hooks for a session with a file $RLORD_DEMO_DIR/nohooks/<folder name>,
+# as when rlord's hooks aren't trusted in Codex yet (rlord then follows the
+# thread index and the rollout).
+set -u
+demo=${RLORD_DEMO_DIR:?}
+home=${CODEX_HOME:?}
+args=("$@")
+tid='' prompt='' exec=0 out='' sub=''
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[$i]} in
+    exec) exec=1 ;;
+    resume | fork) sub=${args[$i]}; tid=${args[$((i + 1))]}; i=$((i + 1)) ;;
+    -m | --model | -c | --config | -s | --sandbox) i=$((i + 1)) ;;
+    -o | --output-last-message) out=${args[$((i + 1))]}; i=$((i + 1)) ;;
+    -*) ;;
+    *) prompt=${args[$i]} ;;
+  esac
+done
+key=$(basename "$PWD")
+
+# `codex exec` (archive summaries): the prepared summary, into the -o file.
+if [[ $exec == 1 ]]; then
+  [[ $sub == fork ]] && key=$(basename "$(sqlite3 "$home/state_5.sqlite" "select cwd from threads where id='$tid'" 2>/dev/null)")
+  text=$(cat "$demo/summaries/$key.txt" 2>/dev/null || echo "A demo session.")
+  if [[ -n $out ]]; then printf '%s\n' "$text" >"$out"; else printf '%s\n' "$text"; fi
+  exit 0
+fi
+
+now() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")'; }
+mkdir -p "$home"
+db=$home/state_5.sqlite
+sqlite3 "$db" "create table if not exists threads (id text primary key, rollout_path text not null, cwd text not null, title text not null default '', created_at_ms integer, updated_at_ms integer, thread_source text, model text)"
+if [[ $sub == resume ]]; then
+  tr=$(sqlite3 "$db" "select rollout_path from threads where id='$tid'")
+  [[ -n $tr ]] || { echo "No saved session found with ID $tid" >&2; exit 1; }
+else
+  tid=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  day=$home/sessions/$(date -u +%Y/%m/%d)
+  mkdir -p "$day"
+  tr=$day/rollout-$(date -u +%Y-%m-%dT%H-%M-%S)-$tid.jsonl
+  ms=$(python3 -c 'import time; print(int(time.time() * 1000))')
+  python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": "session_meta", "payload": {"id": sys.argv[2], "cwd": sys.argv[3], "originator": "codex-tui", "cli_version": "0.167.2"}}))' \
+    "$(now)" "$tid" "$PWD" >"$tr"
+  sqlite3 "$db" "insert into threads (id, rollout_path, cwd, title, created_at_ms, updated_at_ms, thread_source, model) values ('$tid', '$tr', '$PWD', '', $ms, $ms, 'user', 'gpt-6-luna')"
+fi
+
+hook() {
+  [[ -e $demo/nohooks/$key ]] && return
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name": sys.argv[1], "session_id": sys.argv[2], "transcript_path": sys.argv[3], "cwd": sys.argv[4]}))' \
+    "$1" "$tid" "$tr" "$PWD" | rlord hook emit codex >/dev/null 2>&1 || true
+}
+# line TYPE PAYLOAD-JSON: one rollout line.
+line() { python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": sys.argv[2], "payload": json.loads(sys.argv[3])}))' "$(now)" "$1" "$2" >>"$tr"; }
+msg() { python3 -c 'import json,sys; print(json.dumps({"type": "message", "role": sys.argv[1], "content": [{"type": sys.argv[2], "text": sys.argv[3]}]}))' "$1" "$2" "$3"; }
+
+screen=$demo/screens/$key.txt
+state=$(cat "$demo/states/$key" 2>/dev/null || echo idle)
+hook SessionStart
+if [[ $sub != resume ]]; then
+  line event_msg '{"type": "task_started", "turn_id": "t1"}'
+  line response_item "$(msg user input_text "<environment_context><cwd>$PWD</cwd></environment_context>")"
+  line turn_context '{"turn_id": "t1", "model": "gpt-6-luna"}'
+  line response_item "$(msg user input_text "${prompt:-continue}")"
+  hook UserPromptSubmit
+  if [[ $state != working ]]; then
+    line response_item "$(msg assistant output_text "$(sed -n 's/^• //p' "$screen" 2>/dev/null | head -n 3 | tr '\n' ' ')")"
+    line event_msg '{"type": "token_count", "info": {"total_token_usage": {"input_tokens": 14023, "output_tokens": 212}, "last_token_usage": {"input_tokens": 14023, "output_tokens": 212}}}'
+    line event_msg '{"type": "task_complete", "turn_id": "t1"}'
+    hook Stop
+    [[ $state == waiting ]] && hook PermissionRequest
+  fi
+fi
+trap 'hook SessionEnd; exit 0' TERM HUP INT
+clear
+cat "$screen" 2>/dev/null
+while :; do sleep 3600 & wait $!; done

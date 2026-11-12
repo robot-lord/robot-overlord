@@ -147,49 +147,44 @@ it is just SQL.
 
 ## Agent adapter contract
 
-```rust
-trait AgentAdapter {
-    fn launch_argv(&self, s: &Session, first_prompt: Option<&str>) -> Argv;
-    fn resume_argv(&self, s: &Session) -> Result<Argv, ResumeRefusal>;
-    fn install_integration(&self) -> Result<()>;   // hooks / notify program
-    fn on_hook_event(&self, s: &mut Session, ev: HookEvent) -> StatusEvidence;
-    fn pane_patterns(&self) -> &PanePatterns;       // busy/prompt/error regexes
-    fn read_transcript_tail(&self, s: &Session) -> Option<TranscriptTail>;
-    fn delivery_channels(&self) -> &[DeliveryChannel]; // ordered preference
-}
-```
+`rlord_core::agents::Agent` (an enum, one variant per agent; each agent's
+facts live in its module) is what the rest of rlord asks:
 
-**Claude adapter (first-class):**
-- Mints the session UUID; launches with `--session-id <uuid>`; resumes with
-  `--resume <uuid>`. Trust rule inherited from research: only `minted` or
-  `hook`-confirmed ids may authorize `--resume`; a disk-scavenged id never
-  does (start fresh instead). Fork = `--session-id <new> --resume <old>
-  --fork-session`.
-- `rlord claude install-hooks` merge-writes `rlord hook emit claude`
-  into Claude's `settings.json` for SessionStart, UserPromptSubmit, Stop,
-  PermissionRequest, Notification, SessionEnd, PreCompact (preserving user
-  hooks). Hook events drive status, capture/confirm the session id, feed the
-  event log, and carry mailbox delivery (below).
-- Transcript JSONL read-back for last message / latest prompt / usage-limit
-  detection; `/rename` ↔ name sync with `name_locked` respected both ways.
-- Cost events from Stop-hook usage fields → `events` (kind `cost`).
+- **Commands**: `launch` (a new conversation; returns the id and transcript
+  path when rlord can choose them), `resume`, and the same `launch` for a
+  fresh conversation in the pane.
+- **Identity**: `mints_id`. Claude takes a caller-chosen id (`--session-id`),
+  so the transcript path is known at launch. Codex assigns its own: the id
+  is bound from the first hook that carries it (`trust = hook`), or, while
+  hooks aren't trusted, from Codex's thread index (the thread started in the
+  session's folder since launch; `trust = minted`, rlord's own attribution,
+  confirmed by a later hook). Only `minted` or `hook` ids resume; a
+  `scavenged` one never does. A Codex session with no bound id can't resume.
+- **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
+  agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same
+  shape, others' hooks kept, one backup), `map_hook_event` turns an event
+  into (log kind, status). Codex hooks need the user's trust (`/hooks`);
+  rlord never bypasses it.
+- **Transcripts**: where a conversation is written (`transcript_path`,
+  `all_transcripts`), read through `agents::transcript` into one shape for
+  every consumer (excerpts, stats, search/read, context size, model, turn
+  state).
+- **Capabilities**: `has_remote_control`, `tracks_subagents`,
+  `overlord_seat`, `importable` (all Claude-only today; callers ask instead
+  of comparing names).
 
-**Codex adapter (second):**
-- `install_integration` writes `notify = ["rlord","hook","emit","codex"]`
-  into `$CODEX_HOME/config.toml` between markers (auto-offered, not
-  manual-only).
-- Resume `codex resume <sid>` gated on the rollout file existing; subagent
-  threads rewritten to `codex fork <sid>`. Id binding: env → notify payload →
-  bounded rollout scan (scavenged ids get the same no-resume taint rule).
-
-**Generic tier** (later): a TOML-defined adapter (launch cmd, resume flag, id
-source, patterns) so a new CLI costs config, not code.
+Status has more than one source, and that is not part of `Agent`: hook
+events (`methods::hook_emit`), and for agents not reporting through hooks
+`daemon::discover` (the agent's own index and transcript tail, a slow
+tick). Archive summaries are written by the session's own agent
+(`claude::summary_argv`, `codex::summary_argv`: one-shot, nothing saved,
+nothing it could change).
 
 ## Status engine
 
 Same three-tier degradation the research validated, implemented once:
 
-1. **Native events** (Claude hooks / Codex notify), freshness-windowed.
+1. **Native events** (Claude and Codex hooks), freshness-windowed.
    Vocabulary: `starting | working | waiting_input | idle | stopped | error`.
 2. **Pane hints** — OSC pane-title spinner check (zero-capture fast path).
 3. **Pane capture + patterns** — via the control-mode stream where possible;

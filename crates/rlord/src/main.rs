@@ -34,7 +34,7 @@ enum Command {
     Search {
         #[arg(required = true)]
         words: Vec<String>,
-        /// Also Claude Code conversations started outside rlord
+        /// Also agent conversations (Claude Code, Codex) started outside rlord
         #[arg(long)]
         everywhere: bool,
         /// Sessions to show

@@ -1,4 +1,4 @@
-**Status:** in progress (planning)
+**Status:** in progress (phases 1 and 2 built on `codex-support`, 0.19.0-dev.1; phases 3 and 4 to come)
 
 # Codex CLI support
 
@@ -55,7 +55,64 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
 - First round: phases 1 and 2 in one PR (0.19.0-dev.1). Import, messaging,
   sub-agents and Codex overlord seats follow.
 
+## Progress
+
+Phases 1 and 2 are built (branch `codex-support`).
+
+- **Seam**: `core/src/agents/mod.rs` (`Agent` enum), `claude.rs`,
+  `codex.rs`, `transcript.rs` (one shape for both agents' JSONL). Every
+  `"claude"` gate in the daemon and TUI asks the agent.
+- **Identity**: SessionStart hook binds the Codex thread (`trust = hook`).
+  Without trusted hooks `daemon/src/discover.rs` binds from `state_5.sqlite`
+  `threads` (cwd + started since launch, not held by another session;
+  `trust = minted` until a hook confirms). Only a `SessionStart` moves a
+  Codex session to another thread: other events with another id are a
+  sub-agent thread in the same pane and are ignored.
+- **Status**: hooks (SessionStart, UserPromptSubmit, Stop,
+  PermissionRequest, SessionEnd). Without them, `discover` reads
+  task_started / task_complete from the rollout tail (only when the file
+  changed) and "stopped" from the dead pane, every 3s, for unhooked Codex
+  sessions only. It reads the rollout, not `thread_turns`: same facts, one
+  file already open for other reasons.
+- **Summaries**: `codex exec fork <id> --ephemeral --skip-git-repo-check -c
+  sandbox_mode="read-only" -c approval_policy="never" -o <file> <ask>`
+  (`exec fork` has no `-s`; `-c` is accepted), excerpts on stdin to `codex
+  exec … -` when too big or the fork fails. Not run against the real Codex
+  (no model calls in testing): the flags are checked against `--help` only.
+- **Models**: Codex's from `models_cache.json` (visibility `list`, by
+  priority), read on demand; free text when there is none. `[session]
+  codex_model`, `[archive] codex_summary_model`.
+- **Choosing**: `rlord new --agent`, the form's Agent hint (changing it
+  resets the model to that agent's default), `agent` on
+  propose/confirm/create tools.
+- **Demo**: `scripts/demo/bin/codex` stand-in (hooks, rollout, thread
+  index; `nohooks/<folder>` turns its hooks off) and one Codex session.
+
+Unverified against a real Codex run: that hooks fire with these payload
+fields for an interactive session, that SessionStart is not fired for
+sub-agent threads, `thread_source = 'user'` for user threads only, and the
+summary command end to end.
+
+Next: OpenCode (server/SSE events, plugins), then the integrations are done.
+For it, keep in mind what is still file-shaped: a transcript is located by
+a `Path` (`transcripts.source_path`, `Format::of`), and `history::search`
+greps files. The consumer seam is `agents::transcript`'s functions and
+`history::search`/`read` (common shapes out), so an OpenCode `Format` would
+answer those from its storage; status would be a third source next to hooks
+and `discover` (an SSE listener writing the same status events).
+
 ## Owed
 
-- `docs/architecture.md` describes an adapter trait, a Stop-hook mailbox
-  and pane-pattern status that were never built: reconcile when this lands.
+- Stale "waiting": after a permission prompt is answered, a Codex session
+  shows waiting until its turn ends (no hook in between is installed;
+  PostToolUse would fix it at one process per tool call). Claude has the
+  same gap with Notification.
+- `rlord claude install-hooks` is still what `scripts/get.sh`,
+  `install.sh` and the Homebrew caveat print; switch them to `rlord
+  install-hooks` with the next stable release.
+- Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
+  demo session and the form's Agent hint.
+
+- `docs/architecture.md`: the adapter section now describes the real
+  interface; the Stop-hook mailbox and pane-pattern status it describes
+  elsewhere were never built: reconcile when the effort finishes.

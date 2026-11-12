@@ -7,8 +7,22 @@
 //! own facts live in its module (`claude`, `codex`); transcripts are read
 //! through `transcript`, whichever agent wrote them.
 //!
-//! Adding an agent: a module with its argv, hook events and line reader, a
-//! variant here, and a `transcript::Format`.
+//! Adding an agent: a module with its argv and its own facts, a variant
+//! here, and a `transcript::Format`.
+//!
+//! Two things are deliberately not part of this interface, because agents
+//! differ in them:
+//!
+//! - **Where status comes from.** Command hooks (`map_hook_event`) are one
+//!   source; the daemon's `discover` (the agent's own files) is another. A
+//!   source turns what the agent says into a `Status` and writes it the
+//!   same way; an agent with an event stream instead of hooks adds a
+//!   source, not a hook mapping.
+//! - **How a conversation is stored.** Consumers ask `transcript` for
+//!   common shapes (excerpts, messages, stats, context size, model, turn
+//!   state), never for lines. Claude and Codex both keep JSON lines, so
+//!   both are read through `transcript::Line`; a store that isn't a JSONL
+//!   file answers those same functions its own way.
 
 pub mod claude;
 pub mod codex;

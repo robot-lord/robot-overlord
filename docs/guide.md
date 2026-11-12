@@ -107,6 +107,38 @@ first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
 `rlord repos` lists known repos.
 
+## Codex sessions
+
+A session runs on Claude Code or on the Codex CLI. Pick per session: the
+`Agent` hint in the new-session form, "start a Codex session to …" to the
+overlord, or `rlord new --agent codex`. `[session] agent` sets the default,
+`codex_model` Codex's default model (empty: Codex's own); the model picker
+offers Codex's own model list.
+
+Set up once:
+
+```sh
+rlord codex install-hooks    # or `rlord install-hooks` for every agent
+```
+
+then start `codex`, type `/hooks`, and trust the `rlord hook emit codex`
+entries. Codex runs a hook only after you've trusted it. Until you do,
+Codex sessions still work: rlord finds each conversation in Codex's own
+index and reads working/idle from its transcript, a few seconds late and
+without "waiting for you".
+
+What works: launch, attach, stop, resume (`codex resume`), fresh
+conversation, status, the list and its `agent:codex` filter, preview,
+search and history (also over Codex conversations started outside rlord,
+with `--everywhere`), triage excerpts, archive summaries (written by Codex
+itself, read-only and without saving anything; `[archive]
+codex_summary_model`).
+
+Not yet: the overlord and mastermind on Codex, importing Codex
+conversations started outside rlord, passing a message to a Codex session
+from the overlord, sub-agent tracking, Remote Control. A session waiting
+on a permission prompt shows as waiting only with trusted hooks.
+
 ## The right-hand side: preview + details
 
 The preview is the session's live pane, in colour (captured with ANSI
