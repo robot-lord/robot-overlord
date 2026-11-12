@@ -10,8 +10,10 @@ Opus mastermind) was overcomplicated. Go back to one overlord session.
 - The current **mastermind becomes the overlord**: Opus, **low effort**
   (an experiment the user asked for: a smart model at low effort feels like
   the right balance for the overlord; if it proves too dumb, go back to
-  Opus at medium). Same idea for other agents: Codex
-  `model_reasoning_effort = "low"`, OpenCode the matching low variant. Fresh
+  Opus at medium). Same idea for Codex: its strong model with
+  `model_reasoning_effort = "low"`. OpenCode has no clean equivalent: use
+  its default model and don't map effort (it may spend more tokens; fine).
+  Fresh
   restart after idle (`mastermind_fresh_after_mins` → the overlord's),
   Remote Control always available (shown as "rlord overlord").
 - Removed: the Sonnet front desk seat, `hand_off`, Option-M / seat switching
@@ -23,6 +25,14 @@ Opus mastermind) was overcomplicated. Go back to one overlord session.
   overlord's; an explicit `[overlord] model` / `effort` still wins. A user's
   explicit `mastermind_effort` carries over; only the default changes to low.
 - `n` (new session) goes straight to the overlord.
+- **Setup dialog** (first start, `tui/src/overlord.rs` `Setup`): one
+  overlord now, so its rows become **agent**, **model**, **effort**, and
+  Remote Control. Agent is pickable (installed agents only); changing it
+  resets model and effort to that agent's defaults (Claude: Opus / low;
+  Codex: strong model / low; OpenCode: default model, no effort row).
+  Effort is pickable in the dialog (today it's shown but only settable in
+  config.toml). The choice is saved to config so later starts reuse it;
+  the user can change it in config any time.
 
 ## How the overlord routes a request (the heart of overlord.md)
 
