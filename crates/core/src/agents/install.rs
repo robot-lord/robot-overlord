@@ -245,12 +245,24 @@ pub fn pane_program(bin: &str) -> Option<PathBuf> {
 /// `$SHELL -lc 'command -v <bin>'`: an absolute path, or nothing. The
 /// shell and reading its answer both end at `limit`.
 fn login_shell_path(bin: &str, limit: std::time::Duration) -> Option<PathBuf> {
+    // Off for demos, tests and scratch setups: there only what is on PATH
+    // exists, so a stand-in can never be passed over for a real agent the
+    // user's own shell knows.
+    if login_shell_off(std::env::var("RLORD_NO_LOGIN_SHELL").ok().as_deref()) {
+        return None;
+    }
     // (Only ever rlord's own agent names: never text from outside.)
     if !bin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
     shell_answer(&shell, &format!("command -v {bin}"), limit)
+}
+
+/// `RLORD_NO_LOGIN_SHELL`: set to anything but empty or `0`, the login
+/// shell is never asked where an agent is.
+fn login_shell_off(var: Option<&str>) -> bool {
+    var.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Run `shell -lc script` and take the last line it prints as a path.
@@ -710,6 +722,11 @@ mod tests {
             None
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        // The switch that keeps scratch setups to what is on their PATH.
+        assert!(login_shell_off(Some("1")) && login_shell_off(Some("yes")));
+        assert!(
+            !login_shell_off(None) && !login_shell_off(Some("")) && !login_shell_off(Some("0"))
+        );
         // Names that aren't plain command names never reach a shell.
         assert_eq!(
             login_shell_path("codex; rm -rf x", std::time::Duration::from_secs(1)),

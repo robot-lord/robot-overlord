@@ -29,11 +29,23 @@ d=$(cd "$d" && pwd)
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
 cp "$here/bin/claude" "$here/bin/codex" "$d/bin/"
+# A stand-in login shell that sees only the demo's programs: rlord asks the
+# login shell where an agent is when its PATH doesn't have it, and the
+# demo must never find (and launch) a real agent that way.
+cat > "$d/bin/demo-shell" <<EOF
+#!/bin/sh
+PATH=$d/bin:/usr/bin:/bin; export PATH
+case "\$1" in -l*) flags=\$1; shift; exec /bin/sh "-\${flags#-l}" "\$@" ;; esac
+exec /bin/sh "\$@"
+EOF
+chmod +x "$d/bin/demo-shell"
 
 cat > "$d/env.sh" <<EOF
 export XDG_DATA_HOME=$d/data XDG_CONFIG_HOME=$d/config XDG_RUNTIME_DIR=$d/run
 export XDG_STATE_HOME=$d/state CLAUDE_CONFIG_DIR=$d/claude CODEX_HOME=$d/codex
 export RLORD_TMUX_SOCKET=rlord-demo RLORD_DEMO_DIR=$d
+# Only the stand-in agents: never ask a login shell where a real one is.
+export RLORD_NO_LOGIN_SHELL=1 SHELL=$d/bin/demo-shell
 export PATH=$d/bin:\$PATH
 EOF
 # shellcheck disable=SC1091

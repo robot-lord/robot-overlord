@@ -38,7 +38,7 @@ test_in() {
       export PATH="$HOME/.local/bin:$PATH"
       rlord --version
       tmux -V
-      export RLORD_TMUX_SOCKET=smoke
+      export RLORD_TMUX_SOCKET=smoke RLORD_NO_LOGIN_SHELL=1
       tmux -L smoke new-session -d -s keep "sleep 600"
       rlord ls          # starts the daemon on demand
       rlord ping
