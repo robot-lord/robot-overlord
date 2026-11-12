@@ -41,7 +41,7 @@ first for the evidence behind the choices here.
 ```
 
 One cargo workspace, one installed binary `rlord` with subcommands; the
-daemon is `rlord daemon` (started on demand by the first client that needs it, or by an optional launchd user agent). Crates:
+daemon is `rlord daemon` (started on demand by the first client that needs it, or by an optional service unit: a launchd user agent on macOS, a systemd user unit `rlord.service` on Linux; when one is installed, starts and restarts go through it). The daemon logs to `~/Library/Logs/rlordd.log` on macOS and `$XDG_STATE_HOME/robot-overlord/rlordd.log` elsewhere. Crates:
 
 - `rlord-core` — domain types, state store, event log, status engine,
   mailbox, adapter trait + claude/codex adapters, tmux supervisor.
@@ -462,8 +462,8 @@ The on/off choice:
 - The agent pane is pinned as `@rlord_pane`, because a user's
   `split-window -b` lists the new pane first.
 
-`rlord reset` restarts the daemon (via launchd only when launchd's pid is
-ours), then `admin.reset` closes overlays, reconciles, re-sources the config,
+`rlord reset` restarts the daemon (via launchd or systemd only when the
+service manager's pid is ours), then `admin.reset` closes overlays, reconciles, re-sources the config,
 rebinds keys, and respawns the list's pane. `--hard` first kills the server.
 It also removes legacy `rlord`/`rlord_*` sessions and `rlord nav` bindings
 from the user's default server, but only for the real socket.
@@ -534,11 +534,11 @@ them.
   pane and cursor every ~40ms, and forwards keys (`send-keys`) and pastes
   (`paste-buffer -p`). It doesn't use a nested `tmux attach`, which fails
   inside popups. Inside a popup, keys reach the program rather than tmux's key
-  table, so the program itself treats Option-O as "close". Navigation tools
+  table, so the program itself treats Option-O (Alt-O) as "close". Navigation tools
   close popups (`display-popup -C`) before moving the user.
 - **tmux locale**: every tmux invocation forces a UTF-8 `LC_CTYPE` when the
-  environment has none. Under launchd there is no `LANG`, and tmux then
-  rewrites tabs and non-ASCII characters in command output to `_`.
+  environment has none (`en_US.UTF-8` on macOS, `C.UTF-8` on Linux). Under
+  launchd there is no `LANG`, and tmux then rewrites tabs and non-ASCII characters in command output to `_`.
 - **Default view** persists in the `kv` table (schema v5).
 - **Model freshness** (`core/src/models.rs`): a hand-maintained per-tool table
   of the newest model per family, checked against the configured model (alias
@@ -620,7 +620,7 @@ convention), excludes the dir via `.git/info/exclude`, and launches the agent
 - **Daemon crash/restart**: clients reconnect with backoff; hook `emit` spools
   to disk and is drained on startup; tmux panes are untouched (agents keep
   running — the daemon is an observer/controller, not a parent process).
-- **Reboot**: launchd user agent starts daemon → reconcile → sessions marked
+- **Reboot**: the launchd agent or systemd unit (if installed; else the first client) starts daemon → reconcile → sessions marked
   resumable → auto-resume policy or one keystroke in the TUI (`R` = restart
   selection / all resumable).
 - **tmux server death**: same as reboot from the daemon's perspective.

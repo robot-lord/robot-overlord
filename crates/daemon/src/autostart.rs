@@ -1,9 +1,10 @@
 //! Client-side daemon lifecycle, tmux-style: the first client that finds no
 //! daemon starts one in the background, and a daemon running an older build
 //! than the client is restarted on the new binary — so upgrading (or
-//! rebuilding) is just swapping the binary. If the launchd agent
-//! (scripts/install-launchd.sh) is installed, starts and restarts go through
-//! launchd so it stays the owner.
+//! rebuilding) is just swapping the binary. If a service manager owns the
+//! daemon (the launchd agent from scripts/install-launchd.sh on macOS, the
+//! systemd user unit from scripts/install-systemd.sh on Linux), starts and
+//! restarts go through it so it stays the owner.
 
 use std::fs::File;
 use std::io::IsTerminal;
@@ -20,7 +21,6 @@ use rlord_core::paths;
 
 use crate::{build_id, client_call, exe_id, methods};
 
-const LAUNCHD_LABEL: &str = "robot-overlord.daemon";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// After our spawned daemon bows out (lost the lock), how long to wait for
@@ -28,11 +28,23 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// finish starting, short enough that a wedged one fails fast.
 const LOCK_HOLDER_GRACE: Duration = Duration::from_secs(3);
 
-/// Where the daemon logs (shared with the launchd agent and dev-daemon.sh).
+/// Where the daemon logs (shared with the service units and dev-daemon.sh).
+/// macOS: `~/Library/Logs/rlordd.log`. Elsewhere:
+/// `$XDG_STATE_HOME/robot-overlord/rlordd.log` (default `~/.local/state`).
 pub fn log_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Library/Logs/rlordd.log"))
-        .unwrap_or_else(|| std::env::temp_dir().join("rlordd.log"))
+    let env = |v: &str| {
+        std::env::var_os(v)
+            .filter(|x| !x.is_empty())
+            .map(PathBuf::from)
+    };
+    let path = if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Logs/rlordd.log"))
+    } else {
+        env("XDG_STATE_HOME")
+            .or_else(|| env("HOME").map(|h| h.join(".local/state")))
+            .map(|d| d.join("robot-overlord/rlordd.log"))
+    };
+    path.unwrap_or_else(|| std::env::temp_dir().join("rlordd.log"))
 }
 
 /// Make sure a daemon is answering on `socket`: start one if none is
@@ -67,10 +79,11 @@ pub fn restart_daemon(socket: &Path) -> Result<()> {
     // A pidfile left by a crashed daemon may name a pid the OS has since
     // reused: only ever signal a process that is actually `rlord daemon`.
     let old = read_pid().filter(|&pid| is_rlord_daemon(pid));
-    let launchd = launchd_pid();
-    if launchd.is_some() && launchd == old {
-        // launchd owns the daemon serving our socket: let it do the restart.
-        kickstart(true)?;
+    let managed = service::pid();
+    if managed.is_some() && managed == old {
+        // The service manager owns the daemon serving our socket: let it do
+        // the restart.
+        service::kick(true)?;
         return wait_for_new(socket, old, None);
     }
     if let Some(pid) = old {
@@ -89,11 +102,11 @@ pub fn restart_daemon(socket: &Path) -> Result<()> {
     start_daemon(socket, old)
 }
 
-/// Start a daemon — via launchd if its agent is installed, else detached —
-/// and wait until one other than `old` answers.
+/// Start a daemon — via the service manager if its unit is installed, else
+/// detached — and wait until one other than `old` answers.
 fn start_daemon(socket: &Path, old: Option<i32>) -> Result<()> {
-    if launchd_job_loaded() {
-        kickstart(false)?;
+    if service::installed() {
+        service::kick(false)?;
         wait_for_new(socket, old, None)
     } else {
         let mut child = spawn_detached()?;
@@ -200,52 +213,152 @@ fn read_pid() -> Option<i32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-fn launchd_target() -> String {
-    // SAFETY: getuid never fails.
-    format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc::getuid() })
+/// A client pointed at a non-default data dir (tests, sandboxes) must not
+/// route through the service manager: its daemon serves the default socket,
+/// and we would wait on one it never serves.
+fn data_overridden() -> bool {
+    std::env::var_os("XDG_DATA_HOME").is_some_and(|x| !x.is_empty())
 }
 
-/// `launchctl print` output for our agent, if it is loaded.
-fn launchd_print() -> Option<String> {
-    let o = Command::new("launchctl")
-        .args(["print", &launchd_target()])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    o.status
-        .success()
-        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-}
+/// The launchd user agent (scripts/install-launchd.sh).
+#[cfg(target_os = "macos")]
+mod service {
+    use std::process::{Command, Stdio};
 
-/// The launchd agent's daemon runs without XDG overrides, so it serves the
-/// default socket. A client pointed elsewhere (tests, sandboxes) must not
-/// route through it, or it would wait on a socket launchd never serves.
-fn launchd_job_loaded() -> bool {
-    let overridden = ["XDG_RUNTIME_DIR", "XDG_DATA_HOME"]
-        .iter()
-        .any(|v| std::env::var_os(v).is_some_and(|x| !x.is_empty()));
-    !overridden && launchd_print().is_some()
-}
+    use anyhow::{bail, Result};
 
-/// Pid of the daemon launchd is running, if any.
-fn launchd_pid() -> Option<i32> {
-    launchd_print()?
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("pid = ")?.parse().ok())
-}
+    const LABEL: &str = "robot-overlord.daemon";
 
-fn kickstart(kill: bool) -> Result<()> {
-    let target = launchd_target();
-    let mut args = vec!["kickstart"];
-    if kill {
-        args.push("-k");
+    fn target() -> String {
+        // SAFETY: getuid never fails.
+        format!("gui/{}/{LABEL}", unsafe { libc::getuid() })
     }
-    args.push(&target);
-    let st = Command::new("launchctl").args(&args).status()?;
-    if !st.success() {
-        bail!("launchctl {} failed", args.join(" "));
+
+    /// `launchctl print` output for our agent, if it is loaded.
+    fn print() -> Option<String> {
+        let o = Command::new("launchctl")
+            .args(["print", &target()])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
     }
-    Ok(())
+
+    /// Whether the agent is loaded and serves the socket this client uses.
+    /// The agent's daemon runs without XDG overrides, so it serves the
+    /// default socket.
+    pub fn installed() -> bool {
+        let overridden = super::data_overridden()
+            || std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|x| !x.is_empty());
+        !overridden && print().is_some()
+    }
+
+    /// Pid of the daemon launchd is running, if any.
+    pub fn pid() -> Option<i32> {
+        print()?
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pid = ")?.parse().ok())
+    }
+
+    /// Start the daemon (`restart`: kill the running one first).
+    pub fn kick(restart: bool) -> Result<()> {
+        let target = target();
+        let mut args = vec!["kickstart"];
+        if restart {
+            args.push("-k");
+        }
+        args.push(&target);
+        let st = Command::new("launchctl").args(&args).status()?;
+        if !st.success() {
+            bail!("launchctl {} failed", args.join(" "));
+        }
+        Ok(())
+    }
+}
+
+/// The systemd user unit `rlord.service` (scripts/install-systemd.sh), when
+/// there is one; otherwise clients spawn the daemon on demand.
+#[cfg(not(target_os = "macos"))]
+mod service {
+    use std::process::{Command, Stdio};
+
+    use anyhow::{bail, Result};
+
+    const UNIT: &str = "rlord.service";
+
+    /// `systemctl --user show` properties of the unit (empty if systemd
+    /// isn't there).
+    fn show(props: &str) -> Vec<(String, String)> {
+        let Ok(o) = Command::new("systemctl")
+            .args(["--user", "show", UNIT, "-p", props])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !o.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
+    fn prop(props: &[(String, String)], name: &str) -> Option<String> {
+        props
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Whether the unit is installed and serves the socket this client
+    /// uses. The unit's daemon gets the user manager's environment, where
+    /// XDG_RUNTIME_DIR is `/run/user/<uid>`; a client with another one, none
+    /// (its socket is then under the data dir), or another data dir talks
+    /// to a different daemon.
+    pub fn installed() -> bool {
+        if super::data_overridden() {
+            return false;
+        }
+        // SAFETY: getuid never fails.
+        let default_run = format!("/run/user/{}", unsafe { libc::getuid() });
+        let run_ok =
+            std::env::var("XDG_RUNTIME_DIR").is_ok_and(|v| v.trim_end_matches('/') == default_run);
+        if !run_ok {
+            return false;
+        }
+        let p = show("LoadState");
+        prop(&p, "LoadState").as_deref() == Some("loaded")
+    }
+
+    /// Pid of the daemon systemd is running, if any.
+    pub fn pid() -> Option<i32> {
+        if !installed() {
+            return None;
+        }
+        let p = show("MainPID");
+        prop(&p, "MainPID")?.parse().ok().filter(|&n: &i32| n > 0)
+    }
+
+    /// Start the daemon (`restart`: restart the running one).
+    pub fn kick(restart: bool) -> Result<()> {
+        let verb = if restart { "restart" } else { "start" };
+        let st = Command::new("systemctl")
+            .args(["--user", verb, UNIT])
+            .stdin(Stdio::null())
+            .status()?;
+        if !st.success() {
+            bail!("systemctl --user {verb} {UNIT} failed");
+        }
+        Ok(())
+    }
 }
 
 /// Exclusive daemon lock, held for the daemon's lifetime. Returns `None` if

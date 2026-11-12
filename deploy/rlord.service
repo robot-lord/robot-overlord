@@ -1,0 +1,19 @@
+# systemd user unit for the Robot Overlord daemon (rlordd).
+# scripts/install-systemd.sh installs it to ~/.config/systemd/user/ with
+# ExecStart pointing at the rlord on your PATH, PATH set to yours (the daemon
+# spawns tmux, git and the agent CLIs, and tmux panes inherit this
+# environment), and the log at $XDG_STATE_HOME/robot-overlord/rlordd.log.
+# Used as-is it runs ~/.local/bin/rlord and logs to the default state dir.
+[Unit]
+Description=Robot Overlord daemon (rlordd)
+
+[Service]
+ExecStart=%h/.local/bin/rlord daemon
+Environment=RUST_LOG=info
+StandardOutput=append:%h/.local/state/robot-overlord/rlordd.log
+StandardError=append:%h/.local/state/robot-overlord/rlordd.log
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

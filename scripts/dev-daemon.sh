@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Dev loop (macOS): rebuild the binary and restart the daemon on it.
+# Dev loop: rebuild the binary and restart the daemon on it.
 # (`cargo test` does not refresh target/debug/rlord — always build first.)
-# If the launchd agent is installed (scripts/install-launchd.sh), launchd owns
-# the daemon and we restart it there; otherwise we run it under nohup.
+# If a service manager owns the daemon (the launchd agent from
+# scripts/install-launchd.sh on macOS, the systemd user unit from
+# scripts/install-systemd.sh on Linux), we restart it there; otherwise we run
+# it under nohup.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo build --workspace
@@ -28,10 +30,21 @@ wait_new() {
   return 1
 }
 
+# Mirror rlord_daemon::autostart::log_path().
+if [[ "$(uname -s)" == Darwin ]]; then
+  default_log="$HOME/Library/Logs/rlordd.log"
+else
+  default_log="${XDG_STATE_HOME:-$HOME/.local/state}/robot-overlord/rlordd.log"
+fi
+
 target="gui/$(id -u)/robot-overlord.daemon"
-if launchctl print "$target" >/dev/null 2>&1; then
-  log="$HOME/Library/Logs/rlordd.log"
+if [[ "$(uname -s)" == Darwin ]] && launchctl print "$target" >/dev/null 2>&1; then
+  log=$default_log
   launchctl kickstart -k "$target"
+elif [[ "$(uname -s)" != Darwin ]] && command -v systemctl >/dev/null &&
+  [[ "$(systemctl --user show rlord.service -p LoadState --value 2>/dev/null)" == loaded ]]; then
+  log=$default_log
+  systemctl --user restart rlord.service
 else
   if [[ -z "$old" ]]; then
     # No usable pidfile: find a process whose argv is exactly `[.../]rlord daemon`
@@ -49,7 +62,7 @@ else
   if linked=$(command -v rlord 2>/dev/null) && [[ "$(readlink -f "$linked")" == "$(readlink -f "$bin")" ]]; then
     bin=$linked
   fi
-  log=${RLORD_LOG:-$HOME/Library/Logs/rlordd.log}
+  log=${RLORD_LOG:-$default_log}
   mkdir -p "$(dirname "$log")"
   nohup "$bin" daemon >>"$log" 2>&1 &
 fi
