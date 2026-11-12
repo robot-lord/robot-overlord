@@ -27,15 +27,30 @@ CI for releases).
 
 ## Progress
 
-- [ ] version channels: config, update, release.sh, version-bump check
-- [ ] Linux code: clipboard, appearance, autostart, update target
-- [ ] cross builds + .deb/.rpm + SHA256SUMS + smoke tests
-- [ ] get.sh installer
-- [ ] Homebrew tap repo + formula updated by release.sh
-- [ ] OSS files: licenses, README install, CONTRIBUTING; crates.io metadata
-- [ ] scrub for private/Mac-only content before going public
+- [x] version channels: config, update, release.sh, version-bump check
+- [x] Linux code: clipboard (wl-copy/xclip/xsel/OSC 52), appearance
+      (gsettings, RLORD_APPEARANCE), systemd user unit, Alt-/Ctrl- key
+      labels off macOS, XDG log path, portable process scan, C.UTF-8;
+      tests pass in an Ubuntu container
+- [x] cross builds + .deb/.rpm + SHA256SUMS + smoke tests (Ubuntu 22.04/24.04,
+      Debian 12, Fedora 41, Amazon Linux 2023 pass; amd64 via emulation)
+- [x] get.sh installer (offers tmux install; apt does `update` first)
+- [ ] Homebrew tap repo: `scripts/update-tap.sh` written; the repo itself
+      must be created by the owner (`gh repo create` was blocked here)
+- [x] OSS files: licenses, README install, CONTRIBUTING; crates.io metadata
+      (packages renamed robot-overlord*; dry-run of core passes)
+- [x] scrub: fixtures/paths/wording neutral
+- [ ] git author emails (a tailnet hostname, a personal address): the
+      owner's call (history rewrite + force-push)
 
 ## Owed / open
+
+- Arch: its amd64 image's mirrors fail to sync under emulation; not in the
+  default smoke set. AUR package: later.
+- The tap formula and curl installer only work once the repo is public
+  (release assets of a private repo need auth).
+- crates.io: owner runs `cargo login`; `publish-crates.sh` pins internal
+  dep versions at publish time.
 
 - tmux minimum version: audit features used (display-popup ≥3.2,
   client_termtype, send-keys -N); Ubuntu 22.04 / Amazon Linux 2023 ship 3.2a.
