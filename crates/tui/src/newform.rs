@@ -489,6 +489,32 @@ impl NewForm {
         }
     }
 
+    /// A list is open over the form (a picker or the repo finder): the
+    /// wheel moves in it.
+    pub(crate) fn has_list(&self) -> bool {
+        self.picker.is_some() || self.finder.is_some()
+    }
+
+    /// A click on item `i`: of the open list (selects it), else field `i`
+    /// (focuses it). True when Enter should follow: a list item is chosen,
+    /// a pick/toggle field or the send button is activated. A text field
+    /// only takes the focus.
+    pub(crate) fn click(&mut self, i: usize) -> bool {
+        if let Some((_, items, state)) = &mut self.picker {
+            state.select(Some(i.min(items.len().saturating_sub(1))));
+            return true;
+        }
+        if let Some(finder) = &mut self.finder {
+            finder.state.select(Some(i));
+            return true;
+        }
+        if self.text_prompt.is_some() || i >= self.fields().len() {
+            return false;
+        }
+        self.focus = i;
+        !self.current().is_text()
+    }
+
     fn fields(&self) -> &'static [Field] {
         match self.kind {
             FormKind::Overlord => &OVERLORD_FIELDS,
@@ -1125,6 +1151,8 @@ impl App {
             FormKind::Manual => (centered(f.area(), 76, 20), "New session · manual"),
         };
         f.render_widget(Clear, area);
+        self.hits.add(f.area(), mouse::Hit::Outside);
+        self.hits.add(area, mouse::Hit::Inside);
         let block = theme::modal(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1160,6 +1188,14 @@ impl App {
                 .highlight_symbol(theme::SELECT_BAR);
             let mut st = finder.state.clone();
             f.render_stateful_widget(list, list_area, &mut st);
+            // Click a repo to pick it.
+            for i in st.offset()..rows.len().min(st.offset() + list_area.height as usize) {
+                self.hits.row(
+                    list_area,
+                    list_area.y + (i - st.offset()) as u16,
+                    mouse::Hit::Pick(i),
+                );
+            }
             return;
         }
         if let Some((kind, items, state)) = &form.picker {
@@ -1176,6 +1212,17 @@ impl App {
                 .highlight_symbol(theme::SELECT_BAR);
             let mut st = state.clone();
             f.render_stateful_widget(list, inner, &mut st);
+            // Click a choice to pick it (inside the list's own border).
+            let body = Rect {
+                x: inner.x + 1,
+                y: inner.y + 1,
+                width: inner.width.saturating_sub(2),
+                height: inner.height.saturating_sub(2),
+            };
+            for i in st.offset()..items.len().min(st.offset() + body.height as usize) {
+                self.hits
+                    .row(body, body.y + (i - st.offset()) as u16, mouse::Hit::Pick(i));
+            }
             return;
         }
 
@@ -1188,11 +1235,14 @@ impl App {
             } else {
                 tmux::key_label(k)
             };
-            draw_describe_form(f, inner, form, &overlord_key);
+            draw_describe_form(f, inner, form, &overlord_key, &self.hits);
             return;
         }
         let mut lines: Vec<Line> = Vec::new();
         for (i, field) in form.fields().iter().enumerate() {
+            // Click a field to focus it (a pick, toggle or Launch: to use it).
+            self.hits
+                .row(inner, inner.y + lines.len() as u16, mouse::Hit::Pick(i));
             let focused = i == form.focus;
             let marker = if focused { "▶ " } else { "  " };
             let value = match field {
@@ -1311,7 +1361,18 @@ impl App {
 
 /// The overlord form: a description box up top (the part that matters),
 /// then the optional hints, visibly secondary, then send.
-fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: &str) {
+fn draw_describe_form(
+    f: &mut Frame,
+    inner: Rect,
+    form: &NewForm,
+    overlord_key: &str,
+    hits: &mouse::Hits,
+) {
+    // The index of a field in this form (what a click on it picks).
+    let pick = |fld: Field| {
+        let i = OVERLORD_FIELDS.iter().position(|x| *x == fld).unwrap_or(0);
+        mouse::Hit::Pick(i)
+    };
     let dim = theme::faint();
     let gray = theme::muted();
     let accent = Style::default().fg(theme::accent());
@@ -1394,6 +1455,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         width: box_area.width.saturating_sub(4),
         ..box_area
     };
+    hits.add(box_area, pick(Field::Prompt));
     let border = if focus(Field::Prompt) {
         Style::default().fg(theme::yellow())
     } else {
@@ -1435,7 +1497,9 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             ),
         ]),
     ];
-    let hint = |fld: Field, key: &str, value: String, chosen: bool| -> Line<'static> {
+    // (Each hint is one line of `rest`; `row` is the line it will be on.)
+    let hint = |row: usize, fld: Field, key: &str, value: String, chosen: bool| -> Line<'static> {
+        hits.row(rest, rest.y + row as u16, pick(fld));
         let focused = focus(fld);
         let changed = form.changed.iter().any(|c| c == key);
         let label_style = if focused {
@@ -1474,18 +1538,21 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     };
     let auto = matches!(form.location, Location::Auto);
     lines.push(hint(
+        lines.len(),
         Field::Repo,
         "repo",
         form.location_label(),
         form.repo_chosen && !auto,
     ));
     lines.push(hint(
+        lines.len(),
         Field::Agent,
         "agent",
         form.agent_label(),
         form.agent_chosen,
     ));
     lines.push(hint(
+        lines.len(),
         Field::Model,
         "model",
         if form.model.is_empty() {
@@ -1496,6 +1563,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         form.model_chosen,
     ));
     lines.push(hint(
+        lines.len(),
         Field::Workspace,
         "worktree",
         match (&form.location, form.workspace) {
@@ -1512,6 +1580,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         format!("{}{}", form.tags, if tags_focused { "▏" } else { "" })
     };
     lines.push(hint(
+        lines.len(),
         Field::Tags,
         "tags",
         tags,
@@ -1529,6 +1598,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
     } else {
         " Send to mastermind "
     };
+    hits.row(rest, rest.y + lines.len() as u16, pick(Field::Launch));
     lines.push(Line::from(vec![
         Span::raw(if send_focused { "  ▶ " } else { "    " }),
         Span::styled(
@@ -1574,6 +1644,8 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
             Style::default().fg(theme::yellow()),
         )));
     }
+    // The key hints under the form are buttons too.
+    hits.keycaps(rest.x, rest.y, &lines);
     f.render_widget(Paragraph::new(lines), rest);
 }
 

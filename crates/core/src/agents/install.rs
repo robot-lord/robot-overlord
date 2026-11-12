@@ -26,7 +26,8 @@ pub struct Tool {
     pub label: &'static str,
     /// The agent rlord runs it as; None: known, not runnable in rlord yet.
     pub agent: Option<Agent>,
-    /// Its marker in the session list: at most two columns wide, as
+    /// Its marker in the session list: at most two columns wide (the list
+    /// pads it and adds a space), as
     /// coloured pieces (text, RGB; None: the theme's text colour).
     pub marker: &'static [MarkerPiece],
     /// The vendor's install page.

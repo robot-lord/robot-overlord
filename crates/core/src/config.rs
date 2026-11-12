@@ -123,6 +123,12 @@ pub struct TmuxKeys {
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
     pub profile: bool,
+    /// Mouse support in rlord's tmux server: clicks and the wheel reach
+    /// the list, the overlay and agent panes (the wheel scrolls a pane's
+    /// scrollback). With it on, selecting text by dragging needs Shift
+    /// (Option in some macOS terminals). An imported profile's own `mouse`
+    /// setting wins in agent sessions.
+    pub mouse: bool,
 }
 
 impl Default for TmuxKeys {
@@ -134,6 +140,7 @@ impl Default for TmuxKeys {
             overlord: "M-o".into(),
             mastermind: String::new(),
             profile: true,
+            mouse: true,
         }
     }
 }
@@ -555,6 +562,10 @@ overlord = "M-o" # from any pane: the overlord (quick front desk) over it
 mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
                   # overlord's overlay, Alt-M (Option-M on a Mac) always switches to it)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
+mouse = true     # click and scroll in the list, the overlay and agent panes
+                 # (drag-select then needs Shift; Option in some macOS
+                 # terminals). An imported profile's own setting wins in
+                 # agent sessions.
 
 # Archiving a session writes a short summary of what it did (once, in the
 # background, on a cheap model), shown and searched with archived sessions.

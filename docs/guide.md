@@ -340,6 +340,17 @@ counts look wrong.
 
 ## Navigation and keys
 
+**The mouse works everywhere a key does.** Click a row to select it,
+double-click to attach, right-click for its menu (the same actions as the
+footer, each with its key); the wheel moves through the list, the group
+column and the preview. Tabs, search, sort and live/archived in the header
+are clickable, as is every keycap in the footer and in dialogs, form
+fields and their choices, and the `:` launcher's items. rlord's tmux has
+mouse support on (`[tmux] mouse = false` turns it off), so in agent panes
+the wheel scrolls the pane's scrollback, and selecting text by dragging
+needs Shift held (Option in some macOS terminals). With `rlord tmux
+import`, your own `mouse` setting applies in agent sessions.
+
 A session's status means one thing: **working**; **needs you** (blocked
 mid-turn on a permission prompt or a question, until you answer); **your
 turn** (it finished; the next prompt is yours); **stopped**. Filter with
