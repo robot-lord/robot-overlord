@@ -183,11 +183,14 @@ Good to know:
 - OpenCode's screen takes no model flag and creates a session only with
   its first message, so rlord creates the session first (through
   OpenCode's own `opencode api`), with the model you picked, and then
-  opens the screen on it. If that step fails, the session still starts, on
-  OpenCode's default model; rlord then sets the model once it can, and the
-  session's log (`rlord log`) says so, or says that it couldn't.
+  opens the screen on it. That step gets ten seconds. If it fails, what
+  OpenCode said shows in the pane for a moment, and the session still
+  starts, on OpenCode's default model; rlord then sets the model once it
+  can, and the session's log (`rlord log`) says so, or says that it
+  couldn't.
 - Resuming keeps the model the conversation has in OpenCode (you may have
-  changed it there), not the one it was launched with.
+  changed it there), not the one it was launched with. Only a conversation
+  OpenCode doesn't have is created again, with the launch's model.
 - rlord follows the conversation it launched. A new session or tab you
   open inside OpenCode's screen isn't followed.
 - A turn runs in the server: closing the screen stops the rlord session,

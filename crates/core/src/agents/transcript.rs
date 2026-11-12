@@ -238,7 +238,7 @@ pub fn clip(s: &str, max: usize) -> String {
 /// conversation in its database).
 pub fn exists(path: &Path) -> bool {
     match opencode::locate(path) {
-        Some((db, id)) => opencode::exists(db, id),
+        Some((db, id)) => opencode::exists(db, id) == Some(true),
         None => path.exists(),
     }
 }

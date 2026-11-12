@@ -258,17 +258,10 @@ impl Agent {
                 if trust == "scavenged" || !opencode::is_session_id(id) {
                     bail!("refusing to resume a session id rlord didn't choose ({id})");
                 }
-                // A session OpenCode has keeps its own model (the user may
-                // have changed it there since): just opened. One it never
-                // created, or that was deleted there, starts under the
-                // same id, created with the launch's model.
-                let resumed = opencode::exists(&opencode::db_path(), id);
-                let argv = if resumed {
-                    opencode::open_argv(id, None, extra)
-                } else {
-                    opencode::launch_argv(id, project, model, None, extra)
-                };
-                Ok((argv, resumed))
+                // Opened as it is, or created anew (see `resume_argv`).
+                // Opened, nothing is held to confirm afterwards.
+                let has = opencode::exists(&opencode::db_path(), id);
+                Ok(opencode::resume_argv(id, has, project, model, extra))
             }
         }
     }
@@ -629,21 +622,19 @@ mod tests {
             })
         );
         assert_eq!(Agent::Claude.deferred(Some("opus")), None);
-        // Resuming a session OpenCode doesn't have (here: no database)
-        // starts it under the same id, created with the launch's model.
-        let (argv, resumed) = Agent::OpenCode
-            .resume(
-                Some(&id),
-                "minted",
-                "/src/app",
-                Some("opencode/x-free"),
-                &[],
-            )
-            .unwrap();
-        if !resumed {
-            assert_eq!(argv[..2], ["sh", "-c"]);
-            assert_eq!(argv[5..], ["-s", id.as_str()]);
-            assert!(argv[4].contains("x-free"));
+        // Resuming a session OpenCode doesn't have starts it under the
+        // same id, created with the launch's model; one it has, or one it
+        // can't tell about, is opened as it is.
+        let m = Some("opencode/x-free");
+        let (argv, resumed) = opencode::resume_argv(&id, Some(false), "/src/app", m, &[]);
+        assert!(!resumed);
+        assert_eq!(argv[..2], ["sh", "-c"]);
+        assert_eq!(argv[5..], ["-s", id.as_str()]);
+        assert!(argv[4].contains("x-free"));
+        for has in [Some(true), None] {
+            let (argv, resumed) = opencode::resume_argv(&id, has, "/src/app", m, &[]);
+            assert!(resumed);
+            assert_eq!(argv, ["opencode", "-s", id.as_str()]);
         }
         // An id rlord didn't mint is refused.
         assert!(Agent::OpenCode
@@ -663,6 +654,39 @@ mod tests {
             Agent::OpenCode.map_hook_event("Stop", &json!({})),
             ("hook_other", Effect::Nothing)
         );
+    }
+
+    #[test]
+    fn resume_needs_a_bound_id() {
+        let (argv, resumed) = Agent::Codex
+            .resume(Some("t-1"), "hook", "/src/app", Some("gpt-6-luna"), &[])
+            .unwrap();
+        assert_eq!(
+            argv,
+            [
+                "codex",
+                "resume",
+                "t-1",
+                "--no-daemon",
+                "--no-alt-screen",
+                "--model",
+                "gpt-6-luna"
+            ]
+        );
+        assert!(resumed);
+        let e = Agent::Codex
+            .resume(None, "minted", "/src/app", None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("can't") && e.contains("/hooks"), "{e}");
+        assert!(Agent::Claude
+            .resume(None, "minted", "/src/app", None, &[])
+            .is_err());
+        // No transcript for this id: Claude starts it under the same id.
+        let (argv, resumed) = Agent::Claude
+            .resume(Some("u-1"), "minted", "/nonexistent", None, &[])
+            .unwrap();
+        assert_eq!((argv[1].as_str(), resumed), ("--session-id", false));
     }
 
     #[test]

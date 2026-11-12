@@ -10,8 +10,10 @@
 //!   permission request or question and its answer. Events are matched to
 //!   rlord's sessions by the conversation id rlord minted at launch.
 //! - **Resync** after every (re)connect, since the stream has no replay:
-//!   each session's turn state from OpenCode's own session row, and what it
-//!   waits on from the server.
+//!   each session's turn state from OpenCode's own session row, checked
+//!   against the turns the server says are running (a row left "busy" by
+//!   a server that died mid-turn is over), and what it waits on from the
+//!   server.
 //! - **Without the server**: the session rows alone, every tick, and only
 //!   for what they can still say. A session that was starting is up. A
 //!   turn can't be running once the server is gone (turns run in it), so
@@ -37,14 +39,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::json;
 
 use rlord_core::agents::opencode::{self, Turn};
 use rlord_core::agents::opencode_service::{map_event, Events, Service, Signal, EVENT_TYPES};
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
-use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
 
 use crate::Daemon;
@@ -76,7 +77,9 @@ struct Follower {
     /// OpenCode sessions' parents, as looked up (a sub-agent's session
     /// asks permission under its own id). Only definite answers.
     parents: HashMap<String, Option<String>>,
-    /// Attempts to reach the server that failed, in a row.
+    /// Attempts to reach the server that found nothing there (no
+    /// `service.json`, or nothing accepting connections at its address),
+    /// in a row. An error answer means it is there: that resets it.
     failed: u8,
 }
 
@@ -129,6 +132,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     if live.is_empty() {
         f.link = None;
         f.parents.clear();
+        f.failed = 0;
         std::thread::sleep(TICK);
         return Ok(());
     }
@@ -146,11 +150,11 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
                 changed |= settle_all(d, With::Server(&svc), &up, &mut f.blocked)?;
                 f.link = Some((svc, events));
             }
-            Err(e) => {
-                tracing::debug!(error = %format!("{e:#}"), "OpenCode's server not reachable");
+            Err(Unreached { gone, error }) => {
+                tracing::debug!(error = %format!("{error:#}"), gone, "OpenCode's server not followed");
                 f.retry_at = Instant::now() + f.backoff;
                 f.backoff = (f.backoff * 2).min(MAX_BACKOFF);
-                f.failed = f.failed.saturating_add(1);
+                f.failed = if gone { f.failed.saturating_add(1) } else { 0 };
             }
         }
     }
@@ -196,7 +200,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         None => {
             changed |= apply_deferred(d, None, &up)?;
             // Gone, not merely out of reach for a moment (a stream that
-            // just broke): it didn't answer twice running.
+            // just broke, an error answer): nothing was there twice running.
             let rows = With::Rows {
                 server_gone: f.failed >= 2,
             };
@@ -210,36 +214,39 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     Ok(())
 }
 
-/// The server as `service.json` names it now, and its event stream.
-fn connect() -> Result<(Service, Events)> {
-    let svc = Service::read(&opencode::service_file()).context("no OpenCode server is running")?;
-    let events = svc.events(EVENT_TYPES, TICK)?;
-    Ok((svc, events))
+/// Why the server couldn't be followed. `gone`: nothing is there (no
+/// `service.json`, or nothing accepts a connection at its address); else
+/// it is there and answered with an error (a 401, a 404).
+struct Unreached {
+    gone: bool,
+    error: anyhow::Error,
 }
 
-/// Sessions whose TUI exited: stopped. One failed look isn't proof (tmux
-/// busy, a restart in between): two in a row.
+/// The server as `service.json` names it now, and its event stream.
+fn connect() -> Result<(Service, Events), Unreached> {
+    let Some(svc) = Service::read(&opencode::service_file()) else {
+        return Err(Unreached {
+            gone: true,
+            error: anyhow::anyhow!("no OpenCode server is running"),
+        });
+    };
+    match svc.events(EVENT_TYPES, TICK) {
+        Ok(events) => Ok((svc, events)),
+        Err(error) => Err(Unreached {
+            gone: !svc.answers(),
+            error,
+        }),
+    }
+}
+
+/// Sessions whose TUI exited: stopped (two looks in a row, as `discover`
+/// does).
 fn panes(d: &Daemon, live: &[Session], gone: &mut HashMap<String, u8>) -> Result<bool> {
     let mut changed = false;
     for s in live {
-        let dead = s
-            .tmux_session
-            .as_deref()
-            .is_some_and(|t| !tmux::has_session(t) || tmux::format(t, "#{pane_dead}") == "1");
-        let looks = gone.entry(s.id.clone()).or_default();
-        *looks = if dead { looks.saturating_add(1) } else { 0 };
-        if *looks < 2 {
-            continue;
+        if crate::discover::pane_looks(s, gone) >= 2 {
+            changed |= crate::discover::stop_from_pane(&d.db(), s)?;
         }
-        let db = d.db();
-        // (Restarted meanwhile: not this pane's end.)
-        if db.resolve_ref(&s.id)?.status != s.status {
-            continue;
-        }
-        let now = now_ms();
-        db.set_status(&s.id, Status::Stopped, now)?;
-        db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
-        changed = true;
     }
     Ok(changed)
 }
@@ -454,6 +461,10 @@ enum Seen {
     Rows,
     /// Rows only, and the server is gone.
     ServerGone,
+    /// The server answered: nothing waits on the user, and no turn of the
+    /// session is running in it (`Service::active`), whatever the row says
+    /// (a turn that died with an earlier server).
+    NotRunning,
 }
 
 /// The status a session should be in, from its turn state and what is
@@ -469,7 +480,7 @@ fn settle(cur: Status, turn: Turn, seen: Seen) -> Option<Status> {
         (Seen::Pending(true), _) => Status::WaitingInput,
         (Seen::Pending(false), true) => Status::Working,
         (_, false) => Status::Idle,
-        (Seen::ServerGone, true) => Status::Idle,
+        (Seen::ServerGone | Seen::NotRunning, true) => Status::Idle,
         (Seen::Rows, true) if cur == Status::Starting => Status::Working,
         (Seen::Rows, true) => return None,
     };
@@ -477,15 +488,21 @@ fn settle(cur: Status, turn: Turn, seen: Seen) -> Option<Status> {
 }
 
 /// How long a session may be "starting" with no row in OpenCode before it
-/// is taken as up anyway (its screen is: the pane is alive).
-const STARTING_MS: i64 = 10_000;
+/// is taken as up anyway (its screen is: the pane is alive). Longer than
+/// the launch's create step may take, with its message on screen.
+const STARTING_MS: i64 =
+    ((opencode::CREATE_LIMIT_S + opencode::CREATE_PAUSE_S) * 1000) as i64 + 5_000;
 
 /// What `id` and the sub-agent sessions under it wait on the user for
-/// (None: the server couldn't say for all of them).
+/// (None: the server couldn't say for `id` itself). Only sub-agent
+/// sessions with a turn running are asked (one that is done waits on
+/// nobody), and one that can't be asked counts as waiting on nothing.
 fn pending_under(svc: &Service, store: &std::path::Path, id: &str) -> Option<Vec<String>> {
     let mut all = svc.pending(id)?;
-    for child in opencode::descendants(store, id) {
-        all.extend(svc.pending(&child)?);
+    for (child, turn) in opencode::descendants(store, id) {
+        if turn.working() {
+            all.extend(svc.pending(&child).unwrap_or_default());
+        }
     }
     Some(all)
 }
@@ -496,6 +513,12 @@ fn pending_under(svc: &Service, store: &std::path::Path, id: &str) -> Option<Vec
 /// reads happen without the DB lock.
 fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) -> Result<bool> {
     let store = opencode::db_path();
+    // The turns running in the server (asked before the rows are read: a
+    // turn starting in between is on the event stream, already open).
+    let active = match with {
+        With::Server(svc) => svc.active(),
+        With::Rows { .. } => None,
+    };
     let mut changed = false;
     for s in up {
         let Some(id) = s.agent_session.as_deref() else {
@@ -513,7 +536,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
                 blocked.insert(s.id.clone(), p.iter().cloned().collect());
             }
         }
+        let not_running = active.as_ref().is_some_and(|a| !a.contains(id));
         let seen = match (&pending, with) {
+            (Some(p), _) if p.is_empty() && not_running => Seen::NotRunning,
             (Some(p), _) => Seen::Pending(!p.is_empty()),
             (None, With::Rows { server_gone: true }) => Seen::ServerGone,
             (None, _) => Seen::Rows,
@@ -541,6 +566,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
         let (kind, from) = match want {
+            // What it waited on was answered while rlord wasn't listening:
+            // not a message (as from the event stream).
+            Status::Working if s.status == Status::WaitingInput => ("answered", "opencode session"),
             Status::Working => {
                 let busy = turn.and_then(|t| t.busy).unwrap_or(now);
                 db.touch_last_user_msg(&s.id, busy)?;
@@ -554,8 +582,10 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
                 db.touch_last_agent_msg(&s.id, idle)?;
                 ("agent_stopped", "opencode session")
             }
-            // Its turn never ended: the server it ran in is gone. Not a
-            // reply, so "updated" doesn't move.
+            // Its turn never ended: the server it ran in is gone, or the
+            // server running now has no such turn. Not a reply, so
+            // "updated" doesn't move.
+            _ if seen == Seen::NotRunning => ("agent_stopped", "opencode turn not running"),
             _ => ("agent_stopped", "opencode server gone"),
         };
         db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
@@ -807,6 +837,12 @@ mod tests {
         assert_eq!(settle(WaitingInput, running, Seen::ServerGone), Some(Idle));
         assert_eq!(settle(Starting, running, Seen::ServerGone), Some(Idle));
         assert_eq!(settle(Idle, running, Seen::ServerGone), None);
+        // The server answered and runs no turn of it: the row is stale
+        // (its turn died with an earlier server).
+        assert_eq!(settle(Working, running, Seen::NotRunning), Some(Idle));
+        assert_eq!(settle(Starting, running, Seen::NotRunning), Some(Idle));
+        assert_eq!(settle(Idle, running, Seen::NotRunning), None);
+        assert_eq!(settle(Working, over, Seen::NotRunning), Some(Idle));
     }
 
     #[test]

@@ -198,7 +198,26 @@ impl Service {
         })
     }
 
+    /// Whether anything accepts a connection at the server's address (a
+    /// server that answers a request with an error is still there).
+    pub fn answers(&self) -> bool {
+        self.connect(Duration::from_secs(1)).is_ok()
+    }
+
     // ---- the calls rlord makes ----
+
+    /// The sessions with a turn running in the server now (`GET
+    /// /api/session/active`: `{data: {<id>: {type: "running"}, …}}`, `{}`
+    /// when none; checked against OpenCode 2.2.7, mid-turn and idle). The
+    /// server's own memory, so a turn that died with an earlier server
+    /// isn't in it, whatever its session row says. None: it couldn't be
+    /// asked.
+    pub fn active(&self) -> Option<std::collections::HashSet<String>> {
+        let v = self
+            .json("GET", "/api/session/active", None, Duration::from_secs(3))
+            .ok()?;
+        Some(v["data"].as_object()?.keys().cloned().collect())
+    }
 
     /// Whether the server has session `id` (None: it couldn't be asked).
     pub fn has_session(&self, id: &str) -> Option<bool> {
@@ -981,6 +1000,35 @@ mod tests {
         // An id that isn't one never reaches a URL.
         assert!(svc.generate("ses_1a/../x", "hi", limit).is_err());
         assert_eq!(svc.has_session("../x"), Some(false));
+    }
+
+    #[test]
+    fn the_running_turns_are_the_servers_to_say() {
+        // As OpenCode 2.2.7 answered mid-turn, then idle.
+        let (svc, _asked) = serve(vec![
+            String::new(), // (`answers` only connects)
+            ok(r#"{"data":{"ses_1a":{"type":"running"}}}"#),
+            ok(r#"{"data":{}}"#),
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".into(),
+        ]);
+        // Something is there.
+        assert!(svc.answers());
+        assert_eq!(svc.active(), Some(["ses_1a".to_string()].into()));
+        assert_eq!(svc.active(), Some(Default::default()));
+        // An error answer: can't be told.
+        assert_eq!(svc.active(), None);
+        // Nothing at an address: not.
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            Service {
+                host: "127.0.0.1".into(),
+                port,
+                password: "pw".into(),
+            }
+        };
+        assert!(!gone.answers());
     }
 
     #[test]

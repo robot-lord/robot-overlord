@@ -28,6 +28,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use rlord_core::agents::{codex, transcript, Agent};
+use rlord_core::db::Db;
 use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
 
@@ -68,24 +69,14 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
     gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
     let mut changed = false;
     for s in &sessions {
-        // Its program exited (no SessionEnd hook to say so). One failed
-        // look isn't proof (tmux busy, a restart in between): two in a row.
-        let dead = s
-            .tmux_session
-            .as_deref()
-            .is_some_and(|t| !tmux::has_session(t) || tmux::format(t, "#{pane_dead}") == "1");
-        let looks = gone.entry(s.id.clone()).or_default();
-        *looks = if dead { looks.saturating_add(1) } else { 0 };
-        if dead && *looks < 2 {
-            continue;
-        }
-        if dead {
-            let db = d.db();
-            let now = now_ms();
-            db.set_status(&s.id, Status::Stopped, now)?;
-            db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
-            changed = true;
-            continue;
+        // Its program exited (no SessionEnd hook to say so).
+        match pane_looks(s, gone) {
+            0 => {}
+            1 => continue,
+            _ => {
+                changed |= stop_from_pane(&d.db(), s)?;
+                continue;
+            }
         }
         if s.agent_session.is_none() {
             // Another session waiting for a thread in the same folder.
@@ -101,6 +92,32 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
         d.changed();
     }
     Ok(())
+}
+
+/// How many looks in a row session `s`'s pane has looked gone (its tmux
+/// session missing, or its program exited), counted in `gone`. One failed
+/// look isn't proof (tmux busy, a restart in between): act on two.
+pub(crate) fn pane_looks(s: &Session, gone: &mut HashMap<String, u8>) -> u8 {
+    let dead = s
+        .tmux_session
+        .as_deref()
+        .is_some_and(|t| !tmux::has_session(t) || tmux::format(t, "#{pane_dead}") == "1");
+    let looks = gone.entry(s.id.clone()).or_default();
+    *looks = if dead { looks.saturating_add(1) } else { 0 };
+    *looks
+}
+
+/// Session `s` is stopped: its pane ended. Not when its status moved since
+/// `s` was read (restarted meanwhile: not this pane's end). Returns
+/// whether it was written.
+pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
+    if db.resolve_ref(&s.id)?.status != s.status {
+        return Ok(false);
+    }
+    let now = now_ms();
+    db.set_status(&s.id, Status::Stopped, now)?;
+    db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
+    Ok(true)
 }
 
 /// Find the conversation a session launched, in its agent's index (see

@@ -193,7 +193,9 @@ re-read on every connect) and the TUI in the pane is a client of it, so
 that task holds one connection to the server's event stream
 (`agents::opencode_service`: filtered event types, no replay), matches
 events to sessions by the minted id, resyncs after each connect from
-OpenCode's session rows and the server's pending permissions and forms,
+OpenCode's session rows, checked against the turns the server says are
+running (`GET /api/session/active`: a row left "busy" by a server that
+died mid-turn is over), and the server's pending permissions and forms,
 falls back to the session rows alone while no server is reachable, and
 takes "stopped" from the pane. It runs only while there are live OpenCode
 sessions. Archive summaries are written by the session's own agent

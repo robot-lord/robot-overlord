@@ -334,9 +334,11 @@ impl Daemon {
             rlord_core::agents::install::warm();
         }
         // The user is about to choose a model, or is looking at their
-        // agents: lists that must be asked for (OpenCode's) are, here only.
+        // agents: lists that must be asked for (OpenCode's) are, here
+        // only. In the background (it can take seconds): this answer has
+        // the list as last listed, the next one the fresh list.
         if matches!(method, "session.defaults" | "agents.list") && params["no_listing"] != true {
-            rlord_core::agents::install::list_models();
+            refresh_models();
         }
         if let Some(r) = self.call_ui(method, &params) {
             return r.map_err(MethodError::Internal);
@@ -609,6 +611,19 @@ enum MethodError {
 /// first asked). Clients only restart a daemon running their own binary, so
 /// two installs (say a worktree's debug build and ~/.local/bin/rlord) don't
 /// take turns restarting the shared daemon.
+/// List OpenCode's models (`install::list_models`) on a thread of its
+/// own, one at a time: a request never waits on it.
+fn refresh_models() {
+    static LISTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LISTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = std::panic::catch_unwind(rlord_core::agents::install::list_models);
+        LISTING.store(false, Ordering::SeqCst);
+    });
+}
+
 pub fn exe_id() -> String {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {

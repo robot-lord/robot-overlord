@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -52,8 +52,19 @@ impl Summaries {
     }
 }
 
-/// Start the worker.
+/// Where summary runs' output files go (`spawn_wait`, Codex's answer):
+/// beside the excerpt runs' folder (`<data>/summaries`), never in it, so a
+/// run never sees another's output.
+fn output_dir() -> PathBuf {
+    paths::data_dir().join("summary-output")
+}
+
+/// Start the worker. Output files an earlier daemon left (it ended
+/// mid-run) are removed first: nothing runs yet.
 pub fn start(d: &Arc<Daemon>) {
+    rlord_core::process::sweep(&output_dir());
+    // (Where they went before they had their own folder.)
+    rlord_core::process::sweep(&paths::data_dir().join("summaries"));
     let (tx, rx) = mpsc::channel::<(String, bool)>();
     if let Ok(mut q) = d.summaries.queue.lock() {
         *q = Some(tx);
@@ -273,7 +284,8 @@ fn opencode_run(model: &str, fork: Option<&str>, ask: &str, cwd: &str) -> Result
     // The session it wrote in: the fork it made, or the one named.
     let wrote = match fork {
         Some(id) => opencode::fork_of(&db, id, since),
-        None => Some(own).filter(|id| opencode::exists(&db, id)),
+        // (Its own id: deleted unless surely not there.)
+        None => Some(own).filter(|id| opencode::exists(&db, id) != Some(false)),
     };
     let answer = wrote
         .as_deref()
@@ -351,11 +363,7 @@ fn run(
     stdin: Option<&str>,
 ) -> Result<String> {
     // Codex writes its answer to a file.
-    let out_file = paths::data_dir().join("summaries").join(format!(
-        "answer-{}-{}.txt",
-        std::process::id(),
-        now_ms()
-    ));
+    let out_file = rlord_core::process::unique_file(&output_dir(), "answer");
     let argv = match agent {
         Agent::Claude => claude::summary_argv(model, fork),
         Agent::Codex => {
@@ -397,7 +405,7 @@ fn spawn_wait(
     cwd: &str,
     stdin: Option<&str>,
 ) -> Result<(std::process::ExitStatus, String)> {
-    spawn_wait_in(&paths::data_dir().join("summaries"), name, argv, cwd, stdin)
+    spawn_wait_in(&output_dir(), name, argv, cwd, stdin)
 }
 
 /// `spawn_wait`, with the directory its output file goes in.
@@ -408,57 +416,15 @@ fn spawn_wait_in(
     cwd: &str,
     stdin: Option<&str>,
 ) -> Result<(std::process::ExitStatus, String)> {
-    use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    let printed = dir.join(format!(
-        "out-{}-{}.txt",
-        std::process::id(),
-        opencode::mint_session_id()
-    ));
-    let out = std::fs::File::create(&printed).context("a file for the agent's output")?;
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
         // Not one of rlord's sessions: its hooks must not report as one.
         .env_remove("RLORD_SESSION_ID")
         .env_remove("TMUX_PANE")
-        .stdin(if stdin.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(out)
         .stderr(std::process::Stdio::null());
-    let spawned = cmd.spawn().with_context(|| format!("running {name}"));
-    let waited = spawned.and_then(|mut child| {
-        // Written from its own thread: a stalled agent must not block the
-        // worker past the timeout.
-        if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
-            let text = text.to_string();
-            std::thread::spawn(move || {
-                let _ = w.write_all(text.as_bytes());
-            });
-        }
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break Ok(st),
-                Ok(None) if start.elapsed() < TIMEOUT => {
-                    std::thread::sleep(Duration::from_millis(200))
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break Err(anyhow::anyhow!("{name} took too long"));
-                }
-            }
-        }
-    });
-    let text = std::fs::read(&printed)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
-    let _ = std::fs::remove_file(&printed);
-    Ok((waited?, text))
+    rlord_core::process::run_to_file(cmd, dir, TIMEOUT, stdin)
+        .with_context(|| format!("running {name}"))
 }
 
 /// The answer in `claude -p --output-format json`'s output.
@@ -537,7 +503,7 @@ mod tests {
         let argv: Vec<String> = ["sh", "-c", "echo answer; (sleep 20 &) ; exit 0"]
             .map(String::from)
             .to_vec();
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let (status, out) = spawn_wait_in(dir.path(), "sh", &argv, &cwd, None).unwrap();
         assert!(status.success());
         assert_eq!(out.trim(), "answer");

@@ -71,18 +71,27 @@ Sessions work end to end (the scope of Codex's phase 2).
   see them (the form opening, `rlord agents` / `list_agents`:
   `install::list_models`), never at daemon start, before a launch or for
   the overlord's `get_session_defaults`, because the command may start
-  OpenCode's server (Brandon's call).
+  OpenCode's server (Brandon's call). The listing runs on a thread of its
+  own (one at a time): the request that asked gets the list as last
+  listed, at once; the next one gets the fresh list.
 - **Launch creates the session first.** The TUI has no model flag, creates
   a session only with its first message, and doesn't notice one created
   under its id afterwards (all checked live). So the pane command is
-  `sh -c '"$0" api POST /api/session -d "$1" …; shift; exec "$0" "$@"'
-  opencode <{id, location, model}> -s <id> [--prompt …]`: OpenCode's own
-  client creates the session with its model, then the TUI opens on it and
-  the prompt runs on that model. The session exists from the start, so a
-  promptless launch shows "your turn" at once. Resume: a session OpenCode
-  has is opened as it is (`opencode -s <id>`: it keeps its own model, and
-  the `resumed` log entry says so); one it doesn't have is created again
-  with the launch's model. `Launch::deferred` (kv `deferred:<session>`,
+  `sh -c '<create, then exec>' opencode <{id, location, model}> -s <id>
+  [--prompt …]`: OpenCode's own client creates the session with its
+  model, then the TUI opens on it and the prompt runs on that model. The
+  create step runs in the background, polled for up to 10s and killed
+  after (plain sh, nothing left behind); when it fails or is cut off,
+  its stderr is printed in the pane with a line from rlord, held 3s, and
+  the TUI starts anyway (`CREATE_LIMIT_S`, `CREATE_PAUSE_S`; the
+  daemon's "starting with no row" window is longer than both). The
+  session exists from the start, so a promptless launch shows "your
+  turn" at once. Resume: `opencode::exists` is three-way. A session
+  OpenCode has is opened as it is (`opencode -s <id>`: it keeps its own
+  model, and the `resumed` log entry says so); one it surely doesn't have
+  is created again with the launch's model; when its database can't be
+  read, the session is opened as it is and nothing is held to confirm
+  (never created over, so a model chosen in OpenCode is never replaced). `Launch::deferred` (kv `deferred:<session>`,
   with the time it was held; cleared by every restart) names the model for
   the status task to confirm: on the session's row, done silently;
   otherwise set through the server (`POST …/model`) with a note that a
@@ -94,13 +103,23 @@ Sessions work end to end (the scope of Codex's phase 2).
   `GET /api/event?types=…` (types repeated; a comma-separated list is
   rejected), read in 3s ticks. Only while there are live OpenCode
   sessions. Resync after every connect: turn state from `session_v2`
-  (`time_busy` / `time_idle`), pending permissions and forms from the
-  server, for the session and the sub-agent sessions under it. No server:
-  the session rows alone, each tick, and only for what they can say: a
+  (`time_busy` / `time_idle`), vetoed by `GET /api/session/active` (a
+  "busy" row the server doesn't list as running is over: its turn died
+  with an earlier server; logged `agent_stopped` from "opencode turn not
+  running", times untouched), pending permissions and forms from the
+  server, for the session and those sub-agent sessions under it whose row
+  is busy (a child that can't be asked counts as waiting on nothing). A
+  session that was waiting and no longer is goes back to working logged
+  `answered`, times untouched (as from the stream). No server: the
+  session rows alone, each tick, and only for what they can say: a
   starting session is up; a "busy" row is believed only for a session that
-  was starting; once the server has failed to answer twice running it is
-  gone, and a session still working becomes your turn (turns run in the
-  server; "updated" doesn't move). Stopped: the pane, two looks. A
+  was starting; once nothing has been there twice running (no
+  `service.json`, or no TCP connection at its address; an error answer
+  such as a 401 means it is there, and resets the count, as does having
+  no live sessions) it is gone, and a session still working becomes your
+  turn (turns run in the server; "updated" doesn't move). Stopped: the
+  pane, two looks (`discover::pane_looks` / `stop_from_pane`, shared with
+  Codex). A
   permission or question from a sub-agent's child session counts for the
   session rlord launched (parents looked up in OpenCode's database; only a
   definite answer is remembered). The HTTP client is hand-written (plain HTTP/1.1 to localhost,
@@ -118,7 +137,10 @@ Sessions work end to end (the scope of Codex's phase 2).
   `[archive] opencode_summary_model` applies to the excerpt run only:
   `generate` and the fork use the session's own model. Commands rlord runs
   for an answer (`opencode run`, `opencode models`) print to a file, not a
-  pipe: one that starts OpenCode's server would leave it holding the pipe.
+  pipe: one that starts OpenCode's server would leave it holding the pipe
+  (`core::process::run_to_file`, shared). Summary runs' files go in
+  `<data>/summary-output` (uuid names), not the excerpt runs' folder
+  `<data>/summaries`; leftovers are swept when the daemon starts.
 - **Config**: `[session] opencode_model`, `[archive]
   opencode_summary_model`.
 - **Forms, CLI, overlord**: `--agent opencode`, the form's Agent hint,
@@ -155,12 +177,20 @@ Sessions work end to end (the scope of Codex's phase 2).
   `session.usage.updated`). It takes no model: the session's answers.
 - `POST /api/session/{id}/model` switched the model (the TUI showed it).
 - `opencode session delete <id>` removes the session and its messages.
+- `GET /api/session/active` is `{"data": {"<id>": {"type": "running"}}}`
+  while a turn runs and `{"data": {}}` once it has ended, matching the
+  row's `time_busy` / `time_idle` (two short turns, polled; the free
+  models answered with a usage-limit error, so the turns were brief, but
+  the session was listed during them and not after).
+- `opencode api …` with no server running starts the background service
+  itself (scratch XDG dirs, own port: answered in about 0.1s). When the
+  service can't start (its port taken), it fails after about 20s with
+  exit 1 and the reason on stderr: hence the bound on the create step.
 
 Not exercised against the real thing: a permission request (events and
-the pending list are from the OpenAPI spec), `opencode api` when no
-server is running (whether it starts one; if it doesn't, the launch falls
-back to the TUI creating the session and the model being set afterwards),
-`opencode run … --fork --archived` (that `--archived`
+the pending list are from the OpenAPI spec; whether a session waiting on
+one is listed by `/api/session/active` too: pending wins over that veto
+either way), `opencode run … --fork --archived` (that `--archived`
 marks the fork `time_archived`, which is how rlord finds the fork to
 delete: if it doesn't, the fork is left behind, never a wrong one
 deleted), `GET /api/model` (names built from `providerID` and `modelID` /
@@ -197,14 +227,13 @@ and without a model and a restart of a session OpenCode no longer had.
   sessions by the id it minted, never by environment, and has no OpenCode
   hooks; the MCP bridge's `caller` only decides whether the mastermind may
   `hand_off`, and a seat can't run on OpenCode.
-
-## Open
-
-- A server that died mid-turn and came back: its session row may still
-  say "busy", and a resync with the server would show working again
-  unless OpenCode repairs the row itself (it has `resume_attempts` /
-  `time_suspended`, so it may). `GET /api/session/active` could veto a
-  stale row, but what it lists mid-turn wasn't checked live.
+- (Batch 2) Creating the session from the daemon through `Service` when
+  `service.json` answers: launches run under the DB lock, so a request
+  there would stall every other call; the bounded wrapper covers it.
+- (Batch 2) Setting a different model only on sessions created after the
+  launch was held: with `exists` three-way, a session is only created
+  over when OpenCode's database surely lacks it, so the deferred model is
+  only ever applied to a session rlord's launch made.
 
 ## Owed
 

@@ -91,10 +91,33 @@ pub fn is_session_id(id: &str) -> bool {
 
 /// What the pane's shell runs for a launch: create the session through the
 /// server (`$0 api POST /api/session -d $1`: OpenCode's own client, which
-/// knows how to reach the server), then become the TUI on it. Whatever
-/// the first step does, the TUI starts.
-const CREATE_THEN_OPEN: &str =
-    r#""$0" api POST /api/session -d "$1" </dev/null >/dev/null 2>&1; shift; exec "$0" "$@""#;
+/// knows how to reach the server, and starts it when none is running),
+/// then become the TUI on it. Whatever the first step does, the TUI
+/// starts: the step gets `CREATE_LIMIT_S` seconds (polled, so nothing is
+/// left behind), and when it fails or is cut off, what it said is shown
+/// in the pane for a few seconds before the TUI takes the screen (and is
+/// there again when the TUI exits).
+const CREATE_THEN_OPEN: &str = r#"e=$(mktemp 2>/dev/null) || e=
+"$0" api POST /api/session -d "$1" </dev/null >/dev/null 2>"${e:-/dev/null}" & p=$!
+n=0
+while kill -0 "$p" 2>/dev/null; do
+  if [ "$n" -ge 100 ]; then kill "$p" 2>/dev/null; echo "rlord: OpenCode took over 10s to create the session" >&2; break; fi
+  sleep 0.1; n=$((n+1))
+done
+wait "$p" 2>/dev/null; s=$?
+if [ "$s" -ne 0 ]; then
+  echo "rlord: OpenCode didn't create the session first (exit $s); opening it anyway" >&2
+  [ -n "$e" ] && head -c 2000 "$e" >&2
+  sleep 3
+fi
+[ -n "$e" ] && rm -f "$e"
+shift; exec "$0" "$@""#;
+
+/// How long the launch's create step may take (`CREATE_THEN_OPEN` counts
+/// tenths of a second up to it), and with its message on screen, how long
+/// a launch may go before the TUI is up.
+pub const CREATE_LIMIT_S: u64 = 10;
+pub const CREATE_PAUSE_S: u64 = 3;
 
 /// `opencode -s <id> [--prompt <text>]`: the full TUI, on the shared
 /// background server (never `--standalone`: its events are what rlord
@@ -142,6 +165,29 @@ pub fn launch_argv(
     argv.push(create_body(id, dir, model).to_string());
     argv.extend(open[1..].iter().cloned());
     argv
+}
+
+/// Continue session `id`, given whether OpenCode has it (`has`, from
+/// `exists`): the command, and whether it is opened as it is (true) or
+/// created anew under the same id (false).
+///
+/// A session OpenCode has keeps its own model (the user may have changed
+/// it there since): just opened. One it doesn't have (never created, or
+/// deleted there) starts under the same id, created with the launch's
+/// model. When that can't be told (its database couldn't be read), it is
+/// opened as it is: never created over, so a model the user chose there
+/// is never replaced.
+pub fn resume_argv(
+    id: &str,
+    has: Option<bool>,
+    dir: &str,
+    model: Option<&str>,
+    extra: &[String],
+) -> (Vec<String>, bool) {
+    match has {
+        Some(false) => (launch_argv(id, dir, model, None, extra), false),
+        Some(true) | None => (open_argv(id, None, extra), true),
+    }
 }
 
 /// `provider/model[#variant]` as the server names a model:
@@ -308,38 +354,14 @@ pub fn list_models(bin: Option<&Path>) {
 /// goes to a file, not a pipe: `opencode` may start its background server,
 /// which would inherit a pipe and hold it open long after the command.
 fn run_bounded(bin: &Path, args: &[&str], limit: Duration) -> Option<String> {
-    let out = std::env::temp_dir().join(format!(
-        "rlord-{}-{}.out",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let file = std::fs::File::create(&out).ok()?;
-    let spawned = std::process::Command::new(bin)
-        .args(args)
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
         .env_remove("RLORD_SESSION_ID")
-        .stdin(std::process::Stdio::null())
-        .stdout(file)
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let done = spawned.ok().is_some_and(|mut child| {
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st.success(),
-                Ok(None) if start.elapsed() < limit => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-            }
-        }
-    });
-    let text = done.then(|| std::fs::read_to_string(&out).ok()).flatten();
-    let _ = std::fs::remove_file(&out);
-    text
+        .stderr(std::process::Stdio::null());
+    crate::process::run_to_file(cmd, &std::env::temp_dir(), limit, None)
+        .ok()
+        .filter(|(st, _)| st.success())
+        .map(|(_, text)| text)
 }
 
 // ---- archive summaries (the fallback; see the daemon's `summary`) ----
@@ -811,12 +833,19 @@ pub fn observed_model(db: &Path, id: &str) -> Option<String> {
     })
 }
 
-/// OpenCode has a session `id`.
-pub fn exists(db: &Path, id: &str) -> bool {
-    open(db).is_some_and(|c| {
-        c.query_row("SELECT 1 FROM session_v2 WHERE id = ?1", [id], |_| Ok(()))
-            .is_ok()
-    })
+/// Whether OpenCode has a session `id`: `Some(false)` when its database
+/// doesn't list it (or there is no database: OpenCode has no sessions),
+/// None when that can't be told (the database couldn't be read just now).
+pub fn exists(db: &Path, id: &str) -> Option<bool> {
+    use rusqlite::OptionalExtension;
+    if !db.exists() {
+        return Some(false);
+    }
+    open(db)?
+        .query_row("SELECT 1 FROM session_v2 WHERE id = ?1", [id], |_| Ok(()))
+        .optional()
+        .ok()
+        .map(|row| row.is_some())
 }
 
 /// The folder a session runs in.
@@ -846,28 +875,39 @@ pub fn parent(db: &Path, id: &str) -> Option<Option<String>> {
         .ok()?
 }
 
-/// The sessions under `id`: its sub-agents' child sessions and theirs
-/// (four levels, forty sessions at most, newest first within a level).
-pub fn descendants(db: &Path, id: &str) -> Vec<String> {
+/// The sessions under `id`, with their latest turn: its sub-agents' child
+/// sessions and theirs (four levels, forty sessions at most, newest first
+/// within a level).
+pub fn descendants(db: &Path, id: &str) -> Vec<(String, Turn)> {
     let Some(c) = open(db) else {
         return Vec::new();
     };
     let Ok(mut q) = c.prepare(
-        "SELECT id FROM session_v2 WHERE parent_id = ?1 ORDER BY time_created DESC LIMIT 40",
+        "SELECT id, time_busy, time_idle FROM session_v2 WHERE parent_id = ?1 \
+         ORDER BY time_created DESC LIMIT 40",
     ) else {
         return Vec::new();
     };
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, Turn)> = Vec::new();
     let mut level = vec![id.to_string()];
     for _ in 0..4 {
         let mut next = Vec::new();
         for parent in &level {
-            let Ok(rows) = q.query_map([parent], |r| r.get::<_, String>(0)) else {
+            let Ok(rows) = q.query_map([parent], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Turn {
+                        busy: r.get(1)?,
+                        idle: r.get(2)?,
+                    },
+                ))
+            }) else {
                 continue;
             };
-            for child in rows.flatten() {
-                if out.len() < 40 && is_session_id(&child) && !out.contains(&child) {
-                    out.push(child.clone());
+            for (child, turn) in rows.flatten() {
+                if out.len() < 40 && is_session_id(&child) && !out.iter().any(|(c, _)| c == &child)
+                {
+                    out.push((child.clone(), turn));
                     next.push(child);
                 }
             }
@@ -1061,6 +1101,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// Run a launch's command with `bin` (a stand-in script) as OpenCode.
+    fn run_launch(bin: &Path, argv: &[String]) -> std::process::Output {
+        let mut argv = argv.to_vec();
+        argv[3] = bin.to_string_lossy().into_owned();
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_launch_creates_then_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        let log = dir.path().join("log");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" = api ] && exit 0\necho TUI \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let argv = launch_argv("ses_1a", "/src/app", None, Some("it's \"quoted\""), &[]);
+        let out = run_launch(&bin, &argv);
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "TUI -s ses_1a --prompt it's \"quoted\"\n"
+        );
+        assert!(out.stderr.is_empty(), "nothing said when it worked");
+        let asked = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            asked.starts_with(r#"api POST /api/session -d {"id":"ses_1a","#),
+            "{asked}"
+        );
+    }
+
     #[test]
     fn argv() {
         assert_eq!(
@@ -1088,6 +1168,10 @@ pub(crate) mod tests {
                    "model": {"providerID": "opencode", "id": "x-free"}})
         );
         assert_eq!(l[5..], ["-s", "ses_1a", "--prompt", "hi"]);
+        // The create step's bounds are the ones the daemon allows for.
+        assert!(l[2].contains(&format!("-ge {} ]", CREATE_LIMIT_S * 10)));
+        assert!(l[2].contains(&format!("over {CREATE_LIMIT_S}s")));
+        assert!(l[2].contains(&format!("sleep {CREATE_PAUSE_S}\n")));
         // No model, or a name that isn't one: created on OpenCode's default.
         assert_eq!(
             create_body("ses_1a", "/src/app", Some("opus")),
@@ -1217,7 +1301,16 @@ pub(crate) mod tests {
             observed_model(&db, SES).as_deref(),
             Some("opencode/deepseek-v4.1-flash-free")
         );
-        assert!(exists(&db, SES) && !exists(&db, "ses_none"));
+        assert_eq!(
+            (exists(&db, SES), exists(&db, "ses_none")),
+            (Some(true), Some(false))
+        );
+        // No database: OpenCode has no sessions. One that isn't a database
+        // can't tell.
+        assert_eq!(exists(&dir.path().join("absent.db"), SES), Some(false));
+        let junk = dir.path().join("junk.db");
+        std::fs::write(&junk, "not a database").unwrap();
+        assert_eq!(exists(&junk, SES), None);
         assert_eq!(directory(&db, SES).as_deref(), Some("/src/app"));
         assert_eq!(stats(&db, "ses_none"), None);
 
@@ -1264,10 +1357,14 @@ pub(crate) mod tests {
         assert_eq!(parent(&dir.path().join("absent.db"), SES), None);
         c.execute_batch(
             "INSERT INTO session_v2 (id, project_id, parent_id, directory, time_created, time_updated) \
-               VALUES ('ses_grandchild', 'p', 'ses_child', '/src/app', 6, 6);",
+               VALUES ('ses_grandchild', 'p', 'ses_child', '/src/app', 6, 6);
+             UPDATE session_v2 SET time_busy = 8, time_idle = 7 WHERE id = 'ses_grandchild';",
         )
         .unwrap();
-        assert_eq!(descendants(&db, SES), ["ses_child", "ses_grandchild"]);
+        let under = descendants(&db, SES);
+        let ids: Vec<&str> = under.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["ses_child", "ses_grandchild"]);
+        assert!(!under[0].1.working() && under[1].1.working());
         assert!(descendants(&db, "ses_grandchild").is_empty());
         assert_eq!(
             session_model(&db, SES).as_deref(),

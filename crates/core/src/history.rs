@@ -205,11 +205,19 @@ pub fn read(
     let mut all: Vec<Message> = Vec::new();
     let mut target: Option<usize> = None;
     if let Some((db, id)) = opencode::locate(path) {
-        if !opencode::exists(db, id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no such OpenCode conversation",
-            ));
+        match opencode::exists(db, id) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such OpenCode conversation",
+                ))
+            }
+            None => {
+                return Err(std::io::Error::other(
+                    "OpenCode's database can't be read just now",
+                ))
+            }
         }
         for m in opencode::conversation(db, id) {
             if target.is_none() && line.is_some_and(|t| m.seq >= t) {
