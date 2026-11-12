@@ -121,4 +121,4 @@ if ! tmux_ok; then
 fi
 
 say ""
-say "Next: run \`rlord claude install-hooks\` once (lets rlord see Claude Code's state), then \`rlord\`."
+say "Next: run \`rlord install-hooks\` once (lets rlord see what Claude Code and Codex are doing), then \`rlord\`."

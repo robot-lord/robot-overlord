@@ -56,7 +56,7 @@ class Rlord < Formula
 
   def caveats
     <<~EOS
-      Once: rlord claude install-hooks   (lets rlord see Claude Code's state)
+      Once: rlord install-hooks   (lets rlord see what Claude Code and Codex are doing)
       Then: rlord
     EOS
   end
