@@ -82,6 +82,16 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
             } else {
                 s
             };
+            // Blocked on the user (a permission prompt, a question): the
+            // paste's Enter would answer it (OpenCode's dialog takes Enter
+            // as "Allow once"). They answer it themselves.
+            if s.status == Status::WaitingInput {
+                bail!(
+                    "the overlord is waiting on you (a permission prompt or a question): \
+                     answer it first ({}-O)",
+                    rlord_core::keys::alt_name()
+                );
+            }
             if s.status != Status::Starting {
                 let name = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
                 // Its agent pane (not whichever pane is active); out of

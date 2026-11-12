@@ -207,7 +207,14 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
     // OpenCode: no flags, the folder's config (see `overlord_config`).
     std::fs::write(
         d.join("opencode.json"),
-        serde_json::to_string_pretty(&opencode::overlord_config(&bin, &socket))?,
+        serde_json::to_string_pretty(&opencode::overlord_config(
+            &bin,
+            &socket,
+            &SUBAGENTS
+                .iter()
+                .map(|(f, _)| f.trim_end_matches(".md"))
+                .collect::<Vec<_>>(),
+        ))?,
     )?;
 
     let mut md = format!("{GENERATED_NOTE}{INSTRUCTIONS}");
@@ -890,7 +897,7 @@ mod tests {
             "mcp_servers.rlord.default_tools_approval_mode=\"approve\""
         ));
         assert!(has("sandbox_mode=\"read-only\""));
-        assert!(has("approval_policy=\"untrusted\""));
+        assert!(has("approval_policy=\"on-request\""));
         assert!(has(&format!(
             "mcp_servers.rlord.args=[\"mcp\",\"--socket\",\"{}\"]",
             paths::socket_path().display()

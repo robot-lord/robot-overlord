@@ -212,13 +212,33 @@ pub fn resume_argv(
 ///   inherited from some other pane.
 /// - `permissions`: the last matching rule wins, and an agent starts from
 ///   "allow everything", so everything is set to ask first, then reading,
-///   rlord's tools (named `rlord_<tool>`) and sub-agents are allowed. Code
-///   Mode (`execute`, the script OpenCode calls MCP tools from) is left to
-///   ask: whether every side effect inside a script is checked on its own
-///   isn't something rlord can vouch for. (See `docs/architecture.md`, "The
-///   overlord", for what was checked live and the user's own config.)
-pub fn overlord_config(rlord_bin: &str, socket: &str) -> Value {
-    let rule = |action: &str, effect: &str| serde_json::json!({"action": action, "resource": "*", "effect": effect});
+///   rlord's tools (named `rlord_<tool>`) and rlord's own sub-agents
+///   (`subagents`, by name: any other agent asks before it is started) are
+///   allowed. Code Mode (`execute`, the script OpenCode calls MCP tools
+///   from) is not allowed by name: OpenCode checks each tool a script
+///   calls (an rlord tool runs unasked, `fetch` asks as a web fetch), not
+///   the script, and a script can't import `fs` or `child_process`.
+/// - `agents.<name>.permissions`: the same rules again, for each agent the
+///   overlord runs as (OpenCode's `build` and `plan`) and rlord's
+///   sub-agents. OpenCode applies every file's top-level rules first and
+///   the agent-level ones after, so a user's own global agent rule (an
+///   `allow` for the shell under `agent.build`) would otherwise come last
+///   and win. Folder rules come after the user's global ones at each level.
+pub fn overlord_config(rlord_bin: &str, socket: &str, subagents: &[&str]) -> Value {
+    let rule = |action: &str, resource: &str, effect: &str| serde_json::json!({"action": action, "resource": resource, "effect": effect});
+    let mut rules = vec![
+        rule("*", "*", "ask"),
+        rule("read", "*", "allow"),
+        rule("glob", "*", "allow"),
+        rule("grep", "*", "allow"),
+    ];
+    rules.extend(subagents.iter().map(|n| rule("subagent", n, "allow")));
+    rules.push(rule("rlord_*", "*", "allow"));
+    let agents: serde_json::Map<String, Value> = OVERLORD_AGENTS
+        .iter()
+        .chain(subagents)
+        .map(|a| (a.to_string(), serde_json::json!({"permissions": rules})))
+        .collect();
     let environment: serde_json::Map<String, Value> = super::MCP_ENV
         .iter()
         .map(|k| (k.to_string(), Value::String(String::new())))
@@ -232,16 +252,14 @@ pub fn overlord_config(rlord_bin: &str, socket: &str) -> Value {
             "command": command,
             "environment": environment,
         }}},
-        "permissions": [
-            rule("*", "ask"),
-            rule("read", "allow"),
-            rule("glob", "allow"),
-            rule("grep", "allow"),
-            rule("subagent", "allow"),
-            rule("rlord_*", "allow"),
-        ],
+        "permissions": rules,
+        "agents": agents,
     })
 }
+
+/// OpenCode's own primary agents an overlord's conversation runs as (the
+/// default, and the one Tab switches to).
+const OVERLORD_AGENTS: &[&str] = &["build", "plan"];
 
 /// A sub-agent file for OpenCode (`.opencode/agents/<name>.md`): when to
 /// use it, then its instructions as the body. It gets the folder's rules
@@ -1271,7 +1289,7 @@ pub(crate) mod tests {
     /// with its tools allowed after everything was set to ask.
     #[test]
     fn overlord_config_allows_only_what_it_names() {
-        let cfg = overlord_config("/bin/rlord", "/run/d.sock");
+        let cfg = overlord_config("/bin/rlord", "/run/d.sock", &["rlord-tidy"]);
         let server = &cfg["mcp"]["servers"]["rlord"];
         assert_eq!(server["type"], "local");
         assert_eq!(
@@ -1302,6 +1320,15 @@ pub(crate) mod tests {
             assert_eq!(effect(a), None, "{a}");
         }
         assert!(rules.iter().all(|r| r["effect"] != "deny"));
+        // Only rlord's own sub-agents start unasked.
+        let sub: Vec<&Value> = rules.iter().filter(|r| r["action"] == "subagent").collect();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub[0]["resource"], "rlord-tidy");
+        // The same rules at agent level (applied after every file's
+        // top-level rules), for the overlord's agents and rlord's.
+        for a in ["build", "plan", "rlord-tidy"] {
+            assert_eq!(cfg["agents"][a]["permissions"], cfg["permissions"], "{a}");
+        }
     }
 
     #[test]

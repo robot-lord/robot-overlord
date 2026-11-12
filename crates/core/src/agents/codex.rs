@@ -106,12 +106,14 @@ pub fn toml_str(s: &str) -> String {
 ///   `default_tools_approval_mode = "approve"` (Codex's per-server
 ///   counterpart of an allow-list) and `env_vars` passing on what it reads
 ///   (`MCP_ENV`; Codex starts a server with a short environment).
-/// - `sandbox_mode = "read-only"`, `approval_policy = "untrusted"`: only
-///   commands Codex knows to be read-only run unasked; anything else asks
-///   the user, even inside the sandbox. ("on-request" would let any
-///   sandboxed command run, and the read-only sandbox doesn't stop every
-///   side effect: on Linux it may allow connecting to a Unix socket, such
-///   as tmux's, which can type into another session's pane.)
+/// - `sandbox_mode = "read-only"`, `approval_policy = "on-request"`:
+///   commands run in the read-only sandbox without a prompt, and anything
+///   that needs more (a write, the network, leaving the sandbox) asks the
+///   user. ("untrusted", which would ask before every command not known to
+///   be read-only, is refused by Codex 0.167: "no longer supported".) The
+///   sandbox is what stops a command reaching rlord's tmux socket and
+///   typing into another pane: on macOS it refuses the connection
+///   (checked live); on Linux that is unverified.
 /// - `check_for_update_on_startup = false`: no update prompt in front of
 ///   the composer (rlord types into it once it is up).
 /// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
@@ -137,7 +139,7 @@ pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str) -> Vec<String> {
         // start.)
         format!("projects={{{}={{trust_level=\"trusted\"}}}}", toml_str(dir)),
         "sandbox_mode=\"read-only\"".to_string(),
-        "approval_policy=\"untrusted\"".to_string(),
+        "approval_policy=\"on-request\"".to_string(),
         "check_for_update_on_startup=false".to_string(),
     ]
     .into_iter()
@@ -889,8 +891,8 @@ mod tests {
             Some("approve")
         );
         assert_eq!(seen["sandbox_mode"].as_str(), Some("read-only"));
-        // Not "on-request": a sandboxed command would run unasked.
-        assert_eq!(seen["approval_policy"].as_str(), Some("untrusted"));
+        // ("untrusted" is refused by Codex 0.167.)
+        assert_eq!(seen["approval_policy"].as_str(), Some("on-request"));
         assert_eq!(seen["check_for_update_on_startup"].as_bool(), Some(false));
         // The folder's trust: one table keyed by the path itself.
         assert_eq!(
