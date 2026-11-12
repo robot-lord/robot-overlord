@@ -1,0 +1,249 @@
+---
+import Base from "../layouts/Base.astro";
+import Command from "../components/Command.astro";
+import Shot from "../components/Shot.astro";
+import { REPO, GUIDE, RELEASES, INSTALL_CMD, BREW_CMD, TAGLINE } from "../site";
+
+const features = [
+  {
+    title: "The overlord",
+    body: "One agent session wired to rlord's tools. Option-O opens it from anywhere. It finds sessions, starts new ones, passes work to the ones you have, and renames, tags and describes them.",
+  },
+  {
+    title: "One list",
+    body: "Live status (working, needs you, your turn) and how much each session has used. Sort by your last message, the agent's last message or usage. Group by tag, mark favourites, search, and preview the selected session live.",
+  },
+  {
+    title: "Durable sessions",
+    body: "Every session can be stopped and resumed straight back into its conversation. That works after a reboot too.",
+  },
+  {
+    title: "Archive summaries",
+    body: "An archived session keeps a short summary of what it did. rlord writes it when you archive the session.",
+  },
+  {
+    title: "Search",
+    body: "rlord search looks through every session's conversation, archived ones included. The overlord runs it for you when you ask.",
+  },
+  {
+    title: "Your tmux and keys",
+    body: "rlord runs a private tmux server and never touches yours. Agent sessions can use your own tmux config, and every key can be rebound.",
+  },
+  {
+    title: "Remote Control",
+    body: "Pick a Claude Code session up from the Claude app on your phone while it keeps running at your desk.",
+  },
+  {
+    title: "macOS and Linux",
+    body: "Prebuilt for Apple Silicon Macs and for Linux on x86_64 and ARM. The Linux build is static and runs on any distro.",
+  },
+];
+
+const agents = [
+  {
+    name: "Claude Code",
+    href: "https://claude.com/claude-code",
+    tag: "Used every day",
+    body: "rlord follows each session through Claude Code's hooks. Remote Control works with Claude Code sessions.",
+  },
+  {
+    name: "Codex CLI",
+    href: "https://github.com/openai/codex",
+    tag: "Supported",
+    body: "Codex sessions run beside Claude's. rlord follows them through Codex's hooks once you trust them.",
+  },
+  {
+    name: "OpenCode",
+    href: "https://opencode.ai",
+    tag: "Supported (v2)",
+    body: "OpenCode v2 sessions need no setup. rlord follows OpenCode's own background server.",
+  },
+];
+---
+
+<Base>
+  <section class="hero">
+    <div class="wrap">
+      <div class="banner">
+        <img
+          src="/img/logo-1600.webp"
+          srcset="/img/logo-800.webp 800w, /img/logo-1600.webp 1600w"
+          sizes="(min-width: 1140px) 1076px, calc(100vw - 2rem)"
+          width="1600"
+          height="534"
+          alt="Robot Overlord: a red robot wearing a gold crown"
+          fetchpriority="high"
+        />
+      </div>
+      <div class="hero-text">
+        <h1>{TAGLINE}</h1>
+        <p class="lede">
+          rlord runs your Claude Code, Codex and OpenCode sessions in tmux and shows them in one list you can sort,
+          search and organize. The overlord is an AI session that drives rlord for you.
+        </p>
+        <div class="install">
+          <Command cmd={INSTALL_CMD} label="Copy the install command" />
+          <p class="install-alt">
+            <span>Or with Homebrew:</span>
+            <code>{BREW_CMD}</code>
+            <a href="/install/">Other ways to install</a>
+          </p>
+        </div>
+        <div class="actions">
+          <a class="button" href="/install/">Get started</a>
+          <a class="button ghost" href={REPO}>GitHub</a>
+          <a class="button ghost" href={GUIDE}>User guide</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-label="Screenshot">
+    <div class="wrap">
+      <Shot
+        name="overlord"
+        alt="The overlord open over the session list. It answers which sessions are waiting, passes a message to one and starts a new session."
+        caption="The overlord, open over the session list."
+        eager
+      />
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Features</p>
+        <h2>One place for every session</h2>
+        <p>
+          Starting AI coding sessions is easy. Keeping track of ten of them is not. rlord keeps them all running and
+          shows you which one is working, which one is waiting on you and what each one is for.
+        </p>
+      </div>
+      <ul class="grid">
+        {
+          features.map((f) => (
+            <li class="card">
+              <h3>{f.title}</h3>
+              <p>{f.body}</p>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+  </section>
+
+  <section id="list">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">The list</p>
+        <h2>Status, usage and groups</h2>
+        <p>
+          The list shows when each session last heard from you, when its agent last answered and what it is waiting
+          on. You can sort and search all of it.
+        </p>
+      </div>
+      <Shot
+        name="waiting"
+        alt="The session list with Claude Code, Codex and OpenCode sessions, their status and usage, and the live pane of a session that is waiting on you."
+        caption="Claude Code, Codex and OpenCode sessions in one list, with the live pane of a session that is waiting on you."
+      />
+    </div>
+  </section>
+
+  <section id="overlord">
+    <div class="wrap split">
+      <div>
+        <p class="eyebrow">The overlord</p>
+        <h2>An AI session that runs rlord</h2>
+        <p class="lede" style="margin-top:0.75rem">
+          Organizing, tagging and describing dozens of agent sessions is tedious work, and AI is good at it. Press
+          Option-O and say what you want.
+        </p>
+        <ul class="asks" aria-label="Things you can ask the overlord">
+          <li>start a session on the flaky login tests</li>
+          <li>what's waiting on me?</li>
+          <li>tag everything about billing</li>
+          <li>we fixed this before, find it</li>
+        </ul>
+      </div>
+      <ul class="points">
+        <li>
+          <h3>Light work stays with the overlord</h3>
+          <p>
+            It runs a strong model at medium effort. Look-ups, small edits and short answers it does itself. Bulk
+            upkeep and research go to subagents, and real work becomes a session of its own.
+          </p>
+        </li>
+        <li>
+          <h3>Fresh conversations</h3>
+          <p>
+            After sitting idle it starts a fresh conversation, so its context stays small. It looks up what you
+            talked about before only when you refer to it. You can read or continue its earlier conversations.
+          </p>
+        </li>
+        <li>
+          <h3>Plain code does the bookkeeping</h3>
+          <p>
+            Tracking, sorting, searching and organizing are ordinary, fast code. The overlord spends tokens only on
+            what needs judgment.
+          </p>
+        </li>
+        <li>
+          <h3>The keys still work</h3>
+          <p>The list and its keys are still there when you want them.</p>
+        </li>
+      </ul>
+    </div>
+    <div class="wrap">
+      <p class="note"><a href="/how-it-works/">How the overlord, the daemon and tmux fit together</a></p>
+    </div>
+  </section>
+
+  <section id="agents">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Agents</p>
+        <h2>Supported agents</h2>
+        <p>
+          Sessions are the ordinary agent CLIs. You pick the agent for each session, and the overlord runs on any of
+          the three.
+        </p>
+      </div>
+      <ul class="grid">
+        {
+          agents.map((a) => (
+            <li class="card">
+              <span class="tag">{a.tag}</span>
+              <h3>
+                <a href={a.href}>{a.name}</a>
+              </h3>
+              <p>{a.body}</p>
+            </li>
+          ))
+        }
+      </ul>
+      <p class="note">
+        rlord is young and moves fast. Codex and OpenCode sessions support launch, resume, status, usage, search and
+        summaries. The guide lists what does not work yet for{" "}
+        <a href={`${GUIDE}#codex-sessions`}>Codex</a> and <a href={`${GUIDE}#opencode-sessions`}>OpenCode</a>. Other
+        agent CLIs are planned.
+      </p>
+    </div>
+  </section>
+
+  <section class="cta">
+    <div class="wrap">
+      <h2>Install rlord</h2>
+      <p>
+        The script installs the latest release to <code>~/.local/bin/rlord</code> and verifies its checksum. You need
+        tmux 3.2 or newer and at least one agent.
+      </p>
+      <Command cmd={INSTALL_CMD} label="Copy the install command" />
+      <div class="actions" style="margin-top:1.25rem">
+        <a class="button" href="/install/">Install and first steps</a>
+        <a class="button ghost" href={RELEASES}>Releases</a>
+        <a class="button ghost" href={REPO}>GitHub</a>
+      </div>
+    </div>
+  </section>
+</Base>
