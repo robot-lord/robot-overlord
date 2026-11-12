@@ -620,6 +620,15 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
         if let Err(e) = sync_tmux_name(db, &s) {
             tracing::warn!(session = %s.id, error = %e, "renaming tmux session");
         }
+        // Only the agent's pane stays when its program exits (older rlord
+        // kept every pane in the window).
+        if let Ok(s) = db.resolve_ref(&s.id) {
+            if let Some(t) = s.tmux_session.as_deref().filter(|t| tmux::has_session(t)) {
+                if let Err(e) = tmux::keep_agent_pane_on_exit(t) {
+                    tracing::debug!(session = %s.id, error = %e, "remain-on-exit");
+                }
+            }
+        }
     }
     Ok(())
 }
