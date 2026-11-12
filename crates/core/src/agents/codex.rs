@@ -114,6 +114,8 @@ pub struct Thread {
     pub id: String,
     pub rollout_path: String,
     pub created_at_ms: i64,
+    /// The prompt that started it ("" until Codex records one).
+    pub first_user_message: String,
 }
 
 fn open_state(home: &Path) -> Option<rusqlite::Connection> {
@@ -132,9 +134,11 @@ fn open_state(home: &Path) -> Option<rusqlite::Connection> {
     Some(c)
 }
 
-/// Threads the user started in `cwd` at or after `since_ms`, oldest first
-/// (at most 8): candidates for the conversation a session just launched
-/// there. `cwd` is matched as given and resolved (symlinks).
+/// Threads the user started from the CLI in `cwd` at or after `since_ms`,
+/// oldest first (at most 8): candidates for the conversation a session
+/// just launched there. Not sub-agent threads, nor ones started from an
+/// editor or the desktop app in the same folder. `cwd` is matched as given
+/// and resolved (symlinks).
 pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> {
     let Some(c) = open_state(home) else {
         return Vec::new();
@@ -143,8 +147,8 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string());
     let q = c.prepare(
-        "SELECT id, rollout_path, created_at_ms FROM threads \
-         WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 \
+        "SELECT id, rollout_path, created_at_ms, first_user_message FROM threads \
+         WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 AND source = 'cli' \
            AND (thread_source IS NULL OR thread_source = 'user') \
          ORDER BY created_at_ms ASC LIMIT 8",
     );
@@ -156,6 +160,7 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
             id: r.get(0)?,
             rollout_path: r.get(1)?,
             created_at_ms: r.get(2)?,
+            first_user_message: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
         })
     });
     match rows {
@@ -164,9 +169,57 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
     }
 }
 
+/// Whether thread `id` is one the user drives (not a sub-agent's), from
+/// the index. None when the index doesn't know it (yet).
+pub fn is_user_thread(home: &Path, id: &str) -> Option<bool> {
+    open_state(home)?
+        .query_row(
+            "SELECT thread_source FROM threads WHERE id = ?1",
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .map(|source| source.is_none_or(|s| s == "user"))
+}
+
+/// The rollouts of conversations that ran in any of `folders`, from the
+/// index (one query). None when there is no index to ask.
+pub fn rollouts_in_folders(
+    home: &Path,
+    folders: &[String],
+) -> Option<std::collections::HashSet<PathBuf>> {
+    let c = open_state(home)?;
+    let mut q = c
+        .prepare("SELECT rollout_path FROM threads WHERE cwd = ?1")
+        .ok()?;
+    let mut out = std::collections::HashSet::new();
+    for f in folders {
+        let rows = q.query_map([f], |r| r.get::<_, String>(0)).ok()?;
+        out.extend(rows.flatten().map(PathBuf::from));
+    }
+    Some(out)
+}
+
 /// The rollout file of a conversation: from the thread index, else by its
 /// name under `sessions/` (the file name ends in the id).
 pub fn rollout_of(home: &Path, id: &str) -> Option<PathBuf> {
+    // A rollout never moves: remember where each was found.
+    static FOUND: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(PathBuf, String), PathBuf>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let key = (home.to_path_buf(), id.to_string());
+    let known = FOUND.lock().ok().and_then(|f| f.get(&key).cloned());
+    if let Some(p) = known.filter(|p| p.exists()) {
+        return Some(p);
+    }
+    let found = find_rollout(home, id)?;
+    if let Ok(mut f) = FOUND.lock() {
+        f.insert(key, found.clone());
+    }
+    Some(found)
+}
+
+fn find_rollout(home: &Path, id: &str) -> Option<PathBuf> {
     let indexed = open_state(home).and_then(|c| {
         c.query_row(
             "SELECT rollout_path FROM threads WHERE id = ?1",
@@ -253,8 +306,36 @@ fn content_text(p: &Value, part: &str) -> Option<String> {
     (!t.trim().is_empty()).then_some(t)
 }
 
+/// What Codex injects as user messages: each starts with one of these
+/// (the tagged ones also close their tag). Named one by one, so a real
+/// prompt that happens to start with `<` is kept.
+const INJECTED_TAGS: &[&str] = &[
+    "environment_context",
+    "user_instructions",
+    "INSTRUCTIONS",
+    "turn_aborted",
+    "user_shell_command",
+    "subagent_notification",
+    "skill",
+    "permissions instructions",
+];
+
+fn injected(text: &str) -> bool {
+    let t = text.trim_start();
+    if t.starts_with("# AGENTS.md instructions for ") {
+        return true;
+    }
+    INJECTED_TAGS.iter().any(|tag| {
+        t.strip_prefix('<')
+            .and_then(|r| r.strip_prefix(tag))
+            .is_some_and(|r| r.starts_with('>'))
+            && t.contains(&format!("</{tag}>"))
+    })
+}
+
 /// A prompt the human typed. Codex also writes context it injects as user
-/// messages (`<environment_context>`, `<user_instructions>`, …): not those.
+/// messages (`<environment_context>`, `<user_instructions>`, the AGENTS.md
+/// instructions, …): not those.
 pub(crate) fn human_prompt(v: &Value) -> Option<String> {
     let p = item(v)?;
     if p["type"] != "message" || p["role"] != "user" {
@@ -262,7 +343,7 @@ pub(crate) fn human_prompt(v: &Value) -> Option<String> {
     }
     let t = content_text(p, "input_text")?;
     let t = t.trim();
-    (!t.starts_with('<')).then(|| t.to_string())
+    (!injected(t)).then(|| t.to_string())
 }
 
 pub(crate) fn reply_text(v: &Value) -> Option<String> {
@@ -680,6 +761,32 @@ mod tests {
     }
 
     #[test]
+    fn only_what_codex_injects_is_not_a_prompt() {
+        let user = |text: &str| {
+            json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": text}]}})
+        };
+        let prompt = |text: &str| human_prompt(&user(text));
+        for injected in [
+            "<environment_context>\n  <cwd>/src/app</cwd>\n</environment_context>",
+            "<user_instructions>\nbe brief\n</user_instructions>",
+            "# AGENTS.md instructions for /src/app\n\n<INSTRUCTIONS>\nuse tabs\n</INSTRUCTIONS>",
+            "<turn_aborted>\ninterrupted\n</turn_aborted>",
+        ] {
+            assert_eq!(prompt(injected), None, "{injected}");
+        }
+        // A real prompt may start with `<`, or mention a tag.
+        for real in [
+            "<div> isn't closing in the header, fix it",
+            "<Button> should be disabled while loading",
+            "<environment_context> is noisy in the logs, can we trim it?",
+            "fix the flaky login test",
+        ] {
+            assert_eq!(prompt(real).as_deref(), Some(real));
+        }
+    }
+
+    #[test]
     fn excerpts_stats_model_and_turn_state() {
         let dir = tempfile::tempdir().unwrap();
         let lines = rollout_lines();
@@ -740,12 +847,14 @@ mod tests {
         let c = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
         c.execute_batch(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, \
-               cwd TEXT NOT NULL, created_at_ms INTEGER, thread_source TEXT);
-             INSERT INTO threads VALUES ('old', '/r/old.jsonl', '/src/app', 1000, 'user');
-             INSERT INTO threads VALUES ('mine', '/r/mine.jsonl', '/src/app', 5000, 'user');
-             INSERT INTO threads VALUES ('sub', '/r/sub.jsonl', '/src/app', 5500, 'subagent');
-             INSERT INTO threads VALUES ('later', '/r/later.jsonl', '/src/app', 9000, 'user');
-             INSERT INTO threads VALUES ('other', '/r/other.jsonl', '/src/web', 6000, 'user');",
+               cwd TEXT NOT NULL, created_at_ms INTEGER, thread_source TEXT, \
+               source TEXT NOT NULL DEFAULT 'cli', first_user_message TEXT NOT NULL DEFAULT '');
+             INSERT INTO threads VALUES ('old', '/r/old.jsonl', '/src/app', 1000, 'user', 'cli', '');
+             INSERT INTO threads VALUES ('mine', '/r/mine.jsonl', '/src/app', 5000, 'user', 'cli', 'fix it');
+             INSERT INTO threads VALUES ('sub', '/r/sub.jsonl', '/src/app', 5500, 'subagent', 'cli', '');
+             INSERT INTO threads VALUES ('editor', '/r/ed.jsonl', '/src/app', 5600, 'user', 'vscode', '');
+             INSERT INTO threads VALUES ('later', '/r/later.jsonl', '/src/app', 9000, 'user', 'cli', '');
+             INSERT INTO threads VALUES ('other', '/r/other.jsonl', '/src/web', 6000, 'user', 'cli', '');",
         )
         .unwrap();
         drop(c);
@@ -753,7 +862,17 @@ mod tests {
             .into_iter()
             .map(|t| t.id)
             .collect();
+        // Not the sub-agent's thread, nor the one started from an editor.
         assert_eq!(ids, ["mine", "later"]);
+        assert_eq!(
+            threads_started_in(dir.path(), "/src/app", 4000)[0].first_user_message,
+            "fix it"
+        );
+        assert_eq!(is_user_thread(dir.path(), "mine"), Some(true));
+        assert_eq!(is_user_thread(dir.path(), "sub"), Some(false));
+        assert_eq!(is_user_thread(dir.path(), "unknown"), None);
+        let in_web = rollouts_in_folders(dir.path(), &["/src/web".to_string()]).unwrap();
+        assert!(in_web.contains(Path::new("/r/other.jsonl")) && in_web.len() == 1);
         assert!(threads_started_in(dir.path(), "/src/none", 0).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0).is_empty());

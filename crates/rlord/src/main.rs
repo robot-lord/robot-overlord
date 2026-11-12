@@ -1506,9 +1506,11 @@ fn hook_emit(agent: &str) -> Result<()> {
     let Ok(instance) = std::env::var("RLORD_SESSION_ID") else {
         return Ok(()); // not an rlord-managed session
     };
-    let mut raw = String::new();
-    std::io::stdin().take(1 << 20).read_to_string(&mut raw).ok();
-    let payload: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+    // Only what rlord uses goes on (not a tool's whole input and output);
+    // stdin cut off at the limit still yields the event's name.
+    let mut raw = Vec::new();
+    std::io::stdin().take(1 << 20).read_to_end(&mut raw).ok();
+    let payload = rlord_daemon::slim_hook_payload(&String::from_utf8_lossy(&raw));
     let event = payload
         .get("hook_event_name")
         .and_then(Value::as_str)
@@ -1523,7 +1525,10 @@ fn hook_emit(agent: &str) -> Result<()> {
         .and_then(|t| t.split(',').next().map(str::to_string));
     let params = json!({"instance": instance, "agent": agent, "event": event,
                         "payload": payload, "pane": pane, "tmux": socket});
-    if client_call(&paths::socket_path(), "hook.emit", params.clone()).is_err() {
+    // Bounded: a stalled daemon never holds up the agent's tool call.
+    if rlord_daemon::send_hook_event(&paths::socket_path(), &params)
+        == rlord_daemon::HookSent::Unreachable
+    {
         spool_hook_event(&params).ok();
     }
     Ok(())
@@ -1737,7 +1742,9 @@ fn print_coding_agents(v: &Value) {
                 ""
             }
         );
-        if a["installed"] == true && a["supported"] == true {
+        if a["hooks_outdated"] == true {
+            println!("  rlord hooks: out of date — run `rlord install-hooks` again");
+        } else if a["installed"] == true && a["supported"] == true {
             let trusted = match a["hooks_trusted"].as_bool() {
                 Some(_) => format!(" · trusted in Codex: {}", yes_no("hooks_trusted")),
                 None => String::new(),

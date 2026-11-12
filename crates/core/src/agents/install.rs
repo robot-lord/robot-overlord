@@ -171,12 +171,76 @@ pub fn suggest(t: &Tool, m: Machine) -> Suggestion {
     }
 }
 
-/// Where a command is on PATH.
+/// Where a command is on PATH (a file that can be executed).
 pub fn on_path(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
+    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// Where a command is, as a session's pane would find it: on this
+/// process's PATH, else where the user's login shell resolves it (`$SHELL
+/// -lc 'command -v <bin>'`: the daemon may run with a shorter PATH than
+/// the user's shell has). The shell's answer is remembered for a minute
+/// (it can be slow to start), and it gets three seconds.
+pub fn resolve(bin: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+    if let Some(p) = on_path(bin) {
+        return Some(p);
+    }
+    type Asked = HashMap<String, (Instant, Option<PathBuf>)>;
+    static ASKED: LazyLock<Mutex<Asked>> = LazyLock::new(Default::default);
+    if let Some((at, found)) = ASKED.lock().ok()?.get(bin) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return found.clone();
+        }
+    }
+    let found = login_shell_path(bin, Duration::from_secs(3));
+    if let Ok(mut asked) = ASKED.lock() {
+        asked.insert(bin.to_string(), (Instant::now(), found.clone()));
+    }
+    found
+}
+
+/// `$SHELL -lc 'command -v <bin>'`: an absolute path, or nothing.
+fn login_shell_path(bin: &str, limit: std::time::Duration) -> Option<PathBuf> {
+    use std::io::Read;
+    // (Only ever rlord's own agent names: never text from outside.)
+    if !bin.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
+    let mut child = std::process::Command::new(shell)
+        .args(["-lc", &format!("command -v {bin}")])
+        .env_remove("RLORD_SESSION_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => break,
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    // (A shell rc may print before it: the answer is the last line.)
+    let p = PathBuf::from(out.lines().next_back()?.trim());
+    (p.is_absolute() && p.is_file()).then_some(p)
 }
 
 /// What `<bin> --version` prints (its first line), remembered until the
@@ -233,9 +297,17 @@ pub fn version(bin: &Path) -> Option<String> {
     v
 }
 
-/// rlord's hook command is in the agent's hooks file.
-pub fn hooks_installed(agent: Agent) -> bool {
-    !our_hooks(&agent.hooks_file()).is_empty()
+/// The events rlord's hook should be installed for and isn't, in the
+/// agent's hooks file (empty: all in place). A newer rlord listens for
+/// more events than an older one installed.
+pub fn hooks_missing(agent: Agent, file: &Path) -> Vec<&'static str> {
+    let ours = our_hooks(file);
+    agent
+        .hook_events()
+        .iter()
+        .map(|(event, _)| *event)
+        .filter(|event| !ours.iter().any(|(e, _, _)| e == event))
+        .collect()
 }
 
 /// Where rlord's hook sits in a hooks file: (event, group index, hook
@@ -314,8 +386,11 @@ pub struct Status {
     pub path: Option<String>,
     /// From `--version` (only when asked for).
     pub version: Option<String>,
-    /// rlord's hooks are in its hooks file (None: rlord doesn't run it).
+    /// Every hook rlord needs is in its hooks file (None: rlord doesn't
+    /// run it).
     pub hooks_installed: Option<bool>,
+    /// Some are, some aren't: installed by an older rlord.
+    pub hooks_outdated: bool,
     /// Codex only: the user trusted rlord's hooks (`/hooks`).
     pub hooks_trusted: Option<bool>,
     /// How to install it, when it isn't.
@@ -331,9 +406,14 @@ pub fn status(versions: bool) -> Vec<Status> {
     TOOLS
         .iter()
         .map(|t| {
-            let path = on_path(t.name);
+            let path = resolve(t.name);
             let installed = path.is_some();
-            let hooks_installed = t.agent.map(hooks_installed);
+            let missing = t.agent.map(|a| hooks_missing(a, &a.hooks_file()));
+            let hooks_installed = missing.as_ref().map(Vec::is_empty);
+            let hooks_outdated = t
+                .agent
+                .zip(missing.as_ref())
+                .is_some_and(|(a, m)| !m.is_empty() && m.len() < a.hook_events().len());
             let hooks_trusted = match t.agent {
                 Some(Agent::Codex) => codex_hooks_trusted(&codex::home()),
                 _ => None,
@@ -348,6 +428,11 @@ pub fn status(versions: bool) -> Vec<Status> {
                     }
                 )),
                 (true, None, _, _) => Some("installed; rlord support coming".to_string()),
+                (true, Some(_), Some(false), _) if hooks_outdated => Some(
+                    "rlord's hooks are out of date (this rlord listens for more events): \
+                     run `rlord install-hooks` again"
+                        .to_string(),
+                ),
                 (true, Some(_), Some(false), _) => Some("run `rlord install-hooks`".to_string()),
                 (true, Some(_), _, Some(false)) => Some(
                     "trust rlord's hooks: start `codex`, type `/hooks`, trust the \
@@ -364,6 +449,7 @@ pub fn status(versions: bool) -> Vec<Status> {
                 version: path.as_deref().filter(|_| versions).and_then(version),
                 path: path.map(|p| p.to_string_lossy().into_owned()),
                 hooks_installed,
+                hooks_outdated,
                 hooks_trusted,
                 install: (!installed).then(|| suggest(t, machine)),
                 next,
@@ -373,9 +459,10 @@ pub fn status(versions: bool) -> Vec<Status> {
 }
 
 /// Why sessions on `agent` can't launch here, with what to do about it;
-/// None when its command is on PATH.
+/// None when its command can be found (on PATH, or by the user's login
+/// shell).
 pub fn missing(agent: Agent) -> Option<String> {
-    if on_path(agent.name()).is_some() {
+    if resolve(agent.name()).is_some() {
         return None;
     }
     let t = tool(agent.name())?;
@@ -501,6 +588,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(codex_hooks_trusted(home), Some(true));
+    }
+
+    #[test]
+    fn hooks_from_an_older_rlord_are_out_of_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hooks.json");
+        assert_eq!(
+            hooks_missing(Agent::Codex, &file).len(),
+            Agent::Codex.hook_events().len(),
+            "none installed"
+        );
+        // As an older rlord left it: no PostToolUse.
+        std::fs::write(
+            &file,
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/bin/rlord hook emit codex"}]}],
+                "UserPromptSubmit":[{"hooks":[{"type":"command","command":"/bin/rlord hook emit codex"}]}],
+                "Stop":[{"hooks":[{"type":"command","command":"/bin/rlord hook emit codex"}]}],
+                "PermissionRequest":[{"hooks":[{"type":"command","command":"/bin/rlord hook emit codex"}]}],
+                "SessionEnd":[{"hooks":[{"type":"command","command":"/bin/rlord hook emit codex"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(hooks_missing(Agent::Codex, &file), ["PostToolUse"]);
+        Agent::Codex.install_hooks_in(&file, "/bin/rlord").unwrap();
+        assert!(hooks_missing(Agent::Codex, &file).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_run_is_not_the_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rlord-test-agent-bin");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let exec = |p: &Path| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        };
+        assert!(!exec(&bin));
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(exec(&bin));
+        // Names that aren't plain command names never reach a shell.
+        assert_eq!(
+            login_shell_path("codex; rm -rf x", std::time::Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]

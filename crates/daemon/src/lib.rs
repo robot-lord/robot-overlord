@@ -639,6 +639,119 @@ pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Va
     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
+// ---- hooks: the client side (`rlord hook emit`) ----
+
+/// The fields of a hook payload rlord uses. Everything else (a tool's
+/// whole input and output, prompts) stays out of the daemon and the spool.
+const HOOK_FIELDS: &[&str] = &[
+    "hook_event_name",
+    "session_id",
+    "transcript_path",
+    "cwd",
+    "source",
+    "reason",
+    "notification_type",
+    "message",
+    "tool_name",
+    "tool_use_id",
+    "agent_id",
+    "agent_type",
+    "agent_transcript_path",
+    "last_assistant_message",
+];
+
+/// What rlord needs of a hook's stdin: the fields above, long ones cut.
+/// Stdin that isn't whole JSON (cut off at the read limit by a huge tool
+/// input) still yields the fields found in it, so the event is known.
+pub fn slim_hook_payload(raw: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) => {
+            for k in HOOK_FIELDS {
+                if let Some(x) = v.get(*k).filter(|x| !x.is_null()) {
+                    out.insert((*k).to_string(), x.clone());
+                }
+            }
+        }
+        Err(_) => {
+            // Each field's first `"name":` followed by a JSON string. (Inside
+            // a string value the quotes are escaped, so this is a real key.)
+            for k in HOOK_FIELDS {
+                let key = format!("\"{k}\":");
+                let Some(at) = raw.find(&key) else { continue };
+                let rest = raw[at + key.len()..].trim_start();
+                let value = serde_json::Deserializer::from_str(rest)
+                    .into_iter::<String>()
+                    .next()
+                    .and_then(|r| r.ok());
+                if let Some(text) = value {
+                    out.insert((*k).to_string(), json!(text));
+                }
+            }
+        }
+    }
+    for (k, max) in [("message", 300), ("last_assistant_message", 4000)] {
+        if let Some(Value::String(text)) = out.get_mut(k) {
+            if text.chars().count() > max {
+                *text = text.chars().take(max).collect();
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// What became of a hook event sent to the daemon.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HookSent {
+    Delivered,
+    /// The daemon isn't there: keep the event for when it is.
+    Unreachable,
+    /// It took the event but didn't answer in time: it has it (or will);
+    /// spooling too would deliver it twice.
+    Slow,
+}
+
+/// Send one hook event, never waiting long: a hook runs inside the agent's
+/// tool call, and a stalled daemon must not hold that up. A second to
+/// connect and send, two for the answer.
+pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (tx, rx) = mpsc::channel::<HookSent>();
+    let path = socket_path.to_path_buf();
+    let req = json!({"id": 1, "method": "hook.emit", "params": params});
+    // On its own thread: a connect to a socket nobody accepts on can block.
+    std::thread::spawn(move || {
+        let sent = (|| {
+            let mut stream = std::os::unix::net::UnixStream::connect(&path).ok()?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+            let mut buf = serde_json::to_vec(&req).ok()?;
+            buf.push(b'\n');
+            stream.write_all(&buf).ok()?;
+            Some(stream)
+        })();
+        let Some(mut stream) = sent else {
+            let _ = tx.send(HookSent::Unreachable);
+            return;
+        };
+        let mut line = String::new();
+        let answered = StdBufReader::new(&mut stream).read_line(&mut line);
+        let _ = tx.send(match answered {
+            Ok(n) if n > 0 => HookSent::Delivered,
+            _ => HookSent::Slow,
+        });
+    });
+    // (Not connected within the first second: unreachable.)
+    match rx.recv_timeout(Duration::from_millis(3500)) {
+        Ok(sent) => sent,
+        Err(_) => HookSent::Unreachable,
+    }
+}
+
 // ---- hook spool: hook evidence must never be lost to a down daemon ----
 
 fn spool_path() -> PathBuf {
@@ -772,6 +885,62 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn hook_payloads_are_cut_to_what_rlord_uses() {
+        let big = "x".repeat(50_000);
+        let raw = json!({"hook_event_name": "PostToolUse", "session_id": "s-1",
+            "transcript_path": "/t.jsonl", "tool_name": "Bash", "agent_id": "a-1",
+            "tool_input": {"command": big}, "tool_response": {"stdout": big},
+            "message": "m".repeat(1000)})
+        .to_string();
+        let v = slim_hook_payload(&raw);
+        assert_eq!(v["hook_event_name"], "PostToolUse");
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["agent_id"], "a-1");
+        assert!(v.get("tool_input").is_none() && v.get("tool_response").is_none());
+        assert_eq!(v["message"].as_str().unwrap().len(), 300);
+        assert!(v.to_string().len() < 1000);
+        // Cut off mid-way (a tool input past the read limit): the event and
+        // the conversation are still known.
+        let cut = &raw[..raw.len() / 2];
+        assert!(serde_json::from_str::<Value>(cut).is_err());
+        let v = slim_hook_payload(cut);
+        assert_eq!(v["hook_event_name"], "PostToolUse");
+        assert_eq!(v["session_id"], "s-1");
+        // (What came after the cut is lost: here the tool's name.)
+        assert!(v.get("tool_name").is_none());
+        // A key named inside a string value isn't the field.
+        let tricky = r#"{"tool_input": {"command": "echo \"hook_event_name\": \"Stop\""}, "hook_event_name": "PreToolUse", "#;
+        assert_eq!(slim_hook_payload(tricky)["hook_event_name"], "PreToolUse");
+        assert_eq!(slim_hook_payload("not json"), json!({}));
+    }
+
+    #[test]
+    fn a_hook_never_waits_long_for_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        // No daemon: unreachable (so the event is spooled).
+        assert_eq!(
+            send_hook_event(&dir.path().join("absent.sock"), &json!({})),
+            HookSent::Unreachable
+        );
+        // A daemon that takes the event and never answers: the hook gives
+        // up after its read timeout, and doesn't spool a second copy.
+        let sock = dir.path().join("stalled.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let hold = std::thread::spawn(move || {
+            let conn = listener.accept().map(|(c, _)| c);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            drop(conn);
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(
+            send_hook_event(&sock, &json!({"event": "Stop"})),
+            HookSent::Slow
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(3400));
+        hold.join().unwrap();
+    }
+
     /// "Needs you" is a block mid-turn, cleared when the agent moves on;
     /// Claude's idle reminder leaves a finished session "your turn".
     #[test]
@@ -822,6 +991,32 @@ mod tests {
         assert_eq!(status(), Status::Working, "denied: the agent carries on");
         emit("Stop", json!({}));
         assert_eq!(status(), Status::Idle);
+        // A sub-agent's tool finishing doesn't answer the main agent's
+        // prompt; a prompt for a sub-agent's tool is cleared by that tool.
+        emit("UserPromptSubmit", json!({}));
+        emit("PermissionRequest", json!({"tool_name": "Bash"}));
+        let r = emit(
+            "PostToolUse",
+            json!({"tool_name": "Read", "agent_id": "agent-7"}),
+        );
+        assert_eq!(r["unchanged"], true);
+        assert_eq!(status(), Status::WaitingInput);
+        emit("PostToolUse", json!({"tool_name": "Bash"}));
+        assert_eq!(status(), Status::Working);
+        emit(
+            "PermissionRequest",
+            json!({"tool_name": "Bash", "agent_id": "agent-7"}),
+        );
+        assert_eq!(
+            emit("PostToolUse", json!({"tool_name": "Edit"}))["unchanged"],
+            true
+        );
+        emit(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "agent_id": "agent-7"}),
+        );
+        assert_eq!(status(), Status::Working);
+        emit("Stop", json!({}));
         let s = db.resolve_ref("01cl").unwrap();
         // A minute later Claude says it's idle: still "your turn", nothing logged.
         let events = db.list_events("01cl", 100).unwrap().len();
@@ -906,6 +1101,37 @@ mod tests {
         emit("SessionStart", "thread-2");
         assert_eq!(get().agent_session.as_deref(), Some("thread-2"));
         assert_eq!(db.past_agent_sessions("01codex").unwrap(), ["thread-1"]);
+        // A sub-agent's thread is blocked on a prompt: the session needs
+        // you, and only that thread moving on clears it.
+        emit("UserPromptSubmit", "thread-2");
+        emit("PermissionRequest", "thread-sub");
+        let s = get();
+        assert_eq!(s.status, rlord_core::types::Status::WaitingInput);
+        assert_eq!(s.agent_session.as_deref(), Some("thread-2"), "not rebound");
+        assert_eq!(emit("PostToolUse", "thread-2")["unchanged"], true);
+        assert_eq!(get().status, rlord_core::types::Status::WaitingInput);
+        emit("PostToolUse", "thread-sub");
+        assert_eq!(get().status, rlord_core::types::Status::Working);
+        emit("Stop", "thread-2");
+        // A fresh conversation: until its SessionStart, late events from
+        // the process just replaced neither bind its thread nor stop it.
+        db.clear_agent_session("01codex").unwrap();
+        db.set_status("01codex", rlord_core::types::Status::Starting, 2)
+            .unwrap();
+        assert!(emit("SessionEnd", "thread-2")["ignored"].is_string());
+        let s = get();
+        assert_eq!(s.agent_session, None);
+        assert_eq!(s.status, rlord_core::types::Status::Starting);
+        // Bound from Codex's index (rlord's guess), and the hooks then name
+        // another thread: theirs is the one.
+        db.set_agent_session("01codex", "thread-guess", "minted")
+            .unwrap();
+        emit("UserPromptSubmit", "thread-3");
+        let s = get();
+        assert_eq!(s.agent_session.as_deref(), Some("thread-3"));
+        assert_eq!(s.agent_session_trust, "hook");
+        assert_eq!(s.status, rlord_core::types::Status::Working);
+        emit("Stop", "thread-3");
         // Claude's hooks from a Codex session's pane are only logged.
         methods::hook_emit(
             &db,
@@ -914,7 +1140,7 @@ mod tests {
         )
         .unwrap();
         let s = get();
-        assert_eq!(s.agent_session.as_deref(), Some("thread-2"));
+        assert_eq!(s.agent_session.as_deref(), Some("thread-3"));
         assert_eq!(s.status, rlord_core::types::Status::Idle);
     }
 }

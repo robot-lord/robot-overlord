@@ -185,11 +185,33 @@ pub(crate) fn key_from_hint(label: &str) -> Option<KeyEvent> {
     one(label)
 }
 
+/// What a menu or a confirmation is about. The list can change under it
+/// (a push from the daemon): it is found again by this, never by position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A session, by id.
+    Session(String),
+    /// A group, by name.
+    Group(String),
+}
+
+/// "Stop web-fix?": asked before a click stops, restarts or archives a
+/// session (a key does it at once, as always).
+pub(crate) struct Confirm {
+    question: String,
+    /// What it does, for the button ("stop").
+    verb: &'static str,
+    target: Target,
+    key: KeyEvent,
+}
+
 /// The right-click menu: what the row (or group) under the pointer offers,
 /// each entry with its key.
 pub(crate) struct Menu {
     x: u16,
     y: u16,
+    /// What it was opened on: an entry acts on that, or not at all.
+    target: Target,
     title: String,
     /// (key label, what it does, the key).
     items: Vec<(String, &'static str, KeyEvent)>,
@@ -230,9 +252,9 @@ impl App {
             && self
                 .last_click
                 .take()
-                .is_some_and(|(at, h)| h == hit && at.elapsed() < DOUBLE_CLICK);
+                .is_some_and(|(at, on)| on == self.clicked(&hit) && at.elapsed() < DOUBLE_CLICK);
         if !right && !double {
-            self.last_click = Some((Instant::now(), hit.clone()));
+            self.last_click = Some((Instant::now(), self.clicked(&hit)));
         }
         // Typing in the footer (search, rename, …): a click elsewhere
         // doesn't throw the text away.
@@ -248,7 +270,13 @@ impl App {
         }
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         match hit {
-            Hit::Key(k) if !right => return self.handle_key(k, terminal),
+            Hit::Key(k) if !right => {
+                // Stop, restart, archive: a click asks first.
+                if matches!(self.mode, Mode::Normal) && self.confirm_first(k) {
+                    return Ok(false);
+                }
+                return self.handle_key(k, terminal);
+            }
             Hit::Tab(t) if !right => self.switch_tab(t),
             Hit::Row(i) if i < self.sessions.len() => {
                 self.group_focus = false;
@@ -282,7 +310,11 @@ impl App {
             Hit::Outside
                 if matches!(
                     self.mode,
-                    Mode::Help | Mode::Menu(_) | Mode::Command(_) | Mode::ConfirmQuit
+                    Mode::Help
+                        | Mode::Menu(_)
+                        | Mode::Confirm(_)
+                        | Mode::Command(_)
+                        | Mode::ConfirmQuit
                 ) =>
             {
                 return self.handle_key(esc, terminal)
@@ -293,6 +325,141 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    /// What a click landed on, for telling a double-click: a row by its
+    /// session and a group by its name (the list may reorder between the
+    /// two clicks), anything else by its place.
+    fn clicked(&self, hit: &Hit) -> String {
+        match hit {
+            Hit::Row(i) => format!(
+                "session {}",
+                self.sessions
+                    .get(*i)
+                    .and_then(|s| s["id"].as_str())
+                    .unwrap_or("?")
+            ),
+            Hit::Group(i) => format!(
+                "group {}",
+                self.groups.get(*i).map_or("?", |g| g.0.as_str())
+            ),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Put the highlight back on what a menu or confirmation is about.
+    /// False (with a note) when it is no longer in the list.
+    fn reselect(&mut self, target: &Target) -> bool {
+        let found = match target {
+            Target::Session(id) => {
+                let at = self.sessions.iter().position(|s| s["id"] == id.as_str());
+                if let Some(i) = at {
+                    self.group_focus = false;
+                    self.table.select(Some(i));
+                }
+                at.is_some()
+            }
+            Target::Group(g) => {
+                let at = self.groups.iter().position(|(name, _)| name == g);
+                if let Some(i) = at {
+                    self.group_focus = true;
+                    let cur = self.group_state.selected().unwrap_or(0);
+                    if self.group_sel.as_deref() != Some(g.as_str()) {
+                        self.move_group(i as isize - cur as isize);
+                    }
+                }
+                at.is_some()
+            }
+        };
+        if !found {
+            self.status_line = "it's no longer in the list: nothing done".into();
+        }
+        found
+    }
+
+    /// A click asked for `k`: if that stops, restarts or archives the
+    /// highlighted session, ask first (true: a confirmation is now open).
+    fn confirm_first(&mut self, k: KeyEvent) -> bool {
+        if self.tab == Tab::Groups && self.group_focus {
+            return false;
+        }
+        let verb = match self.keys.action(&k) {
+            Some(Action::Stop) => "stop",
+            Some(Action::Restart) => "restart",
+            Some(Action::Archive) => "archive",
+            _ => return false,
+        };
+        let Some(s) = self.selected() else {
+            return false;
+        };
+        let (Some(id), name) = (s["id"].as_str(), s["name"].as_str().unwrap_or("it")) else {
+            return false;
+        };
+        let mut question = format!("{verb} {name}?");
+        if let Some(first) = question.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        self.mode = Mode::Confirm(Box::new(Confirm {
+            question,
+            verb,
+            target: Target::Session(id.to_string()),
+            key: k,
+        }));
+        true
+    }
+
+    /// Returns true to quit.
+    pub(crate) fn handle_confirm(
+        &mut self,
+        k: KeyEvent,
+        c: Confirm,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<bool> {
+        if !matches!(
+            k.code,
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
+        ) {
+            self.status_line = "cancelled".into();
+            return Ok(false);
+        }
+        if !self.reselect(&c.target) {
+            return Ok(false);
+        }
+        self.handle_key(c.key, terminal)
+    }
+
+    pub(crate) fn draw_confirm(&self, f: &mut Frame, c: &Confirm) {
+        let w = (c.question.width() as u16 + 8).max(40);
+        let area = newform::centered(f.area(), w, 6);
+        f.render_widget(Clear, area);
+        let lines = vec![
+            Line::from(""),
+            Line::from(format!("  {}", c.question)).bold(),
+            Line::from(""),
+            keys_line(&[
+                ("y/enter", c.verb, Cap::Context),
+                ("any key", "cancel", Cap::Global),
+            ]),
+        ];
+        self.modal_hits(f.area(), area, &lines);
+        f.render_widget(Paragraph::new(lines).block(theme::modal("Confirm")), area);
+    }
+
+    /// Run a menu entry's key on what the menu was opened for.
+    fn run_menu_item(
+        &mut self,
+        target: &Target,
+        key: KeyEvent,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<bool> {
+        if !self.reselect(target) {
+            return Ok(false);
+        }
+        // (The menu came from a click: stop, restart, archive ask first.)
+        if self.confirm_first(key) {
+            return Ok(false);
+        }
+        self.handle_key(key, terminal)
     }
 
     /// A click on item `i` of the open modal.
@@ -379,6 +546,14 @@ impl App {
             .into_iter()
             .filter_map(|(a, label)| Some((self.keys.label(a), label, self.keys.event(a)?)))
             .collect();
+        let target = if group {
+            Target::Group(self.group_sel.clone().unwrap_or_default())
+        } else {
+            match self.selected_id() {
+                Some(id) => Target::Session(id),
+                None => return,
+            }
+        };
         let title = if group {
             let g = self.group_sel.clone().unwrap_or_default();
             if g != groups::UNTAGGED {
@@ -404,6 +579,7 @@ impl App {
         self.mode = Mode::Menu(Box::new(Menu {
             x,
             y,
+            target,
             title,
             items,
             sel: 0,
@@ -422,7 +598,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(n - 1),
             KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
             // Run it as its key would (the menu is closed by now).
-            KeyCode::Enter => return self.handle_key(m.items[m.sel].2, terminal),
+            KeyCode::Enter => return self.run_menu_item(&m.target, m.items[m.sel].2, terminal),
             // One of the listed keys runs that entry; anything else closes.
             _ => {
                 let item = m.items.iter().find(|(_, _, key)| {
@@ -431,7 +607,7 @@ impl App {
                             == k.modifiers.contains(KeyModifiers::CONTROL)
                 });
                 return match item {
-                    Some((_, _, key)) => self.handle_key(*key, terminal),
+                    Some((_, _, key)) => self.run_menu_item(&m.target, *key, terminal),
                     None => Ok(false),
                 };
             }
@@ -550,11 +726,11 @@ mod tests {
         let keys = KeyMap::from_config(&Keys::default()).unwrap();
         let mut app = App::new(rx, Config::default(), keys);
         app.sessions = vec![
-            json!({"name": "login-flake", "status": "working", "agent": "claude",
+            json!({"id": "s1", "name": "login-flake", "status": "working", "agent": "claude",
                    "agent_session": "a", "tags": ["web"], "archived_at": null}),
-            json!({"name": "image-pipeline", "status": "idle", "agent": "codex",
+            json!({"id": "s2", "name": "image-pipeline", "status": "idle", "agent": "codex",
                    "agent_session": "b", "tags": [], "archived_at": null}),
-            json!({"name": "old-migration", "status": "stopped", "agent": "claude",
+            json!({"id": "s3", "name": "old-migration", "status": "stopped", "agent": "claude",
                    "agent_session": "c", "tags": [], "archived_at": 5}),
         ];
         app.all = app.sessions.clone();
@@ -640,6 +816,73 @@ mod tests {
         let rows = drawn(&mut app);
         let (x, y) = find(&rows, "favourite");
         assert!(x < 150 && y < 34);
+    }
+
+    #[test]
+    fn a_menu_acts_on_what_it_was_opened_for_or_not_at_all() {
+        let mut app = fleet();
+        app.table.select(Some(1));
+        app.open_menu(30, 8, false);
+        let target = match &app.mode {
+            Mode::Menu(m) => m.target.clone(),
+            _ => panic!("no menu"),
+        };
+        assert_eq!(target, Target::Session("s2".into()));
+        // The list reorders under the open menu: the entry still finds
+        // its session, not the row that took its place.
+        app.sessions.swap(0, 1);
+        assert!(app.reselect(&target));
+        assert_eq!(app.selected_id().as_deref(), Some("s2"));
+        // It left the list (archived elsewhere): nothing is done.
+        app.sessions.retain(|s| s["id"] != "s2");
+        assert!(!app.reselect(&target));
+        assert!(app.status_line.contains("no longer"));
+        assert_ne!(app.selected_id().as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn a_click_asks_before_stopping_restarting_or_archiving() {
+        let mut app = fleet();
+        app.mode = Mode::Normal;
+        let key = |a: Action| app.keys.event(a).unwrap();
+        let (stop, rename) = (key(Action::Stop), key(Action::Rename));
+        assert!(app.confirm_first(stop));
+        match &app.mode {
+            Mode::Confirm(c) => {
+                assert_eq!(c.question, "Stop login-flake?");
+                assert_eq!(c.target, Target::Session("s1".into()));
+            }
+            _ => panic!("no confirmation"),
+        }
+        // Drawn with its buttons; a click on "stop" presses enter.
+        let rows = drawn(&mut app);
+        let (x, y) = find(&rows, "y/enter");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Key(key_enter())));
+        assert_eq!(
+            app.hits.at(x + 10, y),
+            Some(Hit::Key(key_enter())),
+            "its label"
+        );
+        // Nothing destructive: no question.
+        app.mode = Mode::Normal;
+        assert!(!app.confirm_first(rename));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    fn key_enter() -> KeyEvent {
+        key(KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_double_click_is_two_clicks_on_the_same_session() {
+        let mut app = fleet();
+        let first = app.clicked(&Hit::Row(0));
+        assert_eq!(first, "session s1");
+        // The list reordered between the clicks: row 0 is another session,
+        // so the second click is not a double-click on the first.
+        app.sessions.swap(0, 1);
+        assert_ne!(app.clicked(&Hit::Row(0)), first);
+        assert_eq!(app.clicked(&Hit::Row(1)), first);
     }
 
     #[test]

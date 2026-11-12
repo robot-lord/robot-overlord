@@ -315,18 +315,18 @@ pub fn observed_model(path: &Path) -> Option<String> {
         .find_map(|v| format.line(v).model().map(str::to_string))
 }
 
-/// Whether the agent is mid-turn, from the transcript's tail: the last
-/// line that says (`Some(true)` working, `Some(false)` its turn is over).
-/// None when the tail doesn't say or the file can't be read.
+/// Whether the agent is mid-turn (`Some(true)` working, `Some(false)` its
+/// turn is over), from the turn lines read so far. Incremental (see
+/// `transcript_stats`): polling it costs only what was appended. None when
+/// no turn line has been read: there has been no turn yet, or (a daemon
+/// restart mid-turn) it began before what was read this run.
 pub fn working(path: &Path) -> Option<bool> {
-    let format = Format::of(path);
-    // Only the tail, a line at a time from the end: this is polled.
-    read_window(path, true)?
-        .lines()
-        .rev()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .find_map(|v| format.line(&v).turn_ended())
-        .map(|ended| !ended)
+    let st = transcript_stats(path)?;
+    match (st.ended, st.turn_seen) {
+        (true, _) => Some(false),
+        (false, true) => Some(true),
+        (false, false) => None,
+    }
 }
 
 /// Token totals and time span from a transcript.
@@ -389,6 +389,7 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
             // pending); a tool result or new prompt reopens it.
             if let Some(ended) = l.turn_ended() {
                 c.ended = ended;
+                c.turn_seen = true;
             }
         }
         c.offset += end as u64;
@@ -422,6 +423,9 @@ pub struct TranscriptStats {
     pub last: Option<i64>,
     /// The latest turn is a final reply: the agent finished.
     pub ended: bool,
+    /// A line that opens or ends a turn has been read (so `ended: false`
+    /// means "mid-turn", not "nothing known").
+    pub turn_seen: bool,
     /// When the file was last written.
     pub modified: Option<std::time::SystemTime>,
 }
@@ -432,6 +436,7 @@ struct StatsCursor {
     /// Moved since last saved (`take_dirty_cursors`).
     dirty: bool,
     ended: bool,
+    turn_seen: bool,
     ino: u64,
     offset: u64,
     input: i64,
@@ -446,6 +451,7 @@ impl Default for StatsCursor {
         StatsCursor {
             dirty: false,
             ended: false,
+            turn_seen: false,
             ino: 0,
             offset: 0,
             input: 0,
@@ -465,6 +471,7 @@ impl StatsCursor {
             first: self.first,
             last: self.last,
             ended: self.ended,
+            turn_seen: self.turn_seen,
             modified: None,
         }
     }
@@ -503,6 +510,9 @@ pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
             first: st.first,
             last: st.last,
             ended: st.ended,
+            // (Not saved: an ended turn was certainly seen; an open one
+            // may have begun before this run.)
+            turn_seen: st.ended,
             ..Default::default()
         });
     }

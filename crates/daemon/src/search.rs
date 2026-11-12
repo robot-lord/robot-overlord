@@ -75,7 +75,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         .iter()
         .map(|seat| seat.dir().to_string_lossy().into_owned())
         .collect();
-    let mut skip: std::collections::HashSet<PathBuf> = seat_dirs
+    let skip: std::collections::HashSet<PathBuf> = seat_dirs
         .iter()
         .filter_map(|dir| {
             Agent::Claude
@@ -86,18 +86,8 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         .collect();
     for (i, s) in sessions.iter().enumerate() {
         if crate::overlord::is_overlord_role(&s.role) {
-            skip.extend(
-                summary::transcripts_of(d, s)
-                    .iter()
-                    .filter_map(|p| p.parent().map(Path::to_path_buf)),
-            );
-            if let Some(a) = &s.agent_session {
-                let p = Agent::parse(&s.agent)
-                    .and_then(|agent| agent.transcript_path(&s.project_path, a));
-                if let Some(dir) = p.as_deref().and_then(Path::parent) {
-                    skip.insert(dir.to_path_buf());
-                }
-            }
+            // (Its folder is skipped whole, above: no need to look its
+            // transcripts up one by one.)
             continue;
         }
         let ps = summary::transcripts_of(d, s);
@@ -109,10 +99,21 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         paths_of.insert(i, ps);
     }
     if everywhere {
+        // Codex rollouts sit together by date: which ran in a seat's folder
+        // is one question to Codex's index (each file's head only when
+        // there is no index).
+        let seat_rollouts = agents::codex::rollouts_in_folders(&agents::codex::home(), &seat_dirs);
+        let in_seat_folder = |p: &Path| match &seat_rollouts {
+            Some(set) => set.contains(p),
+            None => {
+                agents::agent_of(p) == Agent::Codex
+                    && agents::codex::rollout_cwd(p).is_some_and(|cwd| seat_dirs.contains(&cwd))
+            }
+        };
         paths.extend(history::all_transcripts().into_iter().filter(|p| {
             !by_path.contains_key(p)
                 && !p.parent().is_some_and(|d| skip.contains(d))
-                && !in_seat_folder(p, &seat_dirs)
+                && !in_seat_folder(p)
         }));
     }
     let found = history::search(&paths, query, PER_FILE);
@@ -203,13 +204,6 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         v["more_outside"] = json!(outside_total.saturating_sub(limit));
     }
     Ok(v)
-}
-
-/// A Codex rollout of a conversation that ran in an overlord seat's folder
-/// (rollouts sit together by date, so each one is asked).
-fn in_seat_folder(p: &Path, seat_dirs: &[String]) -> bool {
-    agents::agent_of(p) == Agent::Codex
-        && agents::codex::rollout_cwd(p).is_some_and(|cwd| seat_dirs.contains(&cwd))
 }
 
 pub fn read(d: &Daemon, params: &Value) -> Result<Value> {

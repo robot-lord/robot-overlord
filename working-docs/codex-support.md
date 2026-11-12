@@ -108,9 +108,33 @@ Since then, on the same branch:
   line, and don't tick the list. Existing installs need `rlord
   install-hooks` again (Codex: re-trust).
 
-Known gaps in the status work: a permission denied in Codex clears only
-at the next tool or the turn's end; a sub-agent's tool finishing while the
-main agent waits on a prompt clears "needs you" early (same session id).
+Known gap in the status work: a permission denied in Codex clears only
+at the next tool or the turn's end.
+
+After the PR's code review:
+
+- **Whose conversation a hook speaks for** (`methods::conversation`): a
+  sub-agent's thread never rebinds a session (Codex's index says which
+  threads are the user's); an index-bound id (`minted`) gives way to
+  whatever the hooks name; with nothing bound, only a SessionStart binds
+  (a late event from a replaced process is ignored). Another thread's
+  permission prompt still shows "needs you".
+- **Who "needs you" is for** is remembered (kv `needs_you_by:<id>`: a
+  Claude sub-agent's `agent_id`, a Codex sub-agent's thread, or the main
+  agent), and only that one moving on clears it.
+- **Index binding is cautious** (`discover::pick_thread`): CLI threads
+  only, the first message must be the launch prompt when there was one,
+  and nothing is bound when two sessions wait in one folder or two
+  threads fit.
+- **Unhooked status** uses the incremental transcript stats; "unknown"
+  never ends a running turn; a pane must look gone twice to mean stopped.
+- **Hook client**: payload cut to the fields rlord uses before sending
+  and spooling; bounded waits; spooled only when the daemon is
+  unreachable.
+- **Installed** means found on the daemon's PATH or by the user's login
+  shell; hooks count as installed only when every event is.
+- Clicks that stop, restart or archive ask first; menus and double-clicks
+  go by session id.
 
 Unverified against a real Codex run: that hooks fire with these payload
 fields for an interactive session, that SessionStart is not fired for

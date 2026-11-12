@@ -35,7 +35,7 @@ fi
 now() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")'; }
 mkdir -p "$home"
 db=$home/state_5.sqlite
-sqlite3 "$db" "create table if not exists threads (id text primary key, rollout_path text not null, cwd text not null, title text not null default '', created_at_ms integer, updated_at_ms integer, thread_source text, model text)"
+sqlite3 "$db" "create table if not exists threads (id text primary key, rollout_path text not null, cwd text not null, title text not null default '', created_at_ms integer, updated_at_ms integer, thread_source text, model text, source text not null default 'cli', first_user_message text not null default '')"
 if [[ $sub == resume ]]; then
   tr=$(sqlite3 "$db" "select rollout_path from threads where id='$tid'")
   [[ -n $tr ]] || { echo "No saved session found with ID $tid" >&2; exit 1; }
@@ -47,7 +47,9 @@ else
   ms=$(python3 -c 'import time; print(int(time.time() * 1000))')
   python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": "session_meta", "payload": {"id": sys.argv[2], "cwd": sys.argv[3], "originator": "codex-tui", "cli_version": "0.167.2"}}))' \
     "$(now)" "$tid" "$PWD" >"$tr"
-  sqlite3 "$db" "insert into threads (id, rollout_path, cwd, title, created_at_ms, updated_at_ms, thread_source, model) values ('$tid', '$tr', '$PWD', '', $ms, $ms, 'user', 'gpt-6-luna')"
+  # (The first prompt, as Codex records it: quotes doubled for SQL.)
+  first=$(printf '%s' "$prompt" | sed "s/'/''/g")
+  sqlite3 "$db" "insert into threads (id, rollout_path, cwd, title, created_at_ms, updated_at_ms, thread_source, model, source, first_user_message) values ('$tid', '$tr', '$PWD', '', $ms, $ms, 'user', 'gpt-6-luna', 'cli', '$first')"
 fi
 
 hook() {

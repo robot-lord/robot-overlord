@@ -141,6 +141,8 @@ enum Mode {
     Keys(Box<keyscreen::KeyScreen>),
     /// The right-click menu of a row or a group.
     Menu(Box<mouse::Menu>),
+    /// "Stop web-fix?", before a click does something hard to undo.
+    Confirm(Box<mouse::Confirm>),
 }
 
 struct App {
@@ -202,7 +204,7 @@ struct App {
     /// What is where on screen, rebuilt each frame (see mouse.rs).
     hits: mouse::Hits,
     /// The last left click, for telling a double-click.
-    last_click: Option<(Instant, mouse::Hit)>,
+    last_click: Option<(Instant, String)>,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -584,6 +586,7 @@ impl App {
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
             Mode::Menu(m) => return self.handle_menu(k, m, terminal),
+            Mode::Confirm(c) => return self.handle_confirm(k, *c, terminal),
             Mode::ConfirmQuit => {
                 if matches!(
                     k.code,
@@ -1143,6 +1146,7 @@ impl App {
             Mode::Command(l) => self.draw_launcher(f, l),
             Mode::Keys(ks) => self.draw_keys(f, ks),
             Mode::Menu(m) => self.draw_menu(f, m),
+            Mode::Confirm(c) => self.draw_confirm(f, c),
             _ => {}
         }
     }
@@ -1660,7 +1664,7 @@ impl App {
             )),
             Mode::Keys(_) => Some("keys — see the key screen".to_string()),
             // The menu sits over the list; the footer stays as it is.
-            Mode::Menu(_) => None,
+            Mode::Menu(_) | Mode::Confirm(_) => None,
         };
         let line2 = if self.status_line.is_empty() {
             Line::raw("")

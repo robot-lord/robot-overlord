@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::{claude, install, transcript, Agent};
+use rlord_core::agents::{claude, install, transcript, Agent, Effect};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Status, Subagent};
@@ -468,6 +468,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         // Its conversation is bound once the agent reports it (or it turns
         // up in the agent's own index): one started from now on.
         db.kv_set(&bind_since_key(&id), &now.to_string())?;
+        db.kv_set(&bind_prompt_key(&id), prompt.as_deref().unwrap_or(""))?;
     }
 
     let cmd = tmux::pane_command(&pane_env(&id), argv);
@@ -760,6 +761,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
         (None, _) => {
             db.clear_agent_session(&s.id)?;
             db.kv_set(&bind_since_key(&s.id), &now.to_string())?;
+            db.kv_set(&bind_prompt_key(&s.id), "")?;
         }
     }
     db.set_status(&s.id, Status::Starting, now)?;
@@ -835,37 +837,77 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
     // The hooks of the agent the session runs (another agent started by
     // hand in its pane inherits RLORD_SESSION_ID: logged, nothing more).
     if let Some(agent) = own_agent {
-        let mut bound = true;
-        if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
-            match s.agent_session.as_deref() {
-                None => db.set_agent_session(&s.id, sid, "hook")?,
-                // Another conversation in the pane that isn't the session's
-                // (Codex: a sub-agent's thread): its events aren't ours.
-                Some(cur) if cur != sid && !agent.adopts_new_id_on(event) => bound = false,
-                Some(cur) if cur != sid => {
-                    // The agent is the truth about what it's writing; adopt, but log it.
-                    db.insert_event(
-                        &s.id,
-                        now,
-                        "agent_session_changed",
-                        &json!({"from": cur, "to": sid}).to_string(),
-                    )?;
-                    db.set_agent_session(&s.id, sid, "hook")?;
-                }
-                Some(_) if s.agent_session_trust == "minted" => {
-                    db.set_agent_session(&s.id, sid, "hook")? // confirmed
-                }
-                _ => {}
+        let sid = payload.get("session_id").and_then(Value::as_str);
+        let whose = sid.map_or(Whose::Ours, |sid| {
+            // (Asked of the agent's index only when the ids differ.)
+            let other = s.agent_session.as_deref().is_some_and(|cur| cur != sid);
+            conversation(
+                agent,
+                event,
+                s.agent_session.as_deref(),
+                &s.agent_session_trust,
+                sid,
+                if other {
+                    agent.is_user_conversation(sid)
+                } else {
+                    None
+                },
+            )
+        });
+        match (whose, sid) {
+            (Whose::Bind, Some(sid)) => db.set_agent_session(&s.id, sid, "hook")?,
+            // rlord's own claim (minted at launch, or read from the agent's
+            // index), now confirmed by the agent.
+            (Whose::Ours, Some(sid))
+                if s.agent_session.is_some() && s.agent_session_trust == "minted" =>
+            {
+                db.set_agent_session(&s.id, sid, "hook")?
             }
-        }
-        if !bound {
-            return Ok(json!({"ignored": "another conversation in the pane"}));
-        }
-        if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
-            db.upsert_transcript_source(&s.id, tp)?;
+            (Whose::Adopt, Some(sid)) => {
+                // The agent is the truth about what it's writing; adopt, but log it.
+                db.insert_event(
+                    &s.id,
+                    now,
+                    "agent_session_changed",
+                    &json!({"from": s.agent_session, "to": sid}).to_string(),
+                )?;
+                db.set_agent_session(&s.id, sid, "hook")?;
+            }
+            (Whose::Unbound, _) => {
+                return Ok(json!({"ignored": "no conversation bound yet"}));
+            }
+            _ => {}
         }
         let (kind, effect) = agent.map_hook_event(event, &payload);
+        // Who a "needs you" is for: a sub-agent (Claude names it; Codex's
+        // has its own thread), else the session's own agent ("").
+        let by = payload["agent_id"]
+            .as_str()
+            .or(sid.filter(|_| whose == Whose::Other))
+            .unwrap_or("");
+        let needs_you = effect == Effect::Set(Status::WaitingInput);
+        if whose == Whose::Other {
+            // Another conversation in the pane (a sub-agent's thread): it
+            // never rebinds the session or ends its turn, but a prompt it
+            // is blocked on is the user's to answer here.
+            if !needs_you && effect != Effect::Resume {
+                return Ok(json!({"ignored": "another conversation in the pane"}));
+            }
+        } else if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
+            db.upsert_transcript_source(&s.id, tp)?;
+        }
+        // The agent moved on: only the one that was blocked can say so (a
+        // parallel sub-agent finishing a tool doesn't answer the prompt).
+        if effect == Effect::Resume
+            && s.status == Status::WaitingInput
+            && db.kv_get(&needs_you_key(&s.id))?.unwrap_or_default() != by
+        {
+            return Ok(json!({"ok": true, "unchanged": true}));
+        }
         let status = effect.apply(s.status);
+        if needs_you {
+            db.kv_set(&needs_you_key(&s.id), by)?;
+        }
         // Only a prompt and a finished turn are messages: a permission
         // prompt, a question or a tool call never moves "updated".
         match kind {
@@ -896,6 +938,57 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         )?;
     }
     Ok(json!({"ok": true}))
+}
+
+/// kv key: who the session's "needs you" is for ("" its own agent, else a
+/// sub-agent's id or thread).
+fn needs_you_key(id: &str) -> String {
+    format!("needs_you_by:{id}")
+}
+
+/// Whose conversation a hook event speaks for, relative to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Whose {
+    /// The session's bound conversation (or the event names none).
+    Ours,
+    /// Nothing was bound: this is the session's conversation from now on.
+    Bind,
+    /// The session moved to this conversation.
+    Adopt,
+    /// Another conversation in the pane (a sub-agent's thread).
+    Other,
+    /// Nothing is bound and this event can't bind: not the session's.
+    Unbound,
+}
+
+/// Decide whose conversation `sid` is. `bound`/`trust`: the session's
+/// current one and how it was learned. `user`: what the agent's own index
+/// says about `sid` when it differs (Some(false): a sub-agent's thread).
+fn conversation(
+    agent: Agent,
+    event: &str,
+    bound: Option<&str>,
+    trust: &str,
+    sid: &str,
+    user: Option<bool>,
+) -> Whose {
+    match bound {
+        Some(cur) if cur == sid => Whose::Ours,
+        // An agent that assigns its own id starts a conversation with a
+        // SessionStart: until one arrives (after a launch or a fresh start)
+        // an event is a late one from the process that was just replaced,
+        // and must not bind its old conversation or stop the session.
+        None if agent.mints_id() || agent.adopts_new_id_on(event) => Whose::Bind,
+        None => Whose::Unbound,
+        // A sub-agent's thread never becomes the session's.
+        Some(_) if user == Some(false) => Whose::Other,
+        // A new or resumed conversation in the pane.
+        Some(_) if agent.adopts_new_id_on(event) => Whose::Adopt,
+        // rlord's own guess from the agent's index, and the agent now says
+        // otherwise: the hook is the authority.
+        Some(_) if trust == "minted" && !agent.mints_id() => Whose::Adopt,
+        Some(_) => Whose::Other,
+    }
 }
 
 /// Why a hook isn't from the session's own agent process, if it isn't:
@@ -1037,6 +1130,12 @@ pub(crate) fn bind_since_key(id: &str) -> String {
     format!("bind_since:{id}")
 }
 
+/// kv key: the prompt that conversation was launched with ("" for none):
+/// how its thread is told from another started in the same folder.
+pub(crate) fn bind_prompt_key(id: &str) -> String {
+    format!("bind_prompt:{id}")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1059,6 +1158,46 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn whose_conversation_a_hook_speaks_for() {
+        use Whose::*;
+        let codex = |event: &str, bound: Option<&str>, trust: &str, user: Option<bool>| {
+            conversation(Agent::Codex, event, bound, trust, "t-2", user)
+        };
+        assert_eq!(codex("Stop", Some("t-2"), "hook", None), Ours);
+        // Nothing bound: a SessionStart binds; a late event from the
+        // process just replaced (a fresh start) does not.
+        assert_eq!(codex("SessionStart", None, "minted", None), Bind);
+        assert_eq!(codex("SessionEnd", None, "minted", None), Unbound);
+        assert_eq!(codex("Stop", None, "minted", None), Unbound);
+        // A new thread in the pane is adopted, a sub-agent's never is.
+        assert_eq!(codex("SessionStart", Some("t-1"), "hook", None), Adopt);
+        assert_eq!(
+            codex("SessionStart", Some("t-1"), "hook", Some(true)),
+            Adopt
+        );
+        assert_eq!(
+            codex("SessionStart", Some("t-1"), "hook", Some(false)),
+            Other
+        );
+        assert_eq!(
+            codex("SessionStart", Some("t-1"), "minted", Some(false)),
+            Other
+        );
+        // Bound from the index (a guess): any hook corrects it.
+        assert_eq!(codex("Stop", Some("t-1"), "minted", None), Adopt);
+        assert_eq!(codex("Stop", Some("t-1"), "minted", Some(true)), Adopt);
+        // Confirmed by a hook: another thread's Stop is another thread's.
+        assert_eq!(codex("Stop", Some("t-1"), "hook", None), Other);
+        // Claude chose its id and reports what it writes on every event.
+        let claude = |event: &str, bound: Option<&str>| {
+            conversation(Agent::Claude, event, bound, "minted", "t-2", None)
+        };
+        assert_eq!(claude("Stop", None), Bind);
+        assert_eq!(claude("Stop", Some("t-1")), Adopt);
+        assert_eq!(claude("Stop", Some("t-2")), Ours);
+    }
 
     #[test]
     fn overlord_row_is_fixed() {

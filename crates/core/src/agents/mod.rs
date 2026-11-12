@@ -109,9 +109,9 @@ impl Agent {
         }
     }
 
-    /// Its command is on PATH.
+    /// Its command can be found (PATH, or the user's login shell).
     pub fn installed(self) -> bool {
-        install::on_path(self.name()).is_some()
+        install::resolve(self.name()).is_some()
     }
 
     pub fn format(self) -> Format {
@@ -233,11 +233,26 @@ impl Agent {
     }
 
     pub fn install_hooks_in(self, file: &Path, rlord_bin: &str) -> Result<bool> {
-        let events = match self {
+        merge_hooks(file, &self.hook_command(rlord_bin), self.hook_events())
+    }
+
+    /// (event, matcher): every event rlord's hook is installed for.
+    pub fn hook_events(self) -> &'static [(&'static str, Option<&'static str>)] {
+        match self {
             Agent::Claude => claude::HOOK_EVENTS,
             Agent::Codex => codex::HOOK_EVENTS,
-        };
-        merge_hooks(file, &self.hook_command(rlord_bin), events)
+        }
+    }
+
+    /// Whether conversation `id` is one the user drives, not a sub-agent's
+    /// own thread in the same pane. None when it can't be told (Claude's
+    /// sub-agents report under the session's id; Codex's index may not
+    /// know the thread yet).
+    pub fn is_user_conversation(self, id: &str) -> Option<bool> {
+        match self {
+            Agent::Claude => None,
+            Agent::Codex => codex::is_user_thread(&codex::home(), id),
+        }
     }
 
     /// What the user must still do after the hooks are installed, if anything.
