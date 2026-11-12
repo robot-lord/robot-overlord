@@ -102,7 +102,9 @@ impl KeyScreen {
     }
 
     pub(crate) fn listening(&self) -> bool {
-        matches!(self.phase, Phase::Listen { .. })
+        // Review too: it's still on the empty table, every key is "try
+        // another" (Ctrl-C included).
+        matches!(self.phase, Phase::Listen { .. } | Phase::Review(_))
     }
 
     fn slot(&self) -> &'static Slot {
@@ -220,11 +222,16 @@ impl App {
                 if k.code == KeyCode::Esc && k.modifiers.is_empty() {
                     ks.msg = None;
                 } else if key_of(&k).is_none() {
+                    // Keep listening for the next one.
                     ks.msg = Some((
                         Level::Taken,
-                        "config.toml can't name that key (Shift-Tab, Insert, F13+): try another"
+                        "config.toml can't name that key (Shift-Tab, Insert, F13+): press another"
                             .into(),
                     ));
+                    ks.phase = Phase::Listen {
+                        since: Instant::now(),
+                        _guard: guard,
+                    };
                 } else if let Some(key) = key_of(&k) {
                     let s = ks.slot();
                     // A character Option types (∂ for Option-d) may be a
@@ -238,6 +245,7 @@ impl App {
                     };
                     ks.tested.insert((s.id(), key.clone()));
                     let findings = keys::check(&self.config, &ks.env, s, &key);
+                    ks.msg = None;
                     ks.phase = Phase::Review(Review {
                         guard,
                         findings,
@@ -429,6 +437,12 @@ impl App {
                 d.push(hints(&h));
             }
             Phase::Listen { since, .. } => {
+                if let Some((lv, m)) = &ks.msg {
+                    d.push(level_line(&Finding {
+                        level: *lv,
+                        text: m.clone(),
+                    }));
+                }
                 d.push(Line::from(vec![
                     Span::styled("Press the new key for ", Style::default().fg(theme::text())),
                     Span::styled(s.does, Style::default().fg(theme::accent()).bold()),

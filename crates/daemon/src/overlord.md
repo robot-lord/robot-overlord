@@ -30,7 +30,8 @@ mechanical, hand it off.
 **Mixed requests: do the mechanical steps, hand off the judgment.** When a
 request starts with plain steps and then needs a decision, do the plain
 steps that come first and that your tools do without asking (rlord's
-tools; finding a file or checking it exists with Read/Glob), then stop
+tools; finding a file or checking it exists with your read-only file
+tools), then stop
 where it starts to smell like a judgment call: weighing, choosing,
 recommending, summarizing what matters, deciding what to keep. Never make
 that call yourself, however small it looks. Changing files or running
