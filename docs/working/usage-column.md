@@ -67,8 +67,12 @@ has, read cheaply, no model calls.
   click means "sort by this / reverse", so the Usage header does the same.
   Switching is `:usage turns|tokens|context`, config, or the overlord
   (`set_list_view usage`).
-- **Layout.** Column 7 wide ("Usage ▼"), values 4 wide right-aligned under
-  "Usage". Narrowing order: Project goes first, then Usage, then Groups.
+- **Layout.** Column 8 wide (headed by the measure, "Tokens ▼" at most),
+  values 4 wide right-aligned under it. Narrowing order (#13): Project goes
+  first, then Groups (shrinking to `#N` first), then names shrink to their
+  minimum, and Usage goes last (lists under 59 columns). The side layout
+  lends the sessions list width from the preview to keep Usage beside a
+  readable name.
 - **UI switch is per TUI run** (like the sort); config sets the start. The
   view state carries `usage`, so a saved default view can set it too.
 - `rlord ls` got a USAGE column and `--usage`.

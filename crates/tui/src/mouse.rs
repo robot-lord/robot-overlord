@@ -998,7 +998,7 @@ mod tests {
         // what's drawn: the list's rows run to its new edge, Usage's
         // header sorts, and the preview starts after it.
         let rows = drawn_at(&mut app, 120, 34);
-        let list_w = crate::side_list_width(120, app.config.list_width_pct);
+        let list_w = crate::side_list_width(120, app.config.list_width_pct, true);
         assert!(list_w > 60);
         let (ux, uy) = find(&rows, "Turns");
         assert!(ux < list_w);
@@ -1088,7 +1088,7 @@ mod tests {
     fn list_header(app: &mut App, w: u16) -> (Vec<&'static str>, u16) {
         let rows = drawn_at(app, w, 34);
         let (_, y) = find(&rows, "Name");
-        let list_w = crate::side_list_width(w, app.config.list_width_pct);
+        let list_w = crate::side_list_width(w, app.config.list_width_pct, true);
         let head: String = rows[y as usize].chars().take(list_w as usize).collect();
         let cols = ["Name", "Status", "Message", "Turns", "Groups", "Project"]
             .into_iter()
@@ -1142,9 +1142,15 @@ mod tests {
     #[test]
     fn the_list_borrows_width_only_when_short() {
         use crate::side_list_width as split;
+        let share_of = |total: u16, pct: u16| {
+            ((total as u32 * pct as u32 / 100) as u16)
+                .max(60)
+                .min(total)
+        };
         for total in 60..=400u16 {
             for pct in [20, 30, 50, 70, 80] {
-                let w = split(total, pct);
+                let w = split(total, pct, true);
+                assert_eq!(split(total, pct, false), share_of(total, pct));
                 let share = ((total as u32 * pct as u32 / 100) as u16)
                     .max(60)
                     .min(total);
@@ -1157,7 +1163,38 @@ mod tests {
             }
         }
         // A bigger configured share is kept as it is.
-        assert_eq!(split(200, 70), 140);
+        assert_eq!(split(200, 70, true), 140);
+        // The groups tab doesn't borrow: at 120 it keeps its half.
+        let mut app = fleet();
+        app.tab = Tab::Groups;
+        let rows = drawn_at(&mut app, 120, 34);
+        let y = find(&rows, "live pane").1 + 3;
+        assert_eq!(app.hits.wheel_at(61, y), Some(Hit::Preview));
+        app.tab = Tab::Sessions;
+        drawn_at(&mut app, 120, 34);
+        assert_ne!(app.hits.wheel_at(61, y), Some(Hit::Preview));
+        assert_eq!(app.hits.wheel_at(73, y), Some(Hit::Preview));
+    }
+
+    /// As the list widens, a name never gets narrower (and no column
+    /// goes away).
+    #[test]
+    fn widening_never_narrows_a_name() {
+        let mut last = crate::ListCols::for_width(30);
+        for w in 31..=300u16 {
+            let c = crate::ListCols::for_width(w);
+            assert!(c.name_w >= last.name_w, "width {w}: {last:?} then {c:?}");
+            assert!(
+                c.usage >= last.usage && c.project >= last.project,
+                "width {w}"
+            );
+            assert!(c.tags_w >= last.tags_w, "width {w}");
+            last = c;
+        }
+        // The short time header only under the core width.
+        let core = crate::list_cols::core_width();
+        assert!(crate::ListCols::for_width(core - 1).compact);
+        assert!(!crate::ListCols::for_width(core).compact);
     }
 
     /// Headers whose content can be switched read differently: the sorted

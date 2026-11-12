@@ -1255,7 +1255,12 @@ impl App {
                 // (configured share, but never below what its columns need);
                 // the preview takes the remainder and simply drops out when
                 // that remainder is too small to be useful.
-                let list_w = side_list_width(main_area.width, self.config.list_width_pct);
+                // (Only the sessions list borrows width for its columns.)
+                let list_w = side_list_width(
+                    main_area.width,
+                    self.config.list_width_pct,
+                    self.tab == Tab::Sessions,
+                );
                 let rest = main_area.width - list_w;
                 if rest >= 32 {
                     let [l, r] =
@@ -1319,7 +1324,7 @@ impl App {
             project: show_project,
         } = ListCols::for_width(area.width);
         let show_tags = tags_w > 0;
-        let sel_w = theme::SELECT_BAR.chars().count() as u16;
+        let sel_w = list_cols::sel_w();
 
         // The sort shows on its column: an arrow (▲ ascending, ▼
         // descending; `reverse` flips it), and the time column shows the time
@@ -2467,10 +2472,6 @@ fn edit_in_editor(
     r
 }
 
-/// The Groups column of a row: its tags when they fit in `width`, else how
-/// many groups it is in ("3 groups", or just "3" when that doesn't fit
-/// either, "…" when not even that does), never a tag cut mid-word. All of
-/// them show in the details pane and the groups tab.
 /// The session list's column widths, shared by the list (what to draw) and
 /// the side layout (how much width the list needs).
 mod list_cols {
@@ -2492,11 +2493,14 @@ mod list_cols {
     /// one ("Message ▼").
     pub const TIME_W: u16 = 15;
     pub const TIME_W_COMPACT: u16 = 10;
+    /// The highlight symbol's width (drawn left of every row).
+    pub fn sel_w() -> u16 {
+        crate::theme::SELECT_BAR.chars().count() as u16
+    }
     /// Everything but the name, Usage and the time column: borders and
     /// padding, the highlight symbol, number, pin, status, 4 gaps.
     pub fn base() -> u16 {
-        let sel_w = crate::theme::SELECT_BAR.chars().count() as u16;
-        2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4
+        2 + 2 + sel_w() + 1 + 1 + 13 + 2 * 4
     }
     /// What the list needs to show a readable name, Status, the full time
     /// column and Usage: the side layout widens the list to this when its
@@ -2528,9 +2532,10 @@ impl ListCols {
     fn for_width(width: u16) -> Self {
         use list_cols::*;
         let base = base();
-        // The time column's header names its sort; where a 14-wide name
-        // wouldn't fit beside it and Usage, the short form.
-        let compact = width < base + TIME_W + 14 + USAGE_W + 2;
+        // The time column's header names its sort; where a readable name
+        // wouldn't fit beside it and Usage (under `core_width`), the short
+        // form.
+        let compact = width < core_width();
         let time_w = if compact { TIME_W_COMPACT } else { TIME_W };
         let room = width.saturating_sub(base + time_w);
         let usage = room >= USAGE_W + 2 + NAME_MIN;
@@ -2541,7 +2546,16 @@ impl ListCols {
             0
         };
         let room = if tags_w > 0 { room - tags_w - 2 } else { room };
-        let name_w = room.clamp(NAME_MIN, NAME_MAX);
+        // A name never narrows as the list widens: it stays at the minimum
+        // until Usage is in, at a readable width until Groups is full,
+        // and only then takes the rest (the spare cells stay blank).
+        let name_w = if !usage {
+            NAME_MIN
+        } else if tags_w < TAGS_W {
+            room.clamp(NAME_MIN, NAME_OK)
+        } else {
+            room.clamp(NAME_MIN, NAME_MAX)
+        };
         let project = room >= NAME_MAX + 2 + 12;
         ListCols {
             compact,
@@ -2558,15 +2572,23 @@ impl ListCols {
 /// (`list_width_pct`) first, never under 60; where that's too narrow for
 /// the core columns (`list_cols::core_width`), it borrows from the
 /// preview up to that, leaving the preview at least 40 columns or 30%.
-/// It never takes less than the configured share gives.
-fn side_list_width(total: u16, list_width_pct: u16) -> u16 {
+/// It never takes less than the configured share gives. `borrow` false
+/// (the groups tab): the share alone.
+fn side_list_width(total: u16, list_width_pct: u16, borrow: bool) -> u16 {
     let pct = list_width_pct.clamp(20, 80) as u32;
     let want = ((total as u32 * pct / 100) as u16).max(60).min(total);
+    if !borrow {
+        return want;
+    }
     let right_min = 40u16.max((total as u32 * 30 / 100) as u16);
     let cap = total.saturating_sub(right_min);
     want.max(list_cols::core_width().min(cap))
 }
 
+/// The Groups column of a row: its tags when they fit in `width`, else how
+/// many groups it is in, dimmed as a tag would read (`#3`), or "…" when not
+/// even that fits; never a tag cut mid-word. All of them show in the
+/// details pane and the groups tab.
 fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
     // `#a #b`: a `#` each, a space between.

@@ -349,8 +349,10 @@ keeps its width and the preview drops out first when the terminal is narrow.
 Where its `list_width_pct` share is too narrow for a readable name, Status,
 the time column and Usage, the list borrows that much from the preview,
 leaving the preview at least 40 columns or 30% of the width. It never takes
-less than its share. With the default 50%, Usage shows at any usable
-width, and beside a readable name from about 120 columns.
+less than its share. Usage needs a list of at least 59 columns (the side layout
+gives the list 60 whenever the terminal has them); with the
+default 50% it sits beside a readable name from about 120 columns. The
+groups tab doesn't borrow: it keeps its share.
 
 **Sub-agents** are tracked from outside the pane: Claude Code's `SubagentStart`
 / `SubagentStop` hooks plus the per-agent `meta.json` and transcript Claude
