@@ -338,6 +338,20 @@ impl Prompt {
     }
 
     fn key(&mut self, k: &KeyEvent) -> PromptStep {
+        // Chords aren't text: C-c / C-g cancel (as tmux's prompt), C-u
+        // clears a search, the rest are ignored.
+        if k.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return match (self, k.code) {
+                (_, KeyCode::Char('c' | 'g')) => PromptStep::Cancel,
+                (Prompt::Search { text, .. }, KeyCode::Char('u')) => {
+                    text.clear();
+                    PromptStep::Typing
+                }
+                _ => PromptStep::Typing,
+            };
+        }
         match (self, k.code) {
             (_, KeyCode::Esc) => PromptStep::Cancel,
             (Prompt::Jump(cmd), KeyCode::Char(c)) => PromptStep::Run(cmd, c.to_string()),

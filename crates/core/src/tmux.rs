@@ -591,10 +591,16 @@ fn screen_selection(f: &str) -> Option<((u16, u16), (u16, u16))> {
     // The selection's end is the copy cursor, whose screen row is known:
     // that ties history lines to rows (the live history size moves while
     // copy mode's snapshot doesn't).
-    let [sx, sy, ex, ey, cursor_row, h] = n[..] else {
+    let [sx, sy, ex, ey, cursor_x, cursor_row, h] = n[..] else {
         return None;
     };
-    let top = ey - cursor_row; // history line shown on screen row 0
+    // The cursor is one end: the end, unless swapped to the start (vi `o`).
+    let cursor_line = if ex != cursor_x && sx == cursor_x {
+        sy
+    } else {
+        ey
+    };
+    let top = cursor_line - cursor_row; // history line shown on screen row 0
     let a = (sy - top, sx);
     let b = (ey - top, ex);
     let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
@@ -626,8 +632,8 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
              #{?pane_in_mode,#{copy_cursor_y},#{cursor_y}} \
              #{?pane_in_mode,1,#{cursor_flag}} #{pane_in_mode} \
              #{?selection_present,#{selection_start_x}#,#{selection_start_y}#,\
-             #{selection_end_x}#,#{selection_end_y}#,#{copy_cursor_y}#,\
-             #{pane_height},-}",
+             #{selection_end_x}#,#{selection_end_y}#,#{copy_cursor_x}#,\
+             #{copy_cursor_y}#,#{pane_height},-}",
             ";",
             "capture-pane",
             "-p",
@@ -672,16 +678,28 @@ pub fn copy_command(pane: &str, cmd: &str, arg: &str) -> Result<()> {
     Ok(())
 }
 
-/// The newest paste buffer's name, if any.
+/// The newest paste buffer's name, if any (rlord's own `rlord_…` buffers,
+/// used for pasting into panes, aren't the user's).
 pub fn newest_buffer() -> Option<String> {
     run(&["list-buffers", "-F", "#{buffer_name}"])
         .ok()
-        .and_then(|o| o.lines().next().map(str::to_string))
+        .and_then(|o| {
+            o.lines()
+                .find(|n| !n.starts_with("rlord_"))
+                .map(str::to_string)
+        })
 }
 
-/// A paste buffer's contents.
+/// A paste buffer's contents, exactly (whitespace kept).
 pub fn buffer_text(name: &str) -> Result<String> {
-    run(&["show-buffer", "-b", name])
+    let out = tmux_cmd()
+        .args(["show-buffer", "-b", name])
+        .output()
+        .context("running tmux")?;
+    if !out.status.success() {
+        bail!("tmux show-buffer failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Put a pane in copy mode (no-op if it already is).
@@ -1133,14 +1151,22 @@ mod tests {
     #[test]
     fn selection_maps_history_lines_to_the_screen() {
         // 191 history lines, at the bottom, 10 rows: line 200 is row 9.
-        assert_eq!(screen_selection("0,200,2,198,7,10"), Some(((2, 7), (0, 9))));
+        assert_eq!(
+            screen_selection("0,200,2,198,2,7,10"),
+            Some(((2, 7), (0, 9)))
+        );
         // Scrolled up 1: the lines sit a row lower, the end runs off the
         // bottom (clipped to the last row); scrolled up 5, all off-screen.
         assert_eq!(
-            screen_selection("0,200,2,198,8,10"),
+            screen_selection("0,200,2,198,2,8,10"),
             Some(((2, 8), (u16::MAX, 9)))
         );
-        assert_eq!(screen_selection("0,300,2,298,-5,10"), None);
+        assert_eq!(screen_selection("0,300,2,298,2,-5,10"), None);
+        // Ends swapped (vi `o`): the cursor is at the start, on row 7.
+        assert_eq!(
+            screen_selection("0,198,2,200,0,7,10"),
+            Some(((0, 7), (2, 9)))
+        );
         assert_eq!(screen_selection("-"), None);
     }
 
