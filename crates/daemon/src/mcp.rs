@@ -75,7 +75,7 @@ pub fn tools() -> Value {
             "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear. Not your own conversations: those are `recall`.",
             json!({
                 "query": s("Words to find (all must appear in one message)"),
-                "session": s("Only this session (id, id prefix, or name): for \"what happened in X?\""),
+                "session": s("Only this session (id, id prefix, or name): for \"what happened in X?\". The archived overlord-front-desk (the overlord's old front desk) is searched only when named here"),
                 "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also agent conversations (Claude Code, Codex, OpenCode) started outside rlord"},
                 "limit": {"type": "integer", "description": "Sessions to return (default 8)"},
             }), &["query"]),

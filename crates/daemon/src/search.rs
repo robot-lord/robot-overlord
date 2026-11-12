@@ -70,7 +70,8 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         }
         _ => None,
     };
-    let everywhere = everywhere && one.is_none();
+    let named = one.is_some();
+    let everywhere = everywhere && !named;
     let sessions = match one {
         Some(s) => vec![s],
         None => {
@@ -107,13 +108,20 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                 .map(Path::to_path_buf)
         })
         .collect();
+    // A session that ran in an overlord's folder (the retired front desk)
+    // is searched only when named: then its own transcripts are what was
+    // asked for.
+    let dropped = |s: &Session| !named && is_overlords(s, &own_dirs);
     for (i, s) in sessions.iter().enumerate() {
-        if is_overlords(s, &own_dirs) {
+        if dropped(s) {
             // (Its folder is skipped whole, above: no need to look its
             // transcripts up one by one.)
             continue;
         }
         let ps = summary::transcripts_of(d, s);
+        if named && ps.is_empty() && is_overlords(s, &own_dirs) {
+            bail!("{} has no transcript left on disk to search", s.name);
+        }
         for p in &ps {
             if by_path.insert(p.clone(), i).is_none() {
                 paths.push(p.clone());
@@ -175,7 +183,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut rows: Vec<(usize, Vec<&'static str>, usize)> = sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| !is_overlords(s, &own_dirs))
+        .filter(|(_, s)| !dropped(s))
         .map(|(i, s)| (i, matched_fields(s, &ws), hits.get(&i).map_or(0, |h| h.0)))
         .filter(|(_, f, n)| !f.is_empty() || *n > 0)
         .collect();
@@ -333,4 +341,66 @@ pub fn summarize(d: &Daemon, params: &Value) -> Result<Value> {
     }
     Ok(json!({"queued": queued, "skipped": skipped,
               "note": "summaries are written in the background, one at a time; list_sessions shows them when done"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlord_core::config::Config;
+    use rlord_core::db::{Db, NewSession};
+
+    /// The retired front desk ran in the overlord's folder: left out of a
+    /// search across sessions, searched when named.
+    #[test]
+    fn the_front_desk_is_searched_when_named() {
+        let dir = std::env::temp_dir().join(format!("rlord-search-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("conv-fd.jsonl");
+        std::fs::write(
+            &t,
+            json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                   "message": {"role": "user", "content": "launch the zebracorn report"}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let folder = crate::overlord::dirs()[0].to_string_lossy().into_owned();
+        db.insert_session(&NewSession {
+            id: "01FRONT",
+            name: "overlord-front-desk",
+            agent: "claude",
+            agent_session: Some("conv-fd"),
+            project_path: &folder,
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_archived("01FRONT", Some(2)).unwrap();
+        db.upsert_transcript_source("01FRONT", &t.to_string_lossy())
+            .unwrap();
+        let d = Daemon::new(db, Config::default());
+        let all = search(&d, &json!({"query": "zebracorn"})).unwrap();
+        assert_eq!(all["sessions"], json!([]), "{all}");
+        let one = search(
+            &d,
+            &json!({"query": "zebracorn", "session": "overlord-front-desk"}),
+        )
+        .unwrap();
+        assert_eq!(one["sessions"][0]["id"], "01FRONT", "{one}");
+        assert_eq!(one["sessions"][0]["transcript_hits"], 1, "{one}");
+        // Its transcript gone: a clear error, not an empty answer.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let e = search(
+            &d,
+            &json!({"query": "zebracorn", "session": "overlord-front-desk"}),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no transcript"), "{e}");
+    }
 }

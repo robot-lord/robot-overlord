@@ -69,16 +69,6 @@ fn default_dir() -> PathBuf {
     paths::data_dir().join(ROLE)
 }
 
-/// The overlord's folder: where its session runs (one that began as the
-/// mastermind keeps that folder, so its conversation resumes), else the
-/// folder a new one gets.
-pub fn dir(db: &Db) -> PathBuf {
-    match session(db) {
-        Ok(Some(s)) => PathBuf::from(s.project_path),
-        _ => default_dir(),
-    }
-}
-
 /// Every folder an overlord has run in: its conversations there are its
 /// own (full of searches), never search results.
 pub fn dirs() -> Vec<PathBuf> {
@@ -107,16 +97,55 @@ pub fn effort_args(agent: Agent, effort: &str) -> Vec<String> {
     }
 }
 
-/// The overlord's effort on `agent`: the configured one when that is the
-/// configured agent, else that agent's default.
-fn effort_for(cfg: &Config, agent: Agent) -> String {
+/// The overlord's (model, effort) on `agent`: the configured ones when that
+/// is the configured agent (they are meant for it), else that agent's
+/// defaults.
+fn model_effort_for(cfg: &Config, agent: Agent) -> (String, String) {
     if cfg.overlord.agent.trim() == agent.name() {
-        cfg.overlord.effort.trim().to_string()
+        (
+            cfg.overlord.model.trim().to_string(),
+            cfg.overlord.effort.trim().to_string(),
+        )
     } else {
-        rlord_core::config::OverlordConfig::defaults_for(agent.name())
-            .1
-            .to_string()
+        let (m, e) = rlord_core::config::OverlordConfig::defaults_for(agent.name());
+        (m.to_string(), e.to_string())
     }
+}
+
+/// The overlord's effort on `agent` (see `model_effort_for`).
+fn effort_for(cfg: &Config, agent: Agent) -> String {
+    model_effort_for(cfg, agent).1
+}
+
+/// The effort the overlord was launched with, from the adapter flags in
+/// its launch spec ("": the agent's default).
+pub fn launched_effort(db: &Db, s: &Session) -> String {
+    let spec: Value = db
+        .launch_spec(&s.id)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let args: Vec<&str> = spec["extra_args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    effort_in_args(&args)
+}
+
+/// The effort `effort_args` put in `args`, if any.
+fn effort_in_args(args: &[&str]) -> String {
+    for w in args.windows(2) {
+        match w {
+            ["--effort", e] => return e.to_string(),
+            ["-c", kv] => {
+                if let Some(e) = kv.strip_prefix("model_reasoning_effort=") {
+                    return e.trim_matches('"').to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
 }
 
 /// Write the overlord's folder (instruction files, mcp.json, subagents);
@@ -233,22 +262,15 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             let agent_name = pick("agent").unwrap_or_else(|| cfg.overlord.agent.clone());
             let agent = Agent::named(&agent_name)?;
             agent.runs_overlord()?;
-            // The configured model and effort are for the configured agent;
-            // another agent gets its own defaults.
-            let configured = cfg.overlord.agent.trim() == agent.name();
-            let dflt_model = if configured {
-                cfg.overlord.model.trim()
-            } else {
-                rlord_core::config::OverlordConfig::defaults_for(agent.name()).0
-            };
+            let (dflt_model, dflt_effort) = model_effort_for(cfg, agent);
             // ("" given on purpose: the agent's own default.)
             let model = match params.get("model").and_then(Value::as_str) {
                 Some(m) => m.trim().to_string(),
-                None => dflt_model.to_string(),
+                None => dflt_model,
             };
             let effort = match params.get("effort").and_then(Value::as_str) {
                 Some(e) => e.trim().to_string(),
-                None => effort_for(cfg, agent),
+                None => dflt_effort,
             };
             let d = default_dir();
             let extra_args = write_files(&d, agent, &effort)?;
@@ -452,13 +474,7 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
             .filter(|a| a.runs_overlord().is_ok())
             .filter(|a| rlord_core::agents::install::missing(*a).is_none())
             .map(|a| {
-                let configured = cfg.overlord.agent.trim() == a.name();
-                let (m, e) = rlord_core::config::OverlordConfig::defaults_for(a.name());
-                let (model, effort) = if configured {
-                    (cfg.overlord.model.trim(), cfg.overlord.effort.trim())
-                } else {
-                    (m, e)
-                };
+                let (model, effort) = model_effort_for(cfg, a);
                 json!({
                     "name": a.name(), "label": a.label(),
                     "model": model, "effort": effort,
@@ -550,6 +566,7 @@ const RETIRED_FRONT: &str = "overlord-front-desk";
 /// `sync_tmux_names`). The old front desk is stopped and archived as an
 /// ordinary session. None: there was no mastermind, nothing to do (an
 /// overlord that never had one simply stays the overlord). Idempotent.
+/// Its writes belong in one transaction (`migrate`).
 pub fn migrate_rows(db: &Db) -> Result<Option<Migrated>> {
     // (Renamed whether or not a mastermind ever started.)
     for (old, new) in [
@@ -568,12 +585,14 @@ pub fn migrate_rows(db: &Db) -> Result<Option<Migrated>> {
     db.kv_delete("mastermind_model")?;
     // Remote Control lived on the mastermind, remembered here for one not
     // started yet: now it is the overlord's own wish, like any session's.
+    // (The kv goes once the wish is folded in; the caller commits both
+    // together.)
     let remote = db.kv_get("mastermind_remote")?.as_deref() == Some("1");
-    db.kv_delete("mastermind_remote")?;
     let Some(mind) = db.role_session(OLD_MASTERMIND)? else {
         if let Some(front) = db.role_session(ROLE)?.filter(|_| remote) {
             crate::remote::want(db, &front)?;
         }
+        db.kv_delete("mastermind_remote")?;
         return Ok(None);
     };
     let now = rlord_core::types::now_ms();
@@ -601,6 +620,7 @@ pub fn migrate_rows(db: &Db) -> Result<Option<Migrated>> {
     } else if remote {
         crate::remote::want(db, &db.resolve_ref(&mind.id)?)?;
     }
+    db.kv_delete("mastermind_remote")?;
     db.insert_event(
         &mind.id,
         now,
@@ -611,15 +631,49 @@ pub fn migrate_rows(db: &Db) -> Result<Option<Migrated>> {
     Ok(Some(out))
 }
 
-/// `migrate_rows`, then free the overlord's tmux name: the retired front
-/// desk's session is killed (the mastermind's is renamed onto the name by
-/// `sync_tmux_names`, which runs next at startup).
+/// Make the overlord one session at daemon start: `migrate_rows`, the
+/// config's old `mastermind_*` keys folded in, and the overlord's tmux name
+/// freed for it (the mastermind's session is renamed onto it by
+/// `sync_tmux_names`, which runs next).
 pub fn migrate(db: &Db) -> Result<()> {
-    if let Some(m) = migrate_rows(db)? {
-        if let Some(t) = m.front_tmux {
-            if let Err(e) = tmux::kill_session(&t) {
-                tracing::warn!(error = %e, "stopping the old front desk");
+    migrate_with(db, &tmux::has_session, &tmux::kill_session)?;
+    match rlord_core::config::fold_mastermind_keys_in(&paths::config_path()) {
+        Ok(moved) if !moved.is_empty() => {
+            tracing::info!(keys = ?moved, "config: the mastermind's settings are the overlord's now")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "moving mastermind_* keys in config.toml"),
+    }
+    Ok(())
+}
+
+/// `migrate`'s DB and tmux part, with tmux passed in (tests).
+fn migrate_with(
+    db: &Db,
+    live: &dyn Fn(&str) -> bool,
+    kill: &dyn Fn(&str) -> Result<()>,
+) -> Result<()> {
+    // The row changes commit only once the old front desk's tmux session is
+    // gone: a failed kill (or a crash before it) must not leave a retired,
+    // archived row holding a live session under the overlord's name.
+    db.atomically(|| {
+        if let Some(t) = migrate_rows(db)?.and_then(|m| m.front_tmux) {
+            if live(&t) {
+                kill(&t).with_context(|| format!("stopping the old front desk ({t})"))?;
             }
+        }
+        Ok(())
+    })?;
+    // A session under the overlord's name that no row claims (the front desk
+    // of an earlier, interrupted migration): stop it, so the overlord's
+    // session can be renamed onto the name.
+    if let Some(o) = session(db)? {
+        if o.tmux_session.as_deref() != Some(TMUX_NAME)
+            && !db.tmux_name_taken(TMUX_NAME)?
+            && live(TMUX_NAME)
+        {
+            tracing::info!("stopping an unclaimed {TMUX_NAME} tmux session");
+            kill(TMUX_NAME)?;
         }
     }
     Ok(())
@@ -717,6 +771,14 @@ mod tests {
     #[test]
     fn effort_flags_per_agent() {
         assert_eq!(effort_args(Agent::Claude, "low"), ["--effort", "low"]);
+        // And read back from a launch spec's flags.
+        for (agent, e) in [(Agent::Claude, "high"), (Agent::Codex, "low")] {
+            let args = effort_args(agent, e);
+            let mut all = vec!["--mcp-config", "/x/mcp.json"];
+            all.extend(args.iter().map(String::as_str));
+            assert_eq!(effort_in_args(&all), e);
+        }
+        assert_eq!(effort_in_args(&["--mcp-config", "/x"]), "");
         assert_eq!(
             effort_args(Agent::Codex, " low "),
             ["-c", "model_reasoning_effort=\"low\""]
@@ -802,6 +864,65 @@ mod tests {
         // Again: nothing to do.
         assert_eq!(migrate_rows(&db).unwrap(), None);
         assert_eq!(db.overlord().unwrap().unwrap().id, "01MIND");
+    }
+
+    /// The front desk's tmux session is stopped before the rows commit: a
+    /// failed kill leaves everything as it was, to retry on the next start.
+    #[test]
+    fn a_failed_kill_rolls_the_migration_back() {
+        use std::cell::RefCell;
+        let db = Db::open_in_memory().unwrap();
+        row(&db, "01FRONT", "overlord", "overlord-rlord", "/d/overlord");
+        row(&db, "01MIND", "mastermind", "mastermind-rlord", "/d/mm");
+        db.kv_set("mastermind_remote", "1").unwrap();
+        let fail = |_: &str| -> Result<()> { anyhow::bail!("tmux said no") };
+        assert!(migrate_with(&db, &|_| true, &fail).is_err());
+        assert_eq!(db.overlord().unwrap().unwrap().id, "01FRONT");
+        assert!(db.role_session("mastermind").unwrap().is_some());
+        let f = db.resolve_ref("01FRONT").unwrap();
+        assert_eq!(f.tmux_session.as_deref(), Some("overlord-rlord"));
+        assert_eq!(
+            db.kv_get("mastermind_remote").unwrap().as_deref(),
+            Some("1")
+        );
+        // It works next time: killed, then committed.
+        let killed = RefCell::new(Vec::new());
+        let kill = |t: &str| -> Result<()> {
+            killed.borrow_mut().push(t.to_string());
+            Ok(())
+        };
+        let live = |t: &str| t == "overlord-rlord" && !killed.borrow().iter().any(|k| k == t);
+        migrate_with(&db, &live, &kill).unwrap();
+        assert_eq!(*killed.borrow(), ["overlord-rlord"]);
+        assert_eq!(db.overlord().unwrap().unwrap().id, "01MIND");
+        assert_eq!(db.kv_get("mastermind_remote").unwrap(), None);
+    }
+
+    /// An interrupted migration left a live session under the overlord's
+    /// name that no row claims: it is stopped so the overlord's can take
+    /// the name. One a row claims is left alone.
+    #[test]
+    fn an_unclaimed_overlord_tmux_session_is_stopped() {
+        use std::cell::RefCell;
+        let db = Db::open_in_memory().unwrap();
+        row(&db, "01MIND", "overlord", "mastermind-rlord", "/d/mm");
+        let killed = RefCell::new(Vec::new());
+        let kill = |t: &str| -> Result<()> {
+            killed.borrow_mut().push(t.to_string());
+            Ok(())
+        };
+        migrate_with(&db, &|_| true, &kill).unwrap();
+        assert_eq!(*killed.borrow(), [TMUX_NAME]);
+        // Claimed by a row: kept.
+        killed.borrow_mut().clear();
+        row(&db, "01OTHER", "", TMUX_NAME, "/d/x");
+        migrate_with(&db, &|_| true, &kill).unwrap();
+        assert!(killed.borrow().is_empty());
+        // The overlord already has the name: nothing to do.
+        let db = Db::open_in_memory().unwrap();
+        row(&db, "01O", "overlord", TMUX_NAME, "/d/o");
+        migrate_with(&db, &|_| true, &kill).unwrap();
+        assert!(killed.borrow().is_empty());
     }
 
     #[test]

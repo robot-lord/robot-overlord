@@ -39,41 +39,56 @@ pub fn ask(d: &Daemon, params: &Value) -> Result<Value> {
 /// Type `text` into the overlord's pane (starting it if it has stopped).
 /// It must have been set up.
 pub fn send(d: &Daemon, text: &str) -> Result<Value> {
-    // Not while an idle overlord is being restarted fresh.
-    let _send = d.overlord_send.lock().expect("overlord send lock");
-    if d.db().overlord()?.is_none() {
-        bail!(
-            "no overlord yet: press {}-O to set one up (or N for the manual form)",
-            rlord_core::keys::alt_name()
-        );
-    }
-    let s = overlord::ensure(&d.db(), &d.config(), &json!({}))?;
-    let pane = s["tmux_session"]
-        .as_str()
-        .unwrap_or(overlord::TMUX_NAME)
-        .to_string();
-    d.changed();
     // A fresh or resumed overlord isn't listening until its SessionStart hook
-    // flips it out of `starting`.
+    // flips it out of `starting`. That wait is spent without the send lock
+    // (an idle fresh restart or a "continue it" may need it meanwhile); each
+    // look is under it, and the paste happens under the same hold as the
+    // look that found it ready.
     let start = Instant::now();
+    let mut started = false;
     loop {
-        let s = overlord::session(&d.db())?.context("overlord vanished")?;
-        if s.status != Status::Starting {
-            break;
+        {
+            // Not while an idle overlord is being restarted fresh. (Lock
+            // order: this, then the DB.)
+            let _send = d.overlord_send.lock().expect("overlord send lock");
+            let Some(s) = d.db().overlord()? else {
+                if started {
+                    bail!("overlord vanished");
+                }
+                bail!(
+                    "no overlord yet: press {}-O to set one up (or N for the manual form)",
+                    rlord_core::keys::alt_name()
+                );
+            };
+            let running = s.status != Status::Stopped
+                && s.tmux_session.as_deref().is_some_and(tmux::has_session);
+            let s = if !started || !running {
+                // Start it (or pick up fresh flags) once; again only if it
+                // stopped while we waited.
+                overlord::ensure(&d.db(), &d.config(), &json!({}))?;
+                started = true;
+                d.changed();
+                d.db().overlord()?.context("overlord vanished")?
+            } else {
+                s
+            };
+            if s.status != Status::Starting {
+                let pane = s.tmux_session.as_deref().unwrap_or(overlord::TMUX_NAME);
+                // Out of copy mode first (left there by the overlay): its
+                // keys would take the Enter that submits this.
+                let _ = tmux::cancel_mode(pane);
+                tmux::paste(pane, text)?;
+                // Let the paste land before submitting it.
+                std::thread::sleep(Duration::from_millis(150));
+                tmux::send_keys(pane, &["Enter"])?;
+                return Ok(json!({"sent": true}));
+            }
         }
         if start.elapsed() > READY_TIMEOUT {
             bail!("the overlord is still starting; try again in a moment");
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    // Out of copy mode first (left there by the overlay): its keys would
-    // take the Enter that submits this.
-    let _ = tmux::cancel_mode(&pane);
-    tmux::paste(&pane, text)?;
-    // Let the paste land before submitting it.
-    std::thread::sleep(Duration::from_millis(150));
-    tmux::send_keys(&pane, &["Enter"])?;
-    Ok(json!({"sent": true}))
 }
 
 /// kv key: recent form requests' hints and their provenance, by request id

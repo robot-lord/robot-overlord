@@ -205,7 +205,8 @@ impl OverlordConfig {
 /// `[overlord]` as written, which may be from when the overlord was two
 /// sessions (a fast front desk on `model` / `effort`, and a mastermind on
 /// `mastermind_model` / `mastermind_effort`). The mastermind is the overlord
-/// now, so its keys carry over; see `From<OverlordToml>`.
+/// now, so its keys carry over; see `From<OverlordToml>`. The daemon moves
+/// them onto the plain keys once (`fold_mastermind_keys_in`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct OverlordToml {
@@ -222,39 +223,113 @@ struct OverlordToml {
     height: Option<String>,
 }
 
-/// The old front desk's defaults: next to a `mastermind_*` key they are the
-/// removed seat's values (the old template wrote both), not a choice for
-/// the overlord.
-const OLD_FRONT_MODEL: &str = "sonnet";
-const OLD_FRONT_EFFORT: &str = "low";
-
 impl From<OverlordToml> for OverlordConfig {
-    /// What the user wrote wins; only the defaults changed. `model` /
-    /// `effort` win over the old `mastermind_*` keys, unless they are just
-    /// the old front desk's defaults sitting beside one: then the
-    /// mastermind's value carries over.
+    /// What the user wrote wins; only the defaults changed. An old
+    /// `mastermind_*` key wins over its plain counterpart, whatever that
+    /// says: the mastermind's settings are what the migrated overlord
+    /// already runs on (the plain keys were the removed front desk's).
     fn from(t: OverlordToml) -> Self {
         let agent = t.agent.unwrap_or_else(|| "claude".into());
         let (model_dflt, effort_dflt) = OverlordConfig::defaults_for(&agent);
-        let pick =
-            |own: Option<String>, old: Option<String>, front: &str, dflt: &str| match (own, old) {
-                (Some(o), Some(_)) if o.trim() != front => o,
-                (_, Some(m)) => m,
-                (Some(o), None) => o,
-                (None, None) => dflt.to_string(),
-            };
         OverlordConfig {
-            model: pick(t.model, t.mastermind_model, OLD_FRONT_MODEL, model_dflt),
-            effort: pick(t.effort, t.mastermind_effort, OLD_FRONT_EFFORT, effort_dflt),
+            model: t
+                .mastermind_model
+                .or(t.model)
+                .unwrap_or_else(|| model_dflt.into()),
+            effort: t
+                .mastermind_effort
+                .or(t.effort)
+                .unwrap_or_else(|| effort_dflt.into()),
             fresh_after_mins: t
-                .fresh_after_mins
-                .or(t.mastermind_fresh_after_mins)
+                .mastermind_fresh_after_mins
+                .or(t.fresh_after_mins)
                 .unwrap_or(15),
             width: t.width.unwrap_or_else(|| "90%".into()),
             height: t.height.unwrap_or_else(|| "85%".into()),
             agent,
         }
     }
+}
+
+/// The two-session overlord's keys and the overlord's own they become.
+const MASTERMIND_KEYS: &[(&str, &str)] = &[
+    ("mastermind_model", "model"),
+    ("mastermind_effort", "effort"),
+    ("mastermind_fresh_after_mins", "fresh_after_mins"),
+];
+
+/// Move the old `mastermind_*` keys in the config file at `path` onto the
+/// overlord's own (`model`, `effort`, `fresh_after_mins`), replacing those,
+/// so later edits to them take effect. Keeps the rest of the file as
+/// written; writes only when something moved, and only if what loads is
+/// unchanged. Returns the keys moved (none: nothing to do, or no file).
+pub fn fold_mastermind_keys_in(path: &std::path::Path) -> Result<Vec<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    match fold_mastermind_keys(&text)? {
+        Some((out, moved)) => {
+            write_config(path, &out)?;
+            Ok(moved)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `text` with the `mastermind_*` keys moved (see `fold_mastermind_keys_in`);
+/// None when it has none.
+fn fold_mastermind_keys(text: &str) -> Result<Option<(String, Vec<String>)>> {
+    let mut doc: toml_edit::DocumentMut = text.parse().context("parsing config.toml")?;
+    let has_old =
+        |t: &dyn toml_edit::TableLike| MASTERMIND_KEYS.iter().any(|(o, _)| t.contains_key(o));
+    if !doc
+        .get("overlord")
+        .and_then(|i| i.as_table_like())
+        .is_some_and(has_old)
+    {
+        return Ok(None);
+    }
+    if let Some(t) = doc
+        .get("overlord")
+        .and_then(|i| i.as_inline_table())
+        .cloned()
+    {
+        doc["overlord"] = toml_edit::Item::Table(t.into_table());
+    }
+    let table = doc["overlord"]
+        .as_table_mut()
+        .context("[overlord] isn't a table")?;
+    let mut moved = Vec::new();
+    for (old, new) in MASTERMIND_KEYS {
+        let Some(mut v) = table.remove(old).and_then(|i| i.into_value().ok()) else {
+            continue;
+        };
+        match table.get_mut(new).and_then(|i| i.as_value_mut()) {
+            // Keep the line's own comment.
+            Some(cur) => {
+                *v.decor_mut() = cur.decor().clone();
+                *cur = v;
+            }
+            None => table[new] = toml_edit::Item::Value(v),
+        }
+        moved.push(format!("{old} -> {new}"));
+    }
+    let out = doc.to_string();
+    let before = toml::from_str::<Config>(text).context("config.toml doesn't load")?;
+    let after = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+    let key = |c: &Config| {
+        (
+            c.overlord.model.clone(),
+            c.overlord.effort.clone(),
+            c.overlord.fresh_after_mins,
+        )
+    };
+    if key(&before) != key(&after) {
+        anyhow::bail!("moving the mastermind_* keys would change the overlord's settings");
+    }
+    Ok(Some((out, moved)))
 }
 
 impl Default for OverlordConfig {
@@ -769,8 +844,7 @@ mod tests {
         // Nothing set: the new defaults.
         let d = o("");
         assert_eq!((d.model.as_str(), d.effort.as_str()), ("opus", "low"));
-        // The old template, as written: the mastermind carries over (the
-        // front desk's sonnet / low are the removed seat's).
+        // The old template, as written: the mastermind carries over.
         let t = o("[overlord]\nmodel = \"sonnet\"\neffort = \"low\"\n\
                    mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
                    mastermind_fresh_after_mins = 30\n");
@@ -779,12 +853,13 @@ mod tests {
         // Only the old keys.
         let m = o("[overlord]\nmastermind_model = \"fable\"\nmastermind_effort = \"high\"\n");
         assert_eq!((m.model.as_str(), m.effort.as_str()), ("fable", "high"));
-        // An explicit model / effort wins over the old keys.
+        // An old key wins over the plain one, whatever that says: it is
+        // what the migrated overlord runs on.
         let e = o("[overlord]\nmodel = \"haiku\"\neffort = \"max\"\n\
                    mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
                    fresh_after_mins = 0\nmastermind_fresh_after_mins = 30\n");
-        assert_eq!((e.model.as_str(), e.effort.as_str()), ("haiku", "max"));
-        assert_eq!(e.fresh_after_mins, 0);
+        assert_eq!((e.model.as_str(), e.effort.as_str()), ("opus", "medium"));
+        assert_eq!(e.fresh_after_mins, 30);
         // On its own, sonnet is a choice.
         assert_eq!(o("[overlord]\nmodel = \"sonnet\"\n").model, "sonnet");
         // Another agent: its own defaults; an old tmux key is ignored.
@@ -792,6 +867,58 @@ mod tests {
         assert_eq!((c.model.as_str(), c.effort.as_str()), ("", "low"));
         assert_eq!(OverlordConfig::defaults_for("opencode"), ("", ""));
         assert!(OverlordConfig::efforts_for("opencode").is_empty());
+    }
+
+    /// The daemon moves the old keys onto the plain ones once; after that,
+    /// editing `model` / `effort` takes effect.
+    #[test]
+    fn mastermind_keys_are_folded_in_once() {
+        let old = "# mine\n[overlord]\nmodel = \"sonnet\"   # front desk\neffort = \"low\"\n\
+                   mastermind_model = \"opus\"\nmastermind_effort = \"medium\"\n\
+                   mastermind_fresh_after_mins = 30\nwidth = \"80%\"\n";
+        let (out, moved) = fold_mastermind_keys(old).unwrap().expect("keys moved");
+        assert_eq!(moved.len(), 3);
+        assert!(!out.contains("mastermind"), "{out}");
+        assert!(
+            out.starts_with("# mine\n") && out.contains("# front desk"),
+            "{out}"
+        );
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            (c.overlord.model.as_str(), c.overlord.effort.as_str()),
+            ("opus", "medium")
+        );
+        assert_eq!(
+            (c.overlord.fresh_after_mins, c.overlord.width.as_str()),
+            (30, "80%")
+        );
+        // Nothing left to move.
+        assert!(fold_mastermind_keys(&out).unwrap().is_none());
+        assert!(fold_mastermind_keys("").unwrap().is_none());
+        // Afterwards an edit to `model` takes.
+        let edited = set_in(&out, "overlord", "model", "sonnet").unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&edited).unwrap().overlord.model,
+            "sonnet"
+        );
+        // Only an old key, no plain one: it is added.
+        let (out, _) = fold_mastermind_keys("[overlord]\nmastermind_effort = \"high\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&out).unwrap().overlord.effort,
+            "high"
+        );
+        // On disk: written in place; a missing file is nothing to do.
+        let dir = std::env::temp_dir().join(format!("rlord-fold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        assert!(fold_mastermind_keys_in(&p).unwrap().is_empty());
+        std::fs::write(&p, old).unwrap();
+        assert_eq!(fold_mastermind_keys_in(&p).unwrap().len(), 3);
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("mastermind"));
+        assert!(fold_mastermind_keys_in(&p).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The setup dialog's choice is what loads afterwards, whatever old

@@ -3,8 +3,8 @@
 # Codex CLI support
 
 Goal: Codex sessions are first-class in rlord, beside Claude Code: launch,
-resume, status, list, preview, search, summaries, import, messaging; later a
-Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
+resume, status, list, preview, search, summaries, import, messaging; then
+the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
 ~/.codex files, its app-server schema) and its docs.
 
 ## What rlord uses from Claude, and Codex's counterpart
@@ -21,7 +21,7 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
 | Import | scan Claude project dirs | `threads` table has cwd, title, first message, git branch, model | easier than Claude |
 | Sub-agents | hooks + `<id>/subagents/` files | `threads` rows with agent_nickname/role, `thread_spawn_edges`; Subagent* hooks | later |
 | Messaging a session | overlord's Claude peer tools (`SendMessage`) | **`codex queue --thread <id> --message …`**: delivered without typing | better than Claude's; new rlord tool |
-| Overlord seat | `--mcp-config`, `--allowedTools`, `--effort`, `.claude/agents` | `-c mcp_servers.rlord.*` + `default_tools_approval_mode="approve"`, `-c model_reasoning_effort`, AGENTS.md (already written), `[agents]` | doable; later phase |
+| Overlord | `--mcp-config`, `--allowedTools`, `--effort`, `.claude/agents` | `-c mcp_servers.rlord.*` + `default_tools_approval_mode="approve"`, `-c model_reasoning_effort`, AGENTS.md (already written), `[agents]` | doable; later phase |
 | Models | opus/sonnet/haiku catalog | `codex debug models` / `models_cache.json` | per-agent catalog |
 | Remote Control | Claude app bridge | `codex remote-control` (experimental) | later; report unavailable |
 | Key shadows | Claude defaults + keybindings.json | `tui.keymap.*` (only `alt-r` default) | later; verify Alt-O/Alt-D by hand |
@@ -43,6 +43,9 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
    session now. Its Codex defaults are in place: Codex's default model
    with `-c model_reasoning_effort="low"`, `overlord::effort_args`. What's
    missing is the MCP and tool-approval wiring, then `Agent::runs_overlord`.)
+   **Requirement before the repo goes public (Brandon's decision):** the
+   overlord must run on Codex, and preferably on OpenCode too. That is the
+   next work after the single-overlord PR (#7).
 5. Later: Codex Remote Control, key shadows, Gemini.
 
 ## Decisions (with Brandon)
@@ -56,7 +59,10 @@ Codex overlord seat. Researched against codex-cli 0.167.2 (local binary,
 - New sessions: `[session] agent` is the default; the form gets an agent hint
   and the overlord picks Codex when asked.
 - First round: phases 1 and 2 in one PR (0.19.0-dev.1). Import, messaging,
-  sub-agents and Codex overlord seats follow.
+  sub-agents and a Codex overlord follow.
+- The overlord running on Codex (and preferably OpenCode) is required
+  before the repo goes public; it is the next work after PR #7 (one
+  overlord). See phase 4.
 
 ## Progress
 

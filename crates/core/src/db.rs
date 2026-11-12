@@ -317,13 +317,14 @@ impl Db {
     }
 
     /// Every agent conversation id rlord tracks, live or archived, including
-    /// ones a session moved on from (`/clear` starts a new conversation; the
-    /// hook logs the switch as `agent_session_changed`).
+    /// ones a session moved on from: a `/clear` or a fresh restart logs
+    /// `fresh_conversation`, any other switch (a resume)
+    /// `agent_session_changed`, each with the old id as `from`.
     pub fn agent_session_ids(&self) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT agent_session FROM sessions WHERE agent_session IS NOT NULL \
              UNION SELECT json_extract(payload, '$.from') FROM events \
-             WHERE kind = 'agent_session_changed' \
+             WHERE kind IN ('agent_session_changed', 'fresh_conversation') \
                AND json_extract(payload, '$.from') IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -359,6 +360,17 @@ impl Db {
             params![id, name, ts],
         )?;
         Ok(())
+    }
+
+    /// Run `f` in one transaction: every write it makes through this `Db`
+    /// commits together if it returns `Ok`, and none of them if it fails.
+    /// (Not re-entrant: `f` must not call another `atomically` or a method
+    /// that opens its own transaction.)
+    pub fn atomically<T>(&self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let v = f()?;
+        tx.commit()?;
+        Ok(v)
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -1217,6 +1229,30 @@ mod tests {
             role: "",
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_cleared_conversation_stays_tracked() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01a", "a");
+        db.insert_event(
+            "01a",
+            2,
+            "fresh_conversation",
+            r#"{"from":"pre-clear","to":"uuid-1","reason":"clear"}"#,
+        )
+        .unwrap();
+        db.insert_event(
+            "01a",
+            3,
+            "agent_session_changed",
+            r#"{"from":"resumed-away","to":"uuid-1"}"#,
+        )
+        .unwrap();
+        let ids = db.agent_session_ids().unwrap();
+        for id in ["uuid-1", "pre-clear", "resumed-away"] {
+            assert!(ids.contains(id), "{id} tracked: {ids:?}");
+        }
     }
 
     #[test]

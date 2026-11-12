@@ -469,6 +469,8 @@ impl Daemon {
                     };
                     let mut v = serde_json::to_value(&o)?;
                     v["conversations"] = recall::summary(&db, &o);
+                    // What it runs on now (config may since have changed).
+                    v["effort"] = json!(overlord::launched_effort(&db, &o));
                     Ok(v)
                 })
             }

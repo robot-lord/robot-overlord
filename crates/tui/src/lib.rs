@@ -195,8 +195,11 @@ struct App {
     /// while filtering): unnumbered, so digits count the fleet below it.
     overlord_rows: usize,
     /// The overlord's conversations (`overlord.conversations`: the current
-    /// one and the earlier ones), loaded while its row is selected.
+    /// one and the earlier ones), loaded when its row is selected and again
+    /// on each daemon change notice (not on the preview's timer).
     convs: Value,
+    /// `convs` needs reloading (something changed since it was loaded).
+    convs_stale: bool,
     /// Which of them the preview shows: 0 the live pane, n the nth earlier
     /// conversation (newest first).
     conv_sel: usize,
@@ -254,6 +257,7 @@ impl App {
             system_dark: Default::default(),
             overlord_rows: 0,
             convs: Value::Null,
+            convs_stale: true,
             conv_sel: 0,
             conv_text: None,
             pending_select: None,
@@ -298,6 +302,9 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        // (A daemon change notice or an action: the overlord's
+        // conversations may have changed too.)
+        self.convs_stale = true;
         let q = self.query();
         // The selection follows the session, not the row: a re-sort or the
         // overlord rows appearing must not move it to another session.
@@ -459,6 +466,7 @@ impl App {
         // Another session: its preview starts at the end again.
         if self.preview_for != self.selected_id() {
             self.preview_scroll = 0;
+            self.convs_stale = true;
         }
         self.preview_for = self.selected_id();
         // Remember where the user is (once the highlight settles), so a
@@ -472,10 +480,15 @@ impl App {
             self.agents.clear();
             return;
         };
-        // The overlord's conversations, while its row is selected.
+        // The overlord's conversations, while its row is selected: loaded
+        // when it gets selected or something changed, not on every tick.
         if is_overlord_role(&s) {
-            self.convs = client_call(&paths::socket_path(), "overlord.conversations", json!({}))
-                .unwrap_or(Value::Null);
+            if self.convs_stale || self.convs.is_null() {
+                self.convs =
+                    client_call(&paths::socket_path(), "overlord.conversations", json!({}))
+                        .unwrap_or(Value::Null);
+                self.convs_stale = false;
+            }
             self.conv_sel = self.conv_sel.min(self.earlier_convs().len());
         } else {
             self.convs = Value::Null;
@@ -1868,7 +1881,8 @@ impl App {
                     ),
                     sep(),
                     Span::styled(
-                        match self.config.overlord.effort.trim() {
+                        // What it was launched with, not the config's.
+                        match s["effort"].as_str().unwrap_or("").trim() {
                             "" => "default effort".to_string(),
                             e => format!("effort {e}"),
                         },
@@ -2280,8 +2294,9 @@ fn edit_in_editor(
 }
 
 /// The Groups column of a row: its tags when they fit in `width`, else how
-/// many groups it is in ("3 groups"), never a tag cut mid-word. All of them
-/// show in the details pane and the groups tab.
+/// many groups it is in ("3 groups", or just "3" when that doesn't fit
+/// either, "…" when not even that does), never a tag cut mid-word. All of
+/// them show in the details pane and the groups tab.
 fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
     // `#a #b`: a `#` each, a space between.
@@ -2290,13 +2305,16 @@ fn tags_cell(tags: &[&str], width: usize) -> Line<'static> {
     if need <= width {
         return Line::from(theme::tag_spans(tags.iter().copied()));
     }
-    Line::from(Span::styled(
-        match tags.len() {
-            1 => "1 group".to_string(),
-            n => format!("{n} groups"),
-        },
-        theme::muted(),
-    ))
+    let n = tags.len();
+    let count = match n {
+        1 => "1 group".to_string(),
+        n => format!("{n} groups"),
+    };
+    let text = [count, n.to_string(), "…".to_string()]
+        .into_iter()
+        .find(|t| t.width() <= width)
+        .unwrap_or_default();
+    Line::from(Span::styled(text, theme::muted()))
 }
 
 /// The overlord's conversation in a narrow column: "fresh 2h · 14" (when
@@ -2855,6 +2873,17 @@ mod tests {
         assert_eq!(text(&["release", "tooling"]), "2 groups");
         assert_eq!(text(&["release", "tooling", "wip"]), "3 groups");
         assert_eq!(text(&["a-very-long-group-name"]), "1 group");
+        // A column too narrow for the count's words: the number, then "…".
+        let narrow = |tags: &[&str], w| -> String {
+            tags_cell(tags, w)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(narrow(&["release", "tooling"], 5), "2");
+        assert_eq!(narrow(&["a"; 12], 1), "…");
+        assert_eq!(narrow(&["release"], 0), "");
         assert_eq!(fresh_short(&json!({"earlier": 0})), "");
         let c = json!({"earlier": 3, "fresh_at": rlord_core::types::now_ms() - 7_200_000});
         assert_eq!(fresh_short(&c), "fresh 2h · 3");

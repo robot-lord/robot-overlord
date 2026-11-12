@@ -122,8 +122,15 @@ pub fn summary(db: &Db, o: &Session) -> Value {
     };
     let (_, earlier) = from_changes(&changes, o.agent_session.as_deref());
     let last = earlier.first();
+    // A fresh start: a restart on a new conversation or a `/clear`, not a
+    // switch to another one (going back to an earlier one isn't "fresh").
+    let fresh_at = changes
+        .iter()
+        .rev()
+        .find(|(_, kind, p)| kind == "fresh_conversation" && p["reason"] != "continued")
+        .map(|(ts, _, _)| *ts);
     json!({
-        "fresh_at": changes.last().map(|(ts, _, _)| *ts),
+        "fresh_at": fresh_at,
         "earlier": earlier.len(),
         "reason": last.and_then(|c| c.ended.clone()),
         "why": last.map(why),
@@ -263,12 +270,16 @@ const LIST_ROWS: usize = 30;
 
 /// `overlord.conversations`: the current conversation and the earlier ones
 /// (newest first, the first `LIST_ROWS`), each with when it started and
-/// ended, why, its turns and its first prompt.
+/// ended, why, its turns and its first prompt. The current one's transcript
+/// is still growing, so it isn't read (no turns or first prompt).
 pub fn conversations_rpc(d: &Daemon) -> Result<Value> {
     let (o, cur, earlier) = load(d)?;
     let row = |c: &Conv, current: bool| {
         let path = transcript_of(&d.db(), &o, &c.id);
-        let dg = path.as_deref().map(digest).unwrap_or_default();
+        let dg = match &path {
+            Some(p) if !current => digest(p),
+            _ => Digest::default(),
+        };
         json!({
             "id": c.id, "current": current,
             "started_at": c.started_at.or(dg.first_at).or(current.then_some(o.created_at)),
@@ -377,7 +388,9 @@ pub fn recall(d: &Daemon, params: &Value) -> Result<Value> {
             Some((c, digest(&p)))
         }
         _ => earlier.iter().take(20).find_map(|c| {
-            let dg = digest(&transcript_of(&d.db(), &o, &c.id)?);
+            // (The path first: the DB isn't held while the file is read.)
+            let p = transcript_of(&d.db(), &o, &c.id)?;
+            let dg = digest(&p);
             (dg.turns > 0).then_some((c, dg))
         }),
     };
@@ -442,9 +455,17 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     db.set_agent_session(&o.id, &c.id, "hook")?;
     db.upsert_transcript_source(&o.id, &path.to_string_lossy())?;
     db.kv_set(overlord::FRESH_AT, &now.to_string())?;
+    // Exactly one restart onto the conversation: `ensure` restarts it when
+    // it isn't running (stopped, or its pane is gone) and leaves a running
+    // one alone, which is restarted here.
+    let cur = db.resolve_ref(&o.id)?;
+    let running = cur.status != Status::Stopped
+        && cur
+            .tmux_session
+            .as_deref()
+            .is_some_and(rlord_core::tmux::has_session);
     let v = overlord::ensure(&db, &d.config(), &json!({}))?;
-    // Running: restart it onto the conversation (stopped: `ensure` did).
-    let v = if o.status != Status::Stopped {
+    let v = if running {
         crate::methods::session_restart(&db, &json!({"ref": o.id}))?
     } else {
         v
@@ -532,6 +553,47 @@ mod tests {
         assert_eq!(fresh_label(&json!({"fresh_at": null, "earlier": 0})), None);
         let l = fresh_label(&json!({"fresh_at": now_ms() - 2 * 3_600_000, "earlier": 14})).unwrap();
         assert_eq!(l, "fresh 2h ago · 14 earlier");
+    }
+
+    /// "fresh N ago" counts fresh starts only: going back to an earlier
+    /// conversation (or a resume) isn't one.
+    #[test]
+    fn fresh_at_is_the_last_fresh_start() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01O",
+            name: "overlord",
+            agent: "claude",
+            agent_session: Some("c"),
+            project_path: "/d/o",
+            tmux_session: Some("overlord-rlord"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "overlord",
+        })
+        .unwrap();
+        let add = |ts, kind, p: Value| db.insert_event("01O", ts, kind, &p.to_string()).unwrap();
+        add(
+            10,
+            "fresh_conversation",
+            json!({"from": "a", "to": "b", "reason": "idle"}),
+        );
+        add(
+            20,
+            "fresh_conversation",
+            json!({"from": "b", "to": "x", "reason": "clear"}),
+        );
+        add(
+            30,
+            "fresh_conversation",
+            json!({"from": "x", "to": "a", "reason": "continued"}),
+        );
+        add(40, "agent_session_changed", json!({"from": "a", "to": "c"}));
+        let o = db.resolve_ref("01O").unwrap();
+        assert_eq!(summary(&db, &o)["fresh_at"], 20);
     }
 
     fn line(ts: &str, role: &str, text: &str) -> String {
