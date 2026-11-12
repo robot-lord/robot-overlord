@@ -454,6 +454,43 @@ impl Agent {
     pub fn importable(self) -> bool {
         matches!(self, Agent::Claude)
     }
+
+    // ---- its screen ----
+
+    /// Its pane (`screen`, as `capture-pane` gives it) is at its input
+    /// prompt: text pasted now, then Enter, becomes a prompt, and doesn't
+    /// answer a dialog. A dialog takes Enter as its highlighted choice
+    /// (Claude's "Yes, proceed", Codex's "Yes, proceed", OpenCode's "Allow
+    /// once"), and the status may not say one is up (a Codex session
+    /// without hooks reads as working while it asks).
+    ///
+    /// - Codex: its composer is the bottom input line (`codex::composer_shown`).
+    /// - Claude, OpenCode: no dialog is on screen
+    ///   (`claude::dialog_shown`, `opencode::dialog_shown`).
+    pub fn at_prompt(self, screen: &str) -> bool {
+        match self {
+            Agent::Claude => !claude::dialog_shown(screen),
+            Agent::Codex => codex::composer_shown(screen),
+            Agent::OpenCode => !opencode::dialog_shown(screen),
+        }
+    }
+}
+
+/// The last `n` non-blank lines of a screen, bottom first, without
+/// trailing spaces: where an agent draws its input area and its dialogs.
+pub fn bottom_lines(screen: &str, n: usize) -> impl Iterator<Item = &str> {
+    screen
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .take(n)
+}
+
+/// `text` starts with a numbered choice: digits, then `.` (`1. Yes`).
+pub fn numbered_choice(text: &str) -> bool {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && text[digits..].starts_with('.')
 }
 
 /// The agent a transcript file belongs to (see `Format::of`).

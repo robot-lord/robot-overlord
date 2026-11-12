@@ -356,6 +356,22 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     }
 }
 
+// ---- its screen ----
+
+/// A dialog is on Claude Code's screen: a permission prompt ("Do you want
+/// to proceed?"), a question (`AskUserQuestion`), plan approval, the
+/// folder-trust question. Each lists numbered choices with `❯` at the
+/// highlighted one (`❯ 1. Yes`), in place of the input box at the bottom,
+/// and Enter picks it. Only the bottom of the screen is looked at (a box's
+/// `│` border is allowed for).
+pub fn dialog_shown(screen: &str) -> bool {
+    super::bottom_lines(screen, 15).any(|l| {
+        l.trim_start_matches(|c: char| c.is_whitespace() || c == '│')
+            .strip_prefix('❯')
+            .is_some_and(|rest| super::numbered_choice(rest.trim_start()))
+    })
+}
+
 // ---- archive summaries ----
 
 /// `claude -p` flags for a one-shot answer with no tools and nothing saved.
@@ -490,6 +506,28 @@ pub fn scan_subagents_read(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_dialog_is_told_from_the_input_box() {
+        let idle = "● Done: the tests pass.\n\n\
+            ────────────────────────────────────────\n\
+            > \n\
+            ────────────────────────────────────────\n\
+              ? for shortcuts\n";
+        assert!(!dialog_shown(idle));
+        // A reply that ends in a list isn't a dialog (no `❯`).
+        let list = "● Two options:\n  1. Retry\n  2. Skip\n\n> \n  ? for shortcuts\n";
+        assert!(!dialog_shown(list));
+        let permission = " Bash command\n\n   touch probe.txt\n   Create a probe file\n\n\
+             Do you want to proceed?\n\
+             ❯ 1. Yes\n\
+               2. Yes, and don't ask again for touch commands in /tmp/x\n\
+               3. No, and tell Claude what to do differently (esc)\n";
+        assert!(dialog_shown(permission));
+        // Older versions draw it in a box; the user moved to option 2.
+        let boxed = "╭──────────────────────╮\n│ Do you want to proceed? │\n│   1. Yes │\n│ ❯ 2. No  │\n╰──────────────────────╯\n";
+        assert!(dialog_shown(boxed));
+    }
 
     #[test]
     fn interruptions_are_not_prompts() {

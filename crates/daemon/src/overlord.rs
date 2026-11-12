@@ -191,7 +191,10 @@ fn subagent_parts(text: &str) -> (String, String, String) {
 /// and subagents); return the adapter flags `agent` must always be
 /// launched with. Every agent's files are written, whichever runs it: they
 /// don't read each other's.
-fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
+/// `confirm_sends` (`[overlord] confirm_sends`): `send_to_session` asks the
+/// user each time, in each agent's terms; otherwise it runs unasked like
+/// rlord's other tools.
+fn write_files(d: &Path, agent: Agent, effort: &str, confirm_sends: bool) -> Result<Vec<String>> {
     std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     let bin = methods::rlord_bin();
     // This daemon's socket, as it resolved it: `rlord mcp` is told, so a
@@ -214,6 +217,9 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
                 .iter()
                 .map(|(f, _)| f.trim_end_matches(".md"))
                 .collect::<Vec<_>>(),
+            // (The user's own global agents get the folder's rules too.)
+            &opencode::user_agents(),
+            confirm_sends,
         ))?,
     )?;
 
@@ -266,19 +272,38 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
             // rlord's own `send_to_session`, as on every agent. Anything that
             // writes or runs commands still asks.
             "--allowedTools".into(),
-            "mcp__rlord,Read,Grep,Glob".into(),
+            claude_allowed_tools(confirm_sends),
         ],
         // The same surface in Codex's terms: rlord's tools without a
         // prompt, reading free, writes ask. (Its folder as Codex sees it:
         // the resolved path.)
         Agent::Codex => {
             let dir = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
-            codex::overlord_args(&bin, &socket, &dir.to_string_lossy())
+            codex::overlord_args(&bin, &socket, &dir.to_string_lossy(), confirm_sends)
         }
         Agent::OpenCode => Vec::new(),
     };
     args.extend(effort_args(agent, effort));
     Ok(args)
+}
+
+/// Claude's `--allowedTools`: rlord's MCP server (`mcp__rlord`, every tool)
+/// and the read-only file tools. With `confirm_sends`, rlord's tools are
+/// listed one by one without `send_to_session`, which then asks.
+fn claude_allowed_tools(confirm_sends: bool) -> String {
+    let mut tools = vec!["mcp__rlord".to_string()];
+    if confirm_sends {
+        tools = crate::mcp::tools()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str())
+            .filter(|n| *n != "send_to_session")
+            .map(|n| format!("mcp__rlord__{n}"))
+            .collect();
+    }
+    tools.extend(["Read", "Grep", "Glob"].map(String::from));
+    tools.join(",")
 }
 
 /// Make sure the overlord exists and is running; returns its session.
@@ -360,7 +385,7 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                 None => dflt_effort,
             };
             let d = default_dir();
-            let extra_args = write_files(&d, agent, &effort)?;
+            let extra_args = write_files(&d, agent, &effort, cfg.overlord.confirm_sends)?;
             // Created now, with a model the user chose (or the default): never
             // "offer the default" back to it.
             db.kv_set(DEFAULT_DECLINED, cfg.overlord.model.trim())?;
@@ -422,7 +447,12 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 /// launch spec: its next start (a restart, a fresh conversation) has them.
 fn refresh_launch(db: &Db, cfg: &Config, s: &Session) -> Result<()> {
     let agent = Agent::named(&s.agent)?;
-    let extra_args = write_files(Path::new(&s.project_path), agent, &effort_for(cfg, agent))?;
+    let extra_args = write_files(
+        Path::new(&s.project_path),
+        agent,
+        &effort_for(cfg, agent),
+        cfg.overlord.confirm_sends,
+    )?;
     let mut spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     spec["extra_args"] = json!(extra_args);
     db.set_launch_spec(&s.id, &spec.to_string())
@@ -507,6 +537,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     {
         // Nothing may be pasted into the pane while it's being replaced.
         let _send = d.overlord_send.lock().expect("overlord send lock");
+        let _session = d.sessions.lock(&s.id);
         let db = d.db();
         // Re-check under the lock: a request may have just landed.
         let cur = session(&db)?.context("overlord vanished")?;
@@ -876,13 +907,41 @@ mod tests {
         }
     }
 
+    /// `[overlord] confirm_sends`: Claude lists rlord's tools one by one,
+    /// without `send_to_session` (which then asks); Codex and OpenCode ask
+    /// for that one tool (their own tests).
+    #[test]
+    fn sends_can_be_confirmed() {
+        assert_eq!(claude_allowed_tools(false), "mcp__rlord,Read,Grep,Glob");
+        let on = claude_allowed_tools(true);
+        let tools: Vec<&str> = on.split(',').collect();
+        assert!(!tools.contains(&"mcp__rlord") && !on.contains("send_to_session"));
+        assert!(tools.contains(&"mcp__rlord__list_sessions") && tools.contains(&"Read"));
+        assert_eq!(
+            tools.len(),
+            crate::mcp::tools().as_array().unwrap().len() - 1 + 3
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("overlord");
+        let codex = write_files(&d, Agent::Codex, "", true).unwrap();
+        assert!(codex
+            .iter()
+            .any(|a| a == "mcp_servers.rlord.tools.send_to_session.approval_mode=\"prompt\""));
+        write_files(&d, Agent::OpenCode, "", true).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
+                .unwrap();
+        let rules = cfg["permissions"].as_array().unwrap();
+        assert_eq!(rules.last().unwrap()["action"], "rlord_send_to_session");
+    }
+
     /// Each agent gets rlord's MCP server with its tools pre-allowed, in
     /// its own terms, and its subagents in its own place.
     #[test]
     fn the_folder_is_written_for_every_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("overlord");
-        let claude = write_files(&d, Agent::Claude, "low").unwrap();
+        let claude = write_files(&d, Agent::Claude, "low", false).unwrap();
         assert_eq!(claude[0], "--mcp-config");
         assert!(claude.contains(&"--allowedTools".to_string()));
         assert_eq!(
@@ -890,7 +949,7 @@ mod tests {
             "low"
         );
 
-        let codex = write_files(&d, Agent::Codex, "low").unwrap();
+        let codex = write_files(&d, Agent::Codex, "low", false).unwrap();
         let has = |needle: &str| codex.iter().any(|a| a.contains(needle));
         assert!(has("mcp_servers.rlord.command="));
         assert!(has(
@@ -910,7 +969,9 @@ mod tests {
         assert!(has(&format!("projects={{\"{}\"=", real.display())));
 
         // OpenCode: no flags at all; the folder's config.
-        assert!(write_files(&d, Agent::OpenCode, "").unwrap().is_empty());
+        assert!(write_files(&d, Agent::OpenCode, "", false)
+            .unwrap()
+            .is_empty());
         let cfg: Value =
             serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
                 .unwrap();

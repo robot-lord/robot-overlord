@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use rlord_core::agents::Agent;
 use rlord_core::tmux;
 use rlord_core::types::Status;
 
+use crate::send::{type_into, Checks, Typed};
 use crate::{overlord, Daemon};
 
 /// How long to wait for a just-(re)started overlord to accept input.
@@ -53,7 +55,7 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
             // Not while an idle overlord is being restarted fresh. (Lock
             // order: this, then the DB.)
             let _send = d.overlord_send.lock().expect("overlord send lock");
-            let Some(s) = d.db().overlord()? else {
+            let Some(id) = d.db().overlord()?.map(|s| s.id) else {
                 if started {
                     bail!("overlord vanished");
                 }
@@ -62,6 +64,10 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     rlord_core::keys::alt_name()
                 );
             };
+            // Its session's lock (locks.rs: after the send lock, before the
+            // DB), then a fresh look.
+            let _session = d.sessions.lock(&id);
+            let s = d.db().overlord()?.context("overlord vanished")?;
             let running = s.status != Status::Stopped
                 && s.tmux_session.as_deref().is_some_and(tmux::has_session);
             let s = if !started || !running {
@@ -97,7 +103,21 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                 // Its agent pane (not whichever pane is active); out of
                 // copy mode first (left there by the overlay).
                 let pane = tmux::pane_id(name)?;
-                crate::send::type_into(&s.id, &pane, text)?;
+                // Its screen, right before: a dialog takes the Enter as its
+                // answer, whatever the status says (a Codex overlord
+                // without hooks shows working while it asks). It may be
+                // working: Claude and Codex take a message mid-turn.
+                let checks = Checks {
+                    agent: Agent::named(&s.agent)?,
+                    settle: false,
+                    attached: None,
+                };
+                if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
+                    bail!(
+                        "not sent to the overlord: {why}. Answer it first ({}-O)",
+                        rlord_core::keys::alt_name()
+                    );
+                }
                 return Ok(json!({"sent": true}));
             }
         }

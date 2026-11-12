@@ -158,9 +158,9 @@ fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
     // Up means its composer is on screen, not a startup dialog in front of
     // it (where typed text would land on the wrong thing). Read without
     // the DB lock.
-    if !composer_up(s) {
+    let Some(composer_seen) = screen_settles(s, since, now) else {
         return Ok(false);
-    }
+    };
     let db = d.db();
     // Moved on meanwhile (a hook, a restart): not ours to say.
     let cur = db.resolve_ref(&s.id)?;
@@ -168,7 +168,12 @@ fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
         return Ok(false);
     }
     db.set_status(&s.id, Status::Idle, now)?;
-    db.insert_event(&s.id, now, "awaiting_first_prompt", r#"{"from":"pane"}"#)?;
+    db.insert_event(
+        &s.id,
+        now,
+        "awaiting_first_prompt",
+        &json!({"from": "pane", "composer_seen": composer_seen}).to_string(),
+    )?;
     Ok(true)
 }
 
@@ -176,12 +181,39 @@ fn up_long_enough(launched_ms: i64, now_ms: i64) -> bool {
     now_ms - launched_ms >= UP_AFTER_MS
 }
 
-/// The session's agent pane shows Codex's composer (`codex::composer_shown`).
-fn composer_up(s: &Session) -> bool {
-    s.tmux_session
+/// How long a starting Codex session waits for its composer to be
+/// recognised before it settles on any screen without a dialog.
+const SETTLE_ANYWAY_MS: i64 = 20_000;
+
+/// Whether a starting session (up since `since`, epoch ms) may settle,
+/// from its agent pane: Some(true) when Codex's composer is shown
+/// (`codex::composer_shown`); Some(false) once it has been up
+/// `SETTLE_ANYWAY_MS` with no numbered-choice dialog on screen (a composer
+/// drawn in a way `composer_shown` doesn't know must not leave it starting
+/// for ever; logged); None: not yet.
+fn screen_settles(s: &Session, since: Option<i64>, now: i64) -> Option<bool> {
+    let screen = s
+        .tmux_session
         .as_deref()
-        .and_then(|t| tmux::capture_pane(t).ok())
-        .is_some_and(|screen| codex::composer_shown(&screen))
+        .and_then(|t| tmux::capture_pane(t).ok())?;
+    let r = settles(&screen, since.map(|t| now - t));
+    if r == Some(false) {
+        tracing::info!(
+            session = %s.name,
+            "no Codex composer seen after {}s, and no dialog: settling anyway",
+            SETTLE_ANYWAY_MS / 1000
+        );
+    }
+    r
+}
+
+/// `screen_settles` for a screen up for `up_ms`.
+fn settles(screen: &str, up_ms: Option<i64>) -> Option<bool> {
+    if codex::composer_shown(screen) {
+        return Some(true);
+    }
+    let long = up_ms.is_some_and(|ms| ms >= SETTLE_ANYWAY_MS);
+    (long && !codex::dialog_shown(screen)).then_some(false)
 }
 
 /// Find the conversation a session launched, in its agent's index (see
@@ -323,7 +355,10 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
     };
     // Settling a start with nothing in the transcript: only once the
     // composer is up (not an update or trust prompt in front of it).
-    if s.status == Status::Starting && working.is_none() && !composer_up(s) {
+    if s.status == Status::Starting
+        && working.is_none()
+        && screen_settles(s, s.last_state_change_at, now_ms()).is_none()
+    {
         return Ok(false);
     }
     let Some(next) = next_status(s.status, working) else {
@@ -381,6 +416,20 @@ mod tests {
     fn a_pane_is_up_after_a_moment() {
         assert!(!up_long_enough(10_000, 10_000 + UP_AFTER_MS - 1));
         assert!(up_long_enough(10_000, 10_000 + UP_AFTER_MS));
+    }
+
+    #[test]
+    fn a_start_settles_on_the_composer_or_after_a_while() {
+        let composer = "› Ask Codex to do anything\n\n  ? for shortcuts\n";
+        let dialog = "  Update available!\n\n› 1. Update now\n  2. Skip\n";
+        let unknown = "  something Codex drew that rlord doesn't know\n";
+        assert_eq!(settles(composer, Some(0)), Some(true));
+        assert_eq!(settles(unknown, Some(SETTLE_ANYWAY_MS - 1)), None);
+        assert_eq!(settles(unknown, None), None);
+        // Long enough, and no dialog: settled anyway.
+        assert_eq!(settles(unknown, Some(SETTLE_ANYWAY_MS)), Some(false));
+        // A dialog never settles it.
+        assert_eq!(settles(dialog, Some(10 * SETTLE_ANYWAY_MS)), None);
     }
 
     #[test]

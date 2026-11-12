@@ -449,6 +449,9 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
     // under that lock, after any request that held it).
     let is_overlord = overlord::session(&d.db())?.is_some_and(|o| o.id == id);
     let _send = is_overlord.then(|| d.overlord_send.lock().expect("overlord send lock"));
+    // Nothing typed into it meanwhile, and the check below holds until the
+    // restart (locks.rs: after `overlord_send`, before the DB).
+    let _session = d.sessions.lock(id);
     if only_if_quiet {
         let s = d.db().resolve_ref(id)?;
         let live = live();
@@ -609,6 +612,7 @@ fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     rlord_core::agents::install::warm();
     // Not while a request is being pasted into it.
     let _send = d.overlord_send.lock().expect("overlord send lock");
+    let _session = d.lock_overlord();
     overlord::ensure(&d.db(), &d.config(), &json!({}))?;
     tracing::info!("started the overlord for Remote Control");
     d.changed();

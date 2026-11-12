@@ -176,6 +176,10 @@ pub struct OverlordConfig {
     /// cell count.
     pub width: String,
     pub height: String,
+    /// Ask the user before each `send_to_session` (the overlord typing into
+    /// another session). Off by default: like rlord's other tools, it runs
+    /// unasked.
+    pub confirm_sends: bool,
 }
 
 impl OverlordConfig {
@@ -221,6 +225,7 @@ struct OverlordToml {
     width: Option<String>,
     #[serde(alias = "popup_height")]
     height: Option<String>,
+    confirm_sends: Option<bool>,
 }
 
 impl From<OverlordToml> for OverlordConfig {
@@ -246,6 +251,7 @@ impl From<OverlordToml> for OverlordConfig {
                 .unwrap_or(15),
             width: t.width.unwrap_or_else(|| "90%".into()),
             height: t.height.unwrap_or_else(|| "85%".into()),
+            confirm_sends: t.confirm_sends.unwrap_or(false),
             agent,
         }
     }
@@ -698,6 +704,7 @@ effort = "medium"
 fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
+confirm_sends = false   # ask you before it types into another session
 
 # Easiest: ask your overlord to change a key (or `:keys` in the list). It
 # opens the key screen, which tests that the key reaches rlord and checks it

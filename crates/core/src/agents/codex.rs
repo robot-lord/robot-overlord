@@ -111,15 +111,20 @@ pub fn toml_str(s: &str) -> String {
 ///   that needs more (a write, the network, leaving the sandbox) asks the
 ///   user. ("untrusted", which would ask before every command not known to
 ///   be read-only, is refused by Codex 0.167: "no longer supported".) The
-///   sandbox is what stops a command reaching rlord's tmux socket and
-///   typing into another pane: on macOS it refuses the connection
-///   (checked live); on Linux that is unverified.
+///   sandbox stops a shell command reaching rlord's tmux socket (on macOS
+///   it refuses the connection, checked live; on Linux that is
+///   unverified). It does not stop the overlord typing into other
+///   sessions: rlord's own `send_to_session` does that, and like rlord's
+///   other tools it runs without a prompt.
+/// - `confirm_sends` (`[overlord] confirm_sends`, off by default):
+///   `mcp_servers.rlord.tools.send_to_session.approval_mode = "prompt"`,
+///   so that one tool asks each time.
 /// - `check_for_update_on_startup = false`: no update prompt in front of
 ///   the composer (rlord types into it once it is up).
 /// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
 ///   rlord's own, so Codex doesn't stop to ask about it, and reads the
 ///   sub-agents rlord writes to its `.codex/agents`.
-pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str) -> Vec<String> {
+pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str, confirm_sends: bool) -> Vec<String> {
     let args: Vec<String> = super::mcp_args(socket)
         .iter()
         .map(|a| toml_str(a))
@@ -143,29 +148,45 @@ pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str) -> Vec<String> {
         "check_for_update_on_startup=false".to_string(),
     ]
     .into_iter()
+    .chain(
+        confirm_sends.then(|| {
+            "mcp_servers.rlord.tools.send_to_session.approval_mode=\"prompt\"".to_string()
+        }),
+    )
     .flat_map(|kv| ["-c".to_string(), kv])
     .collect()
 }
 
-/// Codex's screen shows its composer, ready for a prompt: a line near the
-/// bottom that starts with `›` (its prompt mark) and isn't a numbered
-/// choice (the same mark points at the picked option in a dialog: trust
-/// this folder, update now). Startup screens before it (an update prompt,
-/// a login, a trust question) don't count.
+/// Codex's screen shows its composer, ready for a prompt. Only the bottom
+/// input area counts (its last few lines: the composer and the footer
+/// under it): the lowest line there that starts with `›` (its prompt mark)
+/// must not be a numbered choice. The same mark points at the picked
+/// option in a dialog (trust this folder, update now, approve a command),
+/// which Codex draws in place of the composer; a `›` higher up is a prompt
+/// in the history, not the input. Startup screens before it (an update
+/// prompt, a login, a trust question) and an approval don't count.
 pub fn composer_shown(screen: &str) -> bool {
-    screen
-        .lines()
-        .rev()
-        .map(str::trim_end)
-        .filter(|l| !l.trim().is_empty())
-        .take(6)
-        .any(|l| {
-            l.strip_prefix('›').is_some_and(|rest| {
-                let rest = rest.trim_start();
-                let digits = rest.chars().take_while(char::is_ascii_digit).count();
-                !(digits > 0 && rest[digits..].starts_with('.'))
-            })
-        })
+    let bottom: Vec<&str> = super::bottom_lines(screen, 6).collect();
+    // ("Press enter to confirm or esc to cancel": a dialog's own footer.)
+    if bottom.iter().any(|l| l.contains("Press enter to confirm")) {
+        return false;
+    }
+    bottom
+        .iter()
+        .find_map(|l| l.strip_prefix('›'))
+        .is_some_and(|rest| !super::numbered_choice(rest.trim_start()))
+}
+
+/// A numbered-choice dialog is at the bottom of Codex's screen: an
+/// approval, a trust or update question, the login choice (marked `›` or
+/// `>` at the picked option), or a dialog's "Press enter to confirm".
+pub fn dialog_shown(screen: &str) -> bool {
+    super::bottom_lines(screen, 12).any(|l| {
+        l.contains("Press enter to confirm")
+            || l.trim_start()
+                .strip_prefix(['›', '>'])
+                .is_some_and(|rest| super::numbered_choice(rest.trim_start()))
+    })
 }
 
 /// A sub-agent file for Codex (`.codex/agents/<name>.toml`): its name, when
@@ -864,6 +885,7 @@ mod tests {
             "/opt/my \"apps\"/rlord",
             "/run/r\"lord/daemon.sock",
             "/data/o'lord\\x",
+            true,
         );
         assert_eq!(args.len() % 2, 0);
         let mut seen = std::collections::HashMap::new();
@@ -897,6 +919,13 @@ mod tests {
         // ("untrusted" is refused by Codex 0.167.)
         assert_eq!(seen["approval_policy"].as_str(), Some("on-request"));
         assert_eq!(seen["check_for_update_on_startup"].as_bool(), Some(false));
+        // Sends confirmed: that one tool asks.
+        assert_eq!(
+            seen["mcp_servers.rlord.tools.send_to_session.approval_mode"].as_str(),
+            Some("prompt")
+        );
+        let off = overlord_args("/r", "/s", "/d", false);
+        assert!(!off.iter().any(|a| a.contains("approval_mode=\"prompt\"")));
         // The folder's trust: one table keyed by the path itself.
         assert_eq!(
             seen["projects"]["/data/o'lord\\x"]["trust_level"].as_str(),
@@ -918,6 +947,47 @@ mod tests {
             "  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit\n";
         assert!(!composer_shown(trust));
         assert!(!composer_shown(""));
+        for d in [dialog, trust] {
+            assert!(dialog_shown(d));
+        }
+        assert!(!dialog_shown(ready) && !dialog_shown(typed));
+    }
+
+    /// An approval during a turn, as captured from codex-cli 0.167.2: the
+    /// user's prompt (`›`) is in the history above it.
+    #[test]
+    fn an_approval_is_not_the_composer() {
+        let approval = "› Run the shell command: touch probe.txt\n\n\n\
+            • I'll run touch probe.txt, requesting approval.\n\n\
+            • Running touch probe.txt\n\n\n\
+              Would you like to run the following command?\n\n\
+              Reason: Allow creating probe.txt in this read-only workspace?\n\n\
+              $ touch probe.txt\n\n\n\
+            › 1. Yes, proceed (y)\n\
+              2. Yes, and don't ask again for commands that start with `touch probe.txt` (p)\n\
+              3. No, and tell Codex what to do differently (esc)\n\n\
+              Press enter to confirm or esc to cancel\n";
+        assert!(!composer_shown(approval));
+        assert!(dialog_shown(approval));
+        // The user moved to another option: still a dialog.
+        let moved = approval
+            .replace("› 1. Yes", "  1. Yes")
+            .replace("  2. Yes, and", "› 2. Yes, and");
+        assert!(!composer_shown(&moved) && dialog_shown(&moved));
+        // A short dialog under a prompt in the history: the history's `›`
+        // doesn't count.
+        let short = "› fix the tests\n\n› 1. Update now\n  2. Skip\n";
+        assert!(!composer_shown(short) && dialog_shown(short));
+        // Working, as captured: the composer is up under the status line.
+        let working = "› Count slowly from 1 to 5.\n\n\n\
+            • Working (1s • esc to interrupt)\n\n\n\
+            › Ask Codex to do anything\n\n\
+              GPT-6.1-Sol medium · /tmp/x\n\
+              ← for agents · ? for shortcuts      ⚠ 1 warning · f2 to view\n";
+        assert!(composer_shown(working) && !dialog_shown(working));
+        // The login screen marks its choice with `>`.
+        let login = "  Choose how you want to use Codex.\n\n> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n\n  Press enter to continue\n";
+        assert!(!composer_shown(login) && dialog_shown(login));
     }
 
     #[test]

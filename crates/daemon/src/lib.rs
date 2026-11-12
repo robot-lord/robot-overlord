@@ -2,6 +2,7 @@ pub mod ask;
 pub mod autostart;
 pub mod discover;
 pub mod import;
+pub mod locks;
 pub mod mcp;
 pub mod methods;
 pub mod opencode;
@@ -57,8 +58,12 @@ pub struct Daemon {
     pub(crate) overlay: Mutex<Option<(String, u64)>>,
     pub(crate) overlay_seq: std::sync::atomic::AtomicU64,
     /// Held while text is pasted into the overlord, and while an idle one
-    /// is restarted fresh: the two must not overlap.
+    /// is restarted fresh: the two must not overlap. (Taken before
+    /// `sessions` and the DB.)
     pub(crate) overlord_send: Mutex<()>,
+    /// One session at a time: typing into it vs restarting, stopping or
+    /// archiving it (locks.rs, which has the lock order).
+    pub(crate) sessions: locks::SessionLocks,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
@@ -81,6 +86,7 @@ impl Daemon {
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
             overlord_send: Mutex::new(()),
+            sessions: Default::default(),
             warm: Default::default(),
             remote: Default::default(),
             summaries: Default::default(),
@@ -93,6 +99,13 @@ impl Daemon {
 
     pub(crate) fn changed(&self) {
         let _ = self.notify.send(r#"{"notify":"changed"}"#.to_string());
+    }
+
+    /// Hold the overlord's session (`sessions`), if there is one: around
+    /// a start or restart of it. (Before the DB: see locks.rs.)
+    pub(crate) fn lock_overlord(&self) -> Option<locks::SessionGuard<'_>> {
+        let id = overlord::session(&self.db()).ok().flatten()?.id;
+        Some(self.sessions.lock(&id))
     }
 
     pub(crate) fn tui_count(&self) -> usize {
@@ -357,6 +370,18 @@ impl Daemon {
                 | "session.defaults"
                 | "tag.list"
         ) && !(method == "tag.order" && params.get("order").is_none());
+        // Restarting, stopping or archiving a session: not while text is
+        // being typed into it (locks.rs: this lock before the DB's).
+        let session_id = matches!(
+            method,
+            "session.restart" | "session.stop" | "session.archive"
+        )
+        .then(|| {
+            let r = params["ref"].as_str().unwrap_or("");
+            self.db().resolve_ref(r).ok().map(|s| s.id)
+        })
+        .flatten();
+        let _session = session_id.as_deref().map(|id| self.sessions.lock(id));
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
@@ -454,6 +479,7 @@ impl Daemon {
     fn call_ui(&self, method: &str, params: &Value) -> Option<Result<Value>> {
         let r = match method {
             "overlord.ensure" => {
+                let _session = self.lock_overlord();
                 let r = overlord::ensure(&self.db(), &self.config(), params);
                 // (ensure syncs its tmux keys itself.)
                 if r.is_ok() {
@@ -537,6 +563,7 @@ impl Daemon {
             "overlord.triage" => triage::triage(self, params),
             "overlord.new_session" => ask::new_session(self, params),
             "overlord.set_model" => {
+                let _session = self.lock_overlord();
                 let r = overlord::set_model(&self.db(), &self.config(), params);
                 if r.is_ok() {
                     self.changed();
