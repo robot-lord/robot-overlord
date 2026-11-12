@@ -719,24 +719,34 @@ pub fn buffer_text(name: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The keys a key table binds to entering copy mode (`copy-mode`, with
-/// at most `-u`/`-e`): (key spec as tmux lists it, whether it scrolls up a
-/// page on entry). The user's own bindings, honoured by the overlay.
-pub fn copy_mode_bindings(table: &str) -> Vec<(String, bool)> {
+/// A key table's bindings as (key, command), as `list-keys` prints them
+/// (key unescaped: `\;` is `;`).
+pub fn bindings(table: &str) -> Vec<(String, String)> {
     let Ok(out) = run(&["list-keys", "-T", table]) else {
         return vec![];
     };
     out.lines()
         .filter_map(|l| {
-            let mut t = l.split_whitespace();
-            t.next().filter(|w| *w == "bind-key")?;
-            let mut w = t.next()?;
-            if w == "-r" {
-                w = t.next()?;
-            }
-            (w == "-T").then_some(())?;
-            t.next()?; // the table
-            let key = t.next()?.replace('\\', "");
+            let rest = l.trim_start().strip_prefix("bind-key")?.trim_start();
+            let rest = rest.strip_prefix("-r").map(str::trim_start).unwrap_or(rest);
+            let rest = rest.strip_prefix("-T")?.trim_start();
+            let (_table, rest) = rest.split_once(char::is_whitespace)?;
+            let rest = rest.trim_start();
+            let (key, cmd) = rest.split_once(char::is_whitespace)?;
+            let key = key.strip_prefix('\\').unwrap_or(key);
+            Some((key.to_string(), cmd.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The keys a key table binds to entering copy mode (`copy-mode`, with
+/// at most `-u`/`-e`): (key, whether it scrolls up a page on entry). The
+/// user's own bindings, honoured by the overlay.
+pub fn copy_mode_bindings(table: &str) -> Vec<(String, bool)> {
+    bindings(table)
+        .into_iter()
+        .filter_map(|(key, cmd)| {
+            let mut t = cmd.split_whitespace();
             (t.next()? == "copy-mode").then_some(())?;
             let flags: Vec<&str> = t.collect();
             flags
@@ -745,6 +755,28 @@ pub fn copy_mode_bindings(table: &str) -> Vec<(String, bool)> {
                 .then(|| (key, flags.iter().any(|f| f.contains('u'))))
         })
         .collect()
+}
+
+/// A server option's value (`copy-command`, …), empty if unset.
+pub fn server_option(name: &str) -> String {
+    run(&["show-options", "-sqv", name]).unwrap_or_default()
+}
+
+/// Expand a tmux format for a pane (`#{pane_search_string}`).
+pub fn format(pane: &str, fmt: &str) -> String {
+    run(&["display-message", "-p", "-t", pane, fmt]).unwrap_or_default()
+}
+
+/// Send a key to a pane `n` times (`send-keys -N`): a vi count.
+pub fn send_key_repeat(pane: &str, n: u32, key: &str, literal: bool) -> Result<()> {
+    let n = n.to_string();
+    let mut args = vec!["send-keys", "-t", pane, "-N", n.as_str()];
+    if literal {
+        args.extend(["-l", "--"]);
+    }
+    args.push(key);
+    run(&args)?;
+    Ok(())
 }
 
 /// Put a pane in copy mode (no-op if it already is).
