@@ -355,7 +355,7 @@ impl App {
             .find(|b| Line::from(b.clone()).width() <= room)
             .unwrap_or_else(|| build(2));
 
-        // The name: ROBOT in the robot's red, OVERLORD in the crown's gold.
+        // The name, in the robot's red.
         // Box-drawn letters three rows tall where they fit, else one
         // spaced line.
         const BIG: [(&str, &str); 3] = [
@@ -364,7 +364,6 @@ impl App {
             ("╩╚═╚═╝╚═╝╚═╝ ╩ ", "  ╚═╝ ╚╝ ╚═╝╩╚═╩═╝╚═╝╩╚══╩╝"),
         ];
         let robot_s = Style::default().fg(robot).bold();
-        let crown_s = Style::default().fg(crown).bold();
         let gap = || Span::raw("  ");
         let beside = |mut l: Vec<Span<'static>>, rest: Vec<Span<'static>>| {
             l.push(gap());
@@ -376,7 +375,7 @@ impl App {
             let big = |(a, b): (&str, &str)| {
                 vec![
                     Span::styled(a.to_string(), robot_s),
-                    Span::styled(b.to_string(), crown_s),
+                    Span::styled(b.to_string(), robot_s),
                 ]
             };
             vec![
@@ -393,7 +392,7 @@ impl App {
                     vec![
                         Span::styled("R O B O T", robot_s),
                         Span::raw("   "),
-                        Span::styled("O V E R L O R D", crown_s),
+                        Span::styled("O V E R L O R D", robot_s),
                     ],
                 ),
                 beside(l2, bar),
