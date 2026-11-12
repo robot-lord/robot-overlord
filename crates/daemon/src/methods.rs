@@ -1315,18 +1315,17 @@ fn ingest_subagent_hook(
     let from_disk = source
         .as_deref()
         // Only this hook's agent, not every sub-agent of the session.
-        .map(|src| claude::scan_subagents_where(session_id, src, true, &|id| id == agent_id))
+        .map(|src| claude::scan_subagents_read(session_id, src, true, &|id| id == agent_id))
         .unwrap_or_default()
         .into_iter()
-        .find(|a| a.agent_id == agent_id);
+        .find(|(a, _)| a.agent_id == agent_id);
+    // Totals read from its transcript (whole, as `transcript_stats` keeps
+    // them) may replace ones counted by older logic.
+    let mut counted = from_disk.as_ref().is_some_and(|(_, read)| *read);
+    let from_disk = from_disk.map(|(a, _)| a);
     if agent_type.is_empty() && from_disk.is_none() && !db.subagent_exists(&agent_id)? {
         return Ok(()); // internal helper (title/suggestion generators)
     }
-    // Totals read from its transcript (whole, as `transcript_stats` keeps
-    // them) may replace ones counted by older logic.
-    let mut counted = from_disk
-        .as_ref()
-        .is_some_and(|a| a.transcript_path.is_some());
     let mut a = from_disk.unwrap_or(Subagent {
         agent_id: agent_id.clone(),
         session_id: session_id.to_string(),

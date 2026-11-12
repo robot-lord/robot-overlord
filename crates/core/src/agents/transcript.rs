@@ -485,16 +485,24 @@ pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
     }
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     cursors.insert(path.to_path_buf(), c);
-    // Bounded: forget the least recently used files past the cap.
-    if cursors.len() > STATS_CURSOR_CAP {
-        let mut by_age: Vec<(std::time::Instant, PathBuf)> =
-            cursors.iter().map(|(p, c)| (c.used, p.clone())).collect();
-        by_age.sort();
-        for (_, p) in by_age.into_iter().take(cursors.len() - STATS_CURSOR_CAP) {
-            cursors.remove(&p);
-        }
-    }
+    evict(&mut cursors);
     Some(stats)
+}
+
+/// Bounded: forget the least recently used positions past the cap, saved
+/// ones (not dirty) first.
+fn evict(cursors: &mut std::collections::HashMap<PathBuf, StatsCursor>) {
+    if cursors.len() <= STATS_CURSOR_CAP {
+        return;
+    }
+    let mut by_age: Vec<(bool, std::time::Instant, PathBuf)> = cursors
+        .iter()
+        .map(|(p, c)| (c.dirty, c.used, p.clone()))
+        .collect();
+    by_age.sort();
+    for (_, _, p) in by_age.into_iter().take(cursors.len() - STATS_CURSOR_CAP) {
+        cursors.remove(&p);
+    }
 }
 
 /// How much of a transcript `transcript_stats` has yet to read: None
@@ -628,8 +636,9 @@ pub const STATS_PARSE_VERSION: i64 = 2;
 /// How many saved positions are loaded at startup (the most recent).
 pub const STATS_CURSOR_SEED: usize = STATS_CURSOR_CAP;
 
-/// Load saved positions (daemon start). Files already read this run keep
-/// their in-memory position.
+/// Load saved positions (daemon start; one that fell out of memory). Files
+/// already read this run keep their in-memory position. Past the cap, the
+/// least recently used are forgotten again (seed just before reading).
 pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
     let mut cursors = STATS_CURSORS.lock().unwrap_or_else(|e| e.into_inner());
     for (path, st) in saved {
@@ -652,6 +661,7 @@ pub fn seed_cursors(saved: Vec<(PathBuf, CursorState)>) {
             ..Default::default()
         });
     }
+    evict(&mut cursors);
 }
 
 /// Positions that moved since the last call, to save.

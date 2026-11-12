@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use rlord_core::agents::{opencode, transcript};
+use rlord_core::agents::opencode;
+use rlord_core::agents::transcript::{self, CursorState};
 use rlord_core::db::SortMode;
 use rlord_core::usage::{self, Usage, UsageMetric};
 
@@ -47,17 +48,10 @@ pub fn annotate(d: &Daemon, rows: &mut [Value], single: bool) {
         .map(|(id, p)| (id, PathBuf::from(p)))
         .collect();
     // Transcripts whose read position fell out of memory (or wasn't loaded
-    // at start): take the saved one, so only what's new is read.
-    let forgotten: Vec<&str> = sources
-        .values()
-        .filter(|p| opencode::locate(p).is_none() && transcript::unread_bytes(p).is_none())
-        .filter_map(|p| p.to_str())
-        .collect();
-    if !forgotten.is_empty() {
-        if let Ok(saved) = d.db().transcript_cursors_for(&forgotten) {
-            transcript::seed_cursors(saved);
-        }
-    }
+    // at start): the saved one, so only what's new is read. Each is put
+    // back just before its row is read: all at once could push past the
+    // cap and evict the rows not yet reached.
+    let mut saved = saved_positions(d, sources.values().map(PathBuf::as_path));
     let opencode = opencode_usage(rows, &sources);
     let full_loading = d.warm.loading();
     for row in rows.iter_mut() {
@@ -76,6 +70,7 @@ pub fn annotate(d: &Daemon, rows: &mut [Value], single: bool) {
             // (No such file: nothing to read, nothing to queue.)
             continue;
         };
+        restore(&mut saved, path);
         let cheap = match transcript::unread_bytes(path) {
             Some(n) => n <= READ_INLINE_MAX,
             // Never read: all of it.
@@ -91,6 +86,63 @@ pub fn annotate(d: &Daemon, rows: &mut [Value], single: bool) {
         }
     }
     methods::save_cursors(&d.db());
+}
+
+/// Saved read positions (DB) of the JSONL transcripts among `paths` that
+/// have none in memory.
+pub(crate) fn saved_positions<'a>(
+    d: &Daemon,
+    paths: impl Iterator<Item = &'a Path>,
+) -> HashMap<PathBuf, CursorState> {
+    let forgotten: Vec<&str> = paths
+        .filter(|p| opencode::locate(p).is_none() && transcript::unread_bytes(p).is_none())
+        .filter_map(|p| p.to_str())
+        .collect();
+    if forgotten.is_empty() {
+        return HashMap::new();
+    }
+    d.db()
+        .transcript_cursors_for(&forgotten)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Put `path`'s saved position (from `saved_positions`) back in memory, if
+/// it has none there, right before reading it.
+pub(crate) fn restore(saved: &mut HashMap<PathBuf, CursorState>, path: &Path) {
+    if transcript::unread_bytes(path).is_none() {
+        if let Some(c) = saved.remove(path) {
+            transcript::seed_cursors(vec![(path.to_path_buf(), c)]);
+        }
+    }
+}
+
+/// `path`'s saved position back in memory (if it has none there), so a
+/// read goes forward from it rather than from the start.
+pub(crate) fn recall(d: &Daemon, path: &Path) {
+    let mut saved = saved_positions(d, std::iter::once(path));
+    restore(&mut saved, path);
+}
+
+/// Bring a session's usage up to date on a request path: read what's new
+/// if that's at most `READ_INLINE_MAX`; otherwise (never read, far behind)
+/// queue it on the warm-up. Nothing if the warm-up already has it queued.
+pub(crate) fn refresh_bounded(d: &Daemon, id: &str, path: &Path, model: Option<&str>) {
+    if d.warm.usage_queued(id) {
+        return;
+    }
+    recall(d, path);
+    match transcript::unread_bytes(path) {
+        _ if opencode::locate(path).is_some() => {}
+        Some(n) if n <= READ_INLINE_MAX => {
+            usage::of(path, model);
+        }
+        _ if path.is_file() => {
+            d.warm.enqueue_usage(id);
+        }
+        _ => {}
+    }
 }
 
 /// The OpenCode rows' usage: one connection per database.

@@ -40,11 +40,18 @@ has, read cheaply, no model calls.
   `rlord ls`/TUI: `…`). Re-queued after its job ends; a job that read
   nothing marks it failed for the run, so an unreadable file can't loop.
   `session.get` may read an unread transcript up to 4 MB itself.
+  `session.subagents` (`warm::refresh(.., request: true)`) reads the main
+  transcript only within the same bound, and not while a usage job has
+  it. Saved positions are restored one row at a time, just before the
+  read; `seed_cursors` evicts past the cap (saved, non-dirty first). The
+  worker restores before reading, so it never starts from 0 when a
+  position exists.
 - **Recount without zeroing.** `subagents.counted` (migration 0008) is the
   parse version a sub-agent's totals were counted with; existing rows get
   0. The keep-the-larger upsert (and `warm::apply`'s `same` check) lets a
   count from the agent's transcript replace an older-version one, even
-  when lower. The startup prune no longer touches `subagents` (one
+  when lower, but only if the scan actually read the transcript
+  (`scan_subagents_read`); unread zeros use the MAX upsert. The startup prune no longer touches `subagents` (one
   transaction, set-based deletes); archived sessions are recounted lazily
   when viewed. `--rescan` sets `counted = 0` instead of zeroing. No index
   on `subagents.transcript_path`: nothing queries by it now.

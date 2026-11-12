@@ -156,8 +156,12 @@ lock is released:
   `context_pct`, shown as `–`.
 - **A request never reads a whole transcript.** It reads what was
   appended since the last read, at most 4 MB. A position that fell out of
-  memory (`STATS_CURSOR_CAP`) is reloaded from `transcript_cursors`, so
-  long archived lists don't re-read files. A transcript with no position,
+  memory (`STATS_CURSOR_CAP`) is reloaded from `transcript_cursors`, each
+  just before its row is read (all at once would evict rows not yet
+  reached), so long archived lists don't re-read files. The worker reloads
+  a saved position before reading too. `session.subagents` (every TUI
+  selection, MCP `get_session`) follows the same bound for the main
+  transcript. A transcript with no position,
   or more than 4 MB behind, goes to the warm-up worker (`Job::Usage`, its
   own pending set, so it doesn't mark sub-agents loading); the row says
   `usage_loading` meanwhile. Once read it can be queued again; one whose
@@ -384,7 +388,9 @@ latency, disk for description/tool-use id/backfill). Token totals keep the
 larger value, except that `subagents.counted` records the
 `STATS_PARSE_VERSION` they were counted with: totals from older counting
 (or marked by `rlord reset --rescan`) are replaced by the next count from
-the agent's transcript, even when lower. So bumping the parse version
+the agent's transcript, even when lower. A sub-agent transcript that
+couldn't be read gives zeros, not a count: those use the keep-the-larger
+upsert. So bumping the parse version
 needs no data migration: a live session is recounted by the warm-up, an
 archived one when it's next viewed. `sessions` carry
 `agents_running`/`agents_total`. Surfaces: TUI details card + `⚙N` in the

@@ -997,9 +997,134 @@ mod tests {
         server.abort();
     }
 
+    /// Tests that plant made-up saved read positions (to tell a forward
+    /// read from a full re-read) and tests that fill the shared in-memory
+    /// positions past their cap must not run at once.
+    static CURSOR_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn add_session(db: &Db, id: &str, transcript: &std::path::Path) {
+        db.insert_session(&rlord_core::db::NewSession {
+            id,
+            name: id,
+            agent: "claude",
+            agent_session: Some(id),
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.upsert_transcript_source(id, &transcript.to_string_lossy())
+            .unwrap();
+    }
+
+    /// A transcript of `prompts` prompts, and a saved read position at its
+    /// end that claims `turns` (so a forward read gives `turns`, a full
+    /// re-read `prompts`).
+    fn planted(
+        dir: &std::path::Path,
+        name: &str,
+        prompts: usize,
+        turns: u64,
+    ) -> (
+        std::path::PathBuf,
+        rlord_core::agents::transcript::CursorState,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let p = dir.join(format!("{name}.jsonl"));
+        let text: String = (0..prompts)
+            .map(|i| {
+                format!(
+                    "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"p{i}\"}}}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(&p, text).unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        let c = rlord_core::agents::transcript::CursorState {
+            ino: meta.ino(),
+            offset: meta.len(),
+            turns,
+            ..Default::default()
+        };
+        (p, c)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_subagents_never_reads_a_whole_main_transcript() {
+        use rlord_core::agents::transcript;
+        let _lock = CURSOR_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        // a: never read; b: read before, its position saved.
+        let (a, _) = planted(dir.path(), "a", 2, 0);
+        let (b, saved) = planted(dir.path(), "b", 3, 7);
+        {
+            let db = daemon.db.lock().unwrap();
+            add_session(&db, "01a", &a);
+            add_session(&db, "01b", &b);
+            db.save_transcript_cursors(&[(b.clone(), saved)]).unwrap();
+        }
+        let listener = Daemon::bind(&sock).unwrap();
+        let server = tokio::spawn(daemon.clone().serve(listener));
+        for id in ["01a", "01b"] {
+            let sock = sock.clone();
+            tokio::task::spawn_blocking(move || {
+                client_call(&sock, "session.subagents", json!({"ref": id})).unwrap()
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(transcript::unread_bytes(&a), None, "read on the request");
+        // b went forward from its saved position, not from the start.
+        assert_eq!(transcript::transcript_stats(&b).unwrap().turns, 7);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_list_past_the_position_cap_reads_nothing_again() {
+        use rlord_core::agents::transcript::STATS_CURSOR_SEED;
+        let _lock = CURSOR_TESTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let n = STATS_CURSOR_SEED + 50;
+        {
+            let db = daemon.db.lock().unwrap();
+            let mut saved = Vec::new();
+            for i in 0..n {
+                let (p, c) = planted(dir.path(), &format!("t{i}"), 1, 7);
+                add_session(&db, &format!("01s{i:05}"), &p);
+                saved.push((p, c));
+            }
+            db.save_transcript_cursors(&saved).unwrap();
+        }
+        let listener = Daemon::bind(&sock).unwrap();
+        let server = tokio::spawn(daemon.clone().serve(listener));
+        let sock2 = sock.clone();
+        let v = tokio::task::spawn_blocking(move || {
+            client_call(&sock2, "session.list", json!({})).unwrap()
+        })
+        .await
+        .unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), n);
+        // Every row from its saved position (7), none re-read (1) or left
+        // unknown (evicted before its turn).
+        let off: Vec<&Value> = rows.iter().filter(|r| r["usage"]["turns"] != 7).collect();
+        assert!(off.is_empty(), "{} rows off, e.g. {}", off.len(), off[0]);
+        server.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn requests_never_read_a_whole_unread_transcript() {
         use rlord_core::agents::transcript::{self, CursorState};
+        let _lock = CURSOR_TESTS.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
         let daemon = Daemon::new(Db::open_in_memory().unwrap(), Config::default());

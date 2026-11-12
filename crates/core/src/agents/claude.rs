@@ -409,6 +409,21 @@ pub fn scan_subagents_where(
     parent_running: bool,
     want: &dyn Fn(&str) -> bool,
 ) -> Vec<Subagent> {
+    scan_subagents_read(session_id, transcript_path, parent_running, want)
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect()
+}
+
+/// `scan_subagents_where`, saying for each agent whether its transcript
+/// was read (its token totals are a count from it; false: they're zeros
+/// because it couldn't be, and mustn't replace anything).
+pub fn scan_subagents_read(
+    session_id: &str,
+    transcript_path: &str,
+    parent_running: bool,
+    want: &dyn Fn(&str) -> bool,
+) -> Vec<(Subagent, bool)> {
     let dir = subagents_dir(transcript_path);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
@@ -433,7 +448,9 @@ pub fn scan_subagents_where(
             continue;
         };
         let jsonl = dir.join(format!("agent-{id}.jsonl"));
-        let stats = transcript_stats(&jsonl).unwrap_or_default();
+        let read = transcript_stats(&jsonl);
+        let counted = read.is_some();
+        let stats = read.unwrap_or_default();
         // Claude doesn't always mark an agent finished (older versions,
         // agents cut off when the session ended), so also: its last turn is
         // a final reply, or its transcript has gone quiet.
@@ -443,25 +460,28 @@ pub fn scan_subagents_where(
             .is_some_and(|d| d > AGENT_QUIET);
         let finished =
             meta["finished"].as_bool().unwrap_or(false) || stats.ended || quiet || !parent_running;
-        out.push(Subagent {
-            agent_id: id.to_string(),
-            session_id: session_id.to_string(),
-            agent_type: meta["agentType"].as_str().unwrap_or("").to_string(),
-            description: meta["description"].as_str().unwrap_or("").to_string(),
-            tool_use_id: meta["toolUseId"].as_str().map(str::to_string),
-            spawn_depth: meta["spawnDepth"].as_i64().unwrap_or(1),
-            background: meta["requestShape"].as_str() == Some("background"),
-            started_at: stats.first,
-            finished_at: if finished {
-                stats.last.or(stats.first)
-            } else {
-                None
+        out.push((
+            Subagent {
+                agent_id: id.to_string(),
+                session_id: session_id.to_string(),
+                agent_type: meta["agentType"].as_str().unwrap_or("").to_string(),
+                description: meta["description"].as_str().unwrap_or("").to_string(),
+                tool_use_id: meta["toolUseId"].as_str().map(str::to_string),
+                spawn_depth: meta["spawnDepth"].as_i64().unwrap_or(1),
+                background: meta["requestShape"].as_str() == Some("background"),
+                started_at: stats.first,
+                finished_at: if finished {
+                    stats.last.or(stats.first)
+                } else {
+                    None
+                },
+                transcript_path: jsonl.exists().then(|| jsonl.to_string_lossy().into_owned()),
+                result: String::new(),
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
             },
-            transcript_path: jsonl.exists().then(|| jsonl.to_string_lossy().into_owned()),
-            result: String::new(),
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
-        });
+            counted,
+        ));
     }
     out
 }
