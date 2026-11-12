@@ -1050,23 +1050,51 @@ impl App {
         let show_tags = width >= 62;
         let name_w = if width >= 60 { 26 } else { 18 };
 
-        let mut header = vec!["", "", "Name", "Status", "Updated"];
+        // The sort shows on its column: an arrow (▲ ascending, ▼
+        // descending; `reverse` flips it), and the time column shows the time
+        // being sorted by.
+        let (time_label, arrow_on_name) = match self.sort {
+            SortMode::Activity => ("Updated", false),
+            SortMode::User => ("You", false),
+            SortMode::State => ("Changed", false),
+            SortMode::Created => ("Created", false),
+            SortMode::Name => ("Updated", true),
+        };
+        // Names run A→Z (ascending); times newest first (descending).
+        let ascending = arrow_on_name != self.reverse;
+        let arrow = if ascending { " ▲" } else { " ▼" };
+        let head = |label: &str, sorted: bool| -> Cell<'static> {
+            if sorted {
+                Cell::from(format!("{label}{arrow}"))
+                    .style(Style::default().fg(theme::accent()).bold())
+            } else {
+                Cell::from(label.to_string())
+            }
+        };
+        let mut header = vec![
+            Cell::from(""),
+            Cell::from(""),
+            head("Name", arrow_on_name),
+            Cell::from("Status"),
+            head(time_label, !arrow_on_name),
+        ];
         let mut widths = vec![
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(name_w),
             Constraint::Length(13),
-            Constraint::Length(8),
+            Constraint::Length(10),
         ];
         if show_tags {
-            header.push("Groups");
+            header.push(Cell::from("Groups"));
             widths.push(Constraint::Length(18));
         }
         if show_project {
-            header.push("Project");
+            header.push(Cell::from("Project"));
             widths.push(Constraint::Min(10));
         }
         let header = Row::new(header).style(theme::muted()).bottom_margin(1);
+        let sort = self.sort;
         let home = std::env::var("HOME").unwrap_or_default();
         let rows: Vec<Row> = self
             .sessions
@@ -1123,7 +1151,21 @@ impl App {
                             Style::default().fg(theme::overlord()),
                         ),
                     ])),
-                    Cell::from(Span::styled(rel_age(updated_at(s)), theme::muted())),
+                    // The time the list is sorted by (activity otherwise).
+                    Cell::from(Span::styled(
+                        rel_age(match sort {
+                            // (As the sort: created when there's none.)
+                            SortMode::User => {
+                                s["last_user_msg_at"].as_i64().or(s["created_at"].as_i64())
+                            }
+                            SortMode::State => s["last_state_change_at"]
+                                .as_i64()
+                                .or(s["created_at"].as_i64()),
+                            SortMode::Created => s["created_at"].as_i64(),
+                            _ => updated_at(s),
+                        }),
+                        theme::muted(),
+                    )),
                 ];
                 if show_tags {
                     let tags = s["tags"]
