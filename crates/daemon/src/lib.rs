@@ -7,6 +7,8 @@ pub mod overlord;
 pub mod profile;
 pub mod remote;
 pub mod rpc;
+pub mod search;
+pub mod summary;
 pub mod triage;
 pub mod ui;
 pub mod warm;
@@ -58,6 +60,8 @@ pub struct Daemon {
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
     pub(crate) remote: remote::Remote,
+    /// Archive summaries being written (summary.rs).
+    pub(crate) summaries: summary::Summaries,
 }
 
 impl Daemon {
@@ -77,6 +81,7 @@ impl Daemon {
             mastermind_send: Mutex::new(()),
             warm: Default::default(),
             remote: Default::default(),
+            summaries: Default::default(),
         })
     }
 
@@ -361,9 +366,11 @@ impl Daemon {
         let r = match (method, r) {
             ("session.list", Ok(Value::Array(mut rows))) => {
                 let loading = self.warm.loading();
+                let summarizing = self.summaries.pending();
                 for row in &mut rows {
-                    let id = row["id"].as_str().unwrap_or("");
-                    row["loading"] = json!(loading.contains(id));
+                    let id = row["id"].as_str().unwrap_or("").to_string();
+                    row["loading"] = json!(loading.contains(&id));
+                    row["summarizing"] = json!(summarizing.contains(&id));
                 }
                 remote::annotate(self, &mut rows);
                 Ok(Value::Array(rows))
@@ -376,6 +383,12 @@ impl Daemon {
             }
             (_, r) => r,
         };
+        // Archived: write down what it did (once, in the background).
+        if method == "session.archive" && r.is_ok() && self.config().archive.summary {
+            if let Ok(s) = self.db().resolve_ref(params["ref"].as_str().unwrap_or("")) {
+                summary::enqueue(self, &s.id, false);
+            }
+        }
         if method == "session.unarchive" && r.is_ok() {
             if let Some(id) = params["ref"].as_str() {
                 warm::enqueue_ref(self, id);
@@ -452,6 +465,9 @@ impl Daemon {
                     .map(|_| json!({"declined": m}))
             }
             "session.subagents" => warm::session_subagents(self, params),
+            "history.search" => search::search(self, params),
+            "history.read" => search::read(self, params),
+            "session.summarize" => search::summarize(self, params),
             "remote.availability" => remote::availability(self, params),
             "remote.status" => remote::status(self, params),
             "remote.set" => remote::set(self, params),

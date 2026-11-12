@@ -28,6 +28,31 @@ enum Command {
     Daemon,
     /// Check daemon liveness (never starts one)
     Ping,
+    /// Search what sessions said and did: summaries, descriptions, notes and
+    /// transcripts (archived sessions too). Every word must appear.
+    Search {
+        #[arg(required = true)]
+        words: Vec<String>,
+        /// Also Claude Code conversations started outside rlord
+        #[arg(long)]
+        everywhere: bool,
+        /// Sessions to show
+        #[arg(long, default_value_t = 8)]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a session's conversation (around a `rlord search` hit's line, or
+    /// its last messages): text only, tool output clipped.
+    History {
+        /// Session (id, prefix or name), or an outside transcript's path
+        session: String,
+        /// The hit's line (`rlord search` shows it as `:<line>`)
+        #[arg(long)]
+        around: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     /// List sessions. QUERY uses the search syntax: free words match
     /// name/project/group/tag; `status:waiting` `tag:wip` `proj:x` `agent:x`
     /// `group:x` `sort:user` set filters.
@@ -528,6 +553,53 @@ fn main() -> Result<()> {
                 "pong (daemon v{})",
                 r.get("version").and_then(Value::as_str).unwrap_or("?")
             );
+            Ok(())
+        }
+        Command::Search {
+            words,
+            everywhere,
+            limit,
+            json,
+        } => {
+            let v = call(
+                "history.search",
+                json!({"query": words.join(" "), "scope": if everywhere { "all" } else { "rlord" },
+                       "limit": limit}),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            print_search(&v);
+            Ok(())
+        }
+        Command::History {
+            session,
+            around,
+            json,
+        } => {
+            let mut p = if session.ends_with(".jsonl") {
+                json!({"transcript": session})
+            } else {
+                json!({"session": session})
+            };
+            if let Some(l) = around {
+                p["line"] = json!(l);
+            }
+            let v = call("history.read", p)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            for m in v["messages"].as_array().into_iter().flatten() {
+                println!(
+                    "── {} :{}  {}",
+                    m["who"].as_str().unwrap_or(""),
+                    m["line"],
+                    m["at"].as_str().unwrap_or("")
+                );
+                println!("{}\n", m["text"].as_str().unwrap_or(""));
+            }
             Ok(())
         }
         Command::Ls {
@@ -1167,6 +1239,66 @@ fn update(tag: Option<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `rlord search`, for a terminal.
+fn print_search(v: &Value) {
+    let rows = v["sessions"].as_array().cloned().unwrap_or_default();
+    let outside = v["outside_rlord"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() && outside.is_empty() {
+        println!("nothing found");
+        return;
+    }
+    let hits = |h: &Value| {
+        for x in h.as_array().into_iter().flatten() {
+            println!(
+                "    :{:<6} {:<5} {}",
+                x["line"],
+                x["who"].as_str().unwrap_or(""),
+                x["snippet"].as_str().unwrap_or("")
+            );
+        }
+    };
+    for r in &rows {
+        let fields: Vec<&str> = r["matched_in"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        println!(
+            "{}{}  ({} in transcript{})",
+            r["session"].as_str().unwrap_or("?"),
+            if r["archived"] == true {
+                " [archived]"
+            } else {
+                ""
+            },
+            r["transcript_hits"],
+            if fields.is_empty() {
+                String::new()
+            } else {
+                format!("; matches its {}", fields.join(", "))
+            }
+        );
+        if let Some(a) = r["about"].as_str().filter(|a| !a.is_empty()) {
+            println!("    {a}");
+        }
+        hits(&r["hits"]);
+    }
+    if v["more_sessions"].as_u64().unwrap_or(0) > 0 {
+        println!("… {} more (--limit)", v["more_sessions"]);
+    }
+    for r in &outside {
+        println!(
+            "outside rlord: {}  ({} hits)\n    {}",
+            r["folder"].as_str().unwrap_or(""),
+            r["transcript_hits"],
+            r["transcript"].as_str().unwrap_or("")
+        );
+        hits(&r["hits"]);
+    }
+    println!("\nread around a hit: rlord history <session> --around <line>");
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -1223,6 +1355,7 @@ fn run_daemon() -> Result<()> {
         daemon.startup()?;
         // Load every live session's sub-agent data in the background.
         rlord_daemon::warm::start(&daemon);
+        rlord_daemon::summary::start(&daemon);
         // Restart an idle mastermind on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
         rlord_daemon::remote::start(&daemon);

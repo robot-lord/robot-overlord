@@ -165,6 +165,22 @@ key, an org admin hasn't allowed it); don't retry. Never turn it on for a
 session the user didn't name. `remote_control` without `on` lists what's
 connected.
 
+## Past work: search, summaries
+
+"We did this before", "which session fixed the auth refresh?", "find where
+we talked about X": `search_history` (mechanical, do it yourself). It
+searches every session's summary, description, notes and transcript,
+archived ones too (`scope: "all"` adds conversations started outside
+rlord); answer with the sessions and a snippet or two. `read_history` reads
+around a hit when the user wants to see it. Deciding what of it matters,
+or carrying it into a new session, is the mastermind's: `hand_off` with the
+hits (session, line) in `context`.
+
+Archiving a session writes a short summary of what it did, in the
+background. For sessions archived without one, or to redo one,
+`summarize_sessions` (one cheap model call each; only for sessions the
+user named or agreed to, never all of them unasked).
+
 ## Keys
 
 "Change my keys", "Option-D is awkward", "what's bound?": `keys_list`

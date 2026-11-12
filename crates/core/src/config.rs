@@ -294,6 +294,30 @@ pub struct Config {
     pub overlord: OverlordConfig,
     pub keys: Keys,
     pub tmux: TmuxKeys,
+    pub archive: ArchiveConfig,
+}
+
+/// Archiving: a summary of what the session did, made once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveConfig {
+    /// Make a summary when a session is archived (in the background).
+    pub summary: bool,
+    /// The model that writes it: a cheap one is plenty.
+    pub summary_model: String,
+    /// A conversation bigger than this (tokens) is summarized from excerpts
+    /// instead of in full.
+    pub summary_max_tokens: u64,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        ArchiveConfig {
+            summary: true,
+            summary_model: "haiku".into(),
+            summary_max_tokens: 150_000,
+        }
+    }
 }
 
 impl Default for Config {
@@ -309,6 +333,7 @@ impl Default for Config {
             overlord: OverlordConfig::default(),
             keys: Keys::default(),
             tmux: TmuxKeys::default(),
+            archive: ArchiveConfig::default(),
         }
     }
 }
@@ -482,6 +507,13 @@ overlord = "M-o" # from any pane: the overlord (quick front desk) over it
 mastermind = ""   # e.g. "M-m": the mastermind from any pane (inside the
                   # overlord's overlay, Option-M always switches to it)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
+
+# Archiving a session writes a short summary of what it did (once, in the
+# background, on a cheap model), shown and searched with archived sessions.
+[archive]
+summary = true
+summary_model = "haiku"
+summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
 "##;
 
 #[cfg(test)]

@@ -640,6 +640,9 @@ pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
 
 pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    if s.archived_at.is_some() {
+        bail!("{} is archived: unarchive it first", s.name);
+    }
     if s.agent != "claude" {
         bail!("restart not supported for agent '{}'", s.agent);
     }

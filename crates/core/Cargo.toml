@@ -16,6 +16,9 @@ ulid.workspace = true
 uuid.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

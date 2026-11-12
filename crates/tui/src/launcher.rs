@@ -21,6 +21,7 @@ enum Cmd {
     Keys,
     Sort(SortMode),
     Mastermind,
+    Summarize,
 }
 
 /// (name, what it does, command)
@@ -66,6 +67,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         "archived",
         "show / hide archived sessions",
         Cmd::Act(Action::ToggleArchived),
+    ),
+    (
+        "summarize",
+        "write (or redo) the selected session's summary",
+        Cmd::Summarize,
     ),
     (
         "log",
@@ -162,6 +168,20 @@ impl App {
                 self.dirty = true;
             }
             Cmd::Mastermind => self.show_seat("mastermind"),
+            Cmd::Summarize => {
+                if let Some(id) = self.selected_id() {
+                    if let Some(v) = self.call(
+                        "session.summarize",
+                        json!({"sessions": [id], "force": true}),
+                    ) {
+                        self.status_line = match v["skipped"][0]["why"].as_str() {
+                            Some(w) => format!("no summary: {w}"),
+                            None => "writing its summary in the background…".into(),
+                        };
+                        self.dirty = true;
+                    }
+                }
+            }
         }
         Ok(())
     }

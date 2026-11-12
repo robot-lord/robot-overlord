@@ -381,7 +381,7 @@ pub fn transcript_excerpts(path: &Path) -> Excerpts {
 
 /// Parsed JSON lines from the start and the end of a transcript (each at
 /// most `EXCERPT_WINDOW` bytes; a small file is read once and used for both).
-pub(crate) fn read_head_tail(path: &Path) -> (Vec<Value>, Vec<Value>) {
+pub fn read_head_tail(path: &Path) -> (Vec<Value>, Vec<Value>) {
     let parse = |s: String| -> Vec<Value> {
         s.lines()
             .filter_map(|l| serde_json::from_str(l).ok())

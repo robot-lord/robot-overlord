@@ -21,6 +21,7 @@ mod launcher;
 mod newform;
 mod overlay;
 mod overlord;
+mod record;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -595,6 +596,11 @@ impl App {
                 }
             }
             Action::Attach => self.attach(terminal)?,
+            Action::Restart | Action::Stop
+                if self.selected().is_some_and(|s| !s["archived_at"].is_null()) =>
+            {
+                self.archived_hint()
+            }
             Action::Restart => self.action("session.restart", "restarted"),
             Action::Stop => self.action("session.stop", "stopped"),
             // One rule for the overlord's row, mirrored by `context_legend`
@@ -900,6 +906,10 @@ impl App {
         let Some(mut s) = self.selected().cloned() else {
             return Ok(());
         };
+        if !s["archived_at"].is_null() {
+            self.archived_hint();
+            return Ok(());
+        }
         if is_overlord_role(&s) {
             // Like any session, full screen — started/resumed if needed, and
             // its window handed back from whatever size an overlay set.
@@ -1241,7 +1251,19 @@ impl App {
         f.render_stateful_widget(table, area, &mut self.table);
     }
 
+    /// Archived sessions are a record: they open again only once unarchived.
+    fn archived_hint(&mut self) {
+        self.status_line = format!(
+            "archived: {} unarchives it, then it can be opened",
+            self.keys.label(Action::Unarchive)
+        );
+    }
+
     fn draw_preview(&self, f: &mut Frame, area: Rect) {
+        // An archived session has no live pane: show its record instead.
+        if let Some(s) = self.selected().filter(|s| !s["archived_at"].is_null()) {
+            return self.draw_record(f, area, s);
+        }
         let name = self
             .selected()
             .and_then(|s| s["name"].as_str())
@@ -2049,6 +2071,16 @@ fn context_legend(
     let overlord = is_overlord_role(s);
     let stopped = s["status"] == "stopped" || s["status"].is_null();
     let archived = !s["archived_at"].is_null();
+    // Archived: a record. Unarchive first; its notes can still be kept up.
+    if archived {
+        return vec![
+            (Action::Unarchive, "unarchive"),
+            (Action::Rename, "rename"),
+            (Action::Tags, "tags"),
+            (Action::Describe, "describe"),
+            (Action::Notes, "notes"),
+        ];
+    }
     // Resuming (Enter on a stopped row) and restarting both need a
     // conversation the agent can resume.
     let resumable = s["agent"] == "claude" && !s["agent_session"].is_null();
@@ -2122,15 +2154,8 @@ mod tests {
                               "archived_at": 1, "pinned": true, "role": ""});
         assert_eq!(
             labels(&context_legend(false, None, Some(&archived))),
-            [
-                "resume",
-                "unarchive",
-                "rename",
-                "unpin",
-                "tags",
-                "describe",
-                "notes"
-            ]
+            // A record: unarchive first, no resume.
+            ["unarchive", "rename", "tags", "describe", "notes"]
         );
         let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
                               "archived_at": null, "pinned": false, "role": "overlord"});
@@ -2206,7 +2231,7 @@ mod tests {
             println!("{}", out.join("\n"));
         }
         let all = out.join("\n");
-        assert!(all.contains("┏▲▲▲┓") && all.contains("● working") && all.contains("#wip"));
+        assert!(all.contains("╔▲▲▲╗") && all.contains("● working") && all.contains("#wip"));
 
         // The groups tab: group column focused.
         app.tab = Tab::Groups;
@@ -2271,7 +2296,7 @@ mod tests {
             "{archived}"
         );
         assert!(
-            right.contains(" unarchive ") && right.contains(" resume "),
+            right.contains(" unarchive ") && !right.contains(" resume "),
             "{archived}"
         );
         assert!(

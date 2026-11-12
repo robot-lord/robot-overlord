@@ -265,6 +265,35 @@ files (`~/.claude/projects/`), so it doesn't matter what started them.
 
 Only Claude Code conversations for now.
 
+## Archived sessions and past work
+
+Archiving a session (`x`, or asking the overlord) keeps it as a record: it
+can't be opened again until it's unarchived (`u`), and where a live session
+shows its pane, an archived one shows **what it did**: a short summary
+written when it was archived, plus its notes and dates.
+
+The summary is written once, in the background, on a cheap model (`[archive]
+summary_model`, Haiku by default). Claude reads a fork of the whole
+conversation (`--resume … --fork-session`, nothing saved, no tools; the
+session itself is untouched); a conversation bigger than
+`summary_max_tokens` is summarized from its first prompt and last messages
+instead. `:summarize` (or the overlord's `summarize_sessions`) writes or
+redoes one.
+
+**Searching past work.** The list's search matches descriptions, notes and
+summaries too. To search what sessions actually said and did:
+
+    rlord search auth refresh            # every word, in one message
+    rlord search auth refresh --everywhere   # also Claude conversations outside rlord
+    rlord history <session> --around <line>  # read around a hit
+
+It searches each session's transcripts in place (including the ones before
+a `/clear`), with ripgrep's engine built in: nothing to install, and a
+search over hundreds of MB takes well under a second. The overlord has the
+same as `search_history` / `read_history` ("we did this before, find it"),
+and the mastermind uses them to carry earlier decisions into a new
+session. Any session can run `rlord search` itself.
+
 ## Remote Control (from your phone)
 
 Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control)

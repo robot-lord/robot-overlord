@@ -70,6 +70,28 @@ pub fn tools() -> Value {
         tool("show_list",
             "Show the user the rlord session list (hides your overlay).",
             json!({}), &[]),
+        tool("search_history",
+            "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear.",
+            json!({
+                "query": s("Words to find (all must appear in one message)"),
+                "scope": {"type": "string", "enum": ["rlord", "all"], "description": "rlord's sessions (default), or also Claude Code conversations started outside rlord"},
+                "limit": {"type": "integer", "description": "Sessions to return (default 8)"},
+            }), &["query"]),
+        tool("read_history",
+            "Read a session's conversation around a search_history hit (or its last messages): text only, tool output clipped, about 12k characters at most.",
+            json!({
+                "session": s(SESSION_REF),
+                "transcript": s("A hit's transcript path from search_history: an outside_rlord one (instead of session), or a session's older one (with session)"),
+                "line": {"type": "integer", "description": "A hit's line; omit for the last messages"},
+                "before": {"type": "integer", "description": "Messages before the line (default 6)"},
+                "after": {"type": "integer", "description": "Messages from the line on (default 14)"},
+            }), &[]),
+        tool("summarize_sessions",
+            "Write archive summaries (what each session was for, did, left unfinished) in the background, one cheap model call each. Archiving makes one automatically; use this for sessions archived without one, or to redo one.",
+            json!({
+                "sessions": {"type": "array", "items": {"type": "string"}, "description": "Session refs (at most 20)"},
+                "force": b("Replace an existing summary"),
+            }), &["sessions"]),
         tool("keys_list",
             "Every key rlord binds (global keys, the list's keys) as set now, each with what stands in its way: taken (won't work as set) or shadows (rlord takes it from Claude Code, the shell or the user's tmux).",
             json!({}), &[]),
@@ -215,7 +237,7 @@ fn session_ref(args: &Value) -> Result<String> {
 /// The compact row the overlord sees per session.
 fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
-    json!({
+    let mut row = json!({
         "id": s["id"], "name": s["name"], "status": s["status"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         // Its tmux session: how ListAgents names its pane (to message it).
@@ -226,7 +248,21 @@ fn summarize(s: &Value) -> Value {
         "subagents_running": s["agents_running"],
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
-    })
+    });
+    // Archived: what it did (get_session has it all).
+    if !s["archived_at"].is_null() {
+        let sum = s["summary"].as_str().unwrap_or("");
+        row["summary"] = if sum.is_empty() {
+            if s["summarizing"] == true {
+                json!("(being written)")
+            } else {
+                Value::Null
+            }
+        } else {
+            json!(rlord_core::agents::claude::clip(sum, 200))
+        };
+    }
+    row
 }
 
 /// The compact row the overlord sees per importable conversation.
@@ -319,6 +355,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "goto_session" => d.rpc("ui.goto", json!({"ref": session_ref(args)?})),
         "show_list" => d.rpc("ui.show_list", json!({})),
         "keys_list" => d.rpc("keys.list", json!({})),
+        "search_history" => d.rpc("history.search", args.clone()),
+        "read_history" => d.rpc("history.read", args.clone()),
+        "summarize_sessions" => d.rpc("session.summarize", args.clone()),
         "open_keys" => d.rpc("ui.keys", args.clone()),
         "set_list_view" => {
             let mut p = Map::new();
