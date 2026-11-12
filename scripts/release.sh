@@ -99,7 +99,10 @@ gh release create "$tag" -R "$repo" "$dist"/* "${flags[@]}"
 
 if [[ $dev == 0 ]]; then
   scripts/update-tap.sh "$ver" "$dist/SHA256SUMS" "$tap"
-  if [[ -f ~/.cargo/credentials.toml ]]; then
+  # crates.io publishes the source: only once the repo itself is public.
+  if [[ "$(gh repo view "$repo" --json visibility -q .visibility)" != PUBLIC ]]; then
+    echo "crates.io: $repo is private — skipped (publish later with scripts/publish-crates.sh)" >&2
+  elif [[ -f ~/.cargo/credentials.toml ]]; then
     scripts/publish-crates.sh
   else
     echo "crates.io: not logged in (cargo login) — skipped" >&2
