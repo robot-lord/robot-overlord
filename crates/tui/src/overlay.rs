@@ -85,6 +85,10 @@ fn run_loop(
     // goes to the clipboard (a yank to tmux's buffer alone would otherwise
     // reach no client: none shows the seat's window).
     let mut buffer_at_entry: Option<Option<String>> = None;
+    // The pane's history size when copy mode began: the mode's snapshot,
+    // which its selection lines count in (taken just before the overlay
+    // enters it; on first sight if it was entered elsewhere).
+    let mut history_at_entry: Option<i64> = None;
     let mut size = (0u16, 0u16);
     let mut screen = Text::default();
     let mut cursor: Option<(u16, u16)> = None;
@@ -107,7 +111,11 @@ fn run_loop(
                 Ok(f) => {
                     if f.in_mode && !in_mode {
                         buffer_at_entry = Some(tmux::newest_buffer());
-                    } else if !f.in_mode && in_mode {
+                        history_at_entry.get_or_insert(f.history);
+                    } else if !f.in_mode {
+                        history_at_entry = None;
+                    }
+                    if !f.in_mode && in_mode {
                         prompt = None;
                         if let Some(before) = buffer_at_entry.take() {
                             let now = tmux::newest_buffer();
@@ -118,7 +126,11 @@ fn run_loop(
                     }
                     in_mode = f.in_mode;
                     screen = f.ansi.as_bytes().into_text().unwrap_or_default();
-                    if let Some(sel) = f.selection {
+                    let on_screen = f
+                        .selection
+                        .zip(history_at_entry)
+                        .and_then(|(sel, h0)| tmux::screen_selection(sel, h0, f.scroll, f.height));
+                    if let Some(sel) = on_screen {
                         highlight(&mut screen, sel);
                     }
                     cursor = f.cursor_visible.then_some((f.cursor_x, f.cursor_y));
@@ -197,6 +209,7 @@ fn run_loop(
                     after_prefix = false;
                     if k.code == KeyCode::Char('[') {
                         if !in_mode {
+                            history_at_entry = tmux::history_size(pane);
                             if let Err(e) = tmux::copy_mode(pane) {
                                 error = Some(format!("{e:#}"));
                             }
@@ -268,7 +281,12 @@ fn run_loop(
             // (Motion and clicks are ignored: no redraw for them.)
             Event::Mouse(m) => {
                 let r = match m.kind {
-                    MouseEventKind::ScrollUp => tmux::scroll(pane, true),
+                    MouseEventKind::ScrollUp => {
+                        if !in_mode {
+                            history_at_entry = tmux::history_size(pane);
+                        }
+                        tmux::scroll(pane, true)
+                    }
                     MouseEventKind::ScrollDown if in_mode => tmux::scroll(pane, false),
                     _ => continue,
                 };

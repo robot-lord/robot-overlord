@@ -577,30 +577,38 @@ pub struct PaneFrame {
     /// The pane is in a mode (copy mode): the screen and cursor are the
     /// mode's.
     pub in_mode: bool,
-    /// Copy mode's selection on screen, ends inclusive and in order:
-    /// ((col, row), (col, row)). tmux doesn't draw it into a capture.
-    pub selection: Option<((u16, u16), (u16, u16))>,
+    /// Copy mode's selection, in its history-line coordinates
+    /// `[start_x, start_y, end_x, end_y]` (tmux doesn't draw it into a
+    /// capture): see `screen_selection`.
+    pub selection: Option<[i64; 4]>,
+    /// Copy mode's scroll position, the pane's live history size and its
+    /// height.
+    pub scroll: i64,
+    pub history: i64,
+    pub height: i64,
 }
 
-/// The on-screen selection from tmux's (history-line) coordinates.
-fn screen_selection(f: &str) -> Option<((u16, u16), (u16, u16))> {
-    let n: Vec<i64> = f
-        .split(',')
-        .map(|v| v.parse().ok())
-        .collect::<Option<_>>()?;
-    // The selection's end is the copy cursor, whose screen row is known:
-    // that ties history lines to rows (the live history size moves while
-    // copy mode's snapshot doesn't).
-    let [sx, sy, ex, ey, cursor_x, cursor_row, h] = n[..] else {
-        return None;
-    };
-    // The cursor is one end: the end, unless swapped to the start (vi `o`).
-    let cursor_line = if ex != cursor_x && sx == cursor_x {
-        sy
-    } else {
-        ey
-    };
-    let top = cursor_line - cursor_row; // history line shown on screen row 0
+/// The pane's history size now (copy mode works on a snapshot of it taken
+/// when the mode begins: record it then, see `screen_selection`).
+pub fn history_size(pane: &str) -> Option<i64> {
+    run(&["display-message", "-p", "-t", pane, "#{history_size}"])
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// The selection on screen, ends inclusive and in reading order:
+/// ((col, row), (col, row)). Copy mode numbers lines in the snapshot it took
+/// on entry, whose history size was `history_at_entry`: screen row 0 shows
+/// line `history_at_entry - scroll`. (The live history size moves while the
+/// agent prints; the snapshot doesn't.)
+pub fn screen_selection(
+    sel: [i64; 4],
+    history_at_entry: i64,
+    scroll: i64,
+    h: i64,
+) -> Option<((u16, u16), (u16, u16))> {
+    let [sx, sy, ex, ey] = sel;
+    let top = history_at_entry - scroll; // history line shown on screen row 0
     let a = (sy - top, sx);
     let b = (ey - top, ex);
     let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
@@ -632,8 +640,8 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
              #{?pane_in_mode,#{copy_cursor_y},#{cursor_y}} \
              #{?pane_in_mode,1,#{cursor_flag}} #{pane_in_mode} \
              #{?selection_present,#{selection_start_x}#,#{selection_start_y}#,\
-             #{selection_end_x}#,#{selection_end_y}#,#{copy_cursor_x}#,\
-             #{copy_cursor_y}#,#{pane_height},-}",
+             #{selection_end_x}#,#{selection_end_y},-} \
+             #{?pane_in_mode,#{scroll_position},0} #{history_size} #{pane_height}",
             ";",
             "capture-pane",
             "-p",
@@ -652,15 +660,24 @@ pub fn capture_frame(pane: &str) -> Result<PaneFrame> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let (head, ansi) = text.split_once('\n').unwrap_or((&text, ""));
-    let mut f = head
-        .split_whitespace()
-        .map(|v| v.parse::<u16>().unwrap_or(0));
+    let fields: Vec<&str> = head.split_whitespace().collect();
+    let num = |i: usize| -> i64 { fields.get(i).and_then(|v| v.parse().ok()).unwrap_or(0) };
+    let mut f = fields.iter().map(|v| v.parse::<u16>().unwrap_or(0));
     Ok(PaneFrame {
         cursor_x: f.next().unwrap_or(0),
         cursor_y: f.next().unwrap_or(0),
         cursor_visible: f.next().unwrap_or(0) == 1,
         in_mode: f.next().unwrap_or(0) == 1,
-        selection: head.split_whitespace().nth(4).and_then(screen_selection),
+        selection: fields.get(4).and_then(|f| {
+            let n: Vec<i64> = f
+                .split(',')
+                .map(|v| v.parse().ok())
+                .collect::<Option<_>>()?;
+            n.try_into().ok()
+        }),
+        scroll: num(5),
+        history: num(6),
+        height: num(7),
         ansi: ansi.to_string(),
     })
 }
@@ -1150,24 +1167,23 @@ mod tests {
 
     #[test]
     fn selection_maps_history_lines_to_the_screen() {
-        // 191 history lines, at the bottom, 10 rows: line 200 is row 9.
+        // Snapshot of 191 history lines, at the bottom, 10 rows: line 200 is
+        // row 9, whichever end the cursor is on.
         assert_eq!(
-            screen_selection("0,200,2,198,2,7,10"),
+            screen_selection([0, 200, 2, 198], 191, 0, 10),
             Some(((2, 7), (0, 9)))
         );
-        // Scrolled up 1: the lines sit a row lower, the end runs off the
-        // bottom (clipped to the last row); scrolled up 5, all off-screen.
         assert_eq!(
-            screen_selection("0,200,2,198,2,8,10"),
+            screen_selection([2, 198, 0, 200], 191, 0, 10),
+            Some(((2, 7), (0, 9)))
+        );
+        // Scrolled up 1: a row lower, the end clipped to the last row.
+        assert_eq!(
+            screen_selection([0, 200, 2, 198], 191, 1, 10),
             Some(((2, 8), (u16::MAX, 9)))
         );
-        assert_eq!(screen_selection("0,300,2,298,2,-5,10"), None);
-        // Ends swapped (vi `o`): the cursor is at the start, on row 7.
-        assert_eq!(
-            screen_selection("0,198,2,200,0,7,10"),
-            Some(((0, 7), (2, 9)))
-        );
-        assert_eq!(screen_selection("-"), None);
+        // Scrolled up 5: all below the screen.
+        assert_eq!(screen_selection([0, 200, 2, 198], 191, 5, 10), None);
     }
 
     use super::*;
