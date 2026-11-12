@@ -22,11 +22,13 @@ use crate::{methods, Daemon};
 /// More than this left to read: the warm-up reads it, not the request.
 const READ_INLINE_MAX: u64 = 4 << 20;
 
-/// The metric a request asks for (`usage`), else the configured one.
+/// The metric a request asks for (`usage`), else the one the user last
+/// picked (`ui::usage_pref`), else the configured one.
 pub fn metric(d: &Daemon, params: &Value) -> UsageMetric {
     params["usage"]
         .as_str()
         .and_then(UsageMetric::parse)
+        .or_else(|| crate::ui::usage_pref(d))
         .unwrap_or(d.config().usage)
 }
 
@@ -194,13 +196,20 @@ pub fn sort(rows: &mut [Value], metric: UsageMetric, reverse: bool) {
     });
 }
 
-/// `session.list`'s rows: usage on each, sorted by it when asked.
+/// `session.list`'s rows: usage on each, sorted by it when asked. Each
+/// row says which measure this list used (`usage_metric`: the request's,
+/// else the saved pick, else config), so a client that didn't ask shows
+/// the same one.
 pub fn list(d: &Daemon, params: &Value, rows: &mut [Value]) {
     annotate(d, rows, false);
+    let m = metric(d, params);
+    for row in rows.iter_mut() {
+        row["usage_metric"] = json!(m.label());
+    }
     let sort = params["sort"].as_str().and_then(SortMode::parse);
     if sort == Some(SortMode::Usage) {
         let reverse = params["reverse"].as_bool().unwrap_or(false);
-        self::sort(rows, metric(d, params), reverse);
+        self::sort(rows, m, reverse);
     }
 }
 

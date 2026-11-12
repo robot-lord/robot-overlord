@@ -448,11 +448,15 @@ impl App {
         if let Some(r) = v["reverse"].as_bool() {
             self.reverse = r;
         }
-        if let Some(m) = v["usage"]
-            .as_str()
-            .and_then(rlord_core::usage::UsageMetric::parse)
-        {
-            self.usage = m;
+        // A measure, or null: none picked (config `usage`). Absent: as is.
+        match v.get("usage") {
+            Some(Value::Null) => self.usage = self.config.usage,
+            Some(u) => {
+                if let Some(m) = u.as_str().and_then(rlord_core::usage::UsageMetric::parse) {
+                    self.usage = m;
+                }
+            }
+            None => {}
         }
         if let Some(a) = v["archived"].as_str() {
             self.show_archived = a == "only";

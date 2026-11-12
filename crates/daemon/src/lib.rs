@@ -595,6 +595,7 @@ impl Daemon {
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),
             "ui.view.default" => ui::default_view(self),
+            "ui.usage" => ui::usage(self, params),
             // The list's selected session: set with `id`, read without.
             "ui.selected" => match params.get("id").and_then(Value::as_str) {
                 Some(id) => self
@@ -1023,6 +1024,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids(&v), ["01a", "01b", "01c"], "unknown stays last: {v}");
+        // Each row says which measure the list used: asked for, else the
+        // list's saved pick (as `rlord ls` without --usage).
+        assert_eq!(v[0]["usage_metric"], "tokens");
+        assert_eq!(
+            list(json!({"sort": "usage"})).await.unwrap()[0]["usage_metric"],
+            "turns"
+        );
+        daemon.db().kv_set("ui_usage", "tokens").unwrap();
+        let v = list(json!({"sort": "usage"})).await.unwrap();
+        assert_eq!(v[0]["usage_metric"], "tokens");
+        assert_eq!(
+            ids(&v),
+            ["01b", "01a", "01c"],
+            "sorted by the saved pick: {v}"
+        );
         server.abort();
     }
 
