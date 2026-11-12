@@ -773,7 +773,10 @@ mod tests {
         let (hx, hy) = find(&rows, "Last message ▼");
         let arrow = "Last message ".chars().count() as u16;
         assert_eq!(app.hits.at(hx, hy), Some(Hit::SortBy(SortMode::Activity)));
-        assert_eq!(app.hits.at(hx + arrow, hy), Some(Hit::SortBy(SortMode::Activity)));
+        assert_eq!(
+            app.hits.at(hx + arrow, hy),
+            Some(Hit::SortBy(SortMode::Activity))
+        );
         assert_eq!(at("Name", 1), Some(Hit::SortBy(SortMode::Name)));
         // The toolbar's direction arrow flips it.
         assert_eq!(at("▼ ", 0), press(Action::ReverseSort));
