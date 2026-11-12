@@ -825,6 +825,105 @@ mod tests {
         app
     }
 
+    fn drawn_at(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    /// The overlord's row and ten sessions.
+    fn long_fleet() -> App {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.sessions = vec![json!({"id": "o", "name": "overlord", "role": "overlord",
+                                   "status": "idle", "agent": "claude", "tags": [],
+                                   "archived_at": null})];
+        app.sessions.extend((0..10).map(|i| {
+            json!({"id": format!("s{i}"), "name": format!("sess-{i:02}"), "status": "idle",
+                   "agent": "claude", "tags": [], "archived_at": null})
+        }));
+        app.overlord_rows = 1;
+        app.all = app.sessions.clone();
+        app.table.select(Some(1));
+        app
+    }
+
+    /// The list's half of the screen (the preview names sessions too).
+    fn list_half(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|r| r.chars().take(75).collect()).collect()
+    }
+
+    /// The "↑ n more" / "↓ n more" counts on the list's border, and how
+    /// many sessions show.
+    fn more_and_shown(rows: &[String]) -> (usize, usize, usize) {
+        let rows = list_half(rows);
+        let count = |arrow: &str| {
+            rows.iter()
+                .find_map(|r| {
+                    let i = r.find(&format!("{arrow} "))?;
+                    let rest = &r[i + arrow.len() + 1..];
+                    rest.split(' ').next()?.parse().ok()
+                })
+                .unwrap_or(0)
+        };
+        let shown = rows.iter().filter(|r| r.contains("sess-")).count();
+        (count("↑"), shown, count("↓"))
+    }
+
+    /// A short window gives up the header art, then the toolbar and key
+    /// hints, then list rows; rows off screen are always counted on the
+    /// border, and what's drawn is still what's clicked.
+    #[test]
+    fn a_short_window_keeps_the_list() {
+        let has = |rows: &[String], t: &str| rows.iter().any(|r| r.contains(t));
+        let press = |app: &App, a: Action| app.keys.event(a).map(Hit::Key);
+        // 24 rows: everything, every session in view.
+        let mut app = long_fleet();
+        let rows = drawn_at(&mut app, 150, 24);
+        assert!(has(&rows, "╦═╗╔═╗") && has(&rows, "⌕ search") && has(&rows, " quit"));
+        assert_eq!(more_and_shown(&rows), (0, 10, 0));
+        // 16: the art is gone, the toolbar and the key hints stay.
+        let rows = drawn_at(&mut app, 150, 16);
+        assert!(!has(&rows, "╦═╗╔═╗"), "{}", rows.join("\n"));
+        assert!(has(&rows, "⌕ search") && has(&rows, " quit"));
+        assert_eq!(more_and_shown(&rows), (0, 7, 3));
+        let (x, y) = find(&rows, "⌕ search");
+        assert_eq!(app.hits.at(x + 3, y), press(&app, Action::Filter));
+        let (x, y) = find(&rows, " groups ");
+        assert_eq!(app.hits.at(x + 2, y), Some(Hit::Tab(Tab::Groups)));
+        let (x, y) = find(&list_half(&rows), "sess-02");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(3)));
+        let (x, y) = find(&rows, " quit");
+        assert_eq!(app.hits.at(x + 2, y), press(&app, Action::Quit));
+        // 12: the toolbar and key hints go before the list drops below
+        // five sessions.
+        let rows = drawn_at(&mut app, 150, 12);
+        assert!(
+            !has(&rows, "⌕") && !has(&rows, " quit"),
+            "{}",
+            rows.join("\n")
+        );
+        assert_eq!(more_and_shown(&rows), (0, 5, 5));
+        let (x, y) = find(&list_half(&rows), "sess-04");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(5)));
+        // 8: only now does the list shrink, still counting what's hidden.
+        let rows = drawn_at(&mut app, 150, 8);
+        assert_eq!(more_and_shown(&rows), (0, 1, 9), "{}", rows.join("\n"));
+        // Scrolled to the end: the count moves to the top.
+        app.table.select(Some(10));
+        let rows = drawn_at(&mut app, 150, 12);
+        let (up, shown, down) = more_and_shown(&rows);
+        assert!(up > 0 && down == 0, "{}", rows.join("\n"));
+        // (The overlord's row is one of those above.)
+        assert_eq!(up + shown, 11, "{}", rows.join("\n"));
+        let (x, y) = find(&list_half(&rows), "sess-09");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Row(10)));
+    }
+
     #[test]
     fn what_is_drawn_can_be_clicked() {
         let mut app = fleet();

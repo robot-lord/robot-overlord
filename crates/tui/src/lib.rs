@@ -1198,14 +1198,20 @@ impl App {
         if theme::bg().is_some() {
             f.render_widget(Block::default().style(theme::base()), f.area());
         }
+        // A short window gives up the header art first, then the toolbar
+        // and the key hints, and only then list rows (`Chrome::for_height`).
+        let chrome = Chrome::for_height(f.area().height);
         let [bars_area, main_area, footer_area] = RLayout::vertical([
-            // The header: tabs, then the view, beside the 4-row logo.
-            Constraint::Length(4),
-            Constraint::Min(5),
-            Constraint::Length(2),
+            // The header: tabs, then the view, beside the 4-row logo (or
+            // the toolbar alone, compact).
+            Constraint::Length(chrome.header),
+            Constraint::Min(1),
+            Constraint::Length(chrome.footer),
         ])
         .areas(f.area());
-        self.draw_bars(f, bars_area);
+        if chrome.header > 0 {
+            self.draw_bars(f, bars_area);
+        }
         let (list_area, right) = match self.config.layout {
             Layout::Side => {
                 // The list is what this view is for: it gets its width first
@@ -1477,10 +1483,13 @@ impl App {
         };
         let top = self.table.offset();
         let mut y = inner.y;
+        // Rows past the bottom edge (all of them when none fit).
+        let mut below = self.sessions.len().saturating_sub(top);
         for i in top..self.sessions.len() {
             if y >= inner.y + inner.height {
                 break;
             }
+            below -= 1;
             self.hits.row(inner, y, mouse::Hit::Row(i));
             // The gap under the last overlord row: a faint rule over it
             // (it also covers the selection highlight that spills into the
@@ -1500,6 +1509,26 @@ impl App {
                 }
             }
             y += 1;
+        }
+        // Rows off screen, counted on the box's border: the user can scroll
+        // that way. (The border is there at any height.)
+        let more = |n: usize, arrow: &str| {
+            Line::from(Span::styled(format!(" {arrow} {n} more "), theme::muted()))
+        };
+        let more_at = |line: &Line, y: u16| {
+            let w = (line.width() as u16).min(area.width.saturating_sub(4));
+            Rect::new(area.x + area.width.saturating_sub(w + 2), y, w, 1)
+        };
+        if top > 0 && area.height >= 2 {
+            let l = more(top, "↑");
+            f.render_widget(Paragraph::new(l.clone()), more_at(&l, area.y));
+        }
+        if below > 0 && area.height >= 2 {
+            let l = more(below, "↓");
+            f.render_widget(
+                Paragraph::new(l.clone()),
+                more_at(&l, area.y + area.height - 1),
+            );
         }
         // The headers of the sortable columns: Name and the time column,
         // placed by the same layout the table uses (inside the border and
@@ -2030,8 +2059,18 @@ impl App {
                 Span::styled(self.status_line.clone(), theme::muted()),
             ])
         };
-        let [line1_area, line2_area] =
-            RLayout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        // One row (a short window): what's being typed, else the status
+        // line; the key hints are dropped.
+        let one_row = area.height < 2;
+        if one_row && prompt.is_none() {
+            f.render_widget(Paragraph::new(line2), area);
+            return;
+        }
+        let [line1_area, line2_area] = if one_row {
+            [area, Rect::default()]
+        } else {
+            RLayout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area)
+        };
         f.render_widget(Paragraph::new(line2), line2_area);
         if let Some(p) = prompt {
             // `label: text   (hints)` → a label chip, the text, dim hints.
@@ -2136,6 +2175,45 @@ impl App {
         self.hits.spans(right.x, right.y, ctx_hits);
         f.render_widget(Paragraph::new(global), left);
         f.render_widget(Paragraph::new(ctx_line), right);
+    }
+}
+
+/// What the list view keeps around the list at a window height: header
+/// rows (4: the logo, name and toolbar; 1: the toolbar alone; 0: none) and
+/// footer rows (2: key hints and the status line; 1: the status line or
+/// what's being typed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Chrome {
+    header: u16,
+    footer: u16,
+}
+
+impl Chrome {
+    /// The full header and footer.
+    const HEADER: u16 = 4;
+    const FOOTER: u16 = 2;
+    /// The list box with about five sessions in view: its borders, the
+    /// column header and its margin, the overlord's row and the rule under
+    /// it, five rows.
+    const LIST_ROOM: u16 = 2 + 2 + 2 + 5;
+
+    /// The most that leaves the list `LIST_ROOM`: first the art goes (the
+    /// toolbar keeps a row), then the key hints, then the toolbar. Below
+    /// that the list itself shrinks.
+    fn for_height(h: u16) -> Chrome {
+        [
+            (Self::HEADER, Self::FOOTER),
+            (1, Self::FOOTER),
+            (1, 1),
+            (0, 1),
+        ]
+        .into_iter()
+        .map(|(header, footer)| Chrome { header, footer })
+        .find(|c| h >= c.header + c.footer + Self::LIST_ROOM)
+        .unwrap_or(Chrome {
+            header: 0,
+            footer: u16::from(h > 2),
+        })
     }
 }
 
