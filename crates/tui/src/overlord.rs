@@ -70,6 +70,7 @@ impl App {
     /// Called once before the event loop.
     pub(crate) fn startup(&mut self) {
         if tmux::inside_rlord() {
+            keyscreen::clear_stuck_listen();
             if let Some(home) = tmux::current_session() {
                 let _ = tmux::set_home(&home);
             }
@@ -351,6 +352,15 @@ impl App {
                 self.status_line = "overlord set the view".into();
             }
             Some("overlord_setup") => self.check_overlord(),
+            // Never over something the user is typing into.
+            Some("keys") if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Keys(_)) => {
+                self.status_line =
+                    "the overlord wants to open the key screen: finish here, then :keys".into();
+            }
+            Some("keys") => {
+                self.open_keys(cmd["row"].as_str());
+                self.status_line = "the overlord opened the key screen".into();
+            }
             Some("confirm_new_session") => {
                 self.open_new_form(newform::FormKind::Overlord);
                 if let Mode::NewSession(form) = &mut self.mode {

@@ -78,7 +78,7 @@ pub fn sync_ref(d: &Daemon, r: &str) {
     let db = d.db();
     let res = db
         .resolve_ref(r)
-        .and_then(|s| sync(&db, &d.config, &s, false));
+        .and_then(|s| sync(&db, &d.config(), &s, false));
     if let Err(e) = res {
         tracing::warn!(session = %r, error = %e, "applying tmux profile");
     }
@@ -93,7 +93,7 @@ pub fn sync_all(d: &Daemon, refresh: bool) {
         })
         .unwrap_or_default();
     for s in all {
-        if let Err(e) = sync(&db, &d.config, &s, refresh) {
+        if let Err(e) = sync(&db, &d.config(), &s, refresh) {
             tracing::warn!(session = %s.id, error = %e, "applying tmux profile");
         }
     }
@@ -115,7 +115,7 @@ pub fn profile(d: &Daemon, params: &Value) -> Result<Value> {
             "off" => "off",
             "default" => "",
             "toggle" => {
-                if wanted(&db, &d.config, &s)? {
+                if wanted(&db, &d.config(), &s)? {
                     "off"
                 } else {
                     "on"
@@ -124,13 +124,13 @@ pub fn profile(d: &Daemon, params: &Value) -> Result<Value> {
             other => anyhow::bail!("unknown setting '{other}' (on, off, default, toggle)"),
         };
         db.kv_set(&kv_key(&s.id), v)?;
-        sync(&db, &d.config, &s, false)?;
+        sync(&db, &d.config(), &s, false)?;
     }
     Ok(json!({
         "name": s.name,
-        "on": wanted(&db, &d.config, &s)?,
+        "on": wanted(&db, &d.config(), &s)?,
         "explicit": choice(&db, &s)?.is_some(),
-        "default": d.config.tmux.profile,
+        "default": d.config().tmux.profile,
         "imported": tmux_profile::exists(),
     }))
 }

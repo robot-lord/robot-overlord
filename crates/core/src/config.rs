@@ -57,6 +57,10 @@ pub struct Keys {
     /// Edit the selected session's tags (tags are the groups).
     pub tags: String,
     pub cancel: String,
+    /// The cheat sheet: every key, and what to ask the overlord.
+    pub help: String,
+    /// The command launcher: the less frequent things, by name.
+    pub command: String,
 }
 
 impl Default for Keys {
@@ -89,6 +93,8 @@ impl Default for Keys {
             groups_tab: "L".into(),
             tags: "#".into(),
             cancel: "esc".into(),
+            help: "?".into(),
+            command: ":".into(),
         }
     }
 }
@@ -319,10 +325,61 @@ impl Config {
         }
     }
 
+    /// Set one string value (`[section] field = value`) in the user's config
+    /// file, keeping everything else in it as written: comments, order,
+    /// other values. The result must still load, or nothing is written.
+    pub fn set_value(section: &str, field: &str, value: &str) -> Result<()> {
+        let path = paths::config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let out = set_in(&text, section, field, value)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // A symlinked config (a dotfiles repo) is written where it points.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &out)?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
     /// Commented template written by `rlord config init`; equals the defaults.
     pub fn default_toml() -> String {
         DEFAULT_TOML.to_string()
     }
+}
+
+/// `text` with `[section] field = value` set (see `Config::set_value`).
+fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", paths::config_path().display()))?;
+    // `keys = { … }` becomes a `[keys]` table with the same values.
+    if let Some(t) = doc.get(section).and_then(|i| i.as_inline_table()).cloned() {
+        doc[section] = toml_edit::Item::Table(t.into_table());
+    }
+    if !doc.contains_table(section) {
+        doc[section] = toml_edit::table();
+    }
+    let table = doc[section]
+        .as_table_mut()
+        .with_context(|| format!("[{section}] isn't a table"))?;
+    match table.get_mut(field).and_then(|i| i.as_value_mut()) {
+        // Keep the line's own comment.
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = toml_edit::Value::from(value);
+            *v.decor_mut() = decor;
+        }
+        None => table[field] = toml_edit::value(value),
+    }
+    let out = doc.to_string();
+    toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+    Ok(out)
 }
 
 const DEFAULT_TOML: &str = r##"# Robot Overlord configuration. Every key is optional.
@@ -375,6 +432,10 @@ mastermind_fresh_after_mins = 15   # fresh conversation after this idle; 0 = nev
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
 
+# Easiest: ask your overlord to change a key (or `:keys` in the list). It
+# opens the key screen, which tests that the key reaches rlord and checks it
+# against your tmux, shell and Claude Code before saving it here.
+#
 # TUI keys. A character ("q", "R"), a named key ("enter", "esc", "tab", "up",
 # "down", "space", "backspace", "f1".."f12"), optionally "ctrl-"/"alt-" prefixed.
 [keys]
@@ -405,6 +466,8 @@ sessions_tab = "H"      # step left:  sessions tab <- group list <- inside a gro
 groups_tab = "L"        # step right: sessions tab -> group list -> inside a group
 tags = "#"              # edit the selected session's tags (tags are the groups)
 cancel = "esc"
+help = "?"              # cheat sheet: every key, and what to ask the overlord
+command = ":"           # command launcher (keys, sort, log, archived, …)
 
 # Keys bound in rlord's own tmux server (tmux key syntax), so they work from
 # inside any agent pane. rlord runs a private tmux (`tmux -L rlord`, no status
@@ -424,6 +487,41 @@ profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_in_keeps_the_file_as_written() {
+        let t = "# mine\n[tmux]\nback = \"M-d\"   # home\nnext = \"\"\n";
+        let out = set_in(t, "tmux", "back", "M-h").unwrap();
+        assert_eq!(
+            out,
+            "# mine\n[tmux]\nback = \"M-h\"   # home\nnext = \"\"\n"
+        );
+        let out = set_in("", "keys", "help", "F1").unwrap();
+        assert!(out.contains("[keys]") && out.contains("help = \"F1\""));
+        // Commented-out template sections gain a real table.
+        let out = set_in(&Config::default_toml(), "tmux", "next", "M-g").unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.tmux.next, "M-g");
+        assert_eq!(c.tmux.back, "M-d");
+        assert!(set_in(t, "keys", "quit", "x").is_ok());
+        // An inline table keeps its values.
+        let out = set_in(
+            "keys = { quit = \"x\", new = \"a\" }\n",
+            "keys",
+            "help",
+            "F1",
+        )
+        .unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            (
+                c.keys.quit.as_str(),
+                c.keys.new.as_str(),
+                c.keys.help.as_str()
+            ),
+            ("x", "a", "F1")
+        );
+    }
 
     #[test]
     fn tilde_expansion() {

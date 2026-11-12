@@ -45,7 +45,7 @@ pub fn send_to(d: &Daemon, seat: &overlord::Seat, text: &str) -> Result<Value> {
     if d.db().overlord()?.is_none() {
         bail!("no overlord yet: press Option-O to set one up (or N for the manual form)");
     }
-    let s = overlord::ensure(&d.db(), &d.config, &json!({"seat": seat.key}))?;
+    let s = overlord::ensure(&d.db(), &d.config(), &json!({"seat": seat.key}))?;
     let pane = s["tmux_session"].as_str().unwrap_or(seat.tmux).to_string();
     d.changed();
     // A fresh or resumed overlord isn't listening until its SessionStart hook
@@ -213,7 +213,7 @@ fn show_mastermind(d: &Daemon) -> String {
             let db = d.db();
             match overlord::MASTERMIND.session(&db) {
                 Ok(Some(m)) => Some(m),
-                Ok(None) => overlord::ensure(&db, &d.config, &json!({"seat": "mastermind"}))
+                Ok(None) => overlord::ensure(&db, &d.config(), &json!({"seat": "mastermind"}))
                     .ok()
                     .and_then(|v| v["id"].as_str().map(str::to_string))
                     .and_then(|id| db.resolve_ref(&id).ok()),

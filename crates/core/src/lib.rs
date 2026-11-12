@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod git;
 pub mod import;
+pub mod keys;
 pub mod models;
 pub mod names;
 pub mod paths;

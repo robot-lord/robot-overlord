@@ -16,6 +16,8 @@ use ratatui::widgets::{Block, Borders, Cell, ListState, Paragraph, Row, Table, T
 use ratatui::{DefaultTerminal, Frame};
 
 mod groups;
+mod keyscreen;
+mod launcher;
 mod newform;
 mod overlay;
 mod overlord;
@@ -120,6 +122,12 @@ enum Mode {
     RemoteOffer(Box<overlord::RemoteOffer>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
+    /// The cheat sheet (`?`).
+    Help,
+    /// The command launcher (`:`).
+    Command(Box<launcher::Launcher>),
+    /// The key screen (`:keys`, or the overlord's `open_keys`).
+    Keys(Box<keyscreen::KeyScreen>),
 }
 
 struct App {
@@ -304,10 +312,7 @@ impl App {
     }
 
     fn quit_hint(&mut self) {
-        self.status_line = format!(
-            "to quit rlord press {} (Shift-Q)",
-            self.keys.label(Action::Quit)
-        );
+        self.status_line = format!("to quit rlord press {}", self.keys.label(Action::Quit));
     }
 
     fn draw_confirm_quit(&self, f: &mut Frame) {
@@ -459,7 +464,11 @@ impl App {
                     }
                     // Quitting rlord takes the real quit key; the reflexive
                     // ones (Ctrl-C, and q in the list) just say what it is.
-                    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                    let listening = matches!(&self.mode, Mode::Keys(ks) if ks.listening());
+                    if !listening
+                        && k.modifiers.contains(KeyModifiers::CONTROL)
+                        && k.code == KeyCode::Char('c')
+                    {
                         self.quit_hint();
                         continue;
                     }
@@ -490,6 +499,9 @@ impl App {
                         Mode::OverlordSetup(s) => self.handle_setup(k, s),
                         Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
                         Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+                        Mode::Help => {}
+                        Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
+                        Mode::Keys(ks) => self.handle_keys(k, ks),
                         Mode::ConfirmQuit => {
                             if matches!(
                                 k.code,
@@ -546,7 +558,15 @@ impl App {
             }
             return Ok(false);
         };
+        self.do_action(action, terminal)
+    }
+
+    /// Run one list action (from its key, or the command launcher).
+    fn do_action(&mut self, action: Action, terminal: &mut DefaultTerminal) -> Result<bool> {
+        let n = self.sessions.len();
         match action {
+            Action::Help => self.mode = Mode::Help,
+            Action::Command => self.mode = Mode::Command(Box::default()),
             Action::Quit => self.mode = Mode::ConfirmQuit,
             Action::Down => {
                 if n > 0 {
@@ -1039,6 +1059,9 @@ impl App {
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
+            Mode::Help => self.draw_help(f),
+            Mode::Command(l) => self.draw_launcher(f, l),
+            Mode::Keys(ks) => self.draw_keys(f, ks),
             _ => {}
         }
     }
@@ -1488,6 +1511,12 @@ impl App {
             Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
+            Mode::Help => Some("help: any key closes".to_string()),
+            Mode::Command(l) => Some(format!(
+                "command: {}▏   (enter: run · tab: complete · ↑↓: choose · esc: close)",
+                l.buf
+            )),
+            Mode::Keys(_) => Some("keys — see the key screen".to_string()),
         };
         let line2 = if self.status_line.is_empty() {
             Line::raw("")
@@ -1614,18 +1643,13 @@ fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// When a session last changed: its latest message either way or status
-/// change (creation, failing all of those). The list's "Updated" column.
+/// The list's "Updated" column: the latest message either way (not a
+/// resume or a state flip), else when it was created.
 fn updated_at(s: &Value) -> Option<i64> {
-    [
-        "last_agent_msg_at",
-        "last_user_msg_at",
-        "last_state_change_at",
-        "created_at",
-    ]
-    .iter()
-    .filter_map(|k| s[*k].as_i64())
-    .max()
+    ["last_agent_msg_at", "last_user_msg_at", "created_at"]
+        .iter()
+        .filter_map(|k| s[*k].as_i64())
+        .max()
 }
 
 /// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
@@ -1779,6 +1803,8 @@ enum Action {
     GroupsTab,
     Tags,
     Cancel,
+    Help,
+    Command,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1907,6 +1933,8 @@ impl KeyMap {
             (Action::GroupsTab, &k.groups_tab),
             (Action::Tags, &k.tags),
             (Action::Cancel, &k.cancel),
+            (Action::Help, &k.help),
+            (Action::Command, &k.command),
         ];
         let mut bindings: Vec<(Action, KeyBinding)> = Vec::with_capacity(specs.len());
         for (a, spec) in specs {
@@ -1919,9 +1947,12 @@ impl KeyMap {
                 .any(|(a, o)| *a != me && o.code == b.code && o.ctrl == b.ctrl && o.alt == b.alt)
         };
         let snapshot = bindings.clone();
+        // So do `?` and `:` (help, commands), newer still.
         let default_step = |a: &Action| {
             (*a == Action::SessionsTab && k.sessions_tab == "H")
                 || (*a == Action::GroupsTab && k.groups_tab == "L")
+                || (*a == Action::Help && k.help == "?")
+                || (*a == Action::Command && k.command == ":")
         };
         // Only the defaults give way; a step key the user set is theirs.
         bindings.retain(|(a, b)| !default_step(a) || !taken(b, *a, &snapshot));
@@ -1953,13 +1984,14 @@ impl KeyMap {
 
     /// Keys that work whatever is highlighted.
     fn global_legend(&self) -> Vec<(String, &'static str)> {
+        // The everyday keys only: the rest are on the cheat sheet (`?`)
+        // and in the launcher (`:`).
         self.labelled(&[
             (Action::Overlord, "overlord"),
             (Action::SwitchTab, "sessions/groups"),
             (Action::New, "new"),
-            (Action::NewManual, "new (manual)"),
-            (Action::ReverseSort, "reverse"),
-            (Action::ToggleLog, "log"),
+            (Action::Command, "commands"),
+            (Action::Help, "help"),
             (Action::Quit, "quit"),
         ])
     }

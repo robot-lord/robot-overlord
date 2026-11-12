@@ -32,7 +32,7 @@ const SESSION_REF: &str = "Session id, id prefix, or name";
 
 pub fn tools() -> Value {
     let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name"],
-                      "description": "updated = latest message either way or status change; user = latest user prompt; state = latest status change"});
+                      "description": "updated = latest message either way (a resume or status flip alone does not count); user = latest user prompt; state = latest status change"});
     let new_session_props = json!({
         "repo": s("Git repo path to work in (see find_repos). Omit to use the configured default repo."),
         "project": s("Plain folder instead of a repo (no worktree)"),
@@ -70,6 +70,12 @@ pub fn tools() -> Value {
         tool("show_list",
             "Show the user the rlord session list (hides your overlay).",
             json!({}), &[]),
+        tool("keys_list",
+            "Every key rlord binds (global keys, the list's keys) as set now, each with what stands in its way: taken (won't work as set) or shadows (rlord takes it from Claude Code, the shell or the user's tmux).",
+            json!({}), &[]),
+        tool("open_keys",
+            "Open the key screen on the user's list (hides your overlay), optionally at one key. The user presses the new key there: rlord tests it reaches rlord, checks it, and saves it to config.toml when they confirm.",
+            json!({"key": s("Key id from keys_list (e.g. tmux.back, keys.quit); omit for the whole list")}), &[]),
         tool("set_list_view",
             "Set the session list's tab, filter and sort, optionally save it as the default view, and show it to the user. The list has two tabs: 'sessions' (flat) and 'groups' (sessions by tag: tags are the groups).",
             json!({
@@ -312,6 +318,8 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "get_ui_state" => d.rpc("ui.state", json!({})),
         "goto_session" => d.rpc("ui.goto", json!({"ref": session_ref(args)?})),
         "show_list" => d.rpc("ui.show_list", json!({})),
+        "keys_list" => d.rpc("keys.list", json!({})),
+        "open_keys" => d.rpc("ui.keys", args.clone()),
         "set_list_view" => {
             let mut p = Map::new();
             for k in ["query", "sort", "archived", "select", "tab", "group"] {
