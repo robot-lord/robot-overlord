@@ -100,6 +100,13 @@ fn run_loop(
         let area = terminal.size()?;
         if (area.width, area.height) != size && area.width > 0 && area.height > 0 {
             size = (area.width, area.height);
+            // Resizing reflows copy mode's snapshot, so its line numbers no
+            // longer match what was recorded on entry: leave the mode
+            // rather than draw a wrong selection.
+            if in_mode {
+                let _ = tmux::cancel_mode(pane);
+                history_at_entry = None;
+            }
             if let Err(e) = tmux::resize_window(seat.tmux, size.0, size.1) {
                 error = Some(format!("{e:#}"));
             }
