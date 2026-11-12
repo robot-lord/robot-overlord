@@ -148,11 +148,12 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
     }
     // The rarest word would be ideal; the longest is a fine stand-in: the
     // searcher finds lines with it, the JSON check confirms the rest. A
-    // word with `"` or `\` is spelled differently in the raw JSON line, so
-    // it can't be the one; with no other, every line is checked.
+    // word with `"` or `\` is spelled differently in the raw JSON line, and
+    // one with `[`/`]` may be rlord's own label (`[Bash]`), so neither can
+    // be the one; with no other, every line is checked.
     let key = ws
         .iter()
-        .filter(|w| !w.contains(['"', '\\']))
+        .filter(|w| !w.contains(['"', '\\', '[', ']']))
         .max_by_key(|w| w.len())
         .cloned();
     let built = match &key {

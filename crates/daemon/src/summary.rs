@@ -117,10 +117,19 @@ pub fn transcripts_of(d: &Daemon, s: &Session) -> Vec<PathBuf> {
             .as_deref()
             .map(|a| claude::transcript_path(&s.project_path, a))
     });
-    for p in current.into_iter().chain(
-        past.iter()
-            .map(|a| claude::transcript_path(&s.project_path, a)),
-    ) {
+    // Older ones live next to the current one (its project folder), or
+    // under the session's own folder.
+    let dir = current
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let older = past.iter().flat_map(|a| {
+        let mut v = vec![claude::transcript_path(&s.project_path, a)];
+        if let Some(d) = &dir {
+            v.push(d.join(format!("{a}.jsonl")));
+        }
+        v
+    });
+    for p in current.clone().into_iter().chain(older) {
         if p.exists() && !out.contains(&p) {
             out.push(p);
         }
@@ -134,7 +143,10 @@ const TRIVIAL_TOKENS: u64 = 5_000;
 
 fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
     let s = d.db().resolve_ref(id)?;
-    if !force && !s.summary.trim().is_empty() {
+    // An existing summary stands unless there's been a message since it was
+    // written (archived again after more work) or it's forced.
+    let since = crate::triage::updated_at(&s);
+    if !force && !s.summary.trim().is_empty() && s.summary_at.is_some_and(|t| t >= since) {
         return Ok(());
     }
     if s.agent != "claude" {
@@ -183,8 +195,17 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
         bail!("empty summary");
     }
     d.db()
-        .set_summary(&s.id, &claude::clip(text, 1500), Some(now_ms()))?;
+        .set_summary(&s.id, &keep_lines(text, 1500), Some(now_ms()))?;
     Ok(())
+}
+
+/// At most `max` characters, line breaks kept.
+fn keep_lines(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
 }
 
 /// The conversation's size in tokens, from its last reported usage (the
@@ -247,8 +268,13 @@ fn run(extra: &[&str], model: &str, cwd: &str, stdin: Option<&str>) -> Result<St
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().context("running claude")?;
+    // Written from its own thread: a stalled claude must not block the
+    // worker past the timeout.
     if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
-        let _ = w.write_all(text.as_bytes());
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            let _ = w.write_all(text.as_bytes());
+        });
     }
     // Read while waiting: a full pipe would stall it.
     let mut so = child.stdout.take().context("claude's output")?;

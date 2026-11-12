@@ -1251,7 +1251,7 @@ fn print_search(v: &Value) {
         for x in h.as_array().into_iter().flatten() {
             println!(
                 "    :{:<6} {:<5} {}",
-                x["line"],
+                x["line"].as_u64().unwrap_or(0),
                 x["who"].as_str().unwrap_or(""),
                 x["snippet"].as_str().unwrap_or("")
             );

@@ -65,8 +65,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut paths_of: HashMap<usize, Vec<PathBuf>> = HashMap::new();
     let mut paths: Vec<PathBuf> = Vec::new();
+    // The overlord's own conversations are full of searches: never results.
+    let mut skip: std::collections::HashSet<PathBuf> = Default::default();
     for (i, s) in sessions.iter().enumerate() {
         if crate::overlord::is_overlord_role(&s.role) {
+            skip.extend(summary::transcripts_of(d, s));
             continue;
         }
         let ps = summary::transcripts_of(d, s);
@@ -81,7 +84,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         paths.extend(
             history::all_claude_transcripts()
                 .into_iter()
-                .filter(|p| !by_path.contains_key(p)),
+                .filter(|p| !by_path.contains_key(p) && !skip.contains(p)),
         );
     }
     let found = history::search(&paths, query, PER_FILE);

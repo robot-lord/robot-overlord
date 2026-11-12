@@ -386,8 +386,8 @@ impl Daemon {
         // Archived: write down what it did (once, in the background).
         if method == "session.archive" && r.is_ok() && self.config().archive.summary {
             if let Ok(s) = self.db().resolve_ref(params["ref"].as_str().unwrap_or("")) {
-                // Archived again after more work: a new summary.
-                summary::enqueue(self, &s.id, true);
+                // Once; again only after more work (summary.rs checks).
+                summary::enqueue(self, &s.id, false);
             }
         }
         if method == "session.unarchive" && r.is_ok() {
