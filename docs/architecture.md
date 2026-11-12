@@ -663,14 +663,20 @@ Things that are not visible at the call site:
 - **Typing into a pane** (`send::type_into`), for asks, sends and
   deliveries alike: right before the paste, under the session's lock, the
   pinned agent pane is captured and must be at its input prompt
-  (`Agent::at_prompt`: Codex's composer; no Claude `❯ 1.` choice; no
-  OpenCode "Permission required" / question footer). A status can't be
-  trusted for this: a Codex session without hooks reads as working while
-  an approval is up. Sends also hold off within 10s (`SETTLE`) of the last
-  paste into that session (checked under the paste guard, so two can't
-  race) and while a tmux client attached to it was used in the last 5s
-  (someone typing there). Any of these is "not now": a send queues
-  (`when_idle`) or is refused, a delivery waits for a later tick.
+  (`Agent::at_prompt`: Codex's composer; no Claude `❯ 1.` choice as the
+  lowest `❯` line, where a `❯` under a `─` rule is the input box and
+  higher ones are history; no OpenCode permission or question lines inside
+  its bottom box). A status can't be trusted for this: a Codex session
+  without hooks reads as working while an approval is up. Sends also hold
+  off while the input holds a draft (read with attributes, so a dim
+  placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
+  isn't read yet), within 10s (`SETTLE`) of the last paste into that
+  session (checked under the paste guard, so two can't race), and while a
+  tmux client attached to it was used in the last 5s (someone typing
+  there; not the client the overlord's overlay is open on, where the user
+  is typing to the overlord). Any of these is "not now": a send queues
+  (`when_idle`) or is refused, a delivery waits for a later tick and logs
+  `message_held` with the reason once per queued message.
 - **Per-session lock** (`daemon/src/locks.rs`): taken by sends,
   deliveries and asks around the final re-read and the paste, and by
   restart, stop, archive, fresh restarts and `overlord.continue` (and the
@@ -686,7 +692,7 @@ Things that are not visible at the call site:
   once the turn has been over 2s, re-read under the session's lock. Stopped, starting, error, archived and the
   overlord itself are refused; a pending message is dropped when its
   session stops or goes. Logged as `message_sent` / `message_queued` /
-  `message_delivered` / `message_dropped`. `overlord.new_session` formats the list's `n` form as a
+  `message_held` / `message_delivered` / `message_dropped`. `overlord.new_session` formats the list's `n` form as a
   `[rlord new-session request]` message: `confirmed:`, the hints with
   whether each was picked or defaulted, then the description verbatim;
   `overlord.md` defines what the overlord does with one. On a contradiction

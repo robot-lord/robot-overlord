@@ -302,6 +302,23 @@ Known limits, accepted:
   checked live on the overlord (`ask`, same `type_into`) and on a scratch
   tmux pane in a gated test.
 
+### PR #10 review 3 (screen checks)
+
+- `codex::composer_shown` / `dialog_shown` also treat "enter to submit"
+  and "esc to cancel" as a dialog's footer (the composer's is "esc to
+  interrupt").
+- A draft in the composer holds a send (`codex::draft`). Captured live
+  with attributes (codex-cli 0.167.2, scratch tmux socket, no turn run):
+  the placeholder is drawn dim (`ESC[2m`), typed text plain; a numbered
+  draft (`› 1. numbered`) already reads as not the composer.
+- Claude (`claude::dialog_shown`, not run live): only the lowest `❯` line
+  counts, and one under a `─` rule is the input box. The old check read
+  any numbered prompt in the history (`❯ 1. do x`) as a dialog and blocked
+  every send to that session. A draft in the input box
+  (`remote::input_text`, read with attributes) holds a send.
+- The overlay's terminal doesn't count as someone typing in the session
+  behind it; a held queued message is logged once (`message_held`).
+
 Found on the way, not fixed (outside this PR): a hook-confirmed Codex
 session whose tmux session is killed stays "working" (no SessionEnd, and
 `discover` doesn't watch hooked sessions' panes) until it is restarted or

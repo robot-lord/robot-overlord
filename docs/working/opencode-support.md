@@ -343,11 +343,22 @@ and without a model and a restart of a session OpenCode no longer had.
   over when OpenCode's database surely lacks it, so the deferred model is
   only ever applied to a session rlord's launch made.
 
+### PR #10 review 3
+
+- `opencode::dialog_shown` reads only the bottom box (the last run of
+  `┃` lines and the line under it) and needs a dialog's own line
+  (`△ Permission required` opening a line, `Allow once` with `Reject`,
+  `enter submit` with `esc dismiss`, `⇆ select` with `enter confirm`), so
+  the same words in the transcript don't hold sends (PR #10 review 3).
+
 ## Owed
 
 - Import (`session_v2` has directory, title, model).
 - `send_to_session` types into the pane; `POST …/prompt {delivery:
   queue}` could deliver to a busy OpenCode session without typing.
+- A draft in OpenCode's prompt box isn't detected (Claude's and Codex's
+  are): a send would be added to it. Needs a capture of the box with
+  attributes (its placeholder is drawn differently from typed text).
 - Sub-agent tracking (child sessions: `parent_id`).
 - A question form, checked by hand (a real permission prompt was: see
   "The overlord on OpenCode").

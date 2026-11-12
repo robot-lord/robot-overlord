@@ -362,14 +362,36 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
 /// to proceed?"), a question (`AskUserQuestion`), plan approval, the
 /// folder-trust question. Each lists numbered choices with `❯` at the
 /// highlighted one (`❯ 1. Yes`), in place of the input box at the bottom,
-/// and Enter picks it. Only the bottom of the screen is looked at (a box's
-/// `│` border is allowed for).
+/// and Enter picks it.
+///
+/// Claude draws its input box with the same mark (`❯ ` between two `─`
+/// rules), and earlier prompts in the history as `❯ <text>`. So only the
+/// lowest `❯` line in the bottom of the screen counts (higher ones are
+/// history), and one with a `─` rule directly above it is the input box,
+/// whatever is typed there (a draft may start `1.`). A box's `│` border is
+/// allowed for.
 pub fn dialog_shown(screen: &str) -> bool {
-    super::bottom_lines(screen, 15).any(|l| {
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let mark = |l: &str| {
         l.trim_start_matches(|c: char| c.is_whitespace() || c == '│')
             .strip_prefix('❯')
-            .is_some_and(|rest| super::numbered_choice(rest.trim_start()))
-    })
+            .map(str::to_string)
+    };
+    // The lowest `❯` line among the bottom 25 non-blank ones.
+    let Some((i, rest)) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .take(25)
+        .find_map(|(i, l)| mark(l).map(|r| (i, r)))
+    else {
+        return false;
+    };
+    let input_box = i
+        .checked_sub(1)
+        .is_some_and(|j| lines[j].trim_start().starts_with('─'));
+    !input_box && super::numbered_choice(rest.trim_start())
 }
 
 // ---- archive summaries ----
@@ -509,12 +531,29 @@ mod tests {
 
     #[test]
     fn a_dialog_is_told_from_the_input_box() {
+        // Claude's input box, as drawn: `❯ ` between two rules.
         let idle = "● Done: the tests pass.\n\n\
             ────────────────────────────────────────\n\
-            > \n\
+            ❯ \n\
             ────────────────────────────────────────\n\
               ? for shortcuts\n";
         assert!(!dialog_shown(idle));
+        // Earlier prompts in the history are `❯ <text>`, one of them
+        // numbered: the input box under them is the lowest `❯`.
+        let history = "❯ 1. do x\n\n● Done.\n\n❯ 2. then y\n\n● Done too.\n\n\
+            ────────────────────────────────────────\n\
+            ❯ \n\
+            ────────────────────────────────────────\n\
+              ? for shortcuts\n";
+        assert!(!dialog_shown(history));
+        // A numbered draft in the input box isn't a dialog either.
+        let draft = "❯ earlier prompt\n\n● Done.\n\n\
+            ────────────────────────────────────────\n\
+            ❯ 1. fix the login\n\
+            ────────────────────────────────────────\n\
+              ? for shortcuts\n";
+        assert!(!dialog_shown(draft));
+        assert!(crate::agents::Agent::Claude.at_prompt(history));
         // A reply that ends in a list isn't a dialog (no `❯`).
         let list = "● Two options:\n  1. Retry\n  2. Skip\n\n> \n  ? for shortcuts\n";
         assert!(!dialog_shown(list));
@@ -524,6 +563,8 @@ mod tests {
                2. Yes, and don't ask again for touch commands in /tmp/x\n\
                3. No, and tell Claude what to do differently (esc)\n";
         assert!(dialog_shown(permission));
+        // A dialog under a numbered prompt in the history: still one.
+        assert!(dialog_shown(&format!("❯ 1. do x\n\n● Ok.\n\n{permission}")));
         // Older versions draw it in a box; the user moved to option 2.
         let boxed = "╭──────────────────────╮\n│ Do you want to proceed? │\n│   1. Yes │\n│ ❯ 2. No  │\n╰──────────────────────╯\n";
         assert!(dialog_shown(boxed));

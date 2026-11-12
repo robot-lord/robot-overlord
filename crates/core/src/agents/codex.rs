@@ -171,8 +171,7 @@ pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str, confirm_sends: bo
 /// prompt, a login, a trust question) and an approval don't count.
 pub fn composer_shown(screen: &str) -> bool {
     let bottom: Vec<&str> = super::bottom_lines(screen, 6).collect();
-    // ("Press enter to confirm or esc to cancel": a dialog's own footer.)
-    if bottom.iter().any(|l| l.contains("Press enter to confirm")) {
+    if bottom.iter().any(|l| dialog_footer(l)) {
         return false;
     }
     bottom
@@ -181,12 +180,38 @@ pub fn composer_shown(screen: &str) -> bool {
         .is_some_and(|rest| !super::numbered_choice(rest.trim_start()))
 }
 
+/// A dialog's own footer ("Press enter to confirm or esc to cancel", an
+/// MCP approval's "enter to submit | esc to cancel"). The composer's says
+/// "esc to interrupt" while a turn runs.
+fn dialog_footer(line: &str) -> bool {
+    ["Press enter to confirm", "enter to submit", "esc to cancel"]
+        .iter()
+        .any(|m| line.contains(m))
+}
+
+/// What is typed in the composer (`screen` captured with attributes,
+/// `capture-pane -e`), if anything: the text after the lowest `›` in the
+/// input area. Its placeholder ("Ask Codex to do anything") is drawn dim
+/// and isn't a draft.
+pub fn draft(screen: &str) -> Option<String> {
+    let line = screen
+        .lines()
+        .rev()
+        .filter(|l| !super::strip_ansi(l).trim().is_empty())
+        .take(6)
+        .find(|l| super::strip_ansi(l).starts_with('›'))?;
+    let rest = line.split_once('›')?.1;
+    let text = super::undimmed(rest);
+    let text = text.trim_matches([' ', '\u{a0}']);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// A numbered-choice dialog is at the bottom of Codex's screen: an
 /// approval, a trust or update question, the login choice (marked `›` or
-/// `>` at the picked option), or a dialog's "Press enter to confirm".
+/// `>` at the picked option), or a dialog's footer (`dialog_footer`).
 pub fn dialog_shown(screen: &str) -> bool {
     super::bottom_lines(screen, 12).any(|l| {
-        l.contains("Press enter to confirm")
+        dialog_footer(l)
             || l.trim_start()
                 .strip_prefix(['›', '>'])
                 .is_some_and(|rest| super::numbered_choice(rest.trim_start()))
@@ -1001,6 +1026,28 @@ mod tests {
         // The login screen marks its choice with `>`.
         let login = "  Choose how you want to use Codex.\n\n> 1. Sign in with ChatGPT\n  2. Sign in with Device Code\n\n  Press enter to continue\n";
         assert!(!composer_shown(login) && dialog_shown(login));
+        // A dialog's footer alone, with a `›` choice that isn't numbered:
+        // not the composer.
+        for footer in ["enter to submit | esc to cancel", "  esc to cancel"] {
+            let s = format!("  Allow it?\n\n› Allow\n  Cancel\n\n{footer}\n");
+            assert!(!composer_shown(&s) && dialog_shown(&s), "{footer}");
+        }
+    }
+
+    /// The composer as captured with attributes from codex-cli 0.167.2:
+    /// the placeholder is dim, typed text isn't.
+    #[test]
+    fn a_draft_in_the_composer() {
+        let footer = "\n  \x1b[38;2;246;226;183mGPT-6.1-Sol medium\x1b[39m · /tmp/x\n\
+            \x1b[39m  \x1b[1m←\x1b[0m for agents · \x1b[1m?\x1b[0m for shortcuts\n";
+        let empty = format!("\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n{footer}");
+        assert_eq!(draft(&empty), None);
+        let typed = format!("› old prompt\n\n• Done.\n\n\x1b[1m›\x1b[0m half a draft\n{footer}");
+        assert_eq!(draft(&typed).as_deref(), Some("half a draft"));
+        // A prompt in the history above an empty composer isn't a draft.
+        let history = format!("› old prompt\n\n• Done.\n\n{empty}");
+        assert_eq!(draft(&history), None);
+        assert_eq!(draft(""), None);
     }
 
     #[test]

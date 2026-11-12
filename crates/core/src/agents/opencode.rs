@@ -450,17 +450,46 @@ fn parse_jsonc(text: &str) -> Option<Value> {
 /// A dialog is on OpenCode's screen, where its prompt box was: a
 /// permission request ("△ Permission required", then `Allow once  Always
 /// allow  Reject`, where Enter allows) or a question (numbered options,
-/// `↑↓ select  enter submit  esc dismiss`). Told by those lines, as
-/// OpenCode 2.2.7 draws them, in the bottom of the screen.
+/// `↑↓ select  enter submit  esc dismiss`), as OpenCode 2.2.7 draws them.
+///
+/// Only the bottom box is read: the last run of `┃`-bordered lines (no
+/// gap) and the line under it. The transcript above is drawn with the same
+/// border, and a reply may quote these words, so each mark must be a
+/// dialog's own line: `△ Permission required` opening a box line, or the
+/// choices or keys together on one line.
 pub fn dialog_shown(screen: &str) -> bool {
-    const MARKS: &[&str] = &[
-        "Permission required",
-        "Allow once",
-        "enter confirm",
-        "enter submit",
-        "esc dismiss",
-    ];
-    super::bottom_lines(screen, 25).any(|l| MARKS.iter().any(|m| l.contains(m)))
+    let lines: Vec<&str> = screen.lines().map(str::trim_end).collect();
+    let boxed = |l: &str| l.trim_start().starts_with('┃');
+    let Some(last) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .take(25)
+        .find(|(_, l)| boxed(l))
+        .map(|(i, _)| i)
+    else {
+        return false;
+    };
+    let first = lines[..=last]
+        .iter()
+        .rposition(|l| !boxed(l))
+        .map_or(0, |i| i + 1);
+    let under = lines[last + 1..].iter().find(|l| !l.trim().is_empty());
+    lines[first..=last]
+        .iter()
+        .chain(under)
+        .any(|l| dialog_line(l))
+}
+
+/// A line only a dialog draws (its `┃` border allowed for).
+fn dialog_line(line: &str) -> bool {
+    let text = line.trim_start_matches(|c: char| c.is_whitespace() || c == '┃');
+    let has = |a: &str, b: &str| text.contains(a) && text.contains(b);
+    text.starts_with("△ Permission required")
+        || has("Allow once", "Reject")
+        || has("enter submit", "esc dismiss")
+        || has("⇆ select", "enter confirm")
 }
 
 /// A sub-agent file for OpenCode (`.opencode/agents/<name>.md`): when to
@@ -1472,6 +1501,19 @@ pub(crate) mod tests {
         for s in [permission, question] {
             assert!(!crate::agents::Agent::OpenCode.at_prompt(s));
         }
+        // The same words in the transcript above the prompt box (a reply
+        // quoting them, the user's own prompt): not a dialog.
+        let quoted = "  ┃  △ Permission required\n  ┃  Allow once   Always allow   Reject\n\
+              ┃  ↑↓ select  enter submit  esc dismiss\n\n\
+                 Build · Big Pickle · 3.1s\n\n\n";
+        let quoted = format!("{quoted}{idle}");
+        assert!(!dialog_shown(&quoted));
+        // One mark alone in the box isn't enough: "Reject" in a draft.
+        let draft = idle.replace(
+            "┃  Build · Big Pickle OpenCode",
+            "┃  Reject the PR. Build · Big Pickle",
+        );
+        assert!(!dialog_shown(&draft));
         assert!(crate::agents::Agent::OpenCode.at_prompt(idle));
     }
 

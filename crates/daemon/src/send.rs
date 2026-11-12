@@ -20,9 +20,16 @@
 //!
 //! - its screen isn't at its input prompt (`Agent::at_prompt`): a dialog
 //!   would take the Enter as its choice, whatever the status says;
+//! - its input already holds a draft (`draft`): the paste would be added
+//!   to it and sent with it;
 //! - it was typed into in the last `SETTLE` (two messages in one turn);
 //! - someone used a terminal attached to it in the last `USER_ACTIVE_S`
-//!   (the paste would land in the middle of what they are typing).
+//!   (the paste would land in the middle of what they are typing). The
+//!   terminal the overlord's overlay is open on doesn't count: the user is
+//!   typing to the overlord in the popup, not to the session behind it.
+//!
+//! A queued message held back by these is logged once ("message_held",
+//! with why), so a message stuck in the queue shows in the session's log.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +38,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use rlord_core::agents::Agent;
+use rlord_core::agents::{strip_ansi, Agent};
 use rlord_core::db::Db;
 use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
@@ -74,6 +81,11 @@ pub struct Checks<'a> {
     /// Its tmux session: not while someone is using a terminal attached
     /// to it.
     pub attached: Option<&'a str>,
+    /// The terminal (tmux client name) the overlord's overlay is open on:
+    /// its activity is the user typing in the popup, not in the session.
+    pub overlay: Option<&'a str>,
+    /// Not while its input holds a draft (`draft`).
+    pub draft: bool,
 }
 
 /// What `type_into` did.
@@ -101,16 +113,22 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
     }
     if let Some(t) = checks.attached {
         let now_s = now_ms() / 1000;
-        if user_active(&tmux::list_clients(), t, now_s) {
+        if user_active(&tmux::list_clients(), t, checks.overlay, now_s) {
             return Ok(Typed::NotNow(
                 "someone is typing in it (a terminal showing it was just used)".into(),
             ));
         }
     }
-    let screen = tmux::capture_pane_id(pane)?;
-    if !checks.agent.at_prompt(&screen) {
+    // With attributes: a dim placeholder isn't a draft.
+    let ansi = tmux::capture_pane_id_ansi(pane)?;
+    if !checks.agent.at_prompt(&strip_ansi(&ansi)) {
         return Ok(Typed::NotNow(
             "its screen isn't at its input prompt (a dialog or question is up)".into(),
+        ));
+    }
+    if checks.draft && draft(checks.agent, &ansi).is_some() {
+        return Ok(Typed::NotNow(
+            "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
     let _ = tmux::cancel_mode(pane);
@@ -122,11 +140,23 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
 }
 
 /// A terminal showing tmux session `t` was used in the last
-/// `USER_ACTIVE_S` (`now_s`: epoch seconds, as `client_activity`).
-fn user_active(clients: &[tmux::Client], t: &str, now_s: i64) -> bool {
-    clients
-        .iter()
-        .any(|c| c.session == t && now_s - c.activity < USER_ACTIVE_S)
+/// `USER_ACTIVE_S` (`now_s`: epoch seconds, as `client_activity`), other
+/// than `overlay` (the one the overlord's popup is open on).
+fn user_active(clients: &[tmux::Client], t: &str, overlay: Option<&str>, now_s: i64) -> bool {
+    clients.iter().any(|c| {
+        c.session == t && Some(c.name.as_str()) != overlay && now_s - c.activity < USER_ACTIVE_S
+    })
+}
+
+/// Text typed in the agent's input and not sent (`screen` captured with
+/// attributes). Claude's input box (`remote::input_text`) and Codex's
+/// composer (`codex::draft`) are read; OpenCode's prompt box isn't yet.
+fn draft(agent: Agent, screen: &str) -> Option<String> {
+    match agent {
+        Agent::Claude => crate::remote::input_text(screen),
+        Agent::Codex => rlord_core::agents::codex::draft(screen),
+        Agent::OpenCode => None,
+    }
 }
 
 /// Why a session can't be sent anything at all (whatever its turn), if
@@ -164,12 +194,20 @@ fn agent_pane(s: &Session) -> Result<String> {
 
 /// Type a message into session `s` (read under its lock, just now), after
 /// the last checks (`type_into`).
-fn type_message(s: &Session, text: &str) -> Result<Typed> {
+fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed> {
     let pane = agent_pane(s)?;
+    let overlay = d
+        .overlay
+        .lock()
+        .expect("ui mutex")
+        .as_ref()
+        .map(|(client, _)| client.clone());
     let checks = Checks {
         agent: Agent::named(&s.agent)?,
         settle: true,
         attached: s.tmux_session.as_deref(),
+        overlay: overlay.as_deref(),
+        draft: true,
     };
     type_into(&s.id, &pane, text, &checks)
 }
@@ -203,7 +241,7 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         return not_now(d, &s, text, when_idle, &why);
     }
     // (tmux without the DB lock.)
-    if let Typed::NotNow(why) = type_message(&s, text)? {
+    if let Typed::NotNow(why) = type_message(d, &s, text)? {
         return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
     }
     let db = d.db();
@@ -393,9 +431,10 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         return Ok(());
     }
     // Without the DB lock: tmux.
-    let r = type_message(&s, &text);
-    if matches!(r, Ok(Typed::NotNow(_))) {
-        return Ok(()); // (a later tick)
+    let r = type_message(d, &s, &text);
+    if let Ok(Typed::NotNow(why)) = &r {
+        // A later tick; said once, so a stuck queue is visible.
+        return held(d, id, &text, why);
     }
     let db = d.db();
     let mut m = pending(&db)?;
@@ -412,6 +451,30 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         Err(e) => ("message_dropped", json!({"reason": format!("{e:#}")})),
     };
     db.insert_event(id, now_ms(), kind, &detail.to_string())?;
+    drop(db);
+    d.changed();
+    Ok(())
+}
+
+/// Log, once per queued message, why it wasn't delivered yet (its entry
+/// is marked `held`; a newer message starts unmarked).
+fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
+    let db = d.db();
+    let mut m = pending(&db)?;
+    let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if entry.get("text").and_then(Value::as_str) != Some(text) || entry.contains_key("held") {
+        return Ok(());
+    }
+    entry.insert("held".into(), json!(true));
+    save_pending(&db, &m)?;
+    db.insert_event(
+        id,
+        now_ms(),
+        "message_held",
+        &json!({"reason": why}).to_string(),
+    )?;
     drop(db);
     d.changed();
     Ok(())
@@ -496,6 +559,8 @@ mod tests {
             agent: Agent::Claude,
             settle: true,
             attached: None,
+            overlay: None,
+            draft: true,
         };
         let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));
@@ -509,15 +574,54 @@ mod tests {
             activity,
         };
         let now = 1_000_000;
-        assert!(user_active(&[c("rlord_s1", now - 1)], "rlord_s1", now));
+        assert!(user_active(
+            &[c("rlord_s1", now - 1)],
+            "rlord_s1",
+            None,
+            now
+        ));
         // Idle a while, or showing another session: not typing in it.
         assert!(!user_active(
             &[c("rlord_s1", now - USER_ACTIVE_S)],
             "rlord_s1",
+            None,
             now
         ));
-        assert!(!user_active(&[c("rlord_s2", now)], "rlord_s1", now));
-        assert!(!user_active(&[], "rlord_s1", now));
+        assert!(!user_active(&[c("rlord_s2", now)], "rlord_s1", None, now));
+        assert!(!user_active(&[], "rlord_s1", None, now));
+        // The overlord's overlay is open on that terminal: the user is
+        // typing to the overlord in the popup, not to the session.
+        let busy = [c("rlord_s1", now - 1)];
+        assert!(!user_active(&busy, "rlord_s1", Some("/dev/ttys001"), now));
+        // Another terminal on it still counts.
+        assert!(user_active(&busy, "rlord_s1", Some("/dev/ttys009"), now));
+    }
+
+    /// A queued message held back is logged once, with why; a newer one
+    /// is logged again.
+    #[test]
+    fn a_held_message_is_logged_once() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        queue(&db, &id, "first").unwrap();
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        let held_count = || {
+            let log = d.db().list_events(&id, 20).unwrap();
+            log.iter().filter(|e| e.kind == "message_held").count()
+        };
+        held(&d, &id, "first", "a dialog is up").unwrap();
+        held(&d, &id, "first", "a dialog is up").unwrap();
+        assert_eq!(held_count(), 1);
+        assert_eq!(pending(&d.db()).unwrap()[&id]["text"], "first");
+        // (Not this message's text: nothing.)
+        held(&d, &id, "other", "x").unwrap();
+        assert_eq!(held_count(), 1);
+        queue(&d.db(), &id, "second").unwrap();
+        held(&d, &id, "second", "a draft").unwrap();
+        assert_eq!(held_count(), 2);
+        let log = d.db().list_events(&id, 20).unwrap();
+        let e = log.iter().find(|e| e.kind == "message_held").unwrap();
+        assert!(e.payload["reason"].as_str().is_some(), "{}", e.payload);
     }
 
     #[test]
@@ -589,17 +693,18 @@ mod tests {
         assert_eq!(q["queued"], true);
         assert!(!screen().contains("one\n"));
 
-        // At its prompt again: typed, and the queued one is dropped.
-        // (The session is a Codex one: its composer is its prompt.)
-        tmux::respawn_pane("rlord_s1", "/tmp", "cat").unwrap();
-        tx(&[
-            "send-keys",
-            "-t",
-            "rlord_s1",
-            "-l",
-            "› Ask Codex to do anything\r",
-        ]);
-        std::thread::sleep(Duration::from_millis(200));
+        // A draft in its composer (the session is a Codex one): held.
+        let composer = |text: &str| format!("printf '› {text}\\n'; stty -echo; exec cat");
+        tmux::respawn_pane("rlord_s1", "/tmp", &composer("half a draft")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let e = send(&d, &json!({"ref": &id, "text": "one"})).unwrap_err();
+        assert!(e.to_string().contains("unsent text"), "{e}");
+
+        // At its prompt again (the placeholder is dim): typed, and the
+        // queued one is dropped.
+        let placeholder = composer("\\033[2mAsk Codex to do anything\\033[0m");
+        tmux::respawn_pane("rlord_s1", "/tmp", &placeholder).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
         let v = send(&d, &json!({"ref": &id, "text": "two"})).unwrap();
         assert_eq!(v["sent"], true, "{v}");
         assert_eq!(v["replaced_pending"], true, "{v}");

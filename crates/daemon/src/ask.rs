@@ -111,6 +111,10 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     agent: Agent::named(&s.agent)?,
                     settle: false,
                     attached: None,
+                    overlay: None,
+                    // (The user's own message: a draft of theirs in the
+                    // overlord's pane is theirs to merge.)
+                    draft: false,
                 };
                 if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
                     bail!(

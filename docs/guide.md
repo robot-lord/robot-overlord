@@ -114,9 +114,12 @@ runs a command.
   refused. Each send is in the session's log.
 - Right before typing, rlord looks at the session's screen. It holds off
   (the message waits, or is refused) while a dialog is up there (a
-  permission prompt, a question: Enter would pick an answer), within 10s
-  of the last thing typed into it, or while you are typing in a terminal
-  showing that session (used in the last 5s). A restart, stop or archive
+  permission prompt, a question: Enter would pick an answer), while its
+  input holds text you typed and haven't sent (Claude and Codex), within
+  10s of the last thing typed into it, or while you are typing in a
+  terminal showing that session (used in the last 5s; typing to the
+  overlord in its overlay doesn't count). A waiting message that is held
+  back says why once in the session's log. A restart, stop or archive
   of the session waits for a paste in progress, and the other way round.
 - `rlord overlord ask` (and the list's `n` form) won't type into the
   overlord while it waits on you, or while its screen shows a dialog: its

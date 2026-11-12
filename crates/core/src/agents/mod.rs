@@ -487,6 +487,71 @@ pub fn bottom_lines(screen: &str, n: usize) -> impl Iterator<Item = &str> {
         .take(n)
 }
 
+/// The text of `s` drawn without the dim attribute (SGR 2, cleared by 0
+/// or 22), however the codes are combined.
+pub fn undimmed(s: &str) -> String {
+    let mut out = String::new();
+    let mut dim = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut fin = ' ';
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    fin = c;
+                    break;
+                }
+                params.push(c);
+            }
+            if fin == 'm' {
+                let ps: Vec<&str> = params.split(';').collect();
+                let mut i = 0;
+                while i < ps.len() {
+                    match ps[i] {
+                        "" | "0" | "22" => dim = false,
+                        "2" => dim = true,
+                        // Extended colours carry their own numbers (a 2 or
+                        // 0 in an RGB triple isn't an attribute): skip them.
+                        "38" | "48" | "58" => {
+                            i += match ps.get(i + 1) {
+                                Some(&"5") => 2,
+                                Some(&"2") => 4,
+                                _ => 0,
+                            };
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+        } else if !dim {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Drop ANSI escape sequences (CSI: ESC [ … final byte).
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `text` starts with a numbered choice: digits, then `.` (`1. Yes`).
 pub fn numbered_choice(text: &str) -> bool {
     let digits = text.chars().take_while(char::is_ascii_digit).count();
