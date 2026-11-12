@@ -665,12 +665,16 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     let s = match params["seat"].as_str() {
         // (The mastermind may not have started yet: either seat will do,
         // both lead to it below.)
-        Some(seat) => match overlord::seat(seat).session(&d.db())? {
-            Some(s) => s,
-            None => overlord::FRONT
-                .session(&d.db())?
-                .context("no overlord yet")?,
-        },
+        Some(seat) => {
+            // Bound first: a guard in a match scrutinee lives through the arms.
+            let found = overlord::seat(seat).session(&d.db())?;
+            match found {
+                Some(s) => s,
+                None => overlord::FRONT
+                    .session(&d.db())?
+                    .context("no overlord yet")?,
+            }
+        }
         None => d
             .db()
             .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?,
@@ -703,7 +707,10 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
     let (s, mut targets) = if seats {
         d.db()
             .kv_set(MASTERMIND_REMOTE, if on { "1" } else { "0" })?;
-        let mind = match overlord::MASTERMIND.session(&d.db())? {
+        // Bound first: a guard in a match scrutinee lives through the arms
+        // (ensure() below locks the db again).
+        let found = overlord::MASTERMIND.session(&d.db())?;
+        let mind = match found {
             Some(m) => m,
             // Not started yet: start it now (with the flag, from the kv).
             None if on => {

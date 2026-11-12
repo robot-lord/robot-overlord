@@ -204,7 +204,9 @@ fn show_mastermind(d: &Daemon) -> String {
         .iter()
         .any(|c| c.session == overlord::FRONT.tmux);
     if on_front {
-        if let Ok(Some(m)) = overlord::MASTERMIND.session(&d.db()).and_then(|m| match m {
+        // (The db guard must drop before ensure() locks it again.)
+        let found = overlord::MASTERMIND.session(&d.db());
+        if let Ok(Some(m)) = found.and_then(|m| match m {
             Some(m) => Ok(Some(m)),
             None => overlord::ensure(&d.db(), &d.config, &json!({"seat": "mastermind"}))
                 .map(|v| v["id"].as_str().map(str::to_string))
