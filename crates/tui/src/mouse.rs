@@ -255,7 +255,26 @@ impl App {
             MouseEventKind::Down(MouseButton::Right) => self.click(m.column, m.row, true, terminal),
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, true, terminal),
             MouseEventKind::ScrollDown => self.wheel(m.column, m.row, false, terminal),
+            MouseEventKind::Moved => {
+                self.idle_motion = !self.hover(m.column, m.row);
+                Ok(false)
+            }
             _ => Ok(false),
+        }
+    }
+
+    /// The pointer moved: in a right-click menu the highlight follows it
+    /// over the entries, as the arrow keys move it. True when that changed
+    /// what's highlighted (worth drawing again). (Lists that scroll with
+    /// their selection, like the launcher, don't follow: the rows would
+    /// move under the pointer.)
+    pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
+        match (&mut self.mode, self.hits.at(x, y)) {
+            (Mode::Menu(m), Some(Hit::Pick(i))) if i < m.items.len() && m.sel != i => {
+                m.sel = i;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -973,6 +992,20 @@ mod tests {
         assert_eq!(app.hits.wheel_at(x, y), Some(Hit::List));
         let (x, y) = find(&rows, "live pane");
         assert_eq!(app.hits.wheel_at(x, y + 3), Some(Hit::Preview));
+        // Usage's header sorts by it.
+        assert_eq!(at("Turns", 1), Some(Hit::SortBy(SortMode::Usage)));
+        // Where the list borrows width from the preview, clicks follow
+        // what's drawn: the list's rows run to its new edge, Usage's
+        // header sorts, and the preview starts after it.
+        let rows = drawn_at(&mut app, 120, 34);
+        let list_w = crate::side_list_width(120, app.config.list_width_pct, true);
+        assert!(list_w > 60);
+        let (ux, uy) = find(&rows, "Turns");
+        assert!(ux < list_w);
+        assert_eq!(app.hits.at(ux + 1, uy), Some(Hit::SortBy(SortMode::Usage)));
+        let (_, y) = find(&rows, ">_ image-pipe");
+        assert_eq!(app.hits.at(list_w - 2, y), Some(Hit::Row(1)));
+        assert_eq!(app.hits.wheel_at(list_w + 2, y), Some(Hit::Preview));
     }
 
     #[test]
@@ -1039,15 +1072,129 @@ mod tests {
         app.usage = UsageMetric::Turns;
         let rows = drawn_at(&mut app, 220, 34);
         assert_eq!(find(&rows, "Turns ▼").0, ux);
-        // Narrowing: Usage goes before Groups, never the other way round.
-        let mut groups_alone = false;
-        for w in (100..=220).step_by(2) {
+        // Narrowing: Groups goes before Usage, never the other way round.
+        let mut usage_alone = false;
+        for w in (60..=220).step_by(2) {
             let rows = drawn_at(&mut app, w, 34);
             let list = |t: &str| rows.iter().any(|r| r.contains(t));
-            assert!(!list("Turns") || list("Groups"), "width {w}");
-            groups_alone |= list("Groups") && !list("Turns");
+            assert!(!list("Groups") || list("Turns"), "width {w}");
+            usage_alone |= list("Turns") && !list("Groups");
         }
-        assert!(groups_alone);
+        assert!(usage_alone);
+    }
+
+    /// The list's header at a terminal width (default config): which
+    /// columns show, and where the list ends.
+    fn list_header(app: &mut App, w: u16) -> (Vec<&'static str>, u16) {
+        let rows = drawn_at(app, w, 34);
+        let (_, y) = find(&rows, "Name");
+        let list_w = crate::side_list_width(w, app.config.list_width_pct, true);
+        let head: String = rows[y as usize].chars().take(list_w as usize).collect();
+        let cols = ["Name", "Status", "Message", "Turns", "Groups", "Project"]
+            .into_iter()
+            // ("Message" or "Last message", by width.)
+            .filter(|c| head.to_lowercase().contains(&c.to_lowercase()))
+            .collect();
+        (cols, list_w)
+    }
+
+    /// Usage outranks Groups and Project; at ordinary widths the list
+    /// borrows from the preview to show it beside a readable name.
+    #[test]
+    fn usage_shows_at_ordinary_widths() {
+        let mut app = fleet();
+        assert_eq!(app.config.list_width_pct, 50);
+        // 100: the list borrows 10 (the preview keeps 40); the name is
+        // squeezed, the time header short, Usage still there.
+        assert_eq!(
+            list_header(&mut app, 100),
+            (vec!["Name", "Status", "Message", "Turns"], 60)
+        );
+        // 120: borrowed up to a readable name, the full time header.
+        assert_eq!(
+            list_header(&mut app, 120),
+            (vec!["Name", "Status", "Message", "Turns"], 72)
+        );
+        let rows = drawn_at(&mut app, 120, 34);
+        assert!(
+            rows.iter().any(|r| r.contains("Last message")),
+            "{}",
+            rows.join("\n")
+        );
+        // 160: its own half, now with Groups too (a short column).
+        assert_eq!(
+            list_header(&mut app, 160),
+            (vec!["Name", "Status", "Message", "Turns", "Groups"], 80)
+        );
+        // 200: Groups at full width; Project still waits for more.
+        assert_eq!(
+            list_header(&mut app, 200),
+            (vec!["Name", "Status", "Message", "Turns", "Groups"], 100)
+        );
+        assert_eq!(
+            list_header(&mut app, 260).0,
+            vec!["Name", "Status", "Message", "Turns", "Groups", "Project"]
+        );
+    }
+
+    /// The split only ever widens the list, and never past the preview's
+    /// minimum (40 columns or 30%).
+    #[test]
+    fn the_list_borrows_width_only_when_short() {
+        use crate::side_list_width as split;
+        let share_of = |total: u16, pct: u16| {
+            ((total as u32 * pct as u32 / 100) as u16)
+                .max(60)
+                .min(total)
+        };
+        for total in 60..=400u16 {
+            for pct in [20, 30, 50, 70, 80] {
+                let w = split(total, pct, true);
+                assert_eq!(split(total, pct, false), share_of(total, pct));
+                let share = ((total as u32 * pct as u32 / 100) as u16)
+                    .max(60)
+                    .min(total);
+                assert!(w >= share, "{total} {pct}: never below the share");
+                if w > share {
+                    let rest = total - w;
+                    assert!(rest >= 40 && rest >= total * 30 / 100, "{total} {pct}");
+                    assert!(w <= crate::list_cols::core_width(), "{total} {pct}");
+                }
+            }
+        }
+        // A bigger configured share is kept as it is.
+        assert_eq!(split(200, 70, true), 140);
+        // The groups tab doesn't borrow: at 120 it keeps its half.
+        let mut app = fleet();
+        app.tab = Tab::Groups;
+        let rows = drawn_at(&mut app, 120, 34);
+        let y = find(&rows, "live pane").1 + 3;
+        assert_eq!(app.hits.wheel_at(61, y), Some(Hit::Preview));
+        app.tab = Tab::Sessions;
+        drawn_at(&mut app, 120, 34);
+        assert_ne!(app.hits.wheel_at(61, y), Some(Hit::Preview));
+        assert_eq!(app.hits.wheel_at(73, y), Some(Hit::Preview));
+    }
+
+    /// As the list widens, a name never gets narrower (and no column
+    /// goes away).
+    #[test]
+    fn widening_never_narrows_a_name() {
+        let mut last = crate::ListCols::for_width(30);
+        for w in 31..=300u16 {
+            let c = crate::ListCols::for_width(w);
+            assert!(c.name_w >= last.name_w, "width {w}: {last:?} then {c:?}");
+            assert!(
+                c.usage >= last.usage && c.project >= last.project,
+                "width {w}"
+            );
+            assert!(c.tags_w >= last.tags_w, "width {w}");
+            last = c;
+        }
+        // The short time header only under the core width.
+        let core = crate::list_cols::core_width();
+        assert!(crate::ListCols::for_width(core - 1).compact);
+        assert!(!crate::ListCols::for_width(core).compact);
     }
 
     /// Headers whose content can be switched read differently: the sorted
@@ -1209,6 +1356,36 @@ mod tests {
         let rows = drawn(&mut app);
         let (x, y) = find(&rows, "favourite");
         assert!(x < 150 && y < 34);
+    }
+
+    #[test]
+    fn the_menu_highlight_follows_the_pointer() {
+        let sel = |app: &App| match &app.mode {
+            Mode::Menu(m) => m.sel,
+            _ => panic!("no menu"),
+        };
+        let mut app = fleet();
+        app.open_menu(30, 8, false);
+        let rows = drawn(&mut app);
+        assert_eq!(sel(&app), 0);
+        // Over row 3: it's highlighted, and worth a redraw.
+        let (x, y) = find(&rows, "archive");
+        assert_eq!(app.hits.at(x, y), Some(Hit::Pick(3)));
+        assert!(app.hover(x, y));
+        assert_eq!(sel(&app), 3);
+        // Along the same row, or off the menu: nothing changes, no redraw.
+        assert!(!app.hover(x + 2, y));
+        assert!(!app.hover(2, 20));
+        assert_eq!(sel(&app), 3);
+        // Drawn again, the highlight is on that row.
+        let rows = drawn(&mut app);
+        let (x, y) = find(&rows, "rename");
+        assert!(app.hover(x, y));
+        assert_eq!(sel(&app), 4);
+        // No menu open: motion does nothing.
+        app.mode = Mode::Normal;
+        drawn(&mut app);
+        assert!(!app.hover(x, y));
     }
 
     #[test]
