@@ -484,6 +484,45 @@ fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Claude Code's idle screen as it really draws it (layout taken from
+    /// a live 2.x pane): the input box between two rules, then status
+    /// lines, the dim placeholder-free `❯ `, and an earlier reply above.
+    fn claude_idle(input: &str) -> String {
+        let rule = "─".repeat(90);
+        [
+            "✻ Sautéed for 19s · done 11:47 AM".to_string(),
+            String::new(),
+            "❯ 1. run the tests".to_string(),
+            "● Done.".to_string(),
+            rule.clone(),
+            format!("❯ {input}"),
+            rule,
+            "  Opus 5.5 | Context 6.0% | 5h 40.0% | 7d 5.0%".to_string(),
+            "  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)".to_string(),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn claude_real_idle_screen_takes_a_send() {
+        let idle = claude_idle("");
+        assert!(
+            Agent::Claude.at_prompt(&strip_ansi(&idle)),
+            "idle box read as a dialog"
+        );
+        assert_eq!(
+            draft(Agent::Claude, &idle),
+            None,
+            "empty box read as a draft"
+        );
+        let typed = claude_idle("half a thought");
+        assert!(Agent::Claude.at_prompt(&strip_ansi(&typed)));
+        assert!(
+            draft(Agent::Claude, &typed).is_some(),
+            "a typed draft must hold the send"
+        );
+    }
+
     fn insert(db: &Db) -> String {
         db.insert_session(&rlord_core::db::NewSession {
             id: "s1",
