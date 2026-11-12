@@ -43,6 +43,12 @@ Rules of thumb: it doesn't do repo work in its own conversation; it keeps
 its context small (it's long-lived); when unsure between answering and
 launching, launching is right for work, answering is right for questions.
 
+**The headline rule (state it first and plainly in overlord.md):** the
+overlord runs at low effort, so it does only light work itself: look-ups,
+small edits to rlord metadata, short answers. Anything that needs more than
+mild effort (multi-step reasoning, reading a lot, research, bulk passes, any
+repo work) goes to a subagent or a new session. When in doubt, delegate.
+
 ## The overlord remembers by looking things up
 
 It restarts on a fresh conversation after idle, so its own past must be
