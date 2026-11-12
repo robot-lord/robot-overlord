@@ -500,6 +500,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(t) = &launch.transcript {
         db.upsert_transcript_source(&id, &t.to_string_lossy())?;
     }
+    hold_deferred(db, &id, &launch)?;
     if !agent.mints_id() {
         // Its conversation is bound once the agent reports it (or it turns
         // up in the agent's own index): one started from now on.
@@ -787,6 +788,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    hold_deferred(db, &s.id, &launch)?;
     match (&launch.session_id, &launch.transcript) {
         (Some(sid), transcript) => {
             db.set_agent_session(&s.id, sid, "minted")?;
@@ -810,6 +812,18 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
         &json!({"from": s.agent_session, "to": launch.session_id}).to_string(),
     )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+/// Keep what a launch couldn't put on the agent's command line (its
+/// `Deferred`: OpenCode's model, and the prompt that waits for it) until
+/// the agent has the conversation; whatever follows that agent applies it
+/// (`opencode::apply_deferred`). A launch without one clears an older one.
+fn hold_deferred(db: &Db, id: &str, launch: &rlord_core::agents::Launch) -> Result<()> {
+    let key = crate::opencode::deferred_key(id);
+    match &launch.deferred {
+        Some(d) => db.kv_set(&key, &serde_json::to_string(d)?),
+        None => db.kv_delete(&key),
+    }
 }
 
 pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {

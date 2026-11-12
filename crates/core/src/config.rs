@@ -220,7 +220,7 @@ impl Default for OverlordConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionDefaults {
-    /// Coding tool new sessions run: `claude` or `codex`.
+    /// Coding tool new sessions run: `claude`, `codex` or `opencode`.
     pub agent: String,
     /// Model passed to Claude Code (`--model`). Empty = its own default.
     pub model: String,
@@ -229,6 +229,9 @@ pub struct SessionDefaults {
     /// Model passed to Codex (`--model`). Empty = Codex's own default. (Its
     /// picker choices come from Codex's own model catalog.)
     pub codex_model: String,
+    /// Model set on OpenCode sessions (`provider/model`). Empty = whatever
+    /// OpenCode picks. (Its picker choices come from `opencode models`.)
+    pub opencode_model: String,
     /// Create each new session in its own git worktree under `workspace_dir`.
     pub workspace: bool,
     /// Directory (relative to the repo root) that holds session worktrees.
@@ -252,6 +255,7 @@ impl Default for SessionDefaults {
             model: "opus".into(),
             models: vec!["opus".into(), "sonnet".into(), "haiku".into()],
             codex_model: String::new(),
+            opencode_model: String::new(),
             workspace: true,
             workspace_dir: ".worktrees".into(),
             default_repo: String::new(),
@@ -268,6 +272,7 @@ impl SessionDefaults {
         match agent {
             crate::agents::Agent::Claude => &self.model,
             crate::agents::Agent::Codex => &self.codex_model,
+            crate::agents::Agent::OpenCode => &self.opencode_model,
         }
     }
 
@@ -278,6 +283,8 @@ impl SessionDefaults {
             crate::agents::Agent::Codex => {
                 crate::agents::codex::models(&crate::agents::codex::home())
             }
+            // (As last listed: `install::warm` keeps it current.)
+            crate::agents::Agent::OpenCode => crate::agents::opencode::models(),
         }
     }
 
@@ -356,6 +363,10 @@ pub struct ArchiveConfig {
     /// The model that writes a Codex session's (a session's own agent
     /// summarizes it). Empty = Codex's default.
     pub codex_summary_model: String,
+    /// The model that writes an OpenCode session's when it is summarized
+    /// from excerpts (`provider/model`; empty = OpenCode's default). A
+    /// conversation that fits is summarized by the session's own model.
+    pub opencode_summary_model: String,
     /// A conversation bigger than this (tokens) is summarized from excerpts
     /// instead of in full.
     pub summary_max_tokens: u64,
@@ -367,6 +378,7 @@ impl Default for ArchiveConfig {
             summary: true,
             summary_model: "haiku".into(),
             codex_summary_model: String::new(),
+            opencode_summary_model: String::new(),
             summary_max_tokens: 150_000,
         }
     }
@@ -479,11 +491,14 @@ theme = "rlord"
 
 # Defaults for every session you create (TUI form or `rlord new`).
 [session]
-agent = "claude"                # what new sessions run: "claude" or "codex"
+agent = "claude"                # what new sessions run: "claude", "codex"
+                                # or "opencode"
 model = "opus"                  # Claude Code's --model; "" = its default
 models = ["opus", "sonnet", "haiku"]   # model picker choices (Claude Code)
 codex_model = ""                # Codex's --model; "" = its default (the
                                 # picker offers Codex's own model list)
+opencode_model = ""             # OpenCode's model, as provider/model; "" =
+                                # its default (the picker: `opencode models`)
 workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
@@ -574,6 +589,8 @@ mouse = true     # click and scroll in the list, the overlay and agent panes
 summary = true
 summary_model = "haiku"         # for Claude Code sessions
 codex_summary_model = ""        # for Codex sessions; "" = Codex's default
+opencode_summary_model = ""     # for OpenCode sessions too big to summarize
+                                # in full (those that fit use their own model)
 summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
 
 # `rlord update`: "stable" releases, or "dev" for the newest of any kind

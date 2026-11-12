@@ -4,6 +4,7 @@ pub mod discover;
 pub mod import;
 pub mod mcp;
 pub mod methods;
+pub mod opencode;
 pub mod overlord;
 pub mod profile;
 pub mod remote;

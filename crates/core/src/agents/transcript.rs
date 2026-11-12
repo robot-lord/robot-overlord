@@ -1,6 +1,6 @@
 //! Transcripts in one shape, whichever agent wrote them.
 //!
-//! Every agent keeps its conversation as JSON lines, each in its own
+//! Claude Code and Codex keep a conversation as JSON lines, each in its own
 //! format. `Format::line` reads one line as a `Line`, and a `Line` answers
 //! the questions rlord asks of a transcript: is this a message (who said
 //! what, when), a prompt the human typed, the agent's reply, a title, token
@@ -13,27 +13,34 @@
 //! (`Excerpts`, `TranscriptStats`, `context_tokens`, `observed_model`,
 //! `working`; `history::search`/`read` for messages), not `Line`: an agent
 //! whose conversations aren't a JSONL file gets a `Format` that those
-//! functions answer without going through lines.
+//! functions answer without going through lines. OpenCode is one: its
+//! conversations are rows in its database, named by a path that isn't a
+//! file (`opencode::locate`), and each function here asks `opencode` first.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{claude, codex};
+use super::{claude, codex, opencode};
 
 /// Whose transcript format a file is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Claude,
     Codex,
+    /// Not lines: a conversation in OpenCode's database.
+    OpenCode,
 }
 
 impl Format {
     /// From the file's name: Codex writes `rollout-<time>-<id>.jsonl`,
-    /// Claude Code `<id>.jsonl` (and `agent-<id>.jsonl` for sub-agents).
+    /// Claude Code `<id>.jsonl` (and `agent-<id>.jsonl` for sub-agents);
+    /// an OpenCode conversation is `<opencode.db>/<ses_…>`.
     pub fn of(path: &Path) -> Format {
         let name = path.file_name().map(|n| n.to_string_lossy());
-        if name.is_some_and(|n| n.starts_with("rollout-")) {
+        if opencode::is_transcript(path) {
+            Format::OpenCode
+        } else if name.is_some_and(|n| n.starts_with("rollout-")) {
             Format::Codex
         } else {
             Format::Claude
@@ -86,6 +93,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::message(self.v),
             Format::Codex => codex::message(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -95,6 +104,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::human_prompt(self.v),
             Format::Codex => codex::human_prompt(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -103,6 +114,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::reply_text(self.v),
             Format::Codex => codex::reply_text(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -110,6 +123,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::title(self.v),
             Format::Codex => codex::title(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -118,7 +133,7 @@ impl<'a> Line<'a> {
     pub fn last_prompt(&self) -> Option<&'a str> {
         match self.format {
             Format::Claude => claude::last_prompt(self.v),
-            Format::Codex => None,
+            Format::Codex | Format::OpenCode => None,
         }
     }
 
@@ -126,6 +141,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::usage(self.v),
             Format::Codex => codex::usage(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -134,6 +151,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::model(self.v),
             Format::Codex => codex::model(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 
@@ -143,6 +162,8 @@ impl<'a> Line<'a> {
         match self.format {
             Format::Claude => claude::turn_ended(self.v),
             Format::Codex => codex::turn_ended(self.v),
+            // (Never lines: see `Format::OpenCode`.)
+            Format::OpenCode => None,
         }
     }
 }
@@ -213,7 +234,19 @@ pub fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// Whether a transcript is there to read (a file; or, for OpenCode, the
+/// conversation in its database).
+pub fn exists(path: &Path) -> bool {
+    match opencode::locate(path) {
+        Some((db, id)) => opencode::exists(db, id),
+        None => path.exists(),
+    }
+}
+
 pub fn transcript_excerpts(path: &Path) -> Excerpts {
+    if let Some((db, id)) = opencode::locate(path) {
+        return opencode::excerpts(db, id);
+    }
     let (head, tail) = read_head_tail(path);
     excerpts_from(Format::of(path), &head, &tail)
 }
@@ -297,6 +330,9 @@ pub fn excerpts_from(format: Format, head: &[Value], tail: &[Value]) -> Excerpts
 /// The conversation's size in tokens, from its last reported usage (the
 /// whole context it sent); else a guess from the file size.
 pub fn context_tokens(path: &Path) -> u64 {
+    if let Some((db, id)) = opencode::locate(path) {
+        return opencode::context_tokens(db, id);
+    }
     let format = Format::of(path);
     let (_, tail) = read_head_tail(path);
     tail.iter()
@@ -308,6 +344,9 @@ pub fn context_tokens(path: &Path) -> u64 {
 
 /// The model of the latest turn in a transcript, reading only its tail.
 pub fn observed_model(path: &Path) -> Option<String> {
+    if let Some((db, id)) = opencode::locate(path) {
+        return opencode::observed_model(db, id);
+    }
     let format = Format::of(path);
     let (_, tail) = read_head_tail(path);
     tail.iter()
@@ -337,6 +376,10 @@ pub fn working(path: &Path) -> Option<bool> {
 /// without its newline counts once it parses as complete JSON. A file that
 /// was replaced (new inode) or shrank is read again from the start.
 pub fn transcript_stats(path: &Path) -> Option<TranscriptStats> {
+    // (OpenCode keeps the totals itself: one row, nothing to remember.)
+    if let Some((db, id)) = opencode::locate(path) {
+        return opencode::stats(db, id);
+    }
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::MetadataExt;
     let format = Format::of(path);
@@ -570,6 +613,28 @@ mod tests {
             Format::of(Path::new("/h/.claude/projects/-x/abc.jsonl")),
             Format::Claude
         );
+        let opencode = "/h/.local/share/opencode/opencode.db/ses_e3192cfeeffeUElN5gOL3f5nhg";
+        assert_eq!(Format::of(Path::new(opencode)), Format::OpenCode);
+    }
+
+    #[test]
+    fn an_opencode_conversation_answers_from_its_database() {
+        use super::super::opencode::tests::{store, SES};
+        let dir = tempfile::tempdir().unwrap();
+        let p = store(dir.path()).join(SES);
+        assert!(exists(&p) && !exists(&p.with_file_name("ses_none")));
+        let e = transcript_excerpts(&p);
+        assert_eq!(e.title.as_deref(), Some("Repo purpose walkthrough"));
+        assert!(e.first_prompt.unwrap().starts_with("take a look"));
+        assert_eq!(transcript_stats(&p).unwrap().input_tokens, 18736);
+        assert_eq!(working(&p), Some(false));
+        assert_eq!(context_tokens(&p), 22253);
+        assert_eq!(
+            observed_model(&p).as_deref(),
+            Some("opencode/deepseek-v4.1-flash-free")
+        );
+        // Nothing to save a read position for.
+        assert!(take_dirty_cursors().iter().all(|(c, _)| c != &p));
     }
 
     #[test]

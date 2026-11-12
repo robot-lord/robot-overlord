@@ -4,7 +4,8 @@
 //! Plain code decides everything but the words. One worker, one summary at
 //! a time, written by the session's own agent on a cheap model (`[archive]
 //! summary_model` for Claude Code, `codex_summary_model` for Codex), with
-//! nothing saved by the agent and nothing it could change:
+//! nothing saved by the agent and nothing it could change. (OpenCode has
+//! its own ways to the same two steps: see `opencode_summary`.)
 //!
 //! - **In full** when the conversation fits (`summary_max_tokens`): the
 //!   agent reads a fork of it (Claude: `--resume … --fork-session`, no
@@ -23,8 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use rlord_core::agents::opencode_service::Service;
 use rlord_core::agents::transcript::{self, clip};
-use rlord_core::agents::{claude, codex, Agent};
+use rlord_core::agents::{claude, codex, opencode, Agent};
 use rlord_core::types::{now_ms, Session};
 use rlord_core::{history, paths};
 
@@ -134,7 +136,7 @@ pub fn transcripts_of(d: &Daemon, s: &Session) -> Vec<PathBuf> {
         v
     });
     for p in current.clone().into_iter().chain(older) {
-        if p.exists() && !out.contains(&p) {
+        if transcript::exists(&p) && !out.contains(&p) {
             out.push(p);
         }
     }
@@ -167,6 +169,7 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
     let model = match agent {
         Agent::Claude => cfg.archive.summary_model.trim(),
         Agent::Codex => cfg.archive.codex_summary_model.trim(),
+        Agent::OpenCode => cfg.archive.opencode_summary_model.trim(),
     };
     let mut ask = ASK.to_string();
     let known = [
@@ -177,6 +180,10 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
         ask.push_str(&format!("\n\n{what}: {}", clip(v, 1500)));
     }
     let fits = context_tokens(&path) <= cfg.archive.summary_max_tokens;
+    if agent == Agent::OpenCode {
+        let text = opencode_summary(&s, &path, conversation.as_deref(), &ask, fits, model)?;
+        return save(d, &s, &text);
+    }
     let full = match (&conversation, fits) {
         (Some(a), true) if Path::new(&s.project_path).is_dir() => {
             run(agent, model, Some((a, &ask)), &s.project_path, None)
@@ -195,6 +202,10 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
             run(agent, model, None, &dir.to_string_lossy(), Some(&prompt))?
         }
     };
+    save(d, &s, &text)
+}
+
+fn save(d: &Daemon, s: &Session, text: &str) -> Result<()> {
     let text = text.trim();
     if text.is_empty() {
         bail!("empty summary");
@@ -202,6 +213,79 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
     d.db()
         .set_summary(&s.id, &keep_lines(text, 1500), Some(now_ms()))?;
     Ok(())
+}
+
+/// An OpenCode session's summary, by the first of these that works:
+///
+/// 1. **Its server, from the session's own context** (`POST
+///    /api/session/{id}/generate`): the session's model answers and
+///    nothing is added to the conversation (checked against OpenCode
+///    2.2.7: no message, no status change; only its token totals grow).
+///    When the conversation fits and the server is up.
+/// 2. **A fork** (`opencode run -s <id> --fork --archived`), read from
+///    OpenCode's database and then deleted (`opencode session delete`).
+/// 3. **Excerpts**, as for the other agents, to a session of its own
+///    (`opencode run -s <new id> --archived`), deleted afterwards.
+fn opencode_summary(
+    s: &Session,
+    path: &Path,
+    conversation: Option<&str>,
+    ask: &str,
+    fits: bool,
+    model: &str,
+) -> Result<String> {
+    let note = |how: &str, e: anyhow::Error| tracing::info!(session = %s.id, error = %format!("{e:#}"), "{how} summary failed");
+    if let Some(id) = conversation.filter(|_| fits) {
+        let generated = Service::read(&opencode::service_file())
+            .context("OpenCode's server isn't running")
+            .and_then(|svc| svc.generate(id, ask, TIMEOUT));
+        match generated {
+            Ok(t) if !t.trim().is_empty() => return Ok(t),
+            Ok(_) => note("generated", anyhow::anyhow!("empty answer")),
+            Err(e) => note("generated", e),
+        }
+        if Path::new(&s.project_path).is_dir() {
+            match opencode_run(model, Some(id), ask, &s.project_path) {
+                Ok(t) => return Ok(t),
+                Err(e) => note("forked", e),
+            }
+        }
+    }
+    let excerpt = excerpt(path)?;
+    let dir = paths::data_dir().join("summaries");
+    std::fs::create_dir_all(&dir)?;
+    let prompt = format!("{ask}\n\nThe conversation (excerpts):\n\n{excerpt}");
+    opencode_run(model, None, &prompt, &dir.to_string_lossy())
+}
+
+/// One `opencode run` in a throwaway session (a fork of `fork`, or a new
+/// one), its answer read from OpenCode's database, the session deleted.
+fn opencode_run(model: &str, fork: Option<&str>, ask: &str, cwd: &str) -> Result<String> {
+    let db = opencode::db_path();
+    let own = opencode::mint_session_id();
+    // (A little before: the two clocks are the same machine's.)
+    let since = now_ms() - 2_000;
+    let argv = opencode::summary_argv(model, fork, &own, ask);
+    let ran = spawn_wait("opencode", &argv, cwd, None);
+    // The session it wrote in: the fork it made, or the one named.
+    let wrote = match fork {
+        Some(id) => opencode::fork_of(&db, id, since),
+        None => Some(own).filter(|id| opencode::exists(&db, id)),
+    };
+    let answer = wrote
+        .as_deref()
+        .and_then(|id| opencode::latest_reply(&db, id));
+    if let Some(id) = &wrote {
+        match spawn_wait("opencode", &opencode::delete_argv(id), cwd, None) {
+            Ok((st, _)) if st.success() => {}
+            _ => tracing::warn!(opencode_session = %id, "a summary's session wasn't deleted"),
+        }
+    }
+    let (status, _) = ran?;
+    if !status.success() {
+        bail!("opencode run failed ({status})");
+    }
+    answer.context("no answer from opencode")
 }
 
 /// At most `max` characters, line breaks kept.
@@ -219,6 +303,7 @@ fn conversation_of(agent: Agent, path: &Path, s: &Session) -> Option<String> {
     let stem = path.file_stem()?.to_string_lossy().into_owned();
     match agent {
         Agent::Claude => Some(stem),
+        Agent::OpenCode => opencode::locate(path).map(|(_, id)| id.to_string()),
         Agent::Codex => s
             .agent_session
             .clone()
@@ -262,7 +347,6 @@ fn run(
     cwd: &str,
     stdin: Option<&str>,
 ) -> Result<String> {
-    use std::io::{Read, Write};
     // Codex writes its answer to a file.
     let out_file = paths::data_dir().join("summaries").join(format!(
         "answer-{}-{}.txt",
@@ -277,8 +361,38 @@ fn run(
             }
             codex::summary_argv(model, fork, &out_file)
         }
+        // (Not through here: see `opencode_summary`.)
+        Agent::OpenCode => bail!("OpenCode summaries don't run this way"),
     };
     let name = agent.name();
+    let ran = spawn_wait(name, &argv, cwd, stdin);
+    if ran.is_err() {
+        let _ = std::fs::remove_file(&out_file);
+    }
+    let (status, out) = ran?;
+    match agent {
+        Agent::Claude => claude_answer(&out),
+        Agent::Codex => {
+            let answer = std::fs::read_to_string(&out_file);
+            let _ = std::fs::remove_file(&out_file);
+            if !status.success() {
+                bail!("codex exec failed ({status})");
+            }
+            answer.context("no answer from codex")
+        }
+        Agent::OpenCode => unreachable!("refused above"),
+    }
+}
+
+/// Run a command to its end (at most `TIMEOUT`): its exit status and what
+/// it printed.
+fn spawn_wait(
+    name: &str,
+    argv: &[String],
+    cwd: &str,
+    stdin: Option<&str>,
+) -> Result<(std::process::ExitStatus, String)> {
+    use std::io::{Read, Write};
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
@@ -316,23 +430,11 @@ fn run(
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(&out_file);
                 bail!("{name} took too long");
             }
         }
     };
-    let out = reader.join().unwrap_or_default();
-    match agent {
-        Agent::Claude => claude_answer(&out),
-        Agent::Codex => {
-            let answer = std::fs::read_to_string(&out_file);
-            let _ = std::fs::remove_file(&out_file);
-            if !status.success() {
-                bail!("codex exec failed ({status})");
-            }
-            answer.context("no answer from codex")
-        }
-    }
+    Ok((status, reader.join().unwrap_or_default()))
 }
 
 /// The answer in `claude -p --output-format json`'s output.
@@ -394,6 +496,11 @@ mod tests {
         assert_eq!(
             conversation_of(Agent::Claude, Path::new("/p/abc.jsonl"), &s).as_deref(),
             Some("abc")
+        );
+        let oc = Path::new("/h/.local/share/opencode/opencode.db/ses_e3192cfeeffeUElN5gOL3f5nhg");
+        assert_eq!(
+            conversation_of(Agent::OpenCode, oc, &s).as_deref(),
+            Some("ses_e3192cfeeffeUElN5gOL3f5nhg")
         );
     }
 
