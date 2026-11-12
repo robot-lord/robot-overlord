@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing here needs to write to the repo.
+permissions:
+  contents: read
+
 jobs:
   # Every PR ships a release (CLAUDE.md), so it must bump the version.
   # Linux on purpose: this needs only git, and macOS minutes cost 10x.
@@ -12,7 +16,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}" HEAD
@@ -21,14 +25,22 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
           RLORD_TMUX_TESTS: "1"
+  # Known-vulnerable dependencies (RustSec advisories) fail the build.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
