@@ -37,3 +37,18 @@ launch work, keep the list tidy. Default handling:
 Rules of thumb: it doesn't do repo work in its own conversation; it keeps
 its context small (it's long-lived); when unsure between answering and
 launching, launching is right for work, answering is right for questions.
+
+## The overlord remembers by looking things up
+
+It restarts on a fresh conversation after idle, so its own past must be
+cheap to reach without carrying it in context:
+
+- `recall` (MCP): searches only the overlord's own earlier conversations
+  (its transcripts across fresh restarts; normal search skips seat folders)
+  and returns short dated snippets; with no query, a bounded digest of the
+  previous conversation (the user's asks and its short replies, clipped).
+  Plain code, no AI call.
+- `search_history` can take one session, for "what happened in X?".
+- overlord.md: when the user refers to something not in its context, call
+  `recall` first, before asking or searching broadly.
+- Nothing is preloaded into a fresh conversation; it fetches on demand.
