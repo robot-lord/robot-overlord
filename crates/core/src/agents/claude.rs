@@ -210,12 +210,12 @@ mod tests {
     #[test]
     fn slug_matches_observed_claude_encoding() {
         assert_eq!(
-            project_slug("/home/alice/ko/myapp"),
-            "-home-alice-ko-myapp"
+            project_slug("/home/alice/src/myapp"),
+            "-home-alice-src-myapp"
         );
         assert_eq!(
-            project_slug("/home/alice/ko/myapp/.worktrees/feature/x"),
-            "-home-alice-ko-myapp--worktrees-feature-x"
+            project_slug("/home/alice/src/myapp/.worktrees/feature/x"),
+            "-home-alice-src-myapp--worktrees-feature-x"
         );
     }
 

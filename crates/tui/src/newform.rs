@@ -1214,10 +1214,7 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         dim
     };
     let body = if form.prompt.is_empty() && !focus(Field::Prompt) {
-        Paragraph::new(Span::styled(
-            "e.g. fix the flaky login test in myapp",
-            dim,
-        ))
+        Paragraph::new(Span::styled("e.g. fix the flaky login test in myapp", dim))
     } else {
         // Longer than the box: keep the end (where you type) in view.
         let visible = box_h.saturating_sub(2) as usize;
