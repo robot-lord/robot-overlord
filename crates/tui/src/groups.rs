@@ -271,28 +271,28 @@ impl App {
                 Style::default().fg(theme::muted_c()).bg(theme::chip()),
             )
         };
-        // The logo: a stern robot (dark red, heavy outline) with a crown
+        // The logo: a stern robot (dark red, double outline like the name's letters) with a crown
         // (dark gold) set into its head, four rows tall.
         let (crown, robot, eye) = theme::logo();
         let red = Style::default().fg(robot);
         let eyes = Style::default().fg(eye);
         let logo = [
             vec![
-                Span::styled(" ┏", red),
+                Span::styled(" ╔", red),
                 Span::styled("▲▲▲", Style::default().fg(crown)),
-                Span::styled("┓", red),
+                Span::styled("╗", red),
             ],
             vec![
-                Span::styled(" ┃", red),
+                Span::styled(" ║", red),
                 Span::styled("▾ ▾", eyes),
-                Span::styled("┃", red),
+                Span::styled("║", red),
             ],
             vec![
-                Span::styled(" ┃ ", red),
+                Span::styled(" ║ ", red),
                 Span::styled("▬", eyes),
-                Span::styled(" ┃", red),
+                Span::styled(" ║", red),
             ],
-            vec![Span::styled(" ┗━━━┛", red)],
+            vec![Span::styled(" ╚═══╝", red)],
         ];
 
         // The toolbar, roomy, then tighter (narrow separators, no

@@ -61,6 +61,11 @@ pub struct Session {
     /// '' for ordinary sessions, 'overlord' for the management session.
     #[serde(default)]
     pub role: String,
+    /// What it did, in a paragraph (made when it's archived; see
+    /// `rlord_daemon::summary`).
+    #[serde(default)]
+    pub summary: String,
+    pub summary_at: Option<i64>,
 }
 
 pub fn now_ms() -> i64 {

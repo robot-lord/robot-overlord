@@ -14,12 +14,13 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_subagents.sql"),
     include_str!("../migrations/0005_overlord.sql"),
     include_str!("../migrations/0006_transcript_cursors.sql"),
+    include_str!("../migrations/0007_summary.sql"),
 ];
 
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
-     repo_path, workspace_path, branch, description, notes, launch_spec, role";
+     repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -123,7 +124,8 @@ pub struct SessionQuery {
     pub name: Option<String>,
     /// Prefix match on group_path.
     pub group: Option<String>,
-    /// Free text: matches name, project, group, or any tag.
+    /// Free text: matches name, project, group, any tag, description,
+    /// notes or summary.
     pub search: Option<String>,
     pub sort: SortMode,
     pub reverse: bool,
@@ -388,16 +390,19 @@ impl Db {
             args.push(g.clone());
         }
         if let Some(text) = &q.search {
-            // Every word must match somewhere (name/project/group/tag).
+            // Every word must match somewhere (name/project/group/tag, and
+            // what it's about: description, notes, summary).
             for word in text.split_whitespace() {
                 conds.push(
                     "(name LIKE '%' || ? || '%' OR project_path LIKE '%' || ? || '%' \
                       OR group_path LIKE '%' || ? || '%' \
+                      OR description LIKE '%' || ? || '%' OR notes LIKE '%' || ? || '%' \
+                      OR summary LIKE '%' || ? || '%' \
                       OR EXISTS (SELECT 1 FROM tags t WHERE t.session_id = sessions.id \
                                  AND t.tag LIKE '%' || ? || '%'))"
                         .into(),
                 );
-                for _ in 0..4 {
+                for _ in 0..7 {
                     args.push(word.to_string());
                 }
             }
@@ -516,6 +521,15 @@ impl Db {
         self.conn.execute(
             "UPDATE sessions SET description = ?2 WHERE id = ?1",
             params![id, description],
+        )?;
+        Ok(())
+    }
+
+    /// What the session did (`at`: when it was made; None clears it).
+    pub fn set_summary(&self, id: &str, summary: &str, at: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET summary = ?2, summary_at = ?3 WHERE id = ?1",
+            params![id, summary, at],
         )?;
         Ok(())
     }
@@ -1006,6 +1020,38 @@ impl Db {
 
     // ---- transcripts ----
 
+    /// Agent conversation ids a session had before its current one (a
+    /// `/clear`, a resume or a fresh restart starts a new one), newest first.
+    pub fn past_agent_sessions(&self, id: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT payload FROM events WHERE session_id = ?1 \
+             AND kind IN ('agent_session_changed', 'fresh_conversation') \
+             ORDER BY ts DESC",
+        )?;
+        let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
+        let mut out: Vec<String> = Vec::new();
+        for p in rows.flatten() {
+            if let Some(f) = serde_json::from_str::<serde_json::Value>(&p)
+                .ok()
+                .and_then(|v| v["from"].as_str().map(str::to_string))
+            {
+                if !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every session's transcript file (session id, path).
+    pub fn transcript_sources(&self) -> Result<Vec<(String, String)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT session_id, source_path FROM transcripts")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn upsert_transcript_source(&self, session_id: &str, source_path: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO transcripts (session_id, source_path) VALUES (?1, ?2) \
@@ -1047,6 +1093,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
             .filter(|m| !m.is_empty()),
         tags: Vec::new(),
         role: r.get(22)?,
+        summary: r.get(23)?,
+        summary_at: r.get(24)?,
     })
 }
 
@@ -1192,7 +1240,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
         for table in [
             "sessions",
             "tags",
@@ -1220,7 +1268,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
     }
 
     #[test]

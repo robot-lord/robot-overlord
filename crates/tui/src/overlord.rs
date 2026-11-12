@@ -78,6 +78,14 @@ impl App {
         if let Some(v) = self.call("ui.view.default", Value::Null) {
             self.apply_view(&v);
         }
+        // Back on the session the user last had selected.
+        if let Some(id) = self
+            .call("ui.selected", json!({}))
+            .and_then(|v| v["id"].as_str().map(str::to_string))
+        {
+            self.saved_sel = Some(id.clone());
+            self.pending_select = Some(id);
+        }
         if let Some(cmd) = self
             .call("ui.pending", Value::Null)
             .filter(|c| !c.is_null())

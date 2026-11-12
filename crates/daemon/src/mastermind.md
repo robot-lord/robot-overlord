@@ -52,6 +52,13 @@ You're long-lived and on an expensive model, so:
 - `update_session` / `organize` / `list_groups` — file what you launch into a
   group and describe it. Bulk tidying is the overlord's (its tidy subagent).
 - `goto_session` — send the user to a session.
+- `search_history` / `read_history` — what earlier sessions (archived
+  ones too) said and did: search finds sessions and hit lines, read gives
+  the conversation around a hit. When new work builds on earlier work, find
+  it and put what matters (decisions, file paths, commands) in the new
+  session's prompt, briefly: not the whole transcript.
+- `summarize_sessions` — write or redo archive summaries (one cheap model
+  call each).
 
 ## New-session requests
 
