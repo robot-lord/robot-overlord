@@ -160,10 +160,13 @@ facts live in its module) is what the rest of rlord asks:
   session's folder since launch; `trust = minted`, rlord's own attribution,
   confirmed by a later hook). Only `minted` or `hook` ids resume; a
   `scavenged` one never does. A Codex session with no bound id can't resume.
-  OpenCode takes a caller-chosen id too (`opencode -s <ses_…>` continues
-  or creates that session); what its command line can't carry (the model,
-  and a first prompt that must wait for it) rides in `Launch::deferred`
-  and is applied through OpenCode's server once the session exists.
+  OpenCode takes a caller-chosen id too, but its TUI creates a session
+  only with the first message and has no model flag: the pane command
+  first creates the session through OpenCode's server (`opencode api POST
+  /api/session`, with the id, folder and model), then execs the TUI on it
+  (`opencode -s <ses_…> [--prompt …]`). `Launch::deferred` names the model
+  for `daemon::opencode` to confirm afterwards (set it if the create step
+  didn't take; log it if it can't be).
 - **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
   agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same
   shape, others' hooks kept, one backup), `map_hook_event` turns an event

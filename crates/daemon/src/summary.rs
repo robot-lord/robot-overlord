@@ -222,8 +222,9 @@ fn save(d: &Daemon, s: &Session, text: &str) -> Result<()> {
 ///    nothing is added to the conversation (checked against OpenCode
 ///    2.2.7: no message, no status change; only its token totals grow).
 ///    When the conversation fits and the server is up.
-/// 2. **A fork** (`opencode run -s <id> --fork --archived`), read from
-///    OpenCode's database and then deleted (`opencode session delete`).
+/// 2. **A fork** (`opencode run -s <id> --fork --archived`, on the
+///    session's own model), read from OpenCode's database and then
+///    deleted (`opencode session delete`).
 /// 3. **Excerpts**, as for the other agents, to a session of its own
 ///    (`opencode run -s <new id> --archived`), deleted afterwards.
 fn opencode_summary(
@@ -245,7 +246,9 @@ fn opencode_summary(
             Err(e) => note("generated", e),
         }
         if Path::new(&s.project_path).is_dir() {
-            match opencode_run(model, Some(id), ask, &s.project_path) {
+            // (A fork keeps the session's own model: `model` is for the
+            // excerpt run only.)
+            match opencode_run("", Some(id), ask, &s.project_path) {
                 Ok(t) => return Ok(t),
                 Err(e) => note("forked", e),
             }
@@ -385,14 +388,34 @@ fn run(
 }
 
 /// Run a command to its end (at most `TIMEOUT`): its exit status and what
-/// it printed.
+/// it printed. Its output goes to a file, not a pipe: a command that
+/// starts a background process (OpenCode's server) would hand it the
+/// pipe, and reading to its end would then wait on that process.
 fn spawn_wait(
     name: &str,
     argv: &[String],
     cwd: &str,
     stdin: Option<&str>,
 ) -> Result<(std::process::ExitStatus, String)> {
-    use std::io::{Read, Write};
+    spawn_wait_in(&paths::data_dir().join("summaries"), name, argv, cwd, stdin)
+}
+
+/// `spawn_wait`, with the directory its output file goes in.
+fn spawn_wait_in(
+    dir: &Path,
+    name: &str,
+    argv: &[String],
+    cwd: &str,
+    stdin: Option<&str>,
+) -> Result<(std::process::ExitStatus, String)> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let printed = dir.join(format!(
+        "out-{}-{}.txt",
+        std::process::id(),
+        opencode::mint_session_id()
+    ));
+    let out = std::fs::File::create(&printed).context("a file for the agent's output")?;
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .current_dir(cwd)
@@ -404,37 +427,38 @@ fn spawn_wait(
         } else {
             std::process::Stdio::null()
         })
-        .stdout(std::process::Stdio::piped())
+        .stdout(out)
         .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().with_context(|| format!("running {name}"))?;
-    // Written from its own thread: a stalled agent must not block the
-    // worker past the timeout.
-    if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
-        let text = text.to_string();
-        std::thread::spawn(move || {
-            let _ = w.write_all(text.as_bytes());
-        });
-    }
-    // Read while waiting: a full pipe would stall it.
-    let mut so = child.stdout.take().context("the agent's output")?;
-    let reader = std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = so.read_to_string(&mut out);
-        out
-    });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() < TIMEOUT => std::thread::sleep(Duration::from_millis(200)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("{name} took too long");
+    let spawned = cmd.spawn().with_context(|| format!("running {name}"));
+    let waited = spawned.and_then(|mut child| {
+        // Written from its own thread: a stalled agent must not block the
+        // worker past the timeout.
+        if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
+            let text = text.to_string();
+            std::thread::spawn(move || {
+                let _ = w.write_all(text.as_bytes());
+            });
+        }
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Ok(st),
+                Ok(None) if start.elapsed() < TIMEOUT => {
+                    std::thread::sleep(Duration::from_millis(200))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(anyhow::anyhow!("{name} took too long"));
+                }
             }
         }
-    };
-    Ok((status, reader.join().unwrap_or_default()))
+    });
+    let text = std::fs::read(&printed)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&printed);
+    Ok((waited?, text))
 }
 
 /// The answer in `claude -p --output-format json`'s output.
@@ -502,6 +526,31 @@ mod tests {
             conversation_of(Agent::OpenCode, oc, &s).as_deref(),
             Some("ses_e3192cfeeffeUElN5gOL3f5nhg")
         );
+    }
+
+    #[test]
+    fn a_command_that_leaves_something_running_doesnt_hold_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+        // Prints, then leaves a child behind that keeps its output open
+        // (as `opencode` does when it starts its server).
+        let argv: Vec<String> = ["sh", "-c", "echo answer; (sleep 20 &) ; exit 0"]
+            .map(String::from)
+            .to_vec();
+        let start = Instant::now();
+        let (status, out) = spawn_wait_in(dir.path(), "sh", &argv, &cwd, None).unwrap();
+        assert!(status.success());
+        assert_eq!(out.trim(), "answer");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        // What is sent on stdin arrives.
+        let argv: Vec<String> = ["sh", "-c", "cat"].map(String::from).to_vec();
+        let (_, out) = spawn_wait_in(dir.path(), "sh", &argv, &cwd, Some("the prompt")).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "output files removed"
+        );
+        assert_eq!(out, "the prompt");
     }
 
     #[test]

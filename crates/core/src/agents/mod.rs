@@ -92,20 +92,19 @@ pub struct Launch {
     pub session_id: Option<String>,
     /// Where its transcript will be written, when that follows from the id.
     pub transcript: Option<PathBuf>,
-    /// What the agent's command line can't carry (see `Deferred`).
+    /// What should be checked once the conversation exists (see `Deferred`).
     pub deferred: Option<Deferred>,
 }
 
-/// What a launch asked for that the agent takes only once its conversation
-/// exists: applied then, in this order, by whatever follows that agent
-/// (OpenCode's TUI has no model flag: the model is set through its server,
-/// and a first prompt must wait for that or it would run on the default).
+/// What a launch asked for that the agent's own command line can't carry,
+/// to be confirmed once its conversation exists by whatever follows that
+/// agent. OpenCode's TUI has no model flag: the launch creates the session
+/// with its model through OpenCode's server first; if that step didn't
+/// take (no server could be reached), the model is set afterwards, and the
+/// session's log says when it couldn't be.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Deferred {
     pub model: String,
-    /// The first prompt, held back until the model is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
 }
 
 impl Agent {
@@ -205,23 +204,22 @@ impl Agent {
             },
             Agent::OpenCode => {
                 let id = opencode::mint_session_id();
-                let prompt = prompt.map(str::trim).filter(|p| !p.is_empty());
-                // With a model: the prompt waits until the model is set.
-                let deferred = model
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(|m| Deferred {
-                        model: m.to_string(),
-                        prompt: prompt.map(str::to_string),
-                    });
                 Launch {
-                    argv: opencode::launch_argv(&id, prompt.filter(|_| deferred.is_none()), extra),
+                    argv: opencode::launch_argv(&id, project, model, prompt, extra),
                     transcript: Some(opencode::transcript_path(&id)),
                     session_id: Some(id),
-                    deferred,
+                    deferred: self.deferred(model),
                 }
             }
         }
+    }
+
+    /// What must be confirmed after a start with `model` (see `Deferred`).
+    pub fn deferred(self, model: Option<&str>) -> Option<Deferred> {
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        (self == Agent::OpenCode).then(|| Deferred {
+            model: model.to_string(),
+        })
     }
 
     /// Continue conversation `id`: the command, and whether it resumes
@@ -260,11 +258,17 @@ impl Agent {
                 if trust == "scavenged" || !opencode::is_session_id(id) {
                     bail!("refusing to resume a session id rlord didn't choose ({id})");
                 }
-                // The same command continues the session or, when OpenCode
-                // never created it (or it was deleted there), starts it
-                // under that id. (Its model is the session's own by now.)
+                // A session OpenCode has keeps its own model (the user may
+                // have changed it there since): just opened. One it never
+                // created, or that was deleted there, starts under the
+                // same id, created with the launch's model.
                 let resumed = opencode::exists(&opencode::db_path(), id);
-                Ok((opencode::launch_argv(id, None, extra), resumed))
+                let argv = if resumed {
+                    opencode::open_argv(id, None, extra)
+                } else {
+                    opencode::launch_argv(id, project, model, None, extra)
+                };
+                Ok((argv, resumed))
             }
         }
     }
@@ -594,30 +598,40 @@ mod tests {
     }
 
     #[test]
-    fn opencode_mints_its_id_and_takes_its_model_later() {
+    fn opencode_mints_its_id_and_creates_the_session_with_its_model() {
         assert!(Agent::OpenCode.mints_id() && !Agent::OpenCode.uses_hooks());
         let l = Agent::OpenCode.launch("/src/app", Some("hi"), None, &[]);
         let id = l.session_id.clone().expect("minted");
         assert!(opencode::is_session_id(&id));
-        assert_eq!(l.argv, ["opencode", "-s", &id, "--prompt", "hi"]);
+        // Created through OpenCode's server first, then opened.
+        assert_eq!(l.argv[..2], ["sh", "-c"]);
+        assert_eq!(l.argv[3], "opencode");
+        assert_eq!(l.argv[5..], ["-s", id.as_str(), "--prompt", "hi"]);
         assert_eq!(l.deferred, None);
         // Its transcript is that conversation in OpenCode's database.
         let t = l.transcript.unwrap();
         assert_eq!(opencode::locate(&t).map(|(_, i)| i), Some(id.as_str()));
         assert_eq!(agent_of(&t), Agent::OpenCode);
         assert_eq!(Agent::OpenCode.transcript_path("/src/app", &id), Some(t));
-        // With a model: no flag for it, and the prompt waits for it.
+        // With a model: created with it (the prompt still rides along),
+        // and noted for a check afterwards.
         let l = Agent::OpenCode.launch("/src/app", Some("hi"), Some("opencode/x-free"), &[]);
-        assert_eq!(l.argv, ["opencode", "-s", l.session_id.as_deref().unwrap()]);
+        let body: Value = serde_json::from_str(&l.argv[4]).unwrap();
+        assert_eq!(
+            body["model"],
+            json!({"providerID": "opencode", "id": "x-free"})
+        );
+        assert_eq!(l.argv.last().map(String::as_str), Some("hi"));
         assert_eq!(
             l.deferred,
             Some(Deferred {
-                model: "opencode/x-free".into(),
-                prompt: Some("hi".into())
+                model: "opencode/x-free".into()
             })
         );
-        // Resume is the same command; an id rlord didn't mint is refused.
-        let (argv, _) = Agent::OpenCode
+        assert_eq!(Agent::Claude.deferred(Some("opus")), None);
+        // Resuming a session OpenCode doesn't have (here: no database)
+        // starts it under the same id, created with the launch's model.
+        let (argv, resumed) = Agent::OpenCode
             .resume(
                 Some(&id),
                 "minted",
@@ -626,7 +640,12 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(argv, ["opencode", "-s", &id]);
+        if !resumed {
+            assert_eq!(argv[..2], ["sh", "-c"]);
+            assert_eq!(argv[5..], ["-s", id.as_str()]);
+            assert!(argv[4].contains("x-free"));
+        }
+        // An id rlord didn't mint is refused.
         assert!(Agent::OpenCode
             .resume(Some("--standalone"), "minted", "/src/app", None, &[])
             .is_err());
@@ -644,39 +663,6 @@ mod tests {
             Agent::OpenCode.map_hook_event("Stop", &json!({})),
             ("hook_other", Effect::Nothing)
         );
-    }
-
-    #[test]
-    fn resume_needs_a_bound_id() {
-        let (argv, resumed) = Agent::Codex
-            .resume(Some("t-1"), "hook", "/src/app", Some("gpt-6-luna"), &[])
-            .unwrap();
-        assert_eq!(
-            argv,
-            [
-                "codex",
-                "resume",
-                "t-1",
-                "--no-daemon",
-                "--no-alt-screen",
-                "--model",
-                "gpt-6-luna"
-            ]
-        );
-        assert!(resumed);
-        let e = Agent::Codex
-            .resume(None, "minted", "/src/app", None, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("can't") && e.contains("/hooks"), "{e}");
-        assert!(Agent::Claude
-            .resume(None, "minted", "/src/app", None, &[])
-            .is_err());
-        // No transcript for this id: Claude starts it under the same id.
-        let (argv, resumed) = Agent::Claude
-            .resume(Some("u-1"), "minted", "/nonexistent", None, &[])
-            .unwrap();
-        assert_eq!((argv[1].as_str(), resumed), ("--session-id", false));
     }
 
     #[test]

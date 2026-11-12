@@ -70,6 +70,15 @@ impl Service {
         Service::parse(&std::fs::read_to_string(file).ok()?).ok()
     }
 
+    /// `host:port` as a Host header takes it: an IPv6 address in brackets.
+    fn host_header(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
     fn connect(&self, timeout: Duration) -> Result<TcpStream> {
         let addrs = (self.host.as_str(), self.port)
             .to_socket_addrs()
@@ -103,9 +112,9 @@ impl Service {
         let mut stream = self.connect(read_timeout)?;
         let auth = base64(format!("opencode:{}", self.password).as_bytes());
         let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Basic {auth}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {auth}\r\n\
              Accept: {accept}\r\nConnection: close\r\n",
-            self.host, self.port
+            self.host_header()
         );
         let payload = body.map(Value::to_string);
         if let Some(p) = &payload {
@@ -259,20 +268,6 @@ impl Service {
             &format!("/api/session/{id}/model"),
             Some(&serde_json::json!({ "model": model })),
             Duration::from_secs(5),
-        )
-        .map(|_| ())
-    }
-
-    /// Send session `id` a prompt, as if typed.
-    pub fn prompt(&self, id: &str, text: &str) -> Result<()> {
-        if !is_session_id(id) {
-            bail!("not an OpenCode session id");
-        }
-        self.json(
-            "POST",
-            &format!("/api/session/{id}/prompt"),
-            Some(&serde_json::json!({ "text": text })),
-            Duration::from_secs(10),
         )
         .map(|_| ())
     }
@@ -642,7 +637,14 @@ pub fn map_event(v: &Value) -> Option<(String, Signal)> {
             let form = &data["form"];
             return Some((session(form)?, Signal::Asked(id("form", &form["id"])?)));
         }
-        "form.replied" | "form.cancelled" => Signal::Answered(id("form", &data["id"])?),
+        // (As 2.2.7 sends them: `{id, sessionID}`. A form nested as in
+        // `form.created` is read too.)
+        "form.replied" | "form.cancelled" => {
+            let form = &data["form"];
+            let at = if data["id"].is_string() { data } else { form };
+            let owner = session(data).or_else(|| session(form))?;
+            return Some((owner, Signal::Answered(id("form", &at["id"])?)));
+        }
         _ => return None,
     };
     Some((session(data)?, signal))
@@ -665,6 +667,9 @@ mod tests {
         assert!(!format!("{s:?}").contains("s3cret"));
         let s = Service::parse(r#"{"url":"http://[::1]:8080/","password":""}"#).unwrap();
         assert_eq!((s.host.as_str(), s.port), ("::1", 8080));
+        assert_eq!(s.host_header(), "[::1]:8080");
+        let v4 = Service::parse(r#"{"url":"http://localhost:8080","password":""}"#).unwrap();
+        assert_eq!(v4.host_header(), "localhost:8080");
         // Not local, not plain HTTP, or not there: nothing to connect to.
         for bad in [
             r#"{"url":"http://example.com:80","password":"x"}"#,
@@ -860,6 +865,14 @@ mod tests {
                 Some((s.into(), Signal::Answered("form:frm_1".into())))
             );
         }
+        // The same, had the form come nested as `form.created`'s does.
+        assert_eq!(
+            map_event(&ev(
+                "form.cancelled",
+                json!({"form": {"id": "frm_2", "sessionID": s}})
+            )),
+            Some((s.into(), Signal::Answered("form:frm_2".into())))
+        );
         // A prompt the user sent; not other things queued for the session.
         let inbox = |ty: &str| {
             map_event(&ev(

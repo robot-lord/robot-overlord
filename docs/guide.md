@@ -180,10 +180,14 @@ Good to know:
 - OpenCode's screen is full-screen, so **tmux has no scrollback for it**:
   scroll inside OpenCode. rlord's search and history read OpenCode's own
   database instead.
-- A model you pick is set through the server once the session exists
-  (OpenCode's screen takes no model flag), and a first prompt waits for
-  it, 20 seconds at most: then the prompt is sent on OpenCode's default
-  model, and the session's log (`rlord log`) says the model wasn't applied.
+- OpenCode's screen takes no model flag and creates a session only with
+  its first message, so rlord creates the session first (through
+  OpenCode's own `opencode api`), with the model you picked, and then
+  opens the screen on it. If that step fails, the session still starts, on
+  OpenCode's default model; rlord then sets the model once it can, and the
+  session's log (`rlord log`) says so, or says that it couldn't.
+- Resuming keeps the model the conversation has in OpenCode (you may have
+  changed it there), not the one it was launched with.
 - rlord follows the conversation it launched. A new session or tab you
   open inside OpenCode's screen isn't followed.
 - A turn runs in the server: closing the screen stops the rlord session,

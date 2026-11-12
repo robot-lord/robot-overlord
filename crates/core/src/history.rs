@@ -110,6 +110,9 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
     };
     let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut out = Vec::new();
+    // OpenCode's database, opened once however many of its sessions are
+    // searched.
+    let mut stores: std::collections::HashMap<&Path, Option<opencode::Store>> = Default::default();
     for path in paths {
         let format = Format::of(path);
         let mut fh = FileHits {
@@ -120,7 +123,13 @@ pub fn search(paths: &[PathBuf], query: &str, per_file: usize) -> Vec<FileHits> 
         if let Some((db, id)) = opencode::locate(path) {
             // (SQLite's LIKE ignores case for ASCII only.)
             let key = key.as_deref().filter(|k| k.is_ascii());
-            let (hits, total) = opencode::search(db, id, &ws, key, per_file);
+            let store = stores
+                .entry(db)
+                .or_insert_with(|| opencode::Store::open(db));
+            let (hits, total) = match store {
+                Some(store) => store.search(id, &ws, key, per_file),
+                None => (Vec::new(), 0),
+            };
             if total > 0 {
                 fh.total = total;
                 fh.hits = hits

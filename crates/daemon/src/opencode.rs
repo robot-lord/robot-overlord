@@ -12,9 +12,12 @@
 //! - **Resync** after every (re)connect, since the stream has no replay:
 //!   each session's turn state from OpenCode's own session row, and what it
 //!   waits on from the server.
-//! - **Without the server** (not running, or unreachable): working / your
-//!   turn from the session rows alone, every tick. "Needs you" can't be
-//!   seen that way.
+//! - **Without the server**: the session rows alone, every tick, and only
+//!   for what they can still say. A session that was starting is up. A
+//!   turn can't be running once the server is gone (turns run in it), so
+//!   a session still marked working then becomes your turn; while the
+//!   server may only be out of reach for a moment, nothing is concluded.
+//!   "Needs you" can't be seen that way.
 //! - **Stopped** is the pane: the TUI exited (two looks in a row, as
 //!   `discover` does). The turn itself lives in the server and may go on
 //!   after the TUI is closed; rlord shows the session, which is stopped.
@@ -23,11 +26,12 @@
 //! no reads. Nothing is written unless something changed. "Updated" times
 //! move only on a prompt the user sent and on a turn's end.
 //!
-//! This task also applies what a launch couldn't put on the command line
-//! (`agents::Deferred`: the model, then the first prompt), once OpenCode
-//! has the session. The prompt is never dropped: if the model can't be set
-//! in time (`DEFERRED_WAIT`), the prompt is sent anyway, on the default
-//! model, and the session's log says the model wasn't applied.
+//! This task also confirms what a launch asked for beyond the command
+//! line (`agents::Deferred`: the model). The launch creates the session
+//! with its model before opening the TUI; if that didn't take, the model
+//! is set here once the session exists, and when it can't be in time
+//! (`DEFERRED_WAIT_MS`) the session's log says it wasn't applied. The first
+//! prompt always rides on the command line: nothing here can lose it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -38,7 +42,7 @@ use serde_json::json;
 
 use rlord_core::agents::opencode::{self, Turn};
 use rlord_core::agents::opencode_service::{map_event, Events, Service, Signal, EVENT_TYPES};
-use rlord_core::agents::{Agent, Deferred};
+use rlord_core::agents::Agent;
 use rlord_core::db::Db;
 use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
@@ -50,7 +54,7 @@ const TICK: Duration = Duration::from_secs(3);
 /// The longest wait between attempts to reach the server.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// How long a held-back first prompt waits for its model to be set.
+/// How long a launch's model may take to be confirmed or set.
 const DEFERRED_WAIT_MS: i64 = 20_000;
 
 /// Where a launch's `Deferred` waits until OpenCode has the session.
@@ -70,8 +74,10 @@ struct Follower {
     /// How many ticks in a row each session's pane has looked gone.
     gone: HashMap<String, u8>,
     /// OpenCode sessions' parents, as looked up (a sub-agent's session
-    /// asks permission under its own id).
+    /// asks permission under its own id). Only definite answers.
     parents: HashMap<String, Option<String>>,
+    /// Attempts to reach the server that failed, in a row.
+    failed: u8,
 }
 
 /// Start the follower.
@@ -85,6 +91,7 @@ pub fn start(d: &Arc<Daemon>) {
             blocked: HashMap::new(),
             gone: HashMap::new(),
             parents: HashMap::new(),
+            failed: 0,
         };
         loop {
             let began = Instant::now();
@@ -135,13 +142,15 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
             Ok((svc, events)) => {
                 tracing::debug!(server = ?svc, "following OpenCode's events");
                 f.backoff = Duration::from_secs(1);
-                changed |= settle_all(d, Some(&svc), &up, &mut f.blocked)?;
+                f.failed = 0;
+                changed |= settle_all(d, With::Server(&svc), &up, &mut f.blocked)?;
                 f.link = Some((svc, events));
             }
             Err(e) => {
                 tracing::debug!(error = %format!("{e:#}"), "OpenCode's server not reachable");
                 f.retry_at = Instant::now() + f.backoff;
                 f.backoff = (f.backoff * 2).min(MAX_BACKOFF);
+                f.failed = f.failed.saturating_add(1);
             }
         }
     }
@@ -156,7 +165,8 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
                 .filter(|s| s.status == Status::Starting)
                 .collect();
             if !starting.is_empty() {
-                changed |= settle_all(d, None, &starting, &mut f.blocked)?;
+                let rows = With::Rows { server_gone: false };
+                changed |= settle_all(d, rows, &starting, &mut f.blocked)?;
             }
             if changed {
                 d.changed();
@@ -185,7 +195,12 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         }
         None => {
             changed |= apply_deferred(d, None, &up)?;
-            changed |= settle_all(d, None, &up, &mut f.blocked)?;
+            // Gone, not merely out of reach for a moment (a stream that
+            // just broke): it didn't answer twice running.
+            let rows = With::Rows {
+                server_gone: f.failed >= 2,
+            };
+            changed |= settle_all(d, rows, &up, &mut f.blocked)?;
             if changed {
                 d.changed();
             }
@@ -336,28 +351,70 @@ fn apply(db: &Db, blocked: &mut Blocked, s: &Session, signal: &Signal) -> Result
 /// request or question may come from a sub-agent's child session: those
 /// are followed up to the session rlord launched.
 fn owner(d: &Daemon, f: &mut Follower, id: &str, via_parents: bool) -> Result<Option<Session>> {
+    let store = opencode::db_path();
+    let mut found = None;
+    let mut failed = None;
+    climb(
+        &mut f.parents,
+        id,
+        via_parents,
+        |id| match d.db().session_by_agent_session(id) {
+            Ok(s) => {
+                found = s;
+                found.is_some()
+            }
+            Err(e) => {
+                failed = Some(e);
+                true // (stop: nothing can be told)
+            }
+        },
+        |id| opencode::parent(&store, id),
+    );
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(found),
+    }
+}
+
+/// Walk from OpenCode session `id` up its parents until `ours` says one is
+/// rlord's (true: found, or stop). `parent` answers `Some(Some(p))`,
+/// `Some(None)` (it has none) or `None` (couldn't be told). Only definite
+/// answers are remembered in `cache`: a parent that couldn't be read is
+/// asked for again next time, never taken as "no parent".
+fn climb(
+    cache: &mut HashMap<String, Option<String>>,
+    id: &str,
+    via_parents: bool,
+    mut ours: impl FnMut(&str) -> bool,
+    parent: impl Fn(&str) -> Option<Option<String>>,
+) -> bool {
     let mut id = id.to_string();
     for _ in 0..6 {
-        if let Some(s) = d.db().session_by_agent_session(&id)? {
-            return Ok(Some(s));
+        if ours(&id) {
+            return true;
         }
         if !via_parents {
-            return Ok(None);
+            return false;
         }
-        if f.parents.len() > 2000 {
-            f.parents.clear();
+        if cache.len() > 2000 {
+            cache.clear();
         }
-        let parent = f
-            .parents
-            .entry(id.clone())
-            .or_insert_with(|| opencode::parent(&opencode::db_path(), &id))
-            .clone();
-        match parent {
+        let up = match cache.get(&id) {
+            Some(known) => known.clone(),
+            None => match parent(&id) {
+                Some(answer) => {
+                    cache.insert(id.clone(), answer.clone());
+                    answer
+                }
+                None => return false,
+            },
+        };
+        match up {
             Some(p) => id = p,
-            None => return Ok(None),
+            None => return false,
         }
     }
-    Ok(None)
+    false
 }
 
 fn on_signal(
@@ -378,40 +435,77 @@ fn on_signal(
     Ok(changed)
 }
 
-/// The status a session should be in, from its turn state and (when the
-/// server could be asked) whether it waits on the user; None when that is
-/// where it is. Without the server, a session that needs you and is still
-/// mid-turn is left alone: what it waits on can't be seen.
-fn settle(cur: Status, turn: Turn, pending: Option<bool>) -> Option<Status> {
-    let want = match (pending, turn.working()) {
-        (Some(true), _) => Status::WaitingInput,
-        (None, true) if cur == Status::WaitingInput => return None,
-        (_, true) => Status::Working,
+/// What a resync has to go on.
+#[derive(Clone, Copy)]
+enum With<'a> {
+    /// The server, just (re)connected: what each session waits on is asked.
+    Server(&'a Service),
+    /// OpenCode's session rows alone. `server_gone`: the server didn't
+    /// answer repeatedly (not merely a stream that just broke).
+    Rows { server_gone: bool },
+}
+
+/// What is known about a session at a resync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// The server answered: whether the session waits on the user.
+    Pending(bool),
+    /// Rows only, the server possibly still there.
+    Rows,
+    /// Rows only, and the server is gone.
+    ServerGone,
+}
+
+/// The status a session should be in, from its turn state and what is
+/// known; None when that is where it is, or when nothing can be concluded.
+///
+/// With the server's answer, the rows and the answer decide. Without it,
+/// only what the rows can still say: a turn that ended is your turn; a
+/// turn the rows call running is believed only for a session that was
+/// starting, and is over when the server is gone (turns run in it, so a
+/// server that died mid-turn leaves the row "busy" for good).
+fn settle(cur: Status, turn: Turn, seen: Seen) -> Option<Status> {
+    let want = match (seen, turn.working()) {
+        (Seen::Pending(true), _) => Status::WaitingInput,
+        (Seen::Pending(false), true) => Status::Working,
         (_, false) => Status::Idle,
+        (Seen::ServerGone, true) => Status::Idle,
+        (Seen::Rows, true) if cur == Status::Starting => Status::Working,
+        (Seen::Rows, true) => return None,
     };
     (want != cur).then_some(want)
 }
 
+/// How long a session may be "starting" with no row in OpenCode before it
+/// is taken as up anyway (its screen is: the pane is alive).
+const STARTING_MS: i64 = 10_000;
+
+/// What `id` and the sub-agent sessions under it wait on the user for
+/// (None: the server couldn't say for all of them).
+fn pending_under(svc: &Service, store: &std::path::Path, id: &str) -> Option<Vec<String>> {
+    let mut all = svc.pending(id)?;
+    for child in opencode::descendants(store, id) {
+        all.extend(svc.pending(&child)?);
+    }
+    Some(all)
+}
+
 /// Bring every session in line with OpenCode's own record: after a
-/// (re)connect (`svc`: what each waits on is asked too), and every tick
-/// while there is no server. The reads happen without the DB lock.
-fn settle_all(
-    d: &Daemon,
-    svc: Option<&Service>,
-    up: &[&Session],
-    blocked: &mut Blocked,
-) -> Result<bool> {
+/// (re)connect (what each session, and the sub-agent sessions under it,
+/// waits on is asked too), and every tick while there is no server. The
+/// reads happen without the DB lock.
+fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) -> Result<bool> {
     let store = opencode::db_path();
     let mut changed = false;
     for s in up {
         let Some(id) = s.agent_session.as_deref() else {
             continue;
         };
-        // (No row: OpenCode hasn't created the session yet.)
-        let Some(turn) = opencode::turn(&store, id) else {
-            continue;
+        let turn = opencode::turn(&store, id);
+        let pending = match with {
+            With::Server(svc) if turn.is_some() => pending_under(svc, &store, id),
+            _ => None,
         };
-        let pending = svc.and_then(|svc| svc.pending(id));
         if let Some(p) = &pending {
             if p.is_empty() {
                 blocked.remove(&s.id);
@@ -419,7 +513,23 @@ fn settle_all(
                 blocked.insert(s.id.clone(), p.iter().cloned().collect());
             }
         }
-        let Some(want) = settle(s.status, turn, pending.as_ref().map(|p| !p.is_empty())) else {
+        let seen = match (&pending, with) {
+            (Some(p), _) => Seen::Pending(!p.is_empty()),
+            (None, With::Rows { server_gone: true }) => Seen::ServerGone,
+            (None, _) => Seen::Rows,
+        };
+        let now = now_ms();
+        let want = match turn {
+            Some(turn) => settle(s.status, turn, seen),
+            // No row: OpenCode hasn't created the session (the launch's
+            // create step didn't take; the TUI creates it with the first
+            // message). After a while it is simply up.
+            None => {
+                let since = s.last_state_change_at.unwrap_or(s.created_at);
+                (s.status == Status::Starting && now - since > STARTING_MS).then_some(Status::Idle)
+            }
+        };
+        let Some(want) = want else {
             continue;
         };
         let db = d.db();
@@ -427,44 +537,59 @@ fn settle_all(
         if db.resolve_ref(&s.id)?.status != s.status {
             continue;
         }
-        let now = now_ms();
         db.set_status(&s.id, want, now)?;
+        let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
-        let kind = match want {
+        let (kind, from) = match want {
             Status::Working => {
-                db.touch_last_user_msg(&s.id, turn.busy.unwrap_or(now))?;
-                "prompt_submitted"
+                let busy = turn.and_then(|t| t.busy).unwrap_or(now);
+                db.touch_last_user_msg(&s.id, busy)?;
+                ("prompt_submitted", "opencode session")
             }
-            Status::WaitingInput => "permission_request",
+            Status::WaitingInput => ("permission_request", "opencode session"),
             // Just (re)started, and no turn running: it is up.
-            _ if s.status == Status::Starting => "session_start",
-            _ => {
-                db.touch_last_agent_msg(&s.id, turn.idle.unwrap_or(now))?;
-                "agent_stopped"
+            _ if s.status == Status::Starting => ("session_start", "opencode session"),
+            _ if ended => {
+                let idle = turn.and_then(|t| t.idle).unwrap_or(now);
+                db.touch_last_agent_msg(&s.id, idle)?;
+                ("agent_stopped", "opencode session")
             }
+            // Its turn never ended: the server it ran in is gone. Not a
+            // reply, so "updated" doesn't move.
+            _ => ("agent_stopped", "opencode server gone"),
         };
-        db.insert_event(&s.id, now, kind, r#"{"from":"opencode session"}"#)?;
+        db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
         changed = true;
     }
     Ok(changed)
 }
 
-/// Apply what the launch held back (the model, then the first prompt) to
-/// each session OpenCode now has. Once: the record is removed whether or
-/// not the server took the model (one it doesn't know is logged, not
-/// retried), and the prompt is sent either way.
+/// Confirm each launch's model (see `Deferred`), once:
 ///
-/// When OpenCode's server can't be reached, or still has no such session,
-/// `DEFERRED_WAIT_MS` after the launch: the wait is over. The prompt is
-/// typed into the session's screen instead (it runs on OpenCode's default
-/// model), and the session's log says the model wasn't applied.
-fn apply_deferred(d: &Daemon, svc: Option<&Service>, up: &[&Session]) -> Result<bool> {
+/// - the session has it (the launch's create step took): done, silently;
+/// - OpenCode has the session on another model: set it now, and say in
+///   the session's log that a first prompt may have run before that;
+/// - neither within `DEFERRED_WAIT_MS` of the launch (no server, or no
+///   such session): the log says the model wasn't applied.
+///
+/// `linked`: the server the event stream is on; without one, the server
+/// `service.json` names is tried (it may be up before the stream is).
+fn apply_deferred(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Result<bool> {
     let waiting: Vec<(&Session, String)> = {
         let db = d.db();
         up.iter()
             .filter_map(|s| Some((*s, db.kv_get(&deferred_key(&s.id)).ok()??)))
             .collect()
     };
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let store = opencode::db_path();
+    let read = match linked {
+        Some(_) => None,
+        None => Service::read(&opencode::service_file()),
+    };
+    let svc = linked.or(read.as_ref());
     let mut changed = false;
     for (s, raw) in waiting {
         let Some(id) = s.agent_session.as_deref() else {
@@ -472,93 +597,72 @@ fn apply_deferred(d: &Daemon, svc: Option<&Service>, up: &[&Session]) -> Result<
         };
         let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
         let late = now_ms() - held["at"].as_i64().unwrap_or(0) > DEFERRED_WAIT_MS;
-        let there = svc.and_then(|svc| svc.has_session(id));
-        let outcome = match (serde_json::from_value::<Deferred>(held), svc, there) {
-            (Err(e), _, _) => json!({"error": e.to_string()}),
-            (Ok(def), Some(svc), Some(true)) => {
-                let model = match opencode::model_ref(&def.model) {
-                    Some(m) => svc.set_model(id, &m).map_err(|e| format!("{e:#}")),
-                    None => Err("not a provider/model name".to_string()),
-                };
-                // (Whatever became of the model: the prompt goes.)
-                let sent = def
-                    .prompt
-                    .as_deref()
-                    .map(|p| svc.prompt(id, p).map_err(|e| format!("{e:#}")));
-                let typed = match (&sent, def.prompt.as_deref()) {
-                    (Some(Err(_)), Some(p)) => Some(type_prompt(s, p)),
-                    _ => None,
-                };
-                deferred_outcome(&def, model.err(), sent.map(|r| r.is_ok()), typed)
-            }
-            (Ok(def), _, _) if late => {
-                let why = match there {
-                    Some(false) => "OpenCode hasn't created the session",
-                    _ => "OpenCode's server couldn't be reached",
-                };
-                let typed = def.prompt.as_deref().map(|p| type_prompt(s, p));
-                deferred_outcome(&def, Some(format!("{why} in time")), None, typed)
-            }
-            // Not created yet, or the server can't say: later.
-            _ => continue,
+        let model = held["model"].as_str().unwrap_or("").to_string();
+        let has = opencode::session_model(&store, id);
+        let outcome = match deferred_step(&model, has.as_deref(), late) {
+            Deferred::Wait => continue,
+            Deferred::Done => None,
+            Deferred::Note(why) => Some(not_applied(&model, &why)),
+            Deferred::Set(wanted) => match svc.map(|svc| (svc.has_session(id), svc)) {
+                Some((Some(true), svc)) => Some(match svc.set_model(id, &wanted) {
+                    Ok(()) => json!({"model": model, "note": "the model was set after the \
+                        session started: a first prompt may have run on OpenCode's default"}),
+                    Err(e) => not_applied(&model, &format!("{e:#}")),
+                }),
+                _ if late => Some(not_applied(
+                    &model,
+                    match svc {
+                        Some(_) => "OpenCode hasn't created the session in time",
+                        None => "OpenCode's server couldn't be reached in time",
+                    },
+                )),
+                _ => continue,
+            },
         };
         let db = d.db();
         db.kv_delete(&deferred_key(&s.id))?;
-        db.insert_event(&s.id, now_ms(), "launch_applied", &outcome.to_string())?;
-        if outcome["note"].is_string() || outcome["error"].is_string() {
-            tracing::warn!(session = %s.id, outcome = %outcome, "applying an OpenCode launch");
+        if let Some(outcome) = outcome {
+            db.insert_event(&s.id, now_ms(), "launch_applied", &outcome.to_string())?;
+            tracing::warn!(session = %s.id, outcome = %outcome, "an OpenCode launch's model");
+            changed = true;
         }
-        changed = true;
     }
     Ok(changed)
 }
 
-/// Type a prompt into a session's screen and send it: the last way to
-/// deliver a first prompt. Whether it went.
-fn type_prompt(s: &Session, prompt: &str) -> bool {
-    let Some(t) = s.tmux_session.as_deref() else {
-        return false;
-    };
-    let typed = tmux::paste(t, prompt).and_then(|_| {
-        // (The screen takes the paste in before the key.)
-        std::thread::sleep(Duration::from_millis(300));
-        tmux::send_keys(t, &["Enter"])
-    });
-    typed.is_ok()
+/// What to do about a launch's model.
+#[derive(Debug, PartialEq)]
+enum Deferred {
+    /// The session has it.
+    Done,
+    /// Set it through the server (if the session is there).
+    Set(serde_json::Value),
+    /// Nothing can be done: say why in the session's log.
+    Note(String),
+    /// The session isn't there yet: look again.
+    Wait,
 }
 
-/// What became of a held-back launch, for the session's log. `note` says,
-/// in words, anything the user should know: the model that wasn't applied,
-/// a prompt that couldn't be delivered (its text is kept in the log).
-fn deferred_outcome(
-    def: &Deferred,
-    model_error: Option<String>,
-    sent: Option<bool>,
-    typed: Option<bool>,
-) -> serde_json::Value {
-    let delivered = sent == Some(true) || typed == Some(true);
-    let mut notes: Vec<String> = Vec::new();
-    if let Some(e) = &model_error {
-        notes.push(format!(
-            "the model {} wasn't applied ({e}): this session runs on OpenCode's default model",
-            def.model
-        ));
+/// `model`: what the launch asked for; `has`: the model on the session's
+/// row (None: no such session yet, or no model on it).
+fn deferred_step(model: &str, has: Option<&str>, late: bool) -> Deferred {
+    let Some(wanted) = opencode::model_ref(model) else {
+        return Deferred::Note("not a provider/model name".to_string());
+    };
+    // (Compared without the variant: the row doesn't keep it.)
+    let name = opencode::model_name(&wanted);
+    match has {
+        Some(has) if Some(has) == name.as_deref() => Deferred::Done,
+        None if !late => Deferred::Wait,
+        _ => Deferred::Set(wanted),
     }
-    let mut v = json!({"model": def.model, "model_error": model_error});
-    if let Some(p) = &def.prompt {
-        v["prompt_sent"] = json!(sent.unwrap_or(false));
-        if let Some(t) = typed {
-            v["prompt_typed"] = json!(t);
-        }
-        if !delivered {
-            notes.push("the first prompt couldn't be delivered: send it yourself".to_string());
-            v["prompt"] = json!(p);
-        }
-    }
-    if !notes.is_empty() {
-        v["note"] = json!(notes.join("; "));
-    }
-    v
+}
+
+/// The log entry for a model that wasn't applied.
+fn not_applied(model: &str, why: &str) -> serde_json::Value {
+    json!({"model": model, "model_error": why,
+           "note": format!("the model {model} wasn't applied ({why}): this session runs on \
+                            OpenCode's default model")})
 }
 
 #[cfg(test)]
@@ -662,65 +766,119 @@ mod tests {
             turn(Some(20), Some(30)),
             turn(None, None),
         );
+        let (yes, no) = (Seen::Pending(true), Seen::Pending(false));
         // The session exists, nothing asked yet: your turn.
-        assert_eq!(settle(Starting, none, Some(false)), Some(Idle));
-        assert_eq!(settle(Starting, turn(Some(5), None), None), Some(Working));
-        assert_eq!(settle(Idle, running, Some(false)), Some(Working));
-        assert_eq!(settle(Working, over, Some(false)), Some(Idle));
-        assert_eq!(settle(Working, running, Some(false)), None);
-        assert_eq!(settle(Idle, over, None), None);
+        assert_eq!(settle(Starting, none, no), Some(Idle));
+        assert_eq!(settle(Idle, running, no), Some(Working));
+        assert_eq!(settle(Working, over, no), Some(Idle));
+        assert_eq!(settle(Working, running, no), None);
         // Something is waiting on the user, as the server says.
-        assert_eq!(settle(Working, running, Some(true)), Some(WaitingInput));
-        assert_eq!(settle(WaitingInput, running, Some(true)), None);
+        assert_eq!(settle(Working, running, yes), Some(WaitingInput));
+        assert_eq!(settle(WaitingInput, running, yes), None);
         // It was answered while rlord wasn't listening.
-        assert_eq!(settle(WaitingInput, running, Some(false)), Some(Working));
-        // Without the server: a waiting session mid-turn is left alone,
-        // but a turn that ended can't be waiting.
-        assert_eq!(settle(WaitingInput, running, None), None);
-        assert_eq!(settle(WaitingInput, over, None), Some(Idle));
+        assert_eq!(settle(WaitingInput, running, no), Some(Working));
     }
 
     #[test]
-    fn a_held_back_prompt_is_never_dropped_silently() {
-        let def = Deferred {
-            model: "opencode/x-free".into(),
-            prompt: Some("fix it".into()),
+    fn rows_alone_say_less_and_a_dead_server_ends_its_turns() {
+        let (running, over) = (
+            Turn {
+                busy: Some(20),
+                idle: Some(10),
+            },
+            Turn {
+                busy: Some(20),
+                idle: Some(30),
+            },
+        );
+        // A turn that ended is your turn, whoever says so.
+        assert_eq!(settle(Working, over, Seen::Rows), Some(Idle));
+        assert_eq!(settle(WaitingInput, over, Seen::Rows), Some(Idle));
+        assert_eq!(settle(Idle, over, Seen::Rows), None);
+        // A session that was starting is believed mid-turn (launched with
+        // a prompt); otherwise a "busy" row concludes nothing while the
+        // server may only be out of reach.
+        assert_eq!(settle(Starting, running, Seen::Rows), Some(Working));
+        assert_eq!(settle(Idle, running, Seen::Rows), None);
+        assert_eq!(settle(Working, running, Seen::Rows), None);
+        assert_eq!(settle(WaitingInput, running, Seen::Rows), None);
+        // The server is gone: no turn is running, whatever its row says.
+        assert_eq!(settle(Working, running, Seen::ServerGone), Some(Idle));
+        assert_eq!(settle(WaitingInput, running, Seen::ServerGone), Some(Idle));
+        assert_eq!(settle(Starting, running, Seen::ServerGone), Some(Idle));
+        assert_eq!(settle(Idle, running, Seen::ServerGone), None);
+    }
+
+    #[test]
+    fn only_a_definite_parent_is_remembered() {
+        use std::cell::{Cell, RefCell};
+        let ours = |id: &str| id == "ses_root";
+        let mut cache = HashMap::new();
+        // The database can't be read just now: not found, nothing cached.
+        let asked = Cell::new(0);
+        let unreadable = |_: &str| {
+            asked.set(asked.get() + 1);
+            None
         };
-        // All well: nothing to tell.
-        let v = deferred_outcome(&def, None, Some(true), None);
-        assert_eq!(v["prompt_sent"], true);
-        assert!(v["note"].is_null() && v["prompt"].is_null());
-        // The model wasn't taken; the prompt went anyway, and the log says
-        // what it runs on.
-        let v = deferred_outcome(&def, Some("404 no such model".into()), Some(true), None);
+        assert!(!climb(&mut cache, "ses_child", true, ours, unreadable));
+        assert!(cache.is_empty());
+        // Readable again: found through its parent, and remembered.
+        let tree = |id: &str| {
+            asked.set(asked.get() + 1);
+            match id {
+                "ses_grandchild" => Some(Some("ses_child".to_string())),
+                "ses_child" => Some(Some("ses_root".to_string())),
+                "ses_other" => Some(None),
+                _ => None,
+            }
+        };
+        assert!(climb(&mut cache, "ses_grandchild", true, ours, tree));
+        assert_eq!(cache.len(), 2);
+        let before = asked.get();
+        assert!(climb(&mut cache, "ses_grandchild", true, ours, tree));
+        assert_eq!(asked.get(), before, "answered from memory");
+        // Someone else's session: a definite "no parent" is remembered too.
+        assert!(!climb(&mut cache, "ses_other", true, ours, tree));
+        assert_eq!(cache.get("ses_other"), Some(&None));
+        // Events that aren't prompts never climb.
+        let seen = RefCell::new(Vec::new());
+        let note = |id: &str| {
+            seen.borrow_mut().push(id.to_string());
+            false
+        };
+        assert!(!climb(&mut cache, "ses_child", false, note, tree));
+        assert_eq!(*seen.borrow(), ["ses_child"]);
+    }
+
+    #[test]
+    fn a_launchs_model_is_confirmed_set_or_reported() {
+        let want = "opencode/x-free";
+        // The launch created the session with it: nothing to do or say.
+        assert_eq!(
+            deferred_step(want, Some("opencode/x-free"), false),
+            Deferred::Done
+        );
+        assert_eq!(
+            deferred_step("opencode/x-free#high", Some(want), true),
+            Deferred::Done
+        );
+        // The session is there on another model: set it.
+        let set = Deferred::Set(json!({"providerID": "opencode", "id": "x-free"}));
+        assert_eq!(deferred_step(want, Some("opencode/default"), false), set);
+        // Not there yet: wait; past the wait, one last try (the server may
+        // have it though its row can't be read), else it is reported.
+        assert_eq!(deferred_step(want, None, false), Deferred::Wait);
+        assert_eq!(deferred_step(want, None, true), set);
+        assert!(matches!(
+            deferred_step("opus", None, false),
+            Deferred::Note(_)
+        ));
+        let v = not_applied(want, "OpenCode's server couldn't be reached in time");
         let note = v["note"].as_str().unwrap();
         assert!(
-            note.contains("opencode/x-free") && note.contains("default model"),
+            note.contains(want) && note.contains("default model"),
             "{note}"
         );
-        assert!(!note.contains("couldn't be delivered"));
-        // No server in time: typed into the screen instead.
-        let late = Some("OpenCode's server couldn't be reached in time".to_string());
-        let v = deferred_outcome(&def, late.clone(), None, Some(true));
-        assert_eq!(
-            (&v["prompt_sent"], &v["prompt_typed"]),
-            (&json!(false), &json!(true))
-        );
-        assert!(v["prompt"].is_null());
-        // Not even that: the log keeps the prompt and says so.
-        let v = deferred_outcome(&def, late, None, Some(false));
-        assert_eq!(v["prompt"], "fix it");
-        assert!(v["note"]
-            .as_str()
-            .unwrap()
-            .contains("couldn't be delivered"));
-        // A model alone: only the model's fate.
-        let only = Deferred {
-            model: "opencode/x-free".into(),
-            prompt: None,
-        };
-        let v = deferred_outcome(&only, None, None, None);
-        assert!(v["prompt_sent"].is_null() && v["note"].is_null());
     }
 
     fn db_with(id: &str, agent: &str, conversation: &str) -> Db {

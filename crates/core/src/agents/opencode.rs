@@ -8,7 +8,9 @@
 //!   from the server's event stream (`opencode_service`, read by the
 //!   daemon's `opencode` task).
 //! - **rlord chooses the conversation id**: `opencode -s <ses_…>` continues
-//!   that session, or creates it. Resume is the same command.
+//!   that session. The TUI creates a session only with its first message
+//!   (and has no model flag), so a launch first creates it through the
+//!   server, with its model (`launch_argv`), and then opens the TUI on it.
 //! - **Conversations are rows in OpenCode's SQLite database**, not files. A
 //!   session's "transcript path" in rlord is `<opencode.db>/<session id>`:
 //!   not a file, but it names the store and the conversation, so the rest
@@ -87,17 +89,58 @@ pub fn is_session_id(id: &str) -> bool {
 
 // ---- commands ----
 
+/// What the pane's shell runs for a launch: create the session through the
+/// server (`$0 api POST /api/session -d $1`: OpenCode's own client, which
+/// knows how to reach the server), then become the TUI on it. Whatever
+/// the first step does, the TUI starts.
+const CREATE_THEN_OPEN: &str =
+    r#""$0" api POST /api/session -d "$1" </dev/null >/dev/null 2>&1; shift; exec "$0" "$@""#;
+
 /// `opencode -s <id> [--prompt <text>]`: the full TUI, on the shared
 /// background server (never `--standalone`: its events are what rlord
-/// reads status from). The TUI takes no model flag: a model is set through
-/// the server once the session exists (`Deferred`).
-pub fn launch_argv(id: &str, prompt: Option<&str>, extra: &[String]) -> Vec<String> {
+/// reads status from).
+pub fn open_argv(id: &str, prompt: Option<&str>, extra: &[String]) -> Vec<String> {
     let mut argv = vec!["opencode".to_string(), "-s".to_string(), id.to_string()];
     argv.extend(extra.iter().cloned());
     if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
         argv.push("--prompt".to_string());
         argv.push(p.to_string());
     }
+    argv
+}
+
+/// What `POST /api/session` takes to create session `id` in `dir`, on
+/// `model` when one is named (and is a `provider/model` name).
+pub fn create_body(id: &str, dir: &str, model: Option<&str>) -> Value {
+    let mut body = serde_json::json!({"id": id, "location": {"directory": dir}});
+    if let Some(m) = model.and_then(model_ref) {
+        body["model"] = m;
+    }
+    body
+}
+
+/// A new conversation: the session is created first, then the TUI opened
+/// on it (`open_argv`), in one pane command:
+/// `sh -c '<create, then exec>' opencode <create body> -s <id> …`.
+///
+/// Why not the TUI alone: checked against OpenCode 2.2.7, `opencode -s
+/// <new id>` creates nothing until the first message, takes no model, and
+/// doesn't notice a session created under that id afterwards. Created
+/// first, the session exists from the start (so rlord can show it idle)
+/// and has its model before any prompt runs. Creating is idempotent: an
+/// existing session is returned as it is.
+pub fn launch_argv(
+    id: &str,
+    dir: &str,
+    model: Option<&str>,
+    prompt: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["sh".into(), "-c".into(), CREATE_THEN_OPEN.into()];
+    let open = open_argv(id, prompt, extra);
+    argv.push(open[0].clone());
+    argv.push(create_body(id, dir, model).to_string());
+    argv.extend(open[1..].iter().cloned());
     argv
 }
 
@@ -120,7 +163,7 @@ pub fn model_ref(model: &str) -> Option<Value> {
 }
 
 /// A model as rlord shows it: `provider/model` (from `{providerID, id}`).
-fn model_name(m: &Value) -> Option<String> {
+pub fn model_name(m: &Value) -> Option<String> {
     Some(format!(
         "{}/{}",
         m["providerID"].as_str().filter(|p| !p.is_empty())?,
@@ -168,27 +211,58 @@ pub fn parse_models(out: &str) -> Vec<String> {
         .collect()
 }
 
-type Listed = Option<(Instant, Vec<String>)>;
-static MODELS: std::sync::Mutex<Listed> = std::sync::Mutex::new(None);
+/// The model list, and when each way of getting it was last tried.
+#[derive(Default)]
+struct Listing {
+    models: Vec<String>,
+    /// A list was last stored.
+    listed: Option<Instant>,
+    /// The server / the command was last asked, whatever it answered: a
+    /// way that failed isn't tried again until the same time has passed.
+    server_tried: Option<Instant>,
+    command_tried: Option<Instant>,
+}
 
-/// How long a model list is taken as current.
+static MODELS: std::sync::Mutex<Listing> = std::sync::Mutex::new(Listing {
+    models: Vec::new(),
+    listed: None,
+    server_tried: None,
+    command_tried: None,
+});
+
+/// How long a model list (or a failed attempt at one) is taken as current.
 const MODELS_FOR: Duration = Duration::from_secs(600);
 
 /// The models OpenCode offers, as last listed (`list_models`). Starts
 /// nothing: safe under a lock. Empty until listed: the model is typed in.
 pub fn models() -> Vec<String> {
-    MODELS
-        .lock()
-        .ok()
-        .and_then(|m| m.as_ref().map(|(_, v)| v.clone()))
-        .unwrap_or_default()
+    MODELS.lock().map(|m| m.models.clone()).unwrap_or_default()
 }
 
-fn models_fresh() -> bool {
-    MODELS.lock().ok().is_some_and(|m| {
-        m.as_ref()
-            .is_some_and(|(at, v)| !v.is_empty() && at.elapsed() < MODELS_FOR)
-    })
+fn recent(at: Option<Instant>) -> bool {
+    at.is_some_and(|t| t.elapsed() < MODELS_FOR)
+}
+
+/// Which ways to try now, each marked as tried: (the server, the command).
+/// Neither while a list is current; each at most once per `MODELS_FOR`,
+/// so a server that doesn't answer costs its wait once, not on every call.
+fn models_due(command: bool) -> (bool, bool) {
+    let Ok(mut m) = MODELS.lock() else {
+        return (false, false);
+    };
+    if recent(m.listed) {
+        return (false, false);
+    }
+    let server = !recent(m.server_tried);
+    let command = command && !recent(m.command_tried);
+    let now = Some(Instant::now());
+    if server {
+        m.server_tried = now;
+    }
+    if command {
+        m.command_tried = now;
+    }
+    (server, command)
 }
 
 fn keep_models(listed: Vec<String>) -> bool {
@@ -197,31 +271,32 @@ fn keep_models(listed: Vec<String>) -> bool {
         return false;
     }
     if let Ok(mut m) = MODELS.lock() {
-        *m = Some((Instant::now(), listed));
+        m.models = listed;
+        m.listed = Some(Instant::now());
     }
     true
 }
 
-/// List OpenCode's models when the last list is older than ten minutes:
-/// from its background server when one is running (`GET /api/model`), and
+/// List OpenCode's models when there is no current list: from its
+/// background server when one is running (`GET /api/model`), and
 /// otherwise, only when `bin` is given, by running `<bin> models` (five
-/// seconds at most).
+/// seconds at most). An attempt that fails is remembered as long as a
+/// list is (ten minutes).
 ///
 /// `bin` is for when the user asked to see them (the new-session form,
 /// `rlord agents`): the command may start OpenCode's server, which rlord
 /// must not do on its own (at daemon start, before a launch). Makes a
 /// request or runs a command: never call it holding a lock others wait on.
 pub fn list_models(bin: Option<&Path>) {
-    if models_fresh() {
-        return;
-    }
-    let served = super::opencode_service::Service::read(&service_file())
-        .and_then(|svc| svc.models())
-        .is_some_and(keep_models);
+    let (server, command) = models_due(bin.is_some());
+    let served = server
+        && super::opencode_service::Service::read(&service_file())
+            .and_then(|svc| svc.models())
+            .is_some_and(keep_models);
     if served {
         return;
     }
-    if let Some(bin) = bin {
+    if let Some(bin) = bin.filter(|_| command) {
         let listed = run_bounded(bin, &["models"], Duration::from_secs(5))
             .map(|out| parse_models(&out))
             .unwrap_or_default();
@@ -229,37 +304,42 @@ pub fn list_models(bin: Option<&Path>) {
     }
 }
 
-/// Run a command and take what it prints, giving up at `limit`.
+/// Run a command and take what it prints, giving up at `limit`. Its output
+/// goes to a file, not a pipe: `opencode` may start its background server,
+/// which would inherit a pipe and hold it open long after the command.
 fn run_bounded(bin: &Path, args: &[&str], limit: Duration) -> Option<String> {
-    use std::io::Read;
-    let mut child = std::process::Command::new(bin)
+    let out = std::env::temp_dir().join(format!(
+        "rlord-{}-{}.out",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let file = std::fs::File::create(&out).ok()?;
+    let spawned = std::process::Command::new(bin)
         .args(args)
         .env_remove("RLORD_SESSION_ID")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(file)
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        let _ = tx.send(out);
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) if st.success() => break,
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+        .spawn();
+    let done = spawned.ok().is_some_and(|mut child| {
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st.success(),
+                Ok(None) if start.elapsed() < limit => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
             }
         }
-    }
-    rx.recv_timeout(Duration::from_millis(500)).ok()
+    });
+    let text = done.then(|| std::fs::read_to_string(&out).ok()).flatten();
+    let _ = std::fs::remove_file(&out);
+    text
 }
 
 // ---- archive summaries (the fallback; see the daemon's `summary`) ----
@@ -422,6 +502,27 @@ fn reply_text(data: &Value) -> Option<String> {
     parts_text(&data["content"])
 }
 
+/// A LIKE pattern (with `ESCAPE '\'`) for rows whose JSON holds `word` in
+/// a string: the word as JSON writes it (`"` is `\"`, a line break `\n`),
+/// and LIKE's own wildcards (`%`, `_`) and escape character taken
+/// literally.
+fn like_pattern(word: &str) -> String {
+    let json = serde_json::to_string(word).unwrap_or_default();
+    let inner = json
+        .strip_prefix('"')
+        .and_then(|j| j.strip_suffix('"'))
+        .unwrap_or(word);
+    let mut out = String::from("%");
+    for c in inner.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
 /// Rows of one session, oldest first, through `each` (false stops).
 /// `like`: only rows whose JSON contains it (ASCII case-insensitive).
 fn each_row(
@@ -442,13 +543,7 @@ fn each_row(
     let Ok(mut q) = c.prepare(&sql) else {
         return; // not a schema rlord knows
     };
-    let pattern = like.map(|k| {
-        let escaped = k
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        format!("%{escaped}%")
-    });
+    let pattern = like.map(like_pattern);
     let Ok(mut rows) = q.query(rusqlite::params![id, pattern]) else {
         return;
     };
@@ -488,9 +583,49 @@ pub fn conversation(db: &Path, id: &str) -> Vec<Said> {
     out
 }
 
-/// Messages of `id` containing every word of `words` (lowercased), oldest
-/// first: all of them counted, the first `keep` returned. `key`: a word
-/// that must appear in a row's raw JSON (narrows what is parsed).
+/// OpenCode's database, opened once for several questions (a search over
+/// many sessions).
+pub struct Store(rusqlite::Connection);
+
+impl Store {
+    pub fn open(db: &Path) -> Option<Store> {
+        open(db).map(Store)
+    }
+
+    /// Messages of `id` containing every word of `words` (lowercased),
+    /// oldest first: all of them counted, the first `keep` returned.
+    /// `key`: a word that must appear in a row's raw JSON (narrows what is
+    /// parsed).
+    pub fn search(
+        &self,
+        id: &str,
+        words: &[String],
+        key: Option<&str>,
+        keep: usize,
+    ) -> (Vec<Said>, usize) {
+        let (mut hits, mut total) = (Vec::new(), 0);
+        each_row(&self.0, id, key, |seq, kind, at_ms, data| {
+            for (who, text) in said(kind, data) {
+                let lower = text.to_lowercase();
+                if words.iter().all(|w| lower.contains(w.as_str())) {
+                    total += 1;
+                    if hits.len() < keep {
+                        hits.push(Said {
+                            seq,
+                            at_ms,
+                            who,
+                            text,
+                        });
+                    }
+                }
+            }
+            true
+        });
+        (hits, total)
+    }
+}
+
+/// `Store::search` on a database opened for it.
 pub fn search(
     db: &Path,
     id: &str,
@@ -498,28 +633,10 @@ pub fn search(
     key: Option<&str>,
     keep: usize,
 ) -> (Vec<Said>, usize) {
-    let Some(c) = open(db) else {
-        return (Vec::new(), 0);
-    };
-    let (mut hits, mut total) = (Vec::new(), 0);
-    each_row(&c, id, key, |seq, kind, at_ms, data| {
-        for (who, text) in said(kind, data) {
-            let lower = text.to_lowercase();
-            if words.iter().all(|w| lower.contains(w.as_str())) {
-                total += 1;
-                if hits.len() < keep {
-                    hits.push(Said {
-                        seq,
-                        at_ms,
-                        who,
-                        text,
-                    });
-                }
-            }
-        }
-        true
-    });
-    (hits, total)
+    match Store::open(db) {
+        Some(store) => store.search(id, words, key, keep),
+        None => (Vec::new(), 0),
+    }
 }
 
 /// One row's `data` by a query that selects it.
@@ -713,16 +830,60 @@ pub fn directory(db: &Path, id: &str) -> Option<String> {
         .ok()
 }
 
-/// The session `id` is a child of (a sub-agent's session names its parent).
-pub fn parent(db: &Path, id: &str) -> Option<String> {
+/// The session `id` is a child of (a sub-agent's session names its
+/// parent): `Some(Some(parent))`, or `Some(None)` for a session that has
+/// none. `None` when it can't be told (the database couldn't be read, or
+/// doesn't list the session yet): ask again, don't remember that.
+pub fn parent(db: &Path, id: &str) -> Option<Option<String>> {
+    use rusqlite::OptionalExtension;
     open(db)?
         .query_row(
             "SELECT parent_id FROM session_v2 WHERE id = ?1",
             [id],
             |r| r.get::<_, Option<String>>(0),
         )
-        .ok()
-        .flatten()
+        .optional()
+        .ok()?
+}
+
+/// The sessions under `id`: its sub-agents' child sessions and theirs
+/// (four levels, forty sessions at most, newest first within a level).
+pub fn descendants(db: &Path, id: &str) -> Vec<String> {
+    let Some(c) = open(db) else {
+        return Vec::new();
+    };
+    let Ok(mut q) = c.prepare(
+        "SELECT id FROM session_v2 WHERE parent_id = ?1 ORDER BY time_created DESC LIMIT 40",
+    ) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut level = vec![id.to_string()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for parent in &level {
+            let Ok(rows) = q.query_map([parent], |r| r.get::<_, String>(0)) else {
+                continue;
+            };
+            for child in rows.flatten() {
+                if out.len() < 40 && is_session_id(&child) && !out.contains(&child) {
+                    out.push(child.clone());
+                    next.push(child);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    out
+}
+
+/// The model session `id` is set to (`provider/model`), from its row.
+pub fn session_model(db: &Path, id: &str) -> Option<String> {
+    let c = open(db)?;
+    one_data(&c, "SELECT model FROM session_v2 WHERE id = ?1", id).and_then(|m| model_name(&m))
 }
 
 /// The newest archived fork of `id` created at or after `since_ms`: the
@@ -903,12 +1064,34 @@ pub(crate) mod tests {
     #[test]
     fn argv() {
         assert_eq!(
-            launch_argv("ses_1a", Some("hello"), &[]),
+            open_argv("ses_1a", Some("hello"), &[]),
             ["opencode", "-s", "ses_1a", "--prompt", "hello"]
         );
         assert_eq!(
-            launch_argv("ses_1a", Some("  "), &["--auto".to_string()]),
+            open_argv("ses_1a", Some("  "), &["--auto".to_string()]),
             ["opencode", "-s", "ses_1a", "--auto"]
+        );
+        // A launch creates the session (with its model) and then opens it.
+        let l = launch_argv(
+            "ses_1a",
+            "/src/app",
+            Some("opencode/x-free"),
+            Some("hi"),
+            &[],
+        );
+        assert_eq!(l[..2], ["sh", "-c"]);
+        assert!(l[2].contains(r#""$0" api POST /api/session -d "$1""#) && l[2].contains("exec"));
+        assert_eq!(l[3], "opencode");
+        assert_eq!(
+            serde_json::from_str::<Value>(&l[4]).unwrap(),
+            json!({"id": "ses_1a", "location": {"directory": "/src/app"},
+                   "model": {"providerID": "opencode", "id": "x-free"}})
+        );
+        assert_eq!(l[5..], ["-s", "ses_1a", "--prompt", "hi"]);
+        // No model, or a name that isn't one: created on OpenCode's default.
+        assert_eq!(
+            create_body("ses_1a", "/src/app", Some("opus")),
+            json!({"id": "ses_1a", "location": {"directory": "/src/app"}})
         );
         let a = summary_argv("opencode/x-free", Some("ses_1a"), "ses_2b", "Summarize");
         assert_eq!(
@@ -1073,8 +1256,24 @@ pub(crate) mod tests {
                VALUES ('ses_fork', 'p', 'ses_e3192cfeeffeUElN5gOL3f5nhg', '/src/app', 9000, 9000, 9000);",
         )
         .unwrap();
-        assert_eq!(parent(&db, "ses_child").as_deref(), Some(SES));
-        assert_eq!(parent(&db, SES), None);
+        assert_eq!(parent(&db, "ses_child"), Some(Some(SES.to_string())));
+        // No parent is an answer; a session the database doesn't list, or
+        // a database that can't be read, is not.
+        assert_eq!(parent(&db, SES), Some(None));
+        assert_eq!(parent(&db, "ses_unknown"), None);
+        assert_eq!(parent(&dir.path().join("absent.db"), SES), None);
+        c.execute_batch(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, time_created, time_updated) \
+               VALUES ('ses_grandchild', 'p', 'ses_child', '/src/app', 6, 6);",
+        )
+        .unwrap();
+        assert_eq!(descendants(&db, SES), ["ses_child", "ses_grandchild"]);
+        assert!(descendants(&db, "ses_grandchild").is_empty());
+        assert_eq!(
+            session_model(&db, SES).as_deref(),
+            Some("opencode/deepseek-v4.1-flash-free")
+        );
+        assert_eq!(session_model(&db, "ses_child"), None);
         assert_eq!(fork_of(&db, SES, 8000).as_deref(), Some("ses_fork"));
         assert_eq!(fork_of(&db, SES, 9001), None);
         // A fork the user made (not archived) isn't the summary's.
@@ -1111,5 +1310,27 @@ pub(crate) mod tests {
         );
         // `%` and `_` in a word are themselves, not wildcards.
         assert_eq!(search(&db, SES, &ws("100%"), Some("100%"), 5).1, 0);
+        assert_eq!(search(&db, SES, &ws("r_po"), Some("r_po"), 5).1, 0);
+        assert_eq!(like_pattern("50%_a\\b"), "%50\\%\\_a\\\\\\\\b%");
+        // A word is looked for as JSON writes it: quotes and line breaks
+        // are escaped in the stored row.
+        assert_eq!(like_pattern("\"hi\""), "%\\\\\"hi\\\\\"%");
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "INSERT INTO session_message VALUES ('msg_99', ?1, 'user', 99, 5, 5, ?2)",
+            rusqlite::params![
+                SES,
+                json!({"text": "rename it to \"wait_2_watch\" at 100%\nplease"}).to_string()
+            ],
+        )
+        .unwrap();
+        for word in ["\"wait_2_watch\"", "100%", "wait_2_watch"] {
+            let (hits, total) = search(&db, SES, &ws(word), Some(word), 5);
+            assert_eq!((total, hits[0].seq), (1, 99), "{word}");
+        }
+        assert_eq!(
+            search(&db, SES, &ws("waitx2xwatch"), Some("wait_2_watch"), 5).1,
+            0
+        );
     }
 }

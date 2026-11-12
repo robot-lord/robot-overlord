@@ -10,12 +10,14 @@ demo=${RLORD_DEMO_DIR:?}
 data=${XDG_DATA_HOME:?}/opencode
 db=$data/opencode.db
 args=("$@")
-sid='' prompt='' sub='' fork=0 archived=0
+sid='' prompt='' sub='' fork=0 archived=0 body=''
 for ((i = 0; i < ${#args[@]}; i++)); do
   case ${args[$i]} in
     --version | -v) echo "opencode v2.2.7"; exit 0 ;;
     models) printf '%s\n' opencode/deepseek-v4.1-flash-free opencode/glm-5.3-flash-free anthropic/claude-sonnet-5; exit 0 ;;
     run) sub=run ;;
+    api) sub=api ;;
+    -d | --data) body=${args[$((i + 1))]}; i=$((i + 1)) ;;
     session) sub=session ;;
     delete) [[ $sub == session ]] && sub=delete ;;
     -s | --session) sid=${args[$((i + 1))]}; i=$((i + 1)) ;;
@@ -24,7 +26,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --fork) fork=1 ;;
     --archived) archived=1 ;;
     -*) ;;
-    *) if [[ $sub == delete ]]; then sid=${args[$i]}; else prompt=${args[$i]}; fi ;;
+    *) case $sub in delete) sid=${args[$i]} ;; api) ;; *) prompt=${args[$i]} ;; esac ;;
   esac
 done
 
@@ -60,6 +62,22 @@ create() { # ID [FORK-OF]
 }
 
 case $sub in
+  api)
+    # `api POST /api/session -d {id, location, model}`: what a launch runs
+    # first, so the session exists (with its model) before its screen.
+    python3 - "$db" "$body" <<'PY'
+import json, sqlite3, sys, time
+db, body = sys.argv[1:]
+b = json.loads(body)
+now = int(time.time() * 1000)
+model = b.get("model") or {"id": "deepseek-v4.1-flash-free", "providerID": "opencode"}
+c = sqlite3.connect(db)
+c.execute("insert or ignore into session_v2 (id, directory, title, model, time_created, time_updated) values (?, ?, '', ?, ?, ?)",
+          (b["id"], b["location"]["directory"], json.dumps(model), now, now))
+c.commit()
+PY
+    exit 0
+    ;;
   delete)
     sql "delete from session_message where session_id='$sid'; delete from session_v2 where id='$sid'"
     echo "Session $sid deleted"
@@ -89,8 +107,9 @@ esac
 key=$(basename "$PWD")
 screen=$demo/screens/$key.txt
 state=$(cat "$demo/states/$key" 2>/dev/null || echo idle)
-if [[ -z $(sql "select id from session_v2 where id='$sid'") ]]; then
-  create "$sid"
+# (The real screen creates a missing session only with its first message.)
+[[ -n $prompt ]] && create "$sid"
+if [[ -z $(sql "select id from session_message where session_id='$sid' limit 1") ]]; then
   if [[ -n $prompt ]]; then
     user "$sid" "$prompt"
     sql "update session_v2 set time_busy = $(ms) where id='$sid'"
