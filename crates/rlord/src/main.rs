@@ -1259,7 +1259,15 @@ fn hook_emit(agent: &str) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let params = json!({"instance": instance, "agent": agent, "event": event, "payload": payload});
+    // Which pane this agent runs in: the daemon accepts a session's hooks
+    // only from its own pane (a forked or background copy of the agent
+    // inherits RLORD_SESSION_ID but isn't in it).
+    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+    let socket = std::env::var("TMUX")
+        .ok()
+        .and_then(|t| t.split(',').next().map(str::to_string));
+    let params = json!({"instance": instance, "agent": agent, "event": event,
+                        "payload": payload, "pane": pane, "tmux": socket});
     if client_call(&paths::socket_path(), "hook.emit", params.clone()).is_err() {
         spool_hook_event(&params).ok();
     }

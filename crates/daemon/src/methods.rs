@@ -221,14 +221,32 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
 /// a conversation that was last connected.
 pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
     let mut a = str_list(spec, "extra_args");
+    // One --settings override for everything rlord sets.
+    let mut settings = serde_json::Map::new();
     if let Some(n) = spec["remote_control"].as_str().filter(|n| !n.is_empty()) {
         a.push("--remote-control".into());
         a.push(n.to_string());
     } else if spec["remote_control_off"] == true {
+        settings.insert("disableRemoteControl".into(), json!(true));
+    }
+    // The renderer (`[session] claude_tui`): inline keeps tmux's scrollback.
+    let tui = CLAUDE_TUI.get().map(String::as_str).unwrap_or("").trim();
+    if !tui.is_empty() {
+        settings.insert("tui".into(), json!(tui));
+    }
+    if !settings.is_empty() {
         a.push("--settings".into());
-        a.push(r#"{"disableRemoteControl":true}"#.into());
+        a.push(Value::Object(settings).to_string());
     }
     a
+}
+
+/// `[session] claude_tui`, set once at daemon start (see `set_claude_tui`).
+static CLAUDE_TUI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the configured Claude renderer for every launch.
+pub fn set_claude_tui(cfg: &Config) {
+    let _ = CLAUDE_TUI.set(cfg.session.claude_tui.clone());
 }
 
 /// A string-array param (missing / wrong type = empty).
@@ -695,6 +713,13 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         return Ok(json!({"ignored": true}));
     };
     let now = now_ms();
+    if let Some(why) = foreign_hook(&s, params) {
+        // Same RLORD_SESSION_ID, another process (e.g. Claude's background
+        // daemon forked the conversation out of the pane): it must not
+        // retarget the session or change its state.
+        tracing::info!(session = %s.id, why, "ignoring a hook from outside the session's pane");
+        return Ok(json!({"ignored": why}));
+    }
 
     if agent == "claude" {
         if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
@@ -748,6 +773,31 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         )?;
     }
     Ok(json!({"ok": true}))
+}
+
+/// Why a hook isn't from the session's own agent process, if it isn't:
+/// it ran outside rlord's tmux, or in another pane than the session's.
+/// Hooks from older clients (no `pane` field) are taken as before.
+fn foreign_hook(s: &rlord_core::types::Session, params: &Value) -> Option<&'static str> {
+    let Some(pane) = params.get("pane")?.as_str() else {
+        return Some("not in a tmux pane");
+    };
+    let socket = tmux::socket_name();
+    if params["tmux"]
+        .as_str()
+        .is_some_and(|t| t.rsplit('/').next() != Some(socket.as_str()))
+    {
+        return Some("another tmux server");
+    }
+    let own = s
+        .tmux_session
+        .as_deref()
+        .and_then(|n| tmux::pane_id(n).ok());
+    match own {
+        Some(own) if own != pane => Some("another pane"),
+        // No live pane to compare with (stopped, starting): accept.
+        _ => None,
+    }
 }
 
 /// SubagentStart/SubagentStop → `subagents` rows. Claude's internal helper
@@ -871,6 +921,7 @@ mod tests {
         let on = json!({"extra_args": ["--x"], "remote_control": "web"});
         assert_eq!(spec_args(&on), ["--x", "--remote-control", "web"]);
         let off = json!({"remote_control_off": true});
+        // (No renderer set in tests: CLAUDE_TUI is unset.)
         assert_eq!(
             spec_args(&off),
             ["--settings", r#"{"disableRemoteControl":true}"#]

@@ -109,6 +109,13 @@ session; treat that the same way. Plain requests that
 aren't about launching ("rename that one", "what's blocked?") you handle
 yourself.
 
+## Passing work to a session
+
+Work that belongs to an existing session goes to it, not to a new one: find
+its `tmux` name (`get_session`), the `ListAgents` peer showing that tmux
+session, and `SendMessage` it the user's request verbatim with the context it
+needs, saying it comes from the user via rlord. Don't wait for the reply.
+
 ## How to behave
 
 - Never do a session's work yourself: launch it, with a prompt that states

@@ -476,13 +476,16 @@ pub fn current_client() -> Option<String> {
 
 /// Open a popup on `client` running `cmd`, without waiting for it to close
 /// (`display-popup` blocks until then). Closes any popup already open there.
-/// `border` is a tmux style for the popup's border (`fg=#cba6f7`).
+/// `border` is a tmux style for the popup's border (`fg=#cba6f7`), `style`
+/// the popup's own (`bg=#1d1828`; without it tmux paints the window style).
+#[allow(clippy::too_many_arguments)]
 pub fn open_popup(
     client: &str,
     width: &str,
     height: &str,
     title: &str,
     border: &str,
+    style: &str,
     cmd: &str,
 ) -> Result<()> {
     let _ = close_popup(client);
@@ -500,6 +503,8 @@ pub fn open_popup(
             "rounded",
             "-S",
             border,
+            "-s",
+            style,
             "-T",
             title,
             cmd,

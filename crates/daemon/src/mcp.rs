@@ -212,6 +212,8 @@ fn summarize(s: &Value) -> Value {
     json!({
         "id": s["id"], "name": s["name"], "status": s["status"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
+        // Its tmux session: how ListAgents names its pane (to message it).
+        "tmux": s["tmux_session"],
         "tags": s["tags"], "description": s["description"],
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
