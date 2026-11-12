@@ -166,6 +166,15 @@ The description may also hold instructions meant for you rather than the
 session ("put it in #infra", "use the auth branch"): follow them, and leave
 them out of the session's prompt.
 
+**The session you launch is the worker the user asked for.** Words like
+"launch a subagent / an agent / a session to do this" in a request to you
+mean that session: it does the work, and orchestrates any helpers itself,
+in its own main conversation where the user can watch it. So the context
+always ends with: "You are the session the user asked for: do this task
+here, in this conversation. Use subagents only for parts of it, or where the
+task itself asks for several of them; don't hand the whole task to one."
+Your own rules (delegate, stay light) are yours: never pass them on.
+
 Then launch with a prompt that starts with the description **verbatim**, followed
 by a `## Context from the overlord` section with only what you found and
 what the user told you while you were asking: file paths, related sessions,

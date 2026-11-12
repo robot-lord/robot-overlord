@@ -1,6 +1,6 @@
 # Archived working docs
 
-A working doc (`working-docs/<effort>.md`) is removed when its effort is
+A working doc (`docs/working/<effort>.md`) is removed when its effort is
 done: what lasts is promoted into `docs/`, and the original stays in git
 history. A residue file is kept here only when something is still owed.
 

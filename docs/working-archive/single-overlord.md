@@ -1,6 +1,6 @@
 # One overlord: what is still owed
 
-Residue of `working-docs/single-overlord.md` (in git history), reconciled
+Residue of `docs/working/single-overlord.md` (in git history), reconciled
 2026-11-12 with 0.21.0-dev.1. How the overlord works now is in
 `docs/guide.md` ("The overlord") and `docs/architecture.md` ("The
 overlord"); the rules for changing it are in `CLAUDE.md`.
@@ -23,7 +23,7 @@ overlord"); the rules for changing it are in `CLAUDE.md`.
   every installed agent that can run the overlord. But only Claude Code can
   run it today (`Agent::runs_overlord`): wiring rlord's MCP server and the
   tool allow-list for the other two is owed by their own working docs
-  (`working-docs/codex-support.md` phase 4, `working-docs/opencode-support.md`
+  (`docs/working/codex-support.md` phase 4, `docs/working/opencode-support.md`
   "Owed"). When one lands, flipping `runs_overlord` makes it pickable.
 - **Screenshots.** `docs/images/overlord.png` (the README's first
   screenshot) is from the two-session overlord: its overlay title offers

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]
-version = "0.22.0-dev.1"
+version = "0.22.0-dev.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ayersb/robot-overlord"
