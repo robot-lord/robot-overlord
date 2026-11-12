@@ -1,0 +1,499 @@
+//! Which coding agents are on this machine, and how to get one that isn't.
+//!
+//! rlord never installs anything: it suggests the command for this machine
+//! and the user runs it. Everything here is plain look-ups (PATH, a few
+//! files, `--version`).
+//!
+//! The install commands live in one table, `TOOLS`. Update it when a
+//! vendor changes theirs; each entry names the vendor page it was checked
+//! against.
+
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use serde_json::Value;
+
+use super::{codex, Agent};
+
+/// A coding agent rlord knows about, and its vendor's install commands.
+pub struct Tool {
+    /// Name in rlord (and its command on PATH).
+    pub name: &'static str,
+    pub label: &'static str,
+    /// The agent rlord runs it as; None: known, not runnable in rlord yet.
+    pub agent: Option<Agent>,
+    /// The vendor's install page.
+    pub docs: &'static str,
+    /// The vendor's install script (macOS and Linux).
+    pub script: &'static str,
+    /// With Homebrew.
+    pub brew: &'static str,
+    /// With npm, globally.
+    pub npm: &'static str,
+    /// With an AUR helper on Arch Linux, when the vendor documents one.
+    pub aur: Option<&'static str>,
+}
+
+/// Checked against the vendors' pages on 2026-11-11.
+pub const TOOLS: [Tool; 3] = [
+    // https://code.claude.com/docs/en/setup (the script is "recommended";
+    // apt/dnf/apk repositories exist too: several steps, see the page).
+    Tool {
+        name: "claude",
+        label: "Claude Code",
+        agent: Some(Agent::Claude),
+        docs: "https://code.claude.com/docs/en/setup",
+        script: "curl -fsSL https://claude.ai/install.sh | bash",
+        brew: "brew install --cask claude-code",
+        npm: "npm install -g @anthropic-ai/claude-code",
+        aur: None,
+    },
+    // https://github.com/openai/codex#readme
+    Tool {
+        name: "codex",
+        label: "Codex",
+        agent: Some(Agent::Codex),
+        docs: "https://github.com/openai/codex#readme",
+        script: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        brew: "brew install --cask codex",
+        npm: "npm install -g @openai/codex",
+        aur: None,
+    },
+    // https://opencode.ai/docs/
+    Tool {
+        name: "opencode",
+        label: "OpenCode",
+        agent: None,
+        docs: "https://opencode.ai/docs/",
+        script: "curl -fsSL https://opencode.ai/v2/install | bash",
+        brew: "brew install anomalyco/tap/opencode-v2",
+        npm: "npm install -g @opencode/cli",
+        aur: Some("paru -S opencode-beta"),
+    },
+];
+
+pub fn tool(name: &str) -> Option<&'static Tool> {
+    TOOLS.iter().find(|t| t.name == name.trim())
+}
+
+/// What about this machine decides the suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Machine {
+    pub macos: bool,
+    pub brew: bool,
+    pub npm: bool,
+    /// An AUR helper (`paru`) is installed.
+    pub paru: bool,
+}
+
+impl Machine {
+    pub fn detect() -> Machine {
+        Machine {
+            macos: cfg!(target_os = "macos"),
+            brew: on_path("brew").is_some(),
+            npm: on_path("npm").is_some(),
+            paru: on_path("paru").is_some(),
+        }
+    }
+}
+
+/// One way to install a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Method {
+    /// `homebrew`, `install script`, `npm`, `aur`.
+    pub via: &'static str,
+    pub command: &'static str,
+}
+
+/// The command to suggest on this machine, and the other ways that would
+/// work here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Suggestion {
+    pub via: &'static str,
+    pub command: &'static str,
+    pub alternatives: Vec<Method>,
+    pub docs: &'static str,
+}
+
+/// macOS with Homebrew: the brew command. Arch with an AUR helper, when
+/// the vendor has a package: that. Otherwise the vendor's install script
+/// (its official method on macOS and Linux). npm, when present, and the
+/// script are offered as alternatives.
+pub fn suggest(t: &Tool, m: Machine) -> Suggestion {
+    let script = Method {
+        via: "install script",
+        command: t.script,
+    };
+    let mut ways: Vec<Method> = Vec::new();
+    if m.brew && m.macos {
+        ways.push(Method {
+            via: "homebrew",
+            command: t.brew,
+        });
+    }
+    if let Some(aur) = t.aur.filter(|_| m.paru && !m.macos) {
+        ways.push(Method {
+            via: "aur",
+            command: aur,
+        });
+    }
+    ways.push(script);
+    // (Linuxbrew: works, but it isn't what a Linux user reaches for first.)
+    if m.brew && !m.macos {
+        ways.push(Method {
+            via: "homebrew",
+            command: t.brew,
+        });
+    }
+    if m.npm {
+        ways.push(Method {
+            via: "npm",
+            command: t.npm,
+        });
+    }
+    let first = ways.remove(0);
+    Suggestion {
+        via: first.via,
+        command: first.command,
+        alternatives: ways,
+        docs: t.docs,
+    }
+}
+
+/// Where a command is on PATH.
+pub fn on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
+}
+
+/// What `<bin> --version` prints (its first line), remembered until the
+/// binary changes. Bounded: a command that doesn't answer in two seconds
+/// has no version.
+pub fn version(bin: &Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
+    static SEEN: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>> =
+        LazyLock::new(Default::default);
+    // (Through symlinks: an upgrade replaces what the link points at.)
+    let modified = std::fs::metadata(bin).and_then(|m| m.modified()).ok()?;
+    if let Some((at, v)) = SEEN.lock().ok()?.get(bin) {
+        if *at == modified {
+            return v.clone();
+        }
+    }
+    let mut child = std::process::Command::new(bin)
+        .arg("--version")
+        .env_remove("RLORD_SESSION_ID")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let done = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.success(),
+            Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let v = done
+        .then(|| {
+            use std::io::Read;
+            let mut out = String::new();
+            child.stdout.take()?.read_to_string(&mut out).ok()?;
+            let line = out.lines().next()?.trim().to_string();
+            (!line.is_empty()).then_some(line)
+        })
+        .flatten();
+    if let Ok(mut seen) = SEEN.lock() {
+        seen.insert(bin.to_path_buf(), (modified, v.clone()));
+    }
+    v
+}
+
+/// rlord's hook command is in the agent's hooks file.
+pub fn hooks_installed(agent: Agent) -> bool {
+    !our_hooks(&agent.hooks_file()).is_empty()
+}
+
+/// Where rlord's hook sits in a hooks file: (event, group index, hook
+/// index) for each event that has it.
+fn our_hooks(file: &Path) -> Vec<(String, usize, usize)> {
+    let Some(v) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (event, groups) in v["hooks"].as_object().into_iter().flatten() {
+        for (gi, g) in groups.as_array().into_iter().flatten().enumerate() {
+            for (hi, h) in g["hooks"].as_array().into_iter().flatten().enumerate() {
+                let ours = h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("hook emit") && c.contains("rlord"));
+                if ours {
+                    out.push((event.clone(), gi, hi));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether the user has trusted rlord's hooks in Codex (`/hooks`): Codex
+/// records each reviewed hook in `config.toml` under `[hooks.state]`, keyed
+/// `<hooks file>:<event>:<group>:<hook>`, with a `trusted_hash`. None when
+/// rlord's hooks aren't installed. (A hash from before the command last
+/// changed still reads as trusted here: Codex decides for real.)
+pub fn codex_hooks_trusted(home: &Path) -> Option<bool> {
+    let file = home.join("hooks.json");
+    let ours = our_hooks(&file);
+    if ours.is_empty() {
+        return None;
+    }
+    let state = std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .and_then(|t| t.get("hooks")?.get("state")?.as_table().cloned())
+        .unwrap_or_default();
+    let trusted = |event: &str, gi: usize, hi: usize| {
+        let key = format!("{}:{}:{gi}:{hi}", file.display(), snake(event));
+        state
+            .get(&key)
+            .and_then(|e| e.get("trusted_hash"))
+            .and_then(|h| h.as_str())
+            .is_some_and(|h| !h.is_empty())
+    };
+    Some(ours.iter().all(|(e, gi, hi)| trusted(e, *gi, *hi)))
+}
+
+/// `SessionStart` → `session_start`.
+fn snake(event: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in event.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// One agent's state on this machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct Status {
+    pub name: &'static str,
+    pub label: &'static str,
+    /// rlord can run sessions on it (false: known, support coming).
+    pub supported: bool,
+    pub installed: bool,
+    /// Where its command is.
+    pub path: Option<String>,
+    /// From `--version` (only when asked for).
+    pub version: Option<String>,
+    /// rlord's hooks are in its hooks file (None: rlord doesn't run it).
+    pub hooks_installed: Option<bool>,
+    /// Codex only: the user trusted rlord's hooks (`/hooks`).
+    pub hooks_trusted: Option<bool>,
+    /// How to install it, when it isn't.
+    pub install: Option<Suggestion>,
+    /// What's left to do, in a line (None: ready).
+    pub next: Option<String>,
+}
+
+/// Every known agent's state. `versions`: also run each one's `--version`
+/// (cached; skip it where only "is it there" matters).
+pub fn status(versions: bool) -> Vec<Status> {
+    let machine = Machine::detect();
+    TOOLS
+        .iter()
+        .map(|t| {
+            let path = on_path(t.name);
+            let installed = path.is_some();
+            let hooks_installed = t.agent.map(hooks_installed);
+            let hooks_trusted = match t.agent {
+                Some(Agent::Codex) => codex_hooks_trusted(&codex::home()),
+                _ => None,
+            };
+            let next = match (installed, t.agent, hooks_installed, hooks_trusted) {
+                (false, _, _, _) => Some(format!(
+                    "not installed: run the install command yourself{}",
+                    if t.agent.is_some() {
+                        ", then `rlord install-hooks`"
+                    } else {
+                        ""
+                    }
+                )),
+                (true, None, _, _) => Some("installed; rlord support coming".to_string()),
+                (true, Some(_), Some(false), _) => Some("run `rlord install-hooks`".to_string()),
+                (true, Some(_), _, Some(false)) => Some(
+                    "trust rlord's hooks: start `codex`, type `/hooks`, trust the \
+                     `rlord hook emit codex` entries"
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            Status {
+                name: t.name,
+                label: t.label,
+                supported: t.agent.is_some(),
+                installed,
+                version: path.as_deref().filter(|_| versions).and_then(version),
+                path: path.map(|p| p.to_string_lossy().into_owned()),
+                hooks_installed,
+                hooks_trusted,
+                install: (!installed).then(|| suggest(t, machine)),
+                next,
+            }
+        })
+        .collect()
+}
+
+/// Why sessions on `agent` can't launch here, with what to do about it;
+/// None when its command is on PATH.
+pub fn missing(agent: Agent) -> Option<String> {
+    if on_path(agent.name()).is_some() {
+        return None;
+    }
+    let t = tool(agent.name())?;
+    let s = suggest(t, Machine::detect());
+    Some(format!(
+        "{} isn't installed (`{}` isn't on PATH). rlord doesn't install it for you; run this \
+         yourself: {}  (other ways: {}). Then `rlord install-hooks`.",
+        t.label, t.name, s.command, s.docs
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAC_BREW: Machine = Machine {
+        macos: true,
+        brew: true,
+        npm: true,
+        paru: false,
+    };
+
+    #[test]
+    fn the_suggestion_fits_the_machine() {
+        let codex = tool("codex").unwrap();
+        let s = suggest(codex, MAC_BREW);
+        assert_eq!(
+            (s.via, s.command),
+            ("homebrew", "brew install --cask codex")
+        );
+        let alt: Vec<&str> = s.alternatives.iter().map(|m| m.via).collect();
+        assert_eq!(alt, ["install script", "npm"]);
+        // A Mac without Homebrew, or Linux: the vendor's script.
+        let bare = Machine {
+            macos: true,
+            ..Default::default()
+        };
+        let s = suggest(codex, bare);
+        assert_eq!(s.via, "install script");
+        assert!(s.alternatives.is_empty());
+        let linux = Machine {
+            npm: true,
+            brew: true,
+            ..Default::default()
+        };
+        let s = suggest(tool("claude").unwrap(), linux);
+        assert_eq!(s.command, "curl -fsSL https://claude.ai/install.sh | bash");
+        let alt: Vec<&str> = s.alternatives.iter().map(|m| m.command).collect();
+        assert_eq!(
+            alt,
+            [
+                "brew install --cask claude-code",
+                "npm install -g @anthropic-ai/claude-code"
+            ]
+        );
+        // Arch with an AUR helper: OpenCode's package; Codex has none.
+        let arch = Machine {
+            paru: true,
+            ..Default::default()
+        };
+        assert_eq!(suggest(tool("opencode").unwrap(), arch).via, "aur");
+        assert_eq!(suggest(codex, arch).via, "install script");
+    }
+
+    #[test]
+    fn every_agent_rlord_runs_has_install_commands() {
+        for a in Agent::ALL {
+            let t = tool(a.name()).expect("in the table");
+            assert_eq!(t.agent, Some(a));
+        }
+        // Known, hinted, not runnable yet.
+        assert_eq!(tool("opencode").unwrap().agent, None);
+        // Nothing here installs with elevated rights or runs unprompted.
+        for t in &TOOLS {
+            for c in [t.script, t.brew, t.npm] {
+                assert!(!c.contains("sudo"), "{c}");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_trust_is_read_from_its_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        assert_eq!(codex_hooks_trusted(home), None, "no hooks installed");
+        // Another tool's hook first on Stop: ours is the second group there.
+        std::fs::write(
+            home.join("hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other"}]}]}}"#,
+        )
+        .unwrap();
+        Agent::Codex
+            .install_hooks_in(&home.join("hooks.json"), "/bin/rlord")
+            .unwrap();
+        assert_eq!(codex_hooks_trusted(home), Some(false));
+        let file = home.join("hooks.json");
+        let entry = |event: &str, gi: usize| {
+            format!(
+                "[hooks.state.\"{}:{event}:{gi}:0\"]\ntrusted_hash = \"sha256:abc\"\n",
+                file.display()
+            )
+        };
+        let mut cfg = String::from("model = \"gpt-6-luna\"\n[hooks.state]\n");
+        for e in [
+            "session_start",
+            "user_prompt_submit",
+            "permission_request",
+            "session_end",
+        ] {
+            cfg += &entry(e, 0);
+        }
+        // Only the other tool's Stop hook is trusted: not all of ours yet.
+        std::fs::write(
+            home.join("config.toml"),
+            format!("{cfg}{}", entry("stop", 0)),
+        )
+        .unwrap();
+        assert_eq!(codex_hooks_trusted(home), Some(false));
+        std::fs::write(
+            home.join("config.toml"),
+            format!("{cfg}{}", entry("stop", 1)),
+        )
+        .unwrap();
+        assert_eq!(codex_hooks_trusted(home), Some(true));
+    }
+
+    #[test]
+    fn event_names_as_codex_keys_them() {
+        assert_eq!(snake("SessionStart"), "session_start");
+        assert_eq!(snake("UserPromptSubmit"), "user_prompt_submit");
+        assert_eq!(snake("Stop"), "stop");
+    }
+}

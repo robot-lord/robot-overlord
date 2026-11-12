@@ -115,6 +115,11 @@ overlord, or `rlord new --agent codex`. `[session] agent` sets the default,
 `codex_model` Codex's default model (empty: Codex's own); the model picker
 offers Codex's own model list.
 
+No Codex yet? `rlord agents` (or asking the overlord, or picking Codex in
+the form) gives the install command for your machine to run yourself;
+rlord doesn't install agents. Sessions run inline (`--no-alt-screen`), so
+tmux scrollback and copy-mode search work as they do for Claude.
+
 Set up once:
 
 ```sh

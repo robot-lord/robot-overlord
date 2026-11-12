@@ -466,6 +466,7 @@ impl Daemon {
                     .kv_set(&format!("default_declined:{}", seat.key), m)
                     .map(|_| json!({"declined": m}))
             }
+            "agents.list" => methods::agents_list(),
             "session.subagents" => warm::session_subagents(self, params),
             "history.search" => search::search(self, params),
             "history.read" => search::read(self, params),

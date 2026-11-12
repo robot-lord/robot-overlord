@@ -39,6 +39,8 @@ You're long-lived and on an expensive model, so:
 - `get_session_defaults` — what a new session gets if you don't say (agent,
   model and its choices, worktree, default repo), and under `agents` which
   coding agents can run a session, each with its own models.
+- `list_agents` — which coding agents are installed and ready, and the
+  install command to suggest for one that isn't.
 - `propose_session` — open the manual new-session form pre-filled for the
   user to review and launch.
 - `confirm_new_session` — reopen the user's new-session form with your
@@ -128,7 +130,11 @@ with that `agent`. Each agent has its own models: a model named for one
 means nothing to the other, so with another agent than the hint's, take
 the model from that agent's entry in `get_session_defaults` (its `model`,
 or "" for the agent's own default) unless the user named one of its
-models. An agent that isn't `installed` can't launch: say so. Otherwise
+models. An agent that isn't `installed` can't launch: don't try. Give the
+user its install command from `list_agents` to run themselves (never run
+it or claim to have installed anything), tell them to run `rlord
+install-hooks` afterwards (and for Codex, trust the hooks with `/hooks`),
+and offer to launch once it's there, or on another agent now. Otherwise
 the agent makes no difference to how you launch, describe or file a session.
 
 ## Reached from the Claude app

@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::{claude, transcript, Agent};
+use rlord_core::agents::{claude, install, transcript, Agent};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Status, Subagent};
@@ -62,17 +62,34 @@ pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
 /// (`models` empty: no catalog, the model is typed in).
 pub fn session_defaults(cfg: &Config) -> Result<Value> {
     let mut v = serde_json::to_value(&cfg.session)?;
-    v["agents"] = Agent::ALL
+    v["agents"] = install::status(false)
         .into_iter()
-        .map(|a| {
+        .map(|st| {
+            let agent = Agent::parse(st.name);
             json!({
-                "name": a.name(), "label": a.label(), "installed": a.installed(),
-                "model": cfg.session.model_for(a),
-                "models": cfg.session.models_for(a),
+                "name": st.name, "label": st.label, "installed": st.installed,
+                // false: rlord knows it but can't run sessions on it yet.
+                "supported": st.supported,
+                // How to install it (the user runs it; rlord never does).
+                "install": st.install,
+                "model": agent.map(|a| cfg.session.model_for(a)).unwrap_or(""),
+                "models": agent.map(|a| cfg.session.models_for(a)).unwrap_or_default(),
             })
         })
         .collect();
     Ok(v)
+}
+
+/// `agents.list`: every coding agent rlord knows, whether it's installed
+/// (and its version), whether rlord's hooks are in place (and, for Codex,
+/// trusted), and the install command to suggest when it's missing. Plain
+/// look-ups; rlord never installs anything.
+pub fn agents_list() -> Result<Value> {
+    Ok(json!({
+        "agents": install::status(true),
+        "note": "rlord never installs an agent: give the user `install.command` to run themselves; \
+                 after installing, `rlord install-hooks` (and for Codex, trust them with /hooks)",
+    }))
 }
 
 pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
@@ -342,6 +359,10 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let role = p_opt("role").unwrap_or_default();
     if crate::overlord::is_overlord_role(&role) {
         agent.overlord_seat()?;
+    }
+    // Not installed: say how to get it, rather than fail in the pane.
+    if let Some(why) = install::missing(agent) {
+        bail!("{why}");
     }
     let remote_control = params["remote_control"].as_bool().unwrap_or(false);
     if remote_control && !agent.has_remote_control() {

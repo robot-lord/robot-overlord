@@ -201,9 +201,14 @@ enum Command {
     Show {
         r#ref: String,
     },
-    /// List the sub-agents a session has spawned
+    /// The coding agents on this machine (Claude Code, Codex, OpenCode):
+    /// installed? rlord's hooks in place? and how to install one that's
+    /// missing. With a session: the sub-agents it has spawned.
     Agents {
-        r#ref: String,
+        /// A session (id, id prefix or name): list its sub-agents instead
+        r#ref: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Show a session's event log
     Log {
@@ -867,9 +872,26 @@ fn main() -> Result<()> {
             println!("notes saved");
             Ok(())
         }
-        Command::Agents { r#ref } => {
-            let r = call("session.subagents", json!({"ref": r#ref}))?;
-            print_agents(&r);
+        Command::Agents {
+            r#ref: Some(r),
+            json,
+        } => {
+            let r = call("session.subagents", json!({"ref": r}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print_agents(&r);
+            }
+            Ok(())
+        }
+        Command::Agents { r#ref: None, json } => {
+            // Asked of the daemon: its PATH is the one sessions launch with.
+            let r = call("agents.list", json!({}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print_coding_agents(&r);
+            }
             Ok(())
         }
         Command::Remote {
@@ -1657,6 +1679,57 @@ fn attach_tmux(tmux_name: &str) -> Result<()> {
             .exec()
     };
     Err(err).context("exec tmux failed")
+}
+
+/// `rlord agents`: one block per coding agent.
+fn print_coding_agents(v: &Value) {
+    for a in v["agents"].as_array().into_iter().flatten() {
+        let yes_no = |k: &str| match a[k].as_bool() {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        };
+        let state = if a["installed"] == true {
+            a["version"].as_str().unwrap_or("installed").to_string()
+        } else {
+            "not installed".to_string()
+        };
+        println!(
+            "{:<12} {state}{}",
+            a["label"].as_str().unwrap_or("?"),
+            if a["supported"] == false {
+                "  (rlord support coming)"
+            } else {
+                ""
+            }
+        );
+        if a["installed"] == true && a["supported"] == true {
+            let trusted = match a["hooks_trusted"].as_bool() {
+                Some(_) => format!(" · trusted in Codex: {}", yes_no("hooks_trusted")),
+                None => String::new(),
+            };
+            println!("  rlord hooks: {}{trusted}", yes_no("hooks_installed"));
+        }
+        if let Some(cmd) = a["install"]["command"].as_str() {
+            println!("  to install it, run:  {cmd}");
+            for alt in a["install"]["alternatives"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "    or ({}):  {}",
+                    alt["via"].as_str().unwrap_or("?"),
+                    alt["command"].as_str().unwrap_or("?")
+                );
+            }
+            println!("    more: {}", a["install"]["docs"].as_str().unwrap_or(""));
+        }
+        if let Some(next) = a["next"].as_str().filter(|_| a["installed"] == true) {
+            println!("  next: {next}");
+        }
+    }
+    println!("\nrlord never installs an agent for you. After installing one: rlord install-hooks");
 }
 
 fn print_agents(list: &Value) {

@@ -90,7 +90,9 @@ distro).
 </details>
 
 **Requirements:** tmux 3.2+ and [Claude Code](https://claude.com/claude-code)
-(and, for Codex sessions, the Codex CLI).
+(and, for Codex sessions, the Codex CLI). `rlord agents` shows which agents
+you have and the install command for one you don't; rlord never installs
+them itself.
 
 ## Getting started
 

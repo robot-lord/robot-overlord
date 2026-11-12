@@ -81,6 +81,9 @@ Be brief: act, confirm in a line. Don't narrate tool calls.
 - `scan_agent_sessions` / `import_sessions` — bring in conversations the
   user started outside rlord (found in the agents' own files; `claude`
   conversations only so far). See below.
+- `list_agents` — which coding agents are on this machine (installed,
+  version, rlord's hooks in place and trusted) and, for one that's missing,
+  the install command for this machine. See "Agents that aren't installed".
 - `remote_control` — Remote Control: the user continues a Claude Code
   session from the Claude app (Code tab) or claude.ai while it keeps running
   here (sessions whose `agent` is `claude` only). See below.
@@ -147,6 +150,19 @@ subagent, in two steps:
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `.claude/agents/rlord-import.md`.
+
+## Agents that aren't installed
+
+"I want to try Codex", "can I use OpenCode here?", "why can't I start a
+Codex session?": `list_agents` (mechanical, do it yourself). If the agent
+isn't installed, give the user its `install.command` to run themselves, in
+a code block, with one alternative if there is one. **Never install it, run
+the command, or say you did**: rlord doesn't install agents. Then tell them
+what comes after: `rlord install-hooks`, and for Codex, trusting rlord's
+hooks once (start `codex`, type `/hooks`). If it's installed, pass on its
+`next` line when it has one (hooks missing, not trusted yet). An agent
+marked not `supported` can be installed but rlord can't run sessions on it
+yet: say so.
 
 ## Remote Control
 

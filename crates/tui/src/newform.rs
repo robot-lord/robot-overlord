@@ -397,6 +397,56 @@ impl NewForm {
         self.resolved.retain(|k| *k != "model");
     }
 
+    /// Why the chosen agent can't launch (rlord can't run it yet, or it
+    /// isn't installed), and the install command to suggest. rlord never
+    /// runs that command: the user does.
+    fn agent_blocker(&self) -> Option<(String, Option<String>)> {
+        let a = self
+            .agents
+            .iter()
+            .find(|a| a["name"] == self.agent.as_str())?;
+        let label = a["label"].as_str().unwrap_or(&self.agent);
+        let cmd = a["install"]["command"].as_str().map(str::to_string);
+        if a["supported"] == false {
+            let have = if a["installed"] == false {
+                "isn't installed, and "
+            } else {
+                ""
+            };
+            return Some((
+                format!("{label} {have}can't run rlord sessions yet (support coming)"),
+                cmd,
+            ));
+        }
+        (a["installed"] == false).then(|| {
+            (
+                format!(
+                    "{label} isn't installed. Install it yourself, then `rlord install-hooks`:"
+                ),
+                cmd,
+            )
+        })
+    }
+
+    /// The lines that say so on the form (empty when the agent is ready).
+    fn agent_blocker_lines(&self, indent: &str) -> Vec<Line<'static>> {
+        let Some((why, cmd)) = self.agent_blocker() else {
+            return Vec::new();
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            format!("{indent}{why}"),
+            Style::default().fg(theme::yellow()),
+        ))];
+        if let Some(cmd) = cmd {
+            lines.push(Line::from(vec![
+                Span::raw(format!("{indent}  ")),
+                Span::styled(cmd, Style::default().fg(theme::text()).bold()),
+                Span::styled("   ^Y copy", theme::faint()),
+            ]));
+        }
+        lines
+    }
+
     /// The agent's name as shown ("Claude Code", "Codex").
     fn agent_label(&self) -> String {
         self.agents
@@ -679,14 +729,12 @@ impl App {
                 }
                 KeyCode::Enter => match kind {
                     PickerKind::Agent => {
+                        // One that isn't installed can be picked: the form
+                        // then says how to get it (and won't send).
                         let picked = f.agents[i]["name"].as_str().unwrap_or("").to_string();
-                        if f.agents[i]["installed"] == false {
-                            f.error = Some(format!("`{picked}` isn't installed (not on PATH)"));
-                        } else {
-                            f.mark_picked("agent", picked != f.agent);
-                            f.set_agent(&picked);
-                            f.error = None;
-                        }
+                        f.mark_picked("agent", picked != f.agent);
+                        f.set_agent(&picked);
+                        f.error = None;
                     }
                     PickerKind::Model if items[i] == OTHER_MODEL => {
                         f.text_prompt = Some((TextPrompt::Model, String::new()));
@@ -736,6 +784,15 @@ impl App {
         let shift_enter = code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT);
         if shift_enter || (ctrl && code == KeyCode::Char('s')) {
             return self.submit_form(f);
+        }
+        // ctrl-y: copy the suggested install command (the user runs it).
+        if ctrl && code == KeyCode::Char('y') {
+            if let Some((_, Some(cmd))) = f.agent_blocker() {
+                overlay::copy_text("rlord-install", &cmd);
+                self.status_line = format!("copied: {cmd}");
+                f.error = None;
+            }
+            return Ok(Some(f));
         }
         // ctrl-e (the overlord form): edit the description in $EDITOR, e.g.
         // your vim; it comes back into the box.
@@ -880,8 +937,10 @@ impl App {
                     format!(
                         "{}{}",
                         a["label"].as_str().unwrap_or("?"),
-                        if a["installed"] == false {
-                            "  (not installed)"
+                        if a["supported"] == false {
+                            "  (rlord support coming)"
+                        } else if a["installed"] == false {
+                            "  (not installed: pick it to see how)"
                         } else {
                             ""
                         }
@@ -940,7 +999,15 @@ impl App {
         });
     }
 
-    fn submit_form(&mut self, f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+    fn submit_form(&mut self, mut f: Box<NewForm>) -> Result<Option<Box<NewForm>>> {
+        // Nothing to launch it with: say so here, not in a dead pane.
+        if let Some((why, _)) = f.agent_blocker() {
+            f.error = Some(format!(
+                "{} (pick another agent, or install it and reopen this form)",
+                why.trim_end_matches(':')
+            ));
+            return Ok(Some(f));
+        }
         match f.kind {
             FormKind::Overlord => self.submit_request(f),
             FormKind::Manual => self.submit_manual(f),
@@ -1054,8 +1121,8 @@ impl App {
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
         let (area, title) = match form.kind {
-            FormKind::Overlord => (centered(f.area(), 82, 27), "New session"),
-            FormKind::Manual => (centered(f.area(), 76, 18), "New session · manual"),
+            FormKind::Overlord => (centered(f.area(), 82, 28), "New session"),
+            FormKind::Manual => (centered(f.area(), 76, 20), "New session · manual"),
         };
         f.render_widget(Clear, area);
         let block = theme::modal(title);
@@ -1221,6 +1288,7 @@ impl App {
                 lines.push(Line::raw(""));
             }
         }
+        lines.extend(form.agent_blocker_lines(""));
         if let Some(e) = &form.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {e}"),
@@ -1449,7 +1517,11 @@ fn draw_describe_form(f: &mut Frame, inner: Rect, form: &NewForm, overlord_key: 
         tags,
         form.tags_chosen && !form.tags.is_empty(),
     ));
-    lines.push(Line::raw(""));
+    let blocker = form.agent_blocker_lines("    ");
+    if blocker.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(blocker);
 
     let send_focused = focus(Field::Launch);
     let send = if form.confirmed {
@@ -1674,6 +1746,41 @@ mod tests {
         let out = render(&app, &f);
         let line = out.lines().find(|l| l.contains("Agent")).unwrap();
         assert!(line.contains("Codex") && line.contains("updated"), "{line}");
+    }
+
+    #[test]
+    fn a_missing_agent_shows_how_to_install_it_and_blocks_sending() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = form(&mut app);
+        f.prompt = "fix it".into();
+        f.agents = vec![
+            json!({"name": "claude", "label": "Claude Code", "installed": true,
+                   "supported": true, "model": "opus", "models": ["opus"]}),
+            json!({"name": "codex", "label": "Codex", "installed": false, "supported": true,
+                   "model": "", "models": [],
+                   "install": {"via": "homebrew", "command": "brew install --cask codex"}}),
+            json!({"name": "opencode", "label": "OpenCode", "installed": true,
+                   "supported": false, "model": "", "models": []}),
+        ];
+        f.agent.clear();
+        f.set_agent("claude");
+        assert!(f.agent_blocker().is_none());
+        f.set_agent("codex");
+        let out = render(&app, &f);
+        assert!(
+            out.contains("Codex isn't installed. Install it yourself"),
+            "{out}"
+        );
+        assert!(out.contains("brew install --cask codex") && out.contains("^Y copy"));
+        // Sending is refused, with the reason; the form stays open.
+        let f = app.submit_form(f).unwrap().expect("still open");
+        assert!(f.error.as_deref().unwrap().contains("isn't installed"));
+        let mut f = f;
+        f.set_agent("opencode");
+        let (why, cmd) = f.agent_blocker().unwrap();
+        assert!(why.contains("support coming") && cmd.is_none(), "{why}");
     }
 
     #[test]

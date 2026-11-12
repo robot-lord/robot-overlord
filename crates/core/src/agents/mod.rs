@@ -26,6 +26,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod install;
 pub mod remote;
 pub mod transcript;
 
@@ -88,8 +89,7 @@ impl Agent {
 
     /// Its command is on PATH.
     pub fn installed(self) -> bool {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(self.name()).is_file()))
+        install::on_path(self.name()).is_some()
     }
 
     pub fn format(self) -> Format {
@@ -440,7 +440,7 @@ mod tests {
         );
         assert!(l.transcript.unwrap().ends_with(format!("{id}.jsonl")));
         let l = Agent::Codex.launch("/src/app", Some("hi"), None, &[]);
-        assert_eq!(l.argv, ["codex", "--no-daemon", "hi"]);
+        assert_eq!(l.argv, ["codex", "--no-daemon", "--no-alt-screen", "hi"]);
         assert_eq!((l.session_id, l.transcript), (None, None));
         assert!(Agent::Claude.mints_id() && !Agent::Codex.mints_id());
     }
@@ -457,6 +457,7 @@ mod tests {
                 "resume",
                 "t-1",
                 "--no-daemon",
+                "--no-alt-screen",
                 "--model",
                 "gpt-6-luna"
             ]

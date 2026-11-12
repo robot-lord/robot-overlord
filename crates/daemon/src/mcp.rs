@@ -118,6 +118,9 @@ pub fn tools() -> Value {
         tool("get_session_defaults",
             "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
+        tool("list_agents",
+            "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it, whether rlord's hooks are installed (and, for Codex, trusted), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
+            json!({}), &[]),
         tool("hand_off",
             "Overlord (front desk) only: give a request to the mastermind (the overlord's deeper session) and switch the user to it: launches and anything needing reasoning, research or a judgment call. The mastermind doesn't use this.",
             json!({
@@ -409,6 +412,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             json!({"request": arg_str(args, "request").context("missing 'request'")?,
                    "context": arg_str(args, "context").unwrap_or("")}),
         ),
+        "list_agents" => d.rpc("agents.list", json!({})),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),
         "confirm_new_session" => {
             let mut p = Map::new();

@@ -662,11 +662,17 @@ fn copy_to_clipboard(buffer: &str) {
     let Ok(text) = tmux::buffer_text(buffer) else {
         return;
     };
+    copy_text(buffer, &text);
+}
+
+/// Put `text` on the clipboard (see `copy_to_clipboard`); `buffer` names
+/// the tmux paste buffer used when it has to go through tmux.
+pub(crate) fn copy_text(buffer: &str, text: &str) {
     let custom = tmux::server_option("copy-command");
     if !custom.trim().is_empty() {
         pipe_to(
             std::process::Command::new("sh").args(["-c", custom.trim()]),
-            &text,
+            text,
         );
         return;
     }
@@ -684,11 +690,11 @@ fn copy_to_clipboard(buffer: &str) {
         }
     }
     for t in tools {
-        if pipe_to(std::process::Command::new(t[0]).args(&t[1..]), &text) {
+        if pipe_to(std::process::Command::new(t[0]).args(&t[1..]), text) {
             return;
         }
     }
-    let _ = tmux::buffer_to_clipboard(buffer, &text);
+    let _ = tmux::buffer_to_clipboard(buffer, text);
 }
 
 /// Run `cmd` with `text` on its stdin; whether it ran and succeeded.
