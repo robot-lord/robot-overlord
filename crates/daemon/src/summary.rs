@@ -2,13 +2,15 @@
 //! in a paragraph, written once when it's archived (or when asked).
 //!
 //! Plain code decides everything but the words. One worker, one summary at
-//! a time, on a cheap model (`[archive] summary_model`), with nothing saved
-//! by the agent (`--no-session-persistence`, no tools):
+//! a time, written by the session's own agent on a cheap model (`[archive]
+//! summary_model` for Claude Code, `codex_summary_model` for Codex), with
+//! nothing saved by the agent and nothing it could change:
 //!
-//! - **In full** when the conversation fits (`summary_max_tokens`): Claude
-//!   resumes a fork of it (`--resume … --fork-session`) and is asked for
-//!   the summary. It reads everything; the session itself is untouched,
-//!   running or not, and nothing is typed into it.
+//! - **In full** when the conversation fits (`summary_max_tokens`): the
+//!   agent reads a fork of it (Claude: `--resume … --fork-session`, no
+//!   tools, no persistence; Codex: `codex exec fork … --ephemeral`,
+//!   read-only sandbox) and is asked for the summary. The session itself is
+//!   untouched, running or not, and nothing is typed into it.
 //! - **From excerpts** otherwise (or if that fails): the first prompt and
 //!   the conversation's last messages (`history::read`, bounded), sent as
 //!   plain text.
@@ -21,7 +23,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use rlord_core::agents::claude;
+use rlord_core::agents::transcript::{self, clip};
+use rlord_core::agents::{claude, codex, Agent};
 use rlord_core::types::{now_ms, Session};
 use rlord_core::{history, paths};
 
@@ -32,7 +35,7 @@ text (no headings, no lists unless they help). Cover: what it was for, what got 
 was left unfinished, and the key files, decisions or commands someone would need to pick it \
 up again. Answer from the conversation only; don't use tools.";
 
-/// Each `claude -p` gets this long.
+/// Each run of the agent gets this long.
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Default)]
@@ -111,19 +114,20 @@ pub fn transcripts_of(d: &Daemon, s: &Session) -> Vec<PathBuf> {
             db.past_agent_sessions(&s.id).unwrap_or_default(),
         )
     };
+    let agent = Agent::parse(&s.agent);
+    let path_of = |a: &str| agent.and_then(|ag| ag.transcript_path(&s.project_path, a));
     let mut out: Vec<PathBuf> = Vec::new();
-    let current = src.map(PathBuf::from).or_else(|| {
-        s.agent_session
-            .as_deref()
-            .map(|a| claude::transcript_path(&s.project_path, a))
-    });
-    // Older ones live next to the current one (its project folder), or
-    // under the session's own folder.
+    let current = src
+        .map(PathBuf::from)
+        .or_else(|| s.agent_session.as_deref().and_then(path_of));
+    // Older ones are where the agent puts that conversation; Claude's may
+    // also sit next to the current one (its project folder).
     let dir = current
         .as_ref()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .filter(|_| agent == Some(Agent::Claude));
     let older = past.iter().flat_map(|a| {
-        let mut v = vec![claude::transcript_path(&s.project_path, a)];
+        let mut v: Vec<PathBuf> = path_of(a).into_iter().collect();
         if let Some(d) = &dir {
             v.push(d.join(format!("{a}.jsonl")));
         }
@@ -149,9 +153,7 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
     if !force && !s.summary.trim().is_empty() && s.summary_at.is_some_and(|t| t >= since) {
         return Ok(());
     }
-    if s.agent != "claude" {
-        bail!("summaries read Claude Code transcripts only");
-    }
+    let agent = Agent::named(&s.agent)?;
     // The latest transcript with real work in it, and its conversation id.
     let all = transcripts_of(d, &s);
     let path = all
@@ -160,21 +162,24 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
         .or(all.first())
         .cloned()
         .context("no transcript on disk")?;
-    let conversation = path.file_stem().map(|f| f.to_string_lossy().into_owned());
+    let conversation = conversation_of(agent, &path, &s);
     let cfg = d.config();
-    let model = cfg.archive.summary_model.trim();
+    let model = match agent {
+        Agent::Claude => cfg.archive.summary_model.trim(),
+        Agent::Codex => cfg.archive.codex_summary_model.trim(),
+    };
     let mut ask = ASK.to_string();
     let known = [
         ("The user's one-line description", s.description.trim()),
         ("The user's notes", s.notes.trim()),
     ];
     for (what, v) in known.iter().filter(|(_, v)| !v.is_empty()) {
-        ask.push_str(&format!("\n\n{what}: {}", claude::clip(v, 1500)));
+        ask.push_str(&format!("\n\n{what}: {}", clip(v, 1500)));
     }
     let fits = context_tokens(&path) <= cfg.archive.summary_max_tokens;
     let full = match (&conversation, fits) {
         (Some(a), true) if Path::new(&s.project_path).is_dir() => {
-            run(&["--resume", a, "--fork-session", &ask], model, &s.project_path, None)
+            run(agent, model, Some((a, &ask)), &s.project_path, None)
                 .map_err(|e| tracing::info!(session = %s.id, error = %format!("{e:#}"), "full summary failed; using excerpts"))
                 .ok()
         }
@@ -187,7 +192,7 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
             let dir = paths::data_dir().join("summaries");
             std::fs::create_dir_all(&dir)?;
             let prompt = format!("{ask}\n\nThe conversation (excerpts):\n\n{excerpt}");
-            run(&[], model, &dir.to_string_lossy(), Some(&prompt))?
+            run(agent, model, None, &dir.to_string_lossy(), Some(&prompt))?
         }
     };
     let text = text.trim();
@@ -208,30 +213,30 @@ fn keep_lines(s: &str, max: usize) -> String {
     }
 }
 
-/// The conversation's size in tokens, from its last reported usage (the
-/// whole context it sent); else a guess from the file size.
-pub fn context_tokens(path: &Path) -> u64 {
-    let (_, tail) = claude::read_head_tail(path);
-    for v in tail.iter().rev() {
-        let u = &v["message"]["usage"];
-        if u.is_object() {
-            return [
-                "input_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-            ]
-            .iter()
-            .filter_map(|k| u[*k].as_u64())
-            .sum();
-        }
+/// The conversation a transcript holds, as its agent names it: Claude's
+/// transcript is named after it; a Codex rollout's name ends in it.
+fn conversation_of(agent: Agent, path: &Path, s: &Session) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    match agent {
+        Agent::Claude => Some(stem),
+        Agent::Codex => s
+            .agent_session
+            .clone()
+            .filter(|id| stem.ends_with(id.as_str()))
+            // An older rollout of the session: the id is the name's last 36.
+            .or_else(|| {
+                let at = stem.len().checked_sub(36)?;
+                stem.is_char_boundary(at).then(|| stem[at..].to_string())
+            }),
     }
-    std::fs::metadata(path).map(|m| m.len() / 4).unwrap_or(0)
 }
+
+pub use transcript::context_tokens;
 
 /// The start of the conversation and its last messages, as plain text,
 /// about 14k characters at most.
 fn excerpt(path: &Path) -> Result<String> {
-    let first = claude::transcript_excerpts(path).first_prompt;
+    let first = transcript::transcript_excerpts(path).first_prompt;
     let last = history::read(path, None, 80, 0, 12_000)?;
     let mut out = String::new();
     if let Some(f) = first {
@@ -246,16 +251,36 @@ fn excerpt(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-/// `claude -p` with no tools and nothing saved; its answer.
-fn run(extra: &[&str], model: &str, cwd: &str, stdin: Option<&str>) -> Result<String> {
+/// One run of the agent with nothing saved and nothing it could change
+/// (see `claude::summary_argv`, `codex::summary_argv`); its answer. `fork`:
+/// the conversation to read in full and the question; else `stdin` is the
+/// whole prompt.
+fn run(
+    agent: Agent,
+    model: &str,
+    fork: Option<(&str, &str)>,
+    cwd: &str,
+    stdin: Option<&str>,
+) -> Result<String> {
     use std::io::{Read, Write};
-    let mut cmd = std::process::Command::new("claude");
-    cmd.args(["-p", "--output-format", "json", "--no-session-persistence"])
-        .args(["--tools", ""]);
-    if !model.is_empty() {
-        cmd.args(["--model", model]);
-    }
-    cmd.args(extra)
+    // Codex writes its answer to a file.
+    let out_file = paths::data_dir().join("summaries").join(format!(
+        "answer-{}-{}.txt",
+        std::process::id(),
+        now_ms()
+    ));
+    let argv = match agent {
+        Agent::Claude => claude::summary_argv(model, fork),
+        Agent::Codex => {
+            if let Some(dir) = out_file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            codex::summary_argv(model, fork, &out_file)
+        }
+    };
+    let name = agent.name();
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(cwd)
         // Not one of rlord's sessions: its hooks must not report as one.
         .env_remove("RLORD_SESSION_ID")
@@ -267,8 +292,8 @@ fn run(extra: &[&str], model: &str, cwd: &str, stdin: Option<&str>) -> Result<St
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().context("running claude")?;
-    // Written from its own thread: a stalled claude must not block the
+    let mut child = cmd.spawn().with_context(|| format!("running {name}"))?;
+    // Written from its own thread: a stalled agent must not block the
     // worker past the timeout.
     if let (Some(text), Some(mut w)) = (stdin, child.stdin.take()) {
         let text = text.to_string();
@@ -277,25 +302,41 @@ fn run(extra: &[&str], model: &str, cwd: &str, stdin: Option<&str>) -> Result<St
         });
     }
     // Read while waiting: a full pipe would stall it.
-    let mut so = child.stdout.take().context("claude's output")?;
+    let mut so = child.stdout.take().context("the agent's output")?;
     let reader = std::thread::spawn(move || {
         let mut out = String::new();
         let _ = so.read_to_string(&mut out);
         out
     });
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(st)) => break st,
             Ok(None) if start.elapsed() < TIMEOUT => std::thread::sleep(Duration::from_millis(200)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("claude took too long");
+                let _ = std::fs::remove_file(&out_file);
+                bail!("{name} took too long");
             }
         }
-    }
+    };
     let out = reader.join().unwrap_or_default();
+    match agent {
+        Agent::Claude => claude_answer(&out),
+        Agent::Codex => {
+            let answer = std::fs::read_to_string(&out_file);
+            let _ = std::fs::remove_file(&out_file);
+            if !status.success() {
+                bail!("codex exec failed ({status})");
+            }
+            answer.context("no answer from codex")
+        }
+    }
+}
+
+/// The answer in `claude -p --output-format json`'s output.
+fn claude_answer(out: &str) -> Result<String> {
     let v: Value = serde_json::from_str(out.trim()).context("reading claude's answer")?;
     if v["is_error"] == true {
         bail!(
@@ -312,4 +353,57 @@ fn run(extra: &[&str], model: &str, cwd: &str, stdin: Option<&str>) -> Result<St
         .as_str()
         .map(str::to_string)
         .context("no result from claude")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(agent_session: Option<&str>) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": "01s", "name": "s", "name_locked": false, "agent": "codex",
+            "agent_session": agent_session, "agent_session_trust": "hook",
+            "project_path": "/src/app", "tmux_session": null, "status": "stopped",
+            "group_path": "", "pinned": false, "created_at": 1, "archived_at": null,
+            "last_user_msg_at": null, "last_agent_msg_at": null,
+            "last_state_change_at": null, "repo_path": null, "workspace_path": null,
+            "branch": null, "model": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_transcript_names_its_conversation() {
+        let id = "01a1ce53-c71d-7e13-b376-63f7271fa320";
+        let old = "01a1ce40-0000-7000-8000-000000000000";
+        let rollout = |id: &str| {
+            PathBuf::from(format!(
+                "/h/.codex/sessions/2026/11/11/rollout-2026-11-11T21-55-59-{id}.jsonl"
+            ))
+        };
+        let s = session(Some(id));
+        assert_eq!(
+            conversation_of(Agent::Codex, &rollout(id), &s).as_deref(),
+            Some(id)
+        );
+        // An older rollout of the same session.
+        assert_eq!(
+            conversation_of(Agent::Codex, &rollout(old), &s).as_deref(),
+            Some(old)
+        );
+        assert_eq!(
+            conversation_of(Agent::Claude, Path::new("/p/abc.jsonl"), &s).as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn claude_answers_are_read_from_its_json() {
+        assert_eq!(
+            claude_answer(r#"{"is_error": false, "result": "Did X."}"#).unwrap(),
+            "Did X."
+        );
+        let e = claude_answer(r#"{"is_error": true, "result": "nope"}"#).unwrap_err();
+        assert!(e.to_string().contains("nope"));
+    }
 }

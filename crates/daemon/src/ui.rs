@@ -223,7 +223,7 @@ pub fn reset(d: &Daemon, params: &Value) -> Result<Value> {
     // numbers look wrong).
     if params["rescan"].as_bool() == Some(true) {
         d.db().clear_transcript_cursors()?;
-        rlord_core::agents::claude::clear_cursors();
+        rlord_core::agents::transcript::clear_cursors();
     }
     *d.pending_ui.lock().expect("ui mutex") = None;
     methods::reconcile(&d.db())?;

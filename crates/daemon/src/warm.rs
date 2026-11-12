@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use serde_json::Value;
 
-use rlord_core::agents::claude;
+use rlord_core::agents::{claude, Agent};
 use rlord_core::db::{Db, SessionQuery};
 use rlord_core::types::{Status, Subagent};
 
@@ -113,7 +113,9 @@ pub fn refresh(d: &Daemon, r: &str) -> Result<Vec<Subagent>> {
         let src = db.transcript_source(&s.id)?;
         (s, src)
     };
-    let Some(src) = src else {
+    // (Only Claude's sub-agents are tracked so far.)
+    let tracked = Agent::parse(&s.agent).is_some_and(Agent::tracks_subagents);
+    let Some(src) = src.filter(|_| tracked) else {
         return d.db().subagents(&s.id);
     };
     // Cheap per call: transcript stats are incremental (only appended bytes

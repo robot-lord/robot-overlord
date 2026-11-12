@@ -16,7 +16,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use rlord_core::agents::claude;
+use rlord_core::agents::transcript;
 use rlord_core::db::Db;
 use rlord_core::timefmt::rel_age;
 use rlord_core::types::{now_ms, Session, Status};
@@ -76,7 +76,7 @@ pub fn triage(d: &crate::Daemon, params: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// Rows plus each row's transcript path (claude sessions only).
+/// Rows plus each row's transcript path (when it has one).
 type Collected = (Value, Vec<Option<String>>);
 
 fn collect(db: &Db, params: &Value) -> Result<Collected> {
@@ -103,11 +103,7 @@ fn collect(db: &Db, params: &Value) -> Result<Collected> {
         .into_iter()
         .take(limit)
         .map(|(s, reviewed, changed)| {
-            sources.push(if s.agent == "claude" {
-                db.transcript_source(&s.id).ok().flatten()
-            } else {
-                None
-            });
+            sources.push(db.transcript_source(&s.id).ok().flatten());
             json!({
                 "id": s.id, "name": s.name, "status": s.status,
                 "dir": s.project_path, "branch": s.branch,
@@ -135,7 +131,7 @@ fn fill_excerpts(out: &mut Value, sources: &[Option<String>]) {
     };
     for (row, src) in rows.iter_mut().zip(sources) {
         if let Some(src) = src {
-            let e = claude::transcript_excerpts(std::path::Path::new(src));
+            let e = transcript::transcript_excerpts(std::path::Path::new(src));
             row["excerpts"] = serde_json::to_value(e).unwrap_or(Value::Null);
         }
     }

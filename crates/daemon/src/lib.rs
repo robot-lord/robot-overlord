@@ -174,7 +174,7 @@ impl Daemon {
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
         {
-            use rlord_core::agents::claude::{seed_cursors, STATS_CURSOR_SEED};
+            use rlord_core::agents::transcript::{seed_cursors, STATS_CURSOR_SEED};
             if let Err(e) = db.prune_transcript_cursors(5 * STATS_CURSOR_SEED) {
                 tracing::warn!(error = %e, "pruning transcript read positions");
             }

@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::claude;
+use rlord_core::agents::{claude, transcript, Agent};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Status, Subagent};
@@ -57,8 +57,22 @@ pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
     Ok(json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth}))
 }
 
+/// `[session]` as configured, plus what each agent offers: `agents` lists
+/// every agent rlord can run with its default model and picker choices
+/// (`models` empty: no catalog, the model is typed in).
 pub fn session_defaults(cfg: &Config) -> Result<Value> {
-    Ok(serde_json::to_value(&cfg.session)?)
+    let mut v = serde_json::to_value(&cfg.session)?;
+    v["agents"] = Agent::ALL
+        .into_iter()
+        .map(|a| {
+            json!({
+                "name": a.name(), "label": a.label(), "installed": a.installed(),
+                "model": cfg.session.model_for(a),
+                "models": cfg.session.models_for(a),
+            })
+        })
+        .collect();
+    Ok(v)
 }
 
 pub fn session_list(db: &Db, params: &Value) -> Result<Value> {
@@ -221,12 +235,15 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
 }
 
 /// A session's agent flags from its launch spec: the adapter flags it was
-/// created with, plus `--remote-control <name>` while Remote Control is on
-/// (so every start, resume and fresh start reconnects it). Turned off, it
-/// stays off with a settings override: `--resume` would otherwise reconnect
-/// a conversation that was last connected.
-pub(crate) fn spec_args(spec: &Value) -> Vec<String> {
+/// created with, plus (Claude) `--remote-control <name>` while Remote
+/// Control is on (so every start, resume and fresh start reconnects it).
+/// Turned off, it stays off with a settings override: `--resume` would
+/// otherwise reconnect a conversation that was last connected.
+pub(crate) fn spec_args(agent: Agent, spec: &Value) -> Vec<String> {
     let mut a = str_list(spec, "extra_args");
+    if agent != Agent::Claude {
+        return a;
+    }
     // One --settings override for everything rlord sets.
     let mut settings = serde_json::Map::new();
     if let Some(n) = spec["remote_control"].as_str().filter(|n| !n.is_empty()) {
@@ -317,12 +334,25 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(String::from)
     };
-    let agent = p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone());
-    if agent != "claude" {
-        bail!("agent '{agent}' not supported yet (claude only)");
+    let agent = Agent::named(&p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone()))?;
+    // Internal-only knobs (the overlord uses them; the MCP surface never
+    // forwards them): adapter flags that must survive restarts, a role, and a
+    // fixed tmux name.
+    let extra_args = str_list(params, "extra_args");
+    let role = p_opt("role").unwrap_or_default();
+    if crate::overlord::is_overlord_role(&role) {
+        agent.overlord_seat()?;
     }
+    let remote_control = params["remote_control"].as_bool().unwrap_or(false);
+    if remote_control && !agent.has_remote_control() {
+        bail!(
+            "Remote Control is a Claude Code feature; {} has none",
+            agent.label()
+        );
+    }
+    // Each agent has its own models: the default is that agent's.
     let model = p_opt("model").or_else(|| {
-        let m = cfg.session.model.trim();
+        let m = cfg.session.model_for(agent).trim();
         (!m.is_empty()).then(|| m.to_string())
     });
     let prompt = p_opt("prompt");
@@ -372,28 +402,20 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         _ => (project, None, None),
     };
 
-    // Internal-only knobs (the overlord uses them; the MCP surface never
-    // forwards them): adapter flags that must survive restarts, a role, and a
-    // fixed tmux name.
-    let extra_args = str_list(params, "extra_args");
-    let role = p_opt("role").unwrap_or_default();
     // Remote Control from the start (the caller checked it's available).
-    let remote = params["remote_control"]
-        .as_bool()
-        .unwrap_or(false)
-        .then(|| crate::remote::remote_name(&name, &role));
-    let mut spec = json!({"agent": agent, "model": model, "prompt": prompt,
+    let remote = remote_control.then(|| crate::remote::remote_name(&name, &role));
+    let mut spec = json!({"agent": agent.name(), "model": model, "prompt": prompt,
                           "extra_args": extra_args});
     if let Some(n) = &remote {
         spec["remote_control"] = json!(n);
     }
-    let claude_sid = claude::mint_session_id();
-    let argv = claude::launch_argv(
-        &claude_sid,
+    let launch = agent.launch(
+        &project_path,
         prompt.as_deref(),
         model.as_deref(),
-        &spec_args(&spec),
+        &spec_args(agent, &spec),
     );
+    let argv = &launch.argv;
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
@@ -404,8 +426,8 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     db.insert_session(&NewSession {
         id: &id,
         name: &name,
-        agent: &agent,
-        agent_session: Some(&claude_sid),
+        agent: agent.name(),
+        agent_session: launch.session_id.as_deref(),
         project_path: &project_path,
         tmux_session: Some(&tmux_name),
         launch_spec: &launch_spec,
@@ -418,14 +440,16 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(r) = &repo {
         db.touch_repo(r, now)?;
     }
-    db.upsert_transcript_source(
-        &id,
-        claude::transcript_path(&project_path, &claude_sid)
-            .to_str()
-            .unwrap_or(""),
-    )?;
+    if let Some(t) = &launch.transcript {
+        db.upsert_transcript_source(&id, &t.to_string_lossy())?;
+    }
+    if !agent.mints_id() {
+        // Its conversation is bound once the agent reports it (or it turns
+        // up in the agent's own index): one started from now on.
+        db.kv_set(&bind_since_key(&id), &now.to_string())?;
+    }
 
-    let cmd = tmux::pane_command(&pane_env(&id), &argv);
+    let cmd = tmux::pane_command(&pane_env(&id), argv);
     tmux::new_session(&tmux_name, &project_path, &cmd)?;
     db.insert_event(
         &id,
@@ -433,7 +457,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         "launched",
         &json!({"argv": argv, "workspace": workspace_path, "branch": branch}).to_string(),
     )?;
-    tracing::info!(session = %id, name = %name, workspace = ?workspace_path, "launched claude session");
+    tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
@@ -643,24 +667,18 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     if s.archived_at.is_some() {
         bail!("{} is archived: unarchive it first", s.name);
     }
-    if s.agent != "claude" {
-        bail!("restart not supported for agent '{}'", s.agent);
-    }
-    let sid = s
-        .agent_session
-        .as_deref()
-        .context("session has no agent session id; cannot resume")?;
+    let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let argv = claude::resume_argv(
-        sid,
+    let (argv, resumed) = agent.resume(
+        s.agent_session.as_deref(),
         &s.agent_session_trust,
         &s.project_path,
         model.as_deref(),
-        &spec_args(&spec),
+        &spec_args(agent, &spec),
     )?;
     let tmux_name = match s.tmux_session.clone() {
         Some(n) => n,
@@ -671,7 +689,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         }
     };
     let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
-    let resumed = argv.iter().any(|a| a == "--resume");
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
@@ -694,37 +711,42 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
 /// can still be resumed with the agent's own `--resume`.
 pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    if s.agent != "claude" {
-        bail!("fresh start not supported for agent '{}'", s.agent);
-    }
+    let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
-    let sid = claude::mint_session_id();
-    let argv = claude::launch_argv(&sid, None, model, &spec_args(&spec));
+    let launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
+    let argv = &launch.argv;
     let tmux_name = s
         .tmux_session
         .clone()
         .context("session has no tmux session")?;
-    let cmd = tmux::pane_command(&pane_env(&s.id), &argv);
+    let cmd = tmux::pane_command(&pane_env(&s.id), argv);
+    let now = now_ms();
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    let now = now_ms();
-    db.set_agent_session(&s.id, &sid, "minted")?;
-    db.upsert_transcript_source(
-        &s.id,
-        claude::transcript_path(&s.project_path, &sid)
-            .to_str()
-            .unwrap_or(""),
-    )?;
+    match (&launch.session_id, &launch.transcript) {
+        (Some(sid), transcript) => {
+            db.set_agent_session(&s.id, sid, "minted")?;
+            if let Some(t) = transcript {
+                db.upsert_transcript_source(&s.id, &t.to_string_lossy())?;
+            }
+        }
+        // The agent assigns the new id: nothing is bound until it reports
+        // one started from now on.
+        (None, _) => {
+            db.clear_agent_session(&s.id)?;
+            db.kv_set(&bind_since_key(&s.id), &now.to_string())?;
+        }
+    }
     db.set_status(&s.id, Status::Starting, now)?;
     db.insert_event(
         &s.id,
         now,
         "fresh_conversation",
-        &json!({"from": s.agent_session, "to": sid}).to_string(),
+        &json!({"from": s.agent_session, "to": launch.session_id}).to_string(),
     )?;
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
@@ -779,12 +801,18 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         return Ok(json!({"ignored": why}));
     }
 
-    if agent == "claude" {
+    // The hooks of the agent the session runs (another agent started by
+    // hand in its pane inherits RLORD_SESSION_ID: logged, nothing more).
+    if let Some(agent) = Agent::parse(agent).filter(|a| a.name() == s.agent) {
+        let mut bound = true;
         if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
             match s.agent_session.as_deref() {
                 None => db.set_agent_session(&s.id, sid, "hook")?,
+                // Another conversation in the pane that isn't the session's
+                // (Codex: a sub-agent's thread): its events aren't ours.
+                Some(cur) if cur != sid && !agent.adopts_new_id_on(event) => bound = false,
                 Some(cur) if cur != sid => {
-                    // Claude is the truth about what it's writing; adopt, but log it.
+                    // The agent is the truth about what it's writing; adopt, but log it.
                     db.insert_event(
                         &s.id,
                         now,
@@ -799,10 +827,13 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
                 _ => {}
             }
         }
+        if !bound {
+            return Ok(json!({"ignored": "another conversation in the pane"}));
+        }
         if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
             db.upsert_transcript_source(&s.id, tp)?;
         }
-        let (kind, status) = claude::map_hook_event(event);
+        let (kind, status) = agent.map_hook_event(event);
         match kind {
             "prompt_submitted" => db.touch_last_user_msg(&s.id, now)?,
             "agent_stopped" => db.touch_last_agent_msg(&s.id, now)?,
@@ -816,7 +847,7 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }
-        if kind.starts_with("subagent_") {
+        if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
         } else {
             // Keep the log light: the event name only.
@@ -911,7 +942,7 @@ fn ingest_subagent_hook(
             a.finished_at = Some(now);
             if let Some(tp) = payload["agent_transcript_path"].as_str() {
                 a.transcript_path = Some(tp.to_string());
-                if let Some(st) = claude::transcript_stats(std::path::Path::new(tp)) {
+                if let Some(st) = transcript::transcript_stats(std::path::Path::new(tp)) {
                     a.input_tokens = st.input_tokens;
                     a.output_tokens = st.output_tokens;
                 }
@@ -934,7 +965,7 @@ fn ingest_subagent_hook(
 
 /// Save transcript read positions that moved (so a restart reads forward).
 pub(crate) fn save_cursors(db: &Db) {
-    let dirty = claude::take_dirty_cursors();
+    let dirty = transcript::take_dirty_cursors();
     if let Err(e) = db.save_transcript_cursors(&dirty) {
         tracing::warn!(error = %e, "saving transcript read positions");
     }
@@ -965,10 +996,11 @@ pub fn reconcile(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// The hook command installed into Claude settings: absolute path, so hooks
-/// work regardless of PATH.
-pub fn hook_command() -> String {
-    format!("{} hook emit claude", rlord_bin())
+/// kv key: when a session whose agent assigns its own conversation id was
+/// last launched on a new conversation (ms). The conversation bound to it
+/// must have started since.
+pub(crate) fn bind_since_key(id: &str) -> String {
+    format!("bind_since:{id}")
 }
 
 #[cfg(test)]
@@ -977,14 +1009,19 @@ mod tests {
     #[test]
     fn remote_control_flags_follow_the_spec() {
         let on = json!({"extra_args": ["--x"], "remote_control": "web"});
-        assert_eq!(spec_args(&on), ["--x", "--remote-control", "web"]);
+        assert_eq!(
+            spec_args(Agent::Claude, &on),
+            ["--x", "--remote-control", "web"]
+        );
+        // Remote Control and the renderer are Claude's: not Codex flags.
+        assert_eq!(spec_args(Agent::Codex, &on), ["--x"]);
         let off = json!({"remote_control_off": true});
         // (No renderer set in tests: CLAUDE_TUI is unset.)
         assert_eq!(
-            spec_args(&off),
+            spec_args(Agent::Claude, &off),
             ["--settings", r#"{"disableRemoteControl":true}"#]
         );
-        assert!(spec_args(&json!({})).is_empty());
+        assert!(spec_args(Agent::Claude, &json!({})).is_empty());
     }
 
     use super::*;

@@ -259,7 +259,7 @@ fn summarize(s: &Value) -> Value {
                 Value::Null
             }
         } else {
-            json!(rlord_core::agents::claude::clip(sum, 200))
+            json!(rlord_core::agents::transcript::clip(sum, 200))
         };
     }
     row

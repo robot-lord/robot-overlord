@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::agents::claude;
+use crate::agents::transcript::{self, Format};
 use crate::git;
 
 /// One conversation that could be imported.
@@ -142,7 +143,7 @@ fn candidate(
     procs: &str,
     excluded: &[PathBuf],
 ) -> Result<Candidate, String> {
-    let (head, tail) = claude::read_head_tail(path);
+    let (head, tail) = transcript::read_head_tail(path);
     let all = || head.iter().chain(tail.iter());
 
     // `claude --resume` finds a conversation by the folder it runs in, so the
@@ -183,7 +184,7 @@ fn candidate(
             "a headless run (entrypoint {e}), not a conversation"
         ));
     }
-    let mut ex = claude::excerpts_from(&head, &tail);
+    let mut ex = transcript::excerpts_from(Format::Claude, &head, &tail);
     // Something the user actually typed. The first prompt can sit past the
     // head window (big attachments) or follow a slash command, so the latest
     // one counts too; a session of only commands (/login, /exit) doesn't.
@@ -195,7 +196,7 @@ fn candidate(
         ex.first_prompt = ex.last_prompt.clone();
     }
 
-    let ts = |v: &Value| v["timestamp"].as_str().and_then(claude::parse_iso_ms);
+    let ts = |v: &Value| v["timestamp"].as_str().and_then(transcript::parse_iso_ms);
     let exchange =
         |v: &&Value| (v["type"] == "user" || v["type"] == "assistant") && v["isMeta"] != true;
     let last_of = |kind: &str| {
@@ -476,7 +477,7 @@ mod tests {
             &empty,
         );
 
-        let since = claude::parse_iso_ms("2026-11-01T00:00:00.000Z").unwrap();
+        let since = transcript::parse_iso_ms("2026-11-01T00:00:00.000Z").unwrap();
         let opts = ScanOpts {
             since_ms: since,
             ..Default::default()
@@ -494,7 +495,7 @@ mod tests {
         assert_eq!(c.pr_url.as_deref(), Some("https://example.test/pr/7"));
         assert_eq!(
             c.last_active_at,
-            claude::parse_iso_ms("2026-11-05T12:00:00.000Z").unwrap()
+            transcript::parse_iso_ms("2026-11-05T12:00:00.000Z").unwrap()
         );
         assert!(c.open_elsewhere && c.dir_exists && c.repo.is_none());
 

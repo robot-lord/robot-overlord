@@ -88,9 +88,12 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
 /// lock; only the insert holds it.
 pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
     let sid = p_str(params, "agent_session")?.trim().to_string();
-    let agent = params["agent"].as_str().unwrap_or("claude");
-    if agent != "claude" {
-        bail!("importing '{agent}' conversations isn't supported yet (claude only)");
+    let agent = rlord_core::agents::Agent::named(params["agent"].as_str().unwrap_or("claude"))?;
+    if !agent.importable() {
+        bail!(
+            "importing {} conversations isn't supported yet",
+            agent.label()
+        );
     }
     if sid.len() != 36 {
         bail!("give the full conversation id");

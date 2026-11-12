@@ -213,12 +213,15 @@ impl Default for OverlordConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionDefaults {
-    /// Coding tool. Only `claude` today.
+    /// Coding tool new sessions run: `claude` or `codex`.
     pub agent: String,
-    /// Model passed to the agent (`--model`). Empty = the agent's own default.
+    /// Model passed to Claude Code (`--model`). Empty = its own default.
     pub model: String,
-    /// Choices offered by the model picker.
+    /// Choices offered by the model picker for Claude Code.
     pub models: Vec<String>,
+    /// Model passed to Codex (`--model`). Empty = Codex's own default. (Its
+    /// picker choices come from Codex's own model catalog.)
+    pub codex_model: String,
     /// Create each new session in its own git worktree under `workspace_dir`.
     pub workspace: bool,
     /// Directory (relative to the repo root) that holds session worktrees.
@@ -241,6 +244,7 @@ impl Default for SessionDefaults {
             agent: "claude".into(),
             model: "opus".into(),
             models: vec!["opus".into(), "sonnet".into(), "haiku".into()],
+            codex_model: String::new(),
             workspace: true,
             workspace_dir: ".worktrees".into(),
             default_repo: String::new(),
@@ -252,6 +256,24 @@ impl Default for SessionDefaults {
 }
 
 impl SessionDefaults {
+    /// The default model for sessions of `agent` ("" = the agent's own).
+    pub fn model_for(&self, agent: crate::agents::Agent) -> &str {
+        match agent {
+            crate::agents::Agent::Claude => &self.model,
+            crate::agents::Agent::Codex => &self.codex_model,
+        }
+    }
+
+    /// The model picker's choices for `agent`.
+    pub fn models_for(&self, agent: crate::agents::Agent) -> Vec<String> {
+        match agent {
+            crate::agents::Agent::Claude => self.models.clone(),
+            crate::agents::Agent::Codex => {
+                crate::agents::codex::models(&crate::agents::codex::home())
+            }
+        }
+    }
+
     /// `default_repo` with `~` expanded; None when unset.
     pub fn default_repo_path(&self) -> Option<String> {
         let r = self.default_repo.trim();
@@ -322,8 +344,11 @@ impl Default for UpdateConfig {
 pub struct ArchiveConfig {
     /// Make a summary when a session is archived (in the background).
     pub summary: bool,
-    /// The model that writes it: a cheap one is plenty.
+    /// The model that writes a Claude Code session's: a cheap one is plenty.
     pub summary_model: String,
+    /// The model that writes a Codex session's (a session's own agent
+    /// summarizes it). Empty = Codex's default.
+    pub codex_summary_model: String,
     /// A conversation bigger than this (tokens) is summarized from excerpts
     /// instead of in full.
     pub summary_max_tokens: u64,
@@ -334,6 +359,7 @@ impl Default for ArchiveConfig {
         ArchiveConfig {
             summary: true,
             summary_model: "haiku".into(),
+            codex_summary_model: String::new(),
             summary_max_tokens: 150_000,
         }
     }
@@ -446,9 +472,11 @@ theme = "rlord"
 
 # Defaults for every session you create (TUI form or `rlord new`).
 [session]
-agent = "claude"
-model = "opus"                  # passed as --model; "" = the agent's default
-models = ["opus", "sonnet", "haiku"]   # model picker choices
+agent = "claude"                # what new sessions run: "claude" or "codex"
+model = "opus"                  # Claude Code's --model; "" = its default
+models = ["opus", "sonnet", "haiku"]   # model picker choices (Claude Code)
+codex_model = ""                # Codex's --model; "" = its default (the
+                                # picker offers Codex's own model list)
 workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
@@ -530,9 +558,11 @@ profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 
 # Archiving a session writes a short summary of what it did (once, in the
 # background, on a cheap model), shown and searched with archived sessions.
+# A session's own agent writes it.
 [archive]
 summary = true
-summary_model = "haiku"
+summary_model = "haiku"         # for Claude Code sessions
+codex_summary_model = ""        # for Codex sessions; "" = Codex's default
 summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
 
 # `rlord update`: "stable" releases, or "dev" for the newest of any kind

@@ -1,4 +1,4 @@
-use crate::agents::claude::{CursorState, STATS_PARSE_VERSION};
+use crate::agents::transcript::{CursorState, STATS_PARSE_VERSION};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -832,6 +832,20 @@ impl Db {
             "UPDATE sessions SET agent_session = ?2, agent_session_trust = ?3 WHERE id = ?1",
             params![id, agent_session, trust],
         )?;
+        Ok(())
+    }
+
+    /// Forget a session's conversation (it starts a new one whose id the
+    /// agent assigns: bound again when the agent reports it) and where its
+    /// transcript was.
+    pub fn clear_agent_session(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET agent_session = NULL, agent_session_trust = 'minted' \
+             WHERE id = ?1",
+            params![id],
+        )?;
+        self.conn
+            .execute("DELETE FROM transcripts WHERE session_id = ?1", params![id])?;
         Ok(())
     }
 

@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use rlord_core::agents::{transcript, Agent};
 use rlord_core::config::Config;
 use rlord_core::timefmt::{fmt_ts, rel_age};
-use rlord_core::{agents::claude, paths, tmux};
+use rlord_core::{paths, tmux};
 use rlord_daemon::{autostart, client_call, methods, spool_hook_event, Daemon};
 
 #[derive(Parser)]
@@ -103,9 +104,13 @@ enum Command {
         /// Branch / workspace name (default: derived from the session name)
         #[arg(long)]
         branch: Option<String>,
-        /// Model passed to the agent (default: [session].model)
+        /// Model passed to the agent (default: [session].model, or
+        /// codex_model for Codex)
         #[arg(long)]
         model: Option<String>,
+        /// Coding agent to run: claude or codex (default: [session].agent)
+        #[arg(long)]
+        agent: Option<String>,
         /// Display name (default: <repo>-<id suffix>)
         #[arg(long)]
         name: Option<String>,
@@ -247,7 +252,13 @@ enum Command {
     Hook(HookCmd),
     /// Claude Code integration management
     #[command(subcommand)]
-    Claude(ClaudeCmd),
+    Claude(AgentCmd),
+    /// Codex integration management
+    #[command(subcommand)]
+    Codex(AgentCmd),
+    /// Install rlord's hook handler for every agent that is installed
+    /// (Claude Code, Codex): how rlord sees what each session is doing
+    InstallHooks,
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
@@ -365,8 +376,10 @@ enum HookCmd {
 }
 
 #[derive(Subcommand)]
-enum ClaudeCmd {
-    /// Install rlord's hook handler into Claude Code's settings.json
+enum AgentCmd {
+    /// Install rlord's hook handler into the agent's hooks (Claude Code's
+    /// settings.json, Codex's hooks.json): how rlord sees what its
+    /// sessions are doing
     InstallHooks,
 }
 
@@ -672,6 +685,7 @@ fn main() -> Result<()> {
             no_workspace,
             branch,
             model,
+            agent,
             name,
             attach,
         } => {
@@ -699,7 +713,7 @@ fn main() -> Result<()> {
                 "session.new",
                 json!({
                     "repo": repo, "project": project, "name": name, "prompt": prompt,
-                    "branch": branch, "model": model,
+                    "branch": branch, "model": model, "agent": agent,
                     "workspace": if no_workspace { Some(false) } else { None },
                 }),
             )?;
@@ -985,21 +999,44 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Hook(HookCmd::Emit { agent }) => hook_emit(&agent),
-        Command::Claude(ClaudeCmd::InstallHooks) => {
-            let settings = claude::config_dir().join("settings.json");
-            let changed = claude::install_hooks(&settings, &methods::hook_command())?;
-            println!(
-                "{} ({})",
-                if changed {
-                    "hooks installed"
-                } else {
-                    "hooks already installed"
-                },
-                settings.display()
-            );
-            Ok(())
+        Command::Claude(AgentCmd::InstallHooks) => install_hooks(&[Agent::Claude]),
+        Command::Codex(AgentCmd::InstallHooks) => install_hooks(&[Agent::Codex]),
+        Command::InstallHooks => {
+            let found: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.installed()).collect();
+            if found.is_empty() {
+                anyhow::bail!("neither `claude` nor `codex` is on PATH: install one first");
+            }
+            install_hooks(&found)
         }
     }
+}
+
+/// Merge rlord's hook command into each agent's hooks file, and say what
+/// the user still has to do (Codex: trust them).
+fn install_hooks(agents: &[Agent]) -> Result<()> {
+    let bin = methods::rlord_bin();
+    for (i, agent) in agents.iter().enumerate() {
+        let changed = agent.install_hooks(&bin)?;
+        if agents.len() > 1 {
+            if i > 0 {
+                println!();
+            }
+            println!("{}:", agent.label());
+        }
+        println!(
+            "{} ({})",
+            if changed {
+                "hooks installed"
+            } else {
+                "hooks already installed"
+            },
+            agent.hooks_file().display()
+        );
+        if let Some(next) = agent.hooks_next_step() {
+            println!("\n{next}");
+        }
+    }
+    Ok(())
 }
 
 fn tmux_import(dry_run: bool, remove: bool) -> Result<()> {
@@ -1144,7 +1181,7 @@ fn import_cmd(
                 rel_age(c["last_active_at"].as_i64()),
                 dir,
                 flags,
-                claude::clip(what, 100),
+                transcript::clip(what, 100),
             );
         }
         println!(

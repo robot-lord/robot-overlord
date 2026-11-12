@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::claude;
+use rlord_core::agents::transcript::clip;
+use rlord_core::agents::{self, Agent};
 use rlord_core::db::{ArchivedMode, SessionQuery};
 use rlord_core::history;
 use rlord_core::types::Session;
@@ -68,10 +69,17 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     // The overlord's own conversations are full of searches: never results.
     // Whole folders: each seat runs in its own, so every conversation it
     // ever had is in there, known to rlord or not.
-    let mut skip: std::collections::HashSet<PathBuf> = crate::overlord::SEATS
+    // (Claude keeps a folder's conversations together, so its transcript
+    // directory stands for the folder; a Codex rollout says its folder.)
+    let seat_dirs: Vec<String> = crate::overlord::SEATS
         .iter()
-        .filter_map(|seat| {
-            claude::transcript_path(&seat.dir().to_string_lossy(), "x")
+        .map(|seat| seat.dir().to_string_lossy().into_owned())
+        .collect();
+    let mut skip: std::collections::HashSet<PathBuf> = seat_dirs
+        .iter()
+        .filter_map(|dir| {
+            Agent::Claude
+                .transcript_path(dir, "x")?
                 .parent()
                 .map(Path::to_path_buf)
         })
@@ -84,7 +92,9 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                     .filter_map(|p| p.parent().map(Path::to_path_buf)),
             );
             if let Some(a) = &s.agent_session {
-                if let Some(dir) = claude::transcript_path(&s.project_path, a).parent() {
+                let p = Agent::parse(&s.agent)
+                    .and_then(|agent| agent.transcript_path(&s.project_path, a));
+                if let Some(dir) = p.as_deref().and_then(Path::parent) {
                     skip.insert(dir.to_path_buf());
                 }
             }
@@ -99,11 +109,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         paths_of.insert(i, ps);
     }
     if everywhere {
-        paths.extend(
-            history::all_claude_transcripts().into_iter().filter(|p| {
-                !by_path.contains_key(p) && !p.parent().is_some_and(|d| skip.contains(d))
-            }),
-        );
+        paths.extend(history::all_transcripts().into_iter().filter(|p| {
+            !by_path.contains_key(p)
+                && !p.parent().is_some_and(|d| skip.contains(d))
+                && !in_seat_folder(p, &seat_dirs)
+        }));
     }
     let found = history::search(&paths, query, PER_FILE);
     // A session's hits across its transcripts (current first); each hit
@@ -160,7 +170,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                 "session": s.name, "id": s.id,
                 "archived": s.archived_at.is_some(),
                 "status": s.status.as_str(),
-                "about": claude::clip(about, 240),
+                "about": clip(about, 240),
                 "matched_in": fields,
                 "transcript_hits": n,
                 "hits": hits.get(&i).map(|h| json!(h.1)).unwrap_or(json!([])),
@@ -175,7 +185,8 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         .map(|fh| {
             json!({
                 "transcript": fh.path,
-                "folder": project_of(&fh.path),
+                "agent": agents::agent_of(&fh.path).name(),
+                "folder": agents::agent_of(&fh.path).transcript_folder(&fh.path),
                 "transcript_hits": fh.total,
                 "hits": fh.hits,
             })
@@ -194,13 +205,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(v)
 }
 
-/// The folder a Claude transcript belongs to (its project directory name,
-/// which is the path with `/` as `-`).
-fn project_of(p: &Path) -> String {
-    p.parent()
-        .and_then(|d| d.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+/// A Codex rollout of a conversation that ran in an overlord seat's folder
+/// (rollouts sit together by date, so each one is asked).
+fn in_seat_folder(p: &Path, seat_dirs: &[String]) -> bool {
+    agents::agent_of(p) == Agent::Codex
+        && agents::codex::rollout_cwd(p).is_some_and(|cwd| seat_dirs.contains(&cwd))
 }
 
 pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
@@ -225,11 +234,13 @@ pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
             (json!({"session": s.name, "id": s.id}), p)
         }
         (_, Some(t)) => {
-            // Only Claude Code's own transcripts.
-            let root = std::fs::canonicalize(claude::config_dir().join("projects"))?;
+            // Only the agents' own transcripts.
             let p = std::fs::canonicalize(t).context("no such transcript")?;
-            if !p.starts_with(&root) || p.extension().is_none_or(|x| x != "jsonl") {
-                bail!("not a Claude Code transcript");
+            let known = Agent::ALL.into_iter().any(|a| {
+                std::fs::canonicalize(a.transcripts_root()).is_ok_and(|root| p.starts_with(root))
+            });
+            if !known || p.extension().is_none_or(|x| x != "jsonl") {
+                bail!("not an agent's transcript");
             }
             (json!({"transcript": p}), p)
         }
@@ -270,8 +281,8 @@ pub fn summarize(d: &Daemon, params: &Value) -> Result<Value> {
                 continue;
             }
         };
-        let why = if s.agent != "claude" {
-            Some("not a Claude Code session")
+        let why = if Agent::parse(&s.agent).is_none() {
+            Some("its agent can't write one")
         } else if !force && !s.summary.trim().is_empty() {
             Some("already has one (force to redo)")
         } else if summary::transcript_of(d, &s).is_none() {
