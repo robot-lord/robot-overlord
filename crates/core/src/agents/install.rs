@@ -230,9 +230,10 @@ pub fn resolved(bin: &str) -> Option<PathBuf> {
 
 /// Ask the login shell about every agent rlord runs that PATH doesn't
 /// have (outside any lock: at daemon start, and before a launch), so
-/// `resolved` knows. Also what else a launch or the form needs that means
-/// running the agent: OpenCode's version (rlord needs v2) and its model
-/// list, each remembered (`version_known`, `opencode::models`).
+/// `resolved` knows. Also OpenCode's version (rlord needs v2; remembered,
+/// `version_known`), and its model list when its background server is
+/// already running. Nothing here starts that server: `list_models` is for
+/// when the user asks to see the models.
 pub fn warm() {
     // Only the ones PATH lacks need the shell, and those at the same time:
     // a slow shell costs its limit once, not once per agent.
@@ -247,10 +248,20 @@ pub fn warm() {
         }
     });
     if let Some(bin) = resolved(Agent::OpenCode.name()) {
-        let usable = version(&bin).is_none_or(|v| opencode::too_old(&v).is_none());
-        if usable {
-            opencode::refresh_models(&bin);
-        }
+        version(&bin);
+        opencode::list_models(None);
+    }
+}
+
+/// The model lists that need asking for, brought up to date: OpenCode's,
+/// from its server or, with none running, `opencode models` (which may
+/// start it). For when the user is choosing a model or looking at their
+/// agents (the new-session form, `rlord agents`); never at daemon start
+/// or before a launch. Outside any lock, after `warm`.
+pub fn list_models() {
+    if let Some(bin) = resolved(Agent::OpenCode.name()) {
+        let usable = version_known(&bin).is_none_or(|v| opencode::too_old(&v).is_none());
+        opencode::list_models(usable.then_some(bin.as_path()));
     }
 }
 

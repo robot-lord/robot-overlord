@@ -174,7 +174,7 @@ static MODELS: std::sync::Mutex<Listed> = std::sync::Mutex::new(None);
 /// How long a model list is taken as current.
 const MODELS_FOR: Duration = Duration::from_secs(600);
 
-/// The models OpenCode offers, as last listed (`refresh_models`). Starts
+/// The models OpenCode offers, as last listed (`list_models`). Starts
 /// nothing: safe under a lock. Empty until listed: the model is typed in.
 pub fn models() -> Vec<String> {
     MODELS
@@ -184,25 +184,48 @@ pub fn models() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// List OpenCode's models (`<bin> models`, five seconds at most) when the
-/// last list is older than ten minutes. **Runs the command**: never call it
-/// while holding a lock others wait on.
-pub fn refresh_models(bin: &Path) {
-    let fresh = MODELS
-        .lock()
-        .ok()
-        .is_some_and(|m| m.as_ref().is_some_and(|(at, _)| at.elapsed() < MODELS_FOR));
-    if fresh {
+fn models_fresh() -> bool {
+    MODELS.lock().ok().is_some_and(|m| {
+        m.as_ref()
+            .is_some_and(|(at, v)| !v.is_empty() && at.elapsed() < MODELS_FOR)
+    })
+}
+
+fn keep_models(listed: Vec<String>) -> bool {
+    // (A failed or empty listing keeps the last one.)
+    if listed.is_empty() {
+        return false;
+    }
+    if let Ok(mut m) = MODELS.lock() {
+        *m = Some((Instant::now(), listed));
+    }
+    true
+}
+
+/// List OpenCode's models when the last list is older than ten minutes:
+/// from its background server when one is running (`GET /api/model`), and
+/// otherwise, only when `bin` is given, by running `<bin> models` (five
+/// seconds at most).
+///
+/// `bin` is for when the user asked to see them (the new-session form,
+/// `rlord agents`): the command may start OpenCode's server, which rlord
+/// must not do on its own (at daemon start, before a launch). Makes a
+/// request or runs a command: never call it holding a lock others wait on.
+pub fn list_models(bin: Option<&Path>) {
+    if models_fresh() {
         return;
     }
-    let listed = run_bounded(bin, &["models"], Duration::from_secs(5))
-        .map(|out| parse_models(&out))
-        .unwrap_or_default();
-    if let Ok(mut m) = MODELS.lock() {
-        // A failed listing keeps the last one (and is asked again later).
-        if !listed.is_empty() || m.is_none() {
-            *m = Some((Instant::now(), listed));
-        }
+    let served = super::opencode_service::Service::read(&service_file())
+        .and_then(|svc| svc.models())
+        .is_some_and(keep_models);
+    if served {
+        return;
+    }
+    if let Some(bin) = bin {
+        let listed = run_bounded(bin, &["models"], Duration::from_secs(5))
+            .map(|out| parse_models(&out))
+            .unwrap_or_default();
+        keep_models(listed);
     }
 }
 

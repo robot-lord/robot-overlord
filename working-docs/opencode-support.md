@@ -66,15 +66,24 @@ Sessions work end to end (the scope of Codex's phase 2).
   OpenCode's shape (12 hex digits of inverted time, 14 base-62). No hooks
   (`Agent::uses_hooks`). Install detection runs it with a v2 floor read
   from `--version` (`install::warm` asks, `missing` and the form refuse an
-  older one with the upgrade command). Models: `opencode models`, listed by
-  `install::warm` (outside any lock), kept ten minutes.
+  older one with the upgrade command). Models, kept ten minutes: from the
+  server (`GET /api/model`) whenever one is running; `opencode models`
+  only when the user asks to see them (the form opening, `rlord agents` /
+  `list_agents`: `install::list_models`), never at daemon start, before a
+  launch or for the overlord's `get_session_defaults`, because the command
+  may start OpenCode's server (Brandon's call).
 - **The TUI has no model flag** (only `opencode run` has `-m`): a model is
   set through the server (`POST /api/session/{id}/model`) once the session
   exists, and a first prompt given with a model is held back and sent
   after it (`POST …/prompt`), or it would run on the default model.
   `Launch::deferred` carries both; kv `deferred:<session>`; applied by the
   status task. Without a model the prompt goes on the command line
-  (`--prompt`).
+  (`--prompt`). The wait is bounded (Brandon's call): 20s after launch
+  with no server or no session, the prompt is typed into the pane instead
+  (default model) and `launch_applied` in the session's log says the model
+  wasn't applied; a model the server refuses is logged the same way and
+  the prompt still goes. A prompt that can't be delivered at all is kept
+  in that log entry.
 - **Status** (`daemon/src/opencode.rs`, client and event mapping in
   `core/src/agents/opencode_service.rs`): one thread, one connection to
   `GET /api/event?types=…` (types repeated; a comma-separated list is
@@ -128,14 +137,15 @@ form (events and the pending lists are from the OpenAPI spec),
 `POST …/prompt`, `opencode run … --fork --archived` (that `--archived`
 marks the fork `time_archived`, which is how rlord finds the fork to
 delete: if it doesn't, the fork is left behind, never a wrong one
-deleted), `opencode models` starting the server as a side effect, and an
-OpenCode older than v2 (what its `--version` prints).
+deleted), `GET /api/model` (names built from `providerID` and `modelID` /
+`id`, per the spec), and an OpenCode older than v2 (what its `--version`
+prints).
 
 The whole flow was run in a scratch rlord against a stand-in server that
 speaks the observed format: deferred model and prompt, every status
 transition from events, an outage (fallback to the rows), reconnect and
-resync with a pending permission, pane death, resume, and both summary
-paths.
+resync with a pending permission, pane death, resume, both summary
+paths, and a held-back prompt typed into the pane when no server came up.
 
 ## Known limits
 
@@ -145,7 +155,8 @@ paths.
   the turn may go on unseen.
 - While no server is reachable, "needs you" can't be seen.
 - A turn rlord learns of from the session row (resync, no server) is
-  logged as `prompt_submitted` whoever started it.
+  logged as `prompt_submitted` whoever started it (as `discover` does for
+  Codex; agreed).
 - `generate` adds its tokens to the session's totals (so a summary nudges
   the session's token counts).
 - Summaries by fork or excerpts may run tools if the model insists (no

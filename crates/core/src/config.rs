@@ -283,7 +283,7 @@ impl SessionDefaults {
             crate::agents::Agent::Codex => {
                 crate::agents::codex::models(&crate::agents::codex::home())
             }
-            // (As last listed: `install::warm` keeps it current.)
+            // (As last listed: see `install::list_models`.)
             crate::agents::Agent::OpenCode => crate::agents::opencode::models(),
         }
     }

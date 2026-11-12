@@ -333,6 +333,11 @@ impl Daemon {
         ) {
             rlord_core::agents::install::warm();
         }
+        // The user is about to choose a model, or is looking at their
+        // agents: lists that must be asked for (OpenCode's) are, here only.
+        if matches!(method, "session.defaults" | "agents.list") && params["no_listing"] != true {
+            rlord_core::agents::install::list_models();
+        }
         if let Some(r) = self.call_ui(method, &params) {
             return r.map_err(MethodError::Internal);
         }

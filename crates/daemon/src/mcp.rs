@@ -408,7 +408,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 .unwrap_or_default();
             Ok(json!({"repos": repos}))
         }
-        "get_session_defaults" => d.rpc("session.defaults", json!({})),
+        // (Asked before most launches: not the moment to run a command
+        // for a model list. The form and `list_agents` do.)
+        "get_session_defaults" => d.rpc("session.defaults", json!({"no_listing": true})),
         "hand_off" => d.rpc(
             "overlord.hand_off",
             json!({"request": arg_str(args, "request").context("missing 'request'")?,

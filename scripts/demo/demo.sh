@@ -25,6 +25,12 @@ fi
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
 mkdir -p "$d"/{data,config/robot-overlord,run,state,claude,codex,bin,src,screens,states,summaries}
 d=$(cd "$d" && pwd)
+# The daemon's socket lives under it, and a unix socket's path is short
+# (about 100 bytes): say so here, not as a daemon that "isn't answering".
+if (( $(printf '%s' "$d/run/robot-overlord/daemon.sock" | wc -c) > 100 )); then
+  echo "demo dir path too long for a unix socket; use a shorter DIR: $d" >&2
+  exit 1
+fi
 
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)

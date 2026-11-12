@@ -240,6 +240,15 @@ impl Service {
         Some(out)
     }
 
+    /// The models the server offers, as `provider/model` (None: it
+    /// couldn't be asked).
+    pub fn models(&self) -> Option<Vec<String>> {
+        let v = self
+            .json("GET", "/api/model", None, Duration::from_secs(3))
+            .ok()?;
+        Some(model_names(&v))
+    }
+
     /// Switch the model session `id` uses from its next turn on.
     pub fn set_model(&self, id: &str, model: &Value) -> Result<()> {
         if !is_session_id(id) {
@@ -286,6 +295,32 @@ impl Service {
             .map(str::to_string)
             .context("no text in OpenCode's answer")
     }
+}
+
+/// `GET /api/model`'s answer as `provider/model` names, in its order.
+fn model_names(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in v["data"].as_array().into_iter().flatten() {
+        let Some(provider) = m["providerID"].as_str().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        // (The model's own id; `id` may already carry the provider.)
+        let Some(id) = m["modelID"]
+            .as_str()
+            .or(m["id"].as_str())
+            .filter(|i| !i.is_empty())
+        else {
+            continue;
+        };
+        let name = match id.strip_prefix(provider).and_then(|r| r.strip_prefix('/')) {
+            Some(_) => id.to_string(),
+            None => format!("{provider}/{id}"),
+        };
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 fn clip_error(text: &str) -> String {
@@ -641,6 +676,28 @@ mod tests {
             assert!(Service::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(Service::read(Path::new("/nonexistent/service.json")), None);
+    }
+
+    #[test]
+    fn the_servers_models_are_named_provider_slash_model() {
+        let v = json!({"location": {}, "data": [
+            {"id": "glm-5.3-flash-free", "providerID": "opencode", "name": "GLM"},
+            {"id": "opencode/beam-free", "modelID": "beam-free", "providerID": "opencode"},
+            {"id": "opencode/iceman-free", "providerID": "opencode"},
+            {"id": "anthropic/claude", "providerID": "openrouter"},
+            {"id": "glm-5.3-flash-free", "providerID": "opencode"},
+            {"id": "x"},
+        ]});
+        assert_eq!(
+            model_names(&v),
+            [
+                "opencode/glm-5.3-flash-free",
+                "opencode/beam-free",
+                "opencode/iceman-free",
+                "openrouter/anthropic/claude"
+            ]
+        );
+        assert!(model_names(&json!({})).is_empty());
     }
 
     #[test]

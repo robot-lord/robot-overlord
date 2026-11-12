@@ -25,7 +25,9 @@
 //!
 //! This task also applies what a launch couldn't put on the command line
 //! (`agents::Deferred`: the model, then the first prompt), once OpenCode
-//! has the session.
+//! has the session. The prompt is never dropped: if the model can't be set
+//! in time (`DEFERRED_WAIT`), the prompt is sent anyway, on the default
+//! model, and the session's log says the model wasn't applied.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -47,6 +49,9 @@ const TICK: Duration = Duration::from_secs(3);
 
 /// The longest wait between attempts to reach the server.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// How long a held-back first prompt waits for its model to be set.
+const DEFERRED_WAIT_MS: i64 = 20_000;
 
 /// Where a launch's `Deferred` waits until OpenCode has the session.
 pub(crate) fn deferred_key(id: &str) -> String {
@@ -142,7 +147,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     }
     match f.link.take() {
         Some((svc, mut events)) => {
-            changed |= apply_deferred(d, &svc, &up)?;
+            changed |= apply_deferred(d, Some(&svc), &up)?;
             // A session still starting: its creation may have been missed
             // (the event is sent once). Its row says when it is there.
             let starting: Vec<&Session> = up
@@ -179,6 +184,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
             f.link = Some((svc, events));
         }
         None => {
+            changed |= apply_deferred(d, None, &up)?;
             changed |= settle_all(d, None, &up, &mut f.blocked)?;
             if changed {
                 d.changed();
@@ -367,7 +373,7 @@ fn on_signal(
     };
     let mut changed = apply(&d.db(), &mut f.blocked, &s, signal)?;
     if *signal == Signal::Created {
-        changed |= apply_deferred(d, svc, &[&s])?;
+        changed |= apply_deferred(d, Some(svc), &[&s])?;
     }
     Ok(changed)
 }
@@ -445,8 +451,14 @@ fn settle_all(
 
 /// Apply what the launch held back (the model, then the first prompt) to
 /// each session OpenCode now has. Once: the record is removed whether or
-/// not the server took it (a model it doesn't know is logged, not retried).
-fn apply_deferred(d: &Daemon, svc: &Service, up: &[&Session]) -> Result<bool> {
+/// not the server took the model (one it doesn't know is logged, not
+/// retried), and the prompt is sent either way.
+///
+/// When OpenCode's server can't be reached, or still has no such session,
+/// `DEFERRED_WAIT_MS` after the launch: the wait is over. The prompt is
+/// typed into the session's screen instead (it runs on OpenCode's default
+/// model), and the session's log says the model wasn't applied.
+fn apply_deferred(d: &Daemon, svc: Option<&Service>, up: &[&Session]) -> Result<bool> {
     let waiting: Vec<(&Session, String)> = {
         let db = d.db();
         up.iter()
@@ -458,35 +470,95 @@ fn apply_deferred(d: &Daemon, svc: &Service, up: &[&Session]) -> Result<bool> {
         let Some(id) = s.agent_session.as_deref() else {
             continue;
         };
-        if svc.has_session(id) != Some(true) {
-            continue; // not created yet (or the server can't say): later
-        }
-        let outcome = match serde_json::from_str::<Deferred>(&raw) {
-            Ok(def) => {
+        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let late = now_ms() - held["at"].as_i64().unwrap_or(0) > DEFERRED_WAIT_MS;
+        let there = svc.and_then(|svc| svc.has_session(id));
+        let outcome = match (serde_json::from_value::<Deferred>(held), svc, there) {
+            (Err(e), _, _) => json!({"error": e.to_string()}),
+            (Ok(def), Some(svc), Some(true)) => {
                 let model = match opencode::model_ref(&def.model) {
                     Some(m) => svc.set_model(id, &m).map_err(|e| format!("{e:#}")),
                     None => Err("not a provider/model name".to_string()),
                 };
-                let prompt = def
+                // (Whatever became of the model: the prompt goes.)
+                let sent = def
                     .prompt
                     .as_deref()
                     .map(|p| svc.prompt(id, p).map_err(|e| format!("{e:#}")));
-                json!({"model": def.model,
-                       "model_error": model.err(),
-                       "prompt_sent": prompt.as_ref().map(|p| p.is_ok()),
-                       "prompt_error": prompt.and_then(|p| p.err())})
+                let typed = match (&sent, def.prompt.as_deref()) {
+                    (Some(Err(_)), Some(p)) => Some(type_prompt(s, p)),
+                    _ => None,
+                };
+                deferred_outcome(&def, model.err(), sent.map(|r| r.is_ok()), typed)
             }
-            Err(e) => json!({"error": e.to_string()}),
+            (Ok(def), _, _) if late => {
+                let why = match there {
+                    Some(false) => "OpenCode hasn't created the session",
+                    _ => "OpenCode's server couldn't be reached",
+                };
+                let typed = def.prompt.as_deref().map(|p| type_prompt(s, p));
+                deferred_outcome(&def, Some(format!("{why} in time")), None, typed)
+            }
+            // Not created yet, or the server can't say: later.
+            _ => continue,
         };
         let db = d.db();
         db.kv_delete(&deferred_key(&s.id))?;
         db.insert_event(&s.id, now_ms(), "launch_applied", &outcome.to_string())?;
-        if outcome["model_error"].is_string() || outcome["prompt_error"].is_string() {
+        if outcome["note"].is_string() || outcome["error"].is_string() {
             tracing::warn!(session = %s.id, outcome = %outcome, "applying an OpenCode launch");
         }
         changed = true;
     }
     Ok(changed)
+}
+
+/// Type a prompt into a session's screen and send it: the last way to
+/// deliver a first prompt. Whether it went.
+fn type_prompt(s: &Session, prompt: &str) -> bool {
+    let Some(t) = s.tmux_session.as_deref() else {
+        return false;
+    };
+    let typed = tmux::paste(t, prompt).and_then(|_| {
+        // (The screen takes the paste in before the key.)
+        std::thread::sleep(Duration::from_millis(300));
+        tmux::send_keys(t, &["Enter"])
+    });
+    typed.is_ok()
+}
+
+/// What became of a held-back launch, for the session's log. `note` says,
+/// in words, anything the user should know: the model that wasn't applied,
+/// a prompt that couldn't be delivered (its text is kept in the log).
+fn deferred_outcome(
+    def: &Deferred,
+    model_error: Option<String>,
+    sent: Option<bool>,
+    typed: Option<bool>,
+) -> serde_json::Value {
+    let delivered = sent == Some(true) || typed == Some(true);
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(e) = &model_error {
+        notes.push(format!(
+            "the model {} wasn't applied ({e}): this session runs on OpenCode's default model",
+            def.model
+        ));
+    }
+    let mut v = json!({"model": def.model, "model_error": model_error});
+    if let Some(p) = &def.prompt {
+        v["prompt_sent"] = json!(sent.unwrap_or(false));
+        if let Some(t) = typed {
+            v["prompt_typed"] = json!(t);
+        }
+        if !delivered {
+            notes.push("the first prompt couldn't be delivered: send it yourself".to_string());
+            v["prompt"] = json!(p);
+        }
+    }
+    if !notes.is_empty() {
+        v["note"] = json!(notes.join("; "));
+    }
+    v
 }
 
 #[cfg(test)]
@@ -606,6 +678,49 @@ mod tests {
         // but a turn that ended can't be waiting.
         assert_eq!(settle(WaitingInput, running, None), None);
         assert_eq!(settle(WaitingInput, over, None), Some(Idle));
+    }
+
+    #[test]
+    fn a_held_back_prompt_is_never_dropped_silently() {
+        let def = Deferred {
+            model: "opencode/x-free".into(),
+            prompt: Some("fix it".into()),
+        };
+        // All well: nothing to tell.
+        let v = deferred_outcome(&def, None, Some(true), None);
+        assert_eq!(v["prompt_sent"], true);
+        assert!(v["note"].is_null() && v["prompt"].is_null());
+        // The model wasn't taken; the prompt went anyway, and the log says
+        // what it runs on.
+        let v = deferred_outcome(&def, Some("404 no such model".into()), Some(true), None);
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("opencode/x-free") && note.contains("default model"),
+            "{note}"
+        );
+        assert!(!note.contains("couldn't be delivered"));
+        // No server in time: typed into the screen instead.
+        let late = Some("OpenCode's server couldn't be reached in time".to_string());
+        let v = deferred_outcome(&def, late.clone(), None, Some(true));
+        assert_eq!(
+            (&v["prompt_sent"], &v["prompt_typed"]),
+            (&json!(false), &json!(true))
+        );
+        assert!(v["prompt"].is_null());
+        // Not even that: the log keeps the prompt and says so.
+        let v = deferred_outcome(&def, late, None, Some(false));
+        assert_eq!(v["prompt"], "fix it");
+        assert!(v["note"]
+            .as_str()
+            .unwrap()
+            .contains("couldn't be delivered"));
+        // A model alone: only the model's fate.
+        let only = Deferred {
+            model: "opencode/x-free".into(),
+            prompt: None,
+        };
+        let v = deferred_outcome(&only, None, None, None);
+        assert!(v["prompt_sent"].is_null() && v["note"].is_null());
     }
 
     fn db_with(id: &str, agent: &str, conversation: &str) -> Db {

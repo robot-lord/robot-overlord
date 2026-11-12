@@ -822,11 +822,16 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
 /// Keep what a launch couldn't put on the agent's command line (its
 /// `Deferred`: OpenCode's model, and the prompt that waits for it) until
 /// the agent has the conversation; whatever follows that agent applies it
-/// (`opencode::apply_deferred`). A launch without one clears an older one.
+/// (`opencode::apply_deferred`), and gives up waiting after a while (`at`:
+/// when it was held). A launch without one clears an older one.
 fn hold_deferred(db: &Db, id: &str, launch: &rlord_core::agents::Launch) -> Result<()> {
     let key = crate::opencode::deferred_key(id);
     match &launch.deferred {
-        Some(d) => db.kv_set(&key, &serde_json::to_string(d)?),
+        Some(d) => {
+            let mut held = serde_json::to_value(d)?;
+            held["at"] = json!(now_ms());
+            db.kv_set(&key, &held.to_string())
+        }
         None => db.kv_delete(&key),
     }
 }

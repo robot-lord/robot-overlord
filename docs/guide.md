@@ -181,7 +181,9 @@ Good to know:
   scroll inside OpenCode. rlord's search and history read OpenCode's own
   database instead.
 - A model you pick is set through the server once the session exists
-  (OpenCode's screen takes no model flag), and a first prompt waits for it.
+  (OpenCode's screen takes no model flag), and a first prompt waits for
+  it, 20 seconds at most: then the prompt is sent on OpenCode's default
+  model, and the session's log (`rlord log`) says the model wasn't applied.
 - rlord follows the conversation it launched. A new session or tab you
   open inside OpenCode's screen isn't followed.
 - A turn runs in the server: closing the screen stops the rlord session,
