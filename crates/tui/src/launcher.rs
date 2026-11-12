@@ -46,18 +46,18 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ("mastermind", "open the mastermind", Cmd::Mastermind),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
     (
-        "sort updated",
-        "latest message first",
+        "sort last message",
+        "newest message from you or the agent first",
         Cmd::Sort(SortMode::Activity),
     ),
     (
-        "sort you",
-        "your latest message first",
+        "sort last prompt",
+        "the session you last messaged first",
         Cmd::Sort(SortMode::User),
     ),
     (
-        "sort changed",
-        "latest state change first",
+        "sort status change",
+        "the last to start, stop, finish or need you first",
         Cmd::Sort(SortMode::State),
     ),
     ("sort created", "newest first", Cmd::Sort(SortMode::Created)),
@@ -169,6 +169,10 @@ impl App {
             }
             Cmd::Keys => self.open_keys(None),
             Cmd::Sort(s) => {
+                // As a header click: a new sort starts in its natural direction.
+                if self.sort != s {
+                    self.reverse = false;
+                }
                 self.sort = s;
                 self.dirty = true;
             }

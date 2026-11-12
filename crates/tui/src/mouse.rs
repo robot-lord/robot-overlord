@@ -27,6 +27,9 @@ pub(crate) enum Hit {
     /// A session row / a group, by index.
     Row(usize),
     Group(usize),
+    /// A sortable column header: sort by it, or flip the direction if the
+    /// list is already sorted by it.
+    SortBy(rlord_core::db::SortMode),
     /// Wheel areas: the session table, the group column, the preview.
     List,
     Groups,
@@ -278,6 +281,15 @@ impl App {
                 return self.handle_key(k, terminal);
             }
             Hit::Tab(t) if !right => self.switch_tab(t),
+            Hit::SortBy(m) if !right => {
+                if self.sort == m {
+                    self.reverse = !self.reverse;
+                } else {
+                    self.sort = m;
+                    self.reverse = false;
+                }
+                self.dirty = true;
+            }
             Hit::Row(i) if i < self.sessions.len() => {
                 self.group_focus = false;
                 if self.table.selected() != Some(i) {
@@ -755,6 +767,19 @@ mod tests {
         let press = |a: Action| app.keys.event(a).map(Hit::Key);
         assert_eq!(at("⌕ search", 3), press(Action::Filter));
         assert_eq!(at("◷ live", 3), press(Action::ToggleArchived));
+        // Column headers sort: the time column's whole label and its arrow
+        // (it's the current sort), and Name.
+        use rlord_core::db::SortMode;
+        let (hx, hy) = find(&rows, "Last message ▼");
+        let arrow = "Last message ".chars().count() as u16;
+        assert_eq!(app.hits.at(hx, hy), Some(Hit::SortBy(SortMode::Activity)));
+        assert_eq!(
+            app.hits.at(hx + arrow, hy),
+            Some(Hit::SortBy(SortMode::Activity))
+        );
+        assert_eq!(at("Name", 1), Some(Hit::SortBy(SortMode::Name)));
+        // The toolbar's direction arrow flips it.
+        assert_eq!(at("▼ ", 0), press(Action::ReverseSort));
         // The footer: a keycap's label presses its key; so do row keys.
         assert_eq!(at(" quit", 2), press(Action::Quit));
         assert_eq!(at(" help", 2), press(Action::Help));

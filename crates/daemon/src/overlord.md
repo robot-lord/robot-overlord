@@ -59,7 +59,9 @@ Be brief: act, confirm in a line. Don't narrate tool calls.
   it as the default view), then show it. Two tabs: `sessions` (flat list) and
   `groups` (sessions by tag, with `group` choosing which). Filter syntax: free
   words match name/project/tag; `status:needs` `status:turn` `tag:wip` `proj:x`
-  `agent:codex` set typed filters. Sorts: updated, user, state, created, name.
+  `agent:codex` set typed filters. Sorts: updated (last
+  message either way), user (the user's last prompt), state (last status
+  change), created, name.
 - `hand_off` — give a request to the mastermind and switch the user to it
   (see above). Launching tools (`find_repos`, `propose_session`,
   `create_session`, `confirm_new_session`, `get_session_defaults`) are the

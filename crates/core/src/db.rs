@@ -82,14 +82,28 @@ pub enum SortMode {
 impl SortMode {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
-            "updated" | "activity" | "agent" => SortMode::Activity,
-            "user" => SortMode::User,
-            "state" | "status" => SortMode::State,
+            "updated" | "activity" | "agent" | "last-message" | "last_message" | "message" => {
+                SortMode::Activity
+            }
+            "user" | "you" | "last-prompt" | "last_prompt" | "prompt" => SortMode::User,
+            "state" | "status" | "changed" | "status-change" | "status_change" => SortMode::State,
             "created" | "age" => SortMode::Created,
             "name" => SortMode::Name,
             _ => return None,
         })
     }
+    /// What the user reads (toolbar, launcher): which time it sorts by.
+    pub fn title(self) -> &'static str {
+        match self {
+            SortMode::Activity => "last message",
+            SortMode::User => "last prompt",
+            SortMode::State => "status change",
+            SortMode::Created => "created",
+            SortMode::Name => "name",
+        }
+    }
+
+    /// The value in views, queries and the API (stable; `parse` reads it).
     pub fn label(self) -> &'static str {
         match self {
             SortMode::Activity => "updated",
