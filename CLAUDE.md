@@ -159,6 +159,20 @@ merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
   tap and publishes to crates.io. `release.sh` refuses a dirty tree, HEAD
   not on `origin/main`, or an existing tag (the PR forgot the bump).
 
+## Documentation
+
+- `docs/` holds the official docs (indexed from `docs/README.md`): how
+  rlord works now. They outrank working docs.
+- Any effort bigger than a small fix gets a working doc in
+  `docs/working/<effort>.md`, started at the beginning and kept current,
+  with a `**Status:** in progress | shipped | parked | abandoned` top line.
+  Deferred findings and owed follow-ups go there.
+- When the effort is done, the PR that finishes it reconciles it: promote
+  what lasts into `docs/` (and CLAUDE.md), repoint citations, `git rm` the
+  working doc, and keep a trimmed residue in `docs/working-archive/` (with
+  a row in its README) only if something is still owed.
+- Any PR that makes an official doc wrong fixes it in the same PR.
+
 ## Other rules
 
 - Don't touch the user's default tmux server in tests or scripts. rlord runs
