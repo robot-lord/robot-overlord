@@ -100,7 +100,7 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn new_id() -> String {
-    ulid::Ulid::new().to_string().to_lowercase()
+    ulid::Ulid::generate().to_string().to_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

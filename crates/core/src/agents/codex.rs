@@ -931,7 +931,7 @@ mod tests {
         for pair in args.chunks(2) {
             assert_eq!(pair[0], "-c");
             let (k, v) = pair[1].split_once('=').unwrap();
-            let doc: toml::Value = format!("v = {v}").parse().unwrap_or_else(|e| {
+            let doc: toml::Table = format!("v = {v}").parse().unwrap_or_else(|e| {
                 panic!("{k}: {v}: {e}");
             });
             seen.insert(k.to_string(), doc["v"].clone());
@@ -1067,7 +1067,7 @@ mod tests {
             "Tidy \"the\" list",
             "Line one.\n\nUse `triage`.\n",
         );
-        let doc: toml::Value = text.parse().unwrap();
+        let doc: toml::Table = text.parse().unwrap();
         assert_eq!(doc["name"].as_str(), Some("rlord-tidy"));
         assert_eq!(doc["description"].as_str(), Some("Tidy \"the\" list"));
         assert_eq!(

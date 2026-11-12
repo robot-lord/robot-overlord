@@ -185,11 +185,26 @@ merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
 ## Dependency updates
 
 Dependabot opens one grouped PR per week for Cargo and one for GitHub
-Actions (`.github/dependabot.yml`). Its PRs don't bump the version, so
-`version-bump` fails on them: push a bump commit to the PR (next `-dev.N`),
-let CI run, review, then merge and release as usual. CI's `advisories` job
+Actions (`.github/dependabot.yml`), here and in `robot-lord/website`. Its
+PRs don't bump the version, so `version-bump` fails on them: they need a
+bump commit (next `-dev.N`) before they can merge. CI's `advisories` job
 (cargo-deny, `deny.toml`) fails on known-vulnerable dependencies; an
 exception in `deny.toml` needs a reason.
+
+**Whenever you open or update a PR in this repo, launch a subagent that
+resolves open Dependabot PRs** in `robot-lord/robot-overlord` and
+`robot-lord/website`. Don't wait to be asked: this is how Dependabot PRs
+get handled without the user looking. For each one:
+
+- robot-overlord: push a version-bump commit with the regenerated
+  `Cargo.lock` (stay below any version another open branch has claimed);
+- build, `cargo clippy --all-targets -- -D warnings` and test; fix
+  breakage from major bumps in the same PR, or drop an update whose fix
+  would be large or risky and say why;
+- check the repo's Actions allow-list still permits every action used;
+- wait for CI to go green, review the diff (changelogs of major bumps),
+  squash-merge, and release (robot-overlord) as above. Website merges
+  deploy through Vercel; confirm the site still loads.
 
 ## Other rules
 
