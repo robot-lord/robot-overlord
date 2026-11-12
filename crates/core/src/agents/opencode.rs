@@ -97,7 +97,15 @@ pub fn is_session_id(id: &str) -> bool {
 /// left behind), and when it fails or is cut off, what it said is shown
 /// in the pane for a few seconds before the TUI takes the screen (and is
 /// there again when the TUI exits).
+///
+/// Known limits: the kill reaches only the `opencode` process (an npm
+/// wrapper's native child may outlive it; the TUI's own create then
+/// races it harmlessly, creating is idempotent). If that step starts
+/// OpenCode's server, the server inherits the step's stderr: an unlinked
+/// temp file once removed (OpenCode logs to its own files, so it stays
+/// small).
 const CREATE_THEN_OPEN: &str = r#"e=$(mktemp 2>/dev/null) || e=
+trap '[ -n "$e" ] && rm -f "$e"; exit 1' HUP TERM
 "$0" api POST /api/session -d "$1" </dev/null >/dev/null 2>"${e:-/dev/null}" & p=$!
 n=0
 while kill -0 "$p" 2>/dev/null; do
@@ -111,6 +119,7 @@ if [ "$s" -ne 0 ]; then
   sleep 3
 fi
 [ -n "$e" ] && rm -f "$e"
+trap - HUP TERM
 shift; exec "$0" "$@""#;
 
 /// How long the launch's create step may take (`CREATE_THEN_OPEN` counts

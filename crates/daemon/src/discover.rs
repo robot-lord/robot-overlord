@@ -111,8 +111,10 @@ pub(crate) fn pane_looks(s: &Session, gone: &mut HashMap<String, u8>) -> u8 {
 /// `s` was read (restarted meanwhile: not this pane's end). Returns
 /// whether it was written.
 pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
-    if db.resolve_ref(&s.id)?.status != s.status {
-        return Ok(false);
+    // Gone (deleted meanwhile) or moved on: leave it to the next pass.
+    match db.resolve_ref(&s.id) {
+        Ok(cur) if cur.status == s.status => {}
+        _ => return Ok(false),
     }
     let now = now_ms();
     db.set_status(&s.id, Status::Stopped, now)?;

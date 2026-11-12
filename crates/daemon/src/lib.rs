@@ -607,10 +607,6 @@ enum MethodError {
     Internal(anyhow::Error),
 }
 
-/// Canonical path of the binary this process was started from (pinned when
-/// first asked). Clients only restart a daemon running their own binary, so
-/// two installs (say a worktree's debug build and ~/.local/bin/rlord) don't
-/// take turns restarting the shared daemon.
 /// List OpenCode's models (`install::list_models`) on a thread of its
 /// own, one at a time: a request never waits on it.
 fn refresh_models() {
@@ -624,6 +620,10 @@ fn refresh_models() {
     });
 }
 
+/// Canonical path of the binary this process was started from (pinned when
+/// first asked). Clients only restart a daemon running their own binary, so
+/// two installs (say a worktree's debug build and ~/.local/bin/rlord) don't
+/// take turns restarting the shared daemon.
 pub fn exe_id() -> String {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {

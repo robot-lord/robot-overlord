@@ -519,6 +519,16 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         With::Server(svc) => svc.active(),
         With::Rows { .. } => None,
     };
+    // When the current server started (it writes service.json then). The
+    // veto below applies only to turns that began before it: a turn that
+    // died with an earlier server. A turn begun under this server is
+    // trusted to its row, since `/active` may not list every project's
+    // sessions or a session waiting on a permission.
+    let server_since = std::fs::metadata(opencode::service_file())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
     let mut changed = false;
     for s in up {
         let Some(id) = s.agent_session.as_deref() else {
@@ -536,7 +546,11 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
                 blocked.insert(s.id.clone(), p.iter().cloned().collect());
             }
         }
-        let not_running = active.as_ref().is_some_and(|a| !a.contains(id));
+        let began_before_server = matches!(
+            (turn.and_then(|t| t.busy), server_since),
+            (Some(b), Some(since)) if b < since
+        );
+        let not_running = began_before_server && active.as_ref().is_some_and(|a| !a.contains(id));
         let seen = match (&pending, with) {
             (Some(p), _) if p.is_empty() && not_running => Seen::NotRunning,
             (Some(p), _) => Seen::Pending(!p.is_empty()),
