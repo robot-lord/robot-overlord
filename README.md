@@ -4,7 +4,7 @@
 
 # Robot Overlord
 
-**Run a fleet of AI coding agents from one place, and talk to it.**
+**Manage your AI coding agents with AI.**
 
 `rlord` keeps every AI coding session you have (Claude Code, Codex,
 OpenCode) running in tmux, in one list you can sort, search and organize,
@@ -22,10 +22,13 @@ Starting AI coding sessions is easy. Keeping track of ten of them isn't:
 which one was fixing the login bug, which is waiting on you, what did that
 session from last week decide? rlord is built around a few ideas:
 
-- **Talk to it.** Most of the time you don't press keys to manage sessions,
-  you ask: *"start a session on the flaky login tests"*, *"what's waiting on
-  me?"*, *"tag everything about billing"*, *"we fixed this before, find it"*.
-  The overlord does it.
+- **AI manages your AI sessions.** Organizing, tagging, describing and
+  digging through dozens of agent sessions is tedious work, and it's
+  exactly the kind of work AI is good at. So rlord is built around the
+  overlord first: *"start a session on the flaky login tests"*, *"what's
+  waiting on me?"*, *"tag everything about billing"*, *"we fixed this
+  before, find it"*. The keys and the list are still there when you want
+  them.
 - **Plain code does the bookkeeping.** Tracking, sorting, searching and
   organizing are ordinary, fast code. The AI is spent where it earns its
   cost, not on every keypress.

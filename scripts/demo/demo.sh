@@ -35,6 +35,9 @@ fi
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
+# tmux by itself (not its whole folder, which may hold a real agent): the
+# stand-in login shell below runs rlord's own panes, the list included.
+ln -sf "$(command -v tmux)" "$d/bin/tmux"
 cp "$here/bin/claude" "$here/bin/codex" "$here/bin/opencode" "$d/bin/"
 # A stand-in login shell that sees only the demo's programs: rlord asks the
 # login shell where an agent is when its PATH doesn't have it, and the
