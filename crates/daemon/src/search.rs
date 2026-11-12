@@ -66,10 +66,28 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let mut paths_of: HashMap<usize, Vec<PathBuf>> = HashMap::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     // The overlord's own conversations are full of searches: never results.
-    let mut skip: std::collections::HashSet<PathBuf> = Default::default();
+    // Whole folders: each seat runs in its own, so every conversation it
+    // ever had is in there, known to rlord or not.
+    let mut skip: std::collections::HashSet<PathBuf> = crate::overlord::SEATS
+        .iter()
+        .filter_map(|seat| {
+            claude::transcript_path(&seat.dir().to_string_lossy(), "x")
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .collect();
     for (i, s) in sessions.iter().enumerate() {
         if crate::overlord::is_overlord_role(&s.role) {
-            skip.extend(summary::transcripts_of(d, s));
+            skip.extend(
+                summary::transcripts_of(d, s)
+                    .iter()
+                    .filter_map(|p| p.parent().map(Path::to_path_buf)),
+            );
+            if let Some(a) = &s.agent_session {
+                if let Some(dir) = claude::transcript_path(&s.project_path, a).parent() {
+                    skip.insert(dir.to_path_buf());
+                }
+            }
             continue;
         }
         let ps = summary::transcripts_of(d, s);
@@ -82,9 +100,9 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     }
     if everywhere {
         paths.extend(
-            history::all_claude_transcripts()
-                .into_iter()
-                .filter(|p| !by_path.contains_key(p) && !skip.contains(p)),
+            history::all_claude_transcripts().into_iter().filter(|p| {
+                !by_path.contains_key(p) && !p.parent().is_some_and(|d| skip.contains(d))
+            }),
         );
     }
     let found = history::search(&paths, query, PER_FILE);

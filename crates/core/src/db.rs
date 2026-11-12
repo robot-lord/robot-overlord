@@ -1021,11 +1021,12 @@ impl Db {
     // ---- transcripts ----
 
     /// Agent conversation ids a session had before its current one (a
-    /// `/clear` or a resume starts a new one), newest first.
+    /// `/clear`, a resume or a fresh restart starts a new one), newest first.
     pub fn past_agent_sessions(&self, id: &str) -> Result<Vec<String>> {
         let mut st = self.conn.prepare(
             "SELECT payload FROM events WHERE session_id = ?1 \
-             AND kind = 'agent_session_changed' ORDER BY ts DESC",
+             AND kind IN ('agent_session_changed', 'fresh_conversation') \
+             ORDER BY ts DESC",
         )?;
         let rows = st.query_map([id], |r| r.get::<_, String>(0))?;
         let mut out: Vec<String> = Vec::new();
