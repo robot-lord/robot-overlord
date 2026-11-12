@@ -41,7 +41,7 @@ pub struct Seat {
 
 pub const FRONT: Seat = Seat {
     key: "overlord",
-    tmux: "rlord_overlord",
+    tmux: "overlord-rlord",
     instructions: include_str!("overlord.md"),
     subagents: &[
         ("rlord-tidy.md", include_str!("tidy.md")),
@@ -53,7 +53,7 @@ pub const FRONT: Seat = Seat {
 
 pub const MASTERMIND: Seat = Seat {
     key: "mastermind",
-    tmux: "rlord_mastermind",
+    tmux: "mastermind-rlord",
     instructions: include_str!("mastermind.md"),
     subagents: &[],
     model_of: |c| &c.overlord.mastermind_model,
@@ -263,18 +263,14 @@ fn ensure_running(db: &Db, cfg: &Config, seat: &Seat, params: &Value) -> Result<
             )?;
             let agent = pick("agent", &cfg.overlord.agent);
             let d = seat.dir();
-            // Remote Control: as the setup chose for the overlord; the
-            // mastermind goes with the overlord (a hand-off lands there).
-            let remote = if seat.key == MASTERMIND.key {
-                match FRONT.session(db)? {
-                    Some(f) => serde_json::from_str::<Value>(&db.launch_spec(&f.id)?)
-                        .ok()
-                        .is_some_and(|sp| sp["remote_control"].is_string()),
-                    None => false,
-                }
-            } else {
-                params["remote_control"].as_bool().unwrap_or(false)
-            };
+            // Remote Control lives on the mastermind (the front desk stays
+            // fast): the setup's choice is recorded for it, and a new
+            // mastermind starts with it.
+            if let Some(rc) = params["remote_control"].as_bool() {
+                db.kv_set(crate::remote::MASTERMIND_REMOTE, if rc { "1" } else { "0" })?;
+            }
+            let remote = seat.key == MASTERMIND.key
+                && db.kv_get(crate::remote::MASTERMIND_REMOTE)?.as_deref() == Some("1");
             methods::session_new(
                 db,
                 cfg,

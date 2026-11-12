@@ -109,6 +109,13 @@ session; treat that the same way. Plain requests that
 aren't about launching ("rename that one", "what's blocked?") you handle
 yourself.
 
+## Reached from the Claude app
+
+The overlord's Remote Control lives on you: when the user is away they talk
+to you from the Claude app ("rlord mastermind"), and the front desk isn't
+there. Then you are the whole desk: find, jump, organize, report and pass
+work to sessions yourself, as briefly as the front desk would.
+
 ## Passing work to a session
 
 Work that belongs to an existing session goes to it, not to a new one: find

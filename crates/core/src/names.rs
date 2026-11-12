@@ -208,6 +208,51 @@ fn random_u64() -> u64 {
 
 /// A fresh `rlord-adjective-noun` name for which `taken` is false. After a
 /// run of collisions a numeric suffix keeps it unique however full the space.
+/// A session's tmux name: its rlord name, tmux-safe, plus `-rlord` (so a
+/// glance at tmux's session name says which rlord session this is). Taken
+/// names get a number: `web-rlord`, `web-2-rlord`, …
+pub fn tmux_name_for(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = tmux_safe(name);
+    std::iter::once(format!("{base}-rlord"))
+        .chain((2..10_000).map(|i| format!("{base}-{i}-rlord")))
+        .find(|n| !taken(n))
+        .unwrap_or_else(|| format!("{base}-{}-rlord", random_u64() % 1_000_000))
+}
+
+/// Whether `tmux` is what `tmux_name_for` would give `name` (any number).
+pub fn is_tmux_name_for(tmux: &str, name: &str) -> bool {
+    let base = tmux_safe(name);
+    let Some(rest) = tmux.strip_suffix("-rlord") else {
+        return false;
+    };
+    rest == base
+        || rest
+            .strip_prefix(&format!("{base}-"))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Letters, digits, `_` and `-` (tmux reserves `.` and `:` in targets);
+/// anything else becomes `-`, runs collapsed.
+fn tmux_safe(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        let c = if c.is_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '-'
+        };
+        if !(c == '-' && out.ends_with('-')) {
+            out.push(c);
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "session".into()
+    } else {
+        out
+    }
+}
+
 pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
     let pick = || {
         let r = random_u64();
@@ -232,6 +277,27 @@ pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tmux_names_follow_the_session_name() {
+        let none = |_: &str| false;
+        assert_eq!(
+            tmux_name_for("myapp-updates", none),
+            "myapp-updates-rlord"
+        );
+        assert_eq!(
+            tmux_name_for("fix: auth.flow now", none),
+            "fix-auth-flow-now-rlord"
+        );
+        assert_eq!(tmux_name_for("  ", none), "session-rlord");
+        let taken = |n: &str| n == "web-rlord" || n == "web-2-rlord";
+        assert_eq!(tmux_name_for("web", taken), "web-3-rlord");
+        assert!(is_tmux_name_for("web-rlord", "web"));
+        assert!(is_tmux_name_for("web-3-rlord", "web"));
+        assert!(!is_tmux_name_for("web-rlord", "api"));
+        assert!(!is_tmux_name_for("rlord-snug-heron", "web"));
+    }
+
     use super::*;
 
     #[test]

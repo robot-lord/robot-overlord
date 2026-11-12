@@ -165,7 +165,7 @@ impl Daemon {
             }
         }
         methods::save_cursors(&db);
-        if let Err(e) = methods::rename_legacy_tmux(&db) {
+        if let Err(e) = methods::sync_tmux_names(&db) {
             tracing::warn!(error = %e, "renaming legacy tmux sessions");
         }
         methods::reconcile(&db)?;
