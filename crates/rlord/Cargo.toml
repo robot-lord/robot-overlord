@@ -49,6 +49,8 @@ license = "MIT OR Apache-2.0"
 assets = [
     { source = "target/release/rlord", dest = "/usr/bin/rlord", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/rlord/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/rlord/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/rlord/LICENSE-APACHE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]

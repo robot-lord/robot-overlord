@@ -1929,16 +1929,10 @@ impl KeyBinding {
             KeyCode::F(n) => format!("f{n}"),
             other => format!("{other:?}").to_lowercase(),
         };
+        // The same labels as the key screen and tmux hints.
         format!(
-            "{}{}{name}",
-            if self.ctrl { "^" } else { "" },
-            if !self.alt {
-                ""
-            } else if cfg!(target_os = "macos") {
-                "⌥"
-            } else {
-                "Alt-"
-            }
+            "{}{name}",
+            rlord_core::keys::mods_label(self.ctrl, self.alt)
         )
     }
 }

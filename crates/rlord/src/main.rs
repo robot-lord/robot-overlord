@@ -1237,7 +1237,7 @@ fn resolve_conversation(id: &str) -> Result<String> {
 }
 
 /// scripts/update.sh, compiled in so updating needs no checkout.
-const UPDATE_SH: &str = include_str!("../../../scripts/update.sh");
+const UPDATE_SH: &str = include_str!("../update.sh");
 
 fn update(tag: Option<String>, force: bool, channel: Option<String>) -> Result<()> {
     let channel = channel.unwrap_or_else(|| {

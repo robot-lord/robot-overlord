@@ -14,6 +14,9 @@ StandardOutput=append:%h/.local/state/robot-overlord/rlordd.log
 StandardError=append:%h/.local/state/robot-overlord/rlordd.log
 Restart=on-failure
 RestartSec=2
+# Only the daemon: the tmux server it starts (and every agent session in it)
+# must survive a restart of the unit (rlord reset, rlord update).
+KillMode=process
 
 [Install]
 WantedBy=default.target
