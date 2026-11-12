@@ -143,6 +143,16 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     match f.link.take() {
         Some((svc, mut events)) => {
             changed |= apply_deferred(d, &svc, &up)?;
+            // A session still starting: its creation may have been missed
+            // (the event is sent once). Its row says when it is there.
+            let starting: Vec<&Session> = up
+                .iter()
+                .copied()
+                .filter(|s| s.status == Status::Starting)
+                .collect();
+            if !starting.is_empty() {
+                changed |= settle_all(d, None, &starting, &mut f.blocked)?;
+            }
             if changed {
                 d.changed();
             }
@@ -420,7 +430,8 @@ fn settle_all(
                 "prompt_submitted"
             }
             Status::WaitingInput => "permission_request",
-            _ if s.status == Status::Starting && turn.busy.is_none() => "session_start",
+            // Just (re)started, and no turn running: it is up.
+            _ if s.status == Status::Starting => "session_start",
             _ => {
                 db.touch_last_agent_msg(&s.id, turn.idle.unwrap_or(now))?;
                 "agent_stopped"

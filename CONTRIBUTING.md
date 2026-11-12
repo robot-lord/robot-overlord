@@ -35,8 +35,10 @@ rlord search <words> / rlord history <ref>        # past work
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
-(its own data, config and tmux server; a stand-in `claude` that needs no
-model), for trying the UI. It sets `RLORD_NO_LOGIN_SHELL=1` (rlord then
+(its own data, config and tmux server; stand-in `claude`, `codex` and
+`opencode` that need no model), for trying the UI. (The OpenCode stand-in
+runs no server, so its session's status comes from the session database
+alone and never shows "needs you".) It sets `RLORD_NO_LOGIN_SHELL=1` (rlord then
 never asks your login shell where an agent is, so only the stand-ins on the
 demo's PATH exist) and a stand-in `SHELL`: set both in any scratch rlord you
 build yourself, so it can never launch a real agent. `scripts/demo/screenshots.sh DIR` retakes the
