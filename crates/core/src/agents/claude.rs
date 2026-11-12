@@ -253,7 +253,7 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["model"], "opus"); // untouched
         let stop = v["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2); // other-tool entry preserved, ours appended
+        assert_eq!(stop.len(), 2); // the other tool's entry preserved, ours appended
         assert!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len() == 1);
         assert!(path.with_extension("json.pre-rlord.bak").exists());
     }

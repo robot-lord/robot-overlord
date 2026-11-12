@@ -74,22 +74,19 @@ binary. To have the system own it instead (started at login):
 
 ## Why
 
-another tool is a tmux-based TUI for running many AI coding agent sessions. It's
-useful — especially its ability to restart a session (even after a reboot) and
-land right back in the agent's conversation — but it falls short in ways that
-matter to us:
+Running many AI coding-agent sessions at once is easy; keeping track of
+them isn't. rlord is built around a few convictions:
 
-- **Weak session meta-context.** Last-message time / last-updated aren't
-  first-class; you can't sort and pivot on them well.
-- **Naming isn't sticky/ergonomic enough.**
-- **AI-mediated everything.** It was clearly designed around phone-driven,
-  fully AI-mediated control loops, which are expensive relative to their value.
-  We want a *software product* over the sessions — tracking, sorting,
-  organization done in plain code — with AI mediation only where it earns its
-  cost.
-- **Cross-session agent control is possible but clunky.** "Go tell that other
-  agent to do X" / "go get context from that other agent" should be first-class
-  and cheap.
+- **Session meta-context comes first.** When a session last heard from you
+  or the agent, what it's for, what it's waiting on: first-class, sortable,
+  searchable.
+- **Durable resume.** Restart any session, even after a reboot, right back
+  in the agent's conversation.
+- **A software product over the sessions, not AI everywhere.** Tracking,
+  sorting and organizing are plain code; the AI (the overlord) is used where
+  it earns its cost.
+- **Sessions can work together.** "Tell that other session to do X", "get
+  context from that one": first-class and cheap.
 
 ## Goals
 
@@ -116,8 +113,8 @@ matter to us:
 
 - **Rust**, terminal-first (TUI), **tmux** as the process substrate.
 - A resident daemon (`rlordd`) owns all state and behavior; CLI, TUI, and a
-  **first-class MCP server** are thin clients over one Unix-socket API — this
-  is the fix for other-tool's cold-start CLI sluggishness.
+  **first-class MCP server** are thin clients over one Unix-socket API, so
+  every command is fast (no cold start).
 
 See `docs/architecture.md` for the full plan and phased milestones.
 
@@ -191,7 +188,7 @@ global files (`~/.claude/CLAUDE.md` and friends) still apply.
 Every session is created with the defaults under `[session]` in your config:
 the coding tool (`claude`), the **model** (`--model`, default `opus`; the
 picker offers `models`), and **workspace = true** — each session gets its own
-git worktree at `<repo>/.worktrees/<branch>` (other-tool's layout; the dir is
+git worktree at `<repo>/.worktrees/<branch>` (the dir is
 `workspace_dir`, excluded via `.git/info/exclude`, never touching your
 `.gitignore`). Set `default_repo` and the form opens on it.
 
@@ -459,6 +456,3 @@ after the tmux server is gone.
 - `docs/architecture.md` — the architecture plan: components, data model,
   adapter contract, status engine, messaging design, MCP tool surface, and
   the phase-by-phase build plan.
-- `docs/research-other-tool.md` — baseline research: how another tool actually
-  works, which of its features are its own machinery vs. delegation to agent
-  CLIs, and what that implies for our design.

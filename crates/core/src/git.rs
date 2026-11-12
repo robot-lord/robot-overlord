@@ -1,5 +1,5 @@
 //! Git worktree workspaces: one worktree per session under
-//! `<repo>/<workspace_dir>/<sanitized-branch>` (other-tool's layout).
+//! `<repo>/<workspace_dir>/<sanitized-branch>`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,7 +75,7 @@ pub fn sanitize_branch(name: &str) -> String {
     }
 }
 
-/// Directory name for a branch: slashes flattened (other-tool convention).
+/// Directory name for a branch: slashes flattened.
 pub fn workspace_dirname(branch: &str) -> String {
     branch.replace('/', "-")
 }

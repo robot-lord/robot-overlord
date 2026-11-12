@@ -9,7 +9,7 @@ use crate::paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
-    /// Session list on the left, preview on the right (other-tool style).
+    /// Session list on the left, preview on the right.
     #[default]
     Side,
     /// List on top, preview below.

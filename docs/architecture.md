@@ -1,7 +1,6 @@
 # Robot Overlord — architecture plan
 
-Status: v1 plan, 2026-09-11. Follows from `research-other-tool.md`; read that
-first for the evidence behind the choices here.
+Status: v1 plan, 2026-09-11, kept current as the design changes.
 
 ## Locked decisions
 
@@ -10,7 +9,7 @@ first for the evidence behind the choices here.
 | Language | **Rust** | Commodity crates cover every need (tokio, rusqlite, notify, ratatui, rmcp); we want a resident daemon that idles at ~zero cost. |
 | Frontend | **Terminal (TUI)** | Matches how we develop. GUI stays cheap to add later because the core is a daemon any client can speak to. |
 | Process substrate | **tmux** | It buys real things: sessions survive SSH disconnects and client crashes, `respawn-pane -k` gives atomic in-place restart, attach UX is free, and every agent CLI runs unmodified in a pane. Not worth reinventing with a hand-rolled PTY supervisor. |
-| Control plane | **Live daemon (`rlordd`)** + thin clients | other-tool's CLI-only model is slow because every call is a cold start (process spawn → SQLite open → several tmux round-trips → pane scrapes). A resident daemon keeps state hot, holds one persistent tmux control-mode connection, and pushes events instead of being polled. |
+| Control plane | **Live daemon (`rlordd`)** + thin clients | A CLI-only model is slow because every call is a cold start (process spawn → SQLite open → several tmux round-trips → pane scrapes). A resident daemon keeps state hot, holds one persistent tmux control-mode connection, and pushes events instead of being polled. |
 | AI control surface | **First-class MCP server** (CLI kept as the human/scripting surface) | Agents call tools directly — no Bash spawn, no arg parsing, no output re-parsing. Both surfaces are thin facades over one internal API, so nothing is MCP-only or CLI-only. |
 | Agent support | **Claude Code first-class, Codex second**, generic adapter trait for the rest | Matches the measured cost curve: Claude is the easiest deep integration (accepts a minted `--session-id`); Codex has a known-good recipe (notify program + rollout gates + fork fallback). |
 
@@ -58,8 +57,8 @@ daemon is `rlord daemon` (started on demand by the first client that needs it, o
 - tmux interaction goes over **one persistent control-mode client**
   (`tmux -C`) owned by the daemon: pane lifecycle, activity events, and
   output capture are streamed/pushed by tmux itself rather than re-spawning
-  `tmux` binaries per query (other-tool forks tmux constantly; this is a large
-  share of its sluggishness). Plain `tmux` exec remains as fallback for the
+  `tmux` binaries per query (forking tmux for every query is what makes
+  such tools sluggish). Plain `tmux` exec remains as fallback for the
   few operations control mode handles poorly.
 - Status is event-driven: hook events arrive over UDS within milliseconds of
   Claude firing them; clients receive push notifications on a subscription
@@ -143,9 +142,8 @@ it is just SQL.
   returns to the TUI); CLI `rlord attach <name|id>` does the same.
 - Reboot recovery: on daemon start, reconcile DB vs `tmux ls`. Sessions whose
   tmux is gone become status `stopped(resumable)`. Auto-resume is a per-session
-  policy flag (default off, matching other-tool's "can't distinguish crash from
-  intentional kill" caution — but opt-in-able per session or group, which
-  other-tool never offered).
+  policy flag (default off: a crash and an intentional kill look alike — but
+  opt-in-able per session or group).
 
 ## Agent adapter contract
 
@@ -179,14 +177,13 @@ trait AgentAdapter {
 **Codex adapter (second):**
 - `install_integration` writes `notify = ["rlord","hook","emit","codex"]`
   into `$CODEX_HOME/config.toml` between markers (auto-offered, not
-  manual-only as in other-tool).
+  manual-only).
 - Resume `codex resume <sid>` gated on the rollout file existing; subagent
   threads rewritten to `codex fork <sid>`. Id binding: env → notify payload →
   bounded rollout scan (scavenged ids get the same no-resume taint rule).
 
 **Generic tier** (later): a TOML-defined adapter (launch cmd, resume flag, id
-source, patterns) so a new CLI costs config, not code — other-tool proved the
-shape works.
+source, patterns) so a new CLI costs config, not code.
 
 ## Status engine
 
@@ -337,11 +334,11 @@ keystroke injection last:
 2. **Next-turn injection (Claude)** — recipient busy: its Stop hook drains the
    mailbox and returns `{decision:"block", reason:<messages>}`, so mail
    becomes the next turn. Consecutive-block cap (3) to prevent token-burn
-   loops. This is other-tool's proven mechanism, kept.
+   loops.
 3. **Idle nudge (fallback)** — recipient idle at a confirmed prompt: inject
    text via `send-keys`/`paste-buffer` with post-send verification. Only used
    when 1–2 can't apply (non-Claude agents without a hook channel), because
-   this is where all of other-tool's fragility lived.
+   typing into a pane is the fragile path.
 
 Semantics: at-least-once with `dedup_key`; `delivered_at` stamped only on
 confirmed delivery; undeliverable → dead-letter event with a typed reason.
@@ -385,8 +382,7 @@ Tools (v1):
 - `report_done(summary, status)` — completion without sentinels.
 
 A small skill/CLAUDE.md snippet documents the tools and conventions
-("prefer get_context over asking the agent", "check_messages when idle") —
-the cheap part of other-tool's skills approach, kept.
+("prefer get_context over asking the agent", "check_messages when idle").
 
 ### CLI
 
@@ -599,8 +595,7 @@ repository root even from inside a worktree, so all workspaces nest under one
 `<repo>/.worktrees/`; or a **plain folder** (no repo, no workspace; the folder
 picker with fuzzy search is a later addition). With `workspace = true` the
 daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
-(existing branch → checkout; dirname = branch with `/`→`-`, other-tool's
-convention), excludes the dir via `.git/info/exclude`, and launches the agent
+(existing branch → checkout; dirname = branch with `/`→`-`), excludes the dir via `.git/info/exclude`, and launches the agent
 *inside the worktree*. `sessions` records `repo_path`, `workspace_path`,
 `branch`; the model is kept in `launch_spec` so restarts resume with the same
 `--model`.
@@ -642,7 +637,7 @@ Each phase ends runnable and used-for-real (dogfood from phase 2 onward).
   status changes within ~1s of hook events.*
 - **Phase 2 — meta-context + TUI**: derived timestamps, tags/groups/pins/
   archive, query object across CLI, TUI v1 (list, live status, sort/filter,
-  attach, archive view). *Acceptance: daily-drive replaces other-tool for
+  attach, archive view). *Acceptance: good enough to daily-drive for
   Claude work.*
 - **Phase 3 — MCP + messaging + transcripts**: MCP server + stdio shim +
   identity; mailbox with the three delivery channels; transcript mirror
@@ -666,5 +661,5 @@ Each phase ends runnable and used-for-real (dogfood from phase 2 onward).
 - Whether `get_context` should optionally summarize via a cheap model call
   (explicitly out of v1 — raw tail + event summary first; keep AI out of the
   hot path).
-- Multi-machine (other-tool's SSH remotes): out of scope until the single-box
+- Multi-machine (SSH remotes): out of scope until the single-box
   product is right.

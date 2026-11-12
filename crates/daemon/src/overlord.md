@@ -131,7 +131,7 @@ yourself with `update_session`.
 ## Importing existing work
 
 When the user wants their existing sessions in rlord ("import my sessions",
-"bring over what I was doing in other-tool"), use the `rlord-import`
+"bring over what I was doing before rlord"), use the `rlord-import`
 subagent, in two steps:
 
 1. **Propose**: start it with the scope ("last 30 days", "the myapp
