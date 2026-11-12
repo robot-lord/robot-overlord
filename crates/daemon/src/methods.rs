@@ -70,6 +70,10 @@ pub fn session_defaults(cfg: &Config) -> Result<Value> {
                 "name": st.name, "label": st.label, "installed": st.installed,
                 // false: rlord knows it but can't run sessions on it yet.
                 "supported": st.supported,
+                // Installed, but a version rlord can't run: why.
+                "too_old": st.too_old,
+                // rlord follows it through hooks it installs (false: none).
+                "hooks": agent.is_some_and(Agent::uses_hooks),
                 // How to install it (the user runs it; rlord never does).
                 "install": st.install,
                 "model": agent.map(|a| cfg.session.model_for(a)).unwrap_or(""),
@@ -88,7 +92,8 @@ pub fn agents_list() -> Result<Value> {
     Ok(json!({
         "agents": install::status(true),
         "note": "rlord never installs an agent: give the user `install.command` to run themselves; \
-                 after installing, `rlord install-hooks` (and for Codex, trust them with /hooks)",
+                 after installing Claude Code or Codex, `rlord install-hooks` (and for Codex, \
+                 trust them with /hooks); OpenCode needs no hooks",
     }))
 }
 
