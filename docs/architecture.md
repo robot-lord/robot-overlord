@@ -488,7 +488,7 @@ from the user's default server, but only for the real socket.
 
 The product's primary control surface: a singleton agent session
 (`role = 'overlord'`, fixed tmux name `overlord-rlord`) that the user talks to,
-wired to rlord's MCP server. One session, on a strong model at low effort
+wired to rlord's MCP server. One session, on a strong model at medium effort
 (`[overlord] model` / `effort`; the effort is a launch flag, per agent:
 `overlord::effort_args`): it does light work itself and sends the rest to
 subagents and new sessions, which `overlord.md` states first. It lives in

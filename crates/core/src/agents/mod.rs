@@ -41,6 +41,21 @@ use serde_json::{json, Value};
 use crate::types::Status;
 use transcript::Format;
 
+/// What `rlord mcp` (the overlord's MCP server) reads from its
+/// environment: which session is calling (only logged). Where the daemon
+/// is never comes from the environment: every overlord config passes
+/// `rlord mcp --socket <path>`. Each agent's wiring is derived from this
+/// one list: Codex, which starts the server with a short environment of
+/// its own, passes these on (`codex::overlord_args`); OpenCode, whose
+/// shared server would hand on whichever pane started it, blanks them
+/// (`opencode::overlord_config`).
+pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
+
+/// The arguments for `rlord mcp`, talking to the daemon at `socket`.
+pub fn mcp_args(socket: &str) -> Vec<String> {
+    vec!["mcp".into(), "--socket".into(), socket.into()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Claude,
@@ -433,16 +448,6 @@ impl Agent {
     /// rlord tracks its sub-agents.
     pub fn tracks_subagents(self) -> bool {
         matches!(self, Agent::Claude)
-    }
-
-    /// It can run the overlord (rlord's MCP server with its tools
-    /// pre-allowed, its instructions, effort where it has one). Why not,
-    /// when it can't. Every agent can today; an agent added without that
-    /// wiring says so here.
-    pub fn runs_overlord(self) -> Result<()> {
-        match self {
-            Agent::Claude | Agent::Codex | Agent::OpenCode => Ok(()),
-        }
     }
 
     /// Can rlord import its conversations started outside rlord.

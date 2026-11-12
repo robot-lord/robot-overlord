@@ -44,8 +44,8 @@ session from last week decide? rlord is built around a few ideas:
   your pick) wired to rlord's tools, one keypress
   away from anywhere (Option-O / Alt-O). It finds and jumps to sessions,
   launches new ones, renames, tags and describes them, and answers
-  questions about your fleet. It runs a strong model at low effort,
-  so it answers quickly, and it delegates anything heavy: bulk upkeep and
+  questions about your fleet. It runs a strong model at medium effort
+  and keeps its own work light, delegating anything heavy: bulk upkeep and
   research go to subagents, real work becomes a session of its own.
 - **An overlord that doesn't bloat.** After sitting idle it starts a fresh
   conversation, and looks up what you talked about before only when you
@@ -139,7 +139,7 @@ from the last week"*.
          ▼                ▼
    ┌───────────┐    ┌──────────────────┐  delegates  ┌─────────────────┐
    │ the list  │    │     overlord     │ ──────────▶ │    subagents    │
-   │   (TUI)   │    │ Opus, low effort │             │ (tidy, import,  │
+   │   (TUI)   │    │ Opus, med effort │             │ (tidy, import,  │
    └─────┬─────┘    └────────┬─────────┘             │    research)    │
          │                   │ MCP tools             └─────────────────┘
          ▼                   ▼
@@ -162,7 +162,7 @@ from the last week"*.
   and resuming uses the agent's own resume (`claude --resume`).
 - **The overlord is one agent session with rlord's tools** (an MCP
   server), floating over whatever you're looking at, on whichever agent
-  you choose (Claude Code, Codex, OpenCode). It runs a strong model at low
+  you choose (Claude Code, Codex, OpenCode). It runs a strong model at medium
   effort: look-ups, small edits and short answers it does itself; anything
   that takes more goes to a subagent or a new session, so it stays quick
   and its own conversation stays small.

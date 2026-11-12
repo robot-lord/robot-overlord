@@ -591,7 +591,7 @@ impl App {
                     "Effort",
                     or_default(s.effort()),
                     String::new(),
-                    "Low keeps it quick: light work itself, the rest delegated. Too shallow? medium."
+                    "Medium: light work itself, the rest delegated. Lower is quicker, higher deeper."
                         .into(),
                 ),
                 SetupRow::Remote => (
@@ -812,24 +812,24 @@ mod tests {
 
     fn status(agents: Value, remote: bool) -> Value {
         json!({"exists": false, "default_agent": "claude", "default_model": "opus",
-               "default_effort": "low", "agents": agents,
+               "default_effort": "medium", "agents": agents,
                "remote": {"available": remote}})
     }
 
     fn claude() -> Value {
-        json!({"name": "claude", "label": "Claude Code", "model": "opus", "effort": "low",
+        json!({"name": "claude", "label": "Claude Code", "model": "opus", "effort": "medium",
                "models": ["opus", "sonnet", "haiku"],
                "efforts": ["low", "medium", "high", "max"], "remote_control": true})
     }
 
     #[test]
     fn setup_defaults_and_rows() {
-        // One agent: Opus at low effort, Remote Control on; the first row
+        // One agent: Opus at medium effort, Remote Control on; the first row
         // with a choice is the model.
         let s = Setup::from_status(&status(json!([claude()]), true));
         assert_eq!(
             (s.choice().name.as_str(), s.model(), s.effort()),
-            ("claude", "opus", "low")
+            ("claude", "opus", "medium")
         );
         assert_eq!(
             s.rows(),
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn setup_rows_are_pickable_and_an_agent_change_resets_them() {
-        let codex = json!({"name": "codex", "label": "Codex", "model": "", "effort": "low",
+        let codex = json!({"name": "codex", "label": "Codex", "model": "", "effort": "medium",
                            "models": ["gpt-x"], "efforts": ["low", "medium", "high"],
                            "remote_control": false});
         let opencode = json!({"name": "opencode", "label": "OpenCode", "model": "",
@@ -867,10 +867,10 @@ mod tests {
         assert_eq!(s.model(), "sonnet");
         s.row = 2;
         s.step(true);
-        s.step(true);
         assert_eq!(s.effort(), "high");
         s.step(false);
-        assert_eq!(s.effort(), "medium");
+        s.step(false);
+        assert_eq!(s.effort(), "low");
         // Remote Control toggles.
         s.row = 3;
         s.step(true);
@@ -881,7 +881,7 @@ mod tests {
         s.step(true);
         assert_eq!(
             (s.choice().name.as_str(), s.model(), s.effort()),
-            ("codex", "", "low")
+            ("codex", "", "medium")
         );
         assert_eq!(
             s.rows(),
@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(s.rows(), [SetupRow::Agent, SetupRow::Model]);
         // Back to Claude: its defaults again, not what was picked before.
         s.step(true);
-        assert_eq!((s.model(), s.effort()), ("opus", "low"));
+        assert_eq!((s.model(), s.effort()), ("opus", "medium"));
     }
 
     #[test]
@@ -923,7 +923,7 @@ mod tests {
             "Model",
             "◀ opus ▶",
             "Effort",
-            "◀ low ▶",
+            "◀ medium ▶",
             "Remote",
         ] {
             assert!(out.contains(want), "{want:?} missing:\n{out}");

@@ -310,7 +310,14 @@ enum Command {
     },
     /// MCP server over stdio (what the overlord's agent connects to)
     #[command(hide = true)]
-    Mcp,
+    Mcp {
+        /// The daemon's socket, as the daemon resolved it. The overlord's
+        /// MCP config always passes it: an agent may start this server with
+        /// another environment (OpenCode's shared server), where the XDG
+        /// dirs would name another socket. Given, no daemon is autostarted.
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
     /// The overlord overlay itself (runs inside the tmux popup)
     #[command(hide = true)]
     Overlay {
@@ -498,7 +505,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Mcp => mcp_stdio(),
+        Command::Mcp { socket } => mcp_stdio(socket),
         Command::Update {
             tag,
             force,
@@ -1629,9 +1636,17 @@ fn restart_daemon() -> Result<()> {
 /// `rlord mcp`: a minimal MCP server over stdio (JSON-RPC, one message per
 /// line). Protocol handling lives here; tools live in the daemon
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
-fn mcp_stdio() -> Result<()> {
+fn mcp_stdio(socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
-    let caller = std::env::var("RLORD_SESSION_ID").ok();
+    let caller = std::env::var("RLORD_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    // The daemon that wrote the overlord's config: only that one, never one
+    // started here from whatever environment this process has.
+    let call = |method: &str, params: Value| match &socket {
+        Some(s) => client_call(s, method, params),
+        None => call(method, params),
+    };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {

@@ -141,17 +141,27 @@ fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
     if s.status != Status::Starting {
         return Ok(false);
     }
-    let db = d.db();
-    let launched_bare = db
-        .kv_get(&methods::bind_prompt_key(&s.id))?
-        .is_some_and(|p| p.trim().is_empty());
-    let since = db
-        .kv_get(&methods::bind_since_key(&s.id))?
-        .and_then(|v| v.parse::<i64>().ok());
+    let (launched_bare, since) = {
+        let db = d.db();
+        let launched_bare = db
+            .kv_get(&methods::bind_prompt_key(&s.id))?
+            .is_some_and(|p| p.trim().is_empty());
+        let since = db
+            .kv_get(&methods::bind_since_key(&s.id))?
+            .and_then(|v| v.parse::<i64>().ok());
+        (launched_bare, since)
+    };
     let now = now_ms();
     if !launched_bare || !since.is_some_and(|t| up_long_enough(t, now)) {
         return Ok(false);
     }
+    // Up means its composer is on screen, not a startup dialog in front of
+    // it (where typed text would land on the wrong thing). Read without
+    // the DB lock.
+    if !composer_up(s) {
+        return Ok(false);
+    }
+    let db = d.db();
     // Moved on meanwhile (a hook, a restart): not ours to say.
     let cur = db.resolve_ref(&s.id)?;
     if cur.status != Status::Starting || cur.agent_session.is_some() {
@@ -166,29 +176,66 @@ fn up_long_enough(launched_ms: i64, now_ms: i64) -> bool {
     now_ms - launched_ms >= UP_AFTER_MS
 }
 
+/// The session's agent pane shows Codex's composer (`codex::composer_shown`).
+fn composer_up(s: &Session) -> bool {
+    s.tmux_session
+        .as_deref()
+        .and_then(|t| tmux::capture_pane(t).ok())
+        .is_some_and(|screen| codex::composer_shown(&screen))
+}
+
 /// Find the conversation a session launched, in its agent's index (see
 /// `pick_thread`). `others`: another session waits for one in this folder.
 fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
-    let (since, prompt, tracked) = {
-        let db = d.db();
-        let since = db
-            .kv_get(&methods::bind_since_key(&s.id))?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(s.created_at);
-        let prompt = db
-            .kv_get(&methods::bind_prompt_key(&s.id))?
-            .filter(|p| !p.trim().is_empty());
-        (since, prompt, db.agent_session_ids()?)
-    };
-    let candidates: Vec<codex::Thread> =
-        codex::threads_started_in(&codex::home(), &s.project_path, since)
-            .into_iter()
-            .filter(|t| !tracked.contains(&t.id))
-            .collect();
+    let (since, prompt, tracked) = bind_inputs(&d.db(), s)?;
+    // (Codex's index is read without the DB lock.)
+    let candidates = untracked_threads(s, since, &tracked);
     let Some(t) = pick_thread(&candidates, prompt.as_deref(), others) else {
         return Ok(false);
     };
-    let db = d.db();
+    record_bind(&d.db(), s, t)
+}
+
+/// `bind`, once, under the caller's DB lock: for a stopped session about to
+/// be started again (the overlord), whose thread may have turned up after
+/// rlord last looked. Nobody else waits in the folder it is asked for.
+pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
+    let (since, prompt, tracked) = bind_inputs(db, s)?;
+    let candidates = untracked_threads(s, since, &tracked);
+    match pick_thread(&candidates, prompt.as_deref(), false) {
+        Some(t) => record_bind(db, s, t),
+        None => Ok(false),
+    }
+}
+
+/// What the search for a session's thread goes by: started since when,
+/// with which first prompt (if any), and the threads already taken.
+fn bind_inputs(
+    db: &Db,
+    s: &Session,
+) -> Result<(i64, Option<String>, std::collections::HashSet<String>)> {
+    let since = db
+        .kv_get(&methods::bind_since_key(&s.id))?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(s.created_at);
+    let prompt = db
+        .kv_get(&methods::bind_prompt_key(&s.id))?
+        .filter(|p| !p.trim().is_empty());
+    Ok((since, prompt, db.agent_session_ids()?))
+}
+
+fn untracked_threads(
+    s: &Session,
+    since: i64,
+    tracked: &std::collections::HashSet<String>,
+) -> Vec<codex::Thread> {
+    codex::threads_started_in(&codex::home(), &s.project_path, since)
+        .into_iter()
+        .filter(|t| !tracked.contains(&t.id))
+        .collect()
+}
+
+fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
     // A hook may have bound it meanwhile.
     if db.resolve_ref(&s.id)?.agent_session.is_some() {
         return Ok(false);
@@ -266,7 +313,20 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
     let Some(src) = d.db().transcript_source(&s.id)? else {
         return Ok(false);
     };
-    let Some(next) = next_status(s.status, transcript::working(Path::new(&src))) else {
+    let path = Path::new(&src);
+    // Still starting (just launched or resumed): only what the agent has
+    // written since counts. A conversation killed mid-turn ends on a turn
+    // that never closes; resumed, it waits for the user.
+    let working = match (s.status, s.last_state_change_at) {
+        (Status::Starting, Some(t)) => transcript::working_since(path, t),
+        _ => transcript::working(path),
+    };
+    // Settling a start with nothing in the transcript: only once the
+    // composer is up (not an update or trust prompt in front of it).
+    if s.status == Status::Starting && working.is_none() && !composer_up(s) {
+        return Ok(false);
+    }
+    let Some(next) = next_status(s.status, working) else {
         return Ok(false);
     };
     let db = d.db();

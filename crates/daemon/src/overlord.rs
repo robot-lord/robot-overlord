@@ -4,7 +4,7 @@
 //! (so the TUI can embed it without a lookup), and rlord's MCP
 //! server wired in with its tools pre-allowed.
 //!
-//! One session: a strong model at low effort. It does light work itself and
+//! One session: a strong model at medium effort. It does light work itself and
 //! sends anything heavier to a subagent or a new session (`overlord.md`).
 //! It is restarted on a fresh conversation once it has sat idle
 //! (`start_fresh_keeper`), and looks its own past up with `recall`
@@ -98,7 +98,10 @@ pub fn effort_args(agent: Agent, effort: &str) -> Vec<String> {
     }
     match agent {
         Agent::Claude => vec!["--effort".into(), effort.into()],
-        Agent::Codex => vec!["-c".into(), format!("model_reasoning_effort=\"{effort}\"")],
+        Agent::Codex => vec![
+            "-c".into(),
+            format!("model_reasoning_effort={}", codex::toml_str(effort)),
+        ],
         Agent::OpenCode => Vec::new(),
     }
 }
@@ -184,26 +187,6 @@ fn subagent_parts(text: &str) -> (String, String, String) {
     )
 }
 
-/// What `rlord mcp` must find in its environment to reach this daemon,
-/// for an agent that doesn't start it from the pane's environment
-/// (OpenCode: its shared server does). The data root always; the others
-/// when this daemon has them.
-fn mcp_env() -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if let Some(root) = paths::data_dir().parent() {
-        env.push((
-            "XDG_DATA_HOME".to_string(),
-            root.to_string_lossy().into_owned(),
-        ));
-    }
-    for k in ["XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
-        if let Some(v) = std::env::var(k).ok().filter(|v| !v.is_empty()) {
-            env.push((k.to_string(), v));
-        }
-    }
-    env
-}
-
 /// Write the overlord's folder (instruction files, each agent's MCP config
 /// and subagents); return the adapter flags `agent` must always be
 /// launched with. Every agent's files are written, whichever runs it: they
@@ -211,17 +194,20 @@ fn mcp_env() -> Vec<(String, String)> {
 fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
     std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     let bin = methods::rlord_bin();
+    // This daemon's socket, as it resolved it: `rlord mcp` is told, so a
+    // server started with another environment still reaches this daemon.
+    let socket = paths::socket_path().to_string_lossy().into_owned();
     let mcp_path = d.join("mcp.json");
     let mcp = json!({"mcpServers": {"rlord": {
         "type": "stdio",
         "command": bin,
-        "args": ["mcp"],
+        "args": rlord_core::agents::mcp_args(&socket),
     }}});
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)?;
     // OpenCode: no flags, the folder's config (see `overlord_config`).
     std::fs::write(
         d.join("opencode.json"),
-        serde_json::to_string_pretty(&opencode::overlord_config(&bin, &mcp_env()))?,
+        serde_json::to_string_pretty(&opencode::overlord_config(&bin, &socket))?,
     )?;
 
     let mut md = format!("{GENERATED_NOTE}{INSTRUCTIONS}");
@@ -261,6 +247,8 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
         std::fs::write(dirs[3].join(file), format!("{body}\n"))?;
     }
 
+    // (No wildcard arm: an agent added to `Agent` doesn't build until it
+    // says here how it runs the overlord.)
     let mut args = match agent {
         Agent::Claude => vec![
             "--mcp-config".into(),
@@ -278,7 +266,7 @@ fn write_files(d: &Path, agent: Agent, effort: &str) -> Result<Vec<String>> {
         // the resolved path.)
         Agent::Codex => {
             let dir = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
-            codex::overlord_args(&bin, &dir.to_string_lossy())
+            codex::overlord_args(&bin, &socket, &dir.to_string_lossy())
         }
         Agent::OpenCode => Vec::new(),
     };
@@ -354,7 +342,6 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         None => {
             let agent_name = pick("agent").unwrap_or_else(|| cfg.overlord.agent.clone());
             let agent = Agent::named(&agent_name)?;
-            agent.runs_overlord()?;
             let (dflt_model, dflt_effort) = model_effort_for(cfg, agent);
             // ("" given on purpose: the agent's own default.)
             let model = match params.get("model").and_then(Value::as_str) {
@@ -406,9 +393,15 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             if alive && s.status != Status::Stopped {
                 return Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?);
             }
-            // Nothing to resume: an agent that assigns the conversation id
-            // itself (Codex) stopped before rlord learned it. Start anew.
-            if s.agent_session.is_none() && s.tmux_session.is_some() {
+            // An agent that assigns the conversation id itself (Codex)
+            // stopped before rlord learned it: look in its index once more
+            // (the thread started since the last start, as `discover`
+            // would have), and resume what it finds. Only when there is
+            // nothing to resume, start anew.
+            let unbound = s.agent_session.is_none()
+                && !Agent::named(&s.agent)?.mints_id()
+                && !crate::discover::bind_now(db, &s)?;
+            if unbound {
                 let v = methods::session_fresh(db, &json!({"ref": s.id, "reason": "unbound"}))?;
                 db.kv_set(FRESH_AT, &rlord_core::types::now_ms().to_string())?;
                 return Ok(v);
@@ -571,7 +564,6 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         // dialog offers: its default model and effort, and the choices.
         let agents: Vec<Value> = Agent::ALL
             .into_iter()
-            .filter(|a| a.runs_overlord().is_ok())
             .filter(|a| rlord_core::agents::install::missing(*a).is_none())
             .map(|a| {
                 let (model, effort) = model_effort_for(cfg, a);
@@ -889,7 +881,11 @@ mod tests {
             "mcp_servers.rlord.default_tools_approval_mode=\"approve\""
         ));
         assert!(has("sandbox_mode=\"read-only\""));
-        assert!(has("approval_policy=\"on-request\""));
+        assert!(has("approval_policy=\"untrusted\""));
+        assert!(has(&format!(
+            "mcp_servers.rlord.args=[\"mcp\",\"--socket\",\"{}\"]",
+            paths::socket_path().display()
+        )));
         assert!(has("model_reasoning_effort=\"low\""));
         // Never the flags that skip approvals or hook trust.
         assert!(!has("dangerously") && !has("never") && !has("--mcp-config"));
@@ -903,7 +899,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
                 .unwrap();
         assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][1], "mcp");
-        assert!(cfg["mcp"]["servers"]["rlord"]["environment"]["XDG_DATA_HOME"].is_string());
+        assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][2], "--socket");
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--socket");
 
         for f in [
             "CLAUDE.md",
@@ -935,14 +934,6 @@ mod tests {
         assert!(description.starts_with("Tidy rlord's session list"));
         assert!(body.starts_with("You keep the user's rlord session list tidy"));
         assert!(!body.contains("omitClaudeMd"));
-    }
-
-    /// Every agent rlord runs can run the overlord.
-    #[test]
-    fn every_agent_runs_the_overlord() {
-        for a in Agent::ALL {
-            assert!(a.runs_overlord().is_ok(), "{}", a.name());
-        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use rlord_core::agents::{claude, install, transcript, Agent, Effect, Indexed};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
-use rlord_core::types::{new_id, now_ms, Status, Subagent};
+use rlord_core::types::{new_id, now_ms, Session, Status, Subagent};
 use rlord_core::{git, tmux};
 
 /// Known repos for the picker: the configured default first (even if never
@@ -415,9 +415,6 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // fixed tmux name.
     let extra_args = str_list(params, "extra_args");
     let role = p_opt("role").unwrap_or_default();
-    if crate::overlord::is_overlord_role(&role) {
-        agent.runs_overlord()?;
-    }
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(agent) {
         bail!("{why}");
@@ -768,14 +765,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // created with the launch's model: that is confirmed as at launch.
     let deferred = agent.deferred(model.as_deref()).filter(|_| !resumed);
     hold(db, &s.id, deferred.as_ref())?;
-    let tmux_name = match s.tmux_session.clone() {
-        Some(n) => n,
-        None => {
-            let n = tmux_name_for(db, &s.name, None);
-            db.set_tmux_session(&s.id, &n)?;
-            n
-        }
-    };
+    let tmux_name = tmux_name_of(db, &s)?;
     let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), &argv);
     note_launch(db, &s.id, &argv)?;
     if tmux::has_session(&tmux_name) {
@@ -801,6 +791,17 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 
+/// The tmux session a session's agent (re)starts in: its own, or (it has
+/// none: imported) a new name, saved.
+fn tmux_name_of(db: &Db, s: &Session) -> Result<String> {
+    if let Some(n) = &s.tmux_session {
+        return Ok(n.clone());
+    }
+    let n = tmux_name_for(db, &s.name, None);
+    db.set_tmux_session(&s.id, &n)?;
+    Ok(n)
+}
+
 /// Restart a session's agent on a **fresh conversation** in its pane (a new
 /// conversation id, not a resume). The old conversation stays on disk and
 /// can still be resumed with the agent's own `--resume`. `reason` says why
@@ -814,10 +815,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let mut launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
-    let tmux_name = s
-        .tmux_session
-        .clone()
-        .context("session has no tmux session")?;
+    let tmux_name = tmux_name_of(db, &s)?;
     let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), argv);
     note_launch(db, &s.id, argv)?;
     let now = now_ms();

@@ -80,7 +80,7 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
 }
 
 /// A TOML basic string (for a `-c key=value` override's value).
-fn toml_str(s: &str) -> String {
+pub fn toml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -97,45 +97,73 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// What `rlord mcp` reads from its environment. Codex starts an MCP server
-/// with a short list of its own, so these are named to be passed on: where
-/// the daemon's socket is, and which session is calling.
-pub const MCP_ENV: &[&str] = &[
-    "RLORD_SESSION_ID",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-    "XDG_CONFIG_HOME",
-];
-
 /// The flags a Codex overlord always runs with (in `dir`, its own folder):
 /// rlord's MCP server, its tools called without a prompt, and nothing else
 /// loosened. All as `-c` overrides: nothing is written to `~/.codex`.
 ///
-/// - `mcp_servers.rlord.*`: the server, with `default_tools_approval_mode =
-///   "approve"` (Codex's per-server counterpart of an allow-list).
-/// - `sandbox_mode = "read-only"`, `approval_policy = "on-request"`:
-///   commands read freely, and anything that writes or leaves the sandbox
-///   asks the user.
+/// - `mcp_servers.rlord.*`: the server (`rlord mcp --socket <socket>`: the
+///   daemon that launched it, whatever the environment says), with
+///   `default_tools_approval_mode = "approve"` (Codex's per-server
+///   counterpart of an allow-list) and `env_vars` passing on what it reads
+///   (`MCP_ENV`; Codex starts a server with a short environment).
+/// - `sandbox_mode = "read-only"`, `approval_policy = "untrusted"`: only
+///   commands Codex knows to be read-only run unasked; anything else asks
+///   the user, even inside the sandbox. ("on-request" would let any
+///   sandboxed command run, and the read-only sandbox doesn't stop every
+///   side effect: on Linux it may allow connecting to a Unix socket, such
+///   as tmux's, which can type into another session's pane.)
+/// - `check_for_update_on_startup = false`: no update prompt in front of
+///   the composer (rlord types into it once it is up).
 /// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
 ///   rlord's own, so Codex doesn't stop to ask about it, and reads the
-///   sub-agents rlord writes to its `.codex/agents`. For this run only:
-///   nothing is saved to the user's config.
-pub fn overlord_args(rlord_bin: &str, dir: &str) -> Vec<String> {
-    let env: Vec<String> = MCP_ENV.iter().map(|v| toml_str(v)).collect();
+///   sub-agents rlord writes to its `.codex/agents`.
+pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str) -> Vec<String> {
+    let args: Vec<String> = super::mcp_args(socket)
+        .iter()
+        .map(|a| toml_str(a))
+        .collect();
+    let env: Vec<String> = super::MCP_ENV.iter().map(|v| toml_str(v)).collect();
     [
         format!("mcp_servers.rlord.command={}", toml_str(rlord_bin)),
-        "mcp_servers.rlord.args=[\"mcp\"]".to_string(),
+        format!("mcp_servers.rlord.args=[{}]", args.join(",")),
         format!("mcp_servers.rlord.env_vars=[{}]", env.join(",")),
         "mcp_servers.rlord.default_tools_approval_mode=\"approve\"".to_string(),
-        // (A whole table: a dotted override path can't hold a quoted key,
-        // and Codex then asks about the folder at every start.)
+        // This replaces the user's whole `projects` table, for this run
+        // only: their other folders' trust is unknown to this process (it
+        // is still in ~/.codex/config.toml, untouched). The overlord works
+        // in its own folder, so nothing it does needs theirs. (A whole
+        // table because a dotted override path can't hold a quoted key: it
+        // is accepted and ignored, and Codex asks about the folder at every
+        // start.)
         format!("projects={{{}={{trust_level=\"trusted\"}}}}", toml_str(dir)),
         "sandbox_mode=\"read-only\"".to_string(),
-        "approval_policy=\"on-request\"".to_string(),
+        "approval_policy=\"untrusted\"".to_string(),
+        "check_for_update_on_startup=false".to_string(),
     ]
     .into_iter()
     .flat_map(|kv| ["-c".to_string(), kv])
     .collect()
+}
+
+/// Codex's screen shows its composer, ready for a prompt: a line near the
+/// bottom that starts with `›` (its prompt mark) and isn't a numbered
+/// choice (the same mark points at the picked option in a dialog: trust
+/// this folder, update now). Startup screens before it (an update prompt,
+/// a login, a trust question) don't count.
+pub fn composer_shown(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .take(6)
+        .any(|l| {
+            l.strip_prefix('›').is_some_and(|rest| {
+                let rest = rest.trim_start();
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                !(digits > 0 && rest[digits..].starts_with('.'))
+            })
+        })
 }
 
 /// A sub-agent file for Codex (`.codex/agents/<name>.toml`): its name, when
@@ -827,7 +855,11 @@ mod tests {
     /// `-c key=value` (the value alone), whatever the paths hold.
     #[test]
     fn overlord_overrides_are_toml() {
-        let args = overlord_args("/opt/my \"apps\"/rlord", "/data/o'lord\\x");
+        let args = overlord_args(
+            "/opt/my \"apps\"/rlord",
+            "/run/r\"lord/daemon.sock",
+            "/data/o'lord\\x",
+        );
         assert_eq!(args.len() % 2, 0);
         let mut seen = std::collections::HashMap::new();
         for pair in args.chunks(2) {
@@ -842,20 +874,45 @@ mod tests {
             seen["mcp_servers.rlord.command"].as_str(),
             Some("/opt/my \"apps\"/rlord")
         );
-        assert_eq!(seen["mcp_servers.rlord.args"][0].as_str(), Some("mcp"));
+        let args: Vec<&str> = seen["mcp_servers.rlord.args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ["mcp", "--socket", "/run/r\"lord/daemon.sock"]);
         let env = seen["mcp_servers.rlord.env_vars"].as_array().unwrap();
-        assert!(env.iter().any(|v| v.as_str() == Some("XDG_RUNTIME_DIR")));
+        assert_eq!(env.len(), crate::agents::MCP_ENV.len());
+        assert!(env.iter().any(|v| v.as_str() == Some("RLORD_SESSION_ID")));
         assert_eq!(
             seen["mcp_servers.rlord.default_tools_approval_mode"].as_str(),
             Some("approve")
         );
         assert_eq!(seen["sandbox_mode"].as_str(), Some("read-only"));
-        assert_eq!(seen["approval_policy"].as_str(), Some("on-request"));
+        // Not "on-request": a sandboxed command would run unasked.
+        assert_eq!(seen["approval_policy"].as_str(), Some("untrusted"));
+        assert_eq!(seen["check_for_update_on_startup"].as_bool(), Some(false));
         // The folder's trust: one table keyed by the path itself.
         assert_eq!(
             seen["projects"]["/data/o'lord\\x"]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    #[test]
+    fn the_composer_is_told_from_a_dialog() {
+        // As captured from codex-cli 0.167.2 (folder trusted, no prompt).
+        let ready = "\n  >_ OpenAI Codex (v0.167.2)\n     /tmp/x\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · /tmp/x  ⚠ 1 warning · f2 to view\n\n";
+        assert!(composer_shown(ready));
+        let typed = "› what is on my list\n\n  ? for shortcuts";
+        assert!(composer_shown(typed));
+        let dialog =
+            "  Update available!\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n";
+        assert!(!composer_shown(dialog));
+        let trust =
+            "  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit\n";
+        assert!(!composer_shown(trust));
+        assert!(!composer_shown(""));
     }
 
     #[test]

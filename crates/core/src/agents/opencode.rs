@@ -204,25 +204,32 @@ pub fn resume_argv(
 /// while everything else asks. OpenCode has no flags for these; its server
 /// reads the config of the folder a session runs in.
 ///
-/// - `mcp.servers.rlord`: `environment` carries `env` (where the daemon's
-///   socket is). The server process belongs to OpenCode's shared server,
-///   whose own environment is whatever first started it.
+/// - `mcp.servers.rlord`: `rlord mcp --socket <socket>`. The server process
+///   belongs to OpenCode's shared server, whose environment is whatever
+///   first started it (another rlord's, or none), so where the daemon is
+///   is given, never looked up; and what `rlord mcp` would read from its
+///   environment (`MCP_ENV`: the calling session) is blanked rather than
+///   inherited from some other pane.
 /// - `permissions`: the last matching rule wins, and an agent starts from
 ///   "allow everything", so everything is set to ask first, then reading,
-///   rlord's tools (named `rlord_<tool>`), sub-agents and Code Mode (the
-///   script OpenCode calls MCP tools from; each tool in it is still
-///   checked) are allowed.
-pub fn overlord_config(rlord_bin: &str, env: &[(String, String)]) -> Value {
+///   rlord's tools (named `rlord_<tool>`) and sub-agents are allowed. Code
+///   Mode (`execute`, the script OpenCode calls MCP tools from) is left to
+///   ask: whether every side effect inside a script is checked on its own
+///   isn't something rlord can vouch for. (See `docs/architecture.md`, "The
+///   overlord", for what was checked live and the user's own config.)
+pub fn overlord_config(rlord_bin: &str, socket: &str) -> Value {
     let rule = |action: &str, effect: &str| serde_json::json!({"action": action, "resource": "*", "effect": effect});
-    let environment: serde_json::Map<String, Value> = env
+    let environment: serde_json::Map<String, Value> = super::MCP_ENV
         .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .map(|k| (k.to_string(), Value::String(String::new())))
         .collect();
+    let mut command = vec![rlord_bin.to_string()];
+    command.extend(super::mcp_args(socket));
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
         "mcp": {"servers": {"rlord": {
             "type": "local",
-            "command": [rlord_bin, "mcp"],
+            "command": command,
             "environment": environment,
         }}},
         "permissions": [
@@ -231,7 +238,6 @@ pub fn overlord_config(rlord_bin: &str, env: &[(String, String)]) -> Value {
             rule("glob", "allow"),
             rule("grep", "allow"),
             rule("subagent", "allow"),
-            rule("execute", "allow"),
             rule("rlord_*", "allow"),
         ],
     })
@@ -1265,12 +1271,16 @@ pub(crate) mod tests {
     /// with its tools allowed after everything was set to ask.
     #[test]
     fn overlord_config_allows_only_what_it_names() {
-        let env = vec![("XDG_DATA_HOME".to_string(), "/d".to_string())];
-        let cfg = overlord_config("/bin/rlord", &env);
+        let cfg = overlord_config("/bin/rlord", "/run/d.sock");
         let server = &cfg["mcp"]["servers"]["rlord"];
         assert_eq!(server["type"], "local");
-        assert_eq!(server["command"], serde_json::json!(["/bin/rlord", "mcp"]));
-        assert_eq!(server["environment"]["XDG_DATA_HOME"], "/d");
+        assert_eq!(
+            server["command"],
+            serde_json::json!(["/bin/rlord", "mcp", "--socket", "/run/d.sock"])
+        );
+        // The caller's id isn't inherited from whichever pane started
+        // OpenCode's shared server.
+        assert_eq!(server["environment"]["RLORD_SESSION_ID"], "");
         let rules = cfg["permissions"].as_array().unwrap();
         // The last matching rule wins: "ask" for everything comes first.
         assert_eq!(
@@ -1286,8 +1296,9 @@ pub(crate) mod tests {
         };
         assert_eq!(effect("rlord_*").as_deref(), Some("allow"));
         assert_eq!(effect("read").as_deref(), Some("allow"));
-        // Nothing that writes or runs commands is named: it asks.
-        for a in ["shell", "edit", "webfetch", "external_directory"] {
+        // Nothing that writes or runs commands is named: it asks. Code Mode
+        // (`execute`) too.
+        for a in ["shell", "edit", "webfetch", "external_directory", "execute"] {
             assert_eq!(effect(a), None, "{a}");
         }
         assert!(rules.iter().all(|r| r["effect"] != "deny"));

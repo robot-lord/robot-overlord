@@ -25,16 +25,17 @@ It runs on any of the agents rlord runs: Claude Code, Codex or OpenCode
 (`[overlord] agent`, or the setup dialog's first row). See "Which agent
 runs the overlord" below for what differs.
 
-- **A strong model at low effort** (`opus` / `low` by default on Claude
-  Code; Codex's own default model at `low`; OpenCode's default model, which
+- **A strong model at medium effort** (`opus` / `medium` by default on
+  Claude Code; Codex's own default model at `medium`; OpenCode's default model, which
   has no effort setting). It does
   light work itself, in seconds: find and jump to sessions (`goto_session`,
   `show_list`), shape the list (`set_list_view`, groups), edit names, tags,
   notes and descriptions, answer from rlord's data ("what's waiting on
   me?"). Anything heavier it delegates: routine passes over many sessions
   go to cheaper subagents (tidy, import), research goes to a subagent, and
-  work in a repo becomes a new session. If low effort proves too shallow
-  for you, set `[overlord] effort = "medium"`.
+  work in a repo becomes a new session. An `[overlord] effort` you set
+  yourself wins over the default (`low` for quicker answers, `high` for
+  deeper ones).
 - **Starting a session**: just tell the overlord ("start a session in ai to
   fix the flaky login tests"). The list's `n` form is a thin wrapper around
   the same thing, with optional hints (describe → confirm via
@@ -112,7 +113,8 @@ the overlord's, and the old front desk is stopped and archived (as
 `overlord-front-desk`). `mastermind_model`, `mastermind_effort` and
 `mastermind_fresh_after_mins` in `config.toml` still work as the overlord's
 `model`, `effort` and `fresh_after_mins`; a `model` or `effort` you set
-yourself wins over them. Only the default effort changed, to low.
+yourself wins over them. With no effort set, it runs at the default
+(medium).
 `[tmux] mastermind` is ignored.
 
 `enter` on a stopped session resumes it and attaches.
