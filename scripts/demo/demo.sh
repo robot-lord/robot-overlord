@@ -248,6 +248,39 @@ s.sendall((json.dumps({"id": 1, "method": "overlord.ensure", "params": {}}) + "\
 s.recv(65536)
 PY
 
+# Earlier overlord conversations (it restarts fresh after idle): transcripts
+# next to the current one, and the restart events that chain them.
+for _ in $(seq 20); do
+  src=$(sql "select t.source_path from transcripts t join sessions s on s.id=t.session_id where s.role='overlord'" 2>/dev/null)
+  [[ -n $src ]] && break
+  sleep 0.5
+done
+oid=$(sql "select id from sessions where role='overlord'")
+cur=$(sql "select agent_session from sessions where role='overlord'")
+if [[ -n ${src:-} && -n $oid && -n $cur ]]; then
+  tdir=$(dirname "$src")
+  past() { # minutes_ago turns first_prompt reply
+    local id
+    id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+    python3 - "$tdir/$id.jsonl" "$2" "$3" "$4" <<'PY2'
+import json, sys
+path, turns, first, reply = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(path, "w") as f:
+    for i in range(turns):
+        f.write(json.dumps({"type": "user", "message": {"content": first if i == 0 else "and then?"}, "timestamp": "2026-01-01T00:00:00Z"}) + "\n")
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}, "timestamp": "2026-01-01T00:00:05Z"}) + "\n")
+PY2
+    echo "$id"
+  }
+  c1=$(past 1500 4 "what did everything do overnight?" "Three sessions finished; terraform-upgrade's plan is clean.")
+  c2=$(past 400 6 "tag the api sessions and tidy their descriptions" "Tagged 4 sessions api; rewrote two descriptions.")
+  c3=$(past 130 2 "is anything stuck?" "No: billing-webhooks is waiting on you, the rest are working.")
+  ev() { sql "insert into events (session_id, ts, kind, payload) values ('$oid', $(ago "$1"), 'fresh_conversation', '{\"from\":\"$2\",\"to\":\"$3\",\"reason\":\"idle\",\"idle_mins\":15}')"; }
+  ev 1490 "$c1" "$c2"
+  ev 380 "$c2" "$c3"
+  ev 115 "$c3" "$cur"
+fi
+
 echo "demo ready in $d"
 echo "  source $d/env.sh && rlord"
 echo "  scripts/demo/screenshots.sh $d    # images into docs/images"

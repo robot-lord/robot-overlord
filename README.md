@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/logo.png" alt="Robot Overlord" width="100%"></p>
+<p align="center"><img src="docs/images/logo.jpg" alt="Robot Overlord" width="100%"></p>
 
 <div align="center">
 
