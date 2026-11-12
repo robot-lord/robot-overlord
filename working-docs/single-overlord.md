@@ -112,3 +112,7 @@ Make it visible:
   one tag that fits shows as is). Groups stay fully visible in the Groups
   tab and the details pane: check that the details pane wraps rather than
   clips them.
+- Archive asks first: `x` (and the menu/launcher archive action) opens a
+  small confirm ("Archive <name>? y / n", Enter = yes, Esc = no). It's
+  too easy to hit by accident; bulk archiving goes through the overlord,
+  which isn't affected.
