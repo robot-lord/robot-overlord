@@ -48,9 +48,9 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error. The overlord itself is not listed.",
             json!({
-                "query": s("Search: free words match name/project/tag; status:waiting tag:x proj:x agent:x filter"),
+                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
                 "sort": sort.clone(),
                 "reverse": b("Reverse the sort"),
@@ -243,7 +243,9 @@ fn session_ref(args: &Value) -> Result<String> {
 fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
     let mut row = json!({
-        "id": s["id"], "name": s["name"], "status": s["status"],
+        "id": s["id"], "name": s["name"],
+        // As people see it: working, needs you, your turn, stopped.
+        "status": rlord_core::types::Status::label_of(s["status"].as_str().unwrap_or("")),
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         // Its tmux session: how ListAgents names its pane (to message it).

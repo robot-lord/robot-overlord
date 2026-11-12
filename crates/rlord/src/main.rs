@@ -55,7 +55,8 @@ enum Command {
         json: bool,
     },
     /// List sessions. QUERY uses the search syntax: free words match
-    /// name/project/group/tag; `status:waiting` `tag:wip` `proj:x` `agent:x`
+    /// name/project/group/tag; `status:needs` (needs you) `status:turn` (your
+    /// turn) `tag:wip` `proj:x` `agent:x`
     /// `group:x` `sort:user` set filters.
     Ls {
         query: Vec<String>,
@@ -65,7 +66,9 @@ enum Command {
         /// Show live and archived sessions
         #[arg(long)]
         all: bool,
-        /// Filter by status (comma-separated: working,idle,waiting_input,stopped,error,starting)
+        /// Filter by status (comma-separated: working, needs-you, your-turn,
+        /// stopped, error, starting; the stored names waiting_input and idle
+        /// work too)
         #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// Filter by tag
@@ -981,7 +984,7 @@ fn main() -> Result<()> {
             };
             println!("{} ({})", g("name"), g("id"));
             println!(
-                "  agent      {} · model {} · status {}",
+                "  agent      {} · model {} · {}",
                 g("agent"),
                 g("model"),
                 g("status")
@@ -1026,7 +1029,7 @@ fn main() -> Result<()> {
         Command::InstallHooks => {
             let found: Vec<Agent> = Agent::ALL.into_iter().filter(|a| a.installed()).collect();
             if found.is_empty() {
-                anyhow::bail!("neither `claude` nor `codex` is on PATH: install one first");
+                anyhow::bail!("neither `claude` nor `codex` is on PATH: `rlord agents` shows how to install one");
             }
             install_hooks(&found)
         }
@@ -1054,8 +1057,26 @@ fn install_hooks(agents: &[Agent]) -> Result<()> {
             },
             agent.hooks_file().display()
         );
-        if let Some(next) = agent.hooks_next_step() {
-            println!("\n{next}");
+        match agent {
+            Agent::Codex => {
+                let trusted = rlord_core::agents::install::codex_hooks_trusted(
+                    &rlord_core::agents::codex::home(),
+                );
+                if trusted == Some(true) && !changed {
+                    println!("trusted in Codex: yes");
+                } else {
+                    if changed {
+                        println!(
+                            "\nrlord's hooks are new or changed: Codex needs you to trust them \
+                             (again, if you had before)."
+                        );
+                    }
+                    if let Some(next) = agent.hooks_next_step() {
+                        println!("\n{next}");
+                    }
+                }
+            }
+            Agent::Claude => {}
         }
     }
     Ok(())
@@ -1804,7 +1825,7 @@ fn print_session_table(list: &Value) {
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
-            get("status"),
+            rlord_core::types::Status::label_of(get("status")),
             rel_age(
                 [
                     "last_agent_msg_at",

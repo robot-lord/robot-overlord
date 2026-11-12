@@ -88,6 +88,30 @@ Phases 1 and 2 are built (branch `codex-support`).
 - **Demo**: `scripts/demo/bin/codex` stand-in (hooks, rollout, thread
   index; `nohooks/<folder>` turns its hooks off) and one Codex session.
 
+Since then, on the same branch:
+
+- Codex launches with `--no-daemon` (hooks must run in the pane) and
+  `--no-alt-screen` (tmux scrollback). Verified against real Codex by the
+  lead: hooks bind, status, search, `exec fork` summary.
+- **Install hints** (`core/src/agents/install.rs`): one table of each
+  vendor's install commands (Claude Code, Codex, OpenCode), the one for
+  this machine suggested by `rlord agents`, `list_agents` (MCP), the form
+  (a missing agent shows the command, `^Y` copies, sending refused) and
+  `session.new`'s error. rlord never runs an install. Commands checked
+  against the vendors' pages on 2026-11-11.
+- **Statuses mean one thing each**: `waiting_input` is shown as "needs
+  you" (PermissionRequest, Claude's AskUserQuestion via PreToolUse, a
+  permission/elicitation Notification by `notification_type`), cleared to
+  working by PostToolUse / PostToolUseFailure; `idle` is "your turn"
+  (Claude's idle Notification is ignored). Stored values unchanged. Tool
+  hooks that change nothing return before any tmux call, write or log
+  line, and don't tick the list. Existing installs need `rlord
+  install-hooks` again (Codex: re-trust).
+
+Known gaps in the status work: a permission denied in Codex clears only
+at the next tool or the turn's end; a sub-agent's tool finishing while the
+main agent waits on a prompt clears "needs you" early (same session id).
+
 Unverified against a real Codex run: that hooks fire with these payload
 fields for an interactive session, that SessionStart is not fired for
 sub-agent threads, `thread_source = 'user'` for user threads only, and the
@@ -103,13 +127,6 @@ and `discover` (an SSE listener writing the same status events).
 
 ## Owed
 
-- Stale "waiting": after a permission prompt is answered, a Codex session
-  shows waiting until its turn ends (no hook in between is installed;
-  PostToolUse would fix it at one process per tool call). Claude has the
-  same gap with Notification.
-- `rlord claude install-hooks` is still what `scripts/get.sh`,
-  `install.sh` and the Homebrew caveat print; switch them to `rlord
-  install-hooks` with the next stable release.
 - Screenshots (`scripts/demo/screenshots.sh`) not retaken with the Codex
   demo session and the form's Agent hint.
 

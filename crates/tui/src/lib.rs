@@ -1534,7 +1534,7 @@ impl App {
         let prompt = match &self.mode {
             Mode::Normal => None,
             Mode::Filter(b) => Some(format!(
-                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:/tag:/proj:)"
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working · tag: · proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),

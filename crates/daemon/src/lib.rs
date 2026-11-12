@@ -396,7 +396,10 @@ impl Daemon {
                 warm::enqueue_ref(self, id);
             }
         }
-        if mutating && r.is_ok() {
+        // (A hook that changed nothing, e.g. one per tool call, isn't a change:
+        // no list refetch.)
+        let unchanged = method == "hook.emit" && r.as_ref().is_ok_and(|v| v["unchanged"] == true);
+        if mutating && r.is_ok() && !unchanged {
             self.changed();
             if method == "session.new" {
                 self.bind_nav_keys();
@@ -769,6 +772,70 @@ mod tests {
         server.abort();
     }
 
+    /// "Needs you" is a block mid-turn, cleared when the agent moves on;
+    /// Claude's idle reminder leaves a finished session "your turn".
+    #[test]
+    fn claude_needs_you_and_your_turn_mean_one_thing_each() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01cl",
+            name: "c",
+            agent: "claude",
+            agent_session: Some("u-1"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01cl_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_status("01cl", Status::Starting, 1).unwrap();
+        let emit = |event: &str, extra: Value| {
+            let mut payload = json!({"session_id": "u-1", "hook_event_name": event});
+            for (k, v) in extra.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            methods::hook_emit(
+                &db,
+                &json!({"instance": "01cl", "agent": "claude", "event": event, "payload": payload}),
+            )
+            .unwrap()
+        };
+        let status = || db.resolve_ref("01cl").unwrap().status;
+        emit("UserPromptSubmit", json!({}));
+        emit("PreToolUse", json!({"tool_name": "AskUserQuestion"}));
+        assert_eq!(status(), Status::WaitingInput, "a question mid-turn");
+        emit("PostToolUse", json!({"tool_name": "AskUserQuestion"}));
+        assert_eq!(status(), Status::Working, "answered");
+        emit("PermissionRequest", json!({"tool_name": "Bash"}));
+        assert_eq!(status(), Status::WaitingInput);
+        emit(
+            "Notification",
+            json!({"notification_type": "permission_prompt"}),
+        );
+        assert_eq!(status(), Status::WaitingInput);
+        emit("PostToolUseFailure", json!({"tool_name": "Bash"}));
+        assert_eq!(status(), Status::Working, "denied: the agent carries on");
+        emit("Stop", json!({}));
+        assert_eq!(status(), Status::Idle);
+        let s = db.resolve_ref("01cl").unwrap();
+        // A minute later Claude says it's idle: still "your turn", nothing logged.
+        let events = db.list_events("01cl", 100).unwrap().len();
+        let r = emit("Notification", json!({"notification_type": "idle_prompt"}));
+        assert_eq!(r["unchanged"], true);
+        let after = db.resolve_ref("01cl").unwrap();
+        assert_eq!(after.status, Status::Idle);
+        assert_eq!(after.last_state_change_at, s.last_state_change_at);
+        assert_eq!(db.list_events("01cl", 100).unwrap().len(), events);
+        // A tool finishing while it's your turn changes nothing either.
+        assert_eq!(emit("PostToolUse", json!({}))["unchanged"], true);
+        assert_eq!(status(), Status::Idle);
+    }
+
     /// Codex assigns its own conversation id: the first hook binds it.
     #[test]
     fn codex_hooks_bind_the_conversation_and_set_status() {
@@ -813,6 +880,20 @@ mod tests {
         assert_eq!(get().status, rlord_core::types::Status::Working);
         emit("PermissionRequest", "thread-1");
         assert_eq!(get().status, rlord_core::types::Status::WaitingInput);
+        // The user approved and the tool ran: working again, and neither
+        // "updated" time moved.
+        let before = get();
+        let r = emit("PostToolUse", "thread-1");
+        assert!(r["unchanged"].is_null());
+        let s = get();
+        assert_eq!(s.status, rlord_core::types::Status::Working);
+        assert_eq!(s.last_user_msg_at, before.last_user_msg_at);
+        assert_eq!(s.last_agent_msg_at, before.last_agent_msg_at);
+        // Every other tool call changes nothing and logs nothing.
+        let events = db.list_events("01codex", 100).unwrap().len();
+        assert_eq!(emit("PostToolUse", "thread-1")["unchanged"], true);
+        assert_eq!(db.list_events("01codex", 100).unwrap().len(), events);
+        emit("PermissionRequest", "thread-1");
         // A sub-agent's thread in the same pane: not this session's events.
         let r = emit("Stop", "thread-sub");
         assert!(r["ignored"].is_string());

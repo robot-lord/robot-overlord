@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use super::transcript::{clip, Title, Usage};
+use super::Effect;
 use crate::types::Status;
 
 /// `~/.codex` or `$CODEX_HOME`.
@@ -78,25 +79,31 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
-/// Map a Codex hook event to (event kind for our log, optional new status).
-/// Codex has no idle notification; a permission prompt is its "waiting".
-pub fn map_hook_event(event: &str) -> (&'static str, Option<Status>) {
+/// Map a Codex hook event to (event kind for our log, what it does to the
+/// status). A permission prompt is its "needs you"; it ends when the tool
+/// it was for has run (PostToolUse).
+pub fn map_hook_event(event: &str) -> (&'static str, Effect) {
+    use Effect::{Nothing, Resume, Set};
     match event {
-        "SessionStart" => ("session_start", Some(Status::Idle)),
-        "UserPromptSubmit" => ("prompt_submitted", Some(Status::Working)),
-        "Stop" => ("agent_stopped", Some(Status::Idle)),
-        "PermissionRequest" => ("permission_request", Some(Status::WaitingInput)),
-        "SessionEnd" => ("session_end", Some(Status::Stopped)),
-        _ => ("hook_other", None),
+        "SessionStart" => ("session_start", Set(Status::Idle)),
+        "UserPromptSubmit" => ("prompt_submitted", Set(Status::Working)),
+        "Stop" => ("agent_stopped", Set(Status::Idle)),
+        "PermissionRequest" => ("permission_request", Set(Status::WaitingInput)),
+        "PostToolUse" => ("tool", Resume),
+        "SessionEnd" => ("session_end", Set(Status::Stopped)),
+        _ => ("hook_other", Nothing),
     }
 }
 
-pub(crate) const HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "UserPromptSubmit",
-    "Stop",
-    "PermissionRequest",
-    "SessionEnd",
+/// (event, matcher). PostToolUse fires on every tool call; the handler
+/// does nothing unless the session was waiting on the user.
+pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("Stop", None),
+    ("PermissionRequest", None),
+    ("PostToolUse", None),
+    ("SessionEnd", None),
 ];
 
 // ---- Codex's thread index ----
@@ -634,12 +641,17 @@ mod tests {
     fn hooks_map_to_status() {
         assert_eq!(
             map_hook_event("PermissionRequest"),
-            ("permission_request", Some(Status::WaitingInput))
+            ("permission_request", Effect::Set(Status::WaitingInput))
         );
-        assert_eq!(map_hook_event("Stop").1, Some(Status::Idle));
-        assert_eq!(map_hook_event("SessionEnd").1, Some(Status::Stopped));
+        assert_eq!(map_hook_event("Stop").1, Effect::Set(Status::Idle));
+        assert_eq!(map_hook_event("SessionEnd").1, Effect::Set(Status::Stopped));
+        // The approved tool ran: the agent moved on.
+        assert_eq!(map_hook_event("PostToolUse"), ("tool", Effect::Resume));
         // Not installed, and never a status: sub-agents aren't tracked yet.
-        assert_eq!(map_hook_event("SubagentStart"), ("hook_other", None));
+        assert_eq!(
+            map_hook_event("SubagentStart"),
+            ("hook_other", Effect::Nothing)
+        );
     }
 
     #[test]

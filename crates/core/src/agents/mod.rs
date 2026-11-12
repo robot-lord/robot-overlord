@@ -45,6 +45,28 @@ pub enum Agent {
     Codex,
 }
 
+/// What a hook event does to a session's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    Nothing,
+    /// The session is now in this status.
+    Set(Status),
+    /// The agent moved on from being blocked on the user: `waiting_input`
+    /// becomes `working`; any other status stays.
+    Resume,
+}
+
+impl Effect {
+    /// The status a session in `current` goes to, if it changes.
+    pub fn apply(self, current: Status) -> Option<Status> {
+        match self {
+            Effect::Set(s) if s != current => Some(s),
+            Effect::Resume if current == Status::WaitingInput => Some(Status::Working),
+            _ => None,
+        }
+    }
+}
+
 /// A new conversation's command, and what is known about it before it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
@@ -183,10 +205,10 @@ impl Agent {
 
     // ---- hooks ----
 
-    /// (event kind for rlord's log, the status it means if any).
-    pub fn map_hook_event(self, event: &str) -> (&'static str, Option<Status>) {
+    /// (event kind for rlord's log, what it does to the status).
+    pub fn map_hook_event(self, event: &str, payload: &Value) -> (&'static str, Effect) {
         match self {
-            Agent::Claude => claude::map_hook_event(event),
+            Agent::Claude => claude::map_hook_event(event, payload),
             Agent::Codex => codex::map_hook_event(event),
         }
     }
@@ -228,8 +250,8 @@ impl Agent {
                  \x20 2. type `/hooks`\n\
                  \x20 3. review the `rlord hook emit codex` entries and trust them\n\
                  Until then rlord still runs Codex sessions: it finds each conversation in \
-                 Codex's own index and reads working/idle from its transcript (a little \
-                 later, and without \"waiting for you\").",
+                 Codex's own index and reads working / your turn from its transcript (a \
+                 little later, and without \"needs you\").",
             ),
         }
     }
@@ -336,10 +358,10 @@ pub fn agent_of(transcript: &Path) -> Agent {
 /// Merge a hook command into an agent's hooks file for each of `events`,
 /// preserving everything already there (including other tools' hooks).
 /// Claude Code's `settings.json` and Codex's `hooks.json` share the shape:
-/// `{"hooks": {"<Event>": [{"hooks": [{"type": "command", "command": …}]}]}}`.
+/// `{"hooks": {"<Event>": [{"matcher"?, "hooks": [{"type": "command", "command": …}]}]}}`.
 /// Idempotent; the file as it was is kept once as `<name>.pre-rlord.bak`.
 /// Returns true if the file was modified.
-pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[&str]) -> Result<bool> {
+pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[(&str, Option<&str>)]) -> Result<bool> {
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -362,7 +384,7 @@ pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[&str]) -> Result<bool>
         bail!("{name} 'hooks' is not an object; refusing to modify");
     }
     let mut changed = false;
-    for event in events {
+    for (event, matcher) in events {
         let arr = hooks
             .as_object_mut()
             .unwrap()
@@ -395,9 +417,12 @@ pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[&str]) -> Result<bool>
             }
         }
         if !found {
-            arr.as_array_mut()
-                .unwrap()
-                .push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
+            let mut group = json!({"hooks": [{"type": "command", "command": hook_cmd}]});
+            // Only for what the matcher names (a tool, a notification type).
+            if let Some(m) = matcher {
+                group["matcher"] = json!(m);
+            }
+            arr.as_array_mut().unwrap().push(group);
             changed = true;
         }
     }
@@ -419,6 +444,18 @@ pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[&str]) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_on_clears_only_needs_you() {
+        use Status::*;
+        assert_eq!(Effect::Resume.apply(WaitingInput), Some(Working));
+        for s in [Working, Idle, Stopped, Starting] {
+            assert_eq!(Effect::Resume.apply(s), None);
+        }
+        assert_eq!(Effect::Set(Idle).apply(Working), Some(Idle));
+        assert_eq!(Effect::Set(Idle).apply(Idle), None);
+        assert_eq!(Effect::Nothing.apply(WaitingInput), None);
+    }
 
     #[test]
     fn names_round_trip() {
@@ -505,6 +542,10 @@ mod tests {
             "/bin/rlord hook emit claude"
         );
         assert!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len() == 1);
+        // Every tool finishing is heard; a tool starting only when it's the
+        // question tool.
+        assert!(v["hooks"]["PostToolUse"][0]["matcher"].is_null());
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "AskUserQuestion");
         assert!(path.with_extension("json.pre-rlord.bak").exists());
     }
 
@@ -522,6 +563,7 @@ mod tests {
             events,
             [
                 "PermissionRequest",
+                "PostToolUse",
                 "SessionEnd",
                 "SessionStart",
                 "Stop",

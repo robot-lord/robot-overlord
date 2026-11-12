@@ -814,6 +814,16 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         return Ok(json!({"ignored": true}));
     };
     let now = now_ms();
+    // Events that fire often (every tool call, every notification) and
+    // change nothing for this session: done, with no tmux call, no write
+    // and no log line.
+    let own_agent = Agent::parse(agent).filter(|a| a.name() == s.agent);
+    if let Some(a) = own_agent {
+        let (kind, effect) = a.map_hook_event(event, &payload);
+        if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() {
+            return Ok(json!({"ok": true, "unchanged": true}));
+        }
+    }
     if let Some(why) = foreign_hook(&s, params) {
         // Same RLORD_SESSION_ID, another process (e.g. Claude's background
         // daemon forked the conversation out of the pane): it must not
@@ -824,7 +834,7 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
 
     // The hooks of the agent the session runs (another agent started by
     // hand in its pane inherits RLORD_SESSION_ID: logged, nothing more).
-    if let Some(agent) = Agent::parse(agent).filter(|a| a.name() == s.agent) {
+    if let Some(agent) = own_agent {
         let mut bound = true;
         if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
             match s.agent_session.as_deref() {
@@ -854,7 +864,10 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
         if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
             db.upsert_transcript_source(&s.id, tp)?;
         }
-        let (kind, status) = agent.map_hook_event(event);
+        let (kind, effect) = agent.map_hook_event(event, &payload);
+        let status = effect.apply(s.status);
+        // Only a prompt and a finished turn are messages: a permission
+        // prompt, a question or a tool call never moves "updated".
         match kind {
             "prompt_submitted" => db.touch_last_user_msg(&s.id, now)?,
             "agent_stopped" => db.touch_last_agent_msg(&s.id, now)?,

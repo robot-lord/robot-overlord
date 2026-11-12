@@ -309,6 +309,10 @@ impl App {
             head("Commands"),
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
+            Line::from(""),
+            head("Status"),
+            row("needs you".into(), "blocked on a prompt or question"),
+            row("your turn".into(), "finished: the next prompt is yours"),
         ];
         // Side by side when wide, else stacked (both heights).
         let wide = f.area().width >= 84;

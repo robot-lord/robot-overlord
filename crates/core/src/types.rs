@@ -22,6 +22,30 @@ impl Status {
             Status::Error => "error",
         }
     }
+
+    /// How a status is shown to people (the stored values stay as they
+    /// are). Each means one thing: `needs you` is blocked mid-turn on the
+    /// user (a permission prompt, a question); `your turn` is a finished
+    /// turn waiting for the next prompt.
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Starting => "starting",
+            Status::Working => "working",
+            Status::WaitingInput => "needs you",
+            Status::Idle => "your turn",
+            Status::Stopped => "stopped",
+            Status::Error => "error",
+        }
+    }
+
+    /// The label for a stored status value (unknown ones as they are).
+    pub fn label_of(stored: &str) -> &str {
+        match stored {
+            "waiting_input" => Status::WaitingInput.label(),
+            "idle" => Status::Idle.label(),
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

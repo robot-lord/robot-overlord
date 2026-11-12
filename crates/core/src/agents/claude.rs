@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::transcript::{transcript_stats, Title, Usage};
+use super::Effect;
 use crate::types::{Status, Subagent};
 
 pub fn mint_session_id() -> String {
@@ -102,30 +103,74 @@ pub fn resume_argv(
     Ok(argv)
 }
 
-/// Map a Claude hook event to (event kind for our log, optional new status).
-pub fn map_hook_event(event: &str) -> (&'static str, Option<Status>) {
+/// Map a Claude hook event to (event kind for our log, what it does to the
+/// status).
+///
+/// "Needs you" (blocked mid-turn on the user) comes from a permission
+/// request, a question (`AskUserQuestion`, seen as its PreToolUse), or a
+/// notification that says so; it ends when the agent moves on (a tool
+/// finished or failed, an elicitation answered). The idle notification
+/// Claude sends a minute after a turn ends is not that: the session is
+/// already "your turn".
+pub fn map_hook_event(event: &str, payload: &Value) -> (&'static str, Effect) {
+    use Effect::{Nothing, Resume, Set};
     match event {
-        "SessionStart" => ("session_start", Some(Status::Idle)),
-        "UserPromptSubmit" => ("prompt_submitted", Some(Status::Working)),
-        "Stop" => ("agent_stopped", Some(Status::Idle)),
-        "Notification" => ("notification", Some(Status::WaitingInput)),
-        "SessionEnd" => ("session_end", Some(Status::Stopped)),
-        "PreCompact" => ("pre_compact", None),
-        "SubagentStart" => ("subagent_started", None),
-        "SubagentStop" => ("subagent_stopped", None),
-        _ => ("hook_other", None),
+        "SessionStart" => ("session_start", Set(Status::Idle)),
+        "UserPromptSubmit" => ("prompt_submitted", Set(Status::Working)),
+        "Stop" => ("agent_stopped", Set(Status::Idle)),
+        "PermissionRequest" => ("permission_request", Set(Status::WaitingInput)),
+        "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
+            ("question_asked", Set(Status::WaitingInput))
+        }
+        "PreToolUse" => ("tool", Nothing),
+        "PostToolUse" | "PostToolUseFailure" => ("tool", Resume),
+        "Notification" => ("notification", notification_effect(payload)),
+        "SessionEnd" => ("session_end", Set(Status::Stopped)),
+        "PreCompact" => ("pre_compact", Nothing),
+        "SubagentStart" => ("subagent_started", Nothing),
+        "SubagentStop" => ("subagent_stopped", Nothing),
+        _ => ("hook_other", Nothing),
     }
 }
 
-pub(crate) const HOOK_EVENTS: &[&str] = &[
-    "SessionStart",
-    "UserPromptSubmit",
-    "Stop",
-    "Notification",
-    "SessionEnd",
-    "PreCompact",
-    "SubagentStart",
-    "SubagentStop",
+/// What a notification means, from its `notification_type` (older Claude
+/// Code sends none: then from its message).
+fn notification_effect(payload: &Value) -> Effect {
+    match payload["notification_type"].as_str() {
+        Some("permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog") => {
+            Effect::Set(Status::WaitingInput)
+        }
+        Some("elicitation_complete" | "elicitation_response") => Effect::Resume,
+        // idle_prompt, auth, quota, agent view, plugins: not this session
+        // blocked on the user.
+        Some(_) => Effect::Nothing,
+        None => {
+            let m = payload["message"].as_str().unwrap_or("").to_lowercase();
+            if m.contains("permission") || m.contains("approval") {
+                Effect::Set(Status::WaitingInput)
+            } else {
+                Effect::Nothing
+            }
+        }
+    }
+}
+
+/// (event, matcher): the events rlord's hook is installed for. The tool
+/// events fire on every tool call (the handler does nothing unless the
+/// session's status changes); PreToolUse only for the question tool.
+pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("Stop", None),
+    ("Notification", None),
+    ("PermissionRequest", None),
+    ("PreToolUse", Some("AskUserQuestion")),
+    ("PostToolUse", None),
+    ("PostToolUseFailure", None),
+    ("SessionEnd", None),
+    ("PreCompact", None),
+    ("SubagentStart", None),
+    ("SubagentStop", None),
 ];
 
 // ---- reading transcript lines (see `transcript::Line`) ----
@@ -432,6 +477,43 @@ mod tests {
         assert_eq!(argv[1], "--session-id");
         assert_eq!(argv.last().unwrap(), "--strict-mcp-config");
         assert!(resume_argv("u-1", "scavenged", "/tmp", None, &[]).is_err());
+    }
+
+    #[test]
+    fn needs_you_is_a_block_mid_turn_not_an_idle_reminder() {
+        use serde_json::json;
+        let note = |ty: &str| map_hook_event("Notification", &json!({"notification_type": ty})).1;
+        assert_eq!(note("permission_prompt"), Effect::Set(Status::WaitingInput));
+        assert_eq!(
+            note("elicitation_dialog"),
+            Effect::Set(Status::WaitingInput)
+        );
+        // A minute after the turn ended: still "your turn".
+        assert_eq!(note("idle_prompt"), Effect::Nothing);
+        assert_eq!(note("auth_success"), Effect::Nothing);
+        assert_eq!(note("elicitation_response"), Effect::Resume);
+        // Older Claude Code: no type, only the text.
+        let old = |m: &str| map_hook_event("Notification", &json!({"message": m})).1;
+        assert_eq!(
+            old("Claude needs your permission to use Bash"),
+            Effect::Set(Status::WaitingInput)
+        );
+        assert_eq!(old("Claude is waiting for your input"), Effect::Nothing);
+        // A question mid-turn blocks; any other tool starting doesn't.
+        let pre = |tool: &str| map_hook_event("PreToolUse", &json!({"tool_name": tool}));
+        assert_eq!(
+            pre("AskUserQuestion"),
+            ("question_asked", Effect::Set(Status::WaitingInput))
+        );
+        assert_eq!(pre("Bash").1, Effect::Nothing);
+        assert_eq!(
+            map_hook_event("PermissionRequest", &json!({})).1,
+            Effect::Set(Status::WaitingInput)
+        );
+        // The agent moved on.
+        for e in ["PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(map_hook_event(e, &json!({})), ("tool", Effect::Resume));
+        }
     }
 
     #[test]

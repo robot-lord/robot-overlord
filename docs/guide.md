@@ -129,8 +129,8 @@ rlord codex install-hooks    # or `rlord install-hooks` for every agent
 then start `codex`, type `/hooks`, and trust the `rlord hook emit codex`
 entries. Codex runs a hook only after you've trusted it. Until you do,
 Codex sessions still work: rlord finds each conversation in Codex's own
-index and reads working/idle from its transcript, a few seconds late and
-without "waiting for you".
+index and reads working / your turn from its transcript, a few seconds
+late and without "needs you".
 
 What works: launch, attach, stop, resume (`codex resume`), fresh
 conversation, status, the list and its `agent:codex` filter, preview,
@@ -141,8 +141,8 @@ codex_summary_model`).
 
 Not yet: the overlord and mastermind on Codex, importing Codex
 conversations started outside rlord, passing a message to a Codex session
-from the overlord, sub-agent tracking, Remote Control. A session waiting
-on a permission prompt shows as waiting only with trusted hooks.
+from the overlord, sub-agent tracking, Remote Control. A session blocked
+on a permission prompt shows "needs you" only with trusted hooks.
 
 ## The right-hand side: preview + details
 
@@ -340,6 +340,13 @@ counts look wrong.
 
 ## Navigation and keys
 
+A session's status means one thing: **working**; **needs you** (blocked
+mid-turn on a permission prompt or a question, until you answer); **your
+turn** (it finished; the next prompt is yours); **stopped**. Filter with
+`status:needs`, `status:turn`, `status:working`. Run `rlord install-hooks`
+again after updating rlord: "needs you" clearing when the agent moves on
+uses hooks added later (and Codex asks you to trust changed hooks again).
+
 The TUI is the hub. `enter` on a session switches your tmux client into its
 pane; from inside **any** agent pane, **Option-D** (`M-d`) brings you back to the
 TUI. It's a home-row key, because you press it constantly. Stopped sessions
@@ -349,7 +356,7 @@ Jumping is search-driven, not cycling: `/` filters as you type and `Enter`
 attaches to the top match (`Tab` keeps the filter, ↑/↓ move within matches);
 digits `1`–`9` attach to the Nth listed session. The search box and
 `rlord ls <query>` share one syntax — free words match name/project/tag,
-and `status:waiting` `tag:wip` `proj:wait2` `agent:claude`
+and `status:needs` `tag:wip` `proj:wait2` `agent:claude`
 `sort:user` set typed filters. `o` cycles sorts, `O` reverses. (macOS: make
 Option send Alt, e.g. kitty `macos_option_as_alt both`.) Option-D and
 Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).

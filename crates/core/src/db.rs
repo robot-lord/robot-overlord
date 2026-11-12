@@ -167,10 +167,14 @@ impl SessionQuery {
     }
 }
 
-/// Accept friendly status spellings (`waiting` → `waiting_input`).
+/// Accept friendly status spellings: the labels people see (`needs you`,
+/// `your turn`; one word in a filter: `needs`, `needs-you`, `your-turn`,
+/// `turn`) and older words (`waiting` → `waiting_input`).
 pub fn normalize_status(s: &str) -> String {
-    match s.trim() {
-        "waiting" | "wait" | "input" => "waiting_input".to_string(),
+    match s.trim().to_lowercase().replace(['_', ' '], "-").as_str() {
+        "waiting" | "wait" | "input" | "waiting-input" | "needs" | "needs-you" | "needsyou"
+        | "blocked" => "waiting_input".to_string(),
+        "your-turn" | "yourturn" | "turn" | "yours" => "idle".to_string(),
         "run" | "busy" => "working".to_string(),
         other => other.to_string(),
     }
@@ -1473,6 +1477,18 @@ mod tests {
         let mut q = SessionQuery::default();
         q.apply_search_text("status:waiting");
         assert_eq!(q.status, ["waiting_input"]);
+        // The words people see are accepted too.
+        for (word, stored) in [
+            ("needs", "waiting_input"),
+            ("needs-you", "waiting_input"),
+            ("waiting_input", "waiting_input"),
+            ("your-turn", "idle"),
+            ("turn", "idle"),
+            ("idle", "idle"),
+            ("working", "working"),
+        ] {
+            assert_eq!(normalize_status(word), stored, "{word}");
+        }
         assert_eq!(db.sessions(&q).unwrap()[0].id, "01bbb");
 
         let mut q = SessionQuery::default();

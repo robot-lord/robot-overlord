@@ -175,8 +175,9 @@ pub fn version(bin: &Path) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant, SystemTime};
-    static SEEN: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>> =
-        LazyLock::new(Default::default);
+    // Per binary: when it was last modified, and what it answered then.
+    type Seen = HashMap<PathBuf, (SystemTime, Option<String>)>;
+    static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(Default::default);
     // (Through symlinks: an upgrade replaces what the link points at.)
     let modified = std::fs::metadata(bin).and_then(|m| m.modified()).ok()?;
     if let Some((at, v)) = SEEN.lock().ok()?.get(bin) {
@@ -472,6 +473,7 @@ mod tests {
             "user_prompt_submit",
             "permission_request",
             "session_end",
+            "post_tool_use",
         ] {
             cfg += &entry(e, 0);
         }

@@ -127,8 +127,10 @@ pub fn title(text: &str) -> String {
 pub fn status_parts(status: &str) -> (&'static str, &'static str, Color) {
     match status {
         "working" => ("●", "working", green()),
-        "waiting_input" => ("◐", "waiting", yellow()),
-        "idle" => ("○", "idle", cyan()),
+        // Blocked mid-turn on the user (a permission prompt, a question).
+        "waiting_input" => ("◐", "needs you", yellow()),
+        // Its turn is over: the next prompt is the user's.
+        "idle" => ("○", "your turn", cyan()),
         "error" => ("✕", "error", red()),
         "starting" => ("◌", "starting", overlord()),
         "stopped" => ("■", "stopped", faint_c()),

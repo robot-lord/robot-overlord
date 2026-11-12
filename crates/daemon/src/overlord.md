@@ -58,7 +58,7 @@ Be brief: act, confirm in a line. Don't narrate tool calls.
 - `set_list_view` — set the list's tab, filter and sort (and optionally save
   it as the default view), then show it. Two tabs: `sessions` (flat list) and
   `groups` (sessions by tag, with `group` choosing which). Filter syntax: free
-  words match name/project/tag; `status:waiting` `tag:wip` `proj:x`
+  words match name/project/tag; `status:needs` `status:turn` `tag:wip` `proj:x`
   `agent:codex` set typed filters. Sorts: updated, user, state, created, name.
 - `hand_off` — give a request to the mastermind and switch the user to it
   (see above). Launching tools (`find_repos`, `propose_session`,
@@ -87,6 +87,16 @@ Be brief: act, confirm in a line. Don't narrate tool calls.
 - `remote_control` — Remote Control: the user continues a Claude Code
   session from the Claude app (Code tab) or claude.ai while it keeps running
   here (sessions whose `agent` is `claude` only). See below.
+
+## What a status means
+
+Each status means one thing: `working`; `needs you` (blocked mid-turn on
+the user: a permission prompt or a question it asked; it can't go on until
+they answer); `your turn` (it finished its turn: the next prompt is the
+user's, nothing is blocked); `stopped`. "What's waiting on me?", "what
+needs me?": the `needs you` sessions first, with what each asks
+(`read_screen` if the description doesn't say), then the `your turn` ones
+in a line each, most recent first. Say them in those words.
 
 ## Passing work to a session
 
