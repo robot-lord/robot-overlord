@@ -104,3 +104,11 @@ Make it visible:
 - `recall` (above) reads the same list, so the overlord and the UI agree on
   what "earlier conversations" are.
 - Rename kv `mastermind_fresh_at` → `overlord_fresh_at` in the migration.
+
+## Also in this PR (small UI fix, user ask 2026-11-12)
+
+- The list's tags column cuts tags mid-word ("#release #tooli"). When a
+  row's tags don't fit `TAGS_W`, show a group count instead ("3 groups";
+  one tag that fits shows as is). Groups stay fully visible in the Groups
+  tab and the details pane: check that the details pane wraps rather than
+  clips them.
