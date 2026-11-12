@@ -1156,11 +1156,15 @@ impl App {
         // Fixed columns take what they need (number, pin, status, the time
         // column with its arrow); the name gets the rest up to 26; groups
         // and the project only show while names keep a readable width.
-        const TIME_W: u16 = 15;
         const TAGS_W: u16 = 15;
         let sel_w = theme::SELECT_BAR.chars().count() as u16;
-        // borders + highlight symbol + number, pin, status, time + 4 gaps
-        let fixed = 2 + 2 + sel_w + 1 + 1 + 13 + TIME_W + 2 * 4; // + padding
+        // borders + padding + highlight symbol + number, pin, status + 4 gaps
+        let base = 2 + 2 + sel_w + 1 + 1 + 13 + 2 * 4;
+        // The time column's header names its sort; where even a 14-wide
+        // name wouldn't fit beside it, the short form.
+        let compact = area.width < base + 15 + 14;
+        let time_w: u16 = if compact { 10 } else { 15 };
+        let fixed = base + time_w;
         let room = area.width.saturating_sub(fixed);
         let show_tags = room >= TAGS_W + 2 + 18;
         let room = if show_tags { room - TAGS_W - 2 } else { room };
@@ -1171,6 +1175,11 @@ impl App {
         // descending; `reverse` flips it), and the time column shows the time
         // being sorted by.
         let (time_label, arrow_on_name) = match self.sort {
+            SortMode::Activity | SortMode::Name if compact => {
+                ("Message", self.sort == SortMode::Name)
+            }
+            SortMode::User if compact => ("Prompt", false),
+            SortMode::State if compact => ("Status", false),
             SortMode::Activity => ("Last message", false),
             SortMode::User => ("Last prompt", false),
             SortMode::State => ("Status change", false),
@@ -1200,7 +1209,7 @@ impl App {
             Constraint::Length(1),
             Constraint::Length(name_w),
             Constraint::Length(13),
-            Constraint::Length(TIME_W),
+            Constraint::Length(time_w),
         ];
         if show_tags {
             header.push(Cell::from("Groups"));
@@ -1332,6 +1341,7 @@ impl App {
         // The list is the focused pane unless the group column has focus.
         let focused = !(self.tab == Tab::Groups && self.group_focus);
         let block = theme::panel(self.list_title(), focused);
+        let widths_for_hits = widths.clone();
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
@@ -1359,18 +1369,40 @@ impl App {
                 break;
             }
             self.hits.row(inner, y, mouse::Hit::Row(i));
-            // The gap under the last overlord row.
-            y += 1 + u16::from(
-                self.overlord_rows > 0
-                    && i + 1 == self.overlord_rows
-                    && self.sessions.len() > self.overlord_rows,
-            );
+            // The gap under the last overlord row: a faint rule over it
+            // (it also covers the selection highlight that spills into the
+            // row's margin).
+            if self.overlord_rows > 0
+                && i + 1 == self.overlord_rows
+                && self.sessions.len() > self.overlord_rows
+            {
+                y += 1;
+                if y < inner.y + inner.height {
+                    let rule = Rect::new(area.x + 2, y, area.width.saturating_sub(4), 1);
+                    f.render_widget(
+                        Paragraph::new("╌".repeat(rule.width as usize))
+                            .style(Style::default().fg(theme::border())),
+                        rule,
+                    );
+                }
+            }
+            y += 1;
         }
-        // The headers of the sortable columns: Name and the time column.
-        // Columns: number, pin, name, status, time (after the highlight
-        // symbol; two cells between columns).
-        let name_x = area.x + 1 + sel_w + (1 + 2) + (1 + 2);
-        let time_x = name_x + name_w + 2 + 13 + 2;
+        // The headers of the sortable columns: Name and the time column,
+        // placed by the same layout the table uses (inside the border and
+        // padding, after the highlight symbol, two cells between columns).
+        let cols_area = Rect::new(
+            area.x + 2 + sel_w,
+            area.y + 1,
+            area.width.saturating_sub(4 + sel_w),
+            1,
+        );
+        let cols = RLayout::horizontal(widths_for_hits.clone())
+            .flex(ratatui::layout::Flex::Start)
+            .spacing(2)
+            .split(cols_area);
+        let (name_x, name_w) = (cols[2].x, cols[2].width);
+        let (time_x, time_hw) = (cols[4].x, cols[4].width);
         let time_sort = match self.sort {
             SortMode::Name => SortMode::Activity,
             m => m,
@@ -1381,7 +1413,7 @@ impl App {
             mouse::Hit::SortBy(SortMode::Name),
         );
         self.hits.add(
-            Rect::new(time_x, head_y, TIME_W, 1),
+            Rect::new(time_x, head_y, time_hw, 1),
             mouse::Hit::SortBy(time_sort),
         );
     }

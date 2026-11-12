@@ -169,6 +169,10 @@ impl App {
             }
             Cmd::Keys => self.open_keys(None),
             Cmd::Sort(s) => {
+                // As a header click: a new sort starts in its natural direction.
+                if self.sort != s {
+                    self.reverse = false;
+                }
                 self.sort = s;
                 self.dirty = true;
             }
