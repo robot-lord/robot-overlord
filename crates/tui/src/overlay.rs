@@ -765,9 +765,9 @@ fn highlight(text: &mut Text<'static>, (a, b): ((u16, u16), (u16, u16))) {
 /// (Option-O), the mastermind's (Option-M) and back (Option-D, closes).
 /// Inside a popup, keys reach this program, not tmux's key table.
 struct SeatKeys {
-    overlord: Option<(bool, bool, char)>,
-    mastermind: Option<(bool, bool, char)>,
-    close: Option<(bool, bool, char)>,
+    overlord: Option<rlord_core::keys::Key>,
+    mastermind: Option<rlord_core::keys::Key>,
+    close: Option<rlord_core::keys::Key>,
 }
 
 /// Whether a key event is the tmux key `spec` (`M-a`, `a`, `[`, `C-Space`,
@@ -832,7 +832,9 @@ fn parse_key(spec: &str) -> Option<(bool, bool, char)> {
 impl SeatKeys {
     fn from_config(cfg: &rlord_core::config::Config) -> Self {
         // An empty or unreadable key falls back to the default.
-        let or = |k: &str, d: &str| parse_key(k).or_else(|| parse_key(d));
+        // The same notation the key screen saves (F-keys and named keys too).
+        use rlord_core::keys::Key;
+        let or = |k: &str, d: &str| Key::parse(k).or_else(|| Key::parse(d));
         SeatKeys {
             overlord: or(&cfg.tmux.overlord, "M-o"),
             mastermind: or(cfg.tmux.mastermind_switch(), "M-m"),
@@ -841,19 +843,13 @@ impl SeatKeys {
     }
 
     fn seat_key(&self, k: &KeyEvent) -> Option<&'static str> {
-        let KeyCode::Char(c) = k.code else {
-            return None;
-        };
-        let got = (
-            k.modifiers.contains(KeyModifiers::ALT),
-            k.modifiers.contains(KeyModifiers::CONTROL),
-            c,
-        );
-        if self.overlord == Some(got) {
+        let got = crate::keyscreen::key_of(k);
+        got.as_ref()?;
+        if self.overlord == got {
             Some(overlord::FRONT.key)
-        } else if self.mastermind == Some(got) {
+        } else if self.mastermind == got {
             Some(overlord::MASTERMIND.key)
-        } else if self.close == Some(got) {
+        } else if self.close == got {
             Some("close")
         } else {
             None

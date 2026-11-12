@@ -475,6 +475,29 @@ fn bound(cfg: &Config) -> Vec<(&'static Slot, Option<Key>)> {
 
 /// What stands in the way of `key` for `slot` (worst first).
 pub fn check(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
+    let mut out = findings(cfg, env, slot, key);
+    out.sort_by_key(|f| std::cmp::Reverse(f.level));
+    out
+}
+
+/// Keys the list always uses, whatever the config says.
+const LIST_BUILTIN: &[(&str, &str)] = &[
+    ("up", "the list always moves up with ↑"),
+    ("down", "the list always moves down with ↓"),
+    ("left", "← moves to the group list (groups tab)"),
+    ("right", "→ opens a group (groups tab)"),
+    ("C-c", "Ctrl-C in the list only says how to quit"),
+];
+
+/// Keys no global binding may take: every pane needs them.
+const PANE_ESSENTIAL: &[(&str, &str)] = &[
+    ("C-c", "interrupt"),
+    ("C-d", "end of input"),
+    ("C-z", "suspend"),
+    ("C-\\", "quit"),
+];
+
+fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut add = |level, text: String| out.push(Finding { level, text });
     let label = key.label();
@@ -527,8 +550,29 @@ pub fn check(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             format!("your tmux config binds {label} on rlord's server: {cmd}"),
         );
     }
+    if slot.scope == Scope::List {
+        let own = matches!(
+            (slot.field, key.name.as_str()),
+            ("up", "up") | ("down", "down")
+        );
+        if let Some((_, why)) = LIST_BUILTIN
+            .iter()
+            .find(|(k, _)| !own && Key::parse(k).as_ref() == Some(key))
+        {
+            add(Level::Taken, why.to_string());
+        }
+    }
     if slot.scope != Scope::Global {
         return out;
+    }
+    if let Some((_, what)) = PANE_ESSENTIAL
+        .iter()
+        .find(|(k, _)| Key::parse(k).as_ref() == Some(key))
+    {
+        add(
+            Level::Taken,
+            format!("{label} is {what} in every pane: it can't be rlord's"),
+        );
     }
     if let Some((_, cmd)) = env.profile.iter().find(|(k, _)| k == key) {
         add(
@@ -559,7 +603,6 @@ pub fn check(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             format!("a plain {label} everywhere would stop you typing it"),
         );
     }
-    out.sort_by_key(|f| std::cmp::Reverse(f.level));
     out
 }
 
@@ -662,6 +705,10 @@ mod tests {
         assert_eq!(lv("M-h", back), None);
         assert_eq!(lv("enter", back), Some(Level::Taken)); // typed everywhere
         assert_eq!(lv("F5", back), None);
+        assert_eq!(lv("C-c", back), Some(Level::Taken)); // interrupt
+        assert_eq!(lv("up", slot("keys.quit").unwrap()), Some(Level::Taken)); // built-in arrow
+        assert_eq!(lv("C-c", slot("keys.quit").unwrap()), Some(Level::Taken));
+        assert_eq!(lv("up", slot("keys.up").unwrap()), None);
         let quit = slot("keys.quit").unwrap();
         assert_eq!(lv("j", quit), Some(Level::Taken)); // down
         assert_eq!(lv("M-d", quit), Some(Level::Taken)); // tmux's first

@@ -21,13 +21,13 @@ const LISTEN_TABLE: &str = "rlord-listen";
 pub(crate) struct KeyScreen {
     sel: usize,
     env: Env,
-    /// Slots whose key arrived in a live test on this screen.
-    tested: HashSet<String>,
+    /// (slot, key) pairs whose key arrived in a live test on this screen.
+    tested: HashSet<(String, Key)>,
     phase: Phase,
     /// The last thing that happened (saved, failed).
     msg: Option<(Level, String)>,
-    /// Each slot's findings for its current key (redone after a save).
-    cache: Vec<Vec<Finding>>,
+    /// Each slot's current key and its findings (redone after a save).
+    cache: Vec<(Option<Key>, Vec<Finding>)>,
 }
 
 enum Phase {
@@ -84,12 +84,16 @@ impl KeyScreen {
 
     /// Redo every slot's findings (the config changed).
     fn recheck(&mut self, cfg: &Config) {
+        let v = serde_json::to_value(cfg).unwrap_or_default();
         self.cache = SLOTS
             .iter()
             .map(|s| {
-                Key::parse(&s.current(cfg))
-                    .map(|k| keys::check(cfg, &self.env, s, &k))
-                    .unwrap_or_default()
+                let key = v[s.section][s.field].as_str().and_then(Key::parse);
+                let fs = key
+                    .as_ref()
+                    .map(|k| keys::check(cfg, &self.env, s, k))
+                    .unwrap_or_default();
+                (key, fs)
             })
             .collect();
     }
@@ -103,12 +107,28 @@ impl KeyScreen {
     }
 
     fn findings(&self, i: usize) -> &[Finding] {
-        self.cache.get(i).map(Vec::as_slice).unwrap_or_default()
+        self.cache
+            .get(i)
+            .map(|c| c.1.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The slot's current key was tested live on this screen.
+    fn tested(&self, i: usize) -> bool {
+        self.cache
+            .get(i)
+            .and_then(|c| c.0.clone())
+            .is_some_and(|k| self.tested.contains(&(SLOTS[i].id(), k)))
     }
 }
 
 /// The key a terminal event stands for.
-fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
+pub(crate) fn key_of(k: &ratatui::crossterm::event::KeyEvent) -> Option<Key> {
+    // Shift shows in a character (`R`); config.toml can't spell it on a
+    // named key (Shift-F5, Shift-Up).
+    if k.modifiers.contains(KeyModifiers::SHIFT) && !matches!(k.code, KeyCode::Char(_)) {
+        return None;
+    }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
     let named = |n: &str| Some(Key::named(n, ctrl, alt));
@@ -201,7 +221,7 @@ impl App {
                     };
                     let key = oc.map(|(_, l)| Key::char(l, false, true)).unwrap_or(key);
                     if oc.is_none() {
-                        ks.tested.insert(s.id());
+                        ks.tested.insert((s.id(), key.clone()));
                     }
                     let mut findings = keys::check(&self.config, &ks.env, s, &key);
                     let option_char = oc.map(|(c, _)| {
@@ -329,13 +349,14 @@ impl App {
                     Style::default().fg(theme::accent()).bold(),
                 ));
             }
-            let spec = s.current(&self.config);
-            let key = Key::parse(&spec)
-                .map(|k| k.label())
+            let key = ks.cache[i]
+                .0
+                .as_ref()
+                .map(Key::label)
                 .unwrap_or_else(|| "off".into());
             let fs = ks.findings(i);
             let mut line = Line::from(vec![
-                mark(fs, ks.tested.contains(&s.id())),
+                mark(fs, ks.tested(i)),
                 Span::styled(
                     format!("{key:<10}"),
                     Style::default().fg(theme::text()).bold(),
@@ -389,7 +410,7 @@ impl App {
                 let fs = ks.findings(ks.sel);
                 if fs.is_empty() && ks.msg.is_none() {
                     d.push(Line::styled(
-                        if ks.tested.contains(&s.id()) {
+                        if ks.tested(ks.sel) {
                             "reaches rlord, and nothing else uses it"
                         } else {
                             "nothing in the way that rlord can see (enter tests it live)"
