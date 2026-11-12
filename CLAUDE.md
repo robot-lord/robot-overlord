@@ -182,6 +182,15 @@ merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
   a row in its README) only if something is still owed.
 - Any PR that makes an official doc wrong fixes it in the same PR.
 
+## Dependency updates
+
+Dependabot opens one grouped PR per week for Cargo and one for GitHub
+Actions (`.github/dependabot.yml`). Its PRs don't bump the version, so
+`version-bump` fails on them: push a bump commit to the PR (next `-dev.N`),
+let CI run, review, then merge and release as usual. CI's `advisories` job
+(cargo-deny, `deny.toml`) fails on known-vulnerable dependencies; an
+exception in `deny.toml` needs a reason.
+
 ## Other rules
 
 - Don't touch the user's default tmux server in tests or scripts. rlord runs

@@ -1,0 +1,20 @@
+# Keep dependencies current: one grouped PR per ecosystem per week, so
+# updates arrive in batches (each merge to main is a release and needs a
+# version bump; see CLAUDE.md).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

@@ -20,7 +20,9 @@ Done (2026-11-12): `main` ruleset fixed (it targeted no branch; now PR +
 admin bypass); `v*` tags protected; Dependabot alerts and security
 updates; Actions limited to GitHub's own plus pinned third-party ones;
 squash-only merges; branches deleted on merge; wiki and projects off;
-`SECURITY.md`; CI pinned to SHAs with read-only token and a RustSec check.
+`SECURITY.md`; CI pinned to SHAs with read-only token and a RustSec check
+(rusqlite 0.42 for the bundled-SQLite CVE; `paste` ignored with a reason);
+Dependabot version updates, grouped weekly.
 
 ## Right after flipping it public
 
