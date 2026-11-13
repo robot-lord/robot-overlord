@@ -261,9 +261,9 @@ there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
 `--enable`, `--disable` or `--search`, in any of their spellings (`-cK=V`,
-`--config=V`, …), in the TUI's own process). So a daemon-mode pane can't be given
-`-c check_for_update_on_startup=false` (the overlord's) and, like an
-in-pane session, can open on Codex's update prompt. `spec_args` adds
+`--config=V`, …), in the TUI's own process). So a daemon-mode pane can't
+be given `-c check_for_update_on_startup=false` (the overlord's) and, like
+an in-pane session, can open on Codex's update prompt. `spec_args` adds
 `--no-daemon` for every other Codex session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
