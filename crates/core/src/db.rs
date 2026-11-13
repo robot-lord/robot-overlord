@@ -513,13 +513,14 @@ impl Db {
             format!("WHERE {}", conds.join(" AND "))
         };
         let (expr, natural) = match q.sort {
-            // Messages only: a resume or an idle notification changes the
+            // Messages only (the user's, the agent's, and what rlord
+            // typed in): a resume or an idle notification changes the
             // state (the State sort), not the conversation.
             // (Usage: in this order until the daemon sorts by usage, which
             // keeps it among equals, reversed or not.)
             SortMode::Activity | SortMode::Usage => (
                 "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
-                 COALESCE(last_user_msg_at, 0))",
+                 COALESCE(last_user_msg_at, 0), COALESCE(last_rlord_msg_at, 0))",
                 "DESC",
             ),
             SortMode::User => ("COALESCE(last_user_msg_at, created_at)", "DESC"),

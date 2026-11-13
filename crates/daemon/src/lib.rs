@@ -813,8 +813,9 @@ pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Va
 
 /// The fields of a hook payload rlord uses. Everything else (a tool's
 /// whole input and output, prompts) stays out of the daemon and the spool.
-/// Of a prompt, only a hash goes (`prompt_hash`: how the daemon knows a
-/// prompt rlord typed itself, `own.rs`).
+/// Of a prompt, only what identifies its text goes (`prompt_hash`,
+/// `prompt_pasted`: how the daemon knows a prompt rlord typed itself,
+/// `own.rs`).
 const HOOK_FIELDS: &[&str] = &[
     "hook_event_name",
     "session_id",
@@ -845,7 +846,11 @@ pub fn slim_hook_payload(raw: &str) -> Value {
                 }
             }
             if let Some(prompt) = v.get("prompt").and_then(Value::as_str) {
-                out.insert("prompt_hash".to_string(), json!(own::text_hash(prompt)));
+                let mark = rlord_core::types::PromptMark::of(prompt);
+                out.insert("prompt_hash".to_string(), json!(mark.hash));
+                if mark.pasted {
+                    out.insert("prompt_pasted".to_string(), json!(true));
+                }
             }
         }
         Err(_) => {

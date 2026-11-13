@@ -38,7 +38,7 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use rlord_core::agents::transcript::{self, LimitHit};
-use rlord_core::db::{ArchivedMode, Db, SessionQuery};
+use rlord_core::db::{ArchivedMode, SessionQuery};
 use rlord_core::timefmt::clock;
 use rlord_core::types::{now_ms, Session, Status};
 
@@ -75,14 +75,6 @@ pub struct Limits {
     now: Mutex<Option<Map<String, Value>>>,
 }
 
-fn kv_map(db: &Db, key: &str) -> Result<Map<String, Value>> {
-    db.kv_map(key)
-}
-
-fn save_map(db: &Db, key: &str, m: &Map<String, Value>) -> Result<()> {
-    db.kv_set_map(key, m)
-}
-
 /// The limit a session is stopped on, from what its transcript says
 /// (`hit`): None once the conversation went on or the limit has reset.
 fn current(hit: Option<&LimitHit>, now: i64) -> Option<Value> {
@@ -108,7 +100,7 @@ pub fn start(d: &Arc<Daemon>) {
 fn limits(d: &Daemon) -> Map<String, Value> {
     let mut now = d.limits.now.lock().expect("limits mutex");
     if now.is_none() {
-        *now = Some(kv_map(&d.db(), LIMITS_KEY).unwrap_or_default());
+        *now = Some(d.db().kv_map(LIMITS_KEY).unwrap_or_default());
     }
     now.clone().unwrap_or_default()
 }
@@ -233,7 +225,7 @@ fn scan(d: &Daemon) -> Result<()> {
                     db.insert_event(id, now, "limit_hit", &l.to_string())?;
                 }
             }
-            save_map(&db, LIMITS_KEY, &after)?;
+            db.kv_set_map(LIMITS_KEY, &after)?;
         }
         *d.limits.now.lock().expect("limits mutex") = Some(after);
         d.changed();
@@ -251,7 +243,7 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     let jobs = if limits.is_empty() {
         Map::new()
     } else {
-        kv_map(&d.db(), JOBS_KEY).unwrap_or_default()
+        d.db().kv_map(JOBS_KEY).unwrap_or_default()
     };
     let now = now_ms();
     for row in rows {
@@ -337,9 +329,9 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         // Its lock: a job running now finishes before this one replaces it.
         let _session = d.sessions.lock(&s.id);
         let db = d.db();
-        let mut jobs = kv_map(&db, JOBS_KEY)?;
+        let mut jobs = db.kv_map(JOBS_KEY)?;
         jobs.insert(s.id.clone(), job.clone());
-        save_map(&db, JOBS_KEY, &jobs)?;
+        db.kv_set_map(JOBS_KEY, &jobs)?;
         db.insert_event(&s.id, now, "limit_resume_scheduled", &job.to_string())?;
         drop(db);
         scheduled.push(json!({
@@ -434,7 +426,7 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
 }
 
 fn run_jobs(d: &Daemon) -> Result<()> {
-    let ids: Vec<String> = kv_map(&d.db(), JOBS_KEY)?.keys().cloned().collect();
+    let ids: Vec<String> = d.db().kv_map(JOBS_KEY)?.keys().cloned().collect();
     for id in ids {
         if let Err(e) = run_job(d, &id) {
             tracing::debug!(session = %id, error = %e, "limit resume job");
@@ -449,7 +441,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
     let _session = d.sessions.lock(id);
     let (job, s, src) = {
         let db = d.db();
-        let Some(job) = kv_map(&db, JOBS_KEY)?.remove(id) else {
+        let Some(job) = db.kv_map(JOBS_KEY)?.remove(id) else {
             return Ok(());
         };
         (
@@ -468,12 +460,12 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
     let same = |j: &Value| ["limit_at", "asked_at"].iter().all(|k| j[*k] == job[*k]);
     let update = |f: &dyn Fn(&mut Map<String, Value>)| -> Result<()> {
         let db = d.db();
-        let mut jobs = kv_map(&db, JOBS_KEY)?;
+        let mut jobs = db.kv_map(JOBS_KEY)?;
         if !jobs.get(id).is_some_and(same) {
             return Ok(());
         }
         f(&mut jobs);
-        save_map(&db, JOBS_KEY, &jobs)
+        db.kv_set_map(JOBS_KEY, &jobs)
     };
     let log = |kind: &str, p: Value| -> Result<()> {
         if s.is_some() {
@@ -542,6 +534,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rlord_core::db::Db;
 
     fn session(status: Status) -> Session {
         serde_json::from_value(json!({
@@ -820,7 +813,7 @@ mod tests {
                 t.join().unwrap();
             }
             assert!(limits(&d).contains_key("s1"));
-            assert!(kv_map(&d.db(), LIMITS_KEY).unwrap().contains_key("s1"));
+            assert!(d.db().kv_map(LIMITS_KEY).unwrap().contains_key("s1"));
         }
     }
 }

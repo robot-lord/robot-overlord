@@ -809,31 +809,47 @@ including when the active one hits a usage limit.
   the user or its screen shows a dialog (the Enter would answer it).
 - **rlord's own prompts** (`daemon/src/own.rs`). The agent reports what
   rlord pastes like any prompt (its UserPromptSubmit hook, OpenCode's
-  events, a turn `discover` reads from a transcript), and it must not
-  count as the user typing: `last_user_msg_at` feeds the "last prompt"
-  sort, triage and resume jobs. So `type_into` leaves a marker right
-  before each paste, in kv `own_prompts` (`{session id: [{at, source,
-  hash}]}`; `source` is `send`, `resume` or `ask`; a daemon restart
-  keeps it), and every reported prompt goes through `own::prompt`:
-  - Claude and Codex hooks carry the prompt's text. `rlord hook emit`
-    sends only a hash of it (`prompt_hash`, whitespace-insensitive;
-    prompts themselves stay out of the daemon). A marker with the same
-    hash, up to 10 minutes old, is that prompt. Any other text is the
-    user's, however soon after a paste.
-  - With no text (OpenCode, a turn found in a transcript, a cut-off hook
-    payload): the first prompt from 1s before a marker to 30s after it.
-    A user prompt that beats rlord's own into that window is read as
-    rlord's; only these text-less paths have that gap.
+  events, a turn `discover` reads from a transcript), and rlord's own
+  messages must not count as the user typing: `last_user_msg_at` feeds
+  the "last prompt" sort and resume jobs. So for `send_to_session`, a
+  `when_idle` delivery and a resume, `type_into` leaves a marker right
+  before the paste, in kv `own_prompts` (`{session id: [{at, source,
+  hash, chars}]}`; `source` is `send` or `resume`; a daemon restart keeps
+  it). `overlord ask` is not marked: its text is what the user typed, so
+  its prompt is the user's. Every reported prompt goes through
+  `own::prompt`:
+  - **With its text**: Claude and Codex hooks (`prompt`), and OpenCode's
+    `session.inbox.enqueued` (`item.payload.text`, per the 2.2.7 schema).
+    Only what identifies the text is kept (`PromptMark`: a
+    whitespace-insensitive hash, and whether it looks changed by a paste);
+    `rlord hook emit` sends `prompt_hash`/`prompt_pasted`, never the
+    prompt. A marker with the same hash, up to 10 minutes old, is that
+    prompt. Any other text is the user's, however soon after a paste.
+  - **A text the agent may have changed.** Claude Code shows a large or
+    multi-line paste as `[Pasted text #1 +30 lines]` in its input. Its
+    transcripts hold the expanded text (checked against local input
+    history: every sampled placeholder entry was stored expanded), so
+    the hook's `prompt` should carry it too, but that was not observed
+    directly. As a guard, when the hash differs and either the reported
+    text holds such a placeholder or is 1000+ characters, or rlord's
+    paste was that long, a prompt within 5s of the paste is taken as it.
+  - **With no text** (OpenCode's session row read after missed events, a
+    turn found in a transcript, a cut-off hook payload): the first prompt
+    from 1s before a marker to 30s after it. A user prompt that beats
+    rlord's own into that window is read as rlord's; only these
+    text-less paths have that gap.
 
   A matched prompt is logged as `rlord_prompt` (with `source`) and moves
   `last_rlord_msg_at`; any other is `prompt_submitted` and moves
   `last_user_msg_at`. A marker is used once per way of reporting: the
-  same prompt told a second way within 30s (a turn read from the
-  transcript, then its hook) is still rlord's, the next prompt told the
-  same way is the user's. It is taken back when its paste fails, and
-  expires after 10 minutes. Code that means "any prompt" (the
-  overlord's idle fresh start, `recall`'s dating, the quiet check before
-  a remote-control restart) reads both times (`Session::last_prompt_at`).
+  same prompt told a second way within 5s of the first report (a turn
+  read from the transcript, then its hook) is still rlord's; anything
+  later, or told the same way, is the user's. It is taken back when its
+  paste fails, and expires after 10 minutes. "Updated" everywhere (the
+  activity sort, the list's last-message time, `triage`) counts all
+  three message times; code that means "any prompt" (the overlord's idle
+  fresh start, `recall`'s dating, the quiet check before a
+  remote-control restart) reads `Session::last_prompt_at`.
 - **Typing into a pane** (`send::type_into`), for asks, sends and
   deliveries alike: right before the paste, under the session's lock, the
   pinned agent pane is captured and must be at its input prompt

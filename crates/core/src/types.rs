@@ -104,6 +104,49 @@ impl Session {
     }
 }
 
+/// What rlord keeps of a prompt's text to recognise it again: never the
+/// text itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMark {
+    /// `PromptMark::hash_of` the text.
+    pub hash: String,
+    /// The agent may have changed the text between the paste and its
+    /// report (a `[Pasted text #1 +30 lines]` placeholder left in it, or a
+    /// text long enough to be cut or stored aside), so the hash can miss.
+    pub pasted: bool,
+}
+
+impl PromptMark {
+    /// Texts this long (characters) count as `pasted`.
+    pub const LONG_CHARS: usize = 1000;
+
+    pub fn of(text: &str) -> Self {
+        PromptMark {
+            hash: Self::hash_of(text),
+            pasted: text.contains("[Pasted text #") || text.chars().count() >= Self::LONG_CHARS,
+        }
+    }
+
+    /// A hash of a prompt's text, the same for what rlord pasted and what
+    /// the agent reports of it: whitespace runs count as one space (a
+    /// paste may change line ends), the ends are trimmed. FNV-1a, written
+    /// out: the hook client and the daemon must agree across versions.
+    pub fn hash_of(text: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for (i, word) in text.split_whitespace().enumerate() {
+            if i > 0 {
+                eat(b' ');
+            }
+            word.bytes().for_each(&mut eat);
+        }
+        format!("{h:016x}")
+    }
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -2028,6 +2028,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
                 [
                     "last_agent_msg_at",
                     "last_user_msg_at",
+                    "last_rlord_msg_at",
                     "last_state_change_at",
                     "created_at"
                 ]

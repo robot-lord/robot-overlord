@@ -32,7 +32,7 @@ const SESSION_REF: &str = "Session id, id prefix, or name";
 
 pub fn tools() -> Value {
     let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name", "usage"],
-                      "description": "updated = last message (from the user or the agent; a resume or status flip alone does not count); user = the user's last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change; usage = most used first, by the usage measure (see `usage`)"});
+                      "description": "updated = last message (from the user, the agent, or one you sent it; a resume or status flip alone does not count); user = the user's own last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change; usage = most used first, by the usage measure (see `usage`)"});
     let usage = json!({"type": "string", "enum": ["turns", "tokens", "context"],
                        "description": "The usage measure: turns (prompts the user typed), tokens (taken in new or written), context (% of the context window in use). Default: the user's configured one."});
     let new_session_props = json!({
@@ -272,6 +272,9 @@ fn summarize(s: &Value) -> Value {
         "tags": s["tags"], "description": s["description"],
         "pinned": s["pinned"], "archived": !s["archived_at"].is_null(),
         "last_agent_msg": ts("last_agent_msg_at"), "last_user_msg": ts("last_user_msg_at"),
+        // A prompt rlord typed in (your send_to_session, a resume): not
+        // the user's.
+        "last_rlord_msg": ts("last_rlord_msg_at"),
         "subagents_running": s["agents_running"],
         // Turns, tokens, context % (null while unknown; "loading" while
         // rlord reads it).
