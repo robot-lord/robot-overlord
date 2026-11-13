@@ -1808,6 +1808,65 @@ mod tests {
         assert_eq!(o["conversations"]["reason"], "switched");
     }
 
+    /// A session on Codex's daemon: its hooks arrive with no session named
+    /// (`by: "thread"`), bind by folder, then go by thread.
+    #[test]
+    fn codex_daemon_hooks_go_by_thread() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        for (id, folder) in [("01dmn", "/src/app"), ("01dmn2", "/src/web")] {
+            db.insert_session(&rlord_core::db::NewSession {
+                id,
+                name: id,
+                agent: "codex",
+                agent_session: None,
+                project_path: folder,
+                tmux_session: Some("rlord_01dmn_absent"),
+                launch_spec: r#"{"agent":"codex","codex_host":"daemon"}"#,
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.set_status(id, Status::Starting, 1).unwrap();
+        }
+        let index = |_: rlord_core::agents::Agent, _: &str| rlord_core::agents::Indexed::User;
+        let emit = |event: &str, sid: &str, cwd: &str| {
+            methods::hook_emit_with(
+                &db,
+                &json!({"instance": null, "by": "thread", "agent": "codex", "event": event,
+                        "payload": {"session_id": sid, "hook_event_name": event, "cwd": cwd,
+                                    "transcript_path": format!("/c/rollout-x-{sid}.jsonl")}}),
+                &index,
+            )
+            .unwrap()
+        };
+        let get = |id: &str| db.resolve_ref(id).unwrap();
+        // Not a first SessionStart: nothing to bind it to.
+        assert!(emit("UserPromptSubmit", "t-1", "/src/app")["ignored"].is_string());
+        // The first SessionStart in its folder binds it, confirmed by hook.
+        emit("SessionStart", "t-1", "/src/app");
+        let s = get("01dmn");
+        assert!(s.codex_daemon);
+        assert_eq!(s.agent_session.as_deref(), Some("t-1"));
+        assert_eq!(s.agent_session_trust, "hook");
+        assert_eq!(get("01dmn2").agent_session, None);
+        // Then by thread, from wherever it was sent.
+        emit("UserPromptSubmit", "t-1", "/elsewhere");
+        assert_eq!(get("01dmn").status, Status::Working);
+        emit("Stop", "t-1", "/src/app");
+        assert_eq!(get("01dmn").status, Status::Idle);
+        // Someone else's thread in the same folder: not this session's.
+        assert!(emit("UserPromptSubmit", "t-9", "/src/app")["ignored"].is_string());
+        assert_eq!(get("01dmn").status, Status::Idle);
+        // A stopped one's thread never brings it back.
+        db.set_status("01dmn", Status::Stopped, 2).unwrap();
+        assert!(emit("UserPromptSubmit", "t-1", "/src/app")["ignored"].is_string());
+        assert_eq!(get("01dmn").status, Status::Stopped);
+    }
+
     /// Codex assigns its own conversation id: the first hook binds it.
     #[test]
     fn codex_hooks_bind_the_conversation_and_set_status() {
