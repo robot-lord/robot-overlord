@@ -19,7 +19,8 @@ sessions moved onto the daemon and back, a stand-in control socket for
 tests (`codex_server::fake`), and docs. Re-check everything below against
 the Codex of the day first. Where the branch's own working doc differs
 (it was written before MFA was on and before the lock was timed twice),
-this file is newer. Rules to keep (Brandon's): the machine switch
+this file is newer. Its version (0.23.0-dev.15) is taken: rebase it and
+bump again. Rules to keep (Brandon's): the machine switch
 goes on only on the user's explicit yes (`confirm_machine`), never
 confirmed by the overlord for them; the pairing code never goes into MCP
 results, logs or events, only to the user's own terminal; turning it off
@@ -96,6 +97,9 @@ its "After launch (tracked)" list:
   `-c`; it would need its MCP server and settings some other way.
 - Linux: the daemon's backend, socket and sandbox (unchecked; Linux fixes
   come after 1.0, Road to 1.0 item 1).
+- Check live what environment a daemon thread's commands and MCP servers
+  get when rlord started the daemon (architecture.md states the expected
+  one).
 - A daemon started by hand from an in-pane rlord session's pane would pass
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.

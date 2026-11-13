@@ -261,8 +261,9 @@ there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
 `--enable`, `--disable` or `--search`, joined forms included, in the TUI's
-own process). Like an in-pane session (and unlike the overlord, whose `-c`
-turns it off), a daemon-mode pane can open on Codex's update prompt. `spec_args` adds `--no-daemon` for every other Codex
+own process). So a daemon-mode pane can't be given
+`-c check_for_update_on_startup=false` (the overlord's) and, like an
+in-pane session, can open on Codex's update prompt. `spec_args` adds `--no-daemon` for every other Codex
 session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
@@ -311,11 +312,11 @@ session. The rest is
   usage-limit resume doesn't wait on the status (it sends while working
   too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
   or the transcript past the limit), so its gap is the same moment. Escape in either client interrupts.
-- **Commands and MCP servers run in the daemon's environment**, like its
-  hooks: whatever environment the daemon was started with, not the pane's.
-  Started by rlord, that is rlord's own (under launchd or systemd, the
-  service's: its PATH, none of your shell rc), less rlord's session
-  variables.
+- **Commands and MCP servers run in the daemon** (expected to get its
+  environment, as its hooks do, not the pane's; not checked live). Started
+  by rlord, that is the rlord daemon's environment less its session
+  variables: the shell that first started rlord, or the launchd/systemd
+  service's.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
