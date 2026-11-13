@@ -91,8 +91,9 @@ pub struct Session {
     pub summary: String,
     pub summary_at: Option<i64>,
     /// When rlord itself last typed a prompt into it (`send_to_session`,
-    /// a resume after a usage limit, `overlord ask`). `last_user_msg_at`
-    /// is the user's own prompts only.
+    /// a held `when_idle` message, a resume after a usage limit).
+    /// `last_user_msg_at` is the user's own prompts only; `overlord ask`
+    /// carries what the user typed, so it counts as the user's.
     #[serde(default)]
     pub last_rlord_msg_at: Option<i64>,
 }
@@ -111,8 +112,8 @@ pub struct PromptMark {
     /// `PromptMark::hash_of` the text.
     pub hash: String,
     /// The agent may have changed the text between the paste and its
-    /// report (a `[Pasted text #1 +30 lines]` placeholder left in it, or a
-    /// text long enough to be cut or stored aside), so the hash can miss.
+    /// report (a paste placeholder left in it, `PLACEHOLDERS`, or a text
+    /// long enough to be cut or stored aside), so the hash can miss.
     pub pasted: bool,
 }
 
@@ -120,10 +121,16 @@ impl PromptMark {
     /// Texts this long (characters) count as `pasted`.
     pub const LONG_CHARS: usize = 1000;
 
+    /// How each agent's input shows a large paste (the start of it):
+    /// Claude Code `[Pasted text #1 +30 lines]`, OpenCode `[Pasted ~30
+    /// lines]` (2.2.7), Codex `[Pasted Content 1234 chars]` (0.167).
+    pub const PLACEHOLDERS: &[&str] = &["[Pasted text #", "[Pasted ~", "[Pasted Content "];
+
     pub fn of(text: &str) -> Self {
         PromptMark {
             hash: Self::hash_of(text),
-            pasted: text.contains("[Pasted text #") || text.chars().count() >= Self::LONG_CHARS,
+            pasted: Self::PLACEHOLDERS.iter().any(|p| text.contains(p))
+                || text.chars().count() >= Self::LONG_CHARS,
         }
     }
 

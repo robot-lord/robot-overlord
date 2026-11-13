@@ -320,8 +320,10 @@ hooks and `discover` keep the stored status to themselves.
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules
   the job to that reset (five sends at most), unless the user typed a
-  prompt since the send (`last_user_msg_at` later than the job's
-  `sent_at`): then the session is theirs and the job ends. What rlord
+  prompt since the send (`last_user_msg_at` more than 5s after the
+  job's `sent_at`; one closer is taken as the job's own message, should
+  its marker have missed): then the session is theirs and the job ends,
+  logged as `limit_resume_skipped`. What rlord
   types (the resume itself, a `when_idle` delivery, `send_to_session`)
   never moves `last_user_msg_at` ("Typing into a pane"). The
   record a resume was sent on is kept as `sent_hit` (a hash of its line),
@@ -825,14 +827,17 @@ including when the active one hits a usage limit.
     `rlord hook emit` sends `prompt_hash`/`prompt_pasted`, never the
     prompt. A marker with the same hash, up to 10 minutes old, is that
     prompt. Any other text is the user's, however soon after a paste.
-  - **A text the agent may have changed.** Claude Code shows a large or
-    multi-line paste as `[Pasted text #1 +30 lines]` in its input. Its
-    transcripts hold the expanded text (checked against local input
-    history: every sampled placeholder entry was stored expanded), so
-    the hook's `prompt` should carry it too, but that was not observed
-    directly. As a guard, when the hash differs and either the reported
-    text holds such a placeholder or is 1000+ characters, or rlord's
-    paste was that long, a prompt within 5s of the paste is taken as it.
+  - **A text the agent may have changed.** Agents show a large or
+    multi-line paste as a placeholder in their input: Claude Code
+    `[Pasted text #1 +30 lines]`, OpenCode `[Pasted ~30 lines]`, Codex
+    `[Pasted Content 1234 chars]` (forms read from the 2.2.7 and 0.167
+    binaries). Claude's transcripts hold the expanded text (checked
+    against local input history), so its hook's `prompt` should too, but
+    no hook payload of a large paste was observed. As a guard, a prompt
+    with another hash within 5s of the paste is still taken as it when
+    rlord's paste was 1000+ characters, or had several lines and the
+    reported text holds a placeholder. Never for a short one-line paste
+    such as "continue": a placeholder after that is the user pasting.
   - **With no text** (OpenCode's session row read after missed events, a
     turn found in a transcript, a cut-off hook payload): the first prompt
     from 1s before a marker to 30s after it. A user prompt that beats
@@ -845,7 +850,8 @@ including when the active one hits a usage limit.
   same prompt told a second way within 5s of the first report (a turn
   read from the transcript, then its hook) is still rlord's; anything
   later, or told the same way, is the user's. It is taken back when its
-  paste fails, and expires after 10 minutes. "Updated" everywhere (the
+  paste fails, and expires after 10 minutes. A paste whose marker can't
+  be written is not made (held or refused, like any "not now"). "Updated" everywhere (the
   activity sort, the list's last-message time, `triage`) counts all
   three message times; code that means "any prompt" (the overlord's idle
   fresh start, `recall`'s dating, the quiet check before a

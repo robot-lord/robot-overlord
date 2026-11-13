@@ -720,8 +720,8 @@ fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> 
     }
     // Nothing new since the last fresh start: nothing to clear.
     let fresh_at = fresh_at(&d.db(), &s.id)?;
-    // (Any prompt: the overlord's mostly arrive through `overlord ask`,
-    // which rlord types.)
+    // (Any prompt. `overlord ask` counts as the user's; a message rlord
+    // typed in is a prompt to clear all the same.)
     if s.last_prompt_at().is_none_or(|u| u <= fresh_at) {
         return Ok(());
     }

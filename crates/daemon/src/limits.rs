@@ -60,6 +60,10 @@ pub(crate) const MARGIN_MS: i64 = 60_000;
 const WATCH_MS: i64 = 15 * 60_000;
 /// A session that can't be typed into this long after its reset: given up.
 const GIVE_UP_MS: i64 = 60 * 60_000;
+/// A user prompt this soon after the job's send is taken as the job's
+/// own message, should its marker have missed (`own.rs`), not as the
+/// user taking over.
+const OWN_PROMPT_MS: i64 = 5_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
@@ -356,7 +360,8 @@ enum Step {
     Send,
     /// Wait for a newer limit's reset: (limit_at, resets_at).
     Reschedule(i64, i64),
-    /// Forget the job (why; `done`: it did its work).
+    /// Forget the job (why; `done`: it did its work, nothing to say in
+    /// the session's log).
     Drop(&'static str, bool),
 }
 
@@ -376,9 +381,9 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
     // A limit newer than the one this job waits on, with nothing after it.
     let newer = hit.filter(|h| h.at > limit_at && !h.touched);
     if let Some(sent) = job["sent_at"].as_i64() {
-        // The user typed since: theirs now.
-        if s.last_user_msg_at.is_some_and(|t| t > sent) {
-            return Step::Drop("the user took the session over after the resume", true);
+        // The user typed since: theirs now. (Said in its log, `false`.)
+        if s.last_user_msg_at.is_some_and(|t| t > sent + OWN_PROMPT_MS) {
+            return Step::Drop("the user took the session over after the resume", false);
         }
         return match newer {
             Some(_) if job["attempts"].as_u64().unwrap_or(0) >= MAX_ATTEMPTS => {
@@ -674,14 +679,21 @@ mod tests {
             step(&sent, Some(&idle), Some(&old), 170_000 + WATCH_MS + 1),
             Step::Drop("resumed", true)
         );
-        // The user typed after the resume, however soon: a later limit
-        // is theirs.
+        // The user typed after the resume: a later limit is theirs, and
+        // the job's log says why it ended.
         let mut took_over = session(Status::Idle);
-        took_over.last_user_msg_at = Some(170_001);
-        assert!(matches!(
+        took_over.last_user_msg_at = Some(170_000 + OWN_PROMPT_MS + 1);
+        assert_eq!(
             step(&sent, Some(&took_over), Some(&again), 400_000),
-            Step::Drop(_, true)
-        ));
+            Step::Drop("the user took the session over after the resume", false)
+        );
+        // A prompt right at the send is the job's own message, should
+        // its marker have missed.
+        took_over.last_user_msg_at = Some(170_500);
+        assert_eq!(
+            step(&sent, Some(&took_over), Some(&again), 180_000),
+            Step::Reschedule(175_000, 900_000)
+        );
         // What rlord typed (the resume's own message, a held `when_idle`,
         // `send_to_session`) is not the user taking over: it moves
         // `last_rlord_msg_at` only (`own.rs`).

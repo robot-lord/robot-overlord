@@ -156,13 +156,20 @@ pub fn type_into(
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
-    // (Without `TYPING`: this takes the DB. A marker that can't be
-    // written doesn't stop the message: its prompt reads as the user's.)
-    let marked = checks.source.and_then(|source| {
-        own::mark(&d.db(), session, text, source, now_ms())
-            .inspect_err(|e| tracing::warn!(session, error = %e, "marking rlord's own prompt"))
-            .ok()
-    });
+    // (Without `TYPING`: this takes the DB.) Not typed without its
+    // marker: the prompt would be counted as the user's.
+    let marked = match checks.source {
+        Some(source) => match own::mark(&d.db(), session, text, source, now_ms()) {
+            Ok(at) => Some(at),
+            Err(e) => {
+                tracing::warn!(session, error = %e, "marking rlord's own prompt");
+                return Ok(Typed::NotNow(
+                    "rlord couldn't record that it is the one typing (its database)".into(),
+                ));
+            }
+        },
+        None => None,
+    };
     let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
     let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);

@@ -21,9 +21,9 @@
 //!   `session.inbox.enqueued` event. A marker with the same hash, at most
 //!   `TEXT_TTL_MS` old, is that prompt. A prompt with another hash is the
 //!   user's, however close to a paste, with one exception: where the
-//!   agent may have changed the text on the way (`PromptMark::pasted`, or
-//!   a long paste of rlord's), a prompt within `PASTE_WINDOW_MS` of the
-//!   paste is taken as it.
+//!   agent may have changed rlord's text on the way (the paste was long,
+//!   or had several lines and the report shows a paste placeholder), a
+//!   prompt within `PASTE_WINDOW_MS` of the paste is taken as it.
 //! - **by time**, when it doesn't (OpenCode's session row, a turn read
 //!   from a transcript, a hook payload that was cut off): a marker from
 //!   `SLACK_MS` after the prompt to `TIME_WINDOW_MS` before it.
@@ -44,7 +44,8 @@ use rlord_core::db::Db;
 use rlord_core::types::PromptMark;
 
 /// kv: pastes whose prompt hasn't been reported yet,
-/// `{session id: [{at, source, hash, chars, via?, claimed_at?}]}`. `via`,
+/// `{session id: [{at, source, hash, chars, lines, via?, claimed_at?}]}`
+/// (`lines`: the text had more than one). `via`,
 /// `claimed_at`: how and when its prompt was first reported (kept
 /// `SAME_TURN_MS` more, for the same prompt told another way).
 pub const KEY: &str = "own_prompts";
@@ -158,7 +159,7 @@ pub fn mark(db: &Db, id: &str, text: &str, source: Source, now: i64) -> Result<i
             .map_or(now, |last| now.max(last + 1));
         list.push(json!({
             "at": at, "source": source.name(), "hash": PromptMark::hash_of(text),
-            "chars": text.chars().count(),
+            "chars": text.chars().count(), "lines": text.trim().contains('\n'),
         }));
         if list.len() > MAX_PER_SESSION {
             let extra = list.len() - MAX_PER_SESSION;
@@ -192,24 +193,26 @@ fn matches(x: &Value, text: Option<&PromptMark>, at: i64, via: Via) -> bool {
         return false;
     };
     let same_text = text.is_some_and(|t| x["hash"].as_str() == Some(t.hash.as_str()));
+    // Another text, but the agent may have changed rlord's on the way: a
+    // long paste, or one of several lines reported with a placeholder in
+    // it. Never for a short one-line paste ("continue"), whatever the
+    // reported text looks like: that is the user pasting something.
+    let long = x["chars"]
+        .as_u64()
+        .is_some_and(|n| n >= PromptMark::LONG_CHARS as u64);
+    let changed = text.is_some_and(|t| long || (x["lines"] == true && t.pasted));
     // Its prompt was reported already: only the same one told another
-    // way, at about that time, is still it.
+    // way, at about the time of that report, is still it.
     if let Some(told) = x["claimed_at"].as_i64() {
-        return (text.is_none() || same_text)
+        return (text.is_none() || same_text || changed)
             && x["via"].as_str() != Some(via.name())
             && (at - told).abs() <= SAME_TURN_MS;
     }
     let since = at - marked;
     match text {
         Some(_) if same_text => (-SLACK_MS..=TEXT_TTL_MS).contains(&since),
-        // Another text. Only where the agent may have changed rlord's on
-        // the way, and only right after the paste.
-        Some(t) => {
-            let long = x["chars"]
-                .as_u64()
-                .is_some_and(|n| n >= PromptMark::LONG_CHARS as u64);
-            (t.pasted || long) && (-SLACK_MS..=PASTE_WINDOW_MS).contains(&since)
-        }
+        // (Only right after the paste.)
+        Some(_) => changed && (-SLACK_MS..=PASTE_WINDOW_MS).contains(&since),
         None => (-SLACK_MS..=TIME_WINDOW_MS).contains(&since),
     }
 }
@@ -380,9 +383,21 @@ mod tests {
         mark(&db, "s1", "continue", Source::Resume, 10_000).unwrap();
         let (kind, _) = prompt(&db, "s1", None, 12_000, Via::Transcript).unwrap();
         assert_eq!(kind, "rlord_prompt");
-        // Well inside 30s of the paste, but not the same turn's report.
+        // Well inside 30s of the paste, but not the same turn's report:
+        // measured from when the prompt was first reported, not from the
+        // paste.
         let next = 12_000 + SAME_TURN_MS + 1;
         let (kind, _) = prompt(&db, "s1", None, next, Via::Hook).unwrap();
+        assert_eq!(kind, "prompt_submitted");
+        // (A paste reported late: its second report is timed from the
+        // first one, well past the paste.)
+        mark(&db, "s1", "continue", Source::Resume, 20_000).unwrap();
+        prompt(&db, "s1", None, 45_000, Via::Transcript).unwrap();
+        let (kind, _) = prompt(&db, "s1", None, 46_000, Via::Hook).unwrap();
+        assert_eq!(kind, "rlord_prompt");
+        mark(&db, "s1", "continue", Source::Resume, 30_000).unwrap();
+        prompt(&db, "s1", None, 31_000, Via::Transcript).unwrap();
+        let (kind, _) = prompt(&db, "s1", None, 31_000 + SAME_TURN_MS + 1, Via::Events).unwrap();
         assert_eq!(kind, "prompt_submitted");
         // Even with the very same words.
         mark(&db, "s1", "continue", Source::Resume, 50_000).unwrap();
@@ -410,14 +425,40 @@ mod tests {
         let late = 100_000 + PASTE_WINDOW_MS + 1;
         let (kind, _) = prompt(&db, "s1", Some(&cut), late, Via::Hook).unwrap();
         assert_eq!(kind, "prompt_submitted");
-        // A short paste: another short text right after is the user's...
+        // A short one-line paste: another text right after is the
+        // user's, also when they pasted something themselves.
         mark(&db, "s1", "continue", Source::Resume, 200_000).unwrap();
         let (kind, _) = prompt(&db, "s1", Some(&other("stop")), 200_500, Via::Hook).unwrap();
         assert_eq!(kind, "prompt_submitted");
-        // ...a placeholder in it is the paste.
+        let their_long = "theirs ".repeat(300);
+        for theirs in [
+            "look at this [Pasted text #1 +3 lines]",
+            "[Pasted ~12 lines]",
+            "[Pasted Content 4096 chars]",
+            their_long.as_str(),
+        ] {
+            let theirs = other(theirs);
+            assert!(theirs.pasted);
+            let (kind, _) = prompt(&db, "s1", Some(&theirs), 201_000, Via::Hook).unwrap();
+            assert_eq!(kind, "prompt_submitted");
+        }
+        // The marker is still there for rlord's own "continue".
+        let (kind, _) = prompt(&db, "s1", Some(&other("continue")), 202_000, Via::Hook).unwrap();
+        assert_eq!(kind, "rlord_prompt");
+        // A few lines of rlord's, reported as a placeholder: the paste.
+        // Reported as some other plain text: the user's.
+        mark(&db, "s1", "one\ntwo\nthree", Source::Send, 300_000).unwrap();
+        let (kind, _) = prompt(&db, "s1", Some(&other("stop")), 300_500, Via::Hook).unwrap();
+        assert_eq!(kind, "prompt_submitted");
         let placeholder = other("[Pasted text #1 +3 lines]");
-        assert!(placeholder.pasted);
-        let (kind, _) = prompt(&db, "s1", Some(&placeholder), 201_000, Via::Hook).unwrap();
+        let (kind, _) = prompt(&db, "s1", Some(&placeholder), 301_000, Via::Hook).unwrap();
+        assert_eq!(kind, "rlord_prompt");
+        // The same prompt told a second way, changed there too.
+        let (kind, _) = prompt(&db, "s1", Some(&placeholder), 301_500, Via::Events).unwrap();
+        assert_eq!(kind, "rlord_prompt");
+        mark(&db, "s1", &long, Source::Send, 400_000).unwrap();
+        prompt(&db, "s1", None, 401_000, Via::Transcript).unwrap();
+        let (kind, _) = prompt(&db, "s1", Some(&cut), 402_000, Via::Hook).unwrap();
         assert_eq!(kind, "rlord_prompt");
     }
 
