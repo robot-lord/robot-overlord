@@ -1538,7 +1538,7 @@ mod tests {
 
         // Clickable hints: ranges count no width, and a status click on a
         // range runs that key's command (tmux's own click otherwise).
-        assert_eq!(visible_len("#[range=user|rlord-list]⌥d list#[norange]"), 6);
+        assert_eq!(visible_len("#[range=user|rlord-list]⌥d list#[norange]"), 7);
         bind_nav_keys("/bin/rl'x", &[("M-d", "home"), ("M-o", "overlord")]).unwrap();
         for table in ["root", PROFILE_TABLE] {
             let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
