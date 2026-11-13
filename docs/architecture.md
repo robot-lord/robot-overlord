@@ -587,6 +587,16 @@ inside the pane, it inherits `RLORD_SESSION_ID` — **caller identity is
 automatic**, so tools can default "me" and enforce policy (e.g. rate limits,
 no self-restart).
 
+Two modes. `rlord mcp` alone is read-only, for any agent session to add:
+the daemon lists and accepts only `mcp::READ_ONLY_TOOLS` (look-ups that
+change no session, tag, view, watermark or UI state and run no agent CLI
+or model), refuses any other call, and the shim never autostarts a
+daemon. `rlord mcp --overlord` serves every tool; only the overlord's
+config passes it (`agents::mcp_args`, shared by every agent's wiring). The
+shim sends `overlord: true` with `mcp.tools` / `mcp.call`; without it the
+daemon treats the caller as read-only. A test makes every tool sit in
+exactly one of the read-only and mutating lists.
+
 Tools (v1):
 - `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
   returns meta-context (status, timestamps, tags, usage, pending-message
@@ -725,7 +735,7 @@ prompt, a prompt for anything that writes or runs a command.
 
 Things that are not visible at the call site:
 
-- **`rlord mcp --socket <path>`**: every agent's config names the daemon's
+- **`rlord mcp --overlord --socket <path>`**: every agent's config names the daemon's
   socket as the daemon resolved it, and `rlord mcp` then never autostarts
   a daemon. An agent may start the server with another environment
   (OpenCode's shared server keeps whatever environment first started it,

@@ -326,9 +326,14 @@ enum Command {
         #[arg(long)]
         rescan: bool,
     },
-    /// MCP server over stdio (what the overlord's agent connects to)
-    #[command(hide = true)]
+    /// MCP server over stdio: read-only look-ups any agent session can
+    /// add (`claude mcp add rlord -- rlord mcp`); `--overlord` serves the
+    /// full toolset
     Mcp {
+        /// Serve every tool (sending to sessions, stopping, renaming, UI
+        /// control). Only rlord's overlord config passes it.
+        #[arg(long)]
+        overlord: bool,
         /// The daemon's socket, as the daemon resolved it. The overlord's
         /// MCP config always passes it: an agent may start this server with
         /// another environment (OpenCode's shared server), where the XDG
@@ -537,7 +542,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Mcp { socket } => mcp_stdio(socket),
+        Command::Mcp { overlord, socket } => mcp_stdio(overlord, socket),
         Command::Update {
             tag,
             force,
@@ -1800,7 +1805,9 @@ fn restart_daemon() -> Result<()> {
 /// `rlord mcp`: a minimal MCP server over stdio (JSON-RPC, one message per
 /// line). Protocol handling lives here; tools live in the daemon
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
-fn mcp_stdio(socket: Option<std::path::PathBuf>) -> Result<()> {
+/// Without `overlord` it is read-only (the daemon serves and accepts only
+/// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
+fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
     let caller = std::env::var("RLORD_SESSION_ID")
         .ok()
@@ -1809,7 +1816,8 @@ fn mcp_stdio(socket: Option<std::path::PathBuf>) -> Result<()> {
     // started here from whatever environment this process has.
     let call = |method: &str, params: Value| match &socket {
         Some(s) => client_call(s, method, params),
-        None => call(method, params),
+        None if overlord => call(method, params),
+        None => call_running(method, params),
     };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -1831,17 +1839,21 @@ fn mcp_stdio(socket: Option<std::path::PathBuf>) -> Result<()> {
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "rlord", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Robot Overlord control surface: inspect agent sessions and drive the rlord UI (navigate, set the list view, propose or create sessions).",
+                "instructions": if overlord {
+                    "Robot Overlord control surface: inspect agent sessions and drive the rlord UI (navigate, set the list view, propose or create sessions)."
+                } else {
+                    "Robot Overlord look-ups (read-only): list rlord's agent sessions, read their screens, search and read their history."
+                },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => call("mcp.tools", json!({}))
+            "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
                 .map(|t| json!({"tools": t}))
                 .map_err(|e| (-32603, format!("{e:#}"))),
             "tools/call" => {
                 let r = call(
                     "mcp.call",
                     json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
-                           "caller": caller}),
+                           "caller": caller, "overlord": overlord}),
                 );
                 Ok(match r {
                     Ok(v) => json!({"content": [{"type": "text",

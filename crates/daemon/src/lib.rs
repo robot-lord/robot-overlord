@@ -771,12 +771,22 @@ impl Daemon {
                 )
             }
             "ui.propose_session" => ui::propose_session(self, params),
-            "mcp.tools" => Ok(mcp::tools()),
+            // Without `overlord: true` (`rlord mcp --overlord`) the server
+            // is read-only: only `mcp::READ_ONLY_TOOLS`, listed and callable.
+            "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
             "mcp.call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                tracing::info!(tool = name, caller = ?params.get("caller"), "mcp tool call");
-                mcp::call(self, name, &args)
+                let overlord = params["overlord"] == true;
+                tracing::info!(tool = name, overlord, caller = ?params.get("caller"), "mcp tool call");
+                if overlord || mcp::READ_ONLY_TOOLS.contains(&name) {
+                    mcp::call(self, name, &args)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "{name}: not available on the read-only rlord MCP server \
+                         (only the overlord's `rlord mcp --overlord` serves it)"
+                    ))
+                }
             }
             _ => return None,
         };
@@ -1071,6 +1081,55 @@ fn drain_spool() -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_read_only_mcp_server_refuses_mutating_tools() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let names = |overlord: bool| -> Vec<String> {
+            d.rpc("mcp.tools", json!({"overlord": overlord}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut ro = names(false);
+        ro.sort();
+        let mut want: Vec<String> = mcp::READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(ro, want);
+        assert!(names(true).len() > ro.len());
+        // No flag at all means read-only too.
+        assert_eq!(
+            d.rpc("mcp.tools", json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            ro.len()
+        );
+        let call = |name: &str, overlord: Value| {
+            d.rpc(
+                "mcp.call",
+                json!({"name": name, "arguments": {"session": "nope", "name": "x"}, "overlord": overlord}),
+            )
+        };
+        for tool in [
+            "update_session",
+            "send_to_session",
+            "session_action",
+            "set_list_view",
+        ] {
+            let e = format!("{:#}", call(tool, Value::Null).unwrap_err());
+            assert!(e.contains("read-only"), "{tool}: {e}");
+        }
+        // The overlord's call gets past the gate (and fails on the ref).
+        let e = format!("{:#}", call("update_session", json!(true)).unwrap_err());
+        assert!(!e.contains("read-only"), "{e}");
+        // A read tool works read-only.
+        assert!(call("list_groups", Value::Null).is_ok());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn ping_and_list_roundtrip() {

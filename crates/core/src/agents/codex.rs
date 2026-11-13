@@ -138,7 +138,7 @@ pub fn toml_str(s: &str) -> String {
 /// rlord's MCP server, its tools called without a prompt, and nothing else
 /// loosened. All as `-c` overrides: nothing is written to `~/.codex`.
 ///
-/// - `mcp_servers.rlord.*`: the server (`rlord mcp --socket <socket>`: the
+/// - `mcp_servers.rlord.*`: the server (`rlord mcp --overlord --socket <socket>`: the
 ///   daemon that launched it, whatever the environment says), with
 ///   `default_tools_approval_mode = "approve"` (Codex's per-server
 ///   counterpart of an allow-list) and `env_vars` passing on what it reads
@@ -1120,7 +1120,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(args, ["mcp", "--socket", "/run/r\"lord/daemon.sock"]);
+        assert_eq!(
+            args,
+            ["mcp", "--overlord", "--socket", "/run/r\"lord/daemon.sock"]
+        );
         let env = seen["mcp_servers.rlord.env_vars"].as_array().unwrap();
         assert_eq!(env.len(), crate::agents::MCP_ENV.len());
         assert!(env.iter().any(|v| v.as_str() == Some("RLORD_SESSION_ID")));
