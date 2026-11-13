@@ -42,6 +42,23 @@ Design calls:
   Switching in the overlay (key), CLI and the list was checked the same
   way; a click on the switcher row is covered by a unit test only.
 
+## Review round 1 (PR #19)
+
+- Claude ends a turn that failed on an API error through `StopFailure`,
+  not `Stop` (checked in the CLI 2.1.323 bundle). Hook added, mapped to
+  idle; `rlord install-hooks` adds it to existing installs (they show as
+  outdated until then). `limits::step` also sends on `working` when the
+  untouched limit record is the transcript's last word, so an install
+  without the hook still resumes. Never on `waiting_input`.
+- `usage_limit` needs `apiError: "usage_limit_reached"` or `status:
+  "rejected"`; a plain 429 is not a limit.
+- `scan` runs one at a time and keeps a file's stamp only after saving.
+  Scheduling takes each session's lock; a job only writes back over
+  itself (`limit_at`, `asked_at`).
+- `roster` runs after the DB guard drops. `overlord_switch` sharing a key
+  with a tmux binding turns the switch key off, with a warning.
+- `overlord.continue` with another overlord's conversation switches first.
+
 ## Owed
 
 - `recall` treats the active overlord as the caller. `rlord mcp` knows the
@@ -57,4 +74,6 @@ Design calls:
   overlay key, not a tmux binding, and the screen's live test goes
   through tmux.
 - No way to cancel a scheduled resume other than using the session.
+- No test drives the "job rescheduled while it runs" race end to end;
+  the guard (`limit_at`/`asked_at` compare) is small and reviewed only.
 - `status:limited` as a list filter.

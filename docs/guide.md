@@ -161,7 +161,8 @@ when it is the configured agent).
 - **In the overlay**: with more than one agent installed, the top row
   shows each agent's marker, the active one highlighted
   (`✻ claude │ >_ codex`). Click one, or press **Option-S** to go to the
-  next (`[tmux] overlord_switch`; "" turns the key off). The overlay stays
+  next (`[tmux] overlord_switch`; "" turns the key off, and so does giving
+  it the same key as `back`, `next`, `prev` or `overlord`). The overlay stays
   open and shows the other overlord.
 - **In the list**: right-click the overlord's row for "Switch overlord to
   Codex" (one entry per installed agent), or `:overlord codex` in the

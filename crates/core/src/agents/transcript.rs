@@ -392,7 +392,10 @@ pub fn limit_hit(path: &Path) -> Option<LimitHit> {
     if format != Format::Claude {
         return None;
     }
-    let (_, tail) = read_head_tail(path);
+    let tail: Vec<Value> = read_window(path, true)?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     limit_in(format, &tail)
 }
 
@@ -1017,7 +1020,11 @@ mod tests {
         let talk = v(
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"You've hit your 5-hour limit · resets 1:30pm"}]}}"#,
         );
-        assert_eq!(limit_in(Format::Claude, &[slept, talk]), None);
+        // A plain 429 (a throttle, retried) is not a usage limit either.
+        let throttled = v(
+            r#"{"type":"assistant","isApiErrorMessage":true,"apiError":"rate_limited","error":"rate_limit","apiErrorStatus":429,"apiErrorParams":{"rate_limit_info":{"status":"allowed_warning","resetsAt":1794519000}},"message":{"content":[{"type":"text","text":"x"}]}}"#,
+        );
+        assert_eq!(limit_in(Format::Claude, &[slept, talk, throttled]), None);
         assert_eq!(limit_in(Format::Codex, &[limit]), None);
     }
 }

@@ -1493,6 +1493,7 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

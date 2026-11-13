@@ -485,12 +485,47 @@ pub fn recall(d: &Daemon, params: &Value) -> Result<Value> {
     }))
 }
 
+/// `overlord.continue {id}` for a conversation another agent's overlord
+/// had: switch to that overlord, then continue it there (if it isn't
+/// that overlord's current one already). None: it is the active one's.
+fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
+    let (active, _, earlier) = load(d)?;
+    if find(&earlier, id).is_ok() {
+        return Ok(None);
+    }
+    let pasts = pasts(d)?;
+    let Ok(p) = find_past(&pasts, id) else {
+        return Ok(None);
+    };
+    if p.o.id == active.id {
+        return Ok(None);
+    }
+    let (conv, agent) = (p.c.id.clone(), p.o.agent.clone());
+    let current = p.o.agent_session.as_deref() == Some(conv.as_str());
+    let switched = d.rpc("overlord.switch", json!({"agent": agent}))?;
+    if current {
+        return Ok(Some(
+            json!({"continued": conv, "switched_to": agent, "session": switched}),
+        ));
+    }
+    let mut v = continue_conversation(d, &json!({"id": conv}))?;
+    v["switched_to"] = json!(agent);
+    Ok(Some(v))
+}
+
 /// `overlord.continue {id}`: go back to an earlier conversation. The
 /// overlord is restarted resuming it, and the current one ends (it stays in
-/// the list), as at an idle restart. Only between turns.
+/// the list), as at an idle restart. Only between turns. One another
+/// agent's overlord had (from `recall`): that overlord is switched to
+/// first (`continue_elsewhere`).
 pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     // (Where the agent's command is: asked before any lock is taken.)
     rlord_core::agents::install::warm();
+    // Another agent's overlord's: switch to it first (before any lock:
+    // the switch takes its own).
+    if let Some(v) = continue_elsewhere(d, params["id"].as_str().unwrap_or(""))? {
+        return Ok(v);
+    }
     // Nothing may be pasted into the pane while it's being replaced.
     let _send = d.overlord_send.lock().expect("overlord send lock");
     let _session = d.lock_overlord();

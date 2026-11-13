@@ -2423,8 +2423,6 @@ fn usage_details(u: &Value) -> String {
     )
 }
 
-/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
-/// wanted but failing or unavailable (red); nothing when off.
 /// A session's status, or in its place that it is stopped on a usage
 /// limit and until when (`limit`, from the daemon's `limits`). `full`:
 /// in words (the details pane); otherwise what fits the list's column.
@@ -2470,6 +2468,8 @@ fn others_up(s: &Value) -> String {
     }
 }
 
+/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
+/// wanted but failing or unavailable (red); nothing when off.
 fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),

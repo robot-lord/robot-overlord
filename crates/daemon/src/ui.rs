@@ -238,11 +238,13 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
     // overlord restarts on a fresh one after sitting idle. (With several
     // agents to run an overlord on, the overlay's own switcher row says
     // it, for whichever is active: this title can't change once open.)
+    let several = rlord_core::agents::Agent::ALL
+        .into_iter()
+        .filter(|a| rlord_core::agents::install::missing(*a).is_none())
+        .count()
+        > 1;
     let fresh = {
         let db = d.db();
-        let several = overlord::roster(&db)?
-            .as_array()
-            .is_some_and(|a| a.iter().filter(|o| o["installed"] == true).count() > 1);
         let found = overlord::session(&db)?.filter(|_| !several);
         found
             .map(|o| crate::recall::summary(&db, &o))

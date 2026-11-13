@@ -1063,7 +1063,7 @@ impl OverlayKeys {
             overlord: Key::parse(&cfg.tmux.overlord).or_else(|| Key::parse("M-o")),
             // Off is off (the overlord's key still closes it).
             close: Key::parse(&cfg.tmux.back),
-            switch: Key::parse(&cfg.tmux.overlord_switch),
+            switch: Key::parse(cfg.tmux.switch_key()),
         }
     }
 

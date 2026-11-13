@@ -39,6 +39,7 @@ use serde_json::{json, Map, Value};
 
 use rlord_core::agents::transcript::{self, LimitHit};
 use rlord_core::db::{ArchivedMode, Db, SessionQuery};
+use rlord_core::timefmt::clock;
 use rlord_core::types::{now_ms, Session, Status};
 
 use crate::send::{self, Typed};
@@ -62,6 +63,10 @@ const MAX_ATTEMPTS: u64 = 5;
 
 #[derive(Default)]
 pub struct Limits {
+    /// Held for a whole `scan`: two at once (the tick and a
+    /// `limits.resume`) could otherwise each skip a file the other is
+    /// reading, and the later save drop a limit.
+    scan: Mutex<()>,
     /// Each transcript's size and change time when last looked at.
     seen: Mutex<HashMap<String, (u64, Option<SystemTime>)>>,
     /// kv `limits`, for the list (loaded on the first tick).
@@ -116,6 +121,7 @@ fn limits(d: &Daemon) -> Map<String, Value> {
 /// Look at every live session's transcript that changed since the last
 /// look (all of them the first time), and at limits that have reset.
 fn scan(d: &Daemon) -> Result<()> {
+    let _scan = d.limits.scan.lock().expect("limits mutex");
     let before = limits(d);
     let sources: Vec<(String, String)> = {
         let db = d.db();
@@ -135,6 +141,9 @@ fn scan(d: &Daemon) -> Result<()> {
     };
     let now = now_ms();
     let mut after = Map::new();
+    // New stamps, kept once what was read is saved: a scan that fails
+    // part way looks at those files again next time.
+    let mut stamps = Vec::new();
     // (Files are read without the DB lock.)
     for (id, path) in &sources {
         let path = Path::new(path);
@@ -144,13 +153,10 @@ fn scan(d: &Daemon) -> Result<()> {
         let Some(stamp) = stamp else {
             continue; // (not a file: OpenCode's database, or gone)
         };
-        let unchanged = d
-            .limits
-            .seen
-            .lock()
-            .expect("limits mutex")
-            .insert(id.clone(), stamp)
-            == Some(stamp);
+        let unchanged = d.limits.seen.lock().expect("limits mutex").get(id) == Some(&stamp);
+        if !unchanged {
+            stamps.push((id.clone(), stamp));
+        }
         let state = if unchanged {
             // Nothing new was written: only the clock can end it.
             before
@@ -164,57 +170,21 @@ fn scan(d: &Daemon) -> Result<()> {
             after.insert(id.clone(), l);
         }
     }
-    if after == before {
-        return Ok(());
-    }
-    {
-        let db = d.db();
-        for (id, l) in &after {
-            if before.get(id).map(|b| &b["at"]) != Some(&l["at"]) {
-                db.insert_event(id, now, "limit_hit", &l.to_string())?;
+    if after != before {
+        {
+            let db = d.db();
+            for (id, l) in &after {
+                if before.get(id).map(|b| &b["at"]) != Some(&l["at"]) {
+                    db.insert_event(id, now, "limit_hit", &l.to_string())?;
+                }
             }
+            save_map(&db, LIMITS_KEY, &after)?;
         }
-        save_map(&db, LIMITS_KEY, &after)?;
+        *d.limits.now.lock().expect("limits mutex") = Some(after);
+        d.changed();
     }
-    *d.limits.now.lock().expect("limits mutex") = Some(after);
-    d.changed();
+    d.limits.seen.lock().expect("limits mutex").extend(stamps);
     Ok(())
-}
-
-/// `3:00pm` in the user's time zone; with the weekday when that isn't
-/// today (`Thu 9:00am`).
-pub fn clock(ms: i64) -> String {
-    let local = |ms: i64| -> Option<libc::tm> {
-        let t: libc::time_t = (ms / 1000) as libc::time_t;
-        // SAFETY: `localtime_r` writes into the `tm` we pass and reads
-        // only the time value; both live for the call.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        let r = unsafe { libc::localtime_r(&t, &mut tm) };
-        (!r.is_null()).then_some(tm)
-    };
-    match (local(ms), local(now_ms())) {
-        (Some(t), Some(n)) => fmt_clock(
-            t.tm_hour,
-            t.tm_min,
-            ((t.tm_yday, t.tm_year) != (n.tm_yday, n.tm_year)).then_some(t.tm_wday),
-        ),
-        _ => rlord_core::timefmt::fmt_ts(ms),
-    }
-}
-
-fn fmt_clock(hour: i32, min: i32, weekday: Option<i32>) -> String {
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    let (h, half) = match hour {
-        0 => (12, "am"),
-        1..=11 => (hour, "am"),
-        12 => (12, "pm"),
-        _ => (hour - 12, "pm"),
-    };
-    let day = weekday
-        .and_then(|d| DAYS.get(d as usize))
-        .map(|d| format!("{d} "))
-        .unwrap_or_default();
-    format!("{day}{h}:{min:02}{half}")
 }
 
 /// Annotate list rows with `limit`: `{resets_at, until, kind, resume}`
@@ -284,7 +254,8 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         }
         v
     };
-    let mut jobs = kv_map(&db, JOBS_KEY)?;
+    // (Each target's lock is taken before the DB, as `run_job` does.)
+    drop(db);
     let now = now_ms();
     for s in targets {
         let why = if overlord::is_overlord_role(&s.role) {
@@ -305,15 +276,19 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
             "message": message, "limit_at": l["at"], "resets_at": l["resets_at"],
             "asked_at": now, "attempts": 0,
         });
+        // Its lock: a job running now finishes before this one replaces it.
+        let _session = d.sessions.lock(&s.id);
+        let db = d.db();
+        let mut jobs = kv_map(&db, JOBS_KEY)?;
+        jobs.insert(s.id.clone(), job.clone());
+        save_map(&db, JOBS_KEY, &jobs)?;
         db.insert_event(&s.id, now, "limit_resume_scheduled", &job.to_string())?;
-        jobs.insert(s.id.clone(), job);
+        drop(db);
         scheduled.push(json!({
             "session": s.name,
             "at": clock(l["resets_at"].as_i64().unwrap_or(0) + MARGIN_MS),
         }));
     }
-    save_map(&db, JOBS_KEY, &jobs)?;
-    drop(db);
     d.changed();
     let note = if scheduled.is_empty() && skipped.is_empty() {
         "no session is stopped on a usage limit right now"
@@ -383,12 +358,14 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
             false,
         );
     }
-    // Between turns ("your turn", or the "needs you" Claude shows a while
-    // after a turn ends); its screen is checked right before typing.
-    if matches!(s.status, Status::Idle | Status::WaitingInput) {
-        Step::Send
-    } else {
-        Step::Wait
+    // Between turns. "Your turn"; or still "working": the untouched limit
+    // record (checked above) is where the turn ended, whatever the hooks
+    // said (an older install has no `StopFailure` hook). Not "needs you":
+    // that is blocked on a prompt. Its screen is checked right before
+    // typing either way.
+    match s.status {
+        Status::Idle | Status::Working => Step::Send,
+        _ => Step::Wait,
     }
 }
 
@@ -419,9 +396,15 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
     };
     let hit = src.and_then(|p| transcript::limit_hit(Path::new(&p)));
     let now = now_ms();
+    // Only the job read above: one rescheduled meanwhile (`limits.resume`
+    // asked again) is left alone.
+    let same = |j: &Value| ["limit_at", "asked_at"].iter().all(|k| j[*k] == job[*k]);
     let update = |f: &dyn Fn(&mut Map<String, Value>)| -> Result<()> {
         let db = d.db();
         let mut jobs = kv_map(&db, JOBS_KEY)?;
+        if !jobs.get(id).is_some_and(same) {
+            return Ok(());
+        }
         f(&mut jobs);
         save_map(&db, JOBS_KEY, &jobs)
     };
@@ -532,12 +515,14 @@ mod tests {
         );
         let due = 100_000 + MARGIN_MS;
         assert_eq!(step(&job, Some(&idle), Some(&h), due), Step::Send);
-        // Claude's "needs you" a minute after a turn is still between turns.
+        // "Needs you" is blocked on a prompt: not now.
         let waiting = session(Status::WaitingInput);
-        assert_eq!(step(&job, Some(&waiting), Some(&h), due), Step::Send);
-        // Mid-turn: not now. Stopped: never.
+        assert_eq!(step(&job, Some(&waiting), Some(&h), due), Step::Wait);
+        // Still reading "working" (no `StopFailure` hook): the untouched
+        // limit record ended the turn.
         let working = session(Status::Working);
-        assert_eq!(step(&job, Some(&working), Some(&h), due), Step::Wait);
+        assert_eq!(step(&job, Some(&working), Some(&h), due), Step::Send);
+        // Stopped: never.
         let stopped = session(Status::Stopped);
         assert!(matches!(
             step(&job, Some(&stopped), Some(&h), due),
@@ -617,11 +602,45 @@ mod tests {
         );
     }
 
+    /// Scans at once (the tick and a `limits.resume`) never lose a limit
+    /// one of them read.
     #[test]
-    fn clock_times() {
-        assert_eq!(fmt_clock(15, 0, None), "3:00pm");
-        assert_eq!(fmt_clock(0, 5, None), "12:05am");
-        assert_eq!(fmt_clock(12, 30, None), "12:30pm");
-        assert_eq!(fmt_clock(9, 0, Some(4)), "Thu 9:00am");
+    fn concurrent_scans_keep_the_limit() {
+        const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{"content":[{"type":"text","text":"x"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":99999999999,"rateLimitType":"five_hour"}},"error":"rate_limit","isApiErrorMessage":true}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, format!("{LINE}\n")).unwrap();
+        for _ in 0..20 {
+            let db = Db::open_in_memory().unwrap();
+            db.insert_session(&rlord_core::db::NewSession {
+                id: "s1",
+                name: "web",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.upsert_transcript_source("s1", path.to_str().unwrap())
+                .unwrap();
+            let d = Daemon::new(db, rlord_core::config::Config::default());
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let d = Arc::clone(&d);
+                    std::thread::spawn(move || scan(&d).unwrap())
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert!(limits(&d).contains_key("s1"));
+            assert!(kv_map(&d.db(), LIMITS_KEY).unwrap().contains_key("s1"));
+        }
     }
 }

@@ -273,18 +273,26 @@ hooks and `discover` keep the stored status to themselves.
 - **Detection** is `transcript::limit_hit`, on the transcript's tail.
   Claude Code ends a turn that hit a usage limit with a synthetic
   assistant line: `isApiErrorMessage: true`, `apiError:
-  "usage_limit_reached"`, `error: "rate_limit"`, and the reset time as
+  "usage_limit_reached"`, `error: "rate_limit"`, the limit's `status:
+  "rejected"`, and the reset time as
   epoch seconds in `apiErrorParams.rate_limit_info.resetsAt` (also
   `quotaLimits.resetsAt`), with `rateLimitType` (`five_hour`). The text
   ("You've hit your 5-hour limit · resets 1:30pm (America/Los_Angeles)")
   is never parsed. Other API errors carry `isApiErrorMessage` too
-  (`apiError: "computer_slept"`), so that flag alone is not enough. No
-  hook reports a limit. Seen on Claude Code 2.1.322. Codex and OpenCode
+  (`apiError: "computer_slept"`), so that flag alone is not enough, and
+  neither is `error: "rate_limit"`: a plain 429 the CLI retries has it
+  too. It takes `apiError: "usage_limit_reached"` or `status:
+  "rejected"`. The turn ends through the `StopFailure` hook (any API
+  error), not `Stop`, so rlord installs that hook too and maps it to
+  `idle`; the hook doesn't say which error, so the transcript is still
+  what tells a limit. Seen on Claude Code 2.1.322. Codex and OpenCode
   are not detected yet.
 - A session is limited while that record is the last thing in its
   conversation (no prompt the user typed and no real answer after it:
   `LimitHit::touched`) and the reset time is ahead. A tick (15s) stats
-  each live session's transcript and re-reads only those that changed;
+  each live session's transcript and re-reads only those that changed
+  (one scan at a time; a file's stamp is kept only once what was read
+  from it is saved);
   kv `limits` holds the current ones, and rows carry `limit`
   (`limits::annotate`).
 - **Resuming is only ever asked for** (`limits.resume`: the
@@ -293,9 +301,13 @@ hooks and `discover` keep the stored status to themselves.
   restart keeps it. `limits::step` decides each tick: wait until reset +
   60s; drop the job if the conversation went on since the limit; else
   type `[limits] resume_message` in through `send::type_message` (under
-  the session's lock, with all of `type_into`'s screen checks). Status
-  `idle` or `waiting_input` both count as between turns here, because
-  Claude Code shows "needs you" a minute after any turn ends. After
+  the session's lock, with all of `type_into`'s screen checks). It sends
+  on `idle`, and on `working` too: the untouched limit record is where
+  the turn ended, so a session whose `StopFailure` hook is missing
+  (older install) still resumes. Not on `waiting_input`, which is
+  blocked on a prompt. Scheduling takes the session's lock, and a job
+  only writes back over itself (same `limit_at` and `asked_at`), so
+  asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules
   the job to that reset (five sends at most). The overlords are never
   resumed this way: the user switches to another agent's.
@@ -756,8 +768,10 @@ including when the active one hits a usage limit.
   thinks of one overlord desk and switches agents by hand, often because
   one ran out of usage, so "as I said earlier" may have been said to
   another one. The list's "fresh · N earlier" and the earlier
-  conversations in the details pane stay the active overlord's own
-  (`overlord.continue` resumes one of *its* conversations).
+  conversations in the details pane stay the active overlord's own.
+  `overlord.continue` given another overlord's conversation (an id from
+  `recall`, whose hits name their overlord) switches to that overlord
+  first, then continues it there.
 
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's agent pane (`send::type_into`: bracketed paste, then Enter),

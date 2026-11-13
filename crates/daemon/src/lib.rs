@@ -174,6 +174,10 @@ impl Daemon {
     pub fn bind_nav_keys(&self) {
         let cfg = self.config();
         let bindings = cfg.tmux.bindings();
+        if let Some(verb) = cfg.tmux.switch_overlap() {
+            tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
+                "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");
+        }
         match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
             Ok(conflicts) => {
                 for c in conflicts {
@@ -503,22 +507,23 @@ impl Daemon {
                     let db = self.db();
                     overlord::session(&db).and_then(|o| {
                         let Some(o) = o else {
-                            return Ok(Value::Null);
+                            return Ok((Value::Null, Default::default()));
                         };
                         let mut v = serde_json::to_value(&o)?;
                         v["conversations"] = recall::summary(&db, &o);
                         // What it runs on now (config may since have changed).
                         v["effort"] = json!(overlord::launched_effort(&db, &o));
-                        // The other agents' overlords, for the switchers.
-                        v["overlords"] = overlord::roster(&db)?;
-                        Ok(v)
+                        Ok((v, overlord::roster_rows(&db)?))
                     })
                 };
-                // (The DB guard is gone: `annotate` takes it.)
-                r.map(|v| {
+                // (The DB guard is gone: `roster` runs tmux and the
+                // install checks, `annotate` takes the guard.)
+                r.map(|(mut v, rows)| {
                     if v.is_null() {
                         return v;
                     }
+                    // The other agents' overlords, for the switchers.
+                    v["overlords"] = overlord::roster(rows);
                     // Stopped on a usage limit: the row and the overlay say
                     // so (the user may switch to another agent's).
                     let mut rows = [v];

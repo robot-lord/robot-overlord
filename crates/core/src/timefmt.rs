@@ -42,6 +42,46 @@ pub fn rel_age(ms: Option<i64>) -> String {
     }
 }
 
+/// `ms` in the user's time zone (None if the C library can't say).
+fn local(ms: i64) -> Option<libc::tm> {
+    let t: libc::time_t = (ms / 1000) as libc::time_t;
+    // SAFETY: an all-zero `tm` is a valid value (plain integers and a
+    // nullable pointer); `localtime_r` writes into the `tm` we pass and
+    // reads only `t`, both live for the call.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        (!libc::localtime_r(&t, &mut tm).is_null()).then_some(tm)
+    }
+}
+
+/// `3:00pm` in the user's time zone; with the weekday when that isn't
+/// today (`Thu 9:00am`). Falls back to `fmt_ts`.
+pub fn clock(ms: i64) -> String {
+    match (local(ms), local(now_ms())) {
+        (Some(t), Some(n)) => fmt_clock(
+            t.tm_hour,
+            t.tm_min,
+            ((t.tm_yday, t.tm_year) != (n.tm_yday, n.tm_year)).then_some(t.tm_wday),
+        ),
+        _ => fmt_ts(ms),
+    }
+}
+
+fn fmt_clock(hour: i32, min: i32, weekday: Option<i32>) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let (h, half) = match hour {
+        0 => (12, "am"),
+        1..=11 => (hour, "am"),
+        12 => (12, "pm"),
+        _ => (hour - 12, "pm"),
+    };
+    let day = weekday
+        .and_then(|d| DAYS.get(d as usize))
+        .map(|d| format!("{d} "))
+        .unwrap_or_default();
+    format!("{day}{h}:{min:02}{half}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +97,14 @@ mod tests {
         assert_eq!(rel_age(None), "-");
         assert_eq!(rel_age(Some(now_ms() - 5_000)), "5s");
         assert_eq!(rel_age(Some(now_ms() - 3_600_000 * 5)), "5h");
+    }
+
+    #[test]
+    fn clock_times() {
+        assert_eq!(fmt_clock(15, 0, None), "3:00pm");
+        assert_eq!(fmt_clock(0, 5, None), "12:05am");
+        assert_eq!(fmt_clock(12, 30, None), "12:30pm");
+        assert_eq!(fmt_clock(9, 0, Some(4)), "Thu 9:00am");
+        assert!(!clock(now_ms()).is_empty());
     }
 }

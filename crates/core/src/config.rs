@@ -160,6 +160,30 @@ impl TmuxKeys {
         .map(|(k, v)| (k.as_str(), v))
         .collect()
     }
+
+    /// The tmux binding (`next`, `prev`, …) that also uses the overlay's
+    /// `overlord_switch` key, if one does. One key would then do two jobs
+    /// (in the overlay and out of it), so the switch key is off instead
+    /// (and the daemon warns).
+    pub fn switch_overlap(&self) -> Option<&'static str> {
+        let k = self.overlord_switch.trim();
+        if k.is_empty() {
+            return None;
+        }
+        self.bindings()
+            .into_iter()
+            .find(|(b, _)| b.trim() == k)
+            .map(|(_, verb)| verb)
+    }
+
+    /// `overlord_switch`, or "" (off) when a tmux binding takes it.
+    pub fn switch_key(&self) -> &str {
+        if self.switch_overlap().is_some() {
+            ""
+        } else {
+            &self.overlord_switch
+        }
+    }
 }
 
 /// The overlord: the long-running session you talk to in order to drive
@@ -784,9 +808,10 @@ command = ":"           # command launcher (keys, sort, log, archived, …)
 [tmux]
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
 next = ""       # e.g. "M-g"
-prev = ""       # e.g. "M-s"
+prev = ""       # e.g. "M-p"
 overlord = "M-o" # from any pane: the overlord over it
 overlord_switch = "M-s" # in the overlay: the next agent's overlord
+                        # (not the same key as back/next/prev/overlord)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 mouse = true     # click and scroll in the list, the overlay and agent panes
                  # (drag-select then needs Shift; Option in some macOS
@@ -890,6 +915,12 @@ mod tests {
         assert_eq!(c.keys.attach, "enter");
         // back disabled, next/prev off by default; the overlord remains
         assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
+        assert_eq!(c.tmux.switch_overlap(), None);
+        assert_eq!(c.tmux.switch_key(), "M-s");
+        let mut t = c.tmux.clone();
+        t.prev = "M-s".into();
+        assert_eq!(t.switch_overlap(), Some("prev"));
+        assert_eq!(t.switch_key(), "");
     }
 
     /// A config from the two-seat overlord: the mastermind's keys become

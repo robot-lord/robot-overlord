@@ -438,7 +438,10 @@ pub fn switch(db: &Db, cfg: &Config, agent: &str) -> Result<Value> {
     let before = session(db)?;
     if before.is_none() {
         // Nothing to switch from: this is setting the overlord up.
-        return ensure(db, cfg, &json!({"agent": agent.name()}));
+        let mut v = ensure(db, cfg, &json!({"agent": agent.name()}))?;
+        v["switched"] = json!(true);
+        v["created"] = json!(true);
+        return Ok(v);
     }
     let target = for_agent(db, agent)?;
     let created = target.is_none();
@@ -467,11 +470,10 @@ pub fn switch(db: &Db, cfg: &Config, agent: &str) -> Result<Value> {
 /// The agents an overlord can run on, for the switchers (the overlay's
 /// bar, the list's menu and row, `rlord overlord switch`): each with
 /// whether it is installed, has an overlord, is the active one, and is up.
-/// Starts nothing.
-pub fn roster(db: &Db) -> Result<Value> {
-    let all = all(db)?;
-    let active = session(db)?.map(|s| s.id);
-    Ok(Agent::ALL
+/// Starts nothing. Takes `roster_rows`, read under the DB guard and
+/// passed in once it is dropped: this runs tmux and the install checks.
+pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
+    Agent::ALL
         .into_iter()
         .map(|a| {
             let o = all.iter().find(|s| s.agent == a.name());
@@ -490,7 +492,12 @@ pub fn roster(db: &Db) -> Result<Value> {
                 "tmux_session": o.and_then(|s| s.tmux_session.clone()),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// What `roster` needs from the DB: every overlord, and the active one's id.
+pub fn roster_rows(db: &Db) -> Result<(Vec<Session>, Option<String>)> {
+    Ok((all(db)?, session(db)?.map(|s| s.id)))
 }
 
 /// The overlay popup's style: a wash of the overlord's colour.
@@ -804,7 +811,7 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         "default_effort": cfg.overlord.effort,
     });
     // Which agents an overlord runs on, has one, and which is active.
-    out["overlords"] = roster(db)?;
+    out["overlords"] = roster(roster_rows(db)?);
     let Some(s) = session(db)? else {
         out["exists"] = json!(false);
         // The agents it can run on (installed ones), each with what the
@@ -1317,7 +1324,7 @@ mod tests {
         db.set_active_overlord("nope").unwrap();
         assert_eq!(session(&db).unwrap().unwrap().id, "01a");
 
-        let roster = roster(&db).unwrap();
+        let roster = roster(roster_rows(&db).unwrap());
         let of = |a: &str| {
             roster
                 .as_array()
