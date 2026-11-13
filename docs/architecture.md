@@ -258,16 +258,18 @@ Codex runs one app-server daemon per user; a TUI started without
 `--no-daemon` is a client of it, and the daemon runs the turn and its
 hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
-(`methods::session_new`), never for the overlord or a session whose flags
-need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
-`--enable`, `--disable` or `--search`, in any of their spellings (`-cK=V`,
+(`methods::session_new`), never for the overlord or a session whose
+internal `extra_args` need the pane (only rlord's own wiring passes those;
+`codex::needs_embedded`: Codex runs any `-c` / `--config`, `--enable`,
+`--disable` or `--search`, in any of their spellings (`-cK=V`,
 `--config=V`, …), in the TUI's own process; `-m` / `--model` doesn't). So
 a daemon-mode pane can't be given `-c check_for_update_on_startup=false`
 (the overlord's) and, like an in-pane session, can open on Codex's update
 prompt. `spec_args` adds `--no-daemon` for every other Codex session. The
 rest is `daemon/src/codex_daemon.rs`, with the client in
 `agents::codex_server`. Daemon mode is plumbing: no new-session hint or
-list marker, only the details line ("codex: shared server").
+list marker, only the details line (`codex  shared server · its turn goes
+on when the pane closes`).
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
   environment of whatever started the daemon. So a daemon-mode pane gets
