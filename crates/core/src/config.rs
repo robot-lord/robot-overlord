@@ -428,6 +428,11 @@ pub struct SessionDefaults {
     /// (copy-mode scrolling and search work); "fullscreen" keeps it inside
     /// Claude. "" leaves Claude's own setting.
     pub claude_tui: String,
+    /// New Codex sessions run on Codex's shared background server (its
+    /// daemon) instead of in the pane: the turn keeps going when the pane
+    /// ends, and reopening attaches again. Off: in the pane
+    /// (`--no-daemon`), as before.
+    pub codex_daemon: bool,
 }
 
 impl Default for SessionDefaults {
@@ -444,6 +449,7 @@ impl Default for SessionDefaults {
             repo_roots: vec!["~".into()],
             repo_scan_depth: 3,
             claude_tui: "default".into(),
+            codex_daemon: false,
         }
     }
 }
@@ -764,6 +770,9 @@ repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
 claude_tui = "default"          # Claude's renderer here: "default" (inline: tmux
                                 # scrollback and copy-mode search work),
                                 # "fullscreen", or "" for Claude's own setting
+codex_daemon = false            # new Codex sessions run on Codex's shared
+                                # background server: the turn goes on when
+                                # the pane ends (false: in the pane)
 
 # The overlord: a long-running session you talk to in order to drive rlord —
 # launch sessions, search, jump around, set the list's sort/filter. It gets

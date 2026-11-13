@@ -1952,6 +1952,16 @@ impl App {
                 Span::styled(usage_details(&s["usage"]), theme::muted()),
             ]),
         ];
+        // On Codex's shared background server: the turn outlives the pane.
+        if s["codex_daemon"] == true {
+            lines.push(Line::from(vec![
+                key("codex"),
+                Span::styled(
+                    "shared server · its turn goes on when the pane closes",
+                    theme::muted(),
+                ),
+            ]));
+        }
         if let Some(st) = s["remote"]["state"].as_str() {
             let (text, style) = match st {
                 "on" => (

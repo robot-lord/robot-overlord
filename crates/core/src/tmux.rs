@@ -346,7 +346,17 @@ pub fn shell_quote(s: &str) -> String {
 /// embedded in the command (rather than tmux session env) so respawns are
 /// deterministic and the vars reach hook subprocesses.
 pub fn pane_command(env: &[(String, String)], argv: &[String]) -> String {
+    pane_command_unsetting(&[], env, argv)
+}
+
+/// `pane_command`, with `unset` left out of the environment the pane
+/// inherits (from tmux's own).
+pub fn pane_command_unsetting(unset: &[&str], env: &[(String, String)], argv: &[String]) -> String {
     let mut parts = vec!["exec".to_string(), "env".to_string()];
+    for u in unset {
+        parts.push("-u".to_string());
+        parts.push(shell_quote(u));
+    }
     for (k, v) in env {
         parts.push(shell_quote(&format!("{k}={v}")));
     }
@@ -1552,6 +1562,8 @@ mod tests {
             &["claude".into(), "--session-id".into(), "u-1".into()],
         );
         assert_eq!(cmd, "exec env RLORD_SESSION_ID=abc claude --session-id u-1");
+        let cmd = pane_command_unsetting(&["RLORD_SESSION_ID"], &[], &["codex".into()]);
+        assert_eq!(cmd, "exec env -u RLORD_SESSION_ID codex");
     }
 
     #[test]

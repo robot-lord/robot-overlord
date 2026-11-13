@@ -38,11 +38,48 @@ pub fn sessions_dir() -> PathBuf {
     home().join("sessions")
 }
 
+/// A launch spec's `codex_host` for a session on Codex's shared
+/// background server ("daemon mode"). Absent: in the pane.
+pub const HOST_DAEMON: &str = "daemon";
+
+/// The session (its launch spec) runs on Codex's shared background server:
+/// its thread is hosted by Codex's per-user daemon and the pane is a client
+/// of it. The turn goes on when the pane ends, and reopening attaches
+/// again (`codex resume <id>`).
+pub fn on_daemon(spec: &Value) -> bool {
+    spec["codex_host"] == HOST_DAEMON
+}
+
+/// Where the conversation runs, as flags. In the pane (`--no-daemon`): the
+/// TUI runs the turn itself, so its hooks run in the pane with
+/// `RLORD_SESSION_ID` and `TMUX_PANE`. On the daemon: no flag (Codex's
+/// default); its hooks run in the daemon and rlord tells them apart by
+/// thread id (see `gate`).
+pub fn host_args(daemon: bool) -> Vec<String> {
+    if daemon {
+        Vec::new()
+    } else {
+        vec!["--no-daemon".to_string()]
+    }
+}
+
+/// Flags that make Codex run the turn in its own process even without
+/// `--no-daemon` (0.167.2: "command-line configuration overrides (-c,
+/// --enable, --disable, or --search) requires embedded mode"). A session
+/// launched with any of these can't be on the daemon.
+pub fn needs_embedded(extra: &[String]) -> bool {
+    extra.iter().any(|a| {
+        let flag = a.split('=').next().unwrap_or(a);
+        matches!(
+            flag,
+            "-c" | "--config" | "--enable" | "--disable" | "--search"
+        ) || (a.starts_with("-c") && a.len() > 2 && !a.starts_with("--"))
+    })
+}
+
 fn with_model(mut argv: Vec<String>, model: Option<&str>, extra: &[String]) -> Vec<String> {
-    // In the pane itself, not Codex's shared background app-server: there
-    // the turn (and its hooks) would run outside the pane, without the
-    // environment that tells rlord which session a hook is from.
-    argv.push("--no-daemon".to_string());
+    // (Where it runs, in the pane or on Codex's daemon, rides in `extra`:
+    // `host_args`.)
     // Inline, not the alternate screen: tmux keeps the scrollback, so
     // copy-mode scrolling and search work (as Claude's `claude_tui =
     // "default"` does).
@@ -295,7 +332,13 @@ fn open_state(home: &Path) -> Option<rusqlite::Connection> {
 /// just launched there. Not sub-agent threads, nor ones started from an
 /// editor or the desktop app in the same folder. `cwd` is matched as given
 /// and resolved (symlinks).
-pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> {
+///
+/// `daemon`: the session runs on Codex's shared background server, whose
+/// threads the index lists as an app-server client's (`source = 'vscode'`,
+/// seen with codex-cli 0.167.2 on a 0.169.0 daemon), like an editor's. Those
+/// count too; the first-message and one-waiting rules (`discover`) keep an
+/// editor's thread in the same folder out.
+pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64, daemon: bool) -> Vec<Thread> {
     let Some(c) = open_state(home) else {
         return Vec::new();
     };
@@ -307,21 +350,22 @@ pub fn threads_started_in(home: &Path, cwd: &str, since_ms: i64) -> Vec<Thread> 
     // candidate, with no message to tell them apart (None).
     let (mut q, full) = match c.prepare(
         "SELECT id, rollout_path, created_at_ms, first_user_message FROM threads \
-         WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 AND source = 'cli' \
+         WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 \
+           AND (source = 'cli' OR (?4 AND source = 'vscode')) \
            AND (thread_source IS NULL OR thread_source = 'user') \
          ORDER BY created_at_ms ASC LIMIT 8",
     ) {
         Ok(q) => (q, true),
         Err(_) => match c.prepare(
             "SELECT id, rollout_path, created_at_ms FROM threads \
-             WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 \
+             WHERE cwd IN (?1, ?2) AND created_at_ms >= ?3 AND ?4 IN (0, 1) \
              ORDER BY created_at_ms ASC LIMIT 8",
         ) {
             Ok(q) => (q, false),
             Err(_) => return Vec::new(), // not a schema rlord knows
         },
     };
-    let rows = q.query_map(rusqlite::params![cwd, real, since_ms], |r| {
+    let rows = q.query_map(rusqlite::params![cwd, real, since_ms, daemon], |r| {
         Ok(Thread {
             id: r.get(0)?,
             rollout_path: r.get(1)?,
@@ -980,32 +1024,70 @@ mod tests {
 
     #[test]
     fn argv() {
+        let pane = host_args(false);
         assert_eq!(
-            launch_argv(Some("hello"), Some("gpt-6-luna"), &[]),
+            launch_argv(Some("hello"), Some("gpt-6-luna"), &pane),
             [
                 "codex",
-                "--no-daemon",
                 "--no-alt-screen",
                 "--model",
                 "gpt-6-luna",
+                "--no-daemon",
                 "hello"
             ]
         );
         assert_eq!(
-            launch_argv(None, Some(" "), &[]),
-            ["codex", "--no-daemon", "--no-alt-screen"]
+            launch_argv(None, Some(" "), &pane),
+            ["codex", "--no-alt-screen", "--no-daemon"]
         );
         assert_eq!(
-            resume_argv("t-1", None, &["--search".to_string()]),
+            resume_argv(
+                "t-1",
+                None,
+                &[pane.clone(), vec!["--search".to_string()]].concat()
+            ),
             [
                 "codex",
                 "resume",
                 "t-1",
-                "--no-daemon",
                 "--no-alt-screen",
+                "--no-daemon",
                 "--search"
             ]
         );
+        // On Codex's daemon: no `--no-daemon`, the rest the same.
+        assert_eq!(
+            resume_argv("t-1", Some("gpt-6-luna"), &host_args(true)),
+            [
+                "codex",
+                "resume",
+                "t-1",
+                "--no-alt-screen",
+                "--model",
+                "gpt-6-luna"
+            ]
+        );
+        assert!(on_daemon(&serde_json::json!({"codex_host": "daemon"})));
+        assert!(!on_daemon(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn overrides_keep_codex_in_its_own_process() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(needs_embedded(&v(&["-c", "model=\"x\""])));
+        assert!(needs_embedded(&v(&["-cmodel=x"])));
+        assert!(needs_embedded(&v(&["--config=x=1"])));
+        assert!(needs_embedded(&v(&["--enable", "foo"])));
+        assert!(needs_embedded(&v(&["--search"])));
+        assert!(!needs_embedded(&v(&["--model", "x", "--no-alt-screen"])));
+        assert!(!needs_embedded(&[]));
+        // The overlord's wiring is all `-c`: it stays in its pane.
+        assert!(needs_embedded(&overlord_args(
+            "/bin/rlord",
+            "/s.sock",
+            "/d",
+            false
+        )));
     }
 
     /// The overlord's overrides are each valid TOML as Codex parses a
@@ -1318,14 +1400,18 @@ mod tests {
         )
         .unwrap();
         drop(c);
-        let ids: Vec<String> = threads_started_in(dir.path(), "/src/app", 4000)
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
+        let ids = |daemon| -> Vec<String> {
+            threads_started_in(dir.path(), "/src/app", 4000, daemon)
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
         // Not the sub-agent's thread, nor the one started from an editor.
-        assert_eq!(ids, ["mine", "later"]);
+        assert_eq!(ids(false), ["mine", "later"]);
+        // On Codex's daemon, a thread is listed as an app-server client's.
+        assert_eq!(ids(true), ["mine", "editor", "later"]);
         assert_eq!(
-            threads_started_in(dir.path(), "/src/app", 4000)[0]
+            threads_started_in(dir.path(), "/src/app", 4000, false)[0]
                 .first_user_message
                 .as_deref(),
             Some("fix it")
@@ -1351,15 +1437,15 @@ mod tests {
         )
         .unwrap();
         drop(c);
-        let found = threads_started_in(old.path(), "/src/app", 4000);
+        let found = threads_started_in(old.path(), "/src/app", 4000, false);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].first_user_message, None);
         // It doesn't say whose a thread is: one it lists is the user's.
         assert_eq!(thread_kind(old.path(), "a"), Indexed::User);
         assert_eq!(thread_kind(old.path(), "b"), Indexed::NotListed);
-        assert!(threads_started_in(dir.path(), "/src/none", 0).is_empty());
+        assert!(threads_started_in(dir.path(), "/src/none", 0, false).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
-        assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0).is_empty());
+        assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0, false).is_empty());
     }
 
     #[test]

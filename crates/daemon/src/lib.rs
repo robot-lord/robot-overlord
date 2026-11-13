@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod autostart;
+pub mod codex_daemon;
 pub mod discover;
 pub mod import;
 pub mod limits;
@@ -31,6 +32,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use rlord_core::agents::Agent;
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::{paths, tmux};
@@ -409,7 +411,15 @@ impl Daemon {
         if matches!(method, "session.defaults" | "agents.list") && params["no_listing"] != true {
             refresh_models();
         }
+        // A Codex session about to start on Codex's shared background
+        // server: the server runs first, started by rlord (codex_daemon.rs).
+        if self.starts_on_codex_daemon(method, &params) {
+            codex_daemon::ensure_running();
+        }
         if let Some(r) = self.call_ui(method, &params) {
+            if r.is_ok() {
+                codex_daemon::sync_gate(&self.db());
+            }
             return r.map_err(MethodError::Internal);
         }
         let mutating = !matches!(
@@ -434,6 +444,18 @@ impl Daemon {
         })
         .flatten();
         let _session = session_id.as_deref().map(|id| self.sessions.lock(id));
+        // Stopping a session on Codex's daemon: its running turn is
+        // interrupted first, with no DB lock held (it can take seconds).
+        let mut params = params;
+        if matches!(method, "session.stop" | "session.archive") {
+            let s = session_id
+                .as_deref()
+                .and_then(|id| self.db().resolve_ref(id).ok())
+                .filter(|s| s.codex_daemon && s.status != rlord_core::types::Status::Stopped);
+            if let Some(s) = s {
+                params["interrupt"] = codex_daemon::interrupt(&s).to_json();
+            }
+        }
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
@@ -509,6 +531,7 @@ impl Daemon {
         // no list refetch.)
         let unchanged = method == "hook.emit" && r.as_ref().is_ok_and(|v| v["unchanged"] == true);
         if mutating && r.is_ok() && !unchanged {
+            codex_daemon::sync_gate(&self.db());
             self.changed();
             if method == "session.new" {
                 self.bind_nav_keys();
@@ -528,6 +551,32 @@ impl Daemon {
 }
 
 impl Daemon {
+    /// Whether `method` starts (or restarts) a Codex session that runs on
+    /// Codex's shared background server. Asked before any lock is taken.
+    fn starts_on_codex_daemon(&self, method: &str, params: &Value) -> bool {
+        match method {
+            "session.new" => {
+                let cfg = self.config();
+                let agent = params["agent"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or(&cfg.session.agent)
+                    .to_string();
+                agent == Agent::Codex.name() && cfg.session.codex_daemon
+            }
+            "session.restart" | "ui.goto" => params["ref"]
+                .as_str()
+                .and_then(|r| self.db().resolve_ref(r).ok())
+                // (`ui.goto` starts only a stopped one.)
+                .is_some_and(|s| {
+                    s.codex_daemon
+                        && (method != "ui.goto" || s.status == rlord_core::types::Status::Stopped)
+                }),
+            _ => false,
+        }
+    }
+
     /// Methods that manage their own locking: the overlord, UI control, and
     /// the MCP bridge (which re-enters `call`). None = not one of these.
     fn call_ui(&self, method: &str, params: &Value) -> Option<Result<Value>> {

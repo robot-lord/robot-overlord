@@ -1318,6 +1318,7 @@ fn cursor_row(r: &rusqlite::Row) -> rusqlite::Result<(PathBuf, CursorState)> {
 }
 
 fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+    let spec = serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(21)?).ok();
     Ok(Session {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -1342,10 +1343,11 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         branch: r.get(18)?,
         description: r.get(19)?,
         notes: r.get(20)?,
-        model: serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(21)?)
-            .ok()
+        model: spec
+            .as_ref()
             .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
             .filter(|m| !m.is_empty()),
+        codex_daemon: spec.as_ref().is_some_and(crate::agents::codex::on_daemon),
         tags: Vec::new(),
         role: r.get(22)?,
         summary: r.get(23)?,

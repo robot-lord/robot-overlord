@@ -96,6 +96,10 @@ pub struct Session {
     /// carries what the user typed, so it counts as the user's.
     #[serde(default)]
     pub last_rlord_msg_at: Option<i64>,
+    /// A Codex session on Codex's shared background server (its launch
+    /// spec's `codex_host`), not in its pane: see `agents::codex::on_daemon`.
+    #[serde(default)]
+    pub codex_daemon: bool,
 }
 
 impl Session {

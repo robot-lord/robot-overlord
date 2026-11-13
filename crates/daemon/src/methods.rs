@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use rlord_core::agents::{claude, install, transcript, Agent, Effect, Indexed};
+use rlord_core::agents::{claude, codex, install, transcript, Agent, Effect, Indexed};
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Session, Status, Subagent};
@@ -260,9 +260,16 @@ pub fn session_group(db: &Db, params: &Value) -> Result<Value> {
 /// created with, plus (Claude) `--remote-control <name>` while Remote
 /// Control is on (so every start, resume and fresh start reconnects it).
 /// Turned off, it stays off with a settings override: `--resume` would
-/// otherwise reconnect a conversation that was last connected.
+/// otherwise reconnect a conversation that was last connected. (Codex)
+/// where the conversation runs: in the pane (`--no-daemon`), or on Codex's
+/// shared background server (`codex_host`, see `codex_daemon`).
 pub(crate) fn spec_args(agent: Agent, spec: &Value) -> Vec<String> {
     let mut a = str_list(spec, "extra_args");
+    if agent == Agent::Codex {
+        let mut host = codex::host_args(codex::on_daemon(spec));
+        host.append(&mut a);
+        return host;
+    }
     if agent != Agent::Claude {
         return a;
     }
@@ -373,8 +380,20 @@ fn program_at(agent: Agent, argv: &mut [String], at: Option<std::path::PathBuf>)
 /// the front of PATH. Such an install often needs what sits beside it: an
 /// npm or nvm install is a `#!/usr/bin/env node` script, with `node` in
 /// the same directory.
-fn pane_env(session_id: &str, program: Option<&std::path::Path>) -> Vec<(String, String)> {
-    let mut env = vec![("RLORD_SESSION_ID".to_string(), session_id.to_string())];
+///
+/// A pane whose conversation runs on Codex's daemon (`daemon`) gets no
+/// `RLORD_SESSION_ID` (and `pane_command` unsets one inherited from tmux):
+/// its hooks run in the daemon and go by thread, and a daemon the TUI
+/// starts from this pane would hand the variable to every thread's hooks.
+fn pane_env(
+    session_id: &str,
+    program: Option<&std::path::Path>,
+    daemon: bool,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if !daemon {
+        env.push(("RLORD_SESSION_ID".to_string(), session_id.to_string()));
+    }
     let path = std::env::var("PATH").unwrap_or_default();
     env.extend(path_with(program, &path).map(|p| ("PATH".to_string(), p)));
     env
@@ -394,6 +413,21 @@ fn path_with(program: Option<&std::path::Path>, path: &str) -> Option<String> {
 /// (its launch spec may already hold flags for the next start).
 pub fn launched_args_key(id: &str) -> String {
     format!("launched_args:{id}")
+}
+
+/// The command a session's pane runs (see `pane_env`).
+fn pane_cmd(
+    session_id: &str,
+    program: Option<&std::path::Path>,
+    daemon: bool,
+    argv: &[String],
+) -> String {
+    let env = pane_env(session_id, program, daemon);
+    if daemon {
+        tmux::pane_command_unsetting(&["RLORD_SESSION_ID"], &env, argv)
+    } else {
+        tmux::pane_command(&env, argv)
+    }
 }
 
 fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
@@ -485,6 +519,17 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(n) = &remote {
         spec["remote_control"] = json!(n);
     }
+    // On Codex's shared background server (`[session] codex_daemon`): not
+    // the overlord (its wiring is `-c` overrides, which Codex runs only in
+    // the pane), nor a session whose own flags need the pane.
+    if agent == Agent::Codex
+        && cfg.session.codex_daemon
+        && !crate::overlord::is_overlord_role(&role)
+        && !codex::needs_embedded(&extra_args)
+    {
+        spec["codex_host"] = json!(codex::HOST_DAEMON);
+    }
+    let daemon = codex::on_daemon(&spec);
     let mut launch = agent.launch(
         &project_path,
         prompt.as_deref(),
@@ -528,8 +573,10 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         db.kv_set(&bind_prompt_key(&id), prompt.as_deref().unwrap_or(""))?;
     }
 
-    let cmd = tmux::pane_command(&pane_env(&id, program.as_deref()), argv);
+    let cmd = pane_cmd(&id, program.as_deref(), daemon, argv);
     note_launch(db, &id, argv)?;
+    // (Its folder is in the gate before its first hook can run.)
+    crate::codex_daemon::sync_gate(db);
     tmux::new_session(&tmux_name, &project_path, &cmd)?;
     db.insert_event(
         &id,
@@ -769,7 +816,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let deferred = agent.deferred(model.as_deref()).filter(|_| !resumed);
     hold(db, &s.id, deferred.as_ref())?;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), &argv);
+    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, &argv);
     note_launch(db, &s.id, &argv)?;
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
@@ -778,6 +825,9 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     }
     let now = now_ms();
     db.set_status(&s.id, Status::Starting, now)?;
+    // Listed in the gate again (no longer stopped). (A resumed Codex runs
+    // no hook before its next prompt.)
+    crate::codex_daemon::sync_gate(db);
     db.insert_event(
         &s.id,
         now,
@@ -819,7 +869,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = tmux::pane_command(&pane_env(&s.id, program.as_deref()), argv);
+    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, argv);
     note_launch(db, &s.id, argv)?;
     let now = now_ms();
     if tmux::has_session(&tmux_name) {
@@ -876,6 +926,10 @@ fn hold(db: &Db, id: &str, deferred: Option<&rlord_core::agents::Deferred>) -> R
     }
 }
 
+/// Stop a session: its pane goes. A session on Codex's daemon had its
+/// running turn interrupted first, with no lock held (`params.interrupt`,
+/// set by the caller from `codex_daemon::interrupt`): said in the answer
+/// and the log.
 pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     if let Some(t) = &s.tmux_session {
@@ -884,8 +938,36 @@ pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
     let now = now_ms();
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
-    db.insert_event(&s.id, now, "stopped", "{}")?;
-    Ok(json!({"stopped": s.id}))
+    let turn = &params["interrupt"];
+    db.insert_event(&s.id, now, "stopped", &stop_detail(turn).to_string())?;
+    crate::codex_daemon::sync_gate(db);
+    let mut r = json!({"stopped": s.id});
+    say_turn(&mut r, turn);
+    Ok(r)
+}
+
+/// The log entry's detail for a stop: what became of a running turn.
+fn stop_detail(turn: &Value) -> Value {
+    if turn.is_null() {
+        json!({})
+    } else {
+        json!({"turn": turn})
+    }
+}
+
+/// Put what became of a running turn in a stop's answer, in a line when it
+/// may still be running.
+fn say_turn(r: &mut Value, turn: &Value) {
+    if turn.is_null() {
+        return;
+    }
+    r["turn"] = turn.clone();
+    if turn == "still_running" {
+        r["note"] = json!(
+            "its turn didn't stop when interrupted: it may still be running on Codex's \
+             background server (`codex resume` the thread to see it)"
+        );
+    }
 }
 
 pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
@@ -898,8 +980,12 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
     db.set_archived(&s.id, Some(now))?;
-    db.insert_event(&s.id, now, "archived", "{}")?;
-    Ok(json!({"archived": s.id}))
+    let turn = &params["interrupt"];
+    db.insert_event(&s.id, now, "archived", &stop_detail(turn).to_string())?;
+    crate::codex_daemon::sync_gate(db);
+    let mut r = json!({"archived": s.id});
+    say_turn(&mut r, turn);
+    Ok(r)
 }
 
 pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
@@ -920,14 +1006,29 @@ pub(crate) fn hook_emit_with(
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
 ) -> Result<Value> {
-    let instance = p_str(params, "instance")?;
+    // `instance`: the hook's RLORD_SESSION_ID. A hook Codex's background
+    // server ran has none (`by: "thread"`): see `codex_daemon::route`.
+    let instance = params["instance"].as_str();
     let agent = p_str(params, "agent")?;
     let event = p_str(params, "event")?;
     let payload = params.get("payload").cloned().unwrap_or(json!({}));
-    let Ok(s) = db.resolve_ref(instance) else {
-        // Env var pointed at a session we don't know (deleted?); drop quietly.
-        tracing::debug!(instance, "hook event for unknown session");
-        return Ok(json!({"ignored": true}));
+    let named = instance.and_then(|i| db.resolve_ref(i).ok());
+    let (s, by_thread) = if agent == Agent::Codex.name() {
+        match crate::codex_daemon::route(db, event, &payload, named)? {
+            crate::codex_daemon::Route::Pane(s) => (s, false),
+            crate::codex_daemon::Route::Thread(s) => (s, true),
+            crate::codex_daemon::Route::Ignore(why) => {
+                tracing::debug!(?instance, why, "ignoring a Codex hook");
+                return Ok(json!({"ignored": why}));
+            }
+        }
+    } else {
+        let Some(s) = named else {
+            // Env var pointed at a session we don't know (deleted?); drop quietly.
+            tracing::debug!(?instance, "hook event for unknown session");
+            return Ok(json!({"ignored": true}));
+        };
+        (s, false)
     };
     let now = now_ms();
     // Events that fire often (every tool call, every notification) and
@@ -940,7 +1041,15 @@ pub(crate) fn hook_emit_with(
             return Ok(json!({"ok": true, "unchanged": true}));
         }
     }
-    if let Some(why) = foreign_hook(&s, params) {
+    // A thread on Codex's daemon ends without its pane, never with it (a
+    // client leaving ends nothing): a SessionEnd while the pane is up
+    // doesn't stop the session (`discover` stops it once the pane goes).
+    if by_thread && event == "SessionEnd" && crate::codex_daemon::pane_up(&s) {
+        return Ok(json!({"ignored": "its pane is still up"}));
+    }
+    // (A hook matched by its thread ran in Codex's daemon: no pane of its
+    // own to compare.)
+    if let Some(why) = foreign_hook(&s, params).filter(|_| !by_thread) {
         // Same RLORD_SESSION_ID, another process (e.g. Claude's background
         // daemon forked the conversation out of the pane): it must not
         // retarget the session or change its state.
@@ -1456,7 +1565,11 @@ mod tests {
             ["--x", "--remote-control", "web"]
         );
         // Remote Control and the renderer are Claude's: not Codex flags.
-        assert_eq!(spec_args(Agent::Codex, &on), ["--x"]);
+        // Codex runs in the pane unless its spec puts it on the daemon.
+        assert_eq!(spec_args(Agent::Codex, &on), ["--no-daemon", "--x"]);
+        let daemon = json!({"extra_args": ["--x"], "codex_host": "daemon"});
+        assert_eq!(spec_args(Agent::Codex, &daemon), ["--x"]);
+        assert!(spec_args(Agent::OpenCode, &daemon) == ["--x"]);
         let off = json!({"remote_control_off": true});
         // (No renderer set in tests: CLAUDE_TUI is unset.)
         assert_eq!(
@@ -1565,11 +1678,27 @@ mod tests {
             path_with(Some(program), "").as_deref(),
             Some("/home/a/.nvm/versions/node/v22/bin")
         );
-        let env = pane_env("01s", Some(program));
+        let env = pane_env("01s", Some(program), false);
         assert_eq!(env[0], ("RLORD_SESSION_ID".to_string(), "01s".to_string()));
         assert_eq!(env[1].0, "PATH");
         assert!(env[1].1.starts_with("/home/a/.nvm/versions/node/v22/bin"));
-        assert_eq!(pane_env("01s", None).len(), 1);
+        assert_eq!(pane_env("01s", None, false).len(), 1);
+    }
+
+    /// A pane on Codex's daemon names no session: a daemon its TUI starts
+    /// would pass the name to every thread's hooks.
+    #[test]
+    fn a_daemon_pane_names_no_session() {
+        assert!(pane_env("01s", None, true).is_empty());
+        let argv = ["codex".to_string()];
+        assert_eq!(
+            pane_cmd("01s", None, true, &argv),
+            "exec env -u RLORD_SESSION_ID codex"
+        );
+        assert_eq!(
+            pane_cmd("01s", None, false, &argv),
+            "exec env RLORD_SESSION_ID=01s codex"
+        );
     }
 
     #[test]
