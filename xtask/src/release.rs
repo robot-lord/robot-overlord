@@ -200,7 +200,7 @@ pub fn main(args: &[String]) -> Result<()> {
             let mut why = format!("{tag} already exists — bump the version in Cargo.toml");
             if !ver.is_dev() {
                 why.push_str(
-                    "\n(if an earlier run pushed it and stopped: cargo xtask release --resume)",
+                    "\n(if an earlier run pushed it and stopped: cargo xtask release --resume; if it was a --local release, finish with cargo xtask update-tap and cargo xtask publish-crates)",
                 );
             }
             refuse(why)?;
@@ -284,15 +284,20 @@ pub fn main(args: &[String]) -> Result<()> {
         ".visibility",
     ]));
     cmd::check_interrupted()?;
-    let logged_in = crates_io_token_available();
     if let Err(e) = &visibility {
         eprintln!("crates.io: couldn't tell whether {REPO} is public ({e:#}) — skipped (publish with cargo xtask publish-crates)");
     } else if visibility.as_deref().ok() != Some("PUBLIC") {
         eprintln!("crates.io: {REPO} is private — skipped (publish later with cargo xtask publish-crates)");
-    } else if logged_in {
-        publish::publish(false)?;
     } else {
-        eprintln!("crates.io: not logged in (cargo login) — skipped");
+        // Tried whenever the repo is public: cargo knows best whether it
+        // has a token (a credentials file, an env var, a credential
+        // provider), and says so if it hasn't.
+        publish::publish(false).with_context(|| {
+            format!(
+                "crates.io publish failed; the GitHub release and tap are done ({}). Log in if needed (cargo login), then: cargo xtask publish-crates",
+                release_url(&tag)
+            )
+        })?;
     }
     println!("released: {}", release_url(&tag));
     Ok(())
@@ -380,7 +385,8 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         cmd::sleep(Duration::from_secs(10))?;
         let mut not_cancelled = Vec::new();
         for late in find_runs().map_err(unknown)? {
-            if late.status != "completed" {
+            // An earlier attempt's run isn't this push's to cancel.
+            if late.status != "completed" && !earlier.contains(&late.id) {
                 let id = late.id.to_string();
                 if cmd::run(gh().args(["run", "cancel", &id, "-R", REPO])).is_err() {
                     not_cancelled.push(id);
@@ -460,23 +466,6 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     Ok(())
 }
 
-/// Whether cargo has a crates.io token: CARGO_REGISTRY_TOKEN, or a
-/// credentials file in CARGO_HOME (default ~/.cargo). Existence only: the
-/// token itself is never read.
-fn crates_io_token_available() -> bool {
-    if std::env::var_os("CARGO_REGISTRY_TOKEN").is_some_and(|t| !t.is_empty()) {
-        return true;
-    }
-    let home = std::env::var_os("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")));
-    home.is_some_and(|h| {
-        ["credentials.toml", "credentials"]
-            .iter()
-            .any(|f| h.join(f).is_file())
-    })
-}
-
 fn release_url(tag: &str) -> String {
     format!("https://github.com/{REPO}/releases/tag/{tag}")
 }
@@ -490,8 +479,10 @@ fn release_state(tag: &str) -> Result<Option<bool>> {
         "list",
         "-R",
         REPO,
+        // Newest first, and a version only goes up (check-version-bump), so
+        // a release or draft for this tag is among the latest.
         "-L",
-        "1000",
+        "100",
         "--json",
         "tagName,isDraft",
     ]))?;

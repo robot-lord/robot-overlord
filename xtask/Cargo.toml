@@ -10,5 +10,5 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-# Ctrl-C handling (cmd::on_interrupt); already in the lock via the core crate.
-libc = "0.2"
+# Ctrl-C handling (cmd::on_interrupt).
+libc.workspace = true

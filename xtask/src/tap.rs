@@ -17,8 +17,12 @@ pub fn main(args: &[String], invoked_from: &Path) -> Result<()> {
         [ver, sums, tap] => (ver, sums, tap.as_str()),
         _ => return cmd::usage("usage: cargo xtask update-tap VERSION SHA256SUMS [TAP_REPO]"),
     };
+    let ver = Version::parse(ver)?;
+    if ver.is_dev() {
+        bail!("update-tap: {ver} is a dev build; only stable releases go in the Homebrew tap");
+    }
     // The path is the caller's, not relative to the repository root.
-    update(&Version::parse(ver)?, &invoked_from.join(sums), tap)
+    update(&ver, &invoked_from.join(sums), tap)
 }
 
 pub fn update(ver: &Version, sums: &Path, tap: &str) -> Result<()> {

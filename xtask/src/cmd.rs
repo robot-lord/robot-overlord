@@ -97,15 +97,17 @@ pub fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
-    check_interrupted()?;
     if !status.success() {
+        // A step that finished is never "interrupted"; one that failed
+        // under Ctrl-C is.
+        check_interrupted()?;
         bail!("{} failed ({status})", describe(cmd));
     }
     Ok(())
 }
 
-/// Run without output; its exit status. Ctrl-C before or during it is
-/// `Interrupted`, never a status to act on.
+/// Run without output; its exit status. Ctrl-C before it, or during a run
+/// that then failed, is `Interrupted`, never a status to act on.
 pub fn status_quiet(cmd: &mut Command) -> Result<ExitStatus> {
     check_interrupted()?;
     let status = cmd
@@ -113,7 +115,9 @@ pub fn status_quiet(cmd: &mut Command) -> Result<ExitStatus> {
         .stderr(Stdio::null())
         .status()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
-    check_interrupted()?;
+    if !status.success() {
+        check_interrupted()?;
+    }
     Ok(status)
 }
 
@@ -129,8 +133,8 @@ pub fn output(cmd: &mut Command) -> Result<String> {
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
-    check_interrupted()?;
     if !out.status.success() {
+        check_interrupted()?;
         bail!("{} failed ({})", describe(cmd), out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
