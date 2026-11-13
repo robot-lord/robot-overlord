@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod methods;
 pub mod opencode;
 pub mod overlord;
+pub mod own;
 pub mod profile;
 pub mod recall;
 pub mod remote;
@@ -812,6 +813,8 @@ pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Va
 
 /// The fields of a hook payload rlord uses. Everything else (a tool's
 /// whole input and output, prompts) stays out of the daemon and the spool.
+/// Of a prompt, only a hash goes (`prompt_hash`: how the daemon knows a
+/// prompt rlord typed itself, `own.rs`).
 const HOOK_FIELDS: &[&str] = &[
     "hook_event_name",
     "session_id",
@@ -840,6 +843,9 @@ pub fn slim_hook_payload(raw: &str) -> Value {
                 if let Some(x) = v.get(*k).filter(|x| !x.is_null()) {
                     out.insert((*k).to_string(), x.clone());
                 }
+            }
+            if let Some(prompt) = v.get("prompt").and_then(Value::as_str) {
+                out.insert("prompt_hash".to_string(), json!(own::text_hash(prompt)));
             }
         }
         Err(_) => {
@@ -1407,6 +1413,54 @@ mod tests {
             .map(|e| e["kind"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, ["prompt_submitted", "agent_stopped"]);
+
+        // A prompt rlord typed itself (marked right before its paste) is
+        // logged as rlord's and is not the user's; the user's next one,
+        // moments later with other text, is theirs.
+        let user_at = s["last_user_msg_at"].as_i64().unwrap();
+        own::mark(
+            &daemon.db(),
+            "01test",
+            "continue",
+            own::Source::Resume,
+            rlord_core::types::now_ms(),
+        )
+        .unwrap();
+        let prompt = |text: &str| {
+            let raw = json!({"hook_event_name": "UserPromptSubmit", "session_id": "uuid-1",
+                             "prompt": text})
+            .to_string();
+            let payload = slim_hook_payload(&raw);
+            assert!(payload.get("prompt").is_none(), "only its hash is sent");
+            call(
+                "hook.emit",
+                json!({"instance": "01test", "agent": "claude", "event": "UserPromptSubmit",
+                       "payload": payload}),
+            )
+        };
+        prompt("continue\n").await.unwrap();
+        let s = call("session.get", json!({"ref": "01test"})).await.unwrap();
+        assert_eq!(s["status"], "working");
+        assert_eq!(s["last_user_msg_at"], user_at);
+        assert!(s["last_rlord_msg_at"].as_i64().unwrap() >= user_at);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        prompt("no, stop").await.unwrap();
+        let s = call("session.get", json!({"ref": "01test"})).await.unwrap();
+        assert!(s["last_user_msg_at"].as_i64().unwrap() > user_at);
+        let log = call("session.log", json!({"ref": "01test"})).await.unwrap();
+        let last: Vec<(&str, &str)> = log
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(2)
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap(),
+                    e["payload"]["source"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(last, [("rlord_prompt", "resume"), ("prompt_submitted", "")]);
 
         server.abort();
     }

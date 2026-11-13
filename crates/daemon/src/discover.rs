@@ -373,19 +373,19 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
     }
     let now = now_ms();
     db.set_status(&s.id, next, now)?;
-    let kind = match next {
-        Status::Working => {
-            db.touch_last_user_msg(&s.id, now)?;
-            "prompt_submitted"
-        }
+    let (kind, source) = match next {
+        // A turn began: the user's prompt, or one rlord typed (`own.rs`;
+        // only that a turn is open was read, so by time).
+        Status::Working => crate::own::prompt(&db, &s.id, None, now)?,
         _ => {
             if s.status == Status::Working {
                 db.touch_last_agent_msg(&s.id, now)?;
             }
-            "agent_stopped"
+            ("agent_stopped", None)
         }
     };
-    db.insert_event(&s.id, now, kind, r#"{"from":"transcript"}"#)?;
+    let detail = crate::own::with_source(json!({"from": "transcript"}), source);
+    db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
 }
 

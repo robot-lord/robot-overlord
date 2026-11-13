@@ -356,7 +356,7 @@ fn pasts(d: &Daemon) -> Result<Vec<Past>> {
         let (cur, earlier) = list(&db, &o)?;
         if o.id != active.id {
             if let Some(c) = cur {
-                let when = o.last_user_msg_at.max(o.last_agent_msg_at);
+                let when = o.last_prompt_at().max(o.last_agent_msg_at);
                 out.push(Past {
                     o: o.clone(),
                     c,

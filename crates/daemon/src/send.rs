@@ -28,6 +28,10 @@
 //!   terminal the overlord's overlay is open on doesn't count: the user is
 //!   typing to the overlord in the popup, not to the session behind it.
 //!
+//! Once every check passed, the prompt the paste will make is marked as
+//! rlord's (`own.rs`), so the agent's report of it never counts as the
+//! user typing.
+//!
 //! A queued message held back by these is logged once ("message_held",
 //! with why), so a message stuck in the queue shows in the session's log.
 
@@ -43,6 +47,7 @@ use rlord_core::db::Db;
 use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
 
+use crate::own::{self, Source};
 use crate::Daemon;
 
 /// kv key: pending messages, `{session id: {"text", "at"}}`.
@@ -87,11 +92,9 @@ pub struct Checks<'a> {
     pub overlay: Option<&'a str>,
     /// Not while its input holds a draft (`draft`).
     pub draft: bool,
-    /// Run right before the paste, once every check passed
-    /// (`limits::before_paste`: the resume job's "rlord typed" marker).
-    pub before_paste: Option<&'a dyn Fn()>,
-    /// Run if the paste or its Enter failed after `before_paste` (undo it).
-    pub paste_failed: Option<&'a dyn Fn()>,
+    /// Who is typing: the prompt this makes is marked as rlord's
+    /// (`own::mark`), not the user's.
+    pub source: Source,
 }
 
 /// What `type_into` did.
@@ -107,9 +110,17 @@ pub enum Typed {
 /// pane, never whatever pane is active) and submit it, unless `checks`
 /// say not now: out of copy mode first (its keys would take the Enter),
 /// one bracketed paste, a moment for it to land, then Enter. `session`:
-/// whose pane, remembered for `SETTLE`. The caller holds the session's
-/// lock (locks.rs).
-pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Result<Typed> {
+/// whose pane, remembered for `SETTLE`. Right before the paste the prompt
+/// to come is marked as rlord's (`own::mark`, durable), so it is never
+/// taken for the user's; a paste that fails takes its marker back. The
+/// caller holds the session's lock (locks.rs), and not the DB.
+pub fn type_into(
+    d: &Daemon,
+    session: &str,
+    pane: &str,
+    text: &str,
+    checks: &Checks,
+) -> Result<Typed> {
     let settled = || {
         let typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
         !checks.settle
@@ -143,10 +154,8 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
-    // (Without `TYPING`: it may take the DB.)
-    if let Some(f) = checks.before_paste {
-        f();
-    }
+    // (Without `TYPING`: this takes the DB.)
+    let marked = own::mark(&d.db(), session, text, checks.source, now_ms())?;
     let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
     let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
@@ -154,12 +163,11 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
         std::thread::sleep(Duration::from_millis(150));
         tmux::send_keys(pane, &["Enter"])
     });
-    if pasted.is_err() {
-        if let Some(f) = checks.paste_failed {
-            f();
-        }
+    if let Err(e) = pasted {
+        drop(typed);
+        let _ = own::unmark(&d.db(), session, marked);
+        return Err(e);
     }
-    pasted?;
     last.insert(session.to_string(), Instant::now());
     Ok(Typed::Done)
 }
@@ -233,8 +241,8 @@ fn agent_pane(s: &Session) -> Result<String> {
 }
 
 /// Type a message into session `s` (read under its lock, just now), after
-/// the last checks (`type_into`).
-pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed> {
+/// the last checks (`type_into`). `source`: who sends it.
+pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str, source: Source) -> Result<Typed> {
     let pane = agent_pane(s)?;
     let overlay = d
         .overlay
@@ -242,18 +250,15 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         .expect("ui mutex")
         .as_ref()
         .map(|(client, _)| client.clone());
-    // (The marker `before_paste` replaced: back if the paste fails.)
-    let prev = std::cell::Cell::new(None);
     let checks = Checks {
         agent: Agent::named(&s.agent)?,
         settle: true,
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
-        before_paste: Some(&|| prev.set(crate::limits::before_paste(d, s))),
-        paste_failed: Some(&|| crate::limits::paste_failed(d, &s.id, prev.get())),
+        source,
     };
-    type_into(&s.id, &pane, text, &checks)
+    type_into(d, &s.id, &pane, text, &checks)
 }
 
 /// `session.send {ref, text, when_idle}`.
@@ -302,7 +307,7 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         return not_now(d, &s, text, when_idle, &why);
     }
     // (tmux without the DB lock.)
-    if let Typed::NotNow(why) = type_message(d, &s, text)? {
+    if let Typed::NotNow(why) = type_message(d, &s, text, Source::Send)? {
         return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
     }
     let db = d.db();
@@ -498,7 +503,7 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         return Ok(());
     }
     // Without the DB lock: tmux.
-    let r = type_message(d, &s, &text);
+    let r = type_message(d, &s, &text, Source::Send);
     if let Ok(Typed::NotNow(why)) = &r {
         // A later tick; said once, so a stuck queue is visible.
         return held(d, id, &text, why);
@@ -697,10 +702,13 @@ mod tests {
             attached: None,
             overlay: None,
             draft: true,
-            before_paste: None,
-            paste_failed: None,
+            source: Source::Send,
         };
-        let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
+        let d = Daemon::new(
+            Db::open_in_memory().unwrap(),
+            rlord_core::config::Config::default(),
+        );
+        let r = type_into(&d, id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));
     }
 
@@ -849,6 +857,14 @@ mod tests {
         assert!(pending(&d.db()).unwrap().is_empty());
         std::thread::sleep(Duration::from_millis(200));
         assert!(screen().contains("two"), "{}", screen());
+        // The prompt to come is marked as rlord's (durable); the agent's
+        // report of it is then not the user's.
+        let marked = d.db().kv_get(own::KEY).unwrap().unwrap_or_default();
+        assert!(marked.contains(&own::text_hash("two")), "{marked}");
+        let (kind, source) = own::prompt(&d.db(), &id, None, now_ms()).unwrap();
+        assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("send")));
+        let s = d.db().resolve_ref(&id).unwrap();
+        assert!(s.last_user_msg_at.is_none() && s.last_rlord_msg_at.is_some());
 
         // Right after: one paste per settle.
         let e = send(&d, &json!({"ref": &id, "text": "three"})).unwrap_err();

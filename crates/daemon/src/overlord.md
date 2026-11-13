@@ -70,7 +70,8 @@ you've sat idle a while (the user may also clear you). So:
   `groups` (sessions by tag, with `group` choosing which). Filter syntax: free
   words match name/project/tag; `status:needs` `status:turn` `tag:wip` `proj:x`
   `agent:codex` set typed filters. Sorts: updated (last
-  message either way), user (the user's last prompt), state (last status
+  message either way), user (the user's last prompt; what you send to a
+  session doesn't count), state (last status
   change), created, name, usage (most used first). `usage` sets what the
   list's Usage column shows (turns, tokens, context %), which the usage
   sort follows; it's remembered across restarts (as when the user presses

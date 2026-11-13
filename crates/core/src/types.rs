@@ -90,6 +90,18 @@ pub struct Session {
     #[serde(default)]
     pub summary: String,
     pub summary_at: Option<i64>,
+    /// When rlord itself last typed a prompt into it (`send_to_session`,
+    /// a resume after a usage limit, `overlord ask`). `last_user_msg_at`
+    /// is the user's own prompts only.
+    #[serde(default)]
+    pub last_rlord_msg_at: Option<i64>,
+}
+
+impl Session {
+    /// The last prompt it got, whoever typed it: the user or rlord.
+    pub fn last_prompt_at(&self) -> Option<i64> {
+        self.last_user_msg_at.max(self.last_rlord_msg_at)
+    }
 }
 
 pub fn now_ms() -> i64 {

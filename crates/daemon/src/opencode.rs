@@ -331,13 +331,18 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str) -> Result<bool> {
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
-    if step.user_msg {
-        db.touch_last_user_msg(&s.id, now)?;
-    }
+    // A prompt: the user's, or one rlord typed (`own.rs`; OpenCode's
+    // event has no text here, so by time).
+    let (kind, source) = if step.user_msg {
+        crate::own::prompt(db, &s.id, None, now)?
+    } else {
+        (kind, None)
+    };
     if step.agent_msg {
         db.touch_last_agent_msg(&s.id, now)?;
     }
-    db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
+    let detail = crate::own::with_source(json!({ "from": from }), source);
+    db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
 }
 
@@ -579,14 +584,17 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         db.set_status(&s.id, want, now)?;
         let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
+        let mut source = None;
         let (kind, from) = match want {
             // What it waited on was answered while rlord wasn't listening:
             // not a message (as from the event stream).
             Status::Working if s.status == Status::WaitingInput => ("answered", "opencode session"),
             Status::Working => {
                 let busy = turn.and_then(|t| t.busy).unwrap_or(now);
-                db.touch_last_user_msg(&s.id, busy)?;
-                ("prompt_submitted", "opencode session")
+                // (The user's, or one rlord typed: `own.rs`, by time.)
+                let (kind, by) = crate::own::prompt(&db, &s.id, None, busy)?;
+                source = by;
+                (kind, "opencode session")
             }
             Status::WaitingInput => ("permission_request", "opencode session"),
             // Just (re)started, and no turn running: it is up.
@@ -602,7 +610,8 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if seen == Seen::NotRunning => ("agent_stopped", "opencode turn not running"),
             _ => ("agent_stopped", "opencode server gone"),
         };
-        db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
+        let detail = crate::own::with_source(json!({ "from": from }), source);
+        db.insert_event(&s.id, now, kind, &detail.to_string())?;
         changed = true;
     }
     Ok(changed)

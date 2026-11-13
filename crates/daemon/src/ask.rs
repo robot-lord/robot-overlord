@@ -20,6 +20,7 @@ use rlord_core::agents::Agent;
 use rlord_core::tmux;
 use rlord_core::types::Status;
 
+use crate::own::Source;
 use crate::send::{type_into, Checks, Typed};
 use crate::{overlord, Daemon};
 
@@ -117,10 +118,9 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     // (The user's own message: a draft of theirs in the
                     // overlord's pane is theirs to merge.)
                     draft: false,
-                    before_paste: None,
-                    paste_failed: None,
+                    source: Source::Ask,
                 };
-                if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
+                if let Typed::NotNow(why) = type_into(d, &s.id, &pane, text, &checks)? {
                     bail!(
                         "not sent to the overlord: {why}. Answer it first ({}-O)",
                         rlord_core::keys::alt_name()
