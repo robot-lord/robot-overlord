@@ -331,20 +331,20 @@ The session's details say "codex: shared server". rlord usually starts
 that server itself, and never updates, restarts or stops it; `rlord
 agents` shows its version when it differs from your `codex` (it updates
 itself). Stopping or archiving such a session interrupts its running
-turn first, and says so if it wouldn't stop. The overlord, and a session
-launched with flags that need the pane (`-c` / `--config`, `--enable`,
-`--disable`, `--search`), stay in the pane. Not followed yet on the
-server: `/clear` or `/new` in the session (it stays on its first
-thread), and "needs you" from a sub-agent's prompt.
+turn first, and says so if it wouldn't stop. The overlord stays in the
+pane (its settings are `-c` flags, which Codex runs only in the pane).
+Not followed yet on the server: `/clear` or `/new` in the session (it
+stays on its first thread), and "needs you" from a sub-agent's prompt.
 
 Avoid starting turns on the same conversation from another Codex client:
 rlord can't always tell, and may type a message (or a usage-limit
 "continue") into that turn. Daemon mode has been checked on macOS only
 so far.
 
-Not yet: importing Codex
-conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
-on a permission prompt shows "needs you" only with trusted hooks.
+Not yet: importing Codex conversations started outside rlord, sub-agent
+tracking. Remote Control is Claude Code only: Codex's waits until Codex
+makes it official. A session blocked on a permission prompt shows "needs
+you" only with trusted hooks.
 
 ## OpenCode sessions
 

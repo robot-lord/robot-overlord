@@ -266,7 +266,8 @@ a daemon-mode pane can't be given `-c check_for_update_on_startup=false`
 (the overlord's) and, like an in-pane session, can open on Codex's update
 prompt. `spec_args` adds `--no-daemon` for every other Codex session. The
 rest is `daemon/src/codex_daemon.rs`, with the client in
-`agents::codex_server`:
+`agents::codex_server`. Daemon mode is plumbing: no new-session hint or
+list marker, only the details line ("codex: shared server").
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
   environment of whatever started the daemon. So a daemon-mode pane gets

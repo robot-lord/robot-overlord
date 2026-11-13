@@ -27,7 +27,8 @@ goes on only on the user's explicit yes (`confirm_machine`), never
 confirmed by the overlord for them; the pairing code never goes into MCP
 results, logs or events, only to the user's own terminal; turning it off
 for a session moves it back into its pane and says the phone may still
-reach it, offering the machine switch.
+reach it, offering the machine switch; sessions started from the phone
+don't show in rlord (that waits for Codex import).
 
 Live checks named here (from the removed doc): L3 the Remote Control CLI
 and socket calls; L6 what a paired phone sees (never run).
