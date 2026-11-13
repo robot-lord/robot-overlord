@@ -76,19 +76,11 @@ pub struct Limits {
 }
 
 fn kv_map(db: &Db, key: &str) -> Result<Map<String, Value>> {
-    Ok(db
-        .kv_get(key)?
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default())
+    db.kv_map(key)
 }
 
 fn save_map(db: &Db, key: &str, m: &Map<String, Value>) -> Result<()> {
-    if m.is_empty() {
-        db.kv_delete(key)
-    } else {
-        db.kv_set(key, &Value::Object(m.clone()).to_string())
-    }
+    db.kv_set_map(key, m)
 }
 
 /// The limit a session is stopped on, from what its transcript says

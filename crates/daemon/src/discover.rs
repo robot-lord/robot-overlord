@@ -376,7 +376,7 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
     let (kind, source) = match next {
         // A turn began: the user's prompt, or one rlord typed (`own.rs`;
         // only that a turn is open was read, so by time).
-        Status::Working => crate::own::prompt(&db, &s.id, None, now)?,
+        Status::Working => crate::own::prompt(&db, &s.id, None, now, crate::own::Via::Transcript)?,
         _ => {
             if s.status == Status::Working {
                 db.touch_last_agent_msg(&s.id, now)?;

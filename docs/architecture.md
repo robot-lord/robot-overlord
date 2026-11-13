@@ -822,8 +822,11 @@ including when the active one hits a usage limit.
 
   A matched prompt is logged as `rlord_prompt` (with `source`) and moves
   `last_rlord_msg_at`; any other is `prompt_submitted` and moves
-  `last_user_msg_at`. A marker is used once, is taken back when its paste
-  fails, and expires after 10 minutes. Code that means "any prompt" (the
+  `last_user_msg_at`. A marker is used once per way of reporting: the
+  same prompt told a second way within 30s (a turn read from the
+  transcript, then its hook) is still rlord's, the next prompt told the
+  same way is the user's. It is taken back when its paste fails, and
+  expires after 10 minutes. Code that means "any prompt" (the
   overlord's idle fresh start, `recall`'s dating, the quiet check before
   a remote-control restart) reads both times (`Session::last_prompt_at`).
 - **Typing into a pane** (`send::type_into`), for asks, sends and

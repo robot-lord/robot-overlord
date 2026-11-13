@@ -968,6 +968,28 @@ impl Db {
         Ok(())
     }
 
+    /// A kv value that is a JSON object (`{}` when unset or unreadable).
+    pub fn kv_map(&self, key: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+        Ok(self
+            .kv_get(key)?
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default())
+    }
+
+    /// Store a JSON object under `key`; an empty one deletes the key.
+    pub fn kv_set_map(
+        &self,
+        key: &str,
+        m: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        if m.is_empty() {
+            self.kv_delete(key)
+        } else {
+            self.kv_set(key, &serde_json::Value::Object(m.clone()).to_string())
+        }
+    }
+
     /// A prompt rlord itself typed into the session (never
     /// `last_user_msg_at`: that is the user's own).
     pub fn touch_last_rlord_msg(&self, id: &str, ts: i64) -> Result<()> {

@@ -25,7 +25,11 @@ and `docs/guide.md`. The working doc is in git history.
   `docs/architecture.md`). Left: OpenCode and transcript-discovered
   turns (Codex without hooks) match by time only, so a user prompt in
   the 30s after a paste can read as rlord's; reading the prompt's text
-  from OpenCode's store or the transcript would close it. Messages an
+  from OpenCode's store or the transcript would close it. The reverse
+  on the same paths: a paste the agent queues for more than 30s (an ask
+  into a working OpenCode overlord) reads as the user's. A marker whose
+  prompt never came also matches the user typing the very same text
+  within 10 minutes. Messages an
   agent queues and joins into one prompt (several `overlord ask`s into
   a working overlord), or a paste that lands in a draft, don't match by
   hash and count as the user's.

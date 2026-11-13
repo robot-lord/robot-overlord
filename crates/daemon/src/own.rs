@@ -24,7 +24,10 @@
 //!
 //! A matched prompt is logged as `rlord_prompt` (with `source`) and moves
 //! `last_rlord_msg_at`; any other is `prompt_submitted` and moves
-//! `last_user_msg_at`. A marker is used once. One whose paste failed is
+//! `last_user_msg_at`. A marker is used once per way of reporting
+//! (`Via`): the same prompt told a second way soon after (a turn read
+//! from the transcript, then its hook) is still rlord's, while the next
+//! prompt told the same way is the user's. One whose paste failed is
 //! taken back (`unmark`); one never matched is dropped after
 //! `TEXT_TTL_MS`.
 
@@ -34,7 +37,9 @@ use serde_json::{json, Map, Value};
 use rlord_core::db::Db;
 
 /// kv: pastes whose prompt hasn't been reported yet,
-/// `{session id: [{at, source, hash}]}`.
+/// `{session id: [{at, source, hash, via?, claimed_at?}]}`. `via`,
+/// `claimed_at`: how and when its prompt was first reported (kept
+/// `TIME_WINDOW_MS` more, for the same prompt told another way).
 pub const KEY: &str = "own_prompts";
 
 /// A marker matches a prompt with the same text this long. (A message
@@ -90,20 +95,37 @@ pub fn text_hash(text: &str) -> String {
     format!("{h:016x}")
 }
 
+/// How a prompt was reported. One prompt can be told more than one way
+/// (a turn `discover` reads from the transcript, then the hook for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// The agent's prompt hook.
+    Hook,
+    /// OpenCode's event stream.
+    Events,
+    /// OpenCode's session row, read after events were missed.
+    Session,
+    /// A turn found open in a transcript (`discover`).
+    Transcript,
+}
+
+impl Via {
+    fn name(self) -> &'static str {
+        match self {
+            Via::Hook => "hook",
+            Via::Events => "events",
+            Via::Session => "session",
+            Via::Transcript => "transcript",
+        }
+    }
+}
+
 fn load(db: &Db) -> Result<Map<String, Value>> {
-    Ok(db
-        .kv_get(KEY)?
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default())
+    db.kv_map(KEY)
 }
 
 fn save(db: &Db, m: &Map<String, Value>) -> Result<()> {
-    if m.is_empty() {
-        db.kv_delete(KEY)
-    } else {
-        db.kv_set(KEY, &Value::Object(m.clone()).to_string())
-    }
+    db.kv_set_map(KEY, m)
 }
 
 /// Drop markers too old to match anything (every session's: the map
@@ -113,7 +135,13 @@ fn prune(m: &mut Map<String, Value>, now: i64) {
         let Some(list) = list.as_array_mut() else {
             return false;
         };
-        list.retain(|x| x["at"].as_i64().is_some_and(|at| now - at <= TEXT_TTL_MS));
+        list.retain(|x| {
+            let fresh = x["at"].as_i64().is_some_and(|at| now - at <= TEXT_TTL_MS);
+            let told = x["claimed_at"]
+                .as_i64()
+                .is_some_and(|at| now - at > TIME_WINDOW_MS);
+            fresh && !told
+        });
         !list.is_empty()
     });
 }
@@ -157,42 +185,57 @@ pub fn unmark(db: &Db, id: &str, at: i64) -> Result<()> {
 }
 
 /// Whether marker `x` is the paste behind a prompt reported at `at`
-/// (`hash`: of its text, when the report carried it).
-fn matches(x: &Value, hash: Option<&str>, at: i64) -> bool {
+/// (`hash`: of its text, when the report carried it; `via`: how it was
+/// reported).
+fn matches(x: &Value, hash: Option<&str>, at: i64, via: Via) -> bool {
     let Some(marked) = x["at"].as_i64() else {
         return false;
     };
+    let same_text = hash.is_none_or(|h| x["hash"].as_str() == Some(h));
+    // Its prompt was reported already: only the same one told another
+    // way, about then, is still it.
+    if let Some(told) = x["claimed_at"].as_i64() {
+        return same_text
+            && x["via"].as_str() != Some(via.name())
+            && (at - told).abs() <= TIME_WINDOW_MS;
+    }
     let since = at - marked;
     match hash {
-        Some(h) => x["hash"].as_str() == Some(h) && (-SLACK_MS..=TEXT_TTL_MS).contains(&since),
+        Some(_) => same_text && (-SLACK_MS..=TEXT_TTL_MS).contains(&since),
         None => (-SLACK_MS..=TIME_WINDOW_MS).contains(&since),
     }
 }
 
 /// Session `id` reported a prompt at `at`. If rlord typed it, its marker
-/// is used up and who sent it is returned.
-fn claim(db: &Db, id: &str, hash: Option<&str>, at: i64) -> Result<Option<String>> {
-    let mut m = load(db)?;
-    let Some(list) = m.get_mut(id).and_then(Value::as_array_mut) else {
-        return Ok(None);
-    };
-    // (The oldest that fits: pastes are reported in order.)
-    let Some(i) = list.iter().position(|x| matches(x, hash, at)) else {
-        return Ok(None);
-    };
-    let source = list.remove(i)["source"]
-        .as_str()
-        .unwrap_or("send")
-        .to_string();
-    if list.is_empty() {
-        m.remove(id);
+/// is used up (for this way of reporting) and who sent it is returned.
+fn claim(db: &Db, id: &str, hash: Option<&str>, at: i64, via: Via) -> Result<Option<String>> {
+    let before = load(db)?;
+    let mut m = before.clone();
+    let found = m
+        .get_mut(id)
+        .and_then(Value::as_array_mut)
+        .and_then(|list| {
+            // (The oldest that fits: pastes are reported in order.)
+            let i = list.iter().position(|x| matches(x, hash, at, via))?;
+            let source = list[i]["source"].as_str().unwrap_or("send").to_string();
+            if list[i]["claimed_at"].is_null() {
+                list[i]["via"] = json!(via.name());
+                list[i]["claimed_at"] = json!(at);
+            } else {
+                list.remove(i);
+            }
+            Some(source)
+        });
+    // (After the match: what is left and can't match any more goes.)
+    prune(&mut m, at);
+    if m != before {
+        save(db, &m)?;
     }
-    save(db, &m)?;
-    Ok(Some(source))
+    Ok(found)
 }
 
 /// Record a prompt session `id` reported at `at` (`hash`: of its text,
-/// when known): rlord's own (`last_rlord_msg_at`) or the user's
+/// when known; `via`: how it was reported): rlord's own (`last_rlord_msg_at`) or the user's
 /// (`last_user_msg_at`). Returns the event to log it as, and its source
 /// when it was rlord's.
 pub fn prompt(
@@ -200,8 +243,9 @@ pub fn prompt(
     id: &str,
     hash: Option<&str>,
     at: i64,
+    via: Via,
 ) -> Result<(&'static str, Option<String>)> {
-    match claim(db, id, hash, at)? {
+    match claim(db, id, hash, at, via)? {
         Some(source) => {
             db.touch_last_rlord_msg(id, at)?;
             Ok(("rlord_prompt", Some(source)))
@@ -269,16 +313,45 @@ mod tests {
         mark(&db, "s1", "continue", Source::Resume, 10_000).unwrap();
         // The user got in first with something else.
         let user = text_hash("wait, stop");
-        let (kind, source) = prompt(&db, "s1", Some(&user), 10_200).unwrap();
+        let (kind, source) = prompt(&db, "s1", Some(&user), 10_200, Via::Hook).unwrap();
         assert_eq!((kind, source), ("prompt_submitted", None));
         assert_eq!(times(&db), (Some(10_200), None));
         // rlord's own, minutes later (it sat in the agent's queue).
         let own = text_hash("continue\n");
-        let (kind, source) = prompt(&db, "s1", Some(&own), 200_000).unwrap();
+        let (kind, source) = prompt(&db, "s1", Some(&own), 200_000, Via::Hook).unwrap();
         assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("resume")));
         assert_eq!(times(&db), (Some(10_200), Some(200_000)));
         // The marker is used up: the same words again are the user's.
-        let (kind, _) = prompt(&db, "s1", Some(&own), 201_000).unwrap();
+        let (kind, _) = prompt(&db, "s1", Some(&own), 201_000, Via::Hook).unwrap();
+        assert_eq!(kind, "prompt_submitted");
+    }
+
+    /// One prompt told two ways (a turn read from the transcript, then
+    /// its hook) is rlord's both times; the user's next one is theirs.
+    #[test]
+    fn a_prompt_reported_twice_is_still_rlords() {
+        let db = db();
+        mark(&db, "s1", "continue", Source::Resume, 10_000).unwrap();
+        let own = text_hash("continue");
+        let (kind, _) = prompt(&db, "s1", None, 12_000, Via::Transcript).unwrap();
+        assert_eq!(kind, "rlord_prompt");
+        // The same way again is another prompt: the user's.
+        let (kind, _) = prompt(&db, "s1", None, 13_000, Via::Transcript).unwrap();
+        assert_eq!(kind, "prompt_submitted");
+        // Other text by hook: the user's too.
+        let other = text_hash("stop");
+        let (kind, _) = prompt(&db, "s1", Some(&other), 13_500, Via::Hook).unwrap();
+        assert_eq!(kind, "prompt_submitted");
+        // The paste's own hook, late: rlord's, and the marker is gone.
+        let (kind, source) = prompt(&db, "s1", Some(&own), 14_000, Via::Hook).unwrap();
+        assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("resume")));
+        assert_eq!(db.kv_get(KEY).unwrap(), None);
+        assert_eq!(times(&db), (Some(13_500), Some(14_000)));
+        // A reported marker doesn't linger: the next report clears it.
+        mark(&db, "s1", "continue", Source::Resume, 20_000).unwrap();
+        prompt(&db, "s1", Some(&own), 20_100, Via::Hook).unwrap();
+        let late = 20_100 + TIME_WINDOW_MS + 1;
+        let (kind, _) = prompt(&db, "s1", None, late, Via::Transcript).unwrap();
         assert_eq!(kind, "prompt_submitted");
         assert_eq!(db.kv_get(KEY).unwrap(), None);
     }
@@ -289,25 +362,30 @@ mod tests {
         let db = db();
         mark(&db, "s1", "hi", Source::Send, 10_000).unwrap();
         // Stamped just before the marker: clock slack.
-        let (kind, source) = prompt(&db, "s1", None, 9_500).unwrap();
+        let (kind, source) = prompt(&db, "s1", None, 9_500, Via::Hook).unwrap();
         assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("send")));
         // The next one is the user's, even inside the window.
         assert_eq!(
-            prompt(&db, "s1", None, 12_000).unwrap().0,
+            prompt(&db, "s1", None, 12_000, Via::Hook).unwrap().0,
             "prompt_submitted"
         );
         // Too long after the paste: not its prompt.
         mark(&db, "s1", "hi", Source::Send, 20_000).unwrap();
         let late = 20_000 + TIME_WINDOW_MS + 1;
-        assert_eq!(prompt(&db, "s1", None, late).unwrap().0, "prompt_submitted");
+        assert_eq!(
+            prompt(&db, "s1", None, late, Via::Hook).unwrap().0,
+            "prompt_submitted"
+        );
         // A prompt from before the paste isn't it either.
         assert_eq!(
-            prompt(&db, "s1", None, 20_000 - SLACK_MS - 1).unwrap().0,
+            prompt(&db, "s1", None, 20_000 - SLACK_MS - 1, Via::Hook)
+                .unwrap()
+                .0,
             "prompt_submitted"
         );
         // Another session's marker is not this one's.
         assert_eq!(
-            prompt(&db, "s2", None, 20_100).unwrap().0,
+            prompt(&db, "s2", None, 20_100, Via::Hook).unwrap().0,
             "prompt_submitted"
         );
     }
@@ -322,13 +400,13 @@ mod tests {
         unmark(&db, "s1", second).unwrap();
         let two = text_hash("two");
         assert_eq!(
-            prompt(&db, "s1", Some(&two), 10_500).unwrap().0,
+            prompt(&db, "s1", Some(&two), 10_500, Via::Hook).unwrap().0,
             "prompt_submitted"
         );
         let one = text_hash("one");
         let late = 10_000 + TEXT_TTL_MS + 1;
         assert_eq!(
-            prompt(&db, "s1", Some(&one), late).unwrap().0,
+            prompt(&db, "s1", Some(&one), late, Via::Hook).unwrap().0,
             "prompt_submitted"
         );
         // The next paste (anywhere) clears what expired.

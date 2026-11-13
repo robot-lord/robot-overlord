@@ -334,7 +334,7 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str) -> Result<bool> {
     // A prompt: the user's, or one rlord typed (`own.rs`; OpenCode's
     // event has no text here, so by time).
     let (kind, source) = if step.user_msg {
-        crate::own::prompt(db, &s.id, None, now)?
+        crate::own::prompt(db, &s.id, None, now, crate::own::Via::Events)?
     } else {
         (kind, None)
     };
@@ -592,7 +592,8 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             Status::Working => {
                 let busy = turn.and_then(|t| t.busy).unwrap_or(now);
                 // (The user's, or one rlord typed: `own.rs`, by time.)
-                let (kind, by) = crate::own::prompt(&db, &s.id, None, busy)?;
+                let (kind, by) =
+                    crate::own::prompt(&db, &s.id, None, busy, crate::own::Via::Session)?;
                 source = by;
                 (kind, "opencode session")
             }

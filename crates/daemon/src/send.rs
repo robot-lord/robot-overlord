@@ -154,8 +154,11 @@ pub fn type_into(
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
-    // (Without `TYPING`: this takes the DB.)
-    let marked = own::mark(&d.db(), session, text, checks.source, now_ms())?;
+    // (Without `TYPING`: this takes the DB. A marker that can't be
+    // written doesn't stop the message: its prompt reads as the user's.)
+    let marked = own::mark(&d.db(), session, text, checks.source, now_ms())
+        .inspect_err(|e| tracing::warn!(session, error = %e, "marking rlord's own prompt"))
+        .ok();
     let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
     let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
@@ -165,7 +168,9 @@ pub fn type_into(
     });
     if let Err(e) = pasted {
         drop(typed);
-        let _ = own::unmark(&d.db(), session, marked);
+        if let Some(at) = marked {
+            let _ = own::unmark(&d.db(), session, at);
+        }
         return Err(e);
     }
     last.insert(session.to_string(), Instant::now());
@@ -861,7 +866,7 @@ mod tests {
         // report of it is then not the user's.
         let marked = d.db().kv_get(own::KEY).unwrap().unwrap_or_default();
         assert!(marked.contains(&own::text_hash("two")), "{marked}");
-        let (kind, source) = own::prompt(&d.db(), &id, None, now_ms()).unwrap();
+        let (kind, source) = own::prompt(&d.db(), &id, None, now_ms(), own::Via::Hook).unwrap();
         assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("send")));
         let s = d.db().resolve_ref(&id).unwrap();
         assert!(s.last_user_msg_at.is_none() && s.last_rlord_msg_at.is_some());

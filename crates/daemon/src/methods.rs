@@ -1079,7 +1079,7 @@ pub(crate) fn hook_emit_with(
             _ if whose == Whose::Other => kind,
             "prompt_submitted" => {
                 let hash = payload["prompt_hash"].as_str();
-                let (kind, by) = crate::own::prompt(db, &s.id, hash, now)?;
+                let (kind, by) = crate::own::prompt(db, &s.id, hash, now, crate::own::Via::Hook)?;
                 source = by;
                 kind
             }
