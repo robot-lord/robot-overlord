@@ -1,4 +1,4 @@
-**Status:** in progress (plan done; PR 1 daemon mode being built)
+**Status:** in progress (PR 1, daemon mode, built on `codex-daemon`, 0.23.0-dev.12; PR 2, Remote Control, next)
 
 # Codex daemon mode and Codex Remote Control
 
@@ -278,6 +278,124 @@ PR 2 Remote Control:
 6. Codex overlord in daemon mode only if L5 passed.
 7. Docs; reconcile this doc.
 
+## PR 1 as built (differs from the plan)
+
+- **Identity: launch-then-bind only.** Create-then-attach is not possible
+  on 0.167.2 / daemon 0.169.0: a thread made by `thread/start` has no
+  rollout until its first turn, and `codex resume <id>` on it fails ("no
+  rollout found for thread id"). So `codex_server.rs` has no
+  `thread/start`; the TUI creates the thread, bound by the first
+  `SessionStart` (folder rule) or the index (`source = 'vscode'`).
+- **No `RLORD_SESSION_ID` in daemon-mode panes** (unset), on top of rlord
+  starting the daemon with it scrubbed: a daemon the TUI autostarts
+  inherits the pane's environment (seen: the running daemon has a
+  `TMUX_PANE` and `TMUX` of whatever pane started it) and would hand it to
+  every thread's hooks.
+- **Only the session's own thread passes the gate.** Sub-agent threads on
+  the daemon aren't listed, so their "needs you" isn't shown (owed).
+- **Fresh** (`session_fresh`) is only used for the overlord, which stays in
+  the pane, so it has no interrupt step.
+- **The control-socket client** names itself `codex-tui`: see L1.
+- **Too-old check**: Codex has none, so nothing to take the lower of; the
+  daemon version is shown (`rlord agents`, `list_agents`
+  `daemon_version`) when it differs.
+- **`SessionEnd` while the pane is up is ignored** for daemon-mode
+  sessions (a client leaving ends nothing; the thread outlives it).
+- overlord.md and MCP: nothing new (stop/archive answers may carry `turn`
+  and `note`, which explain themselves).
+
 ## Verified live
 
-(none yet)
+Against codex-cli 0.167.2 with a self-updated daemon 0.169.0, on this Mac
+(2026-11-13). Throwaway threads in scratch tmux sockets, cheapest model
+(`gpt-5.6-luna`), all deleted afterwards (`codex delete --force`).
+
+- **L1** control socket: WebSocket over the Unix socket (HTTP upgrade →
+  101, `x-codex-websocket-max-unfragmented-message-bytes: 16777216`), then
+  JSON-RPC, one message per text frame, no `"jsonrpc"` field in answers.
+  `initialize` (needs `clientInfo`), then `thread/loaded/list`,
+  `thread/read` (status `idle | active{activeFlags} | notLoaded |
+  systemError`), `thread/turns/list` (latest turn's id and `status`:
+  `inProgress | completed | interrupted`), `hooks/list` (rlord's hooks
+  listed `trustStatus: trusted` for a folder). Notification
+  `remoteControl/status/changed` arrives right after `initialize` (status
+  `disabled` here). **Side effect found:** the daemon kept the first
+  `clientInfo.name` it was given after starting as the originator of
+  threads it created later, for other clients too (a TUI thread was
+  recorded `originator = "probe"` after a probe connected). It stays until
+  the daemon restarts; rlord's client now gives `codex-tui`.
+- **L2** daemon thread in the index: `source = 'vscode'`, `thread_source =
+  'user'`, `cli_version` the daemon's (0.169.0), `first_user_message` the
+  launch prompt, `created_at_ms` a second after launch. `codex resume <id>`
+  (no `--no-daemon`) attaches and shows the turns, including one that
+  finished while no pane was attached.
+- **L4** hooks in the daemon: they fire (watched as a second client,
+  `hook/started` / `hook/completed`: `userPromptSubmit`, `stop`), from
+  `~/.codex/hooks.json`, trusted as for in-pane threads. The daemon's
+  environment has no `RLORD_SESSION_ID` but does have `TMUX_PANE` / `TMUX`
+  (counted, not printed). Killing the TUI client (`respawn-pane -k`) fired
+  no `sessionEnd`; the thread stayed loaded, and was `notLoaded` some
+  minutes after its last turn. The payload itself wasn't captured (the hook
+  command is the installed rlord, which exits without `RLORD_SESSION_ID`);
+  its handling is covered by the stand-in.
+- **L5** `-c` on a daemon thread: any `-c`, `--enable`, `--disable` or
+  `--search` makes the TUI run embedded, with the warning "Running without
+  the shared background server: command-line configuration overrides (-c,
+  --enable, --disable, or --search) requires embedded mode." So the Codex
+  overlord (all `-c`) can't run on the daemon as wired today (Brandon's
+  decision 5: acceptable for 1.0). `-m` / `--model` doesn't. Without `-c`,
+  `check_for_update_on_startup=false` can't be passed: a daemon-mode pane
+  can show Codex's update prompt at start, as an ordinary in-pane session
+  does.
+- **L7** two clients on one thread: a draft is per client; a turn sent from
+  one shows in the other as it streams, but the other's composer reads as
+  idle (`› Ask Codex…`, no "esc to interrupt") meanwhile, so a screen check
+  can't tell a turn started elsewhere; Escape in either client interrupts
+  the turn. Approval dialogs in both: not seen (no approval came up).
+- **Killed mid-turn**: the turn ran on (status `active`, then `idle`); the
+  next `codex resume` showed it finished.
+- **End to end, scratch rlord on the real Codex** (own XDG dirs and tmux
+  socket, `RLORD_NO_LOGIN_SHELL=1`, stand-in `SHELL`; its hooks can't reach
+  a scratch rlord, so this is the unhooked path): launched with no
+  `--no-daemon`, bound from the index (`agent_session_bound`, `codex
+  thread index`), your turn / working from the transcript; `rlord stop`
+  mid-turn → `turn: interrupted` in 0.3s, the daemon said `idle`;
+  `rlord restart` re-attached; the tmux session killed mid-turn →
+  `pane_gone_turn_running`, status working, then stopped once the turn
+  ended.
+- **Stand-in end to end** (`scripts/demo/bin/codex` without `--no-daemon`:
+  hooks without `RLORD_SESSION_ID` / `TMUX_PANE`, `source = 'vscode'`):
+  SessionStart bound by folder through the gate, then hooks by thread;
+  gate file lists the bound threads; pane env has no `RLORD_SESSION_ID`;
+  stop of a working session → Escape, `turn: interrupted`; restart →
+  `codex resume <id>` without `--no-daemon`; pane killed with a turn open →
+  `pane_gone_turn_running`, then stopped when the rollout closed the turn;
+  `rlord agents` shows "its background server runs 0.169.0".
+
+Not run:
+
+- **L8** daemon restart/update mid-turn: needs `codex app-server daemon
+  restart|update`, which rlord's checks don't run. Owed, by hand.
+- **L3, L6**: PR 2.
+- **L9** Linux backend/socket/sandbox.
+
+## Owed (after PR 1)
+
+- L8 by hand: a daemon restart or update mid-turn (what the session
+  shows; `notLoaded` should read as not running, so it stops once the pane
+  is gone).
+- A daemon-mode session's hooks through the real daemon into rlord, once a
+  release with the gate is installed (the payload fields, a first
+  SessionStart bound by folder).
+- `/clear` and `/new` in a daemon-mode session: the new thread isn't
+  followed (the session stays on its first); the gate can't tell the
+  session's TUI from another client in the same folder.
+- A sub-agent's permission prompt on the daemon doesn't show "needs you"
+  (its thread isn't in the gate).
+- `send_to_session` still types into the pane; `codex queue` would reach a
+  daemon thread without one.
+- The Codex overlord on the daemon (L5: its `-c` wiring forces embedded);
+  would need its MCP server and settings some other way.
+- Residual: a daemon started by hand from an in-pane rlord session's pane
+  would pass that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every
+  thread's hooks, which then pass the pane check for that session.

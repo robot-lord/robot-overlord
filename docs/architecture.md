@@ -252,6 +252,59 @@ nothing it could change; OpenCode: its server's `generate` call, which
 adds nothing to the conversation, else a throwaway archived session that
 is deleted afterwards).
 
+### Codex on its shared background server (daemon mode)
+
+Codex runs one app-server daemon per user; a TUI started without
+`--no-daemon` is a client of it, and the daemon runs the turn and its
+hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
+there: launch spec `codex_host = "daemon"`, set only at creation
+(`methods::session_new`), never for the overlord or a session whose flags
+need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
+`--disable` or `--search` in the TUI's own process). `spec_args` adds
+`--no-daemon` for every other Codex session. The rest is
+`daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
+
+- **Hooks go by thread, not pane.** The daemon's hooks carry the
+  environment of whatever started the daemon, never the session's. So a
+  daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
+  starts can't pass one on), and rlord starts the daemon itself
+  (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
+  `TMUX_PANE` removed) before such a pane when none runs. `rlord hook emit
+  codex` without `RLORD_SESSION_ID` reads the gate file
+  (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
+  daemon-mode session's bound thread, and the folder of each still waiting
+  for one) and sends only what it admits, marked `by: "thread"`; anything
+  else exits after that one read, unspooled. `codex_daemon::route` decides
+  whose an event is: a live daemon-mode session bound to its thread
+  (whoever the event says sent it), else the session `RLORD_SESSION_ID`
+  names if that one is in the pane, else a first `SessionStart` in the
+  folder of exactly one waiting daemon-mode session. A stopped session's
+  thread is ignored. Matched by thread, there is no pane check
+  (`foreign_hook`), and a `SessionEnd` while the pane is up is ignored (a
+  client leaving ends nothing). `sync_gate` rewrites the file whenever
+  sessions change, and every `discover` pass.
+- **Binding** without trusted hooks: Codex's index lists a daemon thread
+  as an app-server client's (`source = 'vscode'`), which
+  `codex::threads_started_in` accepts for daemon-mode sessions only.
+- **A pane that ends isn't a stopped agent.** `discover` asks the daemon
+  (`thread/read`; the transcript when it can't be asked) every few passes
+  and stops the session only once no turn runs; meanwhile it stays as the
+  hooks say, logged once as `pane_gone_turn_running`.
+- **Stop and archive interrupt first**, before the DB lock: Escape into
+  the pane when it is up with no dialog (it interrupts from any client),
+  else `turn/interrupt`; then up to 4s for the turn to end. The answer and
+  the log say `turn: interrupted | still_running`.
+- **Restart re-attaches** (`codex resume <id>` without `--no-daemon`).
+- **The control socket** (`~/.codex/app-server-control/
+  app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
+  socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
+  and interrupts; it never subscribes to a thread. The daemon keeps the
+  first `clientInfo.name` it is given after it starts as the originator of
+  the threads it then creates, so the client gives the TUI's own name.
+- rlord never runs `daemon update`, `restart` or `stop`; the daemon updates
+  itself and can be newer than the CLI (`rlord agents` shows its version
+  then).
+
 ## Status engine
 
 Same three-tier degradation the research validated, implemented once:

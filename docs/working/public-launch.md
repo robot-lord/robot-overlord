@@ -51,8 +51,8 @@ done, in this order (decided with the user, 2026-11-12):
        providers' 429s (OpenCode retries those as throttles).
 6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
        narrower helper tools.
-7. [ ] Codex daemon mode, with Codex Remote Control (whether it is in
-       1.0 is the user's call, still open).
+7. [ ] Codex daemon mode, with Codex Remote Control (Brandon: in 1.0).
+       Daemon mode built (`codex-daemon.md`, PR 1); Remote Control next.
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
@@ -130,8 +130,7 @@ Dependabot version updates, grouped weekly.
 - Narrower tool lists for Codex/OpenCode overlord subagents.
 - `session.subagents` reads unread sub-agent transcripts in full.
 - A hooked Codex session whose tmux session is killed stays "working".
-- Codex daemon mode (create-then-attach), which also brings Codex Remote
-  Control.
+- Codex Remote Control (daemon mode is built: `codex-daemon.md`).
 - "↑/↓ N more" can't be clicked; the Groups tab has no more-counts.
 - `accent_dim` contrast on light themes.
 - Context-window table (`models::context_window`) upkeep.
