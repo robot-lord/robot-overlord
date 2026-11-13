@@ -273,8 +273,9 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   starts can't pass one on), and rlord starts the daemon itself
   (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
   `TMUX_PANE` removed) before such a pane when none runs (asked at most
-  once a minute, never failing the launch: if it's skipped or fails, the
-  pane's TUI starts it with the pane's environment). `rlord hook emit
+  once a minute, never failing the launch: if none runs and the ask was
+  skipped or failed, the pane's TUI starts one with the pane's
+  environment, or runs the turn in the pane). `rlord hook emit
   codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
   daemon-mode session's bound thread, and the folder of each still waiting

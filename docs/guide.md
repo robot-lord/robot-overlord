@@ -334,15 +334,15 @@ Stopping or archiving such a session interrupts its running turn first,
 and says so if it wouldn't stop. The overlord, and a session launched
 with flags that need the pane (`-c` / `--config`, `--enable`,
 `--disable`, `--search`), stay in the pane. Not followed yet on the
-server: `/clear`
-or `/new` in the session (it stays on its first thread), and "needs you"
-from a sub-agent's prompt. Its commands and MCP servers run in the
-background server, so they should get that server's environment rather
-than the pane's (not checked yet; with rlord as a launchd or systemd
-service, that leaves out what your shell's rc files set). Starting a turn
-on the same conversation from another Codex client can race a message
-rlord sends it. Daemon mode has been
-checked on macOS only so far.
+server: `/clear` or `/new` in the session (it stays on its first
+thread), and "needs you" from a sub-agent's prompt. Its commands and MCP
+servers run in the background server, so they should get the
+environment of whatever started that server (usually rlord; with rlord
+as a launchd or systemd service, without what your shell's rc files
+set; a server started earlier by your own `codex`, that one's) rather
+than the pane's. Not checked yet. Starting a turn on the same
+conversation from another Codex client can race a message rlord sends
+it. Daemon mode has been checked on macOS only so far.
 
 Not yet: importing Codex
 conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
