@@ -19,7 +19,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: cargo xtask check-version-bump "origin/${{ github.base_ref }}" HEAD
+      # Not `cargo xtask` (--locked): a stale Cargo.lock must reach the
+      # check, which says to commit it.
+      - run: cargo run --package xtask -- check-version-bump "origin/${{ github.base_ref }}" HEAD
   # Linux on purpose: nothing here needs macOS, and macOS minutes cost 10x.
   # Release binaries are built by release.yml (stable) or `cargo xtask release` (dev).
   check:

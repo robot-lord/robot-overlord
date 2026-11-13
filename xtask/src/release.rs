@@ -24,9 +24,11 @@
 //! - `--resume`: stable only. The tag is already pushed (an earlier run
 //!   stopped partway). Skip tagging; watch the tag's workflow run, verify,
 //!   publish the draft (if still a draft), then do the tap and crates.io.
-//! - `--dry-run`: publish nothing. The refusals below become warnings, a
-//!   local build still runs (so does the smoke test), and the steps that
-//!   would tag, upload or publish are printed instead.
+//! - `--dry-run`: publish nothing. The refusals below become warnings and
+//!   the steps that would tag, upload or publish are printed instead. A dev
+//!   build or `--local` still builds here (and `--local` smoke-tests); a
+//!   stable release built in CI stops after the checks, since its build is
+//!   the workflow's (rehearse that with a dry run of release.yml).
 //!
 //! Assets: rlord-v<ver>-<target>.tar.gz (rlord, install.sh, licenses),
 //! SHA256SUMS; stable also rlord_<ver>-1_<arch>.deb and
@@ -311,10 +313,27 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         ]))?;
         publishing_runs(&json, head, &tag)
     };
+    // A failed listing (a network blip) is tried again, like no run; but
+    // if they keep failing, the run's state is unknown and nothing here may
+    // say there is none.
+    let unknown = |e: anyhow::Error| {
+        anyhow::anyhow!("couldn't list the release workflow's runs for {tag} ({e:#}); the run may still be going — check https://github.com/{REPO}/actions before anything else, then cargo xtask release --resume")
+    };
     let mut run = None;
+    let mut failures = 0;
     for attempt in 0..60 {
-        // A failed listing (a network blip) is tried again, like no run.
-        run = find_runs().unwrap_or_default().into_iter().next();
+        match find_runs() {
+            Ok(runs) => {
+                failures = 0;
+                run = runs.into_iter().next();
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= 5 {
+                    return Err(unknown(e));
+                }
+            }
+        }
         if run.is_some() {
             break;
         }
@@ -327,10 +346,17 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         // queued for the tag so a late run can't publish over a --local
         // release.
         std::thread::sleep(Duration::from_secs(10));
-        for late in find_runs().unwrap_or_default() {
+        let mut not_cancelled = Vec::new();
+        for late in find_runs().map_err(unknown)? {
             if late.status != "completed" {
-                let _ = cmd::run(gh().args(["run", "cancel", &late.id.to_string(), "-R", REPO]));
+                let id = late.id.to_string();
+                if cmd::run(gh().args(["run", "cancel", &id, "-R", REPO])).is_err() {
+                    not_cancelled.push(id);
+                }
             }
+        }
+        if !not_cancelled.is_empty() {
+            bail!("no release workflow run for {tag} was found in time, and late runs {} couldn't be cancelled — cancel them in https://github.com/{REPO}/actions before anything else; then to build here: {undo}", not_cancelled.join(", "));
         }
         bail!("no release workflow run for {tag} (any late run was cancelled) — check Actions; to build here: {undo}");
     };

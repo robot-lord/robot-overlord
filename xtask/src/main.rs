@@ -35,8 +35,9 @@ usage: cargo xtask <task>
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Every task works from the repository root; a path argument is still
+    // read from where the command was run.
     let invoked_from = std::env::current_dir().unwrap_or_default();
-    // Every task works from the repository root.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask sits in the repository root");
@@ -51,7 +52,7 @@ fn main() -> ExitCode {
     };
     let result = match task.as_str() {
         "release" => release::main(rest),
-        "build-release" => build::main(rest),
+        "build-release" => build::main(rest, &invoked_from),
         "check-version-bump" => bump::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),

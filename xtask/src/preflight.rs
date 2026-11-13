@@ -32,7 +32,7 @@ pub fn main(args: &[String]) -> Result<()> {
 
     let head = cmd::output(git().args(["rev-parse", "HEAD"]))?;
     let merged = cmd::succeeds(git().args(["merge-base", "--is-ancestor", "HEAD", "origin/main"]));
-    let problems = problems(&ver, &reference, merged.then_some(()).ok_or(head.as_str()));
+    let problems = problems(&ver, &reference, (!merged).then_some(head.as_str()));
     for p in &problems {
         if dry_run {
             println!("::warning::{p} (dry run: continuing)");
@@ -69,12 +69,12 @@ pub fn main(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// What stops this ref from being released. `merged` is `Err(HEAD)` when
-/// HEAD isn't on origin/main.
-fn problems(ver: &Version, reference: &str, merged: Result<(), &str>) -> Vec<String> {
+/// What stops this ref from being released. `unmerged_head` is HEAD when
+/// it isn't on origin/main.
+fn problems(ver: &Version, reference: &str, unmerged_head: Option<&str>) -> Vec<String> {
     let tag = ver.tag();
     let mut problems = Vec::new();
-    if let Err(head) = merged {
+    if let Some(head) = unmerged_head {
         problems.push(format!("{head} is not on origin/main"));
     }
     if ver.is_dev() {
@@ -98,14 +98,14 @@ mod tests {
 
     #[test]
     fn a_stable_tag_on_main_has_no_problems() {
-        assert!(problems(&v("1.0.0"), "refs/tags/v1.0.0", Ok(())).is_empty());
+        assert!(problems(&v("1.0.0"), "refs/tags/v1.0.0", None).is_empty());
         // A manual run passes the bare tag.
-        assert!(problems(&v("1.0.0"), "v1.0.0", Ok(())).is_empty());
+        assert!(problems(&v("1.0.0"), "v1.0.0", None).is_empty());
     }
 
     #[test]
     fn reports_each_problem() {
-        let all = problems(&v("0.23.0-dev.8"), "refs/heads/xtask-release", Err("abc"));
+        let all = problems(&v("0.23.0-dev.8"), "refs/heads/xtask-release", Some("abc"));
         assert_eq!(
             all,
             [
@@ -115,7 +115,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            problems(&v("1.0.0"), "refs/tags/v1.0.1", Ok(())),
+            problems(&v("1.0.0"), "refs/tags/v1.0.1", None),
             ["ref refs/tags/v1.0.1 doesn't match Cargo.toml version v1.0.0"]
         );
     }

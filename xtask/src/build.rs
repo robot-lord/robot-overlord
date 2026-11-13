@@ -23,7 +23,7 @@ pub enum Platform {
 
 const USAGE: &str = "usage: cargo xtask build-release macos|linux DIST";
 
-pub fn main(args: &[String]) -> Result<()> {
+pub fn main(args: &[String], invoked_from: &Path) -> Result<()> {
     let [platform, dist] = args else {
         return cmd::usage(USAGE);
     };
@@ -32,7 +32,8 @@ pub fn main(args: &[String]) -> Result<()> {
         "linux" => Platform::Linux,
         other => return cmd::usage(format!("unknown platform {other} (macos|linux)")),
     };
-    build(platform, Path::new(dist))
+    // DIST is the caller's path, not relative to the repository root.
+    build(platform, &invoked_from.join(dist))
 }
 
 pub fn is_apple_silicon_mac() -> bool {

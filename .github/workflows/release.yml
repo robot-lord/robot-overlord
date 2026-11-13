@@ -61,6 +61,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Built in its own step, so no crate build script runs with the token.
+      - run: cargo build --locked --package xtask
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}

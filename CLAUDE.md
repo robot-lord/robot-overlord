@@ -197,11 +197,15 @@ Linux.
   keeps state or branches on many cases, move that logic into an xtask
   task and keep at most a thin wrapper that calls it.
 - The exception is what end users run on a bare machine, where nothing
-  else can be assumed installed: `scripts/get.sh`, `scripts/install.sh`
-  and `crates/rlord/update.sh` stay POSIX `sh`, small and portable.
+  else can be assumed installed: `scripts/get.sh` (POSIX `sh`),
+  `scripts/install.sh` and `crates/rlord/update.sh` (bash) stay shell,
+  small and portable.
 - The version rules, release targets and asset names are in
-  `xtask/src/version.rs` and nowhere else. A workflow or script that
-  needs one asks xtask for it.
+  `xtask/src/version.rs`. A workflow or script that needs one asks xtask
+  for it (release.yml takes the asset list from `release-preflight`).
+  Repeated by necessity, so change them together: the rustup `targets:`
+  in release.yml, and the target and tarball names the installers
+  (`get.sh`, `update.sh`) use, since they run without xtask.
 - Pure logic in xtask (parsing, naming, choosing) gets unit tests.
 
 ## Documentation
