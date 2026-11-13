@@ -470,6 +470,12 @@ pub fn activate(db: &Db, id: &str, from: Option<String>, created: bool) -> Resul
     Ok(())
 }
 
+/// Whether a session's pane is up: not stopped, and its tmux session
+/// still there (a pane can die without a hook saying so). Runs tmux.
+pub fn running(s: &Session) -> bool {
+    s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session)
+}
+
 /// The agents an overlord can run on, for the switchers (the overlay's
 /// bar, the list's menu and row, `rlord overlord switch`): each with
 /// whether it is installed, has an overlord, is the active one, and is up.
@@ -480,10 +486,7 @@ pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
         .into_iter()
         .map(|a| {
             let o = all.iter().find(|s| s.agent == a.name());
-            let running = o.is_some_and(|s| {
-                s.status != Status::Stopped
-                    && s.tmux_session.as_deref().is_some_and(tmux::has_session)
-            });
+            let running = o.is_some_and(running);
             json!({
                 "agent": a.name(), "label": a.label(),
                 "installed": rlord_core::agents::install::missing(a).is_none(),
@@ -842,8 +845,7 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         .transcript_source(&s.id)?
         .and_then(|p| transcript::observed_model(std::path::Path::new(&p)));
     let fresh = models::check(&s.agent, s.model.as_deref(), observed.as_deref());
-    let running =
-        s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session);
+    let running = running(&s);
     out["exists"] = json!(true);
     out["id"] = json!(s.id);
     out["status"] = json!(s.status);

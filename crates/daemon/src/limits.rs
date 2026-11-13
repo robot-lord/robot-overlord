@@ -48,18 +48,26 @@ use crate::{overlord, Daemon};
 /// kv: sessions stopped on a usage limit now, `{id: {at, resets_at, kind}}`.
 pub const LIMITS_KEY: &str = "limits";
 /// kv: resume jobs, `{id: {message, limit_at, resets_at, asked_at,
-/// sent_at?, attempts}}`.
+/// sent_at?, attempts, sent_hit?, typed_at?, user_at?}}`. `sent_hit`: the
+/// key of the limit record it was sent on (still the old limit, however
+/// it reads later). `typed_at`: when rlord last pasted into the session
+/// (`before_paste`), so the prompt that makes isn't taken for the user's.
+/// `user_at`: a prompt of the user's that rlord's paste replaced in
+/// `last_user_msg_at`, so a takeover sticks.
 pub const JOBS_KEY: &str = "limit_resume";
 
 const TICK: Duration = Duration::from_secs(15);
 /// How long after the reset time a job sends (clocks differ a little).
-const MARGIN_MS: i64 = 60_000;
+pub(crate) const MARGIN_MS: i64 = 60_000;
 /// After sending, how long a new limit still counts as "hit again".
 const WATCH_MS: i64 = 15 * 60_000;
 /// A session that can't be typed into this long after its reset: given up.
 const GIVE_UP_MS: i64 = 60 * 60_000;
 /// After a send, a prompt seen within this long is our own message.
 const OWN_PROMPT_MS: i64 = 30_000;
+/// Clock slack: a prompt stamped this much before rlord's marker
+/// (`typed_at`, written right before the paste) is still rlord's (clock slack).
+const TYPED_SLACK_MS: i64 = 1_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
@@ -73,6 +81,67 @@ pub struct Limits {
     seen: Mutex<HashMap<String, (u64, Option<SystemTime>)>>,
     /// kv `limits`, for the list (loaded on the first tick).
     now: Mutex<Option<Map<String, Value>>>,
+}
+
+/// When rlord last typed into the session of a resume job: the job's
+/// `typed_at`, written right before each paste (`before_paste`).
+fn typed_at(job: &Value) -> Option<i64> {
+    job["typed_at"].as_i64()
+}
+
+/// rlord is about to paste into `s` (`send::type_into`, after its checks,
+/// under the session's lock). Only a session with a resume job cares.
+/// First, a prompt of the user's that rlord's will replace in
+/// `last_user_msg_at` is kept on the job (`user_at`), so a takeover
+/// sticks; then the job's `typed_at` marks the prompt to come as rlord's.
+/// Durable (kv): a restarted daemon still tells them apart.
+/// Returns the marker it replaced (for `paste_failed`).
+pub fn before_paste(d: &Daemon, s: &Session) -> Option<i64> {
+    let db = d.db();
+    // (Fresh: the caller's copy may be older than its last prompt.)
+    let s = &db.resolve_ref(&s.id).ok()?;
+    let mut jobs = kv_map(&db, JOBS_KEY).ok()?;
+    let job = jobs.get_mut(&s.id).and_then(Value::as_object_mut)?;
+    let own = job.get("typed_at").and_then(Value::as_i64);
+    if let Some(t) = user_prompt_at(s, own) {
+        if job.get("user_at").and_then(Value::as_i64) < Some(t) {
+            job.insert("user_at".into(), json!(t));
+        }
+    }
+    job.insert("typed_at".into(), json!(now_ms()));
+    let _ = save_map(&db, JOBS_KEY, &jobs);
+    own
+}
+
+/// The paste after `before_paste` failed: its marker back to `prev`
+/// (the user's prompt it kept stays: theirs either way).
+pub fn paste_failed(d: &Daemon, id: &str, prev: Option<i64>) {
+    let db = d.db();
+    let Ok(mut jobs) = kv_map(&db, JOBS_KEY) else {
+        return;
+    };
+    let Some(job) = jobs.get_mut(id).and_then(Value::as_object_mut) else {
+        return;
+    };
+    match prev {
+        Some(t) => job.insert("typed_at".into(), json!(t)),
+        None => job.remove("typed_at"),
+    };
+    let _ = save_map(&db, JOBS_KEY, &jobs);
+}
+
+/// The session's last prompt, if the user typed it: one from just before
+/// rlord's marker (`own`, `TYPED_SLACK_MS`) to `OWN_PROMPT_MS` after it
+/// is rlord's.
+fn user_prompt_at(s: &Session, own: Option<i64>) -> Option<i64> {
+    s.last_user_msg_at
+        .filter(|t| !own.is_some_and(|o| *t >= o - TYPED_SLACK_MS && *t - o <= OWN_PROMPT_MS))
+}
+
+/// The latest prompt the user typed: the session's, or one kept on the
+/// job before rlord typed over it (`before_paste`).
+fn user_since(job: &Value, s: &Session, own: Option<i64>) -> Option<i64> {
+    user_prompt_at(s, own).max(job["user_at"].as_i64())
 }
 
 fn kv_map(db: &Db, key: &str) -> Result<Map<String, Value>> {
@@ -94,7 +163,8 @@ fn save_map(db: &Db, key: &str, m: &Map<String, Value>) -> Result<()> {
 /// The limit a session is stopped on, from what its transcript says
 /// (`hit`): None once the conversation went on or the limit has reset.
 fn current(hit: Option<&LimitHit>, now: i64) -> Option<Value> {
-    let h = hit.filter(|h| !h.touched && h.resets_at > now)?;
+    // (Kept a minute past the reset, as long as messages are held.)
+    let h = hit.filter(|h| !h.touched && held(h.resets_at, now))?;
     Some(json!({"at": h.at, "resets_at": h.resets_at, "kind": h.kind}))
 }
 
@@ -121,26 +191,62 @@ fn limits(d: &Daemon) -> Map<String, Value> {
 }
 
 /// When each session stopped on a usage limit now gets out of it (ms):
-/// `{id: resets_at}`. Takes the DB lock the first time: not under it.
+/// `{id: resets_at}`, held `MARGIN_MS` past the reset. Takes the DB lock the first time: not under it.
 pub fn limited(d: &Daemon) -> HashMap<String, i64> {
     let now = now_ms();
     limits(d)
         .into_iter()
-        .filter_map(|(id, l)| Some((id, l["resets_at"].as_i64().filter(|t| *t > now)?)))
+        .filter_map(|(id, l)| Some((id, l["resets_at"].as_i64().filter(|t| held(*t, now))?)))
         .collect()
+}
+
+/// Whether a limit that resets at `resets_at` still holds messages back:
+/// until `MARGIN_MS` past it, like resume jobs (clocks differ a little).
+pub fn held(resets_at: i64, now: i64) -> bool {
+    resets_at + MARGIN_MS > now
 }
 
 /// A hit whose record had no readable time (`at` 0) gets the time it was
 /// first seen: `known`'s (the same limit, seen before) or `now`. Without
 /// one it would read as long past, and its job be dropped at once.
-fn dated(mut h: LimitHit, known: Option<&Value>, now: i64) -> LimitHit {
+/// `job` is a resume job's `(limit_at, resets_at)`: once `scan` has
+/// dropped the reset limit, the job still knows when it was first seen
+/// (else the hit would read as new on every tick, and be rescheduled),
+/// also after a reschedule onto a hit whose reset had already passed.
+fn dated(mut h: LimitHit, known: Option<&Value>, job: Option<(i64, i64)>, now: i64) -> LimitHit {
     if h.at <= 0 {
         h.at = known
             .filter(|k| k["resets_at"].as_i64() == Some(h.resets_at))
             .and_then(|k| k["at"].as_i64())
+            // (A rescheduled job stored `resets_at.max(at)`; an original
+            // one the record's own, never below its `at`.)
+            .or_else(|| job.filter(|j| j.1 == h.resets_at.max(j.0)).map(|j| j.0))
             .unwrap_or(now);
     }
     h
+}
+
+/// `dated` for a resume job's look at its session's latest limit record.
+fn dated_for(job: &Value, h: LimitHit, known: Option<&Value>, now: i64) -> LimitHit {
+    let j = (
+        job["limit_at"].as_i64().unwrap_or(0),
+        job["resets_at"].as_i64().unwrap_or(0),
+    );
+    // Only the job's own record: before its message was sent, or the one
+    // it was sent on (`sent_hit`; a job sent before that was recorded:
+    // taken as its own). Any other record after the send is a new limit,
+    // even with the same reset time.
+    // (A missing key is an older job; a `null` one was sent with no record
+    // read, so every later record is new.)
+    let own = job["sent_at"].is_null()
+        || job
+            .get("sent_hit")
+            .is_none_or(|k| k.as_u64() == Some(h.key));
+    // (Likewise the list's record: one dated before the send is the old
+    // limit's.)
+    let sent = job["sent_at"].as_i64().unwrap_or(0);
+    let known = known.filter(|k| own || k["at"].as_i64().is_some_and(|a| a > sent));
+    dated(h, known, own.then_some(j), now)
 }
 
 /// Look at every live session's transcript that changed since the last
@@ -186,10 +292,10 @@ fn scan(d: &Daemon) -> Result<()> {
             // Nothing new was written: only the clock can end it.
             before
                 .get(id)
-                .filter(|l| l["resets_at"].as_i64().is_some_and(|t| t > now))
+                .filter(|l| l["resets_at"].as_i64().is_some_and(|t| held(t, now)))
                 .cloned()
         } else {
-            let hit = transcript::limit_hit(path).map(|h| dated(h, before.get(id), now));
+            let hit = transcript::limit_hit(path).map(|h| dated(h, before.get(id), None, now));
             current(hit.as_ref(), now)
         };
         if let Some(l) = state {
@@ -213,7 +319,8 @@ fn scan(d: &Daemon) -> Result<()> {
     Ok(())
 }
 
-/// Annotate list rows with `limit`: `{resets_at, until, kind, resume}`
+/// Annotate list rows with `limit`: `{resets_at, until, reset, kind,
+/// resume}` (`reset`: its time has passed, held a minute more)
 /// for a session stopped on a usage limit (`resume`: a job will pick it
 /// up), else null.
 pub fn annotate(d: &Daemon, rows: &mut [Value]) {
@@ -227,9 +334,11 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
         row["limit"] = match limits.get(id) {
-            Some(l) if l["resets_at"].as_i64().is_some_and(|t| t > now) => json!({
+            Some(l) if l["resets_at"].as_i64().is_some_and(|t| held(t, now)) => json!({
                 "resets_at": l["resets_at"],
                 "until": clock(l["resets_at"].as_i64().unwrap_or(0)),
+                // Its reset time has passed: held a minute more (`held`).
+                "reset": l["resets_at"].as_i64().is_some_and(|t| t <= now),
                 "kind": l["kind"],
                 "resume": jobs.contains_key(id),
             }),
@@ -306,6 +415,16 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         let _session = d.sessions.lock(&s.id);
         let db = d.db();
         let mut jobs = kv_map(&db, JOBS_KEY)?;
+        // Facts about the session, not the job: kept over a replaced one
+        // (rlord's last paste; a user prompt rlord typed over).
+        let mut job = job;
+        if let Some(old) = jobs.get(&s.id) {
+            for k in ["typed_at", "user_at"] {
+                if !old[k].is_null() {
+                    job[k] = old[k].clone();
+                }
+            }
+        }
         jobs.insert(s.id.clone(), job.clone());
         save_map(&db, JOBS_KEY, &jobs)?;
         db.insert_event(&s.id, now, "limit_resume_scheduled", &job.to_string())?;
@@ -338,7 +457,14 @@ enum Step {
 
 /// Decide a job's next step from the session (None: gone) and what its
 /// transcript says now.
-fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> Step {
+/// `own`: when rlord last typed into it (`typed_at`).
+fn step(
+    job: &Value,
+    s: Option<&Session>,
+    hit: Option<&LimitHit>,
+    own: Option<i64>,
+    now: i64,
+) -> Step {
     let Some(s) = s else {
         return Step::Drop("the session is gone", false);
     };
@@ -351,7 +477,7 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
     let newer = hit.filter(|h| h.at > limit_at && !h.touched);
     if let Some(sent) = job["sent_at"].as_i64() {
         // The user typed since (past our own message's echo): theirs now.
-        if s.last_user_msg_at.is_some_and(|t| t > sent + OWN_PROMPT_MS) {
+        if user_since(job, s, own).is_some_and(|t| t > sent + OWN_PROMPT_MS) {
             return Step::Drop("the user took the session over after the resume", true);
         }
         return match newer {
@@ -373,10 +499,12 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
         // written since.)
         _ => true,
     };
-    if touched || s.last_user_msg_at.is_some_and(|t| t > limit_at) {
+    // (Any prompt: one rlord typed after the limit touched its record
+    // too, so there is no own prompt to tell apart here.)
+    if touched || user_since(job, s, None).is_some_and(|t| t > limit_at) {
         return Step::Drop("the session was used since the limit hit", false);
     }
-    if now < resets_at + MARGIN_MS {
+    if held(resets_at, now) {
         return Step::Wait;
     }
     if s.status == Status::Stopped {
@@ -428,7 +556,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
     let known = limits(d).get(id).cloned();
     let hit = src
         .and_then(|p| transcript::limit_hit(Path::new(&p)))
-        .map(|h| dated(h, known.as_ref(), now));
+        .map(|h| dated_for(&job, h, known.as_ref(), now));
     // Only the job read above: one rescheduled meanwhile (`limits.resume`
     // asked again) is left alone.
     let same = |j: &Value| ["limit_at", "asked_at"].iter().all(|k| j[*k] == job[*k]);
@@ -447,7 +575,8 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
         }
         Ok(())
     };
-    match step(&job, s.as_ref(), hit.as_ref(), now) {
+    let own = typed_at(&job);
+    match step(&job, s.as_ref(), hit.as_ref(), own, now) {
         Step::Wait => return Ok(()),
         Step::Drop(why, done) => {
             update(&|j| {
@@ -483,9 +612,13 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
                 }
                 Typed::Done => {
                     let attempts = job["attempts"].as_u64().unwrap_or(0) + 1;
+                    // The record it was sent on: the old limit's, however
+                    // it reads later (`dated_for`).
+                    let sent_hit = hit.as_ref().map(|h| h.key);
                     update(&|j| {
                         if let Some(job) = j.get_mut(id).and_then(Value::as_object_mut) {
                             job.insert("sent_at".into(), json!(now));
+                            job.insert("sent_hit".into(), json!(sent_hit));
                             job.insert("attempts".into(), json!(attempts));
                         }
                     })?;
@@ -523,6 +656,7 @@ mod tests {
             resets_at,
             kind: "five_hour".into(),
             touched,
+            key: at.unsigned_abs() ^ (resets_at.unsigned_abs() << 20),
         }
     }
 
@@ -530,19 +664,31 @@ mod tests {
     fn limited_until_it_resets_or_the_conversation_goes_on() {
         assert!(current(Some(&hit(1_000, 9_000, false)), 2_000).is_some());
         assert_eq!(current(Some(&hit(1_000, 9_000, true)), 2_000), None);
-        assert_eq!(current(Some(&hit(1_000, 9_000, false)), 9_000), None);
+        // Kept for the margin past its reset, then gone.
+        assert!(current(Some(&hit(1_000, 9_000, false)), 9_000).is_some());
+        assert_eq!(
+            current(Some(&hit(1_000, 9_000, false)), 9_000 + MARGIN_MS),
+            None
+        );
         assert_eq!(current(None, 2_000), None);
     }
 
     #[test]
     fn an_undated_limit_is_dated_when_seen() {
         let h = hit(0, 9_000, false);
-        assert_eq!(dated(h.clone(), None, 5_000).at, 5_000);
+        assert_eq!(dated(h.clone(), None, None, 5_000).at, 5_000);
         let known = json!({"at": 4_000, "resets_at": 9_000});
-        assert_eq!(dated(h.clone(), Some(&known), 5_000).at, 4_000);
+        assert_eq!(dated(h.clone(), Some(&known), None, 5_000).at, 4_000);
         let other = json!({"at": 4_000, "resets_at": 8_000});
-        assert_eq!(dated(h, Some(&other), 5_000).at, 5_000);
-        assert_eq!(dated(hit(7, 9_000, false), None, 5_000).at, 7);
+        assert_eq!(dated(h.clone(), Some(&other), None, 5_000).at, 5_000);
+        assert_eq!(dated(hit(7, 9_000, false), None, None, 5_000).at, 7);
+        // The limit reset and `scan` dropped it: the job's date holds, so
+        // the hit doesn't read as new (and reschedule) every tick.
+        assert_eq!(
+            dated(h.clone(), None, Some((3_000, h.resets_at)), 5_000).at,
+            3_000
+        );
+        assert_eq!(dated(h, None, Some((3_000, 1)), 5_000).at, 5_000);
     }
 
     #[test]
@@ -552,31 +698,34 @@ mod tests {
         let idle = session(Status::Idle);
         let h = hit(1_000, 100_000, false);
         // Before the reset, and inside the margin after it: wait.
-        assert_eq!(step(&job, Some(&idle), Some(&h), 50_000), Step::Wait);
+        assert_eq!(step(&job, Some(&idle), Some(&h), None, 50_000), Step::Wait);
         assert_eq!(
-            step(&job, Some(&idle), Some(&h), 100_000 + 5_000),
+            step(&job, Some(&idle), Some(&h), None, 100_000 + 5_000),
             Step::Wait
         );
         let due = 100_000 + MARGIN_MS;
-        assert_eq!(step(&job, Some(&idle), Some(&h), due), Step::Send);
+        assert_eq!(step(&job, Some(&idle), Some(&h), None, due), Step::Send);
         // "Needs you" is blocked on a prompt: not now.
         let waiting = session(Status::WaitingInput);
-        assert_eq!(step(&job, Some(&waiting), Some(&h), due), Step::Wait);
+        assert_eq!(step(&job, Some(&waiting), Some(&h), None, due), Step::Wait);
         // Still reading "working" (no `StopFailure` hook): the untouched
         // limit record ended the turn.
         let working = session(Status::Working);
-        assert_eq!(step(&job, Some(&working), Some(&h), due), Step::Send);
+        assert_eq!(step(&job, Some(&working), Some(&h), None, due), Step::Send);
         // Stopped: never.
         let stopped = session(Status::Stopped);
         assert!(matches!(
-            step(&job, Some(&stopped), Some(&h), due),
+            step(&job, Some(&stopped), Some(&h), None, due),
             Step::Drop(_, false)
         ));
         assert!(matches!(
-            step(&job, Some(&idle), Some(&h), 100_000 + GIVE_UP_MS + 1),
+            step(&job, Some(&idle), Some(&h), None, 100_000 + GIVE_UP_MS + 1),
             Step::Drop(_, false)
         ));
-        assert!(matches!(step(&job, None, None, due), Step::Drop(_, false)));
+        assert!(matches!(
+            step(&job, None, None, None, due),
+            Step::Drop(_, false)
+        ));
     }
 
     #[test]
@@ -588,12 +737,12 @@ mod tests {
         // The transcript went on after the limit.
         let touched = hit(1_000, 100_000, true);
         assert!(matches!(
-            step(&job, Some(&idle), Some(&touched), due),
+            step(&job, Some(&idle), Some(&touched), None, due),
             Step::Drop(_, false)
         ));
         // Even before the reset: there is nothing left to wait for.
         assert!(matches!(
-            step(&job, Some(&idle), Some(&touched), 2_000),
+            step(&job, Some(&idle), Some(&touched), None, 2_000),
             Step::Drop(_, false)
         ));
         // rlord saw a prompt after the limit.
@@ -601,12 +750,12 @@ mod tests {
         prompted.last_user_msg_at = Some(1_500);
         let h = hit(1_000, 100_000, false);
         assert!(matches!(
-            step(&job, Some(&prompted), Some(&h), due),
+            step(&job, Some(&prompted), Some(&h), None, due),
             Step::Drop(_, false)
         ));
         // The limit's record scrolled out of the transcript's tail.
         assert!(matches!(
-            step(&job, Some(&idle), None, due),
+            step(&job, Some(&idle), None, None, due),
             Step::Drop(_, false)
         ));
     }
@@ -618,75 +767,202 @@ mod tests {
                           "sent_at": 170_000, "attempts": 1});
         // Our own message sits after the old limit: that is not "touched".
         let old = hit(1_000, 100_000, true);
-        assert_eq!(step(&sent, Some(&idle), Some(&old), 180_000), Step::Wait);
+        assert_eq!(
+            step(&sent, Some(&idle), Some(&old), None, 180_000),
+            Step::Wait
+        );
         // It hit again: wait for the new reset.
         let again = hit(175_000, 900_000, false);
         assert_eq!(
-            step(&sent, Some(&idle), Some(&again), 180_000),
+            step(&sent, Some(&idle), Some(&again), None, 180_000),
             Step::Reschedule(175_000, 900_000)
         );
         // Nothing new for a while: the job is done.
         assert_eq!(
-            step(&sent, Some(&idle), Some(&old), 170_000 + WATCH_MS + 1),
+            step(&sent, Some(&idle), Some(&old), None, 170_000 + WATCH_MS + 1),
             Step::Drop("resumed", true)
         );
         // The user typed after the resume: a later limit is theirs.
         let mut took_over = session(Status::Idle);
         took_over.last_user_msg_at = Some(170_000 + OWN_PROMPT_MS + 1);
         assert!(matches!(
-            step(&sent, Some(&took_over), Some(&again), 400_000),
+            step(&sent, Some(&took_over), Some(&again), None, 400_000),
             Step::Drop(_, true)
         ));
         // Our own message's prompt doesn't count.
         took_over.last_user_msg_at = Some(170_500);
         assert_eq!(
-            step(&sent, Some(&took_over), Some(&again), 180_000),
+            step(&sent, Some(&took_over), Some(&again), None, 180_000),
             Step::Reschedule(175_000, 900_000)
         );
+        // rlord typed into it since (a held `when_idle`, `send_to_session`):
+        // that prompt is rlord's, not the user taking over.
+        let mut typed = session(Status::Idle);
+        typed.last_user_msg_at = Some(300_000);
+        assert_eq!(
+            step(&sent, Some(&typed), Some(&again), Some(299_000), 400_000),
+            Step::Reschedule(175_000, 900_000)
+        );
+        assert!(matches!(
+            step(&sent, Some(&typed), Some(&again), Some(200_000), 400_000),
+            Step::Drop(_, true)
+        ));
+        // Stamped just before rlord marked its paste: still rlord's (clock slack).
+        assert_eq!(
+            step(&sent, Some(&typed), Some(&again), Some(300_800), 400_000),
+            Step::Reschedule(175_000, 900_000)
+        );
+        // The user typed, then rlord typed over it (`before_paste` kept
+        // theirs on the job): the takeover sticks.
+        let mut kept = sent.clone();
+        kept["user_at"] = json!(250_000);
+        assert!(matches!(
+            step(&kept, Some(&typed), Some(&again), Some(299_000), 400_000),
+            Step::Drop(_, true)
+        ));
+        // An undated hit whose reset has passed: rescheduled once, then
+        // recognised (not "hit again" on every tick).
+        let stale = hit(0, 150_000, false);
+        let now = 200_000;
+        let h1 = dated(stale.clone(), None, Some((1_000, 100_000)), now);
+        let Step::Reschedule(at, resets) = step(&sent, Some(&idle), Some(&h1), None, now) else {
+            panic!("expected a reschedule");
+        };
+        let job2 = json!({"message": "continue", "limit_at": at, "resets_at": resets,
+                          "attempts": 1});
+        let later = now + MARGIN_MS;
+        let h2 = dated(stale, None, Some((at, resets)), later);
+        assert_eq!(step(&job2, Some(&idle), Some(&h2), None, later), Step::Send);
+        // The record it was sent on (`sent_hit`), read again: the old
+        // limit, not dated now.
+        let old = hit(0, 100_000, false);
+        let mut sent_on = sent.clone();
+        sent_on["sent_hit"] = json!(old.key);
+        assert_eq!(dated_for(&sent_on, old.clone(), None, 180_000).at, 1_000);
+        // Another record after the send, same reset time: a new limit.
+        let mut repeat = old.clone();
+        repeat.key ^= 1;
+        let repeat = dated_for(&sent_on, repeat, None, 180_000);
+        assert_eq!(repeat.at, 180_000);
+        assert_eq!(
+            step(&sent_on, Some(&idle), Some(&repeat), None, 180_000),
+            Step::Reschedule(180_000, 180_000)
+        );
+        // A job sent before `sent_hit` was recorded: its own record.
+        assert_eq!(dated_for(&sent, old, None, 180_000).at, 1_000);
         // Not for ever.
         let mut many = sent.clone();
         many["attempts"] = json!(MAX_ATTEMPTS);
         assert!(matches!(
-            step(&many, Some(&idle), Some(&again), 180_000),
+            step(&many, Some(&idle), Some(&again), None, 180_000),
             Step::Drop(_, false)
         ));
         // A reset time already past doesn't make it send at once: never
         // before the limit's own time plus the margin.
         let stale = hit(175_000, 100_000, false);
         assert_eq!(
-            step(&sent, Some(&idle), Some(&stale), 180_000),
+            step(&sent, Some(&idle), Some(&stale), None, 180_000),
             Step::Reschedule(175_000, 175_000)
         );
+    }
+
+    /// A transcript line: the agent stopped on a limit resetting at
+    /// `resets_s` (seconds).
+    fn limit_line(resets_s: i64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{{"content":[{{"type":"text","text":"x"}}]}},"apiError":"usage_limit_reached","apiErrorParams":{{"rate_limit_info":{{"status":"rejected","resetsAt":{resets_s},"rateLimitType":"five_hour"}}}},"error":"rate_limit","isApiErrorMessage":true}}"#
+        )
+    }
+
+    /// A daemon with one session `s1` whose transcript is `path`.
+    fn daemon_with(path: &Path) -> Arc<Daemon> {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "s1",
+            name: "web",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.upsert_transcript_source("s1", path.to_str().unwrap())
+            .unwrap();
+        Daemon::new(db, rlord_core::config::Config::default())
+    }
+
+    /// Just past its reset, a limit still holds messages (and shows
+    /// `reset`) for the margin, through `scan`; after it, it's gone.
+    #[test]
+    fn a_reset_limit_is_held_for_the_margin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let now_s = now_ms() / 1000;
+        std::fs::write(&path, format!("{}\n", limit_line(now_s - 10))).unwrap();
+        let d = daemon_with(&path);
+        scan(&d).unwrap();
+        assert!(limited(&d).contains_key("s1"));
+        let mut rows = [json!({"id": "s1"})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["limit"]["reset"], true);
+        // Unchanged file, next tick: still held.
+        scan(&d).unwrap();
+        assert!(limited(&d).contains_key("s1"));
+        // Past the margin: released.
+        let path2 = dir.path().join("t2.jsonl");
+        let old = now_s - MARGIN_MS / 1000 - 5;
+        std::fs::write(&path2, format!("{}\n", limit_line(old))).unwrap();
+        let d = daemon_with(&path2);
+        scan(&d).unwrap();
+        assert!(!limited(&d).contains_key("s1"));
+    }
+
+    /// rlord marks its paste on the job (durable), after keeping a prompt
+    /// of the user's it is about to type over; no job, nothing written.
+    #[test]
+    fn rlord_marks_its_paste_on_the_job() {
+        let d = daemon_with(Path::new("/nonexistent.jsonl"));
+        let mut s = d.db().resolve_ref("s1").unwrap();
+        s.last_user_msg_at = Some(5_000);
+        d.db().touch_last_user_msg("s1", 5_000).unwrap();
+        before_paste(&d, &s);
+        assert!(kv_map(&d.db(), JOBS_KEY).unwrap().is_empty());
+        let mut jobs = Map::new();
+        jobs.insert("s1".into(), json!({"limit_at": 1_000, "resets_at": 2_000}));
+        save_map(&d.db(), JOBS_KEY, &jobs).unwrap();
+        before_paste(&d, &s);
+        let job = kv_map(&d.db(), JOBS_KEY).unwrap()["s1"].clone();
+        assert_eq!(job["user_at"], 5_000);
+        let at = typed_at(&job).unwrap();
+        assert!(at > 5_000);
+        // A failed paste puts the marker back.
+        let prev = before_paste(&d, &s);
+        assert_eq!(prev, Some(at));
+        paste_failed(&d, "s1", prev);
+        let job = kv_map(&d.db(), JOBS_KEY).unwrap()["s1"].clone();
+        assert_eq!(typed_at(&job), Some(at));
+        // rlord's prompt lands after the marker: not the user's.
+        s.last_user_msg_at = Some(at + 200);
+        assert_eq!(user_prompt_at(&s, Some(at)), None);
+        s.last_user_msg_at = Some(at + OWN_PROMPT_MS + 1);
+        assert!(user_prompt_at(&s, Some(at)).is_some());
     }
 
     /// Scans at once (the tick and a `limits.resume`) never lose a limit
     /// one of them read.
     #[test]
     fn concurrent_scans_keep_the_limit() {
-        const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{"content":[{"type":"text","text":"x"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":99999999999,"rateLimitType":"five_hour"}},"error":"rate_limit","isApiErrorMessage":true}"#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
-        std::fs::write(&path, format!("{LINE}\n")).unwrap();
+        std::fs::write(&path, format!("{}\n", limit_line(99999999999))).unwrap();
         for _ in 0..20 {
-            let db = Db::open_in_memory().unwrap();
-            db.insert_session(&rlord_core::db::NewSession {
-                id: "s1",
-                name: "web",
-                agent: "claude",
-                agent_session: None,
-                project_path: "/tmp",
-                tmux_session: None,
-                launch_spec: "{}",
-                created_at: 1,
-                repo_path: None,
-                workspace_path: None,
-                branch: None,
-                role: "",
-            })
-            .unwrap();
-            db.upsert_transcript_source("s1", path.to_str().unwrap())
-                .unwrap();
-            let d = Daemon::new(db, rlord_core::config::Config::default());
+            let d = daemon_with(&path);
             let threads: Vec<_> = (0..4)
                 .map(|_| {
                     let d = Arc::clone(&d);

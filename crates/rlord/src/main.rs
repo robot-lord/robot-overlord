@@ -461,7 +461,8 @@ fn main() -> Result<()> {
                     .exec();
                 return Err(err).context("exec tmux failed");
             }
-            if let Ok(conflicts) = tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings())
+            if let Ok(conflicts) =
+                tmux::bind_nav_keys(&methods::rlord_bin(), &cfg.tmux.bindings(), cfg.tmux.mouse)
             {
                 for c in conflicts {
                     eprintln!(
@@ -504,7 +505,7 @@ fn main() -> Result<()> {
         Command::Tmux(TmuxCmd::Bind) => {
             let cfg = Config::load()?;
             let b = cfg.tmux.bindings();
-            let conflicts = tmux::bind_nav_keys(&methods::rlord_bin(), &b)?;
+            let conflicts = tmux::bind_nav_keys(&methods::rlord_bin(), &b, cfg.tmux.mouse)?;
             for (k, v) in &b {
                 match conflicts.iter().find(|c| c.key == *k) {
                     Some(c) => println!("{k:<6} SKIPPED — already bound to: {}", c.bound_to),
@@ -1264,6 +1265,9 @@ fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
         m["mode"].as_str().unwrap_or("?"),
         m["why"].as_str().unwrap_or("?")
     );
+    if m["why"] == "RLORD_TMUX_PROFILE" {
+        println!("RLORD_TMUX_PROFILE overrides per-session choices");
+    }
     let current = tmux::current_session()
         // rlord's tmux sessions: `<name>-rlord` (older: `rlord-…`).
         .filter(|s| s.ends_with("-rlord") || s.starts_with("rlord-"));
@@ -2015,6 +2019,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             truncate(get("name"), 23),
             // Stopped on a usage limit: that, and until when.
             match s["limit"]["until"].as_str() {
+                Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
                 Some(until) => truncate(&format!("till {until}"), 16),
                 None => rlord_core::types::Status::label_of(get("status")).to_string(),
             },

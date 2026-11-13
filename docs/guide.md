@@ -138,8 +138,8 @@ runs a command.
   stops the overlord's shell commands reaching rlord's tmux socket, but not
   this tool. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for
   anyone who wants that (Claude then lists rlord's tools one by one without
-  it; Codex sets that tool's `approval_mode = "prompt"`; OpenCode adds an
-  ask rule for `rlord_send_to_session`).
+  `send_to_session` and `resume_after_limit`; Codex sets both tools'
+  `approval_mode = "prompt"`; OpenCode adds an ask rule for each).
 - The agent of the first overlord is chosen when it is set up
   (`[overlord] agent` applies only while there is none yet). An overlord
   never changes agent; you switch to another agent's overlord instead.

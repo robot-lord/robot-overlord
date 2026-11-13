@@ -1144,8 +1144,13 @@ pub struct KeyConflict {
 /// enabled binding, and remove rlord bindings left over from a previous
 /// config. These keys are global to the tmux server, so a key that is the
 /// user's prefix or already bound to something that isn't ours is **skipped**
-/// and reported, never overridden. Idempotent.
-pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConflict>> {
+/// and reported, never overridden. Idempotent. `mouse`: `[tmux] mouse`
+/// (passed in, so callers and tests decide, not the user's config file).
+pub fn bind_nav_keys(
+    bin: &str,
+    bindings: &[(&str, &str)],
+    mouse: bool,
+) -> Result<Vec<KeyConflict>> {
     for key in installed_nav_keys()? {
         if !bindings.iter().any(|(k, _)| *k == key) {
             let _ = run(&["unbind-key", "-n", &key]);
@@ -1189,18 +1194,85 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
         ])?;
     }
     // A click on a hint (`hint_range`) does what its key does. Only with
-    // `[tmux] mouse` on; otherwise nothing is bound, so tmux's own (or the
-    // user's imported) status click stays.
-    let mouse = crate::config::Config::load().map_or(true, |c| c.tmux.mouse);
+    // `[tmux] mouse` on; otherwise the click rlord bound before (mouse on
+    // then) goes back to tmux's own.
     if mouse {
         for table in ["root", PROFILE_TABLE] {
+            // Only over tmux's own click or rlord's: one the user bound
+            // themselves stays theirs, and the hints aren't clickable.
+            if matches!(click_binding(table), Click::User) {
+                if !USER_CLICK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        table,
+                        "your own MouseDown1Status binding is kept: rlord's key hints aren't clickable"
+                    );
+                }
+                continue;
+            }
             let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
             let cmd = status_click(&clickable);
             args.extend(cmd.iter().map(String::as_str));
             run(&args)?;
         }
+    } else {
+        reset_status_click();
     }
     Ok(conflicts)
+}
+
+/// Said once per daemon: a user's own status click keeps rlord's off.
+static USER_CLICK_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whose a table's status click is.
+#[derive(Debug, PartialEq)]
+enum Click {
+    /// Unbound, or tmux's own.
+    Default,
+    /// rlord's (`status_click`: its hint ranges are `rlord-…`).
+    Ours,
+    /// The user's.
+    User,
+}
+
+fn click_binding(table: &str) -> Click {
+    let line = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap_or_default();
+    let cmd = line
+        .lines()
+        .next()
+        .and_then(|l| {
+            l.find(STATUS_CLICK)
+                .map(|i| l[i + STATUS_CLICK.len()..].trim())
+        })
+        .unwrap_or("");
+    if cmd.is_empty() || cmd == STATUS_CLICK_DEFAULT {
+        Click::Default
+    } else if is_our_click(cmd) {
+        Click::Ours
+    } else {
+        Click::User
+    }
+}
+
+/// rlord's status click, however its binary's path is quoted: it tests
+/// `mouse_status_range` against rlord's own range names.
+fn is_our_click(cmd: &str) -> bool {
+    cmd.contains("mouse_status_range") && cmd.contains(",rlord-")
+}
+
+/// Undo rlord's status click (`bind_nav_keys` with mouse on), and only
+/// rlord's: back to tmux's default, in either table (the profile's
+/// doesn't fall back to root: never left unbound). Anything else is left
+/// alone. Best effort: no server, nothing to undo.
+fn reset_status_click() {
+    for table in ["root", PROFILE_TABLE] {
+        if click_binding(table) != Click::Ours {
+            continue;
+        }
+        let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
+        let cmd = status_click(&[]);
+        args.extend(cmd.iter().map(String::as_str));
+        let _ = run(&args);
+    }
 }
 
 /// The status-line mouse key rlord binds for its clickable hints.
@@ -1347,6 +1419,7 @@ pub fn unbind_nav_keys(bindings: &[(&str, &str)]) -> Result<()> {
         let _ = run(&["unbind-key", "-n", &key]);
         let _ = run(&["unbind-key", "-T", PROFILE_TABLE, &key]);
     }
+    reset_status_click();
     Ok(())
 }
 
@@ -1360,6 +1433,8 @@ fn installed_nav_keys() -> Result<Vec<String>> {
         .lines()
         .filter(|l| l.contains("rlord nav "))
         .filter_map(|l| l.split_whitespace().nth(3).map(str::to_string))
+        // (rlord's status click runs `nav` too: not a nav key.)
+        .filter(|k| k != STATUS_CLICK)
         .collect())
 }
 
@@ -1541,7 +1616,7 @@ mod tests {
         // Clickable hints: ranges count no width, and a status click on a
         // range runs that key's command (tmux's own click otherwise).
         assert_eq!(visible_len("#[range=user|rlord-list]⌥d list#[norange]"), 7);
-        bind_nav_keys("/bin/rl'x", &[("M-d", "home"), ("M-o", "overlord")]).unwrap();
+        bind_nav_keys("/bin/rl'x", &[("M-d", "home"), ("M-o", "overlord")], true).unwrap();
         for table in ["root", PROFILE_TABLE] {
             let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
             assert!(k.contains("mouse_status_range"), "{k}");
@@ -1556,6 +1631,57 @@ mod tests {
             status_click(&[]),
             ["switch-client", "-t", "="].map(String::from)
         );
+        // Mouse off (or unbound): tmux's own click again, none of rlord's.
+        let restored = || {
+            for table in ["root", PROFILE_TABLE] {
+                let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+                assert!(!k.contains(" nav "), "{k}");
+                assert!(k.contains("switch-client -t ="), "{k}");
+            }
+        };
+        bind_nav_keys("/bin/rl'x", &[("M-d", "home")], false).unwrap();
+        restored();
+        unbind_nav_keys(&[("M-d", "home"), ("M-o", "overlord")]).unwrap();
+        // An unquoted path (as installed), bound twice: the click is still
+        // rlord's (never taken for a nav key and unbound), the keys too.
+        let bin = "/usr/local/bin/rlord";
+        for _ in 0..2 {
+            let c = bind_nav_keys(bin, &[("M-d", "home")], true).unwrap();
+            assert!(c.is_empty(), "{c:?}");
+        }
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(k.contains("rlord nav home"), "{k}");
+            assert_eq!(click_binding(table), Click::Ours);
+        }
+        assert!(!installed_nav_keys()
+            .unwrap()
+            .contains(&STATUS_CLICK.to_string()));
+        unbind_nav_keys(&[("M-d", "home")]).unwrap();
+        restored();
+        // A click the user bound themselves is never touched: not bound
+        // over with mouse on (the hints just aren't clickable), not reset.
+        for table in ["root", PROFILE_TABLE] {
+            run(&[
+                "bind-key",
+                "-T",
+                table,
+                STATUS_CLICK,
+                "display-message",
+                "mine",
+            ])
+            .unwrap();
+        }
+        bind_nav_keys(bin, &[("M-d", "home")], true).unwrap();
+        bind_nav_keys(bin, &[("M-d", "home")], false).unwrap();
+        unbind_nav_keys(&[("M-d", "home")]).unwrap();
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(
+                k.contains("display-message mine") && !k.contains(" nav "),
+                "{k}"
+            );
+        }
 
         kill_session(name).unwrap();
         assert!(!has_session(name));

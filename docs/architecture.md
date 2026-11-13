@@ -295,13 +295,14 @@ hooks and `discover` keep the stored status to themselves.
   from it is saved; a tail without `usage_limit_reached` or `"rejected"`
   isn't parsed; a record with no readable time is dated when first
   seen, `limits::dated`);
-  kv `limits` holds the current ones, and rows carry `limit`
-  (`limits::annotate`).
+  kv `limits` holds the current ones, each until a minute past its
+  reset (`limits::held`), and rows carry `limit` (`limits::annotate`:
+  `reset` once the reset time has passed, shown as "limit reset").
 - **Nothing else is typed into a limited session** (it would only get
   another limit reply). `send_to_session` refuses it ("stopped on a usage
   limit until …"); with `when_idle`, and for a message already queued,
-  it waits for the reset (`send::refusal`/`next`, from
-  `limits::limited`). Its hook state reads `idle` all the same.
+  it waits for the reset plus a minute, as a resume does
+  (`send::refusal`/`next`, from `limits::limited`). Its hook state reads `idle` all the same.
 - **Resuming is only ever asked for** (`limits.resume`: the
   `resume_after_limit` tool, `rlord resume-after-limit`, the list's
   menu). Each session gets a job in kv `limit_resume`, so a daemon
@@ -317,8 +318,15 @@ hooks and `discover` keep the stored status to themselves.
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules
   the job to that reset (five sends at most), unless the user typed a
-  prompt since the send (more than 30s after it, past our own message's
-  echo): then the session is theirs and the job ends. The overlords are never
+  prompt since the send: then the session is theirs and the job ends.
+  To tell rlord's prompts from the user's, every paste into a session
+  with a job (resume, `when_idle`, `send_to_session`) first stamps the
+  job's `typed_at` (`limits::before_paste`, from `type_into` right
+  before the paste); a prompt from 1s before it to 30s after is rlord's.
+  A user prompt that paste replaces in `last_user_msg_at` is kept as the
+  job's `user_at` first. Both survive a restart and a re-asked job. The
+  record a resume was sent on is kept as `sent_hit` (a hash of its line),
+  so it stays the old limit even if nothing gets written after it. The overlords are never
   resumed this way: the user switches to another agent's.
 
 ## Transcript store (raw conversation data)
@@ -664,11 +672,12 @@ Things that are not visible at the call site:
   injection would take a setup very different from the one rlord is built
   for. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for anyone
   who wants that (`write_files`): Claude lists rlord's tools one by one in
-  `--allowedTools` without it (`claude_allowed_tools`); Codex adds
-  `mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"`
+  `--allowedTools` without them (`claude_allowed_tools`); Codex adds
+  `mcp_servers.rlord.tools.<tool>.approval_mode="prompt"` for each
   (checked live on 0.167.2: Codex asks "Allow the rlord MCP server to run
   tool send_to_session?"); OpenCode adds an ask rule for
-  `rlord_send_to_session` after `rlord_*`.
+  `rlord_send_to_session` and `rlord_resume_after_limit` after `rlord_*`.
+  Both tools are `agents::SEND_TOOLS`.
 - **Codex's folder trust is passed as a whole table**
   (`-c 'projects={"<dir>"={trust_level="trusted"}}'`): a dotted override
   path can't hold a quoted key, and without trust Codex stops at a "trust

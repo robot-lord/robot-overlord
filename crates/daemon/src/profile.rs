@@ -27,20 +27,12 @@ fn choice(db: &Db, s: &Session) -> Result<Option<bool>> {
     })
 }
 
-/// `RLORD_TMUX_PROFILE` as the `rlord` that opened the list had it
-/// (`tmux.profile_mode`): `default` or `imported`, for that run. None:
-/// not set.
-static OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-fn override_mode() -> Option<String> {
-    OVERRIDE.lock().expect("profile override").clone()
-}
-
 /// Which tmux setup agent sessions get, and why: (`imported` uses the
-/// user's profile where a session's own choice allows; `default` is
-/// rlord's own everywhere, as a new user sees it).
+/// user's profile; `default` is rlord's own everywhere, as a new user sees
+/// it). Without `RLORD_TMUX_PROFILE`, each session's own choice still
+/// decides for it (`wanted`); with it, the override wins over those.
 pub fn mode(cfg: &Config) -> (&'static str, &'static str) {
-    match override_mode().as_deref() {
+    match cfg.tmux.profile_env.as_deref() {
         Some("default") => ("default", "RLORD_TMUX_PROFILE"),
         Some(_) if tmux_profile::exists() => ("imported", "RLORD_TMUX_PROFILE"),
         _ if !tmux_profile::exists() => ("default", "no profile imported"),
@@ -53,7 +45,7 @@ fn wanted(db: &Db, cfg: &Config, s: &Session) -> Result<bool> {
     if overlord::is_overlord_role(&s.role) || !tmux_profile::exists() {
         return Ok(false);
     }
-    match override_mode().as_deref() {
+    match cfg.tmux.profile_env.as_deref() {
         Some("default") => Ok(false),
         Some(_) => Ok(true),
         None => Ok(choice(db, s)?.unwrap_or(cfg.tmux.profile)),
@@ -74,12 +66,12 @@ pub fn profile_mode(d: &Daemon, params: &Value) -> Result<Value> {
                 anyhow::bail!("RLORD_TMUX_PROFILE={v}: use default or imported");
             }
         }
-        let changed = {
-            let mut o = OVERRIDE.lock().expect("profile override");
-            let changed = *o != env;
-            *o = env;
+        // (Compared and set under one lock: two at once can't both miss.)
+        let changed = d.update_config(|c| {
+            let changed = c.tmux.profile_env != env;
+            c.tmux.profile_env = env;
             changed
-        };
+        });
         if changed {
             sync_all(d, false);
         }

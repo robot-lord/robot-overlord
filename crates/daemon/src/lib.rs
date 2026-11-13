@@ -143,6 +143,16 @@ impl Daemon {
         self.tui_subscribers.load(Ordering::SeqCst)
     }
 
+    /// Swap the config for one changed by `f` (a copy: readers holding the
+    /// old one keep it).
+    pub(crate) fn update_config<T>(&self, f: impl FnOnce(&mut Config) -> T) -> T {
+        let mut w = self.config.write().expect("config lock");
+        let mut cfg = (**w).clone();
+        let r = f(&mut cfg);
+        *w = Arc::new(cfg);
+        r
+    }
+
     /// The config as last loaded.
     pub fn config(&self) -> Arc<Config> {
         self.config.read().expect("config lock").clone()
@@ -151,8 +161,13 @@ impl Daemon {
     /// Re-read config.toml (the key screen saved it) and re-apply what
     /// depends on it: the global keys and each session's key hints.
     pub(crate) fn reload_config(&self) -> Result<Value> {
-        let cfg = Config::load()?;
-        *self.config.write().expect("config lock") = Arc::new(cfg);
+        let mut cfg = Config::load()?;
+        // (Not in the file: the `rlord` that opened the list set it. Kept
+        // under the same lock as the swap, so a concurrent set isn't lost.)
+        self.update_config(|c| {
+            cfg.tmux.profile_env = c.tmux.profile_env.take();
+            *c = cfg;
+        });
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
@@ -205,7 +220,7 @@ impl Daemon {
             tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
                 "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");
         }
-        match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
+        match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings, cfg.tmux.mouse) {
             Ok(conflicts) => {
                 for c in conflicts {
                     tracing::warn!(key = %c.key, bound_to = %c.bound_to,

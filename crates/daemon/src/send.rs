@@ -69,7 +69,8 @@ const MAX_CHARS: usize = 20_000;
 
 /// One paste at a time (they share tmux's `rlord_paste` buffer), and when
 /// each session was last typed into. Taken last (locks.rs), and nothing
-/// else is taken while it is held.
+/// else is taken while it is held. (The caller's session lock keeps two
+/// pastes into one session apart; this, pastes into different ones.)
 static TYPING: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
 /// What to check right before typing into a session's pane.
@@ -86,6 +87,11 @@ pub struct Checks<'a> {
     pub overlay: Option<&'a str>,
     /// Not while its input holds a draft (`draft`).
     pub draft: bool,
+    /// Run right before the paste, once every check passed
+    /// (`limits::before_paste`: the resume job's "rlord typed" marker).
+    pub before_paste: Option<&'a dyn Fn()>,
+    /// Run if the paste or its Enter failed after `before_paste` (undo it).
+    pub paste_failed: Option<&'a dyn Fn()>,
 }
 
 /// What `type_into` did.
@@ -104,9 +110,15 @@ pub enum Typed {
 /// whose pane, remembered for `SETTLE`. The caller holds the session's
 /// lock (locks.rs).
 pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Result<Typed> {
-    let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
-    let last = typed.get_or_insert_with(HashMap::new);
-    if checks.settle && last.get(session).is_some_and(|t| t.elapsed() < SETTLE) {
+    let settled = || {
+        let typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
+        !checks.settle
+            || typed
+                .as_ref()
+                .and_then(|m| m.get(session))
+                .is_none_or(|t| t.elapsed() >= SETTLE)
+    };
+    if !settled() {
         return Ok(Typed::NotNow(
             "it was typed into moments ago (its turn may not have started yet)".into(),
         ));
@@ -131,10 +143,23 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
+    // (Without `TYPING`: it may take the DB.)
+    if let Some(f) = checks.before_paste {
+        f();
+    }
+    let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
+    let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
-    tmux::paste(pane, text)?;
-    std::thread::sleep(Duration::from_millis(150));
-    tmux::send_keys(pane, &["Enter"])?;
+    let pasted = tmux::paste(pane, text).and_then(|()| {
+        std::thread::sleep(Duration::from_millis(150));
+        tmux::send_keys(pane, &["Enter"])
+    });
+    if pasted.is_err() {
+        if let Some(f) = checks.paste_failed {
+            f();
+        }
+    }
+    pasted?;
     last.insert(session.to_string(), Instant::now());
     Ok(Typed::Done)
 }
@@ -170,11 +195,18 @@ fn refusal(s: &Session, limited: Option<i64>) -> Option<String> {
         return Some(format!("{} is archived", s.name));
     }
     if let Some(t) = limited {
-        return Some(format!(
-            "{} is stopped on a usage limit until {}",
-            s.name,
-            rlord_core::timefmt::clock(t)
-        ));
+        return Some(if t > now_ms() {
+            format!(
+                "{} is stopped on a usage limit until {}",
+                s.name,
+                rlord_core::timefmt::clock(t)
+            )
+        } else {
+            format!(
+                "{}'s usage limit reset just now: try again in a minute",
+                s.name
+            )
+        });
     }
     match s.status {
         Status::Stopped => Some(format!(
@@ -210,12 +242,16 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         .expect("ui mutex")
         .as_ref()
         .map(|(client, _)| client.clone());
+    // (The marker `before_paste` replaced: back if the paste fails.)
+    let prev = std::cell::Cell::new(None);
     let checks = Checks {
         agent: Agent::named(&s.agent)?,
         settle: true,
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
+        before_paste: Some(&|| prev.set(crate::limits::before_paste(d, s))),
+        paste_failed: Some(&|| crate::limits::paste_failed(d, &s.id, prev.get())),
     };
     type_into(&s.id, &pane, text, &checks)
 }
@@ -244,7 +280,19 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     let s = d.db().resolve_ref(&id)?;
     if let Some(why) = refusal(&s, limited) {
         if limited.is_some() && when_idle && refusal(&s, None).is_none() {
-            // Held until the limit resets (then a settled turn).
+            // Held until the limit resets (then a settled turn). (Not
+            // "try again": it is queued.)
+            let why = match limited.filter(|t| *t > now_ms()) {
+                Some(t) => format!(
+                    "{} is stopped on a usage limit until {}: queued, it goes once the limit has cleared",
+                    s.name,
+                    rlord_core::timefmt::clock(t)
+                ),
+                None => format!(
+                    "{}'s usage limit reset just now: queued, it goes once the limit has cleared",
+                    s.name
+                ),
+            };
             return not_now(d, &s, text, true, &why);
         }
         bail!("not sent: {why}");
@@ -362,7 +410,7 @@ fn next(s: Option<&Session>, limited: Option<i64>, now: i64) -> Next {
         return Next::Wait;
     }
     // On a usage limit: it comes back when the limit resets.
-    if limited.is_some_and(|t| t > now) {
+    if limited.is_some_and(|t| crate::limits::held(t, now)) {
         return Next::Wait;
     }
     let settled = s
@@ -578,11 +626,19 @@ mod tests {
         let now = 100_000;
         let mut s = session(Status::Idle, "");
         s.last_state_change_at = Some(0);
-        let why = refusal(&s, Some(now + 60_000)).unwrap();
+        let why = refusal(&s, Some(now_ms() + 60_000)).unwrap();
         assert!(why.contains("stopped on a usage limit until"), "{why}");
+        // Past its reset, held for the margin: said so, not a past time.
+        let why = refusal(&s, Some(now_ms() - 1_000)).unwrap();
+        assert!(why.contains("reset just now"), "{why}");
         // A queued message waits for the reset, then goes as usual.
         assert_eq!(next(Some(&s), Some(now + 60_000), now), Next::Wait);
         assert_eq!(next(Some(&s), None, now), Next::Deliver);
+        // Just past the reset: still held for the margin, like resume jobs.
+        let margin = crate::limits::MARGIN_MS;
+        assert_eq!(next(Some(&s), Some(now - 1), now), Next::Wait);
+        assert_eq!(next(Some(&s), Some(now - margin + 1), now), Next::Wait);
+        assert_eq!(next(Some(&s), Some(now - margin), now), Next::Deliver);
         // Stopped on a limit and archived: dropped, not held.
         s.archived_at = Some(1);
         assert!(matches!(
@@ -641,6 +697,8 @@ mod tests {
             attached: None,
             overlay: None,
             draft: true,
+            before_paste: None,
+            paste_failed: None,
         };
         let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));
