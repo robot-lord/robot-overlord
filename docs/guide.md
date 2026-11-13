@@ -381,9 +381,11 @@ conversations started outside rlord, sub-agent tracking, Remote Control.
 When an agent stops a session because you've hit a usage limit, rlord
 shows it in place of the session's status: `◷ till 3:00pm` in the list,
 "limited until 3:00pm" in the details. It reads this from the agent's own
-record of the limit, reset time included (Claude Code today; Codex and
-OpenCode sessions don't show it yet). A session stays limited until the
-limit resets or you use it again.
+record of the limit, reset time included: Claude Code's limits, Codex's
+ChatGPT-plan limits, and OpenCode's own (free, Go and Console budget
+limits). A limit whose reset time the agent doesn't record (an API key
+out of credit, another provider's quota) doesn't show. A session stays
+limited until the limit resets or you use it again.
 
 To have limited sessions carry on by themselves once the limit resets,
 ask for it:
