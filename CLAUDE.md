@@ -182,8 +182,10 @@ fallback. CONTRIBUTING.md has the full setup.
   (remote and local), then `cargo xtask release --local`. It runs on
   macOS only and refuses a dirty tree, HEAD not on `origin/main`, or an
   existing tag (the PR forgot the bump). `cargo xtask release --dry-run`
-  publishes nothing: it warns instead of refusing, builds, and prints
-  what it would upload.
+  publishes nothing: it warns instead of refusing and prints what it
+  would do. A dev build or `--local` still builds; a stable release
+  built in CI stops after the checks (rehearse that with a release.yml
+  dry run).
 
 ## Automation lives in `cargo xtask`
 

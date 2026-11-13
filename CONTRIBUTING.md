@@ -82,8 +82,10 @@ cargo xtask release
 
 Release automation is Rust, in the `xtask` crate (`cargo xtask help`
 lists the tasks). `cargo xtask release --dry-run` publishes nothing: it
-warns where a real run would refuse, builds, and prints what it would
-upload.
+warns where a real run would refuse and prints what it would do. A dev
+build or `--local` still builds here; a stable release built in CI stops
+after the checks, so rehearse that with a manual dry run of the workflow
+(below).
 
 - **Dev builds** are built on the maintainer's Apple Silicon Mac and uploaded
   as a pre-release.

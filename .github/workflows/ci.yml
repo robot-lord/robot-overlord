@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       # Not `cargo xtask` (--locked): a stale Cargo.lock must reach the
       # check, which says to commit it.
       - run: cargo run --package xtask -- check-version-bump "origin/${{ github.base_ref }}" HEAD

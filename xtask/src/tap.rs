@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use crate::cmd::{self, gh, git, TempDir};
-use crate::version::{Target, Version, LINUX, MAC, REPO, TAP};
+use crate::version::{self, Target, Version, LINUX, MAC, REPO, TAP};
 
 pub fn main(args: &[String], invoked_from: &Path) -> Result<()> {
     let (ver, sums, tap) = match args {
@@ -54,11 +54,9 @@ pub fn update(ver: &Version, sums: &Path, tap: &str) -> Result<()> {
 
 /// The checksum SHA256SUMS lists for a file.
 pub fn checksum<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
-    sums.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let sum = fields.next()?;
-        (fields.next()? == file).then_some(sum)
-    })
+    version::sha256sums(sums)
+        .into_iter()
+        .find_map(|(sum, name)| (name == file).then_some(sum))
 }
 
 /// Formula/rlord.rb for a release, from its SHA256SUMS.

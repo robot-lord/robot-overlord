@@ -182,6 +182,19 @@ fn cmp_pre(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// The `(checksum, file name)` pairs a SHA256SUMS file lists. Lines are
+/// `<sum>  <file>`; a binary-mode `*` before the name is dropped.
+pub fn sha256sums(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sum = fields.next()?;
+            let file = fields.next()?;
+            Some((sum, file.strip_prefix('*').unwrap_or(file)))
+        })
+        .collect()
+}
+
 /// `[workspace.package] version` from the text of the root Cargo.toml.
 pub fn workspace_version(cargo_toml: &str) -> Option<String> {
     let mut lines = cargo_toml.lines();
@@ -301,6 +314,19 @@ mod tests {
         assert_eq!(
             d.tarball(MAC),
             "rlord-v0.23.0-dev.8-aarch64-apple-darwin.tar.gz"
+        );
+    }
+
+    #[test]
+    fn reads_sha256sums() {
+        let sums =
+            "aaa  rlord-v1.0.0-aarch64-apple-darwin.tar.gz\nbbb *rlord_1.0.0-1_amd64.deb\n\n";
+        assert_eq!(
+            sha256sums(sums),
+            [
+                ("aaa", "rlord-v1.0.0-aarch64-apple-darwin.tar.gz"),
+                ("bbb", "rlord_1.0.0-1_amd64.deb")
+            ]
         );
     }
 

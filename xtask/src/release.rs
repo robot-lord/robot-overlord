@@ -378,22 +378,27 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     )?;
     let sums = std::fs::read_to_string(dist.join("SHA256SUMS"))?;
     let listed = summed_files(&sums);
-    for tarball in ver.tarballs() {
-        if !listed.contains(&tarball.as_str()) {
-            bail!("SHA256SUMS lacks {tarball}");
+    for asset in ver.workflow_assets() {
+        if !listed.contains(&asset.as_str()) {
+            bail!("SHA256SUMS lacks {asset}");
         }
     }
     for file in listed {
-        let verified = cmd::succeeds(
+        // stdout hidden, gh's reason for a failure shown.
+        cmd::output(
             gh().args(["attestation", "verify"])
                 .arg(dist.join(file))
                 .args(["-R", REPO]),
-        );
-        if !verified {
-            bail!("provenance check failed for {file}");
-        }
+        )
+        .with_context(|| format!("provenance check failed for {file}"))?;
     }
-    if is_draft(&tag) {
+    // Not `is_draft`: a failed lookup must stop here, not read as "already
+    // published" and go on to the tap and crates.io.
+    let draft = cmd::output(gh().args([
+        "release", "view", &tag, "-R", REPO, "--json", "isDraft", "-q", ".isDraft",
+    ]))
+    .with_context(|| format!("checking whether {tag} is still a draft"))?;
+    if draft == "true" {
         cmd::run(gh().args([
             "release",
             "edit",
@@ -425,11 +430,15 @@ fn write_sums(dist: &Path) -> Result<()> {
         .into_iter()
         .filter(|f| f != "SHA256SUMS")
         .collect();
+    if files.is_empty() {
+        bail!("nothing was built into {}", dist.display());
+    }
     let sums = cmd::output(
         Command::new("shasum")
             .args(["-a", "256", "--"])
             .args(&files)
-            .current_dir(dist),
+            .current_dir(dist)
+            .stdin(std::process::Stdio::null()),
     )?;
     std::fs::write(dist.join("SHA256SUMS"), sums + "\n").context("writing SHA256SUMS")
 }
@@ -454,8 +463,9 @@ fn tagged_commit(ls_remote: &str) -> Option<&str> {
 
 /// The file names SHA256SUMS lists.
 fn summed_files(sums: &str) -> Vec<&str> {
-    sums.lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
+    version::sha256sums(sums)
+        .into_iter()
+        .map(|(_, file)| file)
         .collect()
 }
 
