@@ -48,7 +48,12 @@ use crate::{overlord, Daemon};
 /// kv: sessions stopped on a usage limit now, `{id: {at, resets_at, kind}}`.
 pub const LIMITS_KEY: &str = "limits";
 /// kv: resume jobs, `{id: {message, limit_at, resets_at, asked_at,
-/// sent_at?, attempts}}`.
+/// sent_at?, attempts, sent_hit?, typed_at?, user_at?}}`. `sent_hit`: the
+/// key of the limit record it was sent on (still the old limit, however
+/// it reads later). `typed_at`: when rlord last pasted into the session
+/// (`before_paste`), so the prompt that makes isn't taken for the user's.
+/// `user_at`: a prompt of the user's that rlord's paste replaced in
+/// `last_user_msg_at`, so a takeover sticks.
 pub const JOBS_KEY: &str = "limit_resume";
 
 const TICK: Duration = Duration::from_secs(15);
@@ -90,14 +95,11 @@ fn typed_at(job: &Value) -> Option<i64> {
 /// `last_user_msg_at` is kept on the job (`user_at`), so a takeover
 /// sticks; then the job's `typed_at` marks the prompt to come as rlord's.
 /// Durable (kv): a restarted daemon still tells them apart.
-pub fn before_paste(d: &Daemon, s: &Session) {
+/// Returns the marker it replaced (for `paste_failed`).
+pub fn before_paste(d: &Daemon, s: &Session) -> Option<i64> {
     let db = d.db();
-    let Ok(mut jobs) = kv_map(&db, JOBS_KEY) else {
-        return;
-    };
-    let Some(job) = jobs.get_mut(&s.id).and_then(Value::as_object_mut) else {
-        return;
-    };
+    let mut jobs = kv_map(&db, JOBS_KEY).ok()?;
+    let job = jobs.get_mut(&s.id).and_then(Value::as_object_mut)?;
     let own = job.get("typed_at").and_then(Value::as_i64);
     if let Some(t) = user_prompt_at(s, own) {
         if job.get("user_at").and_then(Value::as_i64) < Some(t) {
@@ -105,6 +107,24 @@ pub fn before_paste(d: &Daemon, s: &Session) {
         }
     }
     job.insert("typed_at".into(), json!(now_ms()));
+    let _ = save_map(&db, JOBS_KEY, &jobs);
+    own
+}
+
+/// The paste after `before_paste` failed: its marker back to `prev`
+/// (the user's prompt it kept stays: theirs either way).
+pub fn paste_failed(d: &Daemon, id: &str, prev: Option<i64>) {
+    let db = d.db();
+    let Ok(mut jobs) = kv_map(&db, JOBS_KEY) else {
+        return;
+    };
+    let Some(job) = jobs.get_mut(id).and_then(Value::as_object_mut) else {
+        return;
+    };
+    match prev {
+        Some(t) => job.insert("typed_at".into(), json!(t)),
+        None => job.remove("typed_at"),
+    };
     let _ = save_map(&db, JOBS_KEY, &jobs);
 }
 
@@ -391,6 +411,16 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         let _session = d.sessions.lock(&s.id);
         let db = d.db();
         let mut jobs = kv_map(&db, JOBS_KEY)?;
+        // Facts about the session, not the job: kept over a replaced one
+        // (rlord's last paste; a user prompt rlord typed over).
+        let mut job = job;
+        if let Some(old) = jobs.get(&s.id) {
+            for k in ["typed_at", "user_at"] {
+                if !old[k].is_null() {
+                    job[k] = old[k].clone();
+                }
+            }
+        }
         jobs.insert(s.id.clone(), job.clone());
         save_map(&db, JOBS_KEY, &jobs)?;
         db.insert_event(&s.id, now, "limit_resume_scheduled", &job.to_string())?;
@@ -905,6 +935,12 @@ mod tests {
         assert_eq!(job["user_at"], 5_000);
         let at = typed_at(&job).unwrap();
         assert!(at > 5_000);
+        // A failed paste puts the marker back.
+        let prev = before_paste(&d, &s);
+        assert_eq!(prev, Some(at));
+        paste_failed(&d, "s1", prev);
+        let job = kv_map(&d.db(), JOBS_KEY).unwrap()["s1"].clone();
+        assert_eq!(typed_at(&job), Some(at));
         // rlord's prompt lands after the marker: not the user's.
         s.last_user_msg_at = Some(at + 200);
         assert_eq!(user_prompt_at(&s, Some(at)), None);

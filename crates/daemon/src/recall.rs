@@ -514,7 +514,6 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     // carry on is never made.
     let before = d.db().resolve_ref(&p.o.id)?;
     can_continue(&d.db(), &before, &conv)?;
-    let was_running = overlord::running(&before);
     // Made active without starting it: `continue_conversation` then starts
     // (or restarts) it once, onto that conversation.
     let activate = |id: &str, from: String| -> Result<()> {
@@ -528,21 +527,9 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     let mut v = match continue_conversation(d, &json!({"id": conv})) {
         Ok(v) => v,
         Err(e) => {
-            // Back as it was: the user's overlord active again, and this
-            // one stopped if it was (`continue_conversation` already put
-            // it back on its own conversation).
-            let undo = || -> Result<()> {
-                {
-                    let _session = d.sessions.lock(&before.id);
-                    let db = d.db();
-                    let now = db.resolve_ref(&before.id)?;
-                    if !was_running && overlord::running(&now) {
-                        crate::methods::session_stop(&db, &json!({"ref": before.id}))?;
-                    }
-                }
-                activate(&active.id, p.o.agent.clone())
-            };
-            if let Err(u) = undo() {
+            // The user's overlord active again (`continue_conversation`'s
+            // `restore` already put this one's pane and conversation back).
+            if let Err(u) = activate(&active.id, p.o.agent.clone()) {
                 tracing::warn!(error = %u, "undoing a failed switch to continue a conversation");
             }
             d.bind_nav_keys();
@@ -574,13 +561,16 @@ fn can_continue(db: &Db, o: &Session, conv: &str) -> Result<PathBuf> {
 
 /// Undo a failed continue: overlord `o` (as it was before) back on its
 /// conversation and transcript (none, if it had none), and its pane as it
-/// was: up again if it was running, stopped if the attempt started it.
+/// was: up again if it was running (on the old conversation, restarted
+/// again if a restart was tried, `restarted`), stopped if the attempt
+/// started it.
 fn restore(
     db: &Db,
     cfg: &Config,
     o: &Session,
     source: Option<&str>,
     was_running: bool,
+    restarted: bool,
 ) -> Result<()> {
     db.clear_agent_session(&o.id)?;
     if let Some(prev) = o.agent_session.as_deref() {
@@ -592,6 +582,11 @@ fn restore(
     let up = overlord::running(&db.resolve_ref(&o.id)?);
     if was_running && !up {
         overlord::ensure_session(db, cfg, &o.id)?;
+    } else if was_running && restarted {
+        // A restart was tried and the pane is up: it may be on the new
+        // conversation. Restarted again onto the old one, so the pane
+        // and the DB agree.
+        crate::methods::session_restart(db, &json!({"ref": o.id}))?;
     } else if !was_running && up {
         crate::methods::session_stop(db, &json!({"ref": o.id}))?;
     }
@@ -626,8 +621,10 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     db.set_agent_session(&o.id, &c.id, "hook")?;
     db.upsert_transcript_source(&o.id, &path.to_string_lossy())?;
     let running = overlord::running(&db.resolve_ref(&o.id)?);
+    let restarted = std::cell::Cell::new(false);
     let started = overlord::ensure(&db, &d.config(), &json!({})).and_then(|v| {
         if running {
+            restarted.set(true);
             crate::methods::session_restart(&db, &json!({"ref": o.id}))
         } else {
             Ok(v)
@@ -637,7 +634,16 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
         Ok(v) => v,
         Err(e) => {
             // Back on the conversation it had, and up again if it was.
-            let undo = || restore(&db, &d.config(), &o, source.as_deref(), running);
+            let undo = || {
+                restore(
+                    &db,
+                    &d.config(),
+                    &o,
+                    source.as_deref(),
+                    running,
+                    restarted.get(),
+                )
+            };
             if let Err(u) = undo() {
                 tracing::warn!(error = %u, "undoing a failed continue");
             }
@@ -684,7 +690,7 @@ mod tests {
         let before = db.resolve_ref("o1").unwrap();
         db.set_agent_session("o1", "conv-b", "hook").unwrap();
         db.upsert_transcript_source("o1", "/tmp/b.jsonl").unwrap();
-        restore(&db, &cfg, &before, None, false).unwrap();
+        restore(&db, &cfg, &before, None, false, false).unwrap();
         let after = db.resolve_ref("o1").unwrap();
         assert_eq!(after.agent_session, None);
         assert_eq!(db.transcript_source("o1").unwrap(), None);
@@ -694,7 +700,7 @@ mod tests {
         let before = db.resolve_ref("o1").unwrap();
         db.set_agent_session("o1", "conv-b", "hook").unwrap();
         db.upsert_transcript_source("o1", "/tmp/b.jsonl").unwrap();
-        restore(&db, &cfg, &before, Some("/tmp/a.jsonl"), false).unwrap();
+        restore(&db, &cfg, &before, Some("/tmp/a.jsonl"), false, false).unwrap();
         assert_eq!(
             db.resolve_ref("o1").unwrap().agent_session.as_deref(),
             Some("conv-a")

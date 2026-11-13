@@ -90,6 +90,8 @@ pub struct Checks<'a> {
     /// Run right before the paste, once every check passed
     /// (`limits::before_paste`: the resume job's "rlord typed" marker).
     pub before_paste: Option<&'a dyn Fn()>,
+    /// Run if the paste or its Enter failed after `before_paste` (undo it).
+    pub paste_failed: Option<&'a dyn Fn()>,
 }
 
 /// What `type_into` did.
@@ -148,9 +150,16 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
     let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
     let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
-    tmux::paste(pane, text)?;
-    std::thread::sleep(Duration::from_millis(150));
-    tmux::send_keys(pane, &["Enter"])?;
+    let pasted = tmux::paste(pane, text).and_then(|()| {
+        std::thread::sleep(Duration::from_millis(150));
+        tmux::send_keys(pane, &["Enter"])
+    });
+    if pasted.is_err() {
+        if let Some(f) = checks.paste_failed {
+            f();
+        }
+    }
+    pasted?;
     last.insert(session.to_string(), Instant::now());
     Ok(Typed::Done)
 }
@@ -233,13 +242,16 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         .expect("ui mutex")
         .as_ref()
         .map(|(client, _)| client.clone());
+    // (The marker `before_paste` replaced: back if the paste fails.)
+    let prev = std::cell::Cell::new(None);
     let checks = Checks {
         agent: Agent::named(&s.agent)?,
         settle: true,
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
-        before_paste: Some(&|| crate::limits::before_paste(d, s)),
+        before_paste: Some(&|| prev.set(crate::limits::before_paste(d, s))),
+        paste_failed: Some(&|| crate::limits::paste_failed(d, &s.id, prev.get())),
     };
     type_into(&s.id, &pane, text, &checks)
 }
@@ -674,6 +686,7 @@ mod tests {
             overlay: None,
             draft: true,
             before_paste: None,
+            paste_failed: None,
         };
         let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));

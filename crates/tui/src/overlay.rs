@@ -359,7 +359,12 @@ fn run_loop(
     loop {
         if hint_until.is_some_and(|t| Instant::now() >= t) {
             hint_until = None;
-            switcher = view.bar.as_ref().map(|b| b.line());
+            // (Without the notice it replaced: that is older still.)
+            switcher = view.bar.as_ref().map(|b| {
+                let mut b = b.clone();
+                b.notice = None;
+                b.line()
+            });
             last = Instant::now() - Duration::from_secs(1);
         }
         let area = terminal.size()?;
@@ -590,6 +595,8 @@ fn run_loop(
                         None => {
                             let mut b = bar.clone();
                             b.hint = Some(ONLY_ONE.into());
+                            // (The newer word wins over a failed switch's.)
+                            b.notice = None;
                             switcher = Some(b.line());
                             hint_until = Some(Instant::now() + HINT_FOR);
                             last = Instant::now() - Duration::from_secs(1);

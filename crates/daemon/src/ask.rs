@@ -118,6 +118,7 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     // overlord's pane is theirs to merge.)
                     draft: false,
                     before_paste: None,
+                    paste_failed: None,
                 };
                 if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
                     bail!(

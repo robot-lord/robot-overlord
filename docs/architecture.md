@@ -318,8 +318,15 @@ hooks and `discover` keep the stored status to themselves.
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules
   the job to that reset (five sends at most), unless the user typed a
-  prompt since the send (more than 30s after it, past our own message's
-  echo): then the session is theirs and the job ends. The overlords are never
+  prompt since the send: then the session is theirs and the job ends.
+  To tell rlord's prompts from the user's, every paste into a session
+  with a job (resume, `when_idle`, `send_to_session`) first stamps the
+  job's `typed_at` (`limits::before_paste`, from `type_into` right
+  before the paste); a prompt from 1s before it to 30s after is rlord's.
+  A user prompt that paste replaces in `last_user_msg_at` is kept as the
+  job's `user_at` first. Both survive a restart and a re-asked job. The
+  record a resume was sent on is kept as `sent_hit` (a hash of its line),
+  so it stays the old limit even if nothing gets written after it. The overlords are never
   resumed this way: the user switches to another agent's.
 
 ## Transcript store (raw conversation data)
