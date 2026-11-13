@@ -280,7 +280,19 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     let s = d.db().resolve_ref(&id)?;
     if let Some(why) = refusal(&s, limited) {
         if limited.is_some() && when_idle && refusal(&s, None).is_none() {
-            // Held until the limit resets (then a settled turn).
+            // Held until the limit resets (then a settled turn). (Not
+            // "try again": it is queued.)
+            let why = match limited.filter(|t| *t > now_ms()) {
+                Some(t) => format!(
+                    "{} is stopped on a usage limit until {}: queued, it goes once the limit has cleared",
+                    s.name,
+                    rlord_core::timefmt::clock(t)
+                ),
+                None => format!(
+                    "{}'s usage limit reset just now: queued, it goes once the limit has cleared",
+                    s.name
+                ),
+            };
             return not_now(d, &s, text, true, &why);
         }
         bail!("not sent: {why}");

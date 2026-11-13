@@ -98,6 +98,8 @@ fn typed_at(job: &Value) -> Option<i64> {
 /// Returns the marker it replaced (for `paste_failed`).
 pub fn before_paste(d: &Daemon, s: &Session) -> Option<i64> {
     let db = d.db();
+    // (Fresh: the caller's copy may be older than its last prompt.)
+    let s = &db.resolve_ref(&s.id).ok()?;
     let mut jobs = kv_map(&db, JOBS_KEY).ok()?;
     let job = jobs.get_mut(&s.id).and_then(Value::as_object_mut)?;
     let own = job.get("typed_at").and_then(Value::as_i64);
@@ -216,11 +218,9 @@ fn dated(mut h: LimitHit, known: Option<&Value>, job: Option<(i64, i64)>, now: i
         h.at = known
             .filter(|k| k["resets_at"].as_i64() == Some(h.resets_at))
             .and_then(|k| k["at"].as_i64())
-            // (A job rescheduled onto this hit stored `resets_at.max(at)`.)
-            .or_else(|| {
-                job.filter(|j| j.1 == h.resets_at || j.1 == h.resets_at.max(j.0))
-                    .map(|j| j.0)
-            })
+            // (A rescheduled job stored `resets_at.max(at)`; an original
+            // one the record's own, never below its `at`.)
+            .or_else(|| job.filter(|j| j.1 == h.resets_at.max(j.0)).map(|j| j.0))
             .unwrap_or(now);
     }
     h
@@ -232,12 +232,11 @@ fn dated_for(job: &Value, h: LimitHit, known: Option<&Value>, now: i64) -> Limit
         job["limit_at"].as_i64().unwrap_or(0),
         job["resets_at"].as_i64().unwrap_or(0),
     );
-    // Only the job's own record: before its message was sent, or one its
-    // message came after (touched), or the one it was sent on. An untouched record after the send is
-    // a new limit, even with the same reset time.
-    // (Or the very record that was there when it was sent, `sent_hit`,
-    // should the agent not have written the message after it.)
-    let own = job["sent_at"].is_null() || h.touched || job["sent_hit"].as_u64() == Some(h.key);
+    // Only the job's own record: before its message was sent, or the one
+    // it was sent on (`sent_hit`; a job sent before that was recorded:
+    // taken as its own). Any other record after the send is a new limit,
+    // even with the same reset time.
+    let own = job["sent_at"].is_null() || job["sent_hit"].as_u64().is_none_or(|k| k == h.key);
     // (Likewise the list's record: one dated before the send is the old
     // limit's.)
     let sent = job["sent_at"].as_i64().unwrap_or(0);
@@ -829,22 +828,23 @@ mod tests {
         let later = now + MARGIN_MS;
         let h2 = dated(stale, None, Some((at, resets)), later);
         assert_eq!(step(&job2, Some(&idle), Some(&h2), None, later), Step::Send);
-        // The limit hit again after the send with the same reset time:
-        // new, not the job's own record (that one is touched by now).
-        let repeat = dated_for(&sent, hit(0, 100_000, false), None, 180_000);
-        assert_eq!(repeat.at, 180_000);
-        assert_eq!(
-            step(&sent, Some(&idle), Some(&repeat), None, 180_000),
-            Step::Reschedule(180_000, 180_000)
-        );
-        let own = dated_for(&sent, hit(0, 100_000, true), None, 180_000);
-        assert_eq!(own.at, 1_000);
-        // The record it was sent on, untouched still (the agent didn't
-        // write the message after it): the old one, not dated now.
+        // The record it was sent on (`sent_hit`), read again: the old
+        // limit, not dated now.
         let old = hit(0, 100_000, false);
         let mut sent_on = sent.clone();
         sent_on["sent_hit"] = json!(old.key);
-        assert_eq!(dated_for(&sent_on, old, None, 180_000).at, 1_000);
+        assert_eq!(dated_for(&sent_on, old.clone(), None, 180_000).at, 1_000);
+        // Another record after the send, same reset time: a new limit.
+        let mut repeat = old.clone();
+        repeat.key ^= 1;
+        let repeat = dated_for(&sent_on, repeat, None, 180_000);
+        assert_eq!(repeat.at, 180_000);
+        assert_eq!(
+            step(&sent_on, Some(&idle), Some(&repeat), None, 180_000),
+            Step::Reschedule(180_000, 180_000)
+        );
+        // A job sent before `sent_hit` was recorded: its own record.
+        assert_eq!(dated_for(&sent, old, None, 180_000).at, 1_000);
         // Not for ever.
         let mut many = sent.clone();
         many["attempts"] = json!(MAX_ATTEMPTS);
@@ -925,6 +925,7 @@ mod tests {
         let d = daemon_with(Path::new("/nonexistent.jsonl"));
         let mut s = d.db().resolve_ref("s1").unwrap();
         s.last_user_msg_at = Some(5_000);
+        d.db().touch_last_user_msg("s1", 5_000).unwrap();
         before_paste(&d, &s);
         assert!(kv_map(&d.db(), JOBS_KEY).unwrap().is_empty());
         let mut jobs = Map::new();

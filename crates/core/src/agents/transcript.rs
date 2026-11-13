@@ -401,15 +401,33 @@ pub fn limit_hit(path: &Path) -> Option<LimitHit> {
     if !text.contains("usage_limit_reached") && !text.contains("\"rejected\"") {
         return None;
     }
-    let tail: Vec<Value> = text
+    let (raw, tail): (Vec<&str>, Vec<Value>) = text
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    limit_in(format, &tail)
+        .filter_map(|l| Some((l, serde_json::from_str(l).ok()?)))
+        .unzip();
+    let (i, mut hit) = limit_at(format, &tail)?;
+    // (Its line as written: stable whatever serde makes of it.)
+    hit.key = fnv(raw[i]);
+    Some(hit)
 }
 
-/// `limit_hit` over parsed lines (oldest first).
+/// FNV-1a of a line: a record's key, stable across builds.
+fn fnv(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// `limit_hit` over parsed lines (oldest first). Its `key` hashes the
+/// line as serialized again (`limit_hit` hashes the line as written).
 pub fn limit_in(format: Format, lines: &[Value]) -> Option<LimitHit> {
+    let (i, mut hit) = limit_at(format, lines)?;
+    hit.key = fnv(&lines[i].to_string());
+    Some(hit)
+}
+
+/// The last limit record in `lines` and where it is (`key` left 0).
+fn limit_at(format: Format, lines: &[Value]) -> Option<(usize, LimitHit)> {
     if format != Format::Claude {
         return None;
     }
@@ -429,19 +447,16 @@ pub fn limit_in(format: Format, lines: &[Value]) -> Option<LimitHit> {
         let l = format.line(v);
         l.prompt().is_some() || (v["type"] == "assistant" && l.reply().is_some())
     });
-    let key = lines[i]
-        .to_string()
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
-    Some(LimitHit {
-        at,
-        resets_at,
-        kind,
-        touched,
-        key,
-    })
+    Some((
+        i,
+        LimitHit {
+            at,
+            resets_at,
+            kind,
+            touched,
+            key: 0,
+        },
+    ))
 }
 
 /// Whether the agent is mid-turn (`Some(true)` working, `Some(false)` its

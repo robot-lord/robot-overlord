@@ -164,11 +164,10 @@ impl Daemon {
         let mut cfg = Config::load()?;
         // (Not in the file: the `rlord` that opened the list set it. Kept
         // under the same lock as the swap, so a concurrent set isn't lost.)
-        {
-            let mut w = self.config.write().expect("config lock");
-            cfg.tmux.profile_env = w.tmux.profile_env.clone();
-            *w = Arc::new(cfg);
-        }
+        self.update_config(|c| {
+            cfg.tmux.profile_env = c.tmux.profile_env.take();
+            *c = cfg;
+        });
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());

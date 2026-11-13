@@ -529,7 +529,14 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
         Err(e) => {
             // The user's overlord active again (`continue_conversation`'s
             // `restore` already put this one's pane and conversation back).
-            if let Err(u) = activate(&active.id, p.o.agent.clone()) {
+            // (Directly: an undo, not a switch, so no `overlord_active`
+            // event; the one the attempt logged stays, as history.)
+            let back = {
+                let _send = d.overlord_send.lock().expect("overlord send lock");
+                let _session = d.sessions.lock(&active.id);
+                d.db().set_active_overlord(&active.id)
+            };
+            if let Err(u) = back {
                 tracing::warn!(error = %u, "undoing a failed switch to continue a conversation");
             }
             d.bind_nav_keys();
@@ -562,8 +569,8 @@ fn can_continue(db: &Db, o: &Session, conv: &str) -> Result<PathBuf> {
 /// Undo a failed continue: overlord `o` (as it was before) back on its
 /// conversation and transcript (none, if it had none), and its pane as it
 /// was: up again if it was running (on the old conversation, restarted
-/// again if a restart was tried, `restarted`), stopped if the attempt
-/// started it.
+/// again if a restart was tried, `restarted`, and it had one), stopped
+/// if the attempt started it.
 fn restore(
     db: &Db,
     cfg: &Config,
@@ -582,10 +589,12 @@ fn restore(
     let up = overlord::running(&db.resolve_ref(&o.id)?);
     if was_running && !up {
         overlord::ensure_session(db, cfg, &o.id)?;
-    } else if was_running && restarted {
+    } else if was_running && restarted && o.agent_session.is_some() {
         // A restart was tried and the pane is up: it may be on the new
         // conversation. Restarted again onto the old one, so the pane
-        // and the DB agree.
+        // and the DB agree. (With no old conversation to go back to, a
+        // restart would only start another new one: the pane is left
+        // as it is.)
         crate::methods::session_restart(db, &json!({"ref": o.id}))?;
     } else if !was_running && up {
         crate::methods::session_stop(db, &json!({"ref": o.id}))?;
