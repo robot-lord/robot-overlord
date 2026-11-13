@@ -259,11 +259,10 @@ Codex runs one app-server daemon per user; a TUI started without
 hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
-need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
-`--disable` or `--search`, joined forms included, in the TUI's own
-process; so, unlike the overlord, a daemon-mode session can't be given
-`check_for_update_on_startup=false`, which in-pane sessions don't get
-either). `spec_args` adds `--no-daemon` for every other Codex
+need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
+`--enable`, `--disable` or `--search`, joined forms included, in the TUI's
+own process). Like an in-pane session (and unlike the overlord, whose `-c`
+turns it off), a daemon-mode pane can open on Codex's update prompt. `spec_args` adds `--no-daemon` for every other Codex
 session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
@@ -309,11 +308,14 @@ session. The rest is
   `send_to_session` and held deliveries wait; the gap is the moment before
   that hook lands (without hooks, before the transcript is read), and the
   whole turn for a thread the gate doesn't list (after `/clear` or `/new`). A
-  usage-limit resume has the same short gap: it is dropped once that
-  turn's hook or transcript shows the session was used. Escape in either client interrupts.
+  usage-limit resume doesn't wait on the status (it sends while working
+  too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
+  or the transcript past the limit), so its gap is the same moment. Escape in either client interrupts.
 - **Commands and MCP servers run in the daemon's environment**, like its
-  hooks: whatever environment the daemon was started with (scrubbed when
-  rlord started it), not the pane's.
+  hooks: whatever environment the daemon was started with, not the pane's.
+  Started by rlord, that is rlord's own (under launchd or systemd, the
+  service's: its PATH, none of your shell rc), less rlord's session
+  variables.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)

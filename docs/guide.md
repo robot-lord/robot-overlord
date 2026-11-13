@@ -336,7 +336,9 @@ with flags that need the pane (`-c` / `--config`, `--enable`,
 `--disable`, `--search`), stay in the pane. Not followed yet on the server: `/clear`
 or `/new` in the session (it stays on its first thread), and "needs you"
 from a sub-agent's prompt. Its commands and MCP servers run with the
-background server's environment, not the pane's. Daemon mode has been
+background server's environment, not the pane's: when rlord started that
+server, rlord's own (as a background service, without what your shell's
+rc files set). Daemon mode has been
 checked on macOS only so far.
 
 Not yet: importing Codex
