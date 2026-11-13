@@ -502,12 +502,21 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     }
     let (conv, agent) = (p.c.id.clone(), p.o.agent.clone());
     let current = p.o.agent_session.as_deref() == Some(conv.as_str());
-    let switched = d.rpc("overlord.switch", json!({"agent": agent}))?;
     if current {
+        // Its current conversation: switching (which starts it) is all.
+        let switched = d.rpc("overlord.switch", json!({"agent": agent}))?;
         return Ok(Some(
             json!({"continued": conv, "switched_to": agent, "session": switched}),
         ));
     }
+    // Made active without starting it: `continue_conversation` then starts
+    // (or restarts) it once, onto that conversation.
+    {
+        let _send = d.overlord_send.lock().expect("overlord send lock");
+        let _session = d.sessions.lock(&p.o.id);
+        overlord::activate(&d.db(), &p.o.id, Some(active.agent.clone()), false)?;
+    }
+    d.bind_nav_keys();
     let mut v = continue_conversation(d, &json!({"id": conv}))?;
     v["switched_to"] = json!(agent);
     Ok(Some(v))

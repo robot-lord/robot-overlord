@@ -624,7 +624,7 @@ prompt, a prompt for anything that writes or runs a command.
 
 | | MCP server and its tools | Everything else | Subagents |
 |---|---|---|---|
-| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` (with `confirm_sends`: rlord's tools listed without `send_to_session`) | asks | `.claude/agents/*.md` |
+| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` (with `confirm_sends`: rlord's tools listed without `send_to_session` and `resume_after_limit`) | asks | `.claude/agents/*.md` |
 | Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"`, `-c check_for_update_on_startup=false` | `.codex/agents/*.toml` |
 | OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`, rlord's own subagents by name, `rlord_*` allow (last match wins); repeated under `agents.<name>` | `.opencode/agents/*.md` |
 
@@ -653,7 +653,7 @@ Things that are not visible at the call site:
   own data and the user's requests, not arbitrary content. So it can type
   into sessions without asking. That is what lets it orchestrate. Prompt
   injection would take a setup very different from the one rlord is built
-  for. `[overlord] confirm_sends = true` makes each send ask, for anyone
+  for. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for anyone
   who wants that (`write_files`): Claude lists rlord's tools one by one in
   `--allowedTools` without it (`claude_allowed_tools`); Codex adds
   `mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"`

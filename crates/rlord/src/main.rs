@@ -1976,7 +1976,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
         return;
     }
     println!(
-        "{:<8} {:<24} {:<13} {:>7}  {:>5}  {:<16} PROJECT",
+        "{:<8} {:<24} {:<16} {:>7}  {:>5}  {:<16} PROJECT",
         "ID", "NAME", "STATUS", "UPDATED", "USAGE", "TAGS"
     );
     for s in rows {
@@ -1994,13 +1994,13 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             None => rlord_core::usage::cell(None, usage),
         };
         println!(
-            "{:<8}{}{:<24} {:<13} {:>7}  {:>5}  {:<16} {}",
+            "{:<8}{}{:<24} {:<16} {:>7}  {:>5}  {:<16} {}",
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
             // Stopped on a usage limit: that, and until when.
             match s["limit"]["until"].as_str() {
-                Some(until) => truncate(&format!("till {until}"), 13),
+                Some(until) => truncate(&format!("till {until}"), 16),
                 None => rlord_core::types::Status::label_of(get("status")).to_string(),
             },
             rel_age(

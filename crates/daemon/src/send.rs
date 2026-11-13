@@ -160,13 +160,21 @@ fn draft(agent: Agent, screen: &str) -> Option<String> {
 }
 
 /// Why a session can't be sent anything at all (whatever its turn), if
-/// it can't.
-fn refusal(s: &Session) -> Option<String> {
+/// it can't. `limited`: when the usage limit it is stopped on resets, if
+/// it is (typed in now, the message gets only another limit reply).
+fn refusal(s: &Session, limited: Option<i64>) -> Option<String> {
     if crate::overlord::is_overlord_role(&s.role) {
         return Some("that is you (the overlord): answer the user directly".into());
     }
     if s.archived_at.is_some() {
         return Some(format!("{} is archived", s.name));
+    }
+    if let Some(t) = limited {
+        return Some(format!(
+            "{} is stopped on a usage limit until {}",
+            s.name,
+            rlord_core::timefmt::clock(t)
+        ));
     }
     match s.status {
         Status::Stopped => Some(format!(
@@ -232,8 +240,13 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     // Its lock, then a fresh look: nothing restarts, stops or archives it
     // from here until the text is in (locks.rs: this before the DB).
     let _session = d.sessions.lock(&id);
+    let limited = crate::limits::limited(d).get(&id).copied();
     let s = d.db().resolve_ref(&id)?;
-    if let Some(why) = refusal(&s) {
+    if let Some(why) = refusal(&s, limited) {
+        if limited.is_some() && when_idle && refusal(&s, None).is_none() {
+            // Held until the limit resets (then a settled turn).
+            return not_now(d, &s, text, true, &why);
+        }
         bail!("not sent: {why}");
     }
     if s.status != Status::Idle {
@@ -337,15 +350,19 @@ enum Next {
     Drop(String),
 }
 
-fn next(s: Option<&Session>, now: i64) -> Next {
+fn next(s: Option<&Session>, limited: Option<i64>, now: i64) -> Next {
     let Some(s) = s else {
         return Next::Drop("session gone".into());
     };
-    if let Some(why) = refusal(s) {
+    if let Some(why) = refusal(s, None) {
         // (Still starting: a restart; it comes back to your turn.)
         if s.status != Status::Starting {
             return Next::Drop(why);
         }
+        return Next::Wait;
+    }
+    // On a usage limit: it comes back when the limit resets.
+    if limited.is_some_and(|t| t > now) {
         return Next::Wait;
     }
     let settled = s
@@ -370,6 +387,7 @@ pub fn start(d: &Arc<Daemon>) {
 }
 
 fn tick(d: &Daemon) -> Result<()> {
+    let limited = crate::limits::limited(d);
     let due: Vec<String> = {
         let db = d.db();
         let mut m = pending(&db)?;
@@ -381,7 +399,7 @@ fn tick(d: &Daemon) -> Result<()> {
         let mut dropped = false;
         for id in m.keys().cloned().collect::<Vec<_>>() {
             let s = db.resolve_ref(&id).ok();
-            match next(s.as_ref(), now) {
+            match next(s.as_ref(), limited.get(&id).copied(), now) {
                 Next::Wait => {}
                 Next::Deliver => due.push(id),
                 Next::Drop(why) => {
@@ -413,6 +431,7 @@ fn tick(d: &Daemon) -> Result<()> {
 /// again under the session's lock, right before typing.
 fn deliver(d: &Daemon, id: &str) -> Result<()> {
     let _session = d.sessions.lock(id);
+    let limited = crate::limits::limited(d).get(id).copied();
     let (s, text) = {
         let db = d.db();
         let Ok(s) = db.resolve_ref(id) else {
@@ -427,7 +446,7 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         };
         (s, text)
     };
-    if next(Some(&s), now_ms()) != Next::Deliver {
+    if next(Some(&s), limited, now_ms()) != Next::Deliver {
         return Ok(());
     }
     // Without the DB lock: tmux.
@@ -550,39 +569,61 @@ mod tests {
         s
     }
 
+    fn refusal_now(s: &Session) -> Option<String> {
+        refusal(s, None)
+    }
+
+    #[test]
+    fn a_limited_session_is_not_sent_to_until_it_resets() {
+        let now = 100_000;
+        let mut s = session(Status::Idle, "");
+        s.last_state_change_at = Some(0);
+        let why = refusal(&s, Some(now + 60_000)).unwrap();
+        assert!(why.contains("stopped on a usage limit until"), "{why}");
+        // A queued message waits for the reset, then goes as usual.
+        assert_eq!(next(Some(&s), Some(now + 60_000), now), Next::Wait);
+        assert_eq!(next(Some(&s), None, now), Next::Deliver);
+        // Stopped on a limit and archived: dropped, not held.
+        s.archived_at = Some(1);
+        assert!(matches!(
+            next(Some(&s), Some(now + 60_000), now),
+            Next::Drop(_)
+        ));
+    }
+
     #[test]
     fn who_can_be_sent_to() {
-        assert!(refusal(&session(Status::Idle, "")).is_none());
-        assert!(refusal(&session(Status::Working, "")).is_none());
+        assert!(refusal_now(&session(Status::Idle, "")).is_none());
+        assert!(refusal_now(&session(Status::Working, "")).is_none());
         for st in [Status::Stopped, Status::Starting, Status::Error] {
-            assert!(refusal(&session(st, "")).is_some(), "{st:?}");
+            assert!(refusal_now(&session(st, "")).is_some(), "{st:?}");
         }
         let mut archived = session(Status::Idle, "");
         archived.archived_at = Some(1);
-        assert!(refusal(&archived).is_some());
-        assert!(refusal(&session(Status::Idle, "overlord")).is_some());
+        assert!(refusal_now(&archived).is_some());
+        assert!(refusal_now(&session(Status::Idle, "overlord")).is_some());
     }
 
     #[test]
     fn a_pending_message_waits_for_a_settled_turn() {
         let now = 100_000;
         let mut s = session(Status::Working, "");
-        assert_eq!(next(Some(&s), now), Next::Wait);
+        assert_eq!(next(Some(&s), None, now), Next::Wait);
         s.status = Status::WaitingInput;
-        assert_eq!(next(Some(&s), now), Next::Wait);
+        assert_eq!(next(Some(&s), None, now), Next::Wait);
         // Its turn just ended: a moment first.
         s.status = Status::Idle;
         s.last_state_change_at = Some(now - 500);
-        assert_eq!(next(Some(&s), now), Next::Wait);
+        assert_eq!(next(Some(&s), None, now), Next::Wait);
         s.last_state_change_at = Some(now - IDLE_FOR_MS);
-        assert_eq!(next(Some(&s), now), Next::Deliver);
+        assert_eq!(next(Some(&s), None, now), Next::Deliver);
         // A restart: wait for it.
         s.status = Status::Starting;
-        assert_eq!(next(Some(&s), now), Next::Wait);
+        assert_eq!(next(Some(&s), None, now), Next::Wait);
         // Stopped, archived or gone: dropped.
         s.status = Status::Stopped;
-        assert!(matches!(next(Some(&s), now), Next::Drop(_)));
-        assert!(matches!(next(None, now), Next::Drop(_)));
+        assert!(matches!(next(Some(&s), None, now), Next::Drop(_)));
+        assert!(matches!(next(None, None, now), Next::Drop(_)));
     }
 
     /// A second paste right after one: not now (before any tmux call).

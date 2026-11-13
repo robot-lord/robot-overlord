@@ -121,8 +121,8 @@ pub fn toml_str(s: &str) -> String {
 ///   rlord's own data and the user's requests), so it can type into
 ///   sessions without asking, which is what lets it orchestrate.
 /// - `confirm_sends` (`[overlord] confirm_sends`, off by default):
-///   `mcp_servers.rlord.tools.send_to_session.approval_mode = "prompt"`,
-///   so that one tool asks each time (for anyone who wants that).
+///   `mcp_servers.rlord.tools.<tool>.approval_mode = "prompt"` for each
+///   of `SEND_TOOLS`, so those ask each time (for anyone who wants that).
 /// - `check_for_update_on_startup = false`: no update prompt in front of
 ///   the composer (rlord types into it once it is up).
 /// - `projects = {"<dir>" = {trust_level = "trusted"}}`: its folder is
@@ -153,9 +153,10 @@ pub fn overlord_args(rlord_bin: &str, socket: &str, dir: &str, confirm_sends: bo
     ]
     .into_iter()
     .chain(
-        confirm_sends.then(|| {
-            "mcp_servers.rlord.tools.send_to_session.approval_mode=\"prompt\"".to_string()
-        }),
+        super::SEND_TOOLS
+            .iter()
+            .filter(|_| confirm_sends)
+            .map(|t| format!("mcp_servers.rlord.tools.{t}.approval_mode=\"prompt\"")),
     )
     .flat_map(|kv| ["-c".to_string(), kv])
     .collect()
@@ -961,6 +962,10 @@ mod tests {
         // Sends confirmed: that one tool asks.
         assert_eq!(
             seen["mcp_servers.rlord.tools.send_to_session.approval_mode"].as_str(),
+            Some("prompt")
+        );
+        assert_eq!(
+            seen["mcp_servers.rlord.tools.resume_after_limit.approval_mode"].as_str(),
             Some("prompt")
         );
         let off = overlord_args("/r", "/s", "/d", false);

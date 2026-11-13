@@ -51,6 +51,10 @@ use transcript::Format;
 /// (`opencode::overlord_config`).
 pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 
+/// rlord's MCP tools that type into sessions (now or later): with
+/// `[overlord] confirm_sends` each asks the user first, on every agent.
+pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit"];
+
 /// The arguments for `rlord mcp`, talking to the daemon at `socket`.
 pub fn mcp_args(socket: &str) -> Vec<String> {
     vec!["mcp".into(), "--socket".into(), socket.into()]

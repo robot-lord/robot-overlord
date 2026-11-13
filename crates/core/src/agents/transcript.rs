@@ -392,7 +392,13 @@ pub fn limit_hit(path: &Path) -> Option<LimitHit> {
     if format != Format::Claude {
         return None;
     }
-    let tail: Vec<Value> = read_window(path, true)?
+    let text = read_window(path, true)?;
+    // Most tails hold no limit: skip parsing them (`claude::usage_limit`
+    // needs one of these).
+    if !text.contains("usage_limit_reached") && !text.contains("\"rejected\"") {
+        return None;
+    }
+    let tail: Vec<Value> = text
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();

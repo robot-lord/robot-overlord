@@ -136,7 +136,7 @@ runs a command.
   not arbitrary content. Prompt injection would take a setup very
   different from the one rlord is built for. Codex's read-only sandbox
   stops the overlord's shell commands reaching rlord's tmux socket, but not
-  this tool. `[overlord] confirm_sends = true` makes each send ask, for
+  this tool. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for
   anyone who wants that (Claude then lists rlord's tools one by one without
   it; Codex sets that tool's `approval_mode = "prompt"`; OpenCode adds an
   ask rule for `rlord_send_to_session`).
@@ -161,9 +161,11 @@ when it is the configured agent).
 - **In the overlay**: with more than one agent installed, the top row
   shows each agent's marker, the active one highlighted
   (`✻ claude │ >_ codex`). Click one, or press **Option-S** to go to the
-  next (`[tmux] overlord_switch`; "" turns the key off, and so does giving
-  it the same key as `back`, `next`, `prev` or `overlord`). The overlay stays
-  open and shows the other overlord.
+  next overlord that exists (`[tmux] overlord_switch`; "" turns the key
+  off, and so does giving it the same key as `back`, `next`, `prev` or
+  `overlord`). The key never creates one: a click on an agent without an
+  overlord, `:overlord <agent>` or the CLI does. The overlay stays open and
+  shows the other overlord.
 - **In the list**: right-click the overlord's row for "Switch overlord to
   Codex" (one entry per installed agent), or `:overlord codex` in the
   command launcher (`:overlord` lists them).

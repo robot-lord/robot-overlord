@@ -223,8 +223,10 @@ impl SwitchBar {
             if !self.info.is_empty() {
                 tail.push(self.info.clone());
             }
-            if !self.key.is_empty() {
+            if !self.key.is_empty() && self.next().is_some() {
                 tail.push(format!("{} or click to switch", self.key));
+            } else {
+                tail.push("click to switch".into());
             }
             spans.push(Span::styled(
                 format!("  {}", tail.join(" · ")),
@@ -238,11 +240,16 @@ impl SwitchBar {
         (ratatui::text::Line::from(spans), hits)
     }
 
-    /// The agent after the active one (round again at the end).
+    /// The overlord after the active one (round again at the end): only
+    /// agents that have one. The key never creates an overlord; that is
+    /// a click on the row, `:overlord <agent>` or the CLI.
     fn next(&self) -> Option<String> {
         let at = self.agents.iter().position(|a| a.2)?;
-        let next = &self.agents[(at + 1) % self.agents.len()];
-        (!next.2).then(|| next.0.clone())
+        let n = self.agents.len();
+        (1..n)
+            .map(|i| &self.agents[(at + i) % n])
+            .find(|a| a.3)
+            .map(|a| a.0.clone())
     }
 }
 
@@ -1172,6 +1179,20 @@ mod tests {
         bar.agents[0].2 = false;
         bar.agents[1].2 = true;
         assert_eq!(bar.next().as_deref(), Some("claude"), "round again");
+        // The key skips agents without an overlord (it never creates one).
+        bar.agents
+            .push(("opencode".into(), "o".into(), false, false));
+        assert_eq!(bar.next().as_deref(), Some("claude"));
+        bar.agents[0].3 = false;
+        assert_eq!(bar.next(), None);
+        let (line, _) = bar.line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.ends_with("click to switch") && !text.contains("⌥s"),
+            "{text}"
+        );
+        bar.agents[0].3 = true;
+        bar.agents.pop();
         // A failed switch says why, in place of the hints.
         bar.notice = Some("codex isn't installed".into());
         let (line, _) = bar.line();
