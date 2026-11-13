@@ -270,9 +270,9 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
   environment of whatever started the daemon, not the session's. (A daemon
   a pane's TUI started has that pane's `TMUX` / `TMUX_PANE` (seen in its
-  own environment), expected to reach its commands and MCP servers; hooks
-  still match by thread, since the hook client drops `TMUX_PANE` on the
-  gate path.) So a daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so
+  own environment), expected to reach its commands and MCP servers. Its
+  hooks still go by thread: a daemon-mode pane has no `RLORD_SESSION_ID`,
+  so the hook client takes the gate path.) So a daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so
   a daemon its TUI starts can't pass one on), and rlord starts the daemon
   itself (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
   `TMUX_PANE` removed) before such a pane when none runs (asked at most
