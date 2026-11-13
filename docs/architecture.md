@@ -260,8 +260,8 @@ hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
-`--enable`, `--disable` or `--search`, joined forms included, in the TUI's
-own process). So a daemon-mode pane can't be given
+`--enable`, `--disable` (also as `-cK=V` or `--flag=V`) or `--search` in
+the TUI's own process). So a daemon-mode pane can't be given
 `-c check_for_update_on_startup=false` (the overlord's) and, like an
 in-pane session, can open on Codex's update prompt. `spec_args` adds
 `--no-daemon` for every other Codex session. The rest is
@@ -269,8 +269,8 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
   environment of whatever started the daemon, not the session's. (A
-  daemon a pane's TUI started carries that pane's `TMUX` / `TMUX_PANE`
-  into commands and MCP servers; hooks still match by thread, since the
+  daemon a pane's TUI started has that pane's `TMUX` / `TMUX_PANE` (seen
+  in its own environment), expected to reach its commands and MCP servers; hooks still match by thread, since the
   hook client drops `TMUX_PANE` on the gate path.) So a
   daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
   starts can't pass one on), and rlord starts the daemon itself

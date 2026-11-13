@@ -331,8 +331,8 @@ details say "codex: shared server". rlord starts that server itself when
 none runs, and never updates, restarts or stops it; `rlord agents` shows
 its version when it differs from your `codex` (it updates itself). If
 rlord's start fails or is skipped, the pane's Codex may start the server
-instead, and then that pane's tmux variables reach every Codex thread on
-it. Stopping or archiving such a session interrupts its running turn
+instead, and then that pane's tmux variables are in the server's
+environment, which its threads' commands are expected to inherit. Stopping or archiving such a session interrupts its running turn
 first, and says so if it wouldn't stop. The overlord, and a session
 launched with flags that need the pane (`-c` / `--config`, `--enable`,
 `--disable`, `--search`), stay in the pane. Not followed yet on the
