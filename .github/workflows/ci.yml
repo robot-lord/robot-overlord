@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
       - run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}" HEAD
   # Linux on purpose: nothing here needs macOS, and macOS minutes cost 10x.
-  # Release binaries are built locally (scripts/release.sh), not in CI.
+  # Release binaries are built by release.yml (stable) or scripts/release.sh (dev).
   check:
     runs-on: ubuntu-latest
     steps:

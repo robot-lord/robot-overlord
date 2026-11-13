@@ -140,12 +140,13 @@ push, and say in one line per finding what was fixed or why it wasn't.
 Only then merge (when the user has said to). Don't merge a PR the review
 hasn't seen.
 
-## Releases: build locally after every merge to main
+## Releases: cut one after every merge to main
 
-Binaries are built on the maintainer's Apple Silicon Mac and uploaded to
-GitHub Releases; there is no release CI. Linux builds are cross-compiled
-there (`cargo zigbuild`, static musl) and smoke-tested in Docker. Every PR
-merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
+Every PR merged to `main` ships as a release, cut by `scripts/release.sh`.
+Dev builds are built on the maintainer's Apple Silicon Mac. Stable releases
+are built in GitHub Actions (`.github/workflows/release.yml`, started by the
+tag push); the build commands live in `scripts/build-release.sh`, shared
+with the local fallback. CONTRIBUTING.md has the full setup.
 
 - **In each PR:** bump `[workspace.package] version` in `Cargo.toml` and
   commit the regenerated `Cargo.lock`. Ordinary PRs bump to a **development
@@ -170,10 +171,15 @@ merged to `main` ships as a release. CONTRIBUTING.md has the full setup.
   Then report the release URL to the user.
 
   The version decides the kind: a dev build is macOS only and a GitHub
-  pre-release (installed by `[update] channel = "dev"`); a stable release
-  builds macOS + Linux tarballs, `.deb`/`.rpm`, smoke-tests them in Docker
-  (needs `colima start`), uploads with `SHA256SUMS`, updates the Homebrew
-  tap and publishes to crates.io. `release.sh` refuses a dirty tree, HEAD
+  pre-release (installed by `[update] channel = "dev"`), built locally. For
+  a stable release `release.sh` pushes the tag, waits for the workflow
+  (macOS + Linux tarballs, `.deb`/`.rpm`, Docker smoke tests, `SHA256SUMS`,
+  provenance attestations, a draft GitHub Release), verifies the assets
+  and attestations, publishes the draft, then updates the Homebrew tap and publishes to crates.io locally (those
+  tokens aren't in CI). If it stops after the tag is pushed:
+  `scripts/release.sh --resume`. If Actions is down: delete the tag
+  (remote and local), then `scripts/release.sh --local`. `release.sh`
+  runs on macOS only and refuses a dirty tree, HEAD
   not on `origin/main`, or an existing tag (the PR forgot the bump).
 
 ## Documentation

@@ -12,7 +12,16 @@ done, in this order (decided with the user, 2026-11-12):
        non-root user is still open (below, "Before flipping it public").
 2. [x] rlord's own pastes no longer count as the user's prompts
        (0.23.0-dev.5; `daemon/src/own.rs`).
-3. [ ] CI release builds: macOS on a Mac runner, Linux on a Linux runner.
+3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
+       (0.23.0-dev.6; `.github/workflows/release.yml`, shared
+       `scripts/build-release.sh`). Tap and crates.io stay local; moving
+       their tokens into repo secrets is owed. Also owed (PR #25 review):
+       toolchain parity for `--local` (a `rust-toolchain.toml`, pinned
+       zig/cargo-zigbuild/cargo-deb/cargo-generate-rpm versions in
+       CONTRIBUTING to match release.yml); one helper for the version and
+       target list (now repeated in build-release.sh, release.sh,
+       update-tap.sh and release.yml); prebuilt packaging tools in CI
+       instead of `cargo install` on every run.
 4. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
        a scheduled resume, a "limited" list filter, Option-S on the keys
        screen.

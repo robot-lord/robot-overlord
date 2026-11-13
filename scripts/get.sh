@@ -38,7 +38,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 if [ -n "${RLORD_DIST:-}" ]; then
-  tag=$(ls "$RLORD_DIST" | sed -n "s/^rlord-\(v[^-]*\)-$target\.tar\.gz$/\1/p" | head -n1)
+  tag=$(ls "$RLORD_DIST" | sed -n "s/^rlord-\(v.*\)-$target\.tar\.gz$/\1/p" | head -n1)
   [ -n "$tag" ] || die "no $target tarball in $RLORD_DIST"
   cp "$RLORD_DIST/rlord-$tag-$target.tar.gz" "$RLORD_DIST/SHA256SUMS" "$tmp/"
 else
