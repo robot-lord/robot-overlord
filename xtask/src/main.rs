@@ -3,7 +3,7 @@
 //! Anything with real logic lives here rather than in shell: it gets the
 //! same compiler, tests, clippy and fmt as the rest of the code and behaves
 //! the same on macOS and Linux. The scripts end users run on a bare machine
-//! (get.sh, update.sh, install.sh) stay POSIX sh.
+//! stay shell: get.sh (POSIX sh), install.sh and update.sh (bash).
 
 mod build;
 mod bump;
@@ -14,7 +14,7 @@ mod release;
 mod tap;
 mod version;
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -39,9 +39,15 @@ fn main() -> ExitCode {
     // Every task works from the repository root; a path argument is still
     // read from where the command was run.
     let invoked_from = std::env::current_dir().unwrap_or_default();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask sits in the repository root");
+    // `cargo run` sets CARGO_MANIFEST_DIR for the checkout it ran in; the
+    // compile-time one covers running the binary directly.
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let Some(root) = manifest_dir.parent() else {
+        eprintln!("xtask: {} has no parent", manifest_dir.display());
+        return ExitCode::FAILURE;
+    };
     if let Err(e) = std::env::set_current_dir(root) {
         eprintln!("xtask: {}: {e}", root.display());
         return ExitCode::FAILURE;
@@ -66,6 +72,10 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if cmd::is_interrupted(&e) => {
+            eprintln!("{e:#}");
+            ExitCode::from(130)
+        }
         Err(e) if e.downcast_ref::<cmd::Usage>().is_some() => {
             eprintln!("{e}");
             ExitCode::from(2)

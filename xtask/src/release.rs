@@ -215,6 +215,14 @@ pub fn main(args: &[String]) -> Result<()> {
             if mode != Mode::Dev {
                 build::build(Platform::Linux, &dist)?;
             }
+            if mode != Mode::Dev {
+                // What CI's "Check assets" step checks, for a release made here.
+                for asset in ver.workflow_assets() {
+                    if !dist.join(&asset).is_file() {
+                        bail!("the build didn't write {asset}");
+                    }
+                }
+            }
             // Checksums before the smoke test: the installer it runs
             // verifies them.
             write_sums(&dist)?;
@@ -270,8 +278,7 @@ pub fn main(args: &[String]) -> Result<()> {
         "-q",
         ".visibility",
     ]))?;
-    let logged_in = std::env::var_os("HOME")
-        .is_some_and(|home| Path::new(&home).join(".cargo/credentials.toml").is_file());
+    let logged_in = crates_io_token_available();
     if visibility != "PUBLIC" {
         eprintln!("crates.io: {REPO} is private — skipped (publish later with cargo xtask publish-crates)");
     } else if logged_in {
@@ -292,9 +299,16 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     );
     if !resume {
         cmd::run(git().args(["tag", "-f", &tag, head]))?;
-        if cmd::run(git().args(["push", "origin", &format!("refs/tags/{tag}")])).is_err() {
-            cmd::succeeds(git().args(["tag", "-d", &tag]));
-            bail!("pushing {tag} failed (local tag deleted)");
+        match cmd::run(git().args(["push", "origin", &format!("refs/tags/{tag}")])) {
+            Ok(()) => {}
+            // The push may or may not have reached origin.
+            Err(e) if cmd::is_interrupted(&e) => {
+                return Err(e.context(format!("interrupted while pushing {tag}: if `git ls-remote --tags origin {tag}` lists it, cargo xtask release --resume")));
+            }
+            Err(_) => {
+                cmd::succeeds(git().args(["tag", "-d", &tag]));
+                bail!("pushing {tag} failed (local tag deleted)");
+            }
         }
     }
     println!("waiting for the release workflow on {tag}…");
@@ -361,8 +375,12 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         bail!("no release workflow run for {tag} (any late run was cancelled) — check Actions; to build here: {undo}");
     };
     let id = run.id.to_string();
-    if cmd::run(gh().args(["run", "watch", &id, "-R", REPO, "--exit-status"])).is_err() {
-        bail!("release workflow failed: https://github.com/{REPO}/actions/runs/{id} — fix and re-run it (gh workflow run release.yml --ref {tag} -f tag={tag} -f dry_run=false), then cargo xtask release --resume; or {undo}");
+    match cmd::run(gh().args(["run", "watch", &id, "-R", REPO, "--exit-status"])) {
+        Ok(()) => {}
+        Err(e) if cmd::is_interrupted(&e) => {
+            return Err(e.context(format!("stopped watching; the workflow run goes on (https://github.com/{REPO}/actions/runs/{id}): when it finishes, cargo xtask release --resume")));
+        }
+        Err(_) => bail!("release workflow failed: https://github.com/{REPO}/actions/runs/{id} — fix and re-run it (gh workflow run release.yml --ref {tag} -f tag={tag} -f dry_run=false), then cargo xtask release --resume; or {undo}"),
     }
     // CI leaves a draft. Before publishing it, check every asset against
     // the CI-made SHA256SUMS, and the provenance attestation of every file
@@ -410,6 +428,23 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         ]))?;
     }
     Ok(())
+}
+
+/// Whether cargo has a crates.io token: CARGO_REGISTRY_TOKEN, or a
+/// credentials file in CARGO_HOME (default ~/.cargo). Existence only: the
+/// token itself is never read.
+fn crates_io_token_available() -> bool {
+    if std::env::var_os("CARGO_REGISTRY_TOKEN").is_some_and(|t| !t.is_empty()) {
+        return true;
+    }
+    let home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")));
+    home.is_some_and(|h| {
+        ["credentials.toml", "credentials"]
+            .iter()
+            .any(|f| h.join(f).is_file())
+    })
 }
 
 fn release_url(tag: &str) -> String {

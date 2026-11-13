@@ -25,7 +25,7 @@ while read -r local_ref local_sha remote_ref _remote_sha; do
   [[ -z "$(git rev-list -n1 "origin/main..$local_sha")" ]] && continue
   echo "pre-push: checking version bump for ${local_ref#refs/heads/}" >&2
   if [[ $built == 0 ]]; then
-    cargo build -q --package xtask 2>/dev/null ||
+    cargo build -q --package xtask ||
       { echo "pre-push: couldn't build xtask; version bump not checked (CI will)" >&2; exit 0; }
     built=1
   fi

@@ -34,8 +34,9 @@ extern "C" fn on_sigint(_: libc::c_int) {
 /// Make Ctrl-C stop xtask by unwinding, not by killing it, so the `Drop`
 /// guards run (scratch folders removed, manifests put back) as the
 /// scripts' `trap … EXIT` did. The child running at the time gets the
-/// SIGINT itself and exits; `run`, `output` and `sleep` then return an
-/// error.
+/// SIGINT itself and exits; `run`, `output` and `sleep` then return
+/// `Interrupted`, and no new command starts (`succeeds` and
+/// `output_quiet` report failure without running).
 pub fn on_interrupt() {
     let handler = on_sigint as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an atomic.
@@ -44,9 +45,25 @@ pub fn on_interrupt() {
     }
 }
 
+/// Ctrl-C was pressed: exits 130, and is never reported as a failed step.
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+pub fn is_interrupted(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Interrupted>().is_some()
+}
+
 fn check_interrupted() -> Result<()> {
     if INTERRUPTED.load(Ordering::SeqCst) {
-        bail!("interrupted");
+        return Err(Interrupted.into());
     }
     Ok(())
 }
@@ -72,6 +89,7 @@ fn describe(cmd: &Command) -> String {
 
 /// Run with the terminal attached; an error if it fails.
 pub fn run(cmd: &mut Command) -> Result<()> {
+    check_interrupted()?;
     let status = cmd
         .status()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
@@ -84,6 +102,9 @@ pub fn run(cmd: &mut Command) -> Result<()> {
 
 /// Run without output; true if it succeeded.
 pub fn succeeds(cmd: &mut Command) -> bool {
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        return false;
+    }
     cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -92,6 +113,7 @@ pub fn succeeds(cmd: &mut Command) -> bool {
 
 /// Run and return what it printed (trimmed); an error if it fails.
 pub fn output(cmd: &mut Command) -> Result<String> {
+    check_interrupted()?;
     let out = cmd
         .stderr(Stdio::inherit())
         .output()
@@ -105,6 +127,9 @@ pub fn output(cmd: &mut Command) -> Result<String> {
 
 /// Like `output`, with errors hidden: `None` if it fails.
 pub fn output_quiet(cmd: &mut Command) -> Option<String> {
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        return None;
+    }
     let out = cmd.stderr(Stdio::null()).output().ok()?;
     out.status
         .success()
