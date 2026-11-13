@@ -295,13 +295,14 @@ hooks and `discover` keep the stored status to themselves.
   from it is saved; a tail without `usage_limit_reached` or `"rejected"`
   isn't parsed; a record with no readable time is dated when first
   seen, `limits::dated`);
-  kv `limits` holds the current ones, and rows carry `limit`
-  (`limits::annotate`).
+  kv `limits` holds the current ones, each until a minute past its
+  reset (`limits::held`), and rows carry `limit` (`limits::annotate`:
+  "resuming soon" once the reset time has passed).
 - **Nothing else is typed into a limited session** (it would only get
   another limit reply). `send_to_session` refuses it ("stopped on a usage
   limit until …"); with `when_idle`, and for a message already queued,
-  it waits for the reset (`send::refusal`/`next`, from
-  `limits::limited`). Its hook state reads `idle` all the same.
+  it waits for the reset plus a minute, as a resume does
+  (`send::refusal`/`next`, from `limits::limited`). Its hook state reads `idle` all the same.
 - **Resuming is only ever asked for** (`limits.resume`: the
   `resume_after_limit` tool, `rlord resume-after-limit`, the list's
   menu). Each session gets a job in kv `limit_resume`, so a daemon

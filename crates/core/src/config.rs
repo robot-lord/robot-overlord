@@ -130,6 +130,13 @@ pub struct TmuxKeys {
     /// (Option in some macOS terminals). An imported profile's own `mouse`
     /// setting wins in agent sessions.
     pub mouse: bool,
+    /// `RLORD_TMUX_PROFILE` (`default` or `imported`) as the `rlord` that
+    /// opened the list had it: a testing override that wins over the
+    /// config and each session's own choice. Never read from or written
+    /// to config.toml; the daemon sets it (`tmux.profile_mode`) and keeps
+    /// it across reloads.
+    #[serde(skip)]
+    pub profile_env: Option<String>,
 }
 
 impl Default for TmuxKeys {
@@ -142,6 +149,7 @@ impl Default for TmuxKeys {
             overlord_switch: "M-s".into(),
             profile: true,
             mouse: true,
+            profile_env: None,
         }
     }
 }

@@ -143,6 +143,15 @@ impl Daemon {
         self.tui_subscribers.load(Ordering::SeqCst)
     }
 
+    /// Swap the config for one changed by `f` (a copy: readers holding the
+    /// old one keep it).
+    pub(crate) fn update_config(&self, f: impl FnOnce(&mut Config)) {
+        let mut w = self.config.write().expect("config lock");
+        let mut cfg = (**w).clone();
+        f(&mut cfg);
+        *w = Arc::new(cfg);
+    }
+
     /// The config as last loaded.
     pub fn config(&self) -> Arc<Config> {
         self.config.read().expect("config lock").clone()
@@ -151,7 +160,9 @@ impl Daemon {
     /// Re-read config.toml (the key screen saved it) and re-apply what
     /// depends on it: the global keys and each session's key hints.
     pub(crate) fn reload_config(&self) -> Result<Value> {
-        let cfg = Config::load()?;
+        let mut cfg = Config::load()?;
+        // (Not in the file: the `rlord` that opened the list set it.)
+        cfg.tmux.profile_env = self.config().tmux.profile_env.clone();
         *self.config.write().expect("config lock") = Arc::new(cfg);
         self.bind_nav_keys();
         profile::sync_all(self, false);

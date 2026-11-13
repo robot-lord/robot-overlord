@@ -509,13 +509,24 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
             json!({"continued": conv, "switched_to": agent, "session": switched}),
         ));
     }
-    // Its agent must still be installed: else it couldn't start, and the
-    // user would be left on an overlord that can't run.
-    if let Some(why) =
-        rlord_core::agents::install::missing(rlord_core::agents::Agent::named(&p.o.agent)?)
-    {
+    // `continue_conversation`'s checks first, so a switch that can't
+    // carry on is never made: its agent installed (else it couldn't
+    // start), the conversation's transcript still there, between turns.
+    if let Some(why) = rlord_core::agents::install::missing(Agent::named(&p.o.agent)?) {
         bail!("{why}");
     }
+    let before = d.db().resolve_ref(&p.o.id)?;
+    if transcript_of(&d.db(), &before, &conv).is_none() {
+        bail!("that conversation's transcript is no longer on disk");
+    }
+    if !matches!(
+        before.status,
+        Status::Idle | Status::WaitingInput | Status::Stopped
+    ) {
+        bail!("the {agent} overlord is busy: continue it once its turn is over");
+    }
+    let source = d.db().transcript_source(&before.id)?;
+    let was_running = running(&before);
     // Made active without starting it: `continue_conversation` then starts
     // (or restarts) it once, onto that conversation.
     let activate = |id: &str, from: String| -> Result<()> {
@@ -529,8 +540,28 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     let mut v = match continue_conversation(d, &json!({"id": conv})) {
         Ok(v) => v,
         Err(e) => {
-            // Back to the overlord the user was on.
-            activate(&active.id, p.o.agent.clone())?;
+            // Back as it was: the user's overlord active again, and this
+            // one on its own conversation, stopped if it was.
+            let undo = || -> Result<()> {
+                {
+                    let _session = d.sessions.lock(&before.id);
+                    let db = d.db();
+                    if let Some(prev) = before.agent_session.as_deref() {
+                        db.set_agent_session(&before.id, prev, &before.agent_session_trust)?;
+                    }
+                    if let Some(src) = source.as_deref() {
+                        db.upsert_transcript_source(&before.id, src)?;
+                    }
+                    let now = db.resolve_ref(&before.id)?;
+                    if !was_running && running(&now) {
+                        crate::methods::session_stop(&db, &json!({"ref": before.id}))?;
+                    }
+                }
+                activate(&active.id, p.o.agent.clone())
+            };
+            if let Err(u) = undo() {
+                tracing::warn!(error = %u, "undoing a failed switch to continue a conversation");
+            }
             d.bind_nav_keys();
             d.changed();
             return Err(e);
@@ -538,6 +569,14 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     };
     v["switched_to"] = json!(agent);
     Ok(Some(v))
+}
+
+/// Its pane is up (not stopped, its tmux session there).
+fn running(s: &Session) -> bool {
+    s.status != Status::Stopped
+        && s.tmux_session
+            .as_deref()
+            .is_some_and(rlord_core::tmux::has_session)
 }
 
 /// `overlord.continue {id}`: go back to an earlier conversation. The
@@ -581,12 +620,7 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     // Exactly one restart onto the conversation: `ensure` restarts it when
     // it isn't running (stopped, or its pane is gone) and leaves a running
     // one alone, which is restarted here.
-    let cur = db.resolve_ref(&o.id)?;
-    let running = cur.status != Status::Stopped
-        && cur
-            .tmux_session
-            .as_deref()
-            .is_some_and(rlord_core::tmux::has_session);
+    let running = running(&db.resolve_ref(&o.id)?);
     let v = overlord::ensure(&db, &d.config(), &json!({}))?;
     let v = if running {
         crate::methods::session_restart(&db, &json!({"ref": o.id}))?

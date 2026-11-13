@@ -136,6 +136,8 @@ struct SwitchBar {
     key: String,
     /// Why the last switch failed.
     notice: Option<String>,
+    /// A passing word in place of the switch hint (`ONLY_ONE`).
+    hint: Option<String>,
 }
 
 impl View {
@@ -178,6 +180,7 @@ impl View {
             limited: limit.is_some(),
             key: keys.switch.as_ref().map(|k| k.label()).unwrap_or_default(),
             notice,
+            hint: None,
         });
         View { tmux, bar }
     }
@@ -224,7 +227,9 @@ impl SwitchBar {
             if !self.info.is_empty() {
                 tail.push(self.info.clone());
             }
-            if !self.key.is_empty() && self.next().is_some() {
+            if let Some(h) = &self.hint {
+                tail.push(h.clone());
+            } else if !self.key.is_empty() && self.next().is_some() {
                 tail.push(format!("{} or click to switch", self.key));
             } else {
                 tail.push("click to switch".into());
@@ -254,8 +259,10 @@ impl SwitchBar {
     }
 }
 
-/// Shown when the switch key is pressed with only one overlord.
+/// Shown for `HINT_FOR` when the switch key is pressed with only one
+/// overlord.
 const ONLY_ONE: &str = "only one overlord: open :overlord <agent> to add another";
+const HINT_FOR: Duration = Duration::from_secs(4);
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
@@ -346,7 +353,14 @@ fn run_loop(
     let mut cursor: Option<(u16, u16)> = None;
     let mut error: Option<String> = None;
     let mut last = Instant::now() - Duration::from_secs(1);
+    // When a passing hint on the switcher goes.
+    let mut hint_until: Option<Instant> = None;
     loop {
+        if hint_until.is_some_and(|t| Instant::now() >= t) {
+            hint_until = None;
+            switcher = view.bar.as_ref().map(|b| b.line());
+            last = Instant::now() - Duration::from_secs(1);
+        }
         let area = terminal.size()?;
         if (area.width, area.height) != size && area.width > 0 && area.height > 0 {
             size = (area.width, area.height);
@@ -574,8 +588,9 @@ fn run_loop(
                         Some(agent) => return Ok(Exit::Switch(agent)),
                         None => {
                             let mut b = bar.clone();
-                            b.notice = Some(ONLY_ONE.into());
+                            b.hint = Some(ONLY_ONE.into());
                             switcher = Some(b.line());
+                            hint_until = Some(Instant::now() + HINT_FOR);
                             last = Instant::now() - Duration::from_secs(1);
                             continue;
                         }
@@ -1164,6 +1179,7 @@ mod tests {
             limited: false,
             key: "⌥s".into(),
             notice: None,
+            hint: None,
         };
         let (line, hits) = bar.line();
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1201,6 +1217,16 @@ mod tests {
             text.ends_with("click to switch") && !text.contains("⌥s"),
             "{text}"
         );
+        // The switch key with one overlord: a passing hint, the info kept.
+        bar.info = "out of usage until 3:00pm: switch to another".into();
+        bar.hint = Some(ONLY_ONE.into());
+        let (line, _) = bar.line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("out of usage until 3:00pm") && text.ends_with(ONLY_ONE),
+            "{text}"
+        );
+        bar.hint = None;
         bar.agents[0].3 = true;
         bar.agents.pop();
         // A failed switch says why, in place of the hints.

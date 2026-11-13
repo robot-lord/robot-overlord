@@ -1209,13 +1209,26 @@ pub fn bind_nav_keys(
     Ok(conflicts)
 }
 
-/// Put the status click back as tmux has it: its default in root, none in
-/// the profile table (best effort: no server, nothing to reset).
+/// Undo rlord's status click (`bind_nav_keys` with mouse on), and only
+/// rlord's: a click the user bound themselves, in root or in their
+/// profile's table, is left as it is. Root gets tmux's default back; the
+/// profile table (no fallback to root) loses rlord's. Best effort: no
+/// server, nothing to undo.
 fn reset_status_click() {
-    let mut args = vec!["bind-key", "-T", "root", STATUS_CLICK];
-    args.extend(STATUS_CLICK_DEFAULT.split(' '));
-    let _ = run(&args);
-    let _ = run(&["unbind-key", "-T", PROFILE_TABLE, STATUS_CLICK]);
+    for table in ["root", PROFILE_TABLE] {
+        let bound = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap_or_default();
+        let ours = bound.contains("mouse_status_range") && bound.contains(" nav ");
+        if !ours {
+            continue;
+        }
+        if table == "root" {
+            let mut args = vec!["bind-key", "-T", "root", STATUS_CLICK];
+            args.extend(STATUS_CLICK_DEFAULT.split(' '));
+            let _ = run(&args);
+        } else {
+            let _ = run(&["unbind-key", "-T", table, STATUS_CLICK]);
+        }
+    }
 }
 
 /// The status-line mouse key rlord binds for its clickable hints.
@@ -1577,14 +1590,39 @@ mod tests {
             let root = run(&["list-keys", "-T", "root", STATUS_CLICK]).unwrap();
             assert!(!root.contains("rlord"), "{root}");
             assert!(root.contains("switch-client -t ="), "{root}");
-            let mine = run(&["list-keys", "-T", PROFILE_TABLE]).unwrap_or_default();
-            assert!(!mine.contains(STATUS_CLICK), "{mine}");
+            let mine = run(&["list-keys", "-T", PROFILE_TABLE, STATUS_CLICK]).unwrap_or_default();
+            assert!(!mine.contains(" nav "), "{mine}");
         };
         bind_nav_keys("/bin/rl'x", &[("M-d", "home")], false).unwrap();
         restored();
         bind_nav_keys("/bin/rl'x", &[("M-d", "home")], true).unwrap();
         unbind_nav_keys(&[("M-d", "home")]).unwrap();
         restored();
+        // A click the user bound themselves stays, in either table.
+        run(&[
+            "bind-key",
+            "-T",
+            "root",
+            STATUS_CLICK,
+            "display-message",
+            "mine",
+        ])
+        .unwrap();
+        run(&[
+            "bind-key",
+            "-T",
+            PROFILE_TABLE,
+            STATUS_CLICK,
+            "display-message",
+            "mine",
+        ])
+        .unwrap();
+        bind_nav_keys("/bin/rl'x", &[("M-d", "home")], false).unwrap();
+        unbind_nav_keys(&[("M-d", "home")]).unwrap();
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(k.contains("mine"), "{k}");
+        }
 
         kill_session(name).unwrap();
         assert!(!has_session(name));

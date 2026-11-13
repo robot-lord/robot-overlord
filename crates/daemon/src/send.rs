@@ -173,7 +173,7 @@ fn refusal(s: &Session, limited: Option<i64>) -> Option<String> {
         return Some(format!(
             "{} is stopped on a usage limit until {}",
             s.name,
-            rlord_core::timefmt::clock(t)
+            crate::limits::until(t, now_ms())
         ));
     }
     match s.status {
@@ -217,12 +217,14 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         overlay: overlay.as_deref(),
         draft: true,
     };
-    let r = type_into(&s.id, &pane, text, &checks)?;
-    if matches!(r, Typed::Done) {
-        // (So the prompt it makes isn't taken for the user's.)
-        d.limits.note_typed(&s.id, now_ms());
+    // Noted before the paste (the prompt's stamp can come before Enter
+    // returns), so the prompt it makes isn't taken for the user's.
+    let prev = crate::limits::before_typing(d, s);
+    let r = type_into(&s.id, &pane, text, &checks);
+    if !matches!(r, Ok(Typed::Done)) {
+        crate::limits::typing_failed(d, &s.id, prev);
     }
-    Ok(r)
+    r
 }
 
 /// `session.send {ref, text, when_idle}`.

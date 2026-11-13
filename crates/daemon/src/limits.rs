@@ -60,6 +60,9 @@ const WATCH_MS: i64 = 15 * 60_000;
 const GIVE_UP_MS: i64 = 60 * 60_000;
 /// After a send, a prompt seen within this long is our own message.
 const OWN_PROMPT_MS: i64 = 30_000;
+/// Clock slack the other way: a prompt stamped this long before rlord
+/// noted it was typing is still rlord's.
+const TYPED_EARLY_MS: i64 = 2_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
@@ -80,24 +83,58 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// rlord typed a message into the session at `at`.
-    pub fn note_typed(&self, id: &str, at: i64) {
-        self.typed
-            .lock()
-            .expect("limits mutex")
-            .insert(id.to_string(), at);
-    }
-
     fn typed_at(&self, id: &str) -> Option<i64> {
         self.typed.lock().expect("limits mutex").get(id).copied()
     }
+
+    fn set_typed(&self, id: &str, at: Option<i64>) {
+        let mut t = self.typed.lock().expect("limits mutex");
+        match at {
+            Some(at) => t.insert(id.to_string(), at),
+            None => t.remove(id),
+        };
+    }
 }
 
-/// The session's last prompt, if the user typed it: one within
-/// `OWN_PROMPT_MS` after rlord typed into it (`own`) is rlord's.
+/// rlord is about to type into `s` (`send::type_message`, under its
+/// lock). The prompt it makes must not read as the user's, but it will
+/// replace `last_user_msg_at`: a prompt of the user's there now is kept
+/// on the session's resume job first (`user_at`), so a takeover sticks.
+/// Returns what to pass to `typing_failed` if nothing gets typed.
+pub fn before_typing(d: &Daemon, s: &Session) -> Option<i64> {
+    let prev = d.limits.typed_at(&s.id);
+    if let Some(t) = user_prompt_at(s, prev) {
+        let db = d.db();
+        if let Ok(mut jobs) = kv_map(&db, JOBS_KEY) {
+            if let Some(job) = jobs.get_mut(&s.id).and_then(Value::as_object_mut) {
+                if job.get("user_at").and_then(Value::as_i64) < Some(t) {
+                    job.insert("user_at".into(), json!(t));
+                    let _ = save_map(&db, JOBS_KEY, &jobs);
+                }
+            }
+        }
+    }
+    d.limits.set_typed(&s.id, Some(now_ms()));
+    prev
+}
+
+/// Nothing was typed after `before_typing` after all: forget it.
+pub fn typing_failed(d: &Daemon, id: &str, prev: Option<i64>) {
+    d.limits.set_typed(id, prev);
+}
+
+/// The session's last prompt, if the user typed it: one from
+/// `TYPED_EARLY_MS` before rlord started typing into it (`own`) to
+/// `OWN_PROMPT_MS` after is rlord's.
 fn user_prompt_at(s: &Session, own: Option<i64>) -> Option<i64> {
     s.last_user_msg_at
-        .filter(|t| !own.is_some_and(|o| *t >= o && *t - o <= OWN_PROMPT_MS))
+        .filter(|t| !own.is_some_and(|o| *t >= o - TYPED_EARLY_MS && *t - o <= OWN_PROMPT_MS))
+}
+
+/// The latest prompt the user typed: the session's, or one kept on the
+/// job before rlord typed over it (`before_typing`).
+fn user_since(job: &Value, s: &Session, own: Option<i64>) -> Option<i64> {
+    user_prompt_at(s, own).max(job["user_at"].as_i64())
 }
 
 fn kv_map(db: &Db, key: &str) -> Result<Map<String, Value>> {
@@ -119,7 +156,8 @@ fn save_map(db: &Db, key: &str, m: &Map<String, Value>) -> Result<()> {
 /// The limit a session is stopped on, from what its transcript says
 /// (`hit`): None once the conversation went on or the limit has reset.
 fn current(hit: Option<&LimitHit>, now: i64) -> Option<Value> {
-    let h = hit.filter(|h| !h.touched && h.resets_at > now)?;
+    // (Kept a minute past the reset, as long as messages are held.)
+    let h = hit.filter(|h| !h.touched && held(h.resets_at, now))?;
     Some(json!({"at": h.at, "resets_at": h.resets_at, "kind": h.kind}))
 }
 
@@ -166,13 +204,18 @@ pub fn held(resets_at: i64, now: i64) -> bool {
 /// one it would read as long past, and its job be dropped at once.
 /// `job` is a resume job's `(limit_at, resets_at)`: once `scan` has
 /// dropped the reset limit, the job still knows when it was first seen
-/// (else the hit would read as new on every tick, and be rescheduled).
+/// (else the hit would read as new on every tick, and be rescheduled),
+/// also after a reschedule onto a hit whose reset had already passed.
 fn dated(mut h: LimitHit, known: Option<&Value>, job: Option<(i64, i64)>, now: i64) -> LimitHit {
     if h.at <= 0 {
         h.at = known
             .filter(|k| k["resets_at"].as_i64() == Some(h.resets_at))
             .and_then(|k| k["at"].as_i64())
-            .or_else(|| job.filter(|j| j.1 == h.resets_at).map(|j| j.0))
+            // (A job rescheduled onto this hit stored `resets_at.max(at)`.)
+            .or_else(|| {
+                job.filter(|j| j.1 == h.resets_at || j.1 == h.resets_at.max(j.0))
+                    .map(|j| j.0)
+            })
             .unwrap_or(now);
     }
     h
@@ -221,7 +264,7 @@ fn scan(d: &Daemon) -> Result<()> {
             // Nothing new was written: only the clock can end it.
             before
                 .get(id)
-                .filter(|l| l["resets_at"].as_i64().is_some_and(|t| t > now))
+                .filter(|l| l["resets_at"].as_i64().is_some_and(|t| held(t, now)))
                 .cloned()
         } else {
             let hit = transcript::limit_hit(path).map(|h| dated(h, before.get(id), None, now));
@@ -248,6 +291,16 @@ fn scan(d: &Daemon) -> Result<()> {
     Ok(())
 }
 
+/// When a limit ends, as rows show it: its time, or "soon" in the minute
+/// after it (still held, `held`).
+pub fn until(resets_at: i64, now: i64) -> String {
+    if resets_at > now {
+        clock(resets_at)
+    } else {
+        "soon".into()
+    }
+}
+
 /// Annotate list rows with `limit`: `{resets_at, until, kind, resume}`
 /// for a session stopped on a usage limit (`resume`: a job will pick it
 /// up), else null.
@@ -262,9 +315,9 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
         row["limit"] = match limits.get(id) {
-            Some(l) if l["resets_at"].as_i64().is_some_and(|t| t > now) => json!({
+            Some(l) if l["resets_at"].as_i64().is_some_and(|t| held(t, now)) => json!({
                 "resets_at": l["resets_at"],
-                "until": clock(l["resets_at"].as_i64().unwrap_or(0)),
+                "until": until(l["resets_at"].as_i64().unwrap_or(0), now),
                 "kind": l["kind"],
                 "resume": jobs.contains_key(id),
             }),
@@ -393,7 +446,7 @@ fn step(
     let newer = hit.filter(|h| h.at > limit_at && !h.touched);
     if let Some(sent) = job["sent_at"].as_i64() {
         // The user typed since (past our own message's echo): theirs now.
-        if user_prompt_at(s, own).is_some_and(|t| t > sent + OWN_PROMPT_MS) {
+        if user_since(job, s, own).is_some_and(|t| t > sent + OWN_PROMPT_MS) {
             return Step::Drop("the user took the session over after the resume", true);
         }
         return match newer {
@@ -415,10 +468,10 @@ fn step(
         // written since.)
         _ => true,
     };
-    if touched || user_prompt_at(s, own).is_some_and(|t| t > limit_at) {
+    if touched || user_since(job, s, own).is_some_and(|t| t > limit_at) {
         return Step::Drop("the session was used since the limit hit", false);
     }
-    if now < resets_at + MARGIN_MS {
+    if held(resets_at, now) {
         return Step::Wait;
     }
     if s.status == Status::Stopped {
@@ -443,6 +496,12 @@ fn step(
 
 fn run_jobs(d: &Daemon) -> Result<()> {
     let ids: Vec<String> = kv_map(&d.db(), JOBS_KEY)?.keys().cloned().collect();
+    // Only sessions with a job need rlord's typing told apart.
+    d.limits
+        .typed
+        .lock()
+        .expect("limits mutex")
+        .retain(|id, _| ids.contains(id));
     for id in ids {
         if let Err(e) = run_job(d, &id) {
             tracing::debug!(session = %id, error = %e, "limit resume job");
@@ -579,7 +638,12 @@ mod tests {
     fn limited_until_it_resets_or_the_conversation_goes_on() {
         assert!(current(Some(&hit(1_000, 9_000, false)), 2_000).is_some());
         assert_eq!(current(Some(&hit(1_000, 9_000, true)), 2_000), None);
-        assert_eq!(current(Some(&hit(1_000, 9_000, false)), 9_000), None);
+        // Kept for the margin past its reset, then gone.
+        assert!(current(Some(&hit(1_000, 9_000, false)), 9_000).is_some());
+        assert_eq!(
+            current(Some(&hit(1_000, 9_000, false)), 9_000 + MARGIN_MS),
+            None
+        );
         assert_eq!(current(None, 2_000), None);
     }
 
@@ -717,6 +781,19 @@ mod tests {
             step(&sent, Some(&typed), Some(&again), Some(200_000), 400_000),
             Step::Drop(_, true)
         ));
+        // Stamped a little before rlord noted it was typing: still rlord's.
+        assert_eq!(
+            step(&sent, Some(&typed), Some(&again), Some(301_500), 400_000),
+            Step::Reschedule(175_000, 900_000)
+        );
+        // The user typed, then rlord typed over it (`before_typing` kept
+        // theirs on the job): the takeover sticks.
+        let mut kept = sent.clone();
+        kept["user_at"] = json!(250_000);
+        assert!(matches!(
+            step(&kept, Some(&typed), Some(&again), Some(299_000), 400_000),
+            Step::Drop(_, true)
+        ));
         // Before the resume too: rlord's prompt isn't "used since".
         let waiting = json!({"limit_at": 1_000, "resets_at": 100_000});
         let fresh = hit(1_000, 100_000, false);
@@ -724,6 +801,19 @@ mod tests {
             step(&waiting, Some(&typed), Some(&fresh), Some(299_500), 400_000),
             Step::Send
         );
+        // An undated hit whose reset has passed: rescheduled once, then
+        // recognised (not "hit again" on every tick).
+        let stale = hit(0, 150_000, false);
+        let now = 200_000;
+        let h1 = dated(stale.clone(), None, Some((1_000, 100_000)), now);
+        let Step::Reschedule(at, resets) = step(&sent, Some(&idle), Some(&h1), None, now) else {
+            panic!("expected a reschedule");
+        };
+        let job2 = json!({"message": "continue", "limit_at": at, "resets_at": resets,
+                          "attempts": 1});
+        let later = now + MARGIN_MS;
+        let h2 = dated(stale, None, Some((at, resets)), later);
+        assert_eq!(step(&job2, Some(&idle), Some(&h2), None, later), Step::Send);
         // Not for ever.
         let mut many = sent.clone();
         many["attempts"] = json!(MAX_ATTEMPTS);
@@ -740,34 +830,72 @@ mod tests {
         );
     }
 
+    /// A transcript line: the agent stopped on a limit resetting at
+    /// `resets_s` (seconds).
+    fn limit_line(resets_s: i64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{{"content":[{{"type":"text","text":"x"}}]}},"apiError":"usage_limit_reached","apiErrorParams":{{"rate_limit_info":{{"status":"rejected","resetsAt":{resets_s},"rateLimitType":"five_hour"}}}},"error":"rate_limit","isApiErrorMessage":true}}"#
+        )
+    }
+
+    /// A daemon with one session `s1` whose transcript is `path`.
+    fn daemon_with(path: &Path) -> Arc<Daemon> {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "s1",
+            name: "web",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.upsert_transcript_source("s1", path.to_str().unwrap())
+            .unwrap();
+        Daemon::new(db, rlord_core::config::Config::default())
+    }
+
+    /// Just past its reset, a limit still holds messages (and shows
+    /// "soon") for the margin, through `scan`; after it, it's gone.
+    #[test]
+    fn a_reset_limit_is_held_for_the_margin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let now_s = now_ms() / 1000;
+        std::fs::write(&path, format!("{}\n", limit_line(now_s - 10))).unwrap();
+        let d = daemon_with(&path);
+        scan(&d).unwrap();
+        assert!(limited(&d).contains_key("s1"));
+        let mut rows = [json!({"id": "s1"})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["limit"]["until"], "soon");
+        // Unchanged file, next tick: still held.
+        scan(&d).unwrap();
+        assert!(limited(&d).contains_key("s1"));
+        // Past the margin: released.
+        let path2 = dir.path().join("t2.jsonl");
+        let old = now_s - MARGIN_MS / 1000 - 5;
+        std::fs::write(&path2, format!("{}\n", limit_line(old))).unwrap();
+        let d = daemon_with(&path2);
+        scan(&d).unwrap();
+        assert!(!limited(&d).contains_key("s1"));
+    }
+
     /// Scans at once (the tick and a `limits.resume`) never lose a limit
     /// one of them read.
     #[test]
     fn concurrent_scans_keep_the_limit() {
-        const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-12T18:40:58.108Z","message":{"content":[{"type":"text","text":"x"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":99999999999,"rateLimitType":"five_hour"}},"error":"rate_limit","isApiErrorMessage":true}"#;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.jsonl");
-        std::fs::write(&path, format!("{LINE}\n")).unwrap();
+        std::fs::write(&path, format!("{}\n", limit_line(99999999999))).unwrap();
         for _ in 0..20 {
-            let db = Db::open_in_memory().unwrap();
-            db.insert_session(&rlord_core::db::NewSession {
-                id: "s1",
-                name: "web",
-                agent: "claude",
-                agent_session: None,
-                project_path: "/tmp",
-                tmux_session: None,
-                launch_spec: "{}",
-                created_at: 1,
-                repo_path: None,
-                workspace_path: None,
-                branch: None,
-                role: "",
-            })
-            .unwrap();
-            db.upsert_transcript_source("s1", path.to_str().unwrap())
-                .unwrap();
-            let d = Daemon::new(db, rlord_core::config::Config::default());
+            let d = daemon_with(&path);
             let threads: Vec<_> = (0..4)
                 .map(|_| {
                     let d = Arc::clone(&d);
