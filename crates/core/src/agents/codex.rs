@@ -677,6 +677,97 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     }
 }
 
+// ---- usage limits ----
+//
+// Codex 0.167 writes no line of its own for a usage limit: its `error`
+// event is not kept in the rollout (`rollout/src/policy.rs`,
+// `persisted_event_msg`). Two lines that are kept tell it:
+//
+// - the turn's `task_complete` carries the error that ended it
+//   (`core/src/tasks/mod.rs`, from the turn's `terminal_error`), and a
+//   usage limit's `codex_error_info` is `"usage_limit_exceeded"`
+//   (`protocol/src/error.rs`, `to_codex_protocol_error`);
+// - just before it, a `token_count` with the limit's snapshot from the
+//   429's headers (`core/src/session/turn.rs`: `UsageLimitReached` calls
+//   `update_rate_limits`), the exhausted window at `used_percent` 100
+//   (`core/tests/suite/client.rs`, `usage_limit_error_emits_rate_limit_event`).
+//
+// The error's own reset time is only in its text ("try again at 3:00
+// PM"), which is never parsed. The reset is the exhausted window's
+// `resets_at` (epoch seconds); the 429's headers in Codex's tests carry
+// none, so failing that, the same window's `resets_at` from an earlier
+// `token_count` (every answer's headers carry it).
+
+/// The turn ended on a usage limit: a `task_complete` (`turn_complete`
+/// in v2) whose error is `usage_limit_exceeded`. That error also covers
+/// an API key out of quota, which has no reset: `limit_reset` tells.
+pub(crate) fn limit_ended(v: &Value) -> bool {
+    event(v, "task_complete")
+        .or_else(|| event(v, "turn_complete"))
+        .is_some_and(|p| p["error"]["codex_error_info"] == "usage_limit_exceeded")
+}
+
+/// When the limit that ended the turn at `before.len()` resets (ms), and
+/// which window it was (`five_hour`, `seven_day`, …), from the
+/// `token_count` lines before it (oldest first; `at`: when it hit, ms).
+pub(crate) fn limit_reset(before: &[Value], at: i64) -> Option<(i64, String)> {
+    // The limit's own snapshot: the turn's last one (not one from before
+    // the turn began).
+    let turn = before
+        .iter()
+        .rposition(|v| event(v, "task_started").is_some() || event(v, "turn_started").is_some())
+        .unwrap_or(0);
+    let own = *snapshots(&before[turn..]).first()?;
+    let earlier = snapshots(before);
+    let mut best: Option<(i64, String)> = None;
+    for w in windows(own).filter(|w| w["used_percent"].as_f64().is_some_and(|p| p >= 100.0)) {
+        let minutes = w["window_minutes"].as_i64();
+        let resets_s = w["resets_at"].as_i64().or_else(|| {
+            // The same window, as an earlier answer described it.
+            earlier
+                .iter()
+                .filter(|r| r["limit_id"] == own["limit_id"])
+                .flat_map(|r| windows(r))
+                .filter(|e| minutes.is_some() && e["window_minutes"].as_i64() == minutes)
+                .find_map(|e| e["resets_at"].as_i64().filter(|s| s * 1000 > at))
+        });
+        let Some(resets_s) = resets_s else { continue };
+        if best.as_ref().is_none_or(|(b, _)| resets_s * 1000 > *b) {
+            best = Some((resets_s * 1000, window_kind(minutes)));
+        }
+    }
+    best
+}
+
+/// The `token_count` lines' rate-limit snapshots, newest first.
+fn snapshots(lines: &[Value]) -> Vec<&Value> {
+    lines
+        .iter()
+        .rev()
+        .filter_map(|v| event(v, "token_count"))
+        .map(|p| &p["rate_limits"])
+        .filter(|r| r.is_object())
+        .collect()
+}
+
+/// A snapshot's windows (`primary`, `secondary`) that are there.
+fn windows(r: &Value) -> impl Iterator<Item = &Value> {
+    ["primary", "secondary"]
+        .into_iter()
+        .map(move |w| &r[w])
+        .filter(|w| w.is_object())
+}
+
+/// A window's length in the words Claude Code uses for its limits.
+fn window_kind(minutes: Option<i64>) -> String {
+    match minutes {
+        Some(300) => "five_hour".into(),
+        Some(10080) => "seven_day".into(),
+        Some(m) => format!("{m}_minute"),
+        None => String::new(),
+    }
+}
+
 // ---- models ----
 
 /// The models Codex offers in its own picker, best first, from the catalog

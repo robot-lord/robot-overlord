@@ -2,9 +2,10 @@
 //!
 //! **Seeing it** is plain code. An agent that hits its usage limit ends the
 //! turn with a record of it in its transcript, reset time included
-//! (`transcript::limit_hit`; Claude Code only so far). A slow tick looks at
-//! the tail of every live session's transcript that changed since the last
-//! look, and keeps what it finds in kv `limits`: `{session id: {at,
+//! (`transcript::limit_hit`: Claude Code, Codex, OpenCode). A slow tick
+//! looks at the tail of every live session's transcript that changed since
+//! the last look (an OpenCode conversation's last rows every tick), and
+//! keeps what it finds in kv `limits`: `{session id: {at,
 //! resets_at, kind}}`. A session is **limited** from then until the limit
 //! resets or the conversation goes on (a prompt, an answer), whichever is
 //! first. The list shows it in place of the status ("limited until
@@ -37,7 +38,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-use rlord_core::agents::transcript::{self, LimitHit};
+use rlord_core::agents::transcript::{self, Format, LimitHit};
 use rlord_core::db::{ArchivedMode, SessionQuery};
 use rlord_core::timefmt::clock;
 use rlord_core::types::{now_ms, Session, Status};
@@ -200,13 +201,19 @@ fn scan(d: &Daemon) -> Result<()> {
         let stamp = std::fs::metadata(path)
             .ok()
             .map(|m| (m.len(), m.modified().ok()));
-        let Some(stamp) = stamp else {
-            continue; // (not a file: OpenCode's database, or gone)
+        let unchanged = match stamp {
+            Some(stamp) => {
+                let same = d.limits.seen.lock().expect("limits mutex").get(id) == Some(&stamp);
+                if !same {
+                    stamps.push((id.clone(), stamp));
+                }
+                same
+            }
+            // OpenCode's conversations are rows, not files: read every
+            // tick (two indexed look-ups).
+            None if Format::of(path) == Format::OpenCode => false,
+            None => continue, // (gone)
         };
-        let unchanged = d.limits.seen.lock().expect("limits mutex").get(id) == Some(&stamp);
-        if !unchanged {
-            stamps.push((id.clone(), stamp));
-        }
         let state = if unchanged {
             // Nothing new was written: only the clock can end it.
             before
@@ -802,6 +809,41 @@ mod tests {
         let old = now_s - MARGIN_MS / 1000 - 5;
         std::fs::write(&path2, format!("{}\n", limit_line(old))).unwrap();
         let d = daemon_with(&path2);
+        scan(&d).unwrap();
+        assert!(!limited(&d).contains_key("s1"));
+    }
+
+    /// An OpenCode conversation is rows in its database, not a file: read
+    /// on every tick, so a prompt after the limit ends it at the next one.
+    #[test]
+    fn an_opencode_limit_is_seen_in_its_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, \
+               type text NOT NULL, seq integer NOT NULL, time_created integer NOT NULL, \
+               time_updated integer NOT NULL, data text NOT NULL);",
+        )
+        .unwrap();
+        let ses = "ses_e3192cfeeffeUElN5gOL3f5nhg";
+        let now = now_ms();
+        // (The row OpenCode 2.2.7 leaves: `opencode::usage_limit`.)
+        let data = json!({"time": {"created": now - 1_000, "completed": now}, "finish": "error",
+            "content": [], "error": {"type": "provider.free-limit", "message": "Free usage limit reached.",
+            "status": 429, "retryAfterMs": 3_600_000}});
+        let row = |id: &str, kind: &str, seq: i64, data: &Value| {
+            c.execute(
+                "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                rusqlite::params![id, ses, kind, seq, now, data.to_string()],
+            )
+            .unwrap();
+        };
+        row("msg_1", "assistant", 1, &data);
+        let d = daemon_with(&db.join(ses));
+        scan(&d).unwrap();
+        assert_eq!(limited(&d).get("s1"), Some(&(now + 3_600_000)));
+        row("msg_2", "user", 2, &json!({"text": "continue"}));
         scan(&d).unwrap();
         assert!(!limited(&d).contains_key("s1"));
     }

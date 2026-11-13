@@ -387,18 +387,26 @@ pub struct LimitHit {
     pub key: u64,
 }
 
-/// The last usage limit near the end of a transcript, if it hit one
-/// (Claude Code only so far: `claude::usage_limit`). Reads only the
-/// file's tail.
+/// The last usage limit near the end of a conversation, if it hit one
+/// with a known reset time (`claude::usage_limit`, `codex::limit_ended`,
+/// `opencode::usage_limit`). Reads only a file's tail; an OpenCode
+/// conversation's last rows.
 pub fn limit_hit(path: &Path) -> Option<LimitHit> {
-    let format = Format::of(path);
-    if format != Format::Claude {
-        return None;
+    if let Some((db, id)) = opencode::locate(path) {
+        return opencode::limit_hit(db, id);
     }
+    let format = Format::of(path);
     let text = read_window(path, true)?;
     // Most tails hold no limit: skip parsing them (`claude::usage_limit`
-    // needs one of these).
-    if !text.contains("usage_limit_reached") && !text.contains("\"rejected\"") {
+    // needs one of the first two, `codex::limit_ended` the last).
+    if ![
+        "usage_limit_reached",
+        "\"rejected\"",
+        "usage_limit_exceeded",
+    ]
+    .iter()
+    .any(|k| text.contains(k))
+    {
         return None;
     }
     let (raw, tail): (Vec<&str>, Vec<Value>) = text
@@ -412,7 +420,7 @@ pub fn limit_hit(path: &Path) -> Option<LimitHit> {
 }
 
 /// FNV-1a of a line: a record's key, stable across builds.
-fn fnv(s: &str) -> u64 {
+pub(crate) fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
@@ -428,24 +436,33 @@ pub fn limit_in(format: Format, lines: &[Value]) -> Option<LimitHit> {
 
 /// The last limit record in `lines` and where it is (`key` left 0).
 fn limit_at(format: Format, lines: &[Value]) -> Option<(usize, LimitHit)> {
-    if format != Format::Claude {
-        return None;
-    }
-    let (i, (resets_at, kind)) = lines
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, v)| Some((i, claude::usage_limit(v)?)))?;
-    let at = format
-        .line(&lines[i])
-        .at()
-        .and_then(parse_iso_ms)
-        .unwrap_or(0);
+    let when = |i: usize| {
+        format
+            .line(&lines[i])
+            .at()
+            .and_then(parse_iso_ms)
+            .unwrap_or(0)
+    };
+    let (i, (resets_at, kind)) = match format {
+        Format::Claude => lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, v)| Some((i, claude::usage_limit(v)?)))?,
+        // The last turn that ended on a limit; no reset found, none.
+        Format::Codex => {
+            let i = lines.iter().rposition(codex::limit_ended)?;
+            (i, codex::limit_reset(&lines[..i], when(i))?)
+        }
+        Format::OpenCode => return None,
+    };
+    let at = when(i);
     // After it: a prompt the human typed, or a real answer (not injected
     // context, a command wrapper or a bookkeeping line).
     let touched = lines[i + 1..].iter().any(|v| {
         let l = format.line(v);
-        l.prompt().is_some() || (v["type"] == "assistant" && l.reply().is_some())
+        l.prompt().is_some()
+            || ((format != Format::Claude || v["type"] == "assistant") && l.reply().is_some())
     });
     Some((
         i,
@@ -1057,5 +1074,143 @@ mod tests {
         );
         assert_eq!(limit_in(Format::Claude, &[slept, talk, throttled]), None);
         assert_eq!(limit_in(Format::Codex, &[limit]), None);
+    }
+
+    /// Codex 0.167.2 rollout lines around a usage limit, hand-written from
+    /// its source (no real one to copy): the `token_count` an answer's
+    /// headers give (as real rollouts have them), the one the 429's
+    /// headers give (`core/tests/suite/client.rs`,
+    /// `usage_limit_error_emits_rate_limit_event`: `info` null, the window
+    /// at 100), and the `task_complete` carrying the turn's error
+    /// (`rollout/src/tests.rs`,
+    /// `rollout_line_decoder_preserves_terminal_records_with_unknown_errors`;
+    /// `usage_limit_exceeded` from `protocol/src/error.rs`). The error
+    /// event itself is not kept in rollouts (`rollout/src/policy.rs`).
+    fn codex_limit_turn(limit_resets_at: Value) -> Vec<Value> {
+        let line = |at: &str, ty: &str, payload: Value| json!({"timestamp": format!("2026-11-12T18:{at}Z"), "type": ty, "payload": payload});
+        let limits = |primary: Value| {
+            json!({"type": "token_count", "info": null, "rate_limits": {
+                "limit_id": "codex", "limit_name": null, "primary": primary,
+                "secondary": {"used_percent": 41.0, "window_minutes": 10080, "resets_at": 1795068294},
+                "credits": {"has_credits": false, "unlimited": false, "balance": "0"},
+                "individual_limit": null, "spend_control_reached": null,
+                "plan_type": "plus", "rate_limit_reached_type": null}})
+        };
+        vec![
+            line(
+                "38:00.000",
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            line(
+                "38:01.000",
+                "event_msg",
+                limits(
+                    json!({"used_percent": 97.0, "window_minutes": 300, "resets_at": 1794519000}),
+                ),
+            ),
+            line(
+                "38:02.000",
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "t1",
+                "last_agent_message": "done"}),
+            ),
+            line(
+                "40:57.000",
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "t2"}),
+            ),
+            line(
+                "40:57.500",
+                "response_item",
+                json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "next step"}]}),
+            ),
+            line(
+                "40:58.000",
+                "event_msg",
+                limits(
+                    json!({"used_percent": 100.0, "window_minutes": 300, "resets_at": limit_resets_at}),
+                ),
+            ),
+            line(
+                "40:58.108",
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "t2",
+                "last_agent_message": null,
+                "error": {"message": "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 1:30 PM.",
+                          "codex_error_info": "usage_limit_exceeded"},
+                "started_at": 1794508857, "completed_at": 1794508858, "duration_ms": 1108}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_codex_usage_limit_is_read_from_its_turns_records() {
+        let lines = codex_limit_turn(json!(1794519000));
+        let hit = limit_in(Format::Codex, &lines).unwrap();
+        assert_eq!(hit.resets_at, 1_794_519_000_000);
+        assert_eq!(hit.kind, "five_hour");
+        assert_eq!(hit.at, parse_iso_ms("2026-11-12T18:40:58.108Z").unwrap());
+        assert!(!hit.touched);
+        // The 429's headers without a reset time (as in Codex's tests):
+        // the same window's, from an earlier answer.
+        let lines = codex_limit_turn(Value::Null);
+        assert_eq!(
+            limit_in(Format::Codex, &lines).unwrap().resets_at,
+            1_794_519_000_000
+        );
+        // No window exhausted (a workspace spend cap, an API key out of
+        // quota): no reset to wait for.
+        let mut capped = codex_limit_turn(json!(1794519000));
+        capped[5]["payload"]["rate_limits"]["primary"]["used_percent"] = json!(12.0);
+        assert_eq!(limit_in(Format::Codex, &capped), None);
+        // No snapshot in the turn: the earlier turn's (97%) isn't the limit's.
+        let mut bare = codex_limit_turn(json!(1794519000));
+        bare.remove(5);
+        assert_eq!(limit_in(Format::Codex, &bare), None);
+        // Another error ending a turn is not a limit.
+        let mut other = codex_limit_turn(json!(1794519000));
+        other[6]["payload"]["error"]["codex_error_info"] = json!("server_overloaded");
+        assert_eq!(limit_in(Format::Codex, &other), None);
+        // A prompt typed after it touches it; so does an answer.
+        let mut lines = codex_limit_turn(json!(1794519000));
+        lines.push(
+            json!({"timestamp": "2026-11-12T18:41:30.000Z", "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "t3"}}),
+        );
+        assert!(!limit_in(Format::Codex, &lines).unwrap().touched);
+        let mut prompted = lines.clone();
+        prompted.push(
+            json!({"type": "response_item", "payload": {"type": "message",
+            "role": "user", "content": [{"type": "input_text", "text": "continue"}]}}),
+        );
+        assert!(limit_in(Format::Codex, &prompted).unwrap().touched);
+        lines.push(
+            json!({"type": "response_item", "payload": {"type": "message",
+            "role": "assistant", "content": [{"type": "output_text", "text": "Carrying on."}]}}),
+        );
+        assert!(limit_in(Format::Codex, &lines).unwrap().touched);
+        // Claude's reader doesn't take it.
+        assert_eq!(
+            limit_in(Format::Claude, &codex_limit_turn(json!(1794519000))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_codex_usage_limit_is_found_in_a_rollout_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir
+            .path()
+            .join("rollout-2026-11-12T18-38-00-01a1ce53-c71d-7e13-b376-63f7271fa320.jsonl");
+        let text: String = codex_limit_turn(json!(1794519000))
+            .iter()
+            .map(|v| format!("{v}\n"))
+            .collect();
+        std::fs::write(&p, text).unwrap();
+        let hit = limit_hit(&p).unwrap();
+        assert_eq!(hit.resets_at, 1_794_519_000_000);
+        assert_ne!(hit.key, 0);
     }
 }

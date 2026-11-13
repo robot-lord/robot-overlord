@@ -1112,6 +1112,100 @@ pub fn stats(db: &Path, id: &str) -> Option<TranscriptStats> {
     .ok()
 }
 
+// ---- usage limits ----
+//
+// OpenCode 2.2.7 ends a step its provider refused with the error on the
+// assistant row: `finish: "error"`, `time.completed`, and `error: {type,
+// message, status, response: {body}, retryAfterMs}` (`session.step.failed`
+// in `core/src/session/message-updater.ts`; the shape is `SessionError`
+// in `schema/src/session-error.ts`). `toSessionError`
+// (`core/src/session/to-session-error.ts`) names the limits of OpenCode's
+// own service by `type`, and OpenCode's timeline shows when they reset
+// (`usageLimit` and `budgetLimit` in `session-ui/src/timeline/projection.ts`):
+//
+// - `provider.free-limit`, `provider.go-limit`: `retryAfterMs` (the 429's
+//   `retry-after`) after the step ended, at most 45 days;
+// - `provider.budget-limit`, `provider.model-budget-limit`: `resetsAt`
+//   (ISO) in the response body's metadata.
+//
+// Others carry no reset time (`provider.chatgpt-limit`, `provider.quota`)
+// or are throttles OpenCode retries itself (`provider.rate-limit`): not
+// limits rlord can wait out.
+
+/// Longest `retryAfterMs` taken as a reset (OpenCode's timeline's own
+/// bound).
+const MAX_RETRY_AFTER_MS: i64 = 45 * 86_400_000;
+
+/// An assistant row's usage limit: (when it hit, when it resets, which;
+/// ms). None: no limit, or one with no reset time.
+pub(crate) fn usage_limit(data: &Value) -> Option<(i64, i64, String)> {
+    let e = &data["error"];
+    let kind = e["type"].as_str()?.strip_prefix("provider.")?;
+    let t = &data["time"];
+    let at = t["completed"].as_i64().or_else(|| t["created"].as_i64())?;
+    let resets_at = match kind {
+        "free-limit" | "go-limit" => {
+            at + e["retryAfterMs"]
+                .as_i64()
+                .filter(|d| (0..=MAX_RETRY_AFTER_MS).contains(d))?
+        }
+        "budget-limit" | "model-budget-limit" => {
+            let body: Value = serde_json::from_str(e["response"]["body"].as_str()?).ok()?;
+            super::transcript::parse_iso_ms(find_str(&body, "resetsAt")?)?
+        }
+        _ => return None,
+    };
+    Some((at, resets_at, kind.to_string()))
+}
+
+/// The first string under `key` anywhere in `v` (OpenCode's envelope has
+/// it in `metadata`, Google's in `error.details[].metadata`).
+fn find_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    match v {
+        Value::Object(m) => m
+            .get(key)
+            .and_then(Value::as_str)
+            .or_else(|| m.values().find_map(|x| find_str(x, key))),
+        Value::Array(a) => a.iter().find_map(|x| find_str(x, key)),
+        _ => None,
+    }
+}
+
+/// The usage limit conversation `id` is stopped on: its latest assistant
+/// row ended on one. `touched`: a prompt came after it (an answer after
+/// it would be a newer assistant row). Two indexed look-ups.
+pub fn limit_hit(db: &Path, id: &str) -> Option<super::transcript::LimitHit> {
+    let c = open(db)?;
+    let (row, seq, data): (String, i64, String) = c
+        .query_row(
+            "SELECT id, seq, data FROM session_message WHERE session_id = ?1 \
+             AND type = 'assistant' ORDER BY seq DESC LIMIT 1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()?;
+    // (Every limit's type ends so: skip parsing the rest.)
+    if !data.contains("-limit\"") {
+        return None;
+    }
+    let (at, resets_at, kind) = usage_limit(&serde_json::from_str(&data).ok()?)?;
+    let touched = c
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_message WHERE session_id = ?1 \
+             AND type = 'user' AND seq > ?2)",
+            rusqlite::params![id, seq],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    Some(super::transcript::LimitHit {
+        at,
+        resets_at,
+        kind,
+        touched,
+        key: super::transcript::fnv(&row),
+    })
+}
+
 /// The size of the context the latest request sent (its input and cached
 /// tokens), 0 when there has been none.
 pub fn context_tokens(db: &Path, id: &str) -> u64 {
@@ -2020,5 +2114,153 @@ pub(crate) mod tests {
             search(&db, SES, &ws("waitx2xwatch"), Some("wait_2_watch"), 5).1,
             0
         );
+    }
+
+    /// A Go-limit refusal as OpenCode 2.2.7 records it, hand-written from
+    /// its source (no real one to copy): the error is
+    /// `core/test/session-error.test.ts`'s (`provider.go-limit`, the 429's
+    /// `retry-after` as `retryAfterMs`), set on the assistant row by
+    /// `session.step.failed` (`core/src/session/message-updater.ts`:
+    /// `finish: "error"`, `time.completed`), and the turn closed by an
+    /// `idle` row with `outcome: "failed"`.
+    fn go_limit_rows(c: &rusqlite::Connection) {
+        let body = json!({"type": "error",
+            "error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"},
+            "metadata": {"workspace": "wrk_go_limit", "limitName": "5 hour"}});
+        let error = json!({"type": "provider.go-limit",
+            "message": "OpenCode Go 5 hour usage limit reached. Switch to a free model, or turn on Extra Usage on the Go page in OpenCode Console to keep going.",
+            "status": 429, "response": {"body": body.to_string()}, "retryAfterMs": 3_600_000});
+        let rows = [
+            (
+                95,
+                "user",
+                json!({"time": {"created": 1794470000000_i64}, "text": "and the worker?",
+                "files": [], "agents": []}),
+            ),
+            (
+                96,
+                "assistant",
+                json!({"time": {"created": 1794470000010_i64, "completed": 1794470000900_i64},
+                "agent": "build", "model": {"id": "kimi-k3", "providerID": "opencode-go"},
+                "content": [], "finish": "error", "error": error}),
+            ),
+            (
+                99,
+                "idle",
+                json!({"time": {"created": 1794470000905_i64}, "outcome": "failed",
+                "error": error}),
+            ),
+        ];
+        for (seq, kind, data) in rows {
+            c.execute(
+                "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                rusqlite::params![
+                    format!("msg_{seq}"),
+                    SES,
+                    kind,
+                    seq,
+                    1794470000000_i64,
+                    data.to_string()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_opencode_usage_limit_is_read_from_the_failed_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        // A turn that ended well: no limit.
+        assert_eq!(limit_hit(&db, SES), None);
+        let c = rusqlite::Connection::open(&db).unwrap();
+        go_limit_rows(&c);
+        let hit = limit_hit(&db, SES).unwrap();
+        assert_eq!(hit.at, 1794470000900);
+        assert_eq!(hit.resets_at, 1794470000900 + 3_600_000);
+        assert_eq!(hit.kind, "go-limit");
+        assert!(!hit.touched);
+        assert_eq!(hit.key, crate::agents::transcript::fnv("msg_96"));
+        // Through the transcript path rlord keeps for it.
+        assert_eq!(
+            crate::agents::transcript::limit_hit(&db.join(SES)),
+            Some(hit)
+        );
+        // A prompt after it touches it.
+        c.execute(
+            "INSERT INTO session_message VALUES ('msg_100', ?1, 'user', 100, 5, 5, ?2)",
+            rusqlite::params![
+                SES,
+                json!({"time": {"created": 5}, "text": "continue"}).to_string()
+            ],
+        )
+        .unwrap();
+        assert!(limit_hit(&db, SES).unwrap().touched);
+        // An answer after it (a newer assistant row) ends it.
+        c.execute(
+            "INSERT INTO session_message VALUES ('msg_101', ?1, 'assistant', 101, 6, 6, ?2)",
+            rusqlite::params![
+                SES,
+                json!({"time": {"created": 6, "completed": 7}, "finish": "stop",
+                "content": [{"type": "text", "text": "Carrying on."}]})
+                .to_string()
+            ],
+        )
+        .unwrap();
+        assert_eq!(limit_hit(&db, SES), None);
+    }
+
+    #[test]
+    fn opencode_limits_reset_as_its_own_timeline_says() {
+        let row =
+            |error: Value| json!({"time": {"created": 1_000, "completed": 2_000}, "error": error});
+        // The free limit: `retryAfterMs` after the step ended
+        // (`core/test/session-error.test.ts`).
+        let free = json!({"type": "provider.free-limit", "message": "Free usage limit reached.",
+            "status": 429, "retryAfterMs": 3_600_000});
+        assert_eq!(
+            usage_limit(&row(free.clone())),
+            Some((2_000, 3_602_000, "free-limit".into()))
+        );
+        // Past OpenCode's own 45-day bound, or absent: no reset known.
+        let mut far = free.clone();
+        far["retryAfterMs"] = json!(46 * 86_400_000_i64);
+        assert_eq!(usage_limit(&row(far)), None);
+        let mut none = free;
+        none.as_object_mut().unwrap().remove("retryAfterMs");
+        assert_eq!(usage_limit(&row(none)), None);
+        // Budgets: `resetsAt` in either envelope
+        // (`session-ui/src/timeline/rows-current.test.ts`).
+        let budget = |kind: &str, body: &str| {
+            row(
+                json!({"type": kind, "message": "Budget reached.", "status": 429,
+                "response": {"body": body}}),
+            )
+        };
+        let reset = crate::agents::transcript::parse_iso_ms("2026-11-01T00:00:00.000Z").unwrap();
+        assert_eq!(
+            usage_limit(&budget(
+                "provider.model-budget-limit",
+                r#"{"type":"error","error":{"type":"BudgetLimitError","message":"A budget policy for this model has been reached."},"metadata":{"coverage":"models","resetsAt":"2026-11-01T00:00:00.000Z"}}"#
+            )),
+            Some((2_000, reset, "model-budget-limit".into()))
+        );
+        assert_eq!(
+            usage_limit(&budget(
+                "provider.budget-limit",
+                r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Budget reached.","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"BudgetLimitError","domain":"opencode.ai","metadata":{"coverage":"all","resetsAt":"2026-11-01T00:00:00.000Z"}}]}}"#
+            )),
+            Some((2_000, reset, "budget-limit".into()))
+        );
+        // Throttles OpenCode retries, and limits with no reset: not these.
+        for kind in [
+            "provider.rate-limit",
+            "provider.chatgpt-limit",
+            "provider.quota",
+            "provider.transport",
+        ] {
+            let e = json!({"type": kind, "message": "x", "status": 429, "retryAfterMs": 45_000});
+            assert_eq!(usage_limit(&row(e)), None, "{kind}");
+        }
     }
 }

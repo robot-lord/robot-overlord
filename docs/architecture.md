@@ -287,15 +287,39 @@ hooks and `discover` keep the stored status to themselves.
   "rejected"`. The turn ends through the `StopFailure` hook (any API
   error), not `Stop`, so rlord installs that hook too and maps it to
   `idle`; the hook doesn't say which error, so the transcript is still
-  what tells a limit. Seen on Claude Code 2.1.322. Codex and OpenCode
-  are not detected yet.
+  what tells a limit. Seen on Claude Code 2.1.322.
+  **Codex** (0.167, from its source: no real one seen yet) keeps no line
+  of its own for a limit: its `error` event isn't written to the
+  rollout. The turn's `task_complete` carries the error that ended it,
+  `codex_error_info: "usage_limit_exceeded"` (`codex::limit_ended`;
+  that also covers an API key out of quota, which has no reset), and
+  just before it a `token_count` holds the 429's rate-limit snapshot
+  with the exhausted window at `used_percent` 100. The reset is that
+  window's `resets_at` (epoch seconds); Codex's own tests send the 429
+  without one, so failing that it is the same window's `resets_at` from
+  an earlier `token_count` in the tail (every answer carries one). No
+  exhausted window, or no reset found: not a limit (`codex::limit_reset`).
+  The error's text ("try again at 3:00 PM") is never parsed.
+  **OpenCode** (2.2.7, from its source) records a refused step on its
+  assistant row: `finish: "error"`, `time.completed`, `error: {type,
+  status, response: {body}, retryAfterMs}`. Its own service's limits
+  have a reset, worked out as OpenCode's timeline does
+  (`opencode::usage_limit`): `provider.free-limit` and
+  `provider.go-limit` reset `retryAfterMs` after the step ended (at most
+  45 days), `provider.budget-limit` and `provider.model-budget-limit` at
+  the `resetsAt` in the response body. Other types have no reset
+  (`provider.chatgpt-limit`, `provider.quota`) or are throttles OpenCode
+  retries itself (`provider.rate-limit`). A conversation is limited when
+  its latest assistant row is one, touched by a `user` row after it
+  (`opencode::limit_hit`: two indexed look-ups in `session_message`).
 - A session is limited while that record is the last thing in its
   conversation (no prompt the user typed and no real answer after it:
   `LimitHit::touched`) and the reset time is ahead. A tick (15s) stats
   each live session's transcript and re-reads only those that changed
+  (an OpenCode conversation, rows rather than a file, is read every tick)
   (one scan at a time; a file's stamp is kept only once what was read
-  from it is saved; a tail without `usage_limit_reached` or `"rejected"`
-  isn't parsed; a record with no readable time is dated when first
+  from it is saved; a tail without `usage_limit_reached`, `"rejected"`
+  or `usage_limit_exceeded` isn't parsed; a record with no readable time is dated when first
   seen, `limits::dated`);
   kv `limits` holds the current ones, each until a minute past its
   reset (`limits::held`), and rows carry `limit` (`limits::annotate`:
