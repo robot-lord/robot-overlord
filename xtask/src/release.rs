@@ -151,6 +151,8 @@ pub fn main(args: &[String]) -> Result<()> {
     // Refuse anything that would make the release not match a pushed
     // commit. A dry run publishes nothing, so it only warns.
     let refuse = |why: String| -> Result<()> {
+        // A check cut short by Ctrl-C isn't a finding.
+        cmd::check_interrupted()?;
         if opts.dry_run {
             eprintln!("warning: {why} (dry run: continuing)");
             return Ok(());
@@ -169,8 +171,6 @@ pub fn main(args: &[String]) -> Result<()> {
             "HEAD {head} is not on origin/main — release only merged code"
         ))?;
     }
-    let tag_on_origin =
-        || cmd::succeeds(git().args(["ls-remote", "--exit-code", "--tags", "origin", &tag]));
     if mode == (Mode::StableCi { resume: true }) {
         // The tag must be pushed, and point at HEAD.
         let refs = cmd::output(git().args([
@@ -187,19 +187,24 @@ pub fn main(args: &[String]) -> Result<()> {
             }
             Some(_) => {}
         }
-    } else if is_draft(&tag) && !tag_on_origin() {
-        // A failed earlier attempt deleted the tag but left CI's draft behind.
-        refuse(format!(
-            "a leftover draft release {tag} exists without its tag — clean up with: gh release delete {tag} -R {REPO} --yes; then run this again"
-        ))?;
-    } else if cmd::succeeds(gh().args(["release", "view", &tag, "-R", REPO])) || tag_on_origin() {
-        let mut why = format!("{tag} already exists — bump the version in Cargo.toml");
-        if !ver.is_dev() {
-            why.push_str(
-                "\n(if an earlier run pushed it and stopped: cargo xtask release --resume)",
-            );
+    } else {
+        let release = release_state(&tag)?;
+        let pushed = tag_on_origin(&tag)?;
+        if release == Some(true) && !pushed {
+            // A failed earlier attempt deleted the tag but left CI's draft
+            // behind.
+            refuse(format!(
+                "a leftover draft release {tag} exists without its tag — clean up with: gh release delete {tag} -R {REPO} --yes; then run this again"
+            ))?;
+        } else if release.is_some() || pushed {
+            let mut why = format!("{tag} already exists — bump the version in Cargo.toml");
+            if !ver.is_dev() {
+                why.push_str(
+                    "\n(if an earlier run pushed it and stopped: cargo xtask release --resume)",
+                );
+            }
+            refuse(why)?;
         }
-        refuse(why)?;
     }
 
     // Under the checkout, not the system temp dir: Docker on the Mac
@@ -214,8 +219,6 @@ pub fn main(args: &[String]) -> Result<()> {
             build::build(Platform::Macos, &dist)?;
             if mode != Mode::Dev {
                 build::build(Platform::Linux, &dist)?;
-            }
-            if mode != Mode::Dev {
                 // What CI's "Check assets" step checks, for a release made here.
                 for asset in ver.workflow_assets() {
                     if !dist.join(&asset).is_file() {
@@ -297,21 +300,6 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     let undo = format!(
         "delete the tag and any draft release (git push origin :refs/tags/{tag}; git tag -d {tag}; gh release delete {tag} -R {REPO} --yes if it is a draft), then cargo xtask release --local"
     );
-    if !resume {
-        cmd::run(git().args(["tag", "-f", &tag, head]))?;
-        match cmd::run(git().args(["push", "origin", &format!("refs/tags/{tag}")])) {
-            Ok(()) => {}
-            // The push may or may not have reached origin.
-            Err(e) if cmd::is_interrupted(&e) => {
-                return Err(e.context(format!("interrupted while pushing {tag}: if `git ls-remote --tags origin {tag}` lists it, cargo xtask release --resume")));
-            }
-            Err(_) => {
-                cmd::succeeds(git().args(["tag", "-d", &tag]));
-                bail!("pushing {tag} failed (local tag deleted)");
-            }
-        }
-    }
-    println!("waiting for the release workflow on {tag}…");
     let find_runs = || -> Result<Vec<Run>> {
         let json = cmd::output(gh().args([
             "run",
@@ -327,10 +315,34 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         ]))?;
         publishing_runs(&json, head, &tag)
     };
+    // Runs from an earlier attempt on this commit aren't this push's run.
+    let earlier: Vec<u64> = if resume {
+        Vec::new()
+    } else {
+        find_runs()?.iter().map(|r| r.id).collect()
+    };
+    if !resume {
+        cmd::run(git().args(["tag", "-f", &tag, head]))?;
+        match cmd::run(git().args(["push", "origin", &format!("refs/tags/{tag}")])) {
+            Ok(()) => {}
+            // The push may or may not have reached origin.
+            Err(e) if cmd::is_interrupted(&e) => {
+                return Err(e.context(format!("interrupted while pushing {tag}: if `git ls-remote --tags origin {tag}` lists it, cargo xtask release --resume")));
+            }
+            Err(_) => {
+                cmd::succeeds(git().args(["tag", "-d", &tag]));
+                bail!("pushing {tag} failed (local tag deleted)");
+            }
+        }
+    }
+    println!("waiting for the release workflow on {tag}…");
     // A failed listing (a network blip) is tried again, like no run; but
     // if they keep failing, the run's state is unknown and nothing here may
     // say there is none.
     let unknown = |e: anyhow::Error| {
+        if cmd::is_interrupted(&e) {
+            return e;
+        }
         anyhow::anyhow!("couldn't list the release workflow's runs for {tag} ({e:#}); the run may still be going — check https://github.com/{REPO}/actions before anything else, then cargo xtask release --resume")
     };
     let mut run = None;
@@ -339,8 +351,9 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         match find_runs() {
             Ok(runs) => {
                 failures = 0;
-                run = runs.into_iter().next();
+                run = runs.into_iter().find(|r| !earlier.contains(&r.id));
             }
+            Err(e) if cmd::is_interrupted(&e) => return Err(e),
             Err(e) => {
                 failures += 1;
                 if failures >= 5 {
@@ -369,6 +382,7 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
                 }
             }
         }
+        cmd::check_interrupted()?;
         if !not_cancelled.is_empty() {
             bail!("no release workflow run for {tag} was found in time, and late runs {} couldn't be cancelled — cancel them in https://github.com/{REPO}/actions before anything else; then to build here: {undo}", not_cancelled.join(", "));
         }
@@ -410,13 +424,13 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         )
         .with_context(|| format!("provenance check failed for {file}"))?;
     }
-    // Not `is_draft`: a failed lookup must stop here, not read as "already
-    // published" and go on to the tap and crates.io.
-    let draft = cmd::output(gh().args([
-        "release", "view", &tag, "-R", REPO, "--json", "isDraft", "-q", ".isDraft",
-    ]))
-    .with_context(|| format!("checking whether {tag} is still a draft"))?;
-    if draft == "true" {
+    // A failed lookup stops here: it must not read as "already published"
+    // and go on to the tap and crates.io.
+    let draft = match release_state(&tag)? {
+        Some(draft) => draft,
+        None => bail!("{tag} has no GitHub release after its workflow run"),
+    };
+    if draft {
         cmd::run(gh().args([
             "release",
             "edit",
@@ -451,12 +465,47 @@ fn release_url(tag: &str) -> String {
     format!("https://github.com/{REPO}/releases/tag/{tag}")
 }
 
-/// Whether the tag's GitHub release exists and is a draft.
-fn is_draft(tag: &str) -> bool {
-    let view = cmd::output_quiet(gh().args([
-        "release", "view", tag, "-R", REPO, "--json", "isDraft", "-q", ".isDraft",
-    ]));
-    view.as_deref() == Some("true")
+/// The tag's GitHub release: `None` if there is none, else whether it is a
+/// draft. Any other failure of gh (auth, network) is an error, never "no
+/// release".
+fn release_state(tag: &str) -> Result<Option<bool>> {
+    cmd::check_interrupted()?;
+    let out = gh()
+        .args([
+            "release", "view", tag, "-R", REPO, "--json", "isDraft", "-q", ".isDraft",
+        ])
+        .output()
+        .context("couldn't start gh release view")?;
+    cmd::check_interrupted()?;
+    if out.status.success() {
+        return match String::from_utf8_lossy(&out.stdout).trim() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            other => bail!("gh release view {tag}: unexpected {other:?}"),
+        };
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("release not found") {
+        return Ok(None);
+    }
+    bail!("gh release view {tag} failed: {}", err.trim())
+}
+
+/// Whether the tag is on origin. `ls-remote --exit-code` exits 2 for no
+/// match; anything else but 0 is an error, never "not pushed".
+fn tag_on_origin(tag: &str) -> Result<bool> {
+    cmd::check_interrupted()?;
+    let status = git()
+        .args(["ls-remote", "--exit-code", "--tags", "origin", tag])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("couldn't start git ls-remote")?;
+    cmd::check_interrupted()?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(false),
+        _ => bail!("git ls-remote origin {tag} failed ({status})"),
+    }
 }
 
 /// SHA256SUMS for every file in `dist`.

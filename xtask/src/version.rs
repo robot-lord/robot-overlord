@@ -67,6 +67,11 @@ impl Version {
         if nums.len() != 3 || pre.is_some_and(|p| p.is_empty()) {
             bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
         }
+        // Digits only: u64's parser would also take a leading `+`.
+        let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+        if !nums.iter().all(|n| digits(n)) {
+            bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
+        }
         // No leading zeros (as semver says), so two versions that compare
         // equal are also the same text.
         let leading_zero =
@@ -180,11 +185,18 @@ fn cmp_pre(a: &str, b: &str) -> Ordering {
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(x), Some(y)) => {
-                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    (Ok(_), Err(_)) => Ordering::Less,
-                    (Err(_), Ok(_)) => Ordering::Greater,
-                    (Err(_), Err(_)) => x.cmp(y),
+                // Digits only, as in `parse` (u64's parser takes a `+`).
+                let num = |s: &str| {
+                    s.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| s.parse::<u64>().ok())
+                        .flatten()
+                };
+                let ord = match (num(x), num(y)) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => x.cmp(y),
                 };
                 if ord != Ordering::Equal {
                     return ord;
@@ -264,6 +276,7 @@ mod tests {
             "v1.2.3",
             "01.2.3",
             "1.2.3-dev.01",
+            "+1.2.3",
         ] {
             assert!(Version::parse(bad).is_err(), "{bad}");
         }
@@ -296,6 +309,8 @@ mod tests {
         assert!(v("1.0.0-dev") < v("1.0.0-dev.1"));
         assert!(v("1.0.0-1") < v("1.0.0-dev"));
         assert!(v("1.0.0-dev.9") < v("1.0.0-dev.10"));
+        // A `+` makes it a word, not a number.
+        assert_ne!(v("1.0.0-dev.+1").cmp(&v("1.0.0-dev.1")), Ordering::Equal);
     }
 
     #[test]

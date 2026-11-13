@@ -31,17 +31,20 @@ extern "C" fn on_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Make Ctrl-C stop xtask by unwinding, not by killing it, so the `Drop`
+/// Make Ctrl-C (and SIGTERM, SIGHUP) stop xtask by unwinding, not by killing it, so the `Drop`
 /// guards run (scratch folders removed, manifests put back) as the
 /// scripts' `trap … EXIT` did. The child running at the time gets the
 /// SIGINT itself and exits; `run`, `output` and `sleep` then return
-/// `Interrupted`, and no new command starts (`succeeds` and
-/// `output_quiet` report failure without running).
+/// `Interrupted`, and no new command starts (`succeeds` reports failure
+/// without running; callers that act on its answer check
+/// `check_interrupted` first).
 pub fn on_interrupt() {
     let handler = on_sigint as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an atomic.
     unsafe {
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(signal, handler as libc::sighandler_t);
+        }
     }
 }
 
@@ -61,7 +64,7 @@ pub fn is_interrupted(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Interrupted>().is_some()
 }
 
-fn check_interrupted() -> Result<()> {
+pub fn check_interrupted() -> Result<()> {
     if INTERRUPTED.load(Ordering::SeqCst) {
         return Err(Interrupted.into());
     }
@@ -123,17 +126,6 @@ pub fn output(cmd: &mut Command) -> Result<String> {
         bail!("{} failed ({})", describe(cmd), out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Like `output`, with errors hidden: `None` if it fails.
-pub fn output_quiet(cmd: &mut Command) -> Option<String> {
-    if INTERRUPTED.load(Ordering::SeqCst) {
-        return None;
-    }
-    let out = cmd.stderr(Stdio::null()).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 pub fn git() -> Command {
