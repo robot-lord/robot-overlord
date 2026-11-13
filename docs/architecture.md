@@ -777,7 +777,9 @@ including when the active one hits a usage limit.
   switched away from. Each overlord's own session lock is as for any
   session (locks.rs).
 - **The switchers** all call `overlord.switch`: the overlay (it draws a
-  top row with each installed agent's marker when there are two or more;
+  top row (always there, ending in a ✕ close button: tmux swallows
+  clicks outside a popup, so it is the mouse way out) with each installed
+  agent's marker when there are two or more;
   a click, or `[tmux] overlord_switch`, default `M-s`, read by the
   overlay and never bound in tmux. The key goes round the overlords that
   exist and never creates one; a click on an agent without one, the
