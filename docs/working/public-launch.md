@@ -7,9 +7,11 @@
 The first stable release is 1.0.0, cut only after everything below is
 done, in this order (decided with the user, 2026-11-12):
 
-1. [ ] Linux Codex sandbox check. Partial (0.23.0-dev.4): blocked as
-       root in a privileged container; the check on real Ubuntu as a
-       non-root user is still open (below, "Before flipping it public").
+1. [x] Linux Codex sandbox check. Partial (0.23.0-dev.4): blocked as
+       root in a privileged container. The user called this good enough
+       for 1.0 (2026-11-13); the README says testing has been mostly
+       macOS with Claude Code and asks for bug reports. Linux fixes come
+       after release if people report them.
 2. [x] rlord's own pastes no longer count as the user's prompts
        (0.23.0-dev.5; `daemon/src/own.rs`).
 3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
