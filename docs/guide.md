@@ -44,7 +44,7 @@ and switch between them: see "An overlord per agent" below.
   the same thing, with optional hints (describe → confirm via
   `confirm_new_session`); `ctrl-e` in it opens the description in your
   `$EDITOR` (e.g. vim).
-- **It starts fresh after sitting idle.** After 15 idle minutes (while
+- **It starts fresh after sitting idle.** After an idle hour (while
   you're not looking at it, and not while its last turn asked you
   something) rlord restarts it on a fresh conversation, so its context
   doesn't grow without end (`[overlord] fresh_after_mins`; 0 = never).

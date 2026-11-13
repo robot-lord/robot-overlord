@@ -302,7 +302,7 @@ impl From<OverlordToml> for OverlordConfig {
             fresh_after_mins: t
                 .mastermind_fresh_after_mins
                 .or(t.fresh_after_mins)
-                .unwrap_or(15),
+                .unwrap_or(60),
             width: t.width.unwrap_or_else(|| "90%".into()),
             height: t.height.unwrap_or_else(|| "85%".into()),
             confirm_sends: t.confirm_sends.unwrap_or(false),
@@ -788,7 +788,7 @@ codex_daemon = false            # new Codex sessions run on Codex's shared
 agent = "claude"
 model = "opus"
 effort = "medium"
-fresh_after_mins = 15   # fresh conversation after this idle; 0 = never
+fresh_after_mins = 60   # fresh conversation after this idle; 0 = never
 width = "90%"           # size of the overlord overlay in the TUI
 height = "85%"          # (percent of the screen, or a cell count)
 confirm_sends = false   # ask you before it types into another session
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(c.session.workspace_dir, ".worktrees");
         assert_eq!(c.overlord.model, "opus");
         assert_eq!(c.overlord.effort, "medium");
-        assert_eq!(c.overlord.fresh_after_mins, 15);
+        assert_eq!(c.overlord.fresh_after_mins, 60);
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
     }
