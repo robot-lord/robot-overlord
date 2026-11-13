@@ -70,17 +70,36 @@ fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
         .collect())
 }
 
+/// Live sessions on Codex's daemon that the hooks follow (not `unhooked`):
+/// only whether their pane is gone is watched here.
+fn on_daemon(d: &Daemon, unhooked: &[Session]) -> Result<Vec<Session>> {
+    Ok(d.db()
+        .running_sessions()?
+        .into_iter()
+        .filter(|s| s.codex_daemon && !unhooked.iter().any(|u| u.id == s.id))
+        .collect())
+}
+
 fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
+    // (Whatever changed the sessions on Codex's daemon, the hook gate
+    // catches up here: a write only when it differs.)
+    crate::codex_daemon::sync_gate(&d.db());
     let sessions = unhooked(d)?;
-    gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    let daemon = on_daemon(d, &sessions)?;
+    gone.retain(|id, _| sessions.iter().chain(&daemon).any(|s| &s.id == id));
     let mut changed = false;
+    for s in &daemon {
+        if pane_looks(s, gone) >= 2 {
+            changed |= pane_gone(d, s, gone)?;
+        }
+    }
     for s in &sessions {
         // Its program exited (no SessionEnd hook to say so).
         match pane_looks(s, gone) {
             0 => {}
             1 => continue,
             _ => {
-                changed |= stop_from_pane(&d.db(), s)?;
+                changed |= pane_gone(d, s, gone)?;
                 continue;
             }
         }
@@ -113,6 +132,40 @@ pub(crate) fn pane_looks(s: &Session, gone: &mut HashMap<String, u8>) -> u8 {
     *looks
 }
 
+/// Session `s`'s pane is gone (looked so twice). In the pane, its agent
+/// ended with it: stopped. On Codex's daemon the turn goes on without the
+/// pane: stopped only once no turn runs there (asked again every few
+/// passes while one does, logged once as `pane_gone_turn_running`).
+fn pane_gone(d: &Daemon, s: &Session, gone: &mut HashMap<String, u8>) -> Result<bool> {
+    if !s.codex_daemon {
+        return stop_from_pane(&d.db(), s);
+    }
+    let looks = gone.get(&s.id).copied().unwrap_or(2);
+    // (Every fifth look after the second: the daemon is asked over a
+    // fresh connection each time.)
+    if (looks - 2) % 5 != 0 {
+        if looks > 200 {
+            gone.insert(s.id.clone(), 2);
+        }
+        return Ok(false);
+    }
+    let transcript = d.db().transcript_source(&s.id)?;
+    // (Asked without the DB lock.)
+    let running = crate::codex_daemon::turn_running(s, transcript.as_deref());
+    if running != Some(true) {
+        return stop_from_pane(&d.db(), s);
+    }
+    let db = d.db();
+    let key = format!("pane_gone_turn:{}", s.id);
+    if db.kv_get(&key)?.is_none() {
+        db.kv_set(&key, &now_ms().to_string())?;
+        db.insert_event(&s.id, now_ms(), "pane_gone_turn_running", "{}")?;
+        tracing::info!(session = %s.id, "pane gone, its turn still runs on Codex's server");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Session `s` is stopped: its pane ended. Not when its status moved since
 /// `s` was read (restarted meanwhile: not this pane's end). Returns
 /// whether it was written.
@@ -125,6 +178,9 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     let now = now_ms();
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
+    db.kv_delete(&format!("pane_gone_turn:{}", s.id))?;
+    // (Its thread leaves the gate: a stopped session's hooks are dropped.)
+    crate::codex_daemon::sync_gate(db);
     Ok(true)
 }
 
@@ -261,7 +317,7 @@ fn untracked_threads(
     since: i64,
     tracked: &std::collections::HashSet<String>,
 ) -> Vec<codex::Thread> {
-    codex::threads_started_in(&codex::home(), &s.project_path, since)
+    codex::threads_started_in(&codex::home(), &s.project_path, since, s.codex_daemon)
         .into_iter()
         .filter(|t| !tracked.contains(&t.id))
         .collect()
@@ -285,6 +341,8 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
         &json!({"to": t.id, "from": "codex thread index"}).to_string(),
     )?;
     tracing::info!(session = %s.id, thread = %t.id, "bound a Codex session from its thread index");
+    // (On Codex's daemon: its hooks now pass the gate by thread.)
+    crate::codex_daemon::sync_gate(db);
     Ok(true)
 }
 

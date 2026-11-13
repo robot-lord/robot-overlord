@@ -26,6 +26,8 @@
 
 pub mod claude;
 pub mod codex;
+pub mod codex_gate;
+pub mod codex_server;
 pub mod install;
 pub mod opencode;
 pub mod opencode_service;
@@ -693,7 +695,7 @@ mod tests {
         );
         assert!(l.transcript.unwrap().ends_with(format!("{id}.jsonl")));
         let l = Agent::Codex.launch("/src/app", Some("hi"), None, &[]);
-        assert_eq!(l.argv, ["codex", "--no-daemon", "--no-alt-screen", "hi"]);
+        assert_eq!(l.argv, ["codex", "--no-alt-screen", "hi"]);
         assert_eq!((l.session_id, l.transcript), (None, None));
         assert!(Agent::Claude.mints_id() && !Agent::Codex.mints_id());
     }
@@ -775,7 +777,6 @@ mod tests {
                 "codex",
                 "resume",
                 "t-1",
-                "--no-daemon",
                 "--no-alt-screen",
                 "--model",
                 "gpt-6-luna"

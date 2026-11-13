@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod autostart;
+pub mod codex_daemon;
 pub mod discover;
 pub mod import;
 pub mod limits;
@@ -31,6 +32,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use rlord_core::agents::Agent;
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::{paths, tmux};
@@ -409,7 +411,15 @@ impl Daemon {
         if matches!(method, "session.defaults" | "agents.list") && params["no_listing"] != true {
             refresh_models();
         }
+        // A Codex session about to start on Codex's shared background
+        // server: the server runs first, started by rlord (codex_daemon.rs).
+        if self.starts_on_codex_daemon(method, &params) {
+            codex_daemon::ensure_running();
+        }
         if let Some(r) = self.call_ui(method, &params) {
+            if r.is_ok() {
+                codex_daemon::sync_gate(&self.db());
+            }
             return r.map_err(MethodError::Internal);
         }
         let mutating = !matches!(
@@ -434,6 +444,18 @@ impl Daemon {
         })
         .flatten();
         let _session = session_id.as_deref().map(|id| self.sessions.lock(id));
+        // Stopping a session on Codex's daemon: its running turn is
+        // interrupted first, with no DB lock held (it can take seconds).
+        let mut params = params;
+        if matches!(method, "session.stop" | "session.archive") {
+            let s = session_id
+                .as_deref()
+                .and_then(|id| self.db().resolve_ref(id).ok())
+                .filter(|s| s.codex_daemon && s.status != rlord_core::types::Status::Stopped);
+            if let Some(s) = s {
+                params["interrupt"] = codex_daemon::interrupt(&s).to_json();
+            }
+        }
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
@@ -509,6 +531,7 @@ impl Daemon {
         // no list refetch.)
         let unchanged = method == "hook.emit" && r.as_ref().is_ok_and(|v| v["unchanged"] == true);
         if mutating && r.is_ok() && !unchanged {
+            codex_daemon::sync_gate(&self.db());
             self.changed();
             if method == "session.new" {
                 self.bind_nav_keys();
@@ -528,6 +551,32 @@ impl Daemon {
 }
 
 impl Daemon {
+    /// Whether `method` starts (or restarts) a Codex session that runs on
+    /// Codex's shared background server. Asked before any lock is taken.
+    fn starts_on_codex_daemon(&self, method: &str, params: &Value) -> bool {
+        match method {
+            "session.new" => {
+                let cfg = self.config();
+                let agent = params["agent"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or(&cfg.session.agent)
+                    .to_string();
+                agent == Agent::Codex.name() && cfg.session.codex_daemon
+            }
+            "session.restart" | "ui.goto" => params["ref"]
+                .as_str()
+                .and_then(|r| self.db().resolve_ref(r).ok())
+                // (`ui.goto` starts only a stopped one.)
+                .is_some_and(|s| {
+                    s.codex_daemon
+                        && (method != "ui.goto" || s.status == rlord_core::types::Status::Stopped)
+                }),
+            _ => false,
+        }
+    }
+
     /// Methods that manage their own locking: the overlord, UI control, and
     /// the MCP bridge (which re-enters `call`). None = not one of these.
     fn call_ui(&self, method: &str, params: &Value) -> Option<Result<Value>> {
@@ -1757,6 +1806,65 @@ mod tests {
         assert_eq!(o["role"], "overlord");
         assert_eq!(o["conversations"]["earlier"], 2);
         assert_eq!(o["conversations"]["reason"], "switched");
+    }
+
+    /// A session on Codex's daemon: its hooks arrive with no session named
+    /// (`by: "thread"`), bind by folder, then go by thread.
+    #[test]
+    fn codex_daemon_hooks_go_by_thread() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        for (id, folder) in [("01dmn", "/src/app"), ("01dmn2", "/src/web")] {
+            db.insert_session(&rlord_core::db::NewSession {
+                id,
+                name: id,
+                agent: "codex",
+                agent_session: None,
+                project_path: folder,
+                tmux_session: Some("rlord_01dmn_absent"),
+                launch_spec: r#"{"agent":"codex","codex_host":"daemon"}"#,
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.set_status(id, Status::Starting, 1).unwrap();
+        }
+        let index = |_: rlord_core::agents::Agent, _: &str| rlord_core::agents::Indexed::User;
+        let emit = |event: &str, sid: &str, cwd: &str| {
+            methods::hook_emit_with(
+                &db,
+                &json!({"instance": null, "by": "thread", "agent": "codex", "event": event,
+                        "payload": {"session_id": sid, "hook_event_name": event, "cwd": cwd,
+                                    "transcript_path": format!("/c/rollout-x-{sid}.jsonl")}}),
+                &index,
+            )
+            .unwrap()
+        };
+        let get = |id: &str| db.resolve_ref(id).unwrap();
+        // Not a first SessionStart: nothing to bind it to.
+        assert!(emit("UserPromptSubmit", "t-1", "/src/app")["ignored"].is_string());
+        // The first SessionStart in its folder binds it, confirmed by hook.
+        emit("SessionStart", "t-1", "/src/app");
+        let s = get("01dmn");
+        assert!(s.codex_daemon);
+        assert_eq!(s.agent_session.as_deref(), Some("t-1"));
+        assert_eq!(s.agent_session_trust, "hook");
+        assert_eq!(get("01dmn2").agent_session, None);
+        // Then by thread, from wherever it was sent.
+        emit("UserPromptSubmit", "t-1", "/elsewhere");
+        assert_eq!(get("01dmn").status, Status::Working);
+        emit("Stop", "t-1", "/src/app");
+        assert_eq!(get("01dmn").status, Status::Idle);
+        // Someone else's thread in the same folder: not this session's.
+        assert!(emit("UserPromptSubmit", "t-9", "/src/app")["ignored"].is_string());
+        assert_eq!(get("01dmn").status, Status::Idle);
+        // A stopped one's thread never brings it back.
+        db.set_status("01dmn", Status::Stopped, 2).unwrap();
+        assert!(emit("UserPromptSubmit", "t-1", "/src/app")["ignored"].is_string());
+        assert_eq!(get("01dmn").status, Status::Stopped);
     }
 
     /// Codex assigns its own conversation id: the first hook binds it.

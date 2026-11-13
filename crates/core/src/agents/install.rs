@@ -519,6 +519,10 @@ pub struct Status {
     pub hooks_outdated: bool,
     /// Codex only: the user trusted rlord's hooks (`/hooks`).
     pub hooks_trusted: Option<bool>,
+    /// Codex only, when asked for versions: the version of its running
+    /// background server, when it differs from the CLI's (it updates
+    /// itself). Sessions on that server run this one.
+    pub daemon_version: Option<String>,
     /// Installed, but a version rlord can't run: why.
     pub too_old: Option<String>,
     /// How to install it, when it isn't (or to upgrade it, when too old).
@@ -555,6 +559,13 @@ pub fn status(full: bool) -> Vec<Status> {
             let hooks_outdated = hooked
                 .zip(missing.as_ref())
                 .is_some_and(|(a, m)| !m.is_empty() && m.len() < a.hook_events().len());
+            // (Its own command, bounded; only when versions are asked for.)
+            let daemon_version = match (t.agent, path.as_deref()) {
+                (Some(Agent::Codex), Some(p)) if versions => super::codex_server::version(p)
+                    .filter(super::codex_server::DaemonInfo::running)
+                    .and_then(|d| d.differs().map(str::to_string)),
+                _ => None,
+            };
             let hooks_trusted = match t.agent {
                 Some(Agent::Codex) => codex_hooks_trusted(&codex::home()),
                 _ => None,
@@ -595,6 +606,7 @@ pub fn status(full: bool) -> Vec<Status> {
                 hooks_installed,
                 hooks_outdated,
                 hooks_trusted,
+                daemon_version,
                 install: (!installed || too_old.is_some()).then(|| suggest(t, machine)),
                 too_old,
                 next,

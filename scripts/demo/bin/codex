@@ -7,14 +7,30 @@
 # No hooks for a session with a file $RLORD_DEMO_DIR/nohooks/<folder name>,
 # as when rlord's hooks aren't trusted in Codex yet (rlord then follows the
 # thread index and the rollout).
+#
+# Without --no-daemon it plays a thread on Codex's shared background
+# server: its hooks run without the pane's RLORD_SESSION_ID / TMUX_PANE (as
+# the daemon's do), and the index lists it as an app-server client's.
+# `codex app-server daemon version|start` answer as the real one does.
 set -u
 demo=${RLORD_DEMO_DIR:?}
 home=${CODEX_HOME:?}
+if [[ ${1:-} == app-server && ${2:-} == daemon ]]; then
+  case ${3:-} in
+    start) mkdir -p "$home" && touch "$home/stand-in-daemon" ;;
+    version) ;;
+    *) echo "the stand-in knows only daemon version|start" >&2; exit 2 ;;
+  esac
+  st=stopped; [[ -e $home/stand-in-daemon ]] && st=running
+  printf '{"status":"%s","backend":"pid","socketPath":"%s/app-server-control/app-server-control.sock","cliVersion":"0.167.2","appServerVersion":"0.169.0"}\n' "$st" "$home"
+  exit 0
+fi
 args=("$@")
-tid='' prompt='' exec=0 out='' sub=''
+tid='' prompt='' exec=0 out='' sub='' daemon=1
 for ((i = 0; i < ${#args[@]}; i++)); do
   case ${args[$i]} in
     exec) exec=1 ;;
+    --no-daemon) daemon=0 ;;
     resume | fork) sub=${args[$i]}; tid=${args[$((i + 1))]}; i=$((i + 1)) ;;
     -m | --model | -c | --config | -s | --sandbox) i=$((i + 1)) ;;
     -o | --output-last-message) out=${args[$((i + 1))]}; i=$((i + 1)) ;;
@@ -49,13 +65,20 @@ else
     "$(now)" "$tid" "$PWD" >"$tr"
   # (The first prompt, as Codex records it: quotes doubled for SQL.)
   first=$(printf '%s' "$prompt" | sed "s/'/''/g")
-  sqlite3 "$db" "insert into threads (id, rollout_path, cwd, title, created_at_ms, updated_at_ms, thread_source, model, source, first_user_message) values ('$tid', '$tr', '$PWD', '', $ms, $ms, 'user', 'gpt-6-luna', 'cli', '$first')"
+  source=cli; [[ $daemon == 1 ]] && source=vscode
+  sqlite3 "$db" "insert into threads (id, rollout_path, cwd, title, created_at_ms, updated_at_ms, thread_source, model, source, first_user_message) values ('$tid', '$tr', '$PWD', '', $ms, $ms, 'user', 'gpt-6-luna', '$source', '$first')"
 fi
 
 hook() {
   [[ -e $demo/nohooks/$key ]] && return
   python3 -c 'import json,sys; print(json.dumps({"hook_event_name": sys.argv[1], "session_id": sys.argv[2], "transcript_path": sys.argv[3], "cwd": sys.argv[4]}))' \
-    "$1" "$tid" "$tr" "$PWD" | rlord hook emit codex >/dev/null 2>&1 || true
+    "$1" "$tid" "$tr" "$PWD" | {
+      if [[ $daemon == 1 ]]; then
+        env -u RLORD_SESSION_ID -u TMUX_PANE rlord hook emit codex
+      else
+        rlord hook emit codex
+      fi
+    } >/dev/null 2>&1 || true
 }
 # line TYPE PAYLOAD-JSON: one rollout line.
 line() { python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": sys.argv[2], "payload": json.loads(sys.argv[3])}))' "$(now)" "$1" "$2" >>"$tr"; }
@@ -88,7 +111,9 @@ if [[ $sub != resume ]]; then
     [[ $state == waiting ]] && hook PermissionRequest
   fi
 fi
-trap 'hook SessionEnd; exit 0' TERM HUP INT
+# (On the daemon the thread outlives its client: no SessionEnd when the
+# pane goes.)
+if [[ $daemon == 1 ]]; then trap 'exit 0' TERM HUP INT; else trap 'hook SessionEnd; exit 0' TERM HUP INT; fi
 clear
 cat "$screen" 2>/dev/null
 while :; do sleep 3600 & wait $!; done

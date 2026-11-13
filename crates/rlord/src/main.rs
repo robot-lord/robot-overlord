@@ -916,11 +916,13 @@ fn main() -> Result<()> {
         Command::Stop { r#ref } => {
             let r = call("session.stop", json!({"ref": r#ref}))?;
             println!("stopped {}", r["stopped"].as_str().unwrap_or("?"));
+            print_turn(&r);
             Ok(())
         }
         Command::Archive { r#ref } => {
             let r = call("session.archive", json!({"ref": r#ref}))?;
             println!("archived {}", r["archived"].as_str().unwrap_or("?"));
+            print_turn(&r);
             Ok(())
         }
         Command::Unarchive { r#ref } => {
@@ -1648,8 +1650,23 @@ fn run_daemon() -> Result<()> {
 /// Fast path for agent hooks: read payload from stdin, forward to the daemon,
 /// spool on failure. Exits 0 in all cases — a hook must never break the agent.
 fn hook_emit(agent: &str) -> Result<()> {
-    let Ok(instance) = std::env::var("RLORD_SESSION_ID") else {
-        return Ok(()); // not an rlord-managed session
+    let instance = std::env::var("RLORD_SESSION_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    // No session named: an agent rlord doesn't run, unless it is a thread
+    // on Codex's background server, whose hooks run there without the
+    // pane's environment. Only threads the gate lists go on (one small
+    // read; nothing for every other Codex thread on the machine).
+    let gate = match &instance {
+        Some(_) => None,
+        None if agent == rlord_core::agents::Agent::Codex.name() => {
+            match rlord_core::agents::codex_gate::read_from(&rlord_core::agents::codex_gate::path())
+            {
+                Some(g) if !g.is_empty() => Some(g),
+                _ => return Ok(()),
+            }
+        }
+        None => return Ok(()), // not an rlord-managed session
     };
     // Only what rlord uses goes on (not a tool's whole input and output);
     // stdin cut off at the limit still yields the event's name.
@@ -1661,15 +1678,27 @@ fn hook_emit(agent: &str) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    // Which pane this agent runs in: the daemon accepts a session's hooks
-    // only from its own pane (a forked or background copy of the agent
-    // inherits RLORD_SESSION_ID but isn't in it).
-    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
-    let socket = std::env::var("TMUX")
-        .ok()
-        .and_then(|t| t.split(',').next().map(str::to_string));
-    let params = json!({"instance": instance, "agent": agent, "event": event,
-                        "payload": payload, "pane": pane, "tmux": socket});
+    let params = match gate {
+        // (The daemon's TMUX_PANE is whichever pane started it: not sent.)
+        Some(g) => {
+            if !g.admits(&event, &payload) {
+                return Ok(());
+            }
+            json!({"instance": null, "by": "thread", "agent": agent, "event": event,
+                   "payload": payload})
+        }
+        None => {
+            // Which pane this agent runs in: the daemon accepts a session's
+            // hooks only from its own pane (a forked or background copy of
+            // the agent inherits RLORD_SESSION_ID but isn't in it).
+            let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+            let socket = std::env::var("TMUX")
+                .ok()
+                .and_then(|t| t.split(',').next().map(str::to_string));
+            json!({"instance": instance, "agent": agent, "event": event,
+                   "payload": payload, "pane": pane, "tmux": socket})
+        }
+    };
     // Bounded: a stalled daemon never holds up the agent's tool call.
     if rlord_daemon::send_hook_event(&paths::socket_path(), &params)
         == rlord_daemon::HookSent::Unreachable
@@ -1874,6 +1903,21 @@ fn attach_tmux(tmux_name: &str) -> Result<()> {
     Err(err).context("exec tmux failed")
 }
 
+/// What stopping a session on Codex's background server did to its
+/// running turn, if it had one.
+fn print_turn(r: &Value) {
+    match r["turn"].as_str() {
+        Some("interrupted") => println!("  its running turn was interrupted first"),
+        Some(_) => println!(
+            "  {}",
+            r["note"]
+                .as_str()
+                .unwrap_or("its turn may still be running")
+        ),
+        None => {}
+    }
+}
+
 /// `rlord agents`: one block per coding agent.
 fn print_coding_agents(v: &Value) {
     for a in v["agents"].as_array().into_iter().flatten() {
@@ -1896,6 +1940,9 @@ fn print_coding_agents(v: &Value) {
                 ""
             }
         );
+        if let Some(d) = a["daemon_version"].as_str() {
+            println!("  its background server runs {d} (sessions on it run that version)");
+        }
         if a["hooks_outdated"] == true {
             println!("  rlord hooks: out of date — run `rlord install-hooks` again");
         } else if let Some(why) = a["too_old"].as_str() {
