@@ -365,8 +365,3 @@ and without a model and a restart of a session OpenCode no longer had.
 - Screenshots retaken with the OpenCode demo session (README pass, 0.22.0-dev.4).
 - `docs/architecture.md` got the OpenCode facts in its agent section; the
   larger reconcile owed by `docs/working/codex-support.md` still stands.
-
-## Codex Remote Control: deferred
-
-Not supported until Codex makes it official (Brandon, 2026-11-13); findings
-and branch `codex-remote` in `docs/working-archive/codex-daemon.md`.

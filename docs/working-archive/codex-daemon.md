@@ -99,15 +99,17 @@ its "After launch (tracked)" list:
 - Linux: the daemon's backend, socket and sandbox (unchecked; Linux fixes
   come after 1.0, Road to 1.0 item 1).
 - Check live what environment a daemon thread's commands and MCP servers
-  get when rlord started the daemon (architecture.md states the expected
-  one).
+  get (expected: the daemon's, which is whatever started it: rlord's own,
+  less its session variables, or a pane's when that pane's TUI started it,
+  or a plain `codex`'s), and document it in architecture.md and the guide.
 - A daemon started by hand from an in-pane rlord session's pane would pass
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.
 - A daemon started by a daemon-mode pane's own TUI carries that pane's
   `TMUX` / `TMUX_PANE` into every thread's commands and MCP servers. Ways
-  rlord's own start doesn't happen first: `ensure_running`'s one-a-minute
-  throttle also starts after a success (throttle only failures);
+  rlord's own start doesn't happen first: `ensure_running` stamps its
+  one-a-minute throttle before it asks, so it applies after a success and
+  after a launch where Codex wasn't resolved yet (stamp only failures);
   `ui.goto` restarts a session whose tmux session is gone without asking
   (`starts_on_codex_daemon` checks only Stopped ones); and `daemon start`
   runs without the Codex folder the pane adds to PATH, so a Codex that

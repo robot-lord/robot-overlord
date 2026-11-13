@@ -337,13 +337,6 @@ launched with flags that need the pane (`-c` / `--config`, `--enable`,
 server: `/clear` or `/new` in the session (it stays on its first
 thread), and "needs you" from a sub-agent's prompt.
 
-The server's commands and MCP servers run with the environment of
-whatever started the server, not your session's pane. That is usually
-rlord. When no server is running and rlord couldn't start one (for
-example, Codex isn't on rlord's own PATH), the pane's Codex starts it,
-with that pane's environment, tmux variables included. A server started
-earlier by your own `codex` keeps that one's. Not checked live yet.
-
 Avoid starting turns on the same conversation from another Codex client:
 rlord can't always tell, and may type a message (or a usage-limit
 "continue") into that turn. Daemon mode has been checked on macOS only

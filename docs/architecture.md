@@ -261,23 +261,22 @@ there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
 `--enable`, `--disable` or `--search`, in any of their spellings (`-cK=V`,
-`--config=V`, …), in the TUI's own process). So a daemon-mode pane can't
-be given `-c check_for_update_on_startup=false` (the overlord's) and, like
-an in-pane session, can open on Codex's update prompt. `spec_args` adds
-`--no-daemon` for every other Codex session. The rest is
-`daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
+`--config=V`, …), in the TUI's own process; `-m` / `--model` doesn't). So
+a daemon-mode pane can't be given `-c check_for_update_on_startup=false`
+(the overlord's) and, like an in-pane session, can open on Codex's update
+prompt. `spec_args` adds `--no-daemon` for every other Codex session. The
+rest is `daemon/src/codex_daemon.rs`, with the client in
+`agents::codex_server`:
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
-  environment of whatever started the daemon, not the session's (even when
-  a pane's TUI started it: a daemon-mode pane has no `RLORD_SESSION_ID`,
-  so the hook client takes the gate path). So a daemon-mode pane gets no
-  `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
+  environment of whatever started the daemon. So a daemon-mode pane gets
+  no `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
   on), and rlord starts the daemon itself (`codex app-server daemon
   start`, `RLORD_SESSION_ID`, `TMUX` and `TMUX_PANE` removed) before such
   a pane when none runs (asked at most once a minute, never failing the
-  launch: if none runs and the ask was skipped or failed, the pane's TUI
-  starts one with the pane's environment, or runs the turn in the pane).
-  `rlord hook emit codex` without `RLORD_SESSION_ID` reads the gate file
+  launch; when none runs and rlord didn't start one, the pane's TUI does,
+  with the pane's environment, or runs the turn in the pane). `rlord hook
+  emit codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
   daemon-mode session's bound thread, and the folder of each still waiting
   for one) and sends only what it admits, marked `by: "thread"`; anything
@@ -321,13 +320,6 @@ an in-pane session, can open on Codex's update prompt. `spec_args` adds
   too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
   or the transcript past the limit), so its gap is the same moment.
   Escape in either client interrupts.
-- **Commands and MCP servers run in the daemon** (expected to get its
-  environment, as its hooks do, not the pane's; not checked live). Started
-  by rlord, that is the rlord daemon's environment less its session
-  variables: the shell that first started rlord, or the launchd/systemd
-  service's. A daemon a daemon-mode pane's TUI started has that pane's
-  `TMUX` / `TMUX_PANE` (seen in its own environment). A daemon something
-  else started (a plain `codex`, an editor) keeps that one's.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
