@@ -56,7 +56,7 @@ impl App {
             ),
             theme::faint(),
         ));
-        let block = theme::panel(title, false);
+        let block = self.archived_tint(theme::panel(title, false));
         f.render_widget(
             Paragraph::new(lines)
                 .block(block)

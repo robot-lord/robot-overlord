@@ -461,6 +461,11 @@ can't be opened again until it's unarchived (`u`), and where a live session
 shows its pane, an archived one shows **what it did**: a short summary
 written when it was archived, plus its notes and dates.
 
+`a` (or `:archived`) switches the list to archived sessions. The list and
+details panes sit on a faint warm tint and the list's title reads
+**Archived** in yellow, so it can't pass for the live list. `esc` (or `a`
+again) goes back; a search filter or an open popup takes `esc` first.
+
 The summary is written once, in the background, on a cheap model (`[archive]
 summary_model`, Haiku by default). Claude reads a fork of the whole
 conversation (`--resume … --fork-session`, nothing saved, no tools; the
@@ -667,6 +672,9 @@ Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).
 The footer shows only the everyday keys. `?` opens a cheat sheet of every
 key; `:` opens a command launcher for the rest (`:keys`, `:sort created`,
 `:archived`, `:log`, `:usage tokens`, …).
+In the launcher, menus and form pickers, `ctrl-n`/`ctrl-p` and
+`ctrl-j`/`ctrl-k` move up and down as the arrows do (as in fzf); plain
+`j`/`k` still type into the launcher's filter.
 
 **Changing keys:** ask the overlord ("change my keys", "Option-D is
 awkward"), or `:keys`. The key screen lists every key rlord binds and what

@@ -53,6 +53,21 @@ pub fn run(config: Config) -> Result<()> {
 /// such as Shift-Enter arrive distinct from plain ones (rlord's tmux has
 /// `extended-keys on` and passes them through). Terminals that don't support
 /// it ignore the request; Shift-Enter then reads as Enter.
+/// A move in a picker list (the launcher, menus, form pickers): `Some(true)`
+/// down, `Some(false)` up. Arrows, plus Ctrl-J/Ctrl-N and Ctrl-K/Ctrl-P as
+/// in fzf. Ctrl-J is LF, but in raw mode (always, here) crossterm reports it
+/// as Ctrl+'j', never as Enter, so it can't be mistaken for one.
+pub(crate) fn picker_step(k: &KeyEvent) -> Option<bool> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Down => Some(true),
+        KeyCode::Up => Some(false),
+        KeyCode::Char('j' | 'n') if ctrl => Some(true),
+        KeyCode::Char('k' | 'p') if ctrl => Some(false),
+        _ => None,
+    }
+}
+
 fn init_terminal() -> DefaultTerminal {
     let t = ratatui::init();
     // The mouse: clicks and the wheel reach the list (see mouse.rs).
@@ -932,10 +947,14 @@ impl App {
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
             Action::Cancel if self.conv_sel > 0 => self.show_conversation(0),
+            // Esc peels one layer: the search filter, then the archived
+            // view (back to the live list).
             Action::Cancel => {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.dirty = true;
+                } else if self.show_archived {
+                    self.do_action(Action::ToggleArchived, terminal)?;
                 }
             }
         }
@@ -1575,7 +1594,7 @@ impl App {
             .collect();
         // The list is the focused pane unless the group column has focus.
         let focused = !(self.tab == Tab::Groups && self.group_focus);
-        let block = theme::panel(self.list_title(), focused);
+        let block = self.archived_tint(theme::panel(self.list_title(), focused));
         let widths_for_hits = widths.clone();
         let table = Table::new(rows, widths)
             .header(header)
@@ -1785,7 +1804,7 @@ impl App {
     /// The control-layer card: everything we know about the session that
     /// isn't the live pane, plus the human-authored description and notes.
     fn draw_details(&self, f: &mut Frame, area: Rect) {
-        let block = theme::panel(theme::title("Details"), false);
+        let block = self.archived_tint(theme::panel(theme::title("Details"), false));
         let Some(s) = self.selected() else {
             f.render_widget(block, area);
             return;

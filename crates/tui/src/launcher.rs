@@ -13,7 +13,7 @@ use rlord_core::usage::UsageMetric;
 #[derive(Default)]
 pub(crate) struct Launcher {
     pub(crate) buf: String,
-    sel: usize,
+    pub(crate) sel: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +177,15 @@ impl App {
     ) -> Result<()> {
         let m = l.matches();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(down) = picker_step(&k) {
+            l.sel = if down {
+                (l.sel + 1).min(m.len().saturating_sub(1))
+            } else {
+                l.sel.saturating_sub(1)
+            };
+            self.mode = Mode::Command(l);
+            return Ok(());
+        }
         match k.code {
             KeyCode::Esc => return Ok(()),
             KeyCode::Char('c' | 'g') if ctrl => return Ok(()),
@@ -193,10 +202,6 @@ impl App {
                     l.sel = 0;
                 }
             }
-            KeyCode::Up => l.sel = l.sel.saturating_sub(1),
-            KeyCode::Char('p') if ctrl => l.sel = l.sel.saturating_sub(1),
-            KeyCode::Down => l.sel = (l.sel + 1).min(m.len().saturating_sub(1)),
-            KeyCode::Char('n') if ctrl => l.sel = (l.sel + 1).min(m.len().saturating_sub(1)),
             KeyCode::Char('u') if ctrl => {
                 l.buf.clear();
                 l.sel = 0;
@@ -346,7 +351,10 @@ impl App {
             row(k(Action::Notes), "notes in $EDITOR"),
             row(k(Action::Sort), "next sort"),
             row(k(Action::ReverseSort), "reverse sort"),
-            row(k(Action::ToggleArchived), "show archived"),
+            row(
+                format!("{}/{}", k(Action::ToggleArchived), k(Action::Cancel)),
+                "archived view / back to the list",
+            ),
             row(k(Action::ToggleLog), "pane ⇄ log preview"),
             row(k(Action::Quit), "quit"),
         ];
@@ -385,6 +393,10 @@ impl App {
             head("Commands"),
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
+            row(
+                "↑↓ ^N/^P ^J/^K".into(),
+                "move in the launcher, menus, pickers",
+            ),
             Line::from(""),
             head("Mouse"),
             Line::styled(

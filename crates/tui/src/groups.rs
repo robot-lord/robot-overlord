@@ -408,6 +408,16 @@ impl App {
                 archived,
             ));
             bar.extend(key(Action::ToggleArchived));
+            // In the archived view: how to get back (Esc, unless the search
+            // filter would take it first). Clicking it goes back too.
+            if self.show_archived && self.filter.is_empty() {
+                if let Some(k) = key(Action::Cancel) {
+                    let back = press(Action::Cancel);
+                    bar.push((Span::raw(" "), None));
+                    bar.push(k);
+                    bar.push((Span::styled(" back", theme::muted()), back));
+                }
+            }
             bar
         };
         // Beside the 6-column logo and its gap (compact: one cell in).
@@ -571,22 +581,39 @@ impl App {
         self.draw_list(f, right);
     }
 
-    /// Title for the session table on either tab.
-    pub(crate) fn list_title(&self) -> String {
+    /// Title for the session table on either tab. In the archived view it
+    /// leads with "Archived" in yellow (as the toolbar's switch), so it's
+    /// plain which list this is.
+    pub(crate) fn list_title(&self) -> Line<'static> {
+        let archived = || Span::styled("Archived", Style::default().fg(theme::yellow()).bold());
         match self.tab {
-            Tab::Sessions => format!(
-                " {}  {} ",
+            Tab::Sessions if self.show_archived => Line::from(vec![
+                " ".into(),
+                archived(),
+                format!("  {} ", self.all.len()).into(),
+            ]),
+            Tab::Sessions => format!(" Sessions  {} ", self.all.len()).into(),
+            Tab::Groups => {
+                let text = match &self.group_sel {
+                    Some(g) => format!("{}  {} ", group_label(g), self.sessions.len()),
+                    None => "No sessions ".into(),
+                };
                 if self.show_archived {
-                    "Archived"
+                    Line::from(vec![" ".into(), archived(), " · ".into(), text.into()])
                 } else {
-                    "Sessions"
-                },
-                self.all.len()
-            ),
-            Tab::Groups => match &self.group_sel {
-                Some(g) => format!(" {}  {} ", group_label(g), self.sessions.len()),
-                None => " No sessions ".into(),
-            },
+                    format!(" {text}").into()
+                }
+            }
+        }
+    }
+
+    /// The archived view's panes sit on their own faint tint
+    /// (`archived_bg`), so it never passes for the live list.
+    pub(crate) fn archived_tint<'a>(&self, block: Block<'a>) -> Block<'a> {
+        if self.show_archived {
+            block.style(theme::base().bg(theme::archived_bg()))
+        } else {
+            block
         }
     }
 }

@@ -56,6 +56,10 @@ pub struct Palette {
     pub bg: Option<Rgb>,
     /// Selected row.
     pub surface: Rgb,
+    /// Behind the session list and details while the archived view is
+    /// shown: a faint warm wash of the background, so it is clearly not the
+    /// live list. Kept off `surface` so the selected row still stands out.
+    pub archived_bg: Rgb,
     /// Chips: tabs, keycaps.
     pub chip: Rgb,
     pub border: Rgb,
@@ -100,6 +104,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: None,
         surface: i(236),
+        archived_bg: h(0x26221a),
         chip: i(237),
         border: i(238),
         faint: i(240),
@@ -124,6 +129,7 @@ pub const THEMES: &[Palette] = &[
         // text on black.
         bg: Some(i(255)),
         surface: i(254),
+        archived_bg: h(0xf2ead6),
         chip: i(253),
         border: i(250),
         faint: i(246),
@@ -145,6 +151,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x1e1e2e)),
         surface: h(0x313244),
+        archived_bg: h(0x292834),
         chip: h(0x45475a),
         border: h(0x45475a),
         faint: h(0x6c7086),
@@ -166,6 +173,7 @@ pub const THEMES: &[Palette] = &[
         dark: false,
         bg: Some(h(0xeff1f5)),
         surface: h(0xccd0da),
+        archived_bg: h(0xede7df),
         chip: h(0xbcc0cc),
         border: h(0xbcc0cc),
         faint: h(0x9ca0b0),
@@ -187,6 +195,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x1a1b26)),
         surface: h(0x292e42),
+        archived_bg: h(0x242229),
         chip: h(0x3b4261),
         border: h(0x3b4261),
         faint: h(0x565f89),
@@ -208,6 +217,7 @@ pub const THEMES: &[Palette] = &[
         dark: false,
         bg: Some(h(0xe1e2e7)),
         surface: h(0xc4c8da),
+        archived_bg: h(0xd8d6d6),
         chip: h(0xb7c1e3),
         border: h(0xa8aecb),
         faint: h(0x848cb5),
@@ -229,6 +239,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x282828)),
         surface: h(0x3c3836),
+        archived_bg: h(0x322f28),
         chip: h(0x504945),
         border: h(0x504945),
         faint: h(0x928374),
@@ -250,6 +261,7 @@ pub const THEMES: &[Palette] = &[
         dark: false,
         bg: Some(h(0xfbf1c7)),
         surface: h(0xebdbb2),
+        archived_bg: h(0xf4e5b5),
         chip: h(0xd5c4a1),
         border: h(0xd5c4a1),
         faint: h(0x928374),
@@ -271,6 +283,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x002b36)),
         surface: h(0x073642),
+        archived_bg: h(0x093033),
         chip: h(0x0f4a57),
         border: h(0x0f4a57),
         faint: h(0x586e75),
@@ -292,6 +305,7 @@ pub const THEMES: &[Palette] = &[
         dark: false,
         bg: Some(h(0xfdf6e3)),
         surface: h(0xeee8d5),
+        archived_bg: h(0xf6ebcc),
         chip: h(0xe4ddc8),
         border: h(0xddd6c1),
         faint: h(0x93a1a1),
@@ -313,6 +327,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x2e3440)),
         surface: h(0x3b4252),
+        archived_bg: h(0x373c44),
         chip: h(0x434c5e),
         border: h(0x434c5e),
         faint: h(0x616e88),
@@ -334,6 +349,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: Some(h(0x282a36)),
         surface: h(0x44475a),
+        archived_bg: h(0x32343a),
         chip: h(0x44475a),
         border: h(0x44475a),
         faint: h(0x6272a4),
@@ -456,6 +472,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every theme has an archived tint: off the background (so it shows)
+    /// and off the selected row's `surface` (so the selection still does),
+    /// but near the background's lightness (subtle, text stays readable).
+    #[test]
+    fn every_theme_has_a_subtle_archived_tint() {
+        let lum = |c: Rgb| match c {
+            Rgb::Hex(r, g, b) => (r as i32 + g as i32 + b as i32) / 3,
+            Rgb::Indexed(_) => panic!("archived_bg is RGB"),
+        };
+        for p in THEMES {
+            assert_ne!(Some(p.archived_bg), p.bg, "{}", p.name);
+            assert_ne!(p.archived_bg, p.surface, "{}", p.name);
+            let l = lum(p.archived_bg);
+            assert!(if p.dark { l < 70 } else { l > 190 }, "{}: {l}", p.name);
+        }
+    }
 
     #[test]
     fn families_follow_the_appearance_and_names_resolve() {
