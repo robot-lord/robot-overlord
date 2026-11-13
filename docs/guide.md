@@ -336,8 +336,8 @@ with flags that need the pane (`-c`, `--enable`, `--disable`,
 `--search`), stay in the pane. Not followed yet on the server: `/clear`
 or `/new` in the session (it stays on its first thread), and "needs you"
 from a sub-agent's prompt. Its commands and MCP servers run with the
-background server's environment, not the pane's (so not, say, a folder's
-direnv). Checked on macOS only so far.
+background server's environment, not the pane's. Daemon mode has been
+checked on macOS only so far.
 
 Not yet: importing Codex
 conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked

@@ -298,14 +298,15 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
 - **Launch, then bind; never create the thread first.** A thread made by
   `thread/start` has no rollout until its first turn, so `codex resume
   <id>` on it fails ("no rollout found for thread id"; 0.167.2 / daemon
-  0.169.0). The pane's TUI creates the thread, bound by the first
-  `SessionStart` (folder rule) or the index.
+  0.169.0). The pane's TUI creates it; binding is as above.
 - **Another client on the same thread**: a turn started there streams
   into the rlord pane, but the pane's composer reads as idle (`› Ask
   Codex…`, no "esc to interrupt"), so `Agent::at_prompt` alone can't tell.
-  Its hooks are matched by thread, so the session turns working and sends
-  hold off; the gap is the moment before that hook lands (without hooks,
-  before the transcript is read). Escape in either client interrupts.
+  Its hooks are matched by thread, so the session turns working and
+  `send_to_session` and held deliveries wait; the gap is the moment before
+  that hook lands (without hooks, before the transcript is read). A
+  usage-limit resume doesn't wait on the status, so it can land in such a
+  turn. Escape in either client interrupts.
 - **Commands and MCP servers run in the daemon's environment**, like its
   hooks: whatever environment the daemon was started with (scrubbed when
   rlord started it), not the pane's.
@@ -971,8 +972,8 @@ including when the active one hits a usage limit.
   its bottom box). A status can't be trusted for this: a Codex session
   without hooks reads as working while an approval is up. (A daemon-mode
   Codex thread with a turn started from another client reads as at its
-  prompt; its status catches it: see "Codex on its shared background
-  server".) Sends also hold
+  prompt; for sends its status catches it: see "Codex on its shared
+  background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
   placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
   isn't read yet), within 10s (`SETTLE`) of the last paste into that

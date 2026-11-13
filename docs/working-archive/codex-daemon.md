@@ -20,8 +20,7 @@ tests (`codex_server::fake`), and docs. Re-check everything below against
 the Codex of the day first.
 
 Live checks named here (from the removed doc): L3 the Remote Control CLI
-and socket calls; L6 what a paired phone sees (never run); L8 a daemon
-restart or update mid-turn; L9 Linux.
+and socket calls; L6 what a paired phone sees (never run).
 
 What L3 found (codex-cli 0.167.2, daemon 0.169.0, macOS):
 
@@ -58,30 +57,21 @@ needs it; main never does):
   open in another app".
 - Onto the daemon (an in-pane thread resumed there) works at once.
 
-## Owed (daemon mode)
+## Owed (daemon mode), after launch
 
-The one list: `docs/working/public-launch.md` points here. **Before
-launch** items keep Road to 1.0 item 7 open; **after launch** items become
-issues with the rest of its tracked list.
+The checks that keep Road to 1.0 item 7 open are listed there
+(`docs/working/public-launch.md`). These become issues with the rest of
+its "After launch (tracked)" list:
 
-Before launch:
-
-- L8 by hand: a daemon restart or update mid-turn (what the session
-  shows; `notLoaded` should read as not running, so it stops once the pane
-  is gone).
-- A daemon-mode session's hooks through the real daemon into rlord, once a
-  release with the gate is installed (the payload fields, a first
-  SessionStart bound by folder).
-- L9: Linux backend, socket and sandbox.
-
-After launch:
-
-- A send can be typed into a daemon-mode thread mid-turn in the moment
-  between another Codex client starting a turn and its hook reaching rlord
-  (without hooks: until the transcript is read); the rlord pane's composer
-  reads idle meanwhile. Fix: in `send::type_into`, for daemon-mode
-  sessions only, ask the daemon (`codex_server::thread_state`) and treat
-  any `Active` as "not now", `waiting` included.
+- A message can be typed into a daemon-mode thread mid-turn when another
+  Codex client started that turn: `send_to_session` in the moment before
+  its hook reaches rlord (without hooks: until the transcript is read), and
+  a usage-limit resume at any point (it doesn't wait on the status). The
+  rlord pane's composer reads idle meanwhile. Fix: in `send::type_message`
+  (which every caller goes through), for daemon-mode sessions only, ask
+  the daemon (`codex_server::thread_state`) and treat any `Active` as "not
+  now", `waiting` included. It's a socket call of up to 3s under the
+  session's lock.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.

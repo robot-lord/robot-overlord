@@ -54,9 +54,15 @@ done, in this order (decided with the user, 2026-11-12):
 7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
-       `docs/working-archive/codex-daemon.md`. Open until its "Before
-       launch" items are done (live checks: hooks through the real
-       daemon, a daemon restart or update mid-turn, Linux).
+       `docs/working-archive/codex-daemon.md`. Open until these live
+       checks are done:
+       - a daemon-mode session's hooks through the real daemon into
+         rlord, once a release with the gate is installed (the payload
+         fields, a first SessionStart bound by folder);
+       - a daemon restart or update mid-turn, by hand (what the session
+         shows; `notLoaded` should read as not running, so it stops once
+         the pane is gone);
+       - Linux: the daemon's backend, socket and sandbox.
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
