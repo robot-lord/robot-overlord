@@ -86,7 +86,11 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
                 )?;
                 let mut rpm = cargo();
                 rpm.args(["generate-rpm", "-p", "crates/rlord", "--target", t.triple])
-                    .args(["--auto-req", "disabled"]);
+                    .args(["--auto-req", "disabled"])
+                    // It doesn't ask cargo where the binary is (cargo-deb
+                    // does): tell it, as the tarballs use.
+                    .arg("--target-dir")
+                    .arg(&target_dir);
                 // RPM forbids '-' in a version (only a dry run of a dev
                 // version gets here).
                 if ver.is_dev() {

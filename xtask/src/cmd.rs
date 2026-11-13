@@ -44,7 +44,11 @@ pub fn on_interrupt() {
         // running child (a whole `gh run watch`) before stopping. SIGINT
         // and SIGHUP reach the child too.
         for signal in [libc::SIGINT, libc::SIGHUP] {
-            libc::signal(signal, handler as libc::sighandler_t);
+            // A signal ignored on entry (nohup) stays ignored, for xtask
+            // and the commands it starts.
+            if libc::signal(signal, handler as libc::sighandler_t) == libc::SIG_IGN {
+                libc::signal(signal, libc::SIG_IGN);
+            }
         }
     }
 }

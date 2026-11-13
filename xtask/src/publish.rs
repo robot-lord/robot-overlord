@@ -151,7 +151,13 @@ remote = { package = \"robot-overlord-core\", version = \"1\" }
             ),
         ] {
             let listed = MANIFESTS.contains(&format!("{path}/Cargo.toml").as_str());
-            let internal = text.matches("package = \"robot-overlord-").count();
+            // Every dependency on a sibling crate, however it is written.
+            let internal = text.lines().filter(|l| l.contains("path = \"../")).count();
+            assert_eq!(
+                internal,
+                text.matches("package = \"robot-overlord-").count(),
+                "{path}: an internal dependency pin_internal_deps can't see"
+            );
             assert_eq!(internal > 0, listed, "{path}: MANIFESTS is out of date");
             let pinned = pin_internal_deps(text, &ver);
             assert_eq!(
