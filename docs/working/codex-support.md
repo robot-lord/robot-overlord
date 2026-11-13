@@ -332,7 +332,8 @@ the daemon restarts.
   user namespaces, e.g. stock Ubuntu 24.04's
   `apparmor_restrict_unprivileged_userns=1`) and say so clearly in the
   overlord or `rlord agents`, instead of every shell command failing
-  silently. (The socket check itself is done: blocked; see
+  silently, or with repeated prompts to run it unsandboxed (which,
+  approved, would reach rlord's socket). (The socket check itself is done: blocked; see
   `public-launch.md`.)
 - `codex queue --thread <id> --message …` could deliver to a busy Codex
   session without typing; `send_to_session` types for every agent today.
