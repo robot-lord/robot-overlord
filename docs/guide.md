@@ -328,11 +328,13 @@ off by default): new Codex sessions run their conversation on Codex's
 per-user background server instead of in the pane. The turn keeps going
 when the pane closes, and a restart attaches to it again. The session's
 details say "codex: shared server". rlord starts that server itself when
-none runs (if that fails, the pane's Codex may start it), and never updates, restarts or stops it; `rlord agents` shows
-its version when it differs from your `codex` (it updates itself).
-Stopping or archiving such a session interrupts its running turn first,
-and says so if it wouldn't stop. The overlord, and a session launched
-with flags that need the pane (`-c` / `--config`, `--enable`,
+none runs, and never updates, restarts or stops it; `rlord agents` shows
+its version when it differs from your `codex` (it updates itself). If
+rlord's start fails or is skipped, the pane's Codex may start the server
+instead, and then that pane's tmux variables reach every Codex thread on
+it. Stopping or archiving such a session interrupts its running turn
+first, and says so if it wouldn't stop. The overlord, and a session
+launched with flags that need the pane (`-c` / `--config`, `--enable`,
 `--disable`, `--search`), stay in the pane. Not followed yet on the
 server: `/clear` or `/new` in the session (it stays on its first
 thread), and "needs you" from a sub-agent's prompt. Its commands and MCP
@@ -342,7 +344,8 @@ as a launchd or systemd service, without what your shell's rc files
 set; a server started earlier by your own `codex`, that one's) rather
 than the pane's. Not checked yet. Avoid starting turns on the same
 conversation from another Codex client: rlord can't always tell, and
-may type a message into that turn. Daemon mode has been checked on macOS only so far.
+may type a message (or a usage-limit "continue") into that turn. Daemon
+mode has been checked on macOS only so far.
 
 Not yet: importing Codex
 conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked

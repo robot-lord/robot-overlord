@@ -75,8 +75,9 @@ its "After launch (tracked)" list:
 
 - A message can be typed into a daemon-mode thread mid-turn when another
   Codex client started that turn (architecture.md, "Another client on the
-  same thread"). Fix: in `send::type_message`
-  (which every caller goes through), for daemon-mode sessions only, ask
+  same thread"). Fix: in `send::type_message` (sends, deliveries and the
+  limit resume; `ask.rs` types into the overlord with `type_into`
+  directly), for daemon-mode sessions only, ask
   the daemon (`codex_server::thread_state`) and treat any `Active` as "not
   now", `waiting` included. `thread_state` is a handshake, `initialize`
   and `thread/read`, each bounded only between 3s reads, so a stalling
@@ -103,7 +104,12 @@ its "After launch (tracked)" list:
 - A daemon started by hand from an in-pane rlord session's pane would pass
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.
-- A daemon started by a daemon-mode pane's own TUI (rlord's
-  `ensure_running` asks at most once a minute and never fails the launch)
-  carries that pane's `TMUX` / `TMUX_PANE` into every thread's hooks,
-  commands and MCP servers.
+- A daemon started by a daemon-mode pane's own TUI carries that pane's
+  `TMUX` / `TMUX_PANE` into every thread's commands and MCP servers. Ways
+  rlord's own start doesn't happen first: `ensure_running`'s one-a-minute
+  throttle also starts after a success (throttle only failures);
+  `ui.goto` restarts a session whose tmux session is gone without asking
+  (`starts_on_codex_daemon` checks only Stopped ones); and `daemon start`
+  runs without the Codex folder the pane adds to PATH, so a Codex that
+  needs it (npm under nvm, rlord as a service) fails there and the pane
+  starts the daemon.

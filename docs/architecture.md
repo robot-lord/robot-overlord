@@ -268,8 +268,10 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
-  environment of whatever started the daemon, not the session's (unless
-  that session's pane started it: see below). So a
+  environment of whatever started the daemon, not the session's. (A
+  daemon a pane's TUI started carries that pane's `TMUX` / `TMUX_PANE`
+  into commands and MCP servers; hooks still match by thread, since the
+  hook client drops `TMUX_PANE` on the gate path.) So a
   daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
   starts can't pass one on), and rlord starts the daemon itself
   (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
@@ -298,7 +300,7 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   and stops the session only once no turn runs; meanwhile it stays as the
   hooks say, logged once as `pane_gone_turn_running`.
 - **Fresh restarts don't interrupt**: `session_fresh` is used only for
-  the overlord, which never runs on the daemon. Using it on a daemon-mode
+  the overlord ("Fresh restarts" below), which never runs on the daemon. Using it on a daemon-mode
   session would leave its turn running there while a new thread starts.
 - **Stop and archive interrupt first**, before the DB lock: Escape into
   the pane when it is up with no dialog (it interrupts from any client),
