@@ -582,7 +582,8 @@ connection to a push stream (status changes, new messages, session CRUD).
 ### MCP server
 
 The daemon serves MCP; each agent session gets it via a stdio shim in its
-`.mcp.json`: `rlord mcp` (proxies stdio ↔ UDS). Because the shim runs
+`.mcp.json`: `rlord mcp` (proxies stdio ↔ UDS; the overlord's adds
+`--overlord`, see below). Because the shim runs
 inside the pane, it inherits `RLORD_SESSION_ID` — **caller identity is
 automatic**, so tools can default "me" and enforce policy (e.g. rate limits,
 no self-restart).
@@ -595,7 +596,9 @@ daemon. `rlord mcp --overlord` serves every tool; only the overlord's
 config passes it (`agents::mcp_args`, shared by every agent's wiring). The
 shim sends `overlord: true` with `mcp.tools` / `mcp.call`; without it the
 daemon treats the caller as read-only. A test makes every tool sit in
-exactly one of the read-only and mutating lists.
+exactly one of the read-only and mutating lists. The gate trusts the shim: it
+keeps an agent that added plain `rlord mcp` to look-ups, but it is no
+boundary against local processes, which can reach the socket anyway.
 
 Tools (v1):
 - `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
