@@ -45,11 +45,22 @@ What L3 found (codex-cli 0.167.2, daemon 0.169.0, macOS):
 - `thread/name/set` exists (could name a thread after its rlord session).
 
 For moving a session between the pane and the daemon (Remote Control
-needs it): back into the pane must wait for the daemon to let go of the
-thread (architecture.md, the writer-lock bullet); onto the daemon works at
-once.
+needs it; main never does):
+
+- The daemon holds a thread's writer lock after its last client leaves,
+  until it unloads the thread (`thread/read` says `notLoaded`; seen from
+  under a minute to several minutes: poll, don't wait a fixed time).
+  `codex resume --no-daemon <id>` before then shows "This conversation is
+  open in another app".
+- Onto the daemon (an in-pane thread resumed there) works at once.
 
 ## Owed (daemon mode)
+
+The one list: `docs/working/public-launch.md` points here. **Before
+launch** items keep Road to 1.0 item 7 open; **after launch** items become
+issues with the rest of its tracked list.
+
+Before launch:
 
 - L8 by hand: a daemon restart or update mid-turn (what the session
   shows; `notLoaded` should read as not running, so it stops once the pane
@@ -57,13 +68,10 @@ once.
 - A daemon-mode session's hooks through the real daemon into rlord, once a
   release with the gate is installed (the payload fields, a first
   SessionStart bound by folder).
-- `/clear` and `/new` in a daemon-mode session: the new thread isn't
-  followed (the session stays on its first); the gate can't tell the
-  session's TUI from another client in the same folder.
-- A sub-agent's permission prompt on the daemon doesn't show "needs you"
-  (its thread isn't in the gate).
-- `send_to_session` still types into the pane; `codex queue` would reach a
-  daemon thread without one.
+- L9: Linux backend, socket and sandbox.
+
+After launch:
+
 - A send can be typed into a daemon-mode thread mid-turn when the turn was
   started from another Codex client (the rlord pane's composer reads idle).
   Fix: before the paste, ask the daemon (`codex_server::thread_state`)
@@ -72,10 +80,16 @@ once.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.
+- `/clear` and `/new` in a daemon-mode session: the new thread isn't
+  followed (the session stays on its first); the gate can't tell the
+  session's TUI from another client in the same folder.
+- A sub-agent's permission prompt on the daemon doesn't show "needs you"
+  (its thread isn't in the gate).
+- `send_to_session` still types into the pane; `codex queue` would reach a
+  daemon thread without one.
 - The Codex overlord on the daemon: any `-c`, `--enable`, `--disable` or
   `--search` makes Codex run embedded, and the overlord's wiring is all
   `-c`; it would need its MCP server and settings some other way.
-- Residual: a daemon started by hand from an in-pane rlord session's pane
-  would pass that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every
-  thread's hooks, which then pass the pane check for that session.
-- L9: Linux backend, socket and sandbox.
+- A daemon started by hand from an in-pane rlord session's pane would pass
+  that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
+  which then pass the pane check for that session.

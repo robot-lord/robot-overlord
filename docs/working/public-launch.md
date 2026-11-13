@@ -54,9 +54,9 @@ done, in this order (decided with the user, 2026-11-12):
 7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
-       `docs/working-archive/codex-daemon.md`. Open before it's done
-       (owed there): live checks of hooks through the real daemon into
-       rlord, a daemon restart or update mid-turn (L8), Linux (L9).
+       `docs/working-archive/codex-daemon.md`. Open until its "Before
+       launch" items are done (live checks: hooks through the real
+       daemon, L8, L9).
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
@@ -129,10 +129,8 @@ Dependabot version updates, grouped weekly.
 
 ## After launch (tracked)
 
-- Codex daemon mode's owed items (`docs/working-archive/codex-daemon.md`):
-  a send typed into a thread mid-turn started from another client,
-  approvals with two clients, `/clear` and `/new` not followed, sub-agent
-  "needs you", `codex queue`, the Codex overlord on the daemon.
+- Codex daemon mode: the "After launch" items in
+  `docs/working-archive/codex-daemon.md` (one issue each).
 - OpenCode: a draft in the input box doesn't hold a `send_to_session`.
 - Switching an existing overlord to another agent.
 - Narrower tool lists for Codex/OpenCode overlord subagents.

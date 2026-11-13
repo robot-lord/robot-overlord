@@ -300,17 +300,11 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
   <id>` on it fails ("no rollout found for thread id"; 0.167.2 / daemon
   0.169.0). The pane's TUI creates the thread, bound by the first
   `SessionStart` (folder rule) or the index.
-- **The daemon holds a thread's writer lock after its last client
-  leaves**, until it unloads the thread (`thread/read` says `notLoaded`;
-  seen from under a minute to several minutes: poll for it, don't wait a
-  fixed time). `codex resume --no-daemon <id>` before then shows "This
-  conversation is open in another app".
 - **Another client on the same thread hides a running turn.** A turn
   started from a second client streams into the rlord pane, but its
   composer reads as idle (`› Ask Codex…`, no "esc to interrupt"), so
   `Agent::at_prompt` can't tell the thread is busy and a send could be
-  typed in mid-turn (owed: ask the daemon first). Escape in either client
-  interrupts.
+  typed in mid-turn. Escape in either client interrupts.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
