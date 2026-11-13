@@ -11,6 +11,16 @@
 use super::*;
 use ratatui::widgets::{List, ListItem};
 
+/// What Esc does in the list (`App::esc_target`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EscTarget {
+    GroupList,
+    Conversation,
+    Filter,
+    LeaveArchived,
+    Nothing,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tab {
     Sessions,
@@ -218,7 +228,7 @@ impl App {
                 self.group_focus = true;
                 return true;
             }
-            _ if !self.group_focus && action == Some(Action::Cancel) => {
+            _ if action == Some(Action::Cancel) && self.esc_target() == EscTarget::GroupList => {
                 self.group_focus = true;
                 return true;
             }
@@ -408,6 +418,19 @@ impl App {
                 archived,
             ));
             bar.extend(key(Action::ToggleArchived));
+            // In the archived view: how to get back, when Esc would really
+            // go there (list showing, nothing nearer takes Esc). Clicking it goes back too.
+            if matches!(self.mode, Mode::Normal) && self.esc_target() == EscTarget::LeaveArchived {
+                if let Some(k) = key(Action::Cancel) {
+                    let back = press(Action::Cancel);
+                    bar.push((Span::raw(" "), None));
+                    bar.push(k);
+                    // (Tighter tiers: the keycap alone.)
+                    if tier < 2 {
+                        bar.push((Span::styled(" back", theme::muted()), back));
+                    }
+                }
+            }
             bar
         };
         // Beside the 6-column logo and its gap (compact: one cell in).
@@ -528,7 +551,7 @@ impl App {
                 ]))
             })
             .collect();
-        let block = theme::panel(theme::title("Groups"), self.group_focus);
+        let block = self.archived_tint(theme::panel(theme::title("Groups"), self.group_focus));
         if items.is_empty() {
             let msg = vec![
                 Line::from(""),
@@ -571,22 +594,57 @@ impl App {
         self.draw_list(f, right);
     }
 
-    /// Title for the session table on either tab.
-    pub(crate) fn list_title(&self) -> String {
+    /// Title for the session table on either tab. In the archived view it
+    /// leads with "Archived" in yellow (as the toolbar's switch), so it's
+    /// plain which list this is.
+    pub(crate) fn list_title(&self) -> Line<'static> {
+        let archived = || Span::styled("Archived", Style::default().fg(theme::yellow()).bold());
         match self.tab {
-            Tab::Sessions => format!(
-                " {}  {} ",
+            Tab::Sessions if self.show_archived => Line::from(vec![
+                " ".into(),
+                archived(),
+                format!("  {} ", self.all.len()).into(),
+            ]),
+            Tab::Sessions => format!(" Sessions  {} ", self.all.len()).into(),
+            Tab::Groups => {
+                let text = match &self.group_sel {
+                    Some(g) => format!("{}  {} ", group_label(g), self.sessions.len()),
+                    None => "No sessions ".into(),
+                };
                 if self.show_archived {
-                    "Archived"
+                    Line::from(vec![" ".into(), archived(), " · ".into(), text.into()])
                 } else {
-                    "Sessions"
-                },
-                self.all.len()
-            ),
-            Tab::Groups => match &self.group_sel {
-                Some(g) => format!(" {}  {} ", group_label(g), self.sessions.len()),
-                None => " No sessions ".into(),
-            },
+                    format!(" {text}").into()
+                }
+            }
+        }
+    }
+
+    /// Where Esc goes in the list, nearest layer first: out of a group (to
+    /// the group list), back from an earlier overlord conversation, the
+    /// search filter cleared, then out of the archived view. The Cancel
+    /// handler and the toolbar's `esc back` hint both ask this.
+    pub(crate) fn esc_target(&self) -> EscTarget {
+        if self.tab == Tab::Groups && !self.group_focus {
+            EscTarget::GroupList
+        } else if self.conv_sel > 0 {
+            EscTarget::Conversation
+        } else if !self.filter.is_empty() {
+            EscTarget::Filter
+        } else if self.show_archived {
+            EscTarget::LeaveArchived
+        } else {
+            EscTarget::Nothing
+        }
+    }
+
+    /// The archived view's panes sit on their own faint tint
+    /// (`archived_bg`), so it never passes for the live list.
+    pub(crate) fn archived_tint<'a>(&self, block: Block<'a>) -> Block<'a> {
+        if self.show_archived {
+            block.style(theme::base().bg(theme::archived_bg()))
+        } else {
+            block
         }
     }
 }

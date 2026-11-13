@@ -49,6 +49,55 @@ pub fn run(config: Config) -> Result<()> {
     result
 }
 
+/// One step in a list of `n`, stopping at the ends.
+pub(crate) fn clamp_step(i: usize, n: usize, down: bool) -> usize {
+    if down {
+        (i + 1).min(n.saturating_sub(1))
+    } else {
+        i.saturating_sub(1)
+    }
+}
+
+/// One step in a list of `n`, wrapping round (0 when empty).
+pub(crate) fn wrap_step(i: usize, n: usize, down: bool) -> usize {
+    match n {
+        0 => 0,
+        _ if down => (i + 1) % n,
+        _ => (i + n - 1) % n,
+    }
+}
+
+/// For tests: a terminal to hand the key handlers. Never drawn to: they
+/// only take it to hand the screen to an editor or tmux. A fixed viewport
+/// asks no tty.
+#[cfg(test)]
+pub(crate) fn handler_term() -> DefaultTerminal {
+    ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+        },
+    )
+    .unwrap()
+}
+
+/// A move in a picker list (the launcher, menus, form pickers): `Some(true)`
+/// down, `Some(false)` up. Arrows, plus Ctrl-J/Ctrl-N and Ctrl-K/Ctrl-P as
+/// in fzf. Ctrl-J is LF, but in raw mode (always, here) crossterm reports it
+/// as Ctrl+'j', never as Enter, so it can't be mistaken for one.
+pub(crate) fn picker_step(k: &KeyEvent) -> Option<bool> {
+    // Ctrl, not Alt (Ctrl-Alt-J is some other key).
+    let ctrl =
+        k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Down => Some(true),
+        KeyCode::Up => Some(false),
+        KeyCode::Char('j' | 'n') if ctrl => Some(true),
+        KeyCode::Char('k' | 'p') if ctrl => Some(false),
+        _ => None,
+    }
+}
+
 /// `ratatui::init` plus xterm modifyOtherKeys (mode 1), so modified keys
 /// such as Shift-Enter arrive distinct from plain ones (rlord's tmux has
 /// `extended-keys on` and passes them through). Terminals that don't support
@@ -874,6 +923,7 @@ impl App {
             Action::ToggleArchived => {
                 self.show_archived = !self.show_archived;
                 self.table.select(Some(0));
+                self.conv_sel = 0;
                 self.dirty = true;
             }
             Action::Sort => {
@@ -931,13 +981,20 @@ impl App {
             }
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
-            Action::Cancel if self.conv_sel > 0 => self.show_conversation(0),
-            Action::Cancel => {
-                if !self.filter.is_empty() {
+            // Esc peels one layer (`esc_target`).
+            Action::Cancel => match self.esc_target() {
+                groups::EscTarget::Conversation => self.show_conversation(0),
+                groups::EscTarget::Filter => {
                     self.filter.clear();
                     self.dirty = true;
                 }
-            }
+                groups::EscTarget::LeaveArchived => {
+                    self.filter.clear();
+                    self.do_action(Action::ToggleArchived, terminal)?;
+                }
+                // GroupList: `handle_groups_key` took it already.
+                groups::EscTarget::GroupList | groups::EscTarget::Nothing => {}
+            },
         }
         Ok(false)
     }
@@ -1575,7 +1632,7 @@ impl App {
             .collect();
         // The list is the focused pane unless the group column has focus.
         let focused = !(self.tab == Tab::Groups && self.group_focus);
-        let block = theme::panel(self.list_title(), focused);
+        let block = self.archived_tint(theme::panel(self.list_title(), focused));
         let widths_for_hits = widths.clone();
         let table = Table::new(rows, widths)
             .header(header)
@@ -1772,7 +1829,7 @@ impl App {
                 )
             }
         };
-        let block = theme::panel(title, false).title(switch);
+        let block = self.archived_tint(theme::panel(title, false).title(switch));
         // A conversation is prose: wrapped (a pane is drawn as it is).
         let p = Paragraph::new(text).block(block);
         if self.preview == Preview::Pane && self.conv_sel > 0 {
@@ -1785,7 +1842,7 @@ impl App {
     /// The control-layer card: everything we know about the session that
     /// isn't the live pane, plus the human-authored description and notes.
     fn draw_details(&self, f: &mut Frame, area: Rect) {
-        let block = theme::panel(theme::title("Details"), false);
+        let block = self.archived_tint(theme::panel(theme::title("Details"), false));
         let Some(s) = self.selected() else {
             f.render_widget(block, area);
             return;
@@ -3317,15 +3374,7 @@ mod tests {
             "archived_at": null, "pinned": false, "role": "", "agent": "claude"})];
         app.table.select(Some(0));
         let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-        // (Never drawn to: the key handlers only take it to hand the
-        // screen to an editor or tmux. A fixed viewport asks no tty.)
-        let mut real = ratatui::Terminal::with_options(
-            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .unwrap();
+        let mut real = handler_term();
         let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         app.handle_key(x, &mut real).unwrap();
         assert!(matches!(app.mode, Mode::Confirm(_)), "x opens the confirm");

@@ -756,25 +756,34 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         let n = m.items.len();
-        match k.code {
-            KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(n - 1),
-            KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
-            // Run it as its key would (the menu is closed by now).
-            KeyCode::Enter => {
-                return self.run_menu_item(&m.target, m.items[m.sel].2.clone(), terminal)
-            }
-            // One of the listed keys runs that entry; anything else closes.
-            _ => {
-                let item = m.items.iter().find(|(_, _, pick)| {
-                    matches!(pick, Pick::Key(key) if key.code == k.code
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                            == k.modifiers.contains(KeyModifiers::CONTROL))
-                });
-                return match item {
-                    Some((_, _, pick)) => self.run_menu_item(&m.target, pick.clone(), terminal),
-                    None => Ok(false),
-                };
-            }
+        // Run it as its key would (the menu is closed by now).
+        if k.code == KeyCode::Enter {
+            return self.run_menu_item(&m.target, m.items[m.sel].2.clone(), terminal);
+        }
+        // One of the listed keys runs that entry, even one that would
+        // otherwise move (a user's ctrl-n, say).
+        // Every modifier counts, except Shift on a character: its case
+        // carries that (terminals differ on also reporting SHIFT).
+        let mods = |e: &KeyEvent| match e.code {
+            KeyCode::Char(_) => e.modifiers - KeyModifiers::SHIFT,
+            _ => e.modifiers,
+        };
+        let item = m.items.iter().find(
+            |(_, _, pick)| matches!(pick, Pick::Key(key) if key.code == k.code && mods(key) == mods(&k)),
+        );
+        if let Some((_, _, pick)) = item {
+            return self.run_menu_item(&m.target, pick.clone(), terminal);
+        }
+        // Then moves; anything else closes.
+        let down = picker_step(&k).or(match k.code {
+            _ if !k.modifiers.is_empty() => None,
+            KeyCode::Char('j') => Some(true),
+            KeyCode::Char('k') => Some(false),
+            _ => None,
+        });
+        match down {
+            Some(down) => m.sel = clamp_step(m.sel, n, down),
+            None => return Ok(false),
         }
         self.mode = Mode::Menu(m);
         Ok(false)
@@ -999,6 +1008,190 @@ mod tests {
         assert_eq!(up + shown, 11, "{}", rows.join("\n"));
         let (x, y) = find(&list_half(&rows), "sess-09");
         assert_eq!(app.hits.at(x, y), Some(Hit::Row(10)));
+    }
+
+    /// Ctrl-J/N and Ctrl-K/P move in the launcher as the arrows do; plain
+    /// j/k still type into its filter. (In raw mode Ctrl-J arrives as
+    /// Ctrl+'j', not Enter, so it runs nothing.)
+    #[test]
+    fn ctrl_jknp_move_in_pickers() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let plain = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(picker_step(&ctrl('j')), Some(true));
+        assert_eq!(picker_step(&ctrl('n')), Some(true));
+        assert_eq!(picker_step(&ctrl('k')), Some(false));
+        assert_eq!(picker_step(&ctrl('p')), Some(false));
+        assert_eq!(
+            picker_step(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(true)
+        );
+        assert_eq!(
+            picker_step(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(false)
+        );
+        assert_eq!(picker_step(&plain('j')), None);
+        assert_eq!(picker_step(&plain('k')), None);
+        assert_eq!(
+            picker_step(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+
+        let mut app = fleet();
+        let mut term = handler_term();
+        app.mode = Mode::Command(Box::default());
+        let sel = |app: &App| match &app.mode {
+            Mode::Command(l) => (l.sel(), l.buf.clone()),
+            _ => panic!("the launcher closed"),
+        };
+        for (k, want) in [
+            (ctrl('j'), 1),
+            (ctrl('n'), 2),
+            (ctrl('k'), 1),
+            (ctrl('p'), 0),
+        ] {
+            app.handle_key(k, &mut term).unwrap();
+            assert_eq!(sel(&app).0, want, "{k:?}");
+        }
+        app.handle_key(plain('j'), &mut term).unwrap();
+        app.handle_key(plain('k'), &mut term).unwrap();
+        assert_eq!(sel(&app), (0, "jk".to_string()));
+    }
+
+    /// In a menu, an entry bound to a key wins over that key moving the
+    /// highlight; keys no entry has move it.
+    #[test]
+    fn menu_entry_keys_win_over_moves() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut app = fleet();
+        let mut term = handler_term();
+        let menu = || {
+            Mode::Menu(Box::new(Menu {
+                x: 0,
+                y: 0,
+                target: Target::Session("s1".into()),
+                title: "t".into(),
+                items: vec![
+                    ("ctrl-j".into(), "one", Pick::Key(ctrl('j'))),
+                    ("x".into(), "two", Pick::Key(ctrl('x'))),
+                ],
+                sel: 0,
+            }))
+        };
+        app.mode = menu();
+        app.handle_key(ctrl('n'), &mut term).unwrap();
+        assert!(
+            matches!(&app.mode, Mode::Menu(m) if m.sel == 1),
+            "ctrl-n moves"
+        );
+        app.mode = menu();
+        // Alt-Ctrl-J isn't the entry's key: it closes, runs nothing.
+        let alt = KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        app.handle_key(alt, &mut term).unwrap();
+        assert!(!matches!(app.mode, Mode::Menu(_)));
+        app.mode = menu();
+        app.handle_key(ctrl('j'), &mut term).unwrap();
+        assert!(!matches!(app.mode, Mode::Menu(_)), "ctrl-j ran its entry");
+        assert_eq!((clamp_step(1, 2, true), clamp_step(0, 2, false)), (1, 0));
+        assert_eq!(
+            (
+                wrap_step(1, 2, true),
+                wrap_step(0, 2, false),
+                wrap_step(3, 0, true)
+            ),
+            (0, 1, 0)
+        );
+    }
+
+    /// The archived view looks apart (tinted panes, "Archived" in yellow),
+    /// says how to get back, and Esc takes you back once nothing else
+    /// wants it; `a` still toggles both ways.
+    #[test]
+    fn archived_view_is_tinted_and_esc_goes_back() {
+        let mut app = fleet();
+        let mut term = handler_term();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        // Esc in the live list stays there.
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(!app.show_archived);
+        app.handle_key(a, &mut term).unwrap();
+        assert!(app.show_archived, "a opens the archived view");
+
+        let (w, h) = (150, 34);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let (tx, ty) = find(&rows, "Archived  ");
+        assert_eq!(buf[(tx, ty)].fg, theme::yellow(), "the title is yellow");
+        // Inside the list pane, under the title: the tint.
+        assert_eq!(buf[(tx, ty + 1)].bg, theme::archived_bg());
+        let (dx, dy) = find(&rows, "Details");
+        assert_eq!(buf[(dx, dy + 1)].bg, theme::archived_bg());
+        // The toolbar says how to get back, and clicking it goes back.
+        let (bx, by) = find(&rows, " back");
+        let cancel = app.keys.event(Action::Cancel).map(Hit::Key);
+        assert!(cancel.is_some());
+        assert_eq!(app.hits.at(bx + 1, by), cancel);
+        let label = format!(" {} ", app.keys.label(Action::Cancel));
+        let (kx, ky) = find(&rows, &format!("{label} back"));
+        assert_eq!(app.hits.at(kx + 1, ky), cancel);
+        // Its switch still toggles.
+        assert_eq!(
+            app.hits.at(find(&rows, "◷ archived").0 + 3, by),
+            app.keys.event(Action::ToggleArchived).map(Hit::Key)
+        );
+
+        // A search filter takes Esc first; then Esc leaves.
+        app.filter = "old".into();
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(app.filter.is_empty() && app.show_archived);
+        // A popup takes Esc first too.
+        app.mode = Mode::Help;
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(app.show_archived);
+        app.mode = Mode::Normal;
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(!app.show_archived, "Esc goes back to the live list");
+        // a, a: in and out again.
+        app.handle_key(a, &mut term).unwrap();
+        app.handle_key(a, &mut term).unwrap();
+        assert!(!app.show_archived);
+
+        // Inside a group Esc goes to the group list first: no back hint
+        // then, and Esc does that. A whitespace filter doesn't count. A
+        // popup over the list: no hint either.
+        use crate::groups::EscTarget;
+        app.handle_key(a, &mut term).unwrap();
+        app.tab = Tab::Groups;
+        app.group_focus = false;
+        assert_eq!(app.esc_target(), EscTarget::GroupList);
+        assert!(!drawn(&mut app).iter().any(|r| r.contains(" esc  back")));
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(app.group_focus && app.show_archived);
+        assert_eq!(app.esc_target(), EscTarget::LeaveArchived);
+        app.tab = Tab::Sessions;
+        // A whitespace filter is still cleared first (nothing shows it as
+        // a search, so no back hint while it's there either way).
+        app.filter = "  ".into();
+        assert_eq!(app.esc_target(), EscTarget::Filter);
+        app.mode = Mode::Help;
+        assert!(!drawn(&mut app).iter().any(|r| r.contains(" esc  back")));
+        app.mode = Mode::Normal;
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(app.show_archived && app.filter.is_empty());
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(!app.show_archived);
+
+        // The live list: no tint, no back hint.
+        let rows = drawn(&mut app);
+        assert!(!rows.iter().any(|r| r.contains(" esc  back")));
+        assert!(rows.iter().any(|r| r.contains("Sessions  ")));
     }
 
     #[test]
