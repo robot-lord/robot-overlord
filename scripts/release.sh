@@ -86,6 +86,11 @@ if [[ $resume == 1 ]]; then
   remote=$(git ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" | awk '{print $1}' | tail -1)
   [[ -n $remote ]] || { echo "--resume: $tag isn't on origin" >&2; exit 1; }
   [[ $remote == "$head" ]] || { echo "--resume: $tag is $remote, HEAD is $head" >&2; exit 1; }
+elif [[ $(gh release view "$tag" -R "$repo" --json isDraft -q .isDraft 2>/dev/null) == true ]] &&
+  ! git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+  # A failed earlier attempt deleted the tag but left CI's draft behind.
+  echo "a leftover draft release $tag exists without its tag — clean up with: gh release delete $tag -R $repo --yes; then run this again" >&2
+  exit 1
 elif gh release view "$tag" -R "$repo" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
   echo "$tag already exists — bump the version in Cargo.toml" >&2
   [[ $dev == 0 ]] && echo "(if an earlier run of this script pushed it and stopped: scripts/release.sh --resume)" >&2
@@ -115,15 +120,19 @@ if [[ $build_here == 1 ]]; then
   [[ $dev == 1 ]] && exit 0
 else
   # Stable in CI: the tag push starts .github/workflows/release.yml.
-  undo="delete the tag (git push origin :refs/tags/$tag; git tag -d $tag), then scripts/release.sh --local"
+  undo="delete the tag and any draft release (git push origin :refs/tags/$tag; git tag -d $tag; gh release delete $tag -R $repo --yes if it is a draft), then scripts/release.sh --local"
   if [[ $resume == 0 ]]; then
     git tag -f "$tag" "$head"
     git push origin "refs/tags/$tag" || { git tag -d "$tag" >/dev/null; echo "pushing $tag failed (local tag deleted)" >&2; exit 1; }
   fi
-  find_runs() { # release.yml runs for this tag (push or dispatch), newest first: "id status"
+  # Runs that can publish this tag, newest first: "id status". Matches the
+  # run-name in release.yml ("release vX.Y.Z", never a "(dry run)") for a
+  # push or a re-run dispatched with --ref vX.Y.Z -f tag=vX.Y.Z, plus push
+  # runs on the tag. Never picks or cancels a dry run.
+  find_runs() {
     gh run list -R "$repo" -w release.yml -L 50 \
-      --json databaseId,headBranch,headSha,status,event,createdAt \
-      -q "[.[] | select(.headSha == \"$head\" and (.event == \"push\" or .event == \"workflow_dispatch\") and (.headBranch == \"$tag\" or .event == \"workflow_dispatch\"))] | sort_by(.createdAt) | reverse | .[] | \"\(.databaseId) \(.status)\""
+      --json databaseId,displayTitle,headBranch,headSha,status,event,createdAt \
+      -q "[.[] | select(.headSha == \"$head\" and (.displayTitle == \"release $tag\" or (.event == \"push\" and .headBranch == \"$tag\")) and (.displayTitle | endswith(\"(dry run)\") | not))] | sort_by(.createdAt) | reverse | .[] | \"\(.databaseId) \(.status)\""
   }
   echo "waiting for the release workflow on $tag…"
   run=
@@ -143,16 +152,18 @@ else
     exit 1
   fi
   gh run watch "$run" -R "$repo" --exit-status ||
-    { echo "release workflow failed: https://github.com/$repo/actions/runs/$run — fix and re-run it, then scripts/release.sh --resume; or $undo" >&2; exit 1; }
-  # CI leaves a draft. Check every asset against the CI-made SHA256SUMS,
-  # and the tarballs' provenance, before publishing it.
+    { echo "release workflow failed: https://github.com/$repo/actions/runs/$run — fix and re-run it (gh workflow run release.yml --ref $tag -f tag=$tag -f dry_run=false), then scripts/release.sh --resume; or $undo" >&2; exit 1; }
+  # CI leaves a draft. Before publishing it, check every asset against the
+  # CI-made SHA256SUMS, and the provenance attestation of every file in it
+  # (tarballs, .deb, .rpm).
   gh release download "$tag" -R "$repo" -D "$dist"
   (cd "$dist" && shasum -a 256 -c SHA256SUMS)
   for t in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-    f=rlord-$tag-$t.tar.gz
-    grep -q " $f\$" "$dist/SHA256SUMS" || { echo "SHA256SUMS lacks $f" >&2; exit 1; }
-    gh attestation verify "$dist/$f" -R "$repo" >/dev/null || { echo "provenance check failed for $f" >&2; exit 1; }
+    grep -q " rlord-$tag-$t.tar.gz\$" "$dist/SHA256SUMS" || { echo "SHA256SUMS lacks rlord-$tag-$t.tar.gz" >&2; exit 1; }
   done
+  while read -r _ f; do
+    gh attestation verify "$dist/$f" -R "$repo" >/dev/null || { echo "provenance check failed for $f" >&2; exit 1; }
+  done < "$dist/SHA256SUMS"
   if [[ $(gh release view "$tag" -R "$repo" --json isDraft -q .isDraft) == true ]]; then
     gh release edit "$tag" -R "$repo" --draft=false --latest
   fi

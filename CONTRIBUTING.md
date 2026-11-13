@@ -102,13 +102,23 @@ artifacts.
 
 If `release.sh` stops after pushing the tag (a failed run you then re-ran,
 a lost connection), `scripts/release.sh --resume` picks up from the tag's
-workflow run (push or manual): watch, verify, publish the draft if it is
-still one, tap, crates.io. Re-running a failed workflow replaces any draft
-it left.
+workflow run: watch, verify, publish the draft if it is still one, tap,
+crates.io. To re-run a failed release, dispatch it on the tag itself, so
+its run is titled `release vX.Y.Z` and `--resume` finds it (it ignores
+dry runs):
+
+```sh
+gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f dry_run=false
+```
+
+A re-run replaces any draft the failed run left. Every file in the release
+is checked against `SHA256SUMS` and its provenance attestation
+(`gh attestation verify`) before the draft is published.
 
 If Actions is down, build a stable release locally instead: delete the tag
 on origin and locally (`git push origin :refs/tags/vX.Y.Z; git tag -d
-vX.Y.Z`), then `scripts/release.sh --local`. Creating that release pushes
+vX.Y.Z`) and any draft release CI left (`gh release delete vX.Y.Z --yes`),
+then `scripts/release.sh --local`. Creating that release pushes
 the tag again, which starts the workflow; its preflight sees the release
 is already published and skips the build, so the two never race. If no
 run shows up for a pushed tag, `release.sh` also cancels any run queued
