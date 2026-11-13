@@ -14,6 +14,9 @@
 //! - the list: "fresh 2h ago · 14 earlier" on the overlord's row, its past
 //!   conversations in the details pane, one of them in the preview.
 //!
+//! With an overlord on more than one agent, the list shows the active
+//! one's own conversations; `recall` reads every overlord's (`pasts`).
+//!
 //! Plain code, no model call; every answer is bounded.
 
 use std::collections::{HashMap, VecDeque};

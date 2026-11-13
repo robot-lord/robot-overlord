@@ -235,10 +235,15 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         tmux::shell_quote(&methods::rlord_bin()),
     );
     // When this conversation started and how many came before: the
-    // overlord restarts on a fresh one after sitting idle.
+    // overlord restarts on a fresh one after sitting idle. (With several
+    // agents to run an overlord on, the overlay's own switcher row says
+    // it, for whichever is active: this title can't change once open.)
     let fresh = {
         let db = d.db();
-        let found = overlord::session(&db)?;
+        let several = overlord::roster(&db)?
+            .as_array()
+            .is_some_and(|a| a.iter().filter(|o| o["installed"] == true).count() > 1);
+        let found = overlord::session(&db)?.filter(|_| !several);
         found
             .map(|o| crate::recall::summary(&db, &o))
             .and_then(|v| crate::recall::fresh_label(&v))

@@ -110,11 +110,16 @@ fn agent_dir(agent: Agent) -> PathBuf {
 /// The folder a new overlord on `agent` gets: its own. Each agent finds
 /// its conversations by folder (Claude resumes and lists them per folder;
 /// a Codex thread is bound by where it started), so two overlords in one
-/// folder would see each other's. The first keeps the plain folder.
+/// folder would see each other's. The first overlord gets the plain
+/// folder, any later one its agent's.
 fn dir_for(db: &Db, agent: Agent) -> Result<PathBuf> {
-    let first = default_dir();
-    let taken = all(db)?.iter().any(|s| Path::new(&s.project_path) == first);
-    Ok(if taken { agent_dir(agent) } else { first })
+    // (Not by comparing folders: a session's is stored resolved, and an
+    // overlord that began as the mastermind lives in neither.)
+    Ok(if all(db)?.is_empty() {
+        default_dir()
+    } else {
+        agent_dir(agent)
+    })
 }
 
 /// Every folder an overlord has run in or may: its conversations there

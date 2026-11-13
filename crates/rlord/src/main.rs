@@ -283,6 +283,19 @@ enum Command {
     /// The overlord: the session you talk to in order to drive rlord
     #[command(subcommand)]
     Overlord(OverlordCmd),
+    /// Pick sessions up when their usage limit resets: each session that
+    /// stopped on a usage limit is sent a message ("continue") once the
+    /// limit has reset, unless you used it meanwhile. Without sessions:
+    /// every limited one.
+    ResumeAfterLimit {
+        /// Sessions (id, prefix or name)
+        sessions: Vec<String>,
+        /// What to send (default: `[limits] resume_message`)
+        #[arg(long, short)]
+        message: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Install the newest release from GitHub (no compiling), then reset a
     /// running rlord onto it. Same as scripts/update.sh.
     Update {
@@ -343,6 +356,13 @@ enum OverlordCmd {
     Restart,
     /// Send the overlord a message, as if typed into it (text, or stdin)
     Ask { text: Vec<String> },
+    /// Make another agent's overlord the active one: `rlord overlord switch
+    /// codex`. Each agent has its own overlord and conversation; the first
+    /// switch to one starts it. Without an agent: list them.
+    Switch {
+        /// claude, codex or opencode
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -592,6 +612,77 @@ fn main() -> Result<()> {
                 "sent to the overlord ({}-O to see it)",
                 rlord_core::keys::alt_name()
             );
+            Ok(())
+        }
+        Command::Overlord(OverlordCmd::Switch { agent }) => {
+            let Some(agent) = agent else {
+                let st = call("overlord.status", json!({}))?;
+                for o in st["overlords"].as_array().into_iter().flatten() {
+                    let state = match (
+                        o["installed"] == true,
+                        o["exists"] == true,
+                        o["running"] == true,
+                    ) {
+                        (false, _, _) => "not installed",
+                        (_, false, _) => "not started yet",
+                        (_, _, true) => "running",
+                        _ => "stopped",
+                    };
+                    println!(
+                        "{} {:<9} {state}",
+                        if o["active"] == true { "*" } else { " " },
+                        o["agent"].as_str().unwrap_or("?"),
+                    );
+                }
+                println!("switch with `rlord overlord switch <agent>` (* is the active one)");
+                return Ok(());
+            };
+            let s = call("overlord.switch", json!({"agent": agent}))?;
+            let agent = s["agent"].as_str().unwrap_or(&agent);
+            println!(
+                "{}",
+                match (s["switched"] == true, s["created"] == true) {
+                    (false, _) => format!("the overlord is already on {agent}"),
+                    (true, true) => format!("the overlord is now on {agent} (a new one, started)"),
+                    (true, false) =>
+                        format!("the overlord is now on {agent} (its conversation as you left it)"),
+                }
+            );
+            Ok(())
+        }
+        Command::ResumeAfterLimit {
+            sessions,
+            message,
+            json,
+        } => {
+            let mut p = json!({});
+            if !sessions.is_empty() {
+                p["sessions"] = json!(sessions);
+            }
+            if let Some(m) = message {
+                p["message"] = json!(m);
+            }
+            let r = call("limits.resume", p)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            for s in r["scheduled"].as_array().into_iter().flatten() {
+                println!(
+                    "{}: \"{}\" at {}",
+                    s["session"].as_str().unwrap_or("?"),
+                    r["message"].as_str().unwrap_or(""),
+                    s["at"].as_str().unwrap_or("?")
+                );
+            }
+            for s in r["skipped"].as_array().into_iter().flatten() {
+                println!(
+                    "{}: skipped ({})",
+                    s["session"].as_str().unwrap_or("?"),
+                    s["why"].as_str().unwrap_or("")
+                );
+            }
+            println!("{}", r["note"].as_str().unwrap_or(""));
             Ok(())
         }
         Command::Daemon => run_daemon(),
@@ -1907,7 +1998,11 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             &id[..id.len().min(6)],
             pin,
             truncate(get("name"), 23),
-            rlord_core::types::Status::label_of(get("status")),
+            // Stopped on a usage limit: that, and until when.
+            match s["limit"]["until"].as_str() {
+                Some(until) => truncate(&format!("till {until}"), 13),
+                None => rlord_core::types::Status::label_of(get("status")).to_string(),
+            },
             rel_age(
                 [
                     "last_agent_msg_at",

@@ -163,7 +163,8 @@ impl TmuxKeys {
 }
 
 /// The overlord: the long-running session you talk to in order to drive
-/// rlord itself (launch sessions, search, navigate, set views). One session:
+/// rlord itself (launch sessions, search, navigate, set views). One session
+/// (one per agent, if the user switches to another agent's):
 /// a strong model at medium effort, which does light work itself and sends
 /// anything heavier to a subagent or a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,6 +724,9 @@ claude_tui = "default"          # Claude's renderer here: "default" (inline: tmu
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
 # One session (Alt-O; Option-O on a Mac): a strong model at medium effort.
+# Each agent can have its own, with one active: switch in the overlay's top
+# row (or Alt-S there), or `rlord overlord switch <agent>`. `agent` here is
+# the first one's; `model` and `effort` apply to the overlord on `agent`.
 # It does light work itself (look-ups, small edits, short answers) and sends
 # anything heavier to a subagent or a new session.
 [overlord]

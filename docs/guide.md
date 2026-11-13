@@ -7,6 +7,7 @@ or ask the overlord).
 
 Contents: [The overlord](#the-overlord) · [Creating sessions](#creating-sessions) ·
 [Codex sessions](#codex-sessions) · [OpenCode sessions](#opencode-sessions) ·
+[Usage limits](#usage-limits) ·
 [The right-hand side](#the-right-hand-side-preview--details) ·
 [Bringing in existing sessions](#bringing-in-existing-sessions) ·
 [Archived sessions and past work](#archived-sessions-and-past-work) ·
@@ -24,7 +25,8 @@ looking at; say what you want.
 
 It runs on any of the agents rlord runs: Claude Code, Codex or OpenCode
 (`[overlord] agent`, or the setup dialog's first row). See "Which agent
-runs the overlord" below for what differs.
+runs the overlord" below for what differs. You can have one on each agent
+and switch between them: see "An overlord per agent" below.
 
 - **A strong model at medium effort** (`opus` / `medium` by default on
   Claude Code; Codex's own default model at `medium`; OpenCode's default model, which
@@ -76,7 +78,8 @@ checks the overlord's model: it reads what the agent actually ran from its
 transcript and compares it with a per-tool table of latest models
 (`crates/core/src/models.rs`). If it is on an older model, a dialog offers
 to switch and restart, and the conversation resumes.
-`rlord overlord status|model <m>|restart|open` does the same from the CLI.
+`rlord overlord status|model <m>|restart|open` does the same from the CLI
+(`rlord overlord switch <agent>`: see "An overlord per agent").
 
 ### Which agent runs the overlord
 
@@ -137,9 +140,42 @@ runs a command.
   anyone who wants that (Claude then lists rlord's tools one by one without
   it; Codex sets that tool's `approval_mode = "prompt"`; OpenCode adds an
   ask rule for `rlord_send_to_session`).
-- The agent is chosen when the overlord is first set up. An existing
-  overlord keeps its agent: `[overlord] agent` applies only while there is
-  none yet. Moving an existing overlord to another agent isn't built.
+- The agent of the first overlord is chosen when it is set up
+  (`[overlord] agent` applies only while there is none yet). An overlord
+  never changes agent; you switch to another agent's overlord instead.
+
+### An overlord per agent
+
+Each agent can have its own overlord, with its own conversation. Exactly
+one is **active**: the one Option-O shows, and the one `n`, `rlord
+overlord ask` and everything else that talks to "the overlord" reaches.
+The others keep running in the background, untouched, and switching back
+finds each exactly where you left it. Use it when one agent is out of
+usage, or to put the same question to another.
+
+Switching is always yours: rlord never switches by itself. An agent's
+overlord is started the first time you switch to it, with that agent's
+default model and effort (the configured `[overlord] model` / `effort`
+when it is the configured agent).
+
+- **In the overlay**: with more than one agent installed, the top row
+  shows each agent's marker, the active one highlighted
+  (`✻ claude │ >_ codex`). Click one, or press **Option-S** to go to the
+  next (`[tmux] overlord_switch`; "" turns the key off). The overlay stays
+  open and shows the other overlord.
+- **In the list**: right-click the overlord's row for "Switch overlord to
+  Codex" (one entry per installed agent), or `:overlord codex` in the
+  command launcher (`:overlord` lists them).
+- **CLI**: `rlord overlord switch codex`; `rlord overlord switch` lists
+  the agents and which is active.
+
+The overlord's row shows the active one (its agent's marker before the
+name). Other overlords that are running show as `+` and their marker
+after its status. Each restarts on a fresh conversation after sitting
+idle, as one overlord does, and each can look up what you said to any of
+them (their `recall` reads all the overlords' conversations), so "as I
+said earlier" still works after a switch. Each lives in its own folder
+(`overlord/`, `overlord-codex/`, … under rlord's data folder).
 
 **Coming from the two-session overlord** (a front desk plus a "mastermind",
 before 0.21): nothing to do. The mastermind's conversation carries on as
@@ -334,6 +370,36 @@ The overlord can run on OpenCode (see "Which agent runs the overlord").
 
 Not yet: importing OpenCode
 conversations started outside rlord, sub-agent tracking, Remote Control.
+
+## Usage limits
+
+When an agent stops a session because you've hit a usage limit, rlord
+shows it in place of the session's status: `◷ till 3:00pm` in the list,
+"limited until 3:00pm" in the details. It reads this from the agent's own
+record of the limit, reset time included (Claude Code today; Codex and
+OpenCode sessions don't show it yet). A session stays limited until the
+limit resets or you use it again.
+
+To have limited sessions carry on by themselves once the limit resets,
+ask for it:
+
+- tell the overlord ("I hit the limit, pick these up when it resets"),
+- `rlord resume-after-limit` (every limited session), or
+  `rlord resume-after-limit web-fix api-tests`,
+- right-click a limited session: "Resume after limit" (or
+  `:resume after limit`).
+
+A minute after the reset time, each of those sessions is sent a short
+message (`[limits] resume_message`, "continue" by default;
+`--message "…"` for another), typed in the way the overlord's
+`send_to_session` types. A session you used in the meantime is left
+alone. If the limit hits again, it waits for the next reset. A scheduled
+resume shows as `↻` next to the time and survives restarting rlord.
+Nothing is resumed unless you ask.
+
+If it is the overlord's agent that is out of usage, switch to another
+agent's overlord ("An overlord per agent", above): the overlay's top row
+says "out of usage until …" when the active one is limited.
 
 ## The right-hand side: preview + details
 
@@ -561,7 +627,8 @@ import`, your own `mouse` setting applies in agent sessions.
 A session's status means one thing: **working**; **needs you** (blocked
 mid-turn on a permission prompt or a question, until you answer); **your
 turn** (it finished; the next prompt is yours); **stopped**. Filter with
-`status:needs`, `status:turn`, `status:working`. Run `rlord install-hooks`
+`status:needs`, `status:turn`, `status:working`. (A session stopped on a
+usage limit shows that instead: see "Usage limits".) Run `rlord install-hooks`
 again after updating rlord: "needs you" clearing when the agent moves on
 uses hooks added later (and Codex asks you to trust changed hooks again).
 

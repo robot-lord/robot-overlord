@@ -289,6 +289,45 @@ impl App {
         }
     }
 
+    /// Make `agent`'s overlord the active one (the row's menu,
+    /// `:overlord <agent>`): started, or created the first time. The one
+    /// it replaces keeps running with its conversation.
+    pub(crate) fn switch_overlord(&mut self, agent: &str) {
+        if let Some(v) = self.call("overlord.switch", json!({"agent": agent})) {
+            let label = rlord_core::agents::Agent::parse(agent).map_or(agent, |a| a.label());
+            self.status_line = match (v["switched"] == true, v["created"] == true) {
+                (false, _) => format!("the overlord is already on {label}"),
+                (true, true) => format!("the overlord is now on {label} (a new one)"),
+                (true, false) => {
+                    format!("the overlord is now on {label}, where you left it")
+                }
+            };
+            self.dirty = true;
+        }
+    }
+
+    /// Schedule the selected session to carry on once its usage limit
+    /// resets (its menu, `:resume after limit`).
+    pub(crate) fn resume_after_limit(&mut self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if let Some(v) = self.call("limits.resume", json!({"sessions": [id]})) {
+            self.status_line = match (
+                v["scheduled"][0]["at"].as_str(),
+                v["skipped"][0]["why"].as_str(),
+            ) {
+                (Some(at), _) => format!(
+                    "it will be sent \"{}\" at {at}, unless you use it first",
+                    v["message"].as_str().unwrap_or("continue")
+                ),
+                (None, Some(why)) => format!("not scheduled: {why}"),
+                _ => "not scheduled".into(),
+            };
+            self.dirty = true;
+        }
+    }
+
     /// Show `m` in the Usage column (the toolbar, its key, `:usage`), saved
     /// with the daemon so it's kept across restarts, over config `usage`;
     /// None forgets the pick (config `usage` again). Only once saved: if
@@ -1142,7 +1181,9 @@ impl App {
                 Some(v) => s = v,
                 None => return Ok(()),
             }
-            let _ = tmux::auto_size_window(rlord_daemon::overlord::TMUX_NAME);
+            if let Some(t) = s["tmux_session"].as_str() {
+                let _ = tmux::auto_size_window(t);
+            }
         } else if s["status"] == "stopped"
             || !s["tmux_session"].as_str().is_some_and(tmux::has_session)
         {
@@ -1403,7 +1444,6 @@ impl App {
             .enumerate()
             .map(|(i, s)| {
                 let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
-                let status = get("status");
                 let is_overlord = is_overlord_role(s);
                 let hue = theme::overlord();
                 let num = i.saturating_sub(self.overlord_rows);
@@ -1427,12 +1467,15 @@ impl App {
                     Cell::from(Line::from({
                         let mut spans = theme::agent_marker(s["agent"].as_str().unwrap_or(""));
                         spans.push(Span::raw(get("name")));
+                        // The other agents' overlords that are up (the
+                        // row itself is the active one).
+                        spans.push(Span::styled(others_up(s), theme::faint()));
                         spans
                     })),
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
-                        theme::status_chip(&status),
+                        state_chip(s, false),
                         // Its sub-agents are still loading (warm-up): the
                         // status is known, the agent counts aren't yet.
                         Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
@@ -1754,7 +1797,6 @@ impl App {
         let tilde = |p: &str| p.replacen(&home, "~", 1);
         let get = |k: &str| s[k].as_str().unwrap_or("-").to_string();
         let key = |k: &str| Span::styled(format!("{k:<10}"), theme::faint());
-        let status = get("status");
         let tags: Vec<&str> = s["tags"]
             .as_array()
             .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -1766,7 +1808,7 @@ impl App {
             Line::from(vec![
                 Span::styled(get("name"), Style::default().fg(theme::text()).bold()),
                 Span::raw("   "),
-                theme::status_chip(&status),
+                state_chip(s, true),
                 Span::styled(
                     match updated_at(s) {
                         Some(t) => format!("  ·  updated {} ago", rel_age(Some(t))),
@@ -1975,7 +2017,7 @@ impl App {
             Line::from(vec![
                 Span::styled(get("name"), Style::default().fg(theme::overlord()).bold()),
                 Span::raw("   "),
-                theme::status_chip(&get("status")),
+                state_chip(s, true),
                 Span::styled(
                     format!("  ·  {} to talk", self.keys.label(Action::Overlord)),
                     theme::muted(),
@@ -2383,6 +2425,51 @@ fn usage_details(u: &Value) -> String {
 
 /// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
 /// wanted but failing or unavailable (red); nothing when off.
+/// A session's status, or in its place that it is stopped on a usage
+/// limit and until when (`limit`, from the daemon's `limits`). `full`:
+/// in words (the details pane); otherwise what fits the list's column.
+/// `↻`: a resume is scheduled for when it resets.
+fn state_chip(s: &Value, full: bool) -> Span<'static> {
+    let l = &s["limit"];
+    let Some(until) = l["until"].as_str() else {
+        return theme::status_chip(s["status"].as_str().unwrap_or("-"));
+    };
+    let resume = if l["resume"] == true { " ↻" } else { "" };
+    let text = if full {
+        format!(
+            "◷ limited until {until}{}",
+            if resume.is_empty() {
+                ""
+            } else {
+                " · resumes then"
+            }
+        )
+    } else if until.chars().count() + resume.chars().count() <= 6 {
+        format!("◷ till {until}{resume}")
+    } else {
+        format!("◷ {until}{resume}")
+    };
+    Span::styled(text, Style::default().fg(theme::yellow()))
+}
+
+/// The other overlords that are running, on the overlord's row: each
+/// one's agent marker (` +>_`). Empty for any other row.
+fn others_up(s: &Value) -> String {
+    let marks: Vec<String> = s["overlords"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["running"] == true && o["active"] != true)
+        .filter_map(|o| rlord_core::agents::install::tool(o["agent"].as_str()?))
+        .map(|t| t.marker.iter().map(|(text, _)| *text).collect::<String>())
+        .collect();
+    if marks.is_empty() {
+        String::new()
+    } else {
+        format!(" +{}", marks.join(" "))
+    }
+}
+
 fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),

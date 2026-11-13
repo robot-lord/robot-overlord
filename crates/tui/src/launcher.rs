@@ -24,6 +24,10 @@ enum Cmd {
     /// None: back to config `usage` (forget the pick).
     Usage(Option<UsageMetric>),
     Summarize,
+    /// Make this agent's overlord the active one.
+    Switch(&'static str),
+    /// Pick the selected session up when its usage limit resets.
+    ResumeAfterLimit,
 }
 
 /// (name, what it does, command)
@@ -45,6 +49,26 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         Cmd::Act(Action::NewManual),
     ),
     ("overlord", "open the overlord", Cmd::Act(Action::Overlord)),
+    (
+        "overlord claude",
+        "switch to the overlord on Claude Code (its own conversation)",
+        Cmd::Switch("claude"),
+    ),
+    (
+        "overlord codex",
+        "switch to the overlord on Codex (its own conversation)",
+        Cmd::Switch("codex"),
+    ),
+    (
+        "overlord opencode",
+        "switch to the overlord on OpenCode (its own conversation)",
+        Cmd::Switch("opencode"),
+    ),
+    (
+        "resume after limit",
+        "the selected session carries on when its usage limit resets",
+        Cmd::ResumeAfterLimit,
+    ),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
     (
         "archive",
@@ -208,6 +232,8 @@ impl App {
                 self.dirty = true;
             }
             Cmd::Usage(m) => self.set_usage(m),
+            Cmd::Switch(agent) => self.switch_overlord(agent),
+            Cmd::ResumeAfterLimit => self.resume_after_limit(),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(
@@ -256,7 +282,7 @@ impl App {
                     self.hits
                         .row(inner, inner.y + row as u16, mouse::Hit::Pick(j));
                     let (n, d, _) = COMMANDS[i];
-                    let name = Span::styled(format!("{n:<14}"), Style::default().bold());
+                    let name = Span::styled(format!("{n:<18} "), Style::default().bold());
                     let about = Span::styled(d.to_string(), theme::muted());
                     let line = Line::from(vec![name, about]);
                     if j == sel {

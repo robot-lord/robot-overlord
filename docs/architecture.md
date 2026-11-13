@@ -264,6 +264,42 @@ Same three-tier degradation the research validated, implemented once:
 Every status transition is an `events` row and a push to subscribers; that is
 what makes the TUI live and `last_state_change_at` trustworthy.
 
+### Usage limits (`daemon/src/limits.rs`)
+
+"Limited" is not a stored status: it is read from the transcript and laid
+over the status in what the list, the CLI and `list_sessions` show, so
+hooks and `discover` keep the stored status to themselves.
+
+- **Detection** is `transcript::limit_hit`, on the transcript's tail.
+  Claude Code ends a turn that hit a usage limit with a synthetic
+  assistant line: `isApiErrorMessage: true`, `apiError:
+  "usage_limit_reached"`, `error: "rate_limit"`, and the reset time as
+  epoch seconds in `apiErrorParams.rate_limit_info.resetsAt` (also
+  `quotaLimits.resetsAt`), with `rateLimitType` (`five_hour`). The text
+  ("You've hit your 5-hour limit · resets 1:30pm (America/Los_Angeles)")
+  is never parsed. Other API errors carry `isApiErrorMessage` too
+  (`apiError: "computer_slept"`), so that flag alone is not enough. No
+  hook reports a limit. Seen on Claude Code 2.1.322. Codex and OpenCode
+  are not detected yet.
+- A session is limited while that record is the last thing in its
+  conversation (no prompt the user typed and no real answer after it:
+  `LimitHit::touched`) and the reset time is ahead. A tick (15s) stats
+  each live session's transcript and re-reads only those that changed;
+  kv `limits` holds the current ones, and rows carry `limit`
+  (`limits::annotate`).
+- **Resuming is only ever asked for** (`limits.resume`: the
+  `resume_after_limit` tool, `rlord resume-after-limit`, the list's
+  menu). Each session gets a job in kv `limit_resume`, so a daemon
+  restart keeps it. `limits::step` decides each tick: wait until reset +
+  60s; drop the job if the conversation went on since the limit; else
+  type `[limits] resume_message` in through `send::type_message` (under
+  the session's lock, with all of `type_into`'s screen checks). Status
+  `idle` or `waiting_input` both count as between turns here, because
+  Claude Code shows "needs you" a minute after any turn ends. After
+  sending, a newer untouched limit record within 15 minutes reschedules
+  the job to that reset (five sends at most). The overlords are never
+  resumed this way: the user switches to another agent's.
+
 ## Transcript store (raw conversation data)
 
 Both target CLIs already persist **complete structured transcripts as local
@@ -547,9 +583,11 @@ from the user's default server, but only for the real socket.
 
 ## The overlord (built 2026-11-10)
 
-The product's primary control surface: a singleton agent session
+The product's primary control surface: an agent session
 (`role = 'overlord'`, fixed tmux name `overlord-rlord`) that the user talks to,
-wired to rlord's MCP server. One session, on a strong model at medium effort
+wired to rlord's MCP server. There can be one per agent, with exactly one
+active ("One per agent, one active", below); what follows holds for each.
+A strong model at medium effort
 (`[overlord] model` / `effort`; the effort is a launch flag, per agent:
 `overlord::effort_args`): it does light work itself and sends the rest to
 subagents and new sessions, which `overlord.md` states first. It lives in
@@ -656,6 +694,71 @@ Things that are not visible at the call site:
   narrow them. A plain copy goes to `<folder>/subagents/` for an overlord
   that can't start one.
 
+### One per agent, one active
+
+Each agent (Claude Code, Codex, OpenCode) can have its own overlord. One is
+**active** and gets everything addressed to "the overlord": the overlay,
+`overlord.ask` and the `n` form, `ui.goto` on its row, Remote Control's
+`overlord: true`. The others keep running with their own conversation and
+are sent nothing. Only the user switches (`overlord::switch`, RPC
+`overlord.switch {agent}`): the first switch to an agent creates its
+overlord with that agent's defaults (`model_effort_for`), later ones find
+it as it was (started again if it had stopped). Nothing switches by itself,
+including when the active one hits a usage limit.
+
+- **In the DB** every overlord has role `overlord`, so `is_overlord_role`
+  and every refusal built on it (rename, tags, notes, archive, stop from a
+  tool, `send_to_session`) hold for all of them without knowing which is
+  active. The `agent` column tells them apart (one per agent:
+  `overlord::for_agent`). kv `overlord_active` is the active one's id;
+  with no kv, or one naming a row that is gone, it is the oldest
+  (`Db::overlord`), which is how an install from before this has its one
+  overlord active with no migration. All are named `overlord`;
+  `resolve_ref("overlord")` means the active one.
+- **`Db::overlord()` / `overlord::session()` are the active one.**
+  `overlord::all()` is every one. Code that keeps overlords healthy
+  iterates all (the idle fresh-restart keeper, the Remote Control keeper,
+  `style`, tmux-name and profile sync via `include_overlord`); code that
+  talks to the overlord uses the active one. kv `overlord_fresh_at:<id>`
+  is per overlord (`overlord::fresh_at` falls back to the old unsuffixed
+  key).
+- **Folders**: one each. The first overlord has `<data>/overlord/` (or
+  `mastermind/`, above); one added for another agent gets
+  `<data>/overlord-<agent>/` (`dir_for`). `write_files` writes the same
+  files whichever agent runs the folder, so sharing would be safe for the
+  files, but every agent finds its conversations by folder (Claude lists
+  and resumes per folder, Codex binds a thread by where it started:
+  `discover::bind_now`), and separate folders keep each overlord's
+  conversations its own. `overlord::dirs()` lists them all, for search
+  and import to skip.
+- **tmux**: the first is `overlord-rlord`, later ones
+  `overlord-rlord-<agent>` (`free_tmux_name`; `is_tmux_name` recognizes
+  both, and both are reserved names). A swap renames nothing, so pane
+  ids, attached clients and a paste in flight stay valid.
+- **Locks**: `Daemon::overlord_send` is still one lock for all overlords.
+  `ask::send` reads which is active under it and `overlord.switch` takes
+  it, so a request can't be pasted into the overlord the user just
+  switched away from. Each overlord's own session lock is as for any
+  session (locks.rs).
+- **The switchers** all call `overlord.switch`: the overlay (it draws a
+  top row with each installed agent's marker when there are two or more;
+  a click, or `[tmux] overlord_switch`, default `M-s`, read by the
+  overlay and never bound in tmux; the overlay then shows the other
+  pane without closing: `overlay::show`), the overlord row's right-click
+  menu, `:overlord <agent>`, and `rlord overlord switch <agent>`.
+  `overlord.get` and `overlord.status` carry `overlords`
+  (`overlord::roster`: per agent installed / exists / active / running),
+  which is what they draw from. The popup's title is set by tmux when it
+  opens and can't change, so with several agents the "fresh 2h ago"
+  label moves from the title to the overlay's own row.
+- **`recall` reads every overlord's conversations**: all their earlier
+  ones plus the other overlords' current ones (`recall::pasts`). The user
+  thinks of one overlord desk and switches agents by hand, often because
+  one ran out of usage, so "as I said earlier" may have been said to
+  another one. The list's "fresh · N earlier" and the earlier
+  conversations in the details pane stay the active overlord's own
+  (`overlord.continue` resumes one of *its* conversations).
+
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's agent pane (`send::type_into`: bracketed paste, then Enter),
   waiting out `starting` after a (re)start, and refusing while it needs
@@ -720,7 +823,7 @@ Things that are not visible at the call site:
   earlier" on its row and overlay title, the earlier conversations in its
   details pane, one in the preview, `overlord.continue` to go back to one).
   Nothing is preloaded into a fresh conversation; it fetches on demand.
-  kv `overlord_fresh_at` is when the current one started.
+  kv `overlord_fresh_at:<id>` is when the current one started.
 - **Triage** (`daemon/src/triage.rs`): the cheap first pass for the
   overlord's upkeep. `overlord.triage` lists live sessions updated since
   their per-session `reviewed:<id>` kv watermark, with missing-metadata flags

@@ -234,9 +234,30 @@ pub(crate) struct Menu {
     /// What it was opened on: an entry acts on that, or not at all.
     target: Target,
     title: String,
-    /// (key label, what it does, the key).
-    items: Vec<(String, &'static str, KeyEvent)>,
+    /// (key label, what it does, what picking it does).
+    items: Vec<(String, &'static str, Pick)>,
     sel: usize,
+}
+
+/// What a menu entry does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// Press this key on the target.
+    Key(KeyEvent),
+    /// Make this agent's overlord the active one (the overlord's row).
+    SwitchOverlord(&'static str),
+    /// Pick the session up when its usage limit resets.
+    ResumeAfterLimit,
+}
+
+/// "Switch overlord to Codex", for the agents an overlord runs on.
+fn switch_label(agent: &str) -> Option<(&'static str, &'static str)> {
+    match agent {
+        "claude" => Some(("claude", "Switch overlord to Claude Code")),
+        "codex" => Some(("codex", "Switch overlord to Codex")),
+        "opencode" => Some(("opencode", "Switch overlord to OpenCode")),
+        _ => None,
+    }
 }
 
 impl App {
@@ -554,16 +575,27 @@ impl App {
         f.render_widget(Paragraph::new(lines).block(theme::modal("Confirm")), area);
     }
 
-    /// Run a menu entry's key on what the menu was opened for.
+    /// Run a menu entry on what the menu was opened for.
     fn run_menu_item(
         &mut self,
         target: &Target,
-        key: KeyEvent,
+        pick: Pick,
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         if !self.reselect(target) {
             return Ok(false);
         }
+        let key = match pick {
+            Pick::Key(k) => k,
+            Pick::SwitchOverlord(agent) => {
+                self.switch_overlord(agent);
+                return Ok(false);
+            }
+            Pick::ResumeAfterLimit => {
+                self.resume_after_limit();
+                return Ok(false);
+            }
+        };
         // (The menu came from a click: stop and restart ask first; archive
         // asks by itself.)
         if self.confirm_first(key) {
@@ -652,10 +684,30 @@ impl App {
     /// the overlord's fixed row).
     fn open_menu(&mut self, x: u16, y: u16, group: bool) {
         let legend = context_legend(group, self.group_sel.as_deref(), self.selected());
-        let mut items: Vec<(String, &'static str, KeyEvent)> = legend
+        let mut items: Vec<(String, &'static str, Pick)> = legend
             .into_iter()
-            .filter_map(|(a, label)| Some((self.keys.label(a), label, self.keys.event(a)?)))
+            .filter_map(|(a, label)| {
+                Some((self.keys.label(a), label, Pick::Key(self.keys.event(a)?)))
+            })
             .collect();
+        if !group {
+            if let Some(s) = self.selected() {
+                if is_overlord_role(s) {
+                    // The other agents an overlord can run on (installed
+                    // ones): each has its own, started on the first switch.
+                    for o in s["overlords"].as_array().into_iter().flatten() {
+                        if o["installed"] == true && o["active"] != true {
+                            if let Some((agent, label)) = o["agent"].as_str().and_then(switch_label)
+                            {
+                                items.push((String::new(), label, Pick::SwitchOverlord(agent)));
+                            }
+                        }
+                    }
+                } else if !s["limit"].is_null() && s["limit"]["resume"] != true {
+                    items.push((String::new(), "Resume after limit", Pick::ResumeAfterLimit));
+                }
+            }
+        }
         let target = if group {
             Target::Group(self.group_sel.clone().unwrap_or_default())
         } else {
@@ -673,7 +725,7 @@ impl App {
                     } else {
                         "favourite"
                     };
-                    items.push((self.keys.label(Action::Pin), label, k));
+                    items.push((self.keys.label(Action::Pin), label, Pick::Key(k)));
                 }
             }
             groups::group_label(&g)
@@ -708,16 +760,18 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(n - 1),
             KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
             // Run it as its key would (the menu is closed by now).
-            KeyCode::Enter => return self.run_menu_item(&m.target, m.items[m.sel].2, terminal),
+            KeyCode::Enter => {
+                return self.run_menu_item(&m.target, m.items[m.sel].2.clone(), terminal)
+            }
             // One of the listed keys runs that entry; anything else closes.
             _ => {
-                let item = m.items.iter().find(|(_, _, key)| {
-                    key.code == k.code
+                let item = m.items.iter().find(|(_, _, pick)| {
+                    matches!(pick, Pick::Key(key) if key.code == k.code
                         && key.modifiers.contains(KeyModifiers::CONTROL)
-                            == k.modifiers.contains(KeyModifiers::CONTROL)
+                            == k.modifiers.contains(KeyModifiers::CONTROL))
                 });
                 return match item {
-                    Some((_, _, key)) => self.run_menu_item(&m.target, *key, terminal),
+                    Some((_, _, pick)) => self.run_menu_item(&m.target, pick.clone(), terminal),
                     None => Ok(false),
                 };
             }
@@ -1356,6 +1410,65 @@ mod tests {
         let rows = drawn(&mut app);
         let (x, y) = find(&rows, "favourite");
         assert!(x < 150 && y < 34);
+    }
+
+    /// The overlord's row offers the other installed agents' overlords; a
+    /// session stopped on a usage limit offers to resume it.
+    #[test]
+    fn the_menu_switches_overlords_and_resumes_limited_sessions() {
+        let picks = |app: &App| -> Vec<(&'static str, Pick)> {
+            match &app.mode {
+                Mode::Menu(m) => m.items.iter().map(|i| (i.1, i.2.clone())).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let mut app = long_fleet();
+        app.sessions[0]["agent_session"] = json!("x");
+        app.sessions[0]["overlords"] = json!([
+            {"agent": "claude", "installed": true, "exists": true, "active": true},
+            {"agent": "codex", "installed": true, "exists": false, "active": false},
+            {"agent": "opencode", "installed": false, "exists": false, "active": false},
+        ]);
+        app.table.select(Some(0));
+        app.open_menu(30, 8, false);
+        let got = picks(&app);
+        assert_eq!(
+            got.last(),
+            Some(&("Switch overlord to Codex", Pick::SwitchOverlord("codex"))),
+            "the installed one that isn't active, and only it: {got:?}"
+        );
+        assert_eq!(
+            got.iter()
+                .filter(|(_, p)| matches!(p, Pick::SwitchOverlord(_)))
+                .count(),
+            1
+        );
+        let rows = drawn(&mut app);
+        find(&rows, "Switch overlord to Codex");
+        // A limited session: resume it, unless that is already scheduled.
+        app.mode = Mode::Normal;
+        app.sessions[1]["limit"] = json!({"until": "3:00pm", "resume": false});
+        app.table.select(Some(1));
+        app.open_menu(30, 8, false);
+        assert_eq!(
+            picks(&app).last(),
+            Some(&("Resume after limit", Pick::ResumeAfterLimit))
+        );
+        app.mode = Mode::Normal;
+        let rows = drawn(&mut app);
+        find(&rows, "◷ till 3:00pm");
+        app.sessions[1]["limit"]["resume"] = json!(true);
+        app.open_menu(30, 8, false);
+        assert!(!picks(&app)
+            .iter()
+            .any(|(_, p)| *p == Pick::ResumeAfterLimit));
+        app.mode = Mode::Normal;
+        let rows = drawn(&mut app);
+        find(&rows, "◷ 3:00pm ↻");
+        // An ordinary session: neither.
+        app.table.select(Some(2));
+        app.open_menu(30, 8, false);
+        assert!(picks(&app).iter().all(|(_, p)| matches!(p, Pick::Key(_))));
     }
 
     #[test]
