@@ -320,7 +320,8 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   environment, as its hooks do, not the pane's; not checked live). Started
   by rlord, that is the rlord daemon's environment less its session
   variables: the shell that first started rlord, or the launchd/systemd
-  service's.
+  service's. A daemon something else started (a plain `codex`, an
+  editor) keeps that one's.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)

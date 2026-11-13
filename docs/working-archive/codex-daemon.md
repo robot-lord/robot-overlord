@@ -19,8 +19,7 @@ sessions moved onto the daemon and back, a stand-in control socket for
 tests (`codex_server::fake`), and docs. Re-check everything below against
 the Codex of the day first. Where the branch's own working doc differs
 (it was written before MFA was on and before the lock was timed twice),
-this file is newer. Its version (0.23.0-dev.15) is taken: rebase it and
-bump again. Rules to keep (Brandon's): the machine switch
+this file is newer. Rebase it and bump to the next free version. Rules to keep (Brandon's): the machine switch
 goes on only on the user's explicit yes (`confirm_machine`), never
 confirmed by the overlord for them; the pairing code never goes into MCP
 results, logs or events, only to the user's own terminal; turning it off
