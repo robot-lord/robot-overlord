@@ -215,6 +215,10 @@ what doesn't work yet), and the overlord
 runs on any of the three. Other agent CLIs are planned behind the same
 adapter.
 
+Most testing so far has been on macOS with Claude Code. Linux, Codex and
+OpenCode get less use, so expect rough edges there. Bug reports are
+welcome: [open an issue](https://github.com/robot-lord/robot-overlord/issues).
+
 ## Contributing
 
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
