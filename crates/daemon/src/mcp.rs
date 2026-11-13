@@ -83,7 +83,7 @@ pub fn tools() -> Value {
     });
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
-    create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
+    create_props["remote_control"] = b("Turn on Remote Control (continue it from the agent's app) once launched; only when the user asks. Claude Code and Codex sessions; for Codex the answer's `remote` may say needs_confirm (machine-wide) or needs_pairing, as remote_control does.");
     json!([
         tool("list_sessions",
             "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
@@ -218,13 +218,18 @@ pub fn tools() -> Value {
             "Rename a group (tag) on every session that has it; merges into an existing group of the new name.",
             json!({"from": s("Current tag"), "to": s("New tag (one word)")}), &["from", "to"]),
         tool("remote_control",
-            "Remote Control: continue a Claude Code session from the Claude app or claude.ai while it keeps running here. `on` true/false turns it on or off: remembered across restarts, and a running session is restarted (conversation resumed) with or without it. If the session has work going, nothing changes and the answer is `needs_confirm` with what a restart would interrupt: ask the user, then call again with `restart`. Without `on` it reports state, url and whether this machine can use it at all (and why not).",
+            "Remote Control: the user continues a session from their phone while it keeps running here (Claude Code: the Claude app or claude.ai, per session; Codex: the ChatGPT app, through a machine-wide switch and a paired phone). `on` true/false turns it on or off for `session`: remembered across restarts; a running session is restarted (conversation resumed) when that's needed. With work going, nothing changes and the answer is `needs_confirm` with what a restart would interrupt: ask, then call again with `restart`. Codex: `needs_confirm` with `machine_wide` means the machine switch is off; only after the user's explicit yes call again with `confirm_machine: true`. `needs_pairing`: no phone is paired yet (remote_pair). `machine: true` with `on` acts on Codex's machine switch itself. Without `on` it reports state and whether this machine can use it (and why not).",
             json!({
                 "session": s(&format!("{SESSION_REF}; omit for every session with it on")),
                 "on": b("Turn it on (true) or off (false); omit to just report"),
                 "restart": {"type": "string", "enum": ["now", "when_idle"],
                             "description": "After needs_confirm, the user's pick: restart now (interrupting), or as soon as its work is done"},
+                "confirm_machine": b("Codex: the user said yes to switching Remote Control on for the whole machine. Only after asking them."),
+                "machine": b("Codex: act on the machine-wide switch, not a session"),
             }), &[]),
+        tool("remote_pair",
+            "Codex Remote Control: show the user a short-lived code to pair the ChatGPT app on their phone with this machine. The code appears on the user's screen in rlord's list, never in this answer: don't ask for it or repeat it. Needs the machine switch on.",
+            json!({}), &[]),
         tool("set_group_order",
             "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
             json!({"order": {"type": "array", "items": {"type": "string"}, "description": "Tags, most important first; [] clears"}}),
@@ -323,6 +328,7 @@ fn summarize(s: &Value) -> Value {
         },
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
+        "remote_reason": s["remote"]["reason"],
     });
     // Stopped on a usage limit: that, rather than the status under it.
     if !s["limit"].is_null() {
@@ -522,8 +528,19 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // have it; otherwise the session launches anyway, with a note.
             let mut params = new_session_params(args);
             let mut remote_note = None;
-            if args.get("remote_control").and_then(Value::as_bool) == Some(true) {
-                let a = d.rpc("remote.availability", json!({"force": true}))?;
+            let agent = match arg_str(args, "agent") {
+                Some(a) => a.to_string(),
+                None => d.rpc("session.defaults", json!({"no_listing": true}))?["agent"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            let codex = agent == "codex";
+            if params_wants_remote(args) {
+                let a = d.rpc(
+                    "remote.availability",
+                    json!({"force": true, "agent": agent}),
+                )?;
                 if a["available"] == true {
                     params["remote_control"] = json!(true);
                 } else {
@@ -534,6 +551,21 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let mut out = summarize(&s);
             if let Some(n) = remote_note {
                 out["remote"] = n;
+            } else if params_wants_remote(args) && codex {
+                // On Codex's server from the start; what the machine still
+                // needs (its switch, a phone) comes back as remote_control's.
+                let mut r = d.rpc("remote.set", json!({"ref": s["id"], "on": true}))?;
+                if let Some(o) = r.as_object_mut() {
+                    o.remove("session");
+                    o.remove("name");
+                }
+                if r["machine_wide"] == true {
+                    r["note"] = json!(format!(
+                        "{} Then remote_control with this session, on: true, confirm_machine: true.",
+                        r["note"].as_str().unwrap_or("")
+                    ));
+                }
+                out["remote"] = r;
             } else if params_wants_remote(args) {
                 out["remote"] = json!("connects as it starts");
             }
@@ -578,17 +610,28 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
         }
         "list_groups" => d.rpc("tag.list", json!({})),
-        "remote_control" => match (
-            arg_str(args, "session"),
-            args.get("on").and_then(Value::as_bool),
-        ) {
-            (Some(r), Some(on)) => d.rpc(
-                "remote.set",
-                json!({"ref": r, "on": on, "restart": arg_str(args, "restart")}),
-            ),
-            (r, None) => d.rpc("remote.status", json!({"ref": r})),
-            (None, Some(_)) => bail!("which session? (pass `session`)"),
-        },
+        "remote_control" => {
+            let confirm = args.get("confirm_machine").and_then(Value::as_bool) == Some(true);
+            match (
+                arg_str(args, "session"),
+                args.get("on").and_then(Value::as_bool),
+            ) {
+                (_, Some(on)) if args.get("machine").and_then(Value::as_bool) == Some(true) => d
+                    .rpc(
+                        "remote.machine",
+                        json!({"agent": "codex", "on": on, "confirm_machine": confirm}),
+                    ),
+                (Some(r), Some(on)) => d.rpc(
+                    "remote.set",
+                    json!({"ref": r, "on": on, "restart": arg_str(args, "restart"),
+                           "confirm_machine": confirm}),
+                ),
+                (r, None) => d.rpc("remote.status", json!({"ref": r})),
+                (None, Some(_)) => bail!("which session? (pass `session`, or `machine: true`)"),
+            }
+        }
+        // (The code itself goes only to the user's terminal.)
+        "remote_pair" => d.rpc("remote.pair", json!({"agent": "codex", "ui": true})),
         "set_group_order" => d.rpc(
             "tag.order",
             json!({"order": args.get("order").cloned().unwrap_or(json!([]))}),
@@ -742,6 +785,7 @@ mod tests {
         "create_session",
         "update_session",
         "remote_control",
+        "remote_pair",
         "set_group_order",
         "rename_group",
         "organize",
@@ -779,5 +823,14 @@ mod tests {
         let served = tools_for(false);
         assert_eq!(served.as_array().unwrap().len(), READ_ONLY_TOOLS.len());
         assert_eq!(tools_for(true), tools());
+    }
+
+    /// The pairing code goes only to the user's terminal: nothing here asks
+    /// for it.
+    #[test]
+    fn the_pairing_code_never_reaches_the_overlord() {
+        let src = include_str!("mcp.rs");
+        let asked = ["remote.pair", "_code"].concat();
+        assert!(!src.contains(&asked));
     }
 }

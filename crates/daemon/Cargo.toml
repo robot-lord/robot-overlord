@@ -21,5 +21,6 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+rlord-core = { package = "robot-overlord-core", path = "../core", features = ["fake-codex"] }
 tempfile = "3"
 rusqlite.workspace = true

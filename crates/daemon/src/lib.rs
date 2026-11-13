@@ -13,6 +13,7 @@ pub mod own;
 pub mod profile;
 pub mod recall;
 pub mod remote;
+pub mod remote_codex;
 pub mod rpc;
 pub mod search;
 pub mod send;
@@ -563,7 +564,8 @@ impl Daemon {
                     .filter(|a| !a.is_empty())
                     .unwrap_or(&cfg.session.agent)
                     .to_string();
-                agent == Agent::Codex.name() && cfg.session.codex_daemon
+                agent == Agent::Codex.name()
+                    && (cfg.session.codex_daemon || params["remote_control"] == true)
             }
             "session.restart" | "ui.goto" => params["ref"]
                 .as_str()
@@ -693,6 +695,9 @@ impl Daemon {
             "remote.availability" => remote::availability(self, params),
             "remote.status" => remote::status(self, params),
             "remote.set" => remote::set(self, params),
+            "remote.machine" => remote_codex::machine(self, params),
+            "remote.pair" => remote_codex::pair(self, params),
+            "remote.pair_code" => remote_codex::pair_code(self, params),
             "overlord.style" => {
                 overlord::style(&self.db(), &self.config());
                 Ok(json!({"styled": true}))

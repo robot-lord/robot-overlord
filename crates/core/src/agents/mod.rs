@@ -27,6 +27,7 @@
 pub mod claude;
 pub mod codex;
 pub mod codex_gate;
+pub mod codex_remote;
 pub mod codex_server;
 pub mod install;
 pub mod opencode;
@@ -453,9 +454,25 @@ impl Agent {
 
     // ---- what it can't do ----
 
-    /// Remote Control (continuing a session from the agent's app).
+    /// Remote Control (continuing a session from the agent's app): Claude
+    /// Code's per session, Codex's machine-wide (`codex_remote`).
     pub fn has_remote_control(self) -> bool {
+        matches!(self, Agent::Claude | Agent::Codex)
+    }
+
+    /// Remote Control for its overlord. Not Codex's: the overlord's wiring
+    /// is `-c` overrides, which make Codex run the thread in the pane, and
+    /// only a thread on its background server is reachable.
+    pub fn overlord_remote_control(self) -> bool {
         matches!(self, Agent::Claude)
+    }
+
+    /// Where the user continues a session with Remote Control.
+    pub fn remote_app(self) -> &'static str {
+        match self {
+            Agent::Codex => "the ChatGPT app",
+            _ => "the Claude app",
+        }
     }
 
     /// rlord tracks its sub-agents.

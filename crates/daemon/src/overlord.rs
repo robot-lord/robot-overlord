@@ -587,8 +587,8 @@ fn ensure_running(db: &Db, cfg: &Config, cur: Option<Session>, params: &Value) -
             if first || cfg.overlord.agent.trim() == agent.name() {
                 db.kv_set(DEFAULT_DECLINED, cfg.overlord.model.trim())?;
             }
-            let remote =
-                params["remote_control"].as_bool().unwrap_or(false) && agent.has_remote_control();
+            let remote = params["remote_control"].as_bool().unwrap_or(false)
+                && agent.overlord_remote_control();
             let v = methods::session_new(
                 db,
                 cfg,
@@ -834,7 +834,7 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
                     "model": model, "effort": effort,
                     "models": cfg.session.models_for(a),
                     "efforts": rlord_core::config::OverlordConfig::efforts_for(a.name()),
-                    "remote_control": a.has_remote_control(),
+                    "remote_control": a.overlord_remote_control(),
                     "catalog": catalog(a.name()),
                 })
             })

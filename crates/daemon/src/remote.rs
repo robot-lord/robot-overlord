@@ -21,6 +21,10 @@
 //!   likely reason (an org that hasn't allowed it) rather than retried.
 //! - **Availability** is checked up front (`remote::check`, cached) so the
 //!   overlord and the list say plainly when this machine can't use it.
+//!
+//! That is Claude Code's. Codex's is machine-wide and works differently
+//! (a switch, a paired phone, the session in daemon mode): `remote_codex`.
+//! `remote.set` and the keeper hand Codex sessions to it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,6 +65,8 @@ pub struct Remote {
     snapshot: Mutex<HashMap<String, Value>>,
     /// One keeper pass at a time (the keeper and a `remote.set`).
     tick: Mutex<()>,
+    /// Codex's Remote Control (machine-wide).
+    pub(crate) codex: crate::remote_codex::CodexRemote,
 }
 
 /// Every live session, the overlord included.
@@ -240,7 +246,8 @@ fn background_shells(pid: u32) -> usize {
 }
 
 /// What a restart would interrupt, in words for the user (empty: nothing).
-fn work_going(s: &Session, live: Option<&Live>) -> Vec<String> {
+/// `live`: Claude's live state (None for other agents).
+pub(crate) fn work_going(s: &Session, live: Option<&Live>) -> Vec<String> {
     let mut why: Vec<String> = Vec::new();
     match live.map(|l| l.status.as_str()) {
         Some("idle") | None => {}
@@ -261,12 +268,14 @@ fn work_going(s: &Session, live: Option<&Live>) -> Vec<String> {
     if s.agents_running > 0 {
         why.push(format!("{} sub-agent(s) running", s.agents_running));
     }
+    let agent = Agent::parse(&s.agent).unwrap_or(Agent::Claude);
     let draft = s
         .tmux_session
         .as_deref()
+        .filter(|n| tmux::has_session(n))
         .and_then(|n| tmux::pane_id(n).ok())
         .and_then(|p| tmux::capture_pane_id_ansi(&p).ok())
-        .and_then(|sc| input_text(&sc));
+        .and_then(|sc| crate::send::draft(agent, &sc));
     if draft.is_some() {
         why.push("there's unsent text in its input".into());
     }
@@ -361,7 +370,7 @@ fn load_queue(d: &Daemon) {
     }
 }
 
-fn enqueue(d: &Daemon, id: &str) {
+pub(crate) fn enqueue(d: &Daemon, id: &str) {
     // The saved queue first: never overwrite it with a partial one.
     load_queue(d);
     let mut q = d.remote.restart_when_idle.lock().expect("remote mutex");
@@ -379,7 +388,12 @@ fn dequeue(d: &Daemon, id: &str) {
 /// Restart a session onto its current wish (resuming the conversation).
 /// `only_if_quiet`: check again, right before, that nothing is going on
 /// (and has been for a few seconds); false means it wasn't restarted.
-fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
+pub(crate) fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
+    // A Codex session going onto Codex's background server: the server
+    // runs first (before any lock: it can take seconds).
+    if d.db().resolve_ref(id).is_ok_and(|s| s.codex_daemon) {
+        crate::codex_daemon::ensure_running();
+    }
     // Not while a request is being pasted into the overlord (and checked
     // under that lock, after any request that held it).
     let is_overlord = d
@@ -474,9 +488,49 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         .lock()
         .expect("remote mutex")
         .clone();
+    // Codex's machine, asked only when a Codex session could be reached.
+    let codex = Agent::Codex.name();
+    let codex_seen = sessions
+        .iter()
+        .any(|s| s.agent == codex && (wants.contains_key(&s.id) || s.codex_daemon))
+        .then(|| d.remote.codex.seen(false));
+    let codex_avail = codex_seen.as_ref().map(|_| {
+        if sessions
+            .iter()
+            .any(|s| s.agent == codex && wants.contains_key(&s.id))
+        {
+            d.remote.codex.availability(false)
+        } else {
+            d.remote
+                .codex
+                .cached_availability()
+                .unwrap_or(Availability {
+                    available: true,
+                    ..Default::default()
+                })
+        }
+    });
+    crate::remote_codex::watch_pairing(d);
     let mut out = HashMap::new();
     for s in &sessions {
         let want = wants.get(&s.id);
+        if s.agent == codex {
+            let (Some(seen), Some(avail)) = (&codex_seen, &codex_avail) else {
+                continue;
+            };
+            let st = crate::remote_codex::state_of(
+                s,
+                want.is_some(),
+                seen,
+                avail,
+                d.remote.codex.last_error().as_deref(),
+                queued.contains_key(&s.id),
+            );
+            if st["state"] != "off" {
+                out.insert(s.id.clone(), st);
+            }
+            continue;
+        }
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
         let st = state_of(
             s,
@@ -561,11 +615,18 @@ fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     Ok(())
 }
 
-/// `remote.availability {force?}`.
+/// `remote.availability {force?, agent?}` (Claude Code's unless `agent`
+/// is `codex`).
 pub fn availability(d: &Daemon, params: &Value) -> Result<Value> {
-    let a = d
-        .remote
-        .availability(params["force"].as_bool().unwrap_or(false));
+    let force = params["force"].as_bool().unwrap_or(false);
+    if params["agent"] == "codex" {
+        let a = d.remote.codex.availability(force);
+        let mut v = avail_json(&a);
+        let seen = d.remote.codex.seen(force);
+        v["machine"] = crate::remote_codex::machine_json(d, &seen, &a)["machine"].clone();
+        return Ok(v);
+    }
+    let a = d.remote.availability(force);
     Ok(avail_json(&a))
 }
 
@@ -575,15 +636,28 @@ pub fn status(d: &Daemon, params: &Value) -> Result<Value> {
     let avail = d
         .remote
         .availability(params["force"].as_bool().unwrap_or(false));
+    let force = params["force"].as_bool().unwrap_or(false);
     let states = pass(d)?;
+    // Codex's switch, where Codex is installed.
+    let codex = rlord_core::agents::install::missing(Agent::Codex)
+        .is_none()
+        .then(|| {
+            let a = d.remote.codex.availability(force);
+            let seen = d.remote.codex.seen(force);
+            crate::remote_codex::machine_json(d, &seen, &a)
+        });
     if let Some(r) = params["ref"].as_str() {
         let s = d.db().resolve_ref(r)?;
         let st = states
             .get(&s.id)
             .cloned()
             .unwrap_or_else(|| json!({"state": "off", "wanted": false}));
-        return Ok(json!({"session": s.id, "name": s.name, "remote": st,
-                         "availability": avail_json(&avail)}));
+        let mut v = json!({"session": s.id, "name": s.name, "remote": st,
+                           "availability": avail_json(&avail)});
+        if s.agent == Agent::Codex.name() {
+            v["codex"] = codex.unwrap_or(Value::Null);
+        }
+        return Ok(v);
     }
     let names: HashMap<String, String> = d
         .db()
@@ -595,7 +669,11 @@ pub fn status(d: &Daemon, params: &Value) -> Result<Value> {
         .into_iter()
         .map(|(id, st)| json!({"session": id, "name": names.get(&id), "remote": st}))
         .collect();
-    Ok(json!({"availability": avail_json(&avail), "sessions": list}))
+    let mut v = json!({"availability": avail_json(&avail), "sessions": list});
+    if let Some(c) = codex {
+        v["codex"] = c;
+    }
+    Ok(v)
 }
 
 /// `remote.set {ref, on, restart?: "now" | "when_idle"}`: turn Remote
@@ -616,10 +694,18 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         d.db()
             .resolve_ref(params["ref"].as_str().context("missing 'ref'")?)?
     };
+    let mode = match params["restart"].as_str() {
+        None | Some("") => None,
+        Some(m @ ("now" | "when_idle")) => Some(m),
+        Some(m) => bail!("restart must be \"now\" or \"when_idle\", not {m:?}"),
+    };
+    if s.agent == Agent::Codex.name() {
+        return crate::remote_codex::set(d, &s, on, mode, params);
+    }
     if on {
         if !has_remote_control(&s.agent) {
             bail!(
-                "Remote Control is a Claude Code feature; {} has none",
+                "Remote Control is a Claude Code and Codex feature; {} has none",
                 s.agent
             );
         }
@@ -632,11 +718,6 @@ pub fn set(d: &Daemon, params: &Value) -> Result<Value> {
         }
     }
     let is_overlord = overlord::is_overlord_role(&s.role);
-    let mode = match params["restart"].as_str() {
-        None | Some("") => None,
-        Some(m @ ("now" | "when_idle")) => Some(m),
-        Some(m) => bail!("restart must be \"now\" or \"when_idle\", not {m:?}"),
-    };
     let targets = [(s.clone(), on)];
     let live = live();
     // What a restart now would interrupt (the overlord never restarts now:
@@ -764,7 +845,9 @@ pub fn offer(d: &Daemon) -> Value {
     // Whether its agent has it. No overlord yet: what this machine can do;
     // the setup dialog shows the row only for an agent that has it
     // (`overlord::status`: each agent's `remote_control`).
-    let can = o.as_ref().is_none_or(|o| has_remote_control(&o.agent));
+    let can = o
+        .as_ref()
+        .is_none_or(|o| Agent::parse(&o.agent).is_some_and(Agent::overlord_remote_control));
     let declined = db
         .kv_get("remote_offer_declined")
         .ok()

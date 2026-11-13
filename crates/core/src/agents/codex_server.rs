@@ -232,6 +232,12 @@ impl Client {
     /// starts as the originator of every thread it then creates, whoever
     /// creates them. Naming the TUI leaves that as it would be anyway.
     pub fn connect(socket: &Path, limit: Duration) -> Result<Client> {
+        Client::connect_with(socket, limit, false)
+    }
+
+    /// `connect`, and with `experimental` the `experimentalApi` capability,
+    /// which the `remoteControl/*` methods need (`codex_remote`).
+    pub fn connect_with(socket: &Path, limit: Duration, experimental: bool) -> Result<Client> {
         let stream = UnixStream::connect(socket)
             .with_context(|| format!("connecting to {}", socket.display()))?;
         stream.set_read_timeout(Some(limit))?;
@@ -242,12 +248,12 @@ impl Client {
             next_id: 1,
         };
         c.handshake(limit)?;
-        c.request(
-            "initialize",
-            json!({"clientInfo": {"name": "codex-tui", "title": "rlord",
-                                  "version": env!("CARGO_PKG_VERSION")}}),
-            limit,
-        )?;
+        let mut init = json!({"clientInfo": {"name": "codex-tui", "title": "rlord",
+                                             "version": env!("CARGO_PKG_VERSION")}});
+        if experimental {
+            init["capabilities"] = json!({"experimentalApi": true});
+        }
+        c.request("initialize", init, limit)?;
         c.send(&json!({"method": "initialized"}))?;
         Ok(c)
     }
@@ -461,6 +467,227 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// A stand-in for the control socket, for tests (rlord's own and the
+/// daemon crate's, with the `fake-codex` feature): it upgrades, answers
+/// each request by method from a small state, and sends the
+/// `remoteControl/status/changed` notification after `initialize` as the
+/// real server does.
+#[cfg(any(test, feature = "fake-codex"))]
+pub mod fake {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::{find, parse_frame};
+
+    #[derive(Default)]
+    struct State {
+        link: String,
+        environment: Option<String>,
+        refuse_enable: Option<String>,
+        claimed: bool,
+        clients: usize,
+        experimental: bool,
+        methods: Vec<String>,
+        thread_status: Value,
+        turns: Value,
+    }
+
+    /// The running stand-in; it serves until the test process ends.
+    #[derive(Clone)]
+    pub struct Fake(Arc<Mutex<State>>);
+
+    impl Fake {
+        pub fn start(sock: &Path) -> Fake {
+            let st = Arc::new(Mutex::new(State {
+                link: "disabled".into(),
+                thread_status: json!({"type": "idle"}),
+                turns: json!({"data": []}),
+                ..State::default()
+            }));
+            let l = UnixListener::bind(sock).expect("bind the stand-in socket");
+            let shared = Arc::clone(&st);
+            std::thread::spawn(move || {
+                for conn in l.incoming() {
+                    let Ok(s) = conn else { break };
+                    let st = Arc::clone(&shared);
+                    std::thread::spawn(move || serve(s, &st));
+                }
+            });
+            Fake(st)
+        }
+
+        fn st(&self) -> std::sync::MutexGuard<'_, State> {
+            self.0.lock().expect("fake mutex")
+        }
+
+        /// `remoteControl/enable` fails with this message ("" accepts).
+        pub fn refuse_enable(&self, msg: &str) {
+            self.st().refuse_enable = (!msg.is_empty()).then(|| msg.to_string());
+        }
+
+        /// The machine as it is: `disabled`, `connected`, `errored`, ….
+        pub fn set_link(&self, link: &str) {
+            let mut st = self.st();
+            st.link = link.into();
+            st.environment = (link == "connected").then(|| "env-1".into());
+        }
+
+        /// A phone enters the pairing code.
+        pub fn claim(&self) {
+            let mut st = self.st();
+            st.claimed = true;
+            st.clients += 1;
+        }
+
+        pub fn set_clients(&self, n: usize) {
+            self.st().clients = n;
+        }
+
+        /// `thread/read`'s status and `thread/turns/list`'s answer.
+        pub fn set_thread(&self, status: Value, turns: Value) {
+            let mut st = self.st();
+            st.thread_status = status;
+            st.turns = turns;
+        }
+
+        /// Whether a client asked for the experimental API.
+        pub fn saw_experimental(&self) -> bool {
+            self.st().experimental
+        }
+
+        /// Every method called so far, in order.
+        pub fn methods(&self) -> Vec<String> {
+            self.st().methods.clone()
+        }
+    }
+
+    fn status(st: &State) -> Value {
+        json!({"status": st.link, "serverName": "stand-in", "installationId": "i",
+               "environmentId": st.environment})
+    }
+
+    fn answer(st: &mut State, method: &str, params: &Value) -> Result<Value, String> {
+        Ok(match method {
+            "initialize" => {
+                if params["capabilities"]["experimentalApi"] == true {
+                    st.experimental = true;
+                }
+                json!({"userAgent": "stand-in"})
+            }
+            m if m.starts_with("remoteControl/") && !st.experimental => {
+                return Err(format!("{m} requires experimentalApi capability"))
+            }
+            "remoteControl/status/read" => status(st),
+            "remoteControl/enable" => {
+                if let Some(e) = &st.refuse_enable {
+                    return Err(e.clone());
+                }
+                st.link = "connected".into();
+                st.environment = Some("env-1".into());
+                status(st)
+            }
+            "remoteControl/disable" => {
+                st.link = "disabled".into();
+                st.environment = None;
+                status(st)
+            }
+            "remoteControl/pairing/start" if st.link == "disabled" => {
+                return Err("remote control pairing requires remote control to be enabled".into())
+            }
+            "remoteControl/pairing/start" => {
+                st.claimed = false;
+                json!({"pairingCode": "STAND-IN-FULL", "manualPairingCode": "STAND-IN-CODE",
+                       "environmentId": st.environment, "expiresAt": 4_000_000_000_000i64})
+            }
+            "remoteControl/pairing/status" => json!({"claimed": st.claimed}),
+            "remoteControl/client/list" => {
+                json!({"data": (0..st.clients).map(|i| json!({"name": format!("phone {i}")})).collect::<Vec<_>>()})
+            }
+            "thread/read" => json!({"thread": {"status": st.thread_status}}),
+            "thread/turns/list" => st.turns.clone(),
+            "thread/loaded/list" => json!({"data": []}),
+            _ => json!({}),
+        })
+    }
+
+    fn server_frame(v: &Value) -> Vec<u8> {
+        let t = v.to_string();
+        let mut f = vec![0x81];
+        if t.len() < 126 {
+            f.push(t.len() as u8);
+        } else {
+            f.push(126);
+            f.extend_from_slice(&(t.len() as u16).to_be_bytes());
+        }
+        f.extend_from_slice(t.as_bytes());
+        f
+    }
+
+    fn serve(mut s: std::os::unix::net::UnixStream, st: &Mutex<State>) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while find(&buf, b"\r\n\r\n").is_none() {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let end = find(&buf, b"\r\n\r\n").expect("end of the upgrade") + 4;
+        buf.drain(..end);
+        if s.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            let got = loop {
+                if let Ok(Some((f, used))) = parse_frame(&buf) {
+                    buf.drain(..used);
+                    break Some(f);
+                }
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let Some((_, _, payload)) = got else { return };
+            let Ok(v) = serde_json::from_slice::<Value>(&payload) else {
+                continue;
+            };
+            let method = v["method"].as_str().unwrap_or("").to_string();
+            let mut out = Vec::new();
+            {
+                let mut st = st.lock().expect("fake mutex");
+                st.methods.push(method.clone());
+                if v.get("id").is_none() {
+                    continue;
+                }
+                let r = answer(&mut st, &method, &v["params"]);
+                // Something unasked first, as the server sends.
+                out.push(json!({"method": "account/updated", "params": {}}));
+                out.push(match r {
+                    Ok(result) => json!({"id": v["id"], "result": result}),
+                    Err(e) => json!({"id": v["id"], "error": {"code": -32600, "message": e}}),
+                });
+                if method == "initialize" {
+                    out.push(
+                        json!({"method": "remoteControl/status/changed", "params": status(&st)}),
+                    );
+                }
+            }
+            for m in out {
+                if s.write_all(&server_frame(&m)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,83 +764,23 @@ mod tests {
         assert_eq!(base64(b"ab"), "YWI=");
     }
 
-    /// A stand-in control socket: upgrade, then answer each request by
-    /// method, with a notification first (as the daemon sends).
+    /// Against the stand-in control socket.
     #[test]
     fn a_client_reads_and_interrupts() {
-        use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let l = UnixListener::bind(&sock).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            for conn in l.incoming().take(2) {
-                let mut s = conn.unwrap();
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                while find(&buf, b"\r\n\r\n").is_none() {
-                    let n = s.read(&mut chunk).unwrap();
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                let end = find(&buf, b"\r\n\r\n").unwrap() + 4;
-                buf.drain(..end);
-                s.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-                    .unwrap();
-                let server = |v: Value| {
-                    let t = v.to_string();
-                    let mut f = vec![0x81];
-                    if t.len() < 126 {
-                        f.push(t.len() as u8);
-                    } else {
-                        f.push(126);
-                        f.extend_from_slice(&(t.len() as u16).to_be_bytes());
-                    }
-                    f.extend_from_slice(t.as_bytes());
-                    f
-                };
-                loop {
-                    let got = loop {
-                        if let Some((f, used)) = parse_frame(&buf).unwrap() {
-                            buf.drain(..used);
-                            break Some(f);
-                        }
-                        match s.read(&mut chunk) {
-                            Ok(0) | Err(_) => break None,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        }
-                    };
-                    let Some((_, _, payload)) = got else { break };
-                    let v: Value = serde_json::from_slice(&payload).unwrap();
-                    let method = v["method"].as_str().unwrap_or("").to_string();
-                    tx.send(method.clone()).unwrap();
-                    if v.get("id").is_none() {
-                        continue;
-                    }
-                    let result = match method.as_str() {
-                        "initialize" => json!({"userAgent": "x"}),
-                        "thread/read" => {
-                            json!({"thread": {"status": {"type": "active", "activeFlags": []}}})
-                        }
-                        "thread/turns/list" => {
-                            json!({"data": [{"id": "turn-9", "status": "inProgress"}]})
-                        }
-                        _ => json!({}),
-                    };
-                    s.write_all(&server(json!({"method": "account/updated", "params": {}})))
-                        .unwrap();
-                    s.write_all(&server(json!({"id": v["id"], "result": result})))
-                        .unwrap();
-                }
-            }
-        });
+        let fake = fake::Fake::start(&sock);
+        fake.set_thread(
+            json!({"type": "active", "activeFlags": []}),
+            json!({"data": [{"id": "turn-9", "status": "inProgress"}]}),
+        );
         assert_eq!(
             thread_state(&sock, "t-1"),
             Some(ThreadState::Active { waiting: false })
         );
         assert_eq!(interrupt(&sock, "t-1").unwrap(), Interrupted::Asked);
-        let seen: Vec<String> = rx.try_iter().collect();
         assert_eq!(
-            seen,
+            fake.methods(),
             [
                 "initialize",
                 "initialized",

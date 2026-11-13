@@ -29,3 +29,7 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# A stand-in for Codex's control socket (`codex_server::fake`), for tests.
+fake-codex = []

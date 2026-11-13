@@ -22,6 +22,7 @@ mod mouse;
 mod newform;
 mod overlay;
 mod overlord;
+mod pairing;
 mod record;
 mod theme;
 use groups::Tab;
@@ -181,6 +182,8 @@ enum Mode {
     OverlordSetup(Box<overlord::Setup>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
+    /// A phone pairing code for Codex Remote Control (`remote_pair`).
+    RemotePair(Box<pairing::Pair>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -422,6 +425,7 @@ impl App {
         // (A daemon change notice or an action: the overlord's
         // conversations may have changed too.)
         self.convs_stale = true;
+        self.refresh_pairing();
         let q = self.query();
         // The selection follows the session, not the row: a re-sort or the
         // overlord rows appearing must not move it to another session.
@@ -781,6 +785,7 @@ impl App {
             Mode::OverlordSetup(s) => self.handle_setup(k, s),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+            Mode::RemotePair(p) => self.handle_pairing(k, p),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
@@ -1401,6 +1406,7 @@ impl App {
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
+            Mode::RemotePair(p) => self.draw_pairing(f, p),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
@@ -1965,11 +1971,20 @@ impl App {
         if let Some(st) = s["remote"]["state"].as_str() {
             let (text, style) = match st {
                 "on" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["url"].as_str().unwrap_or("in the Claude app")
-                    ),
+                    match s["remote"]["url"].as_str() {
+                        Some(u) => format!("on · {u}"),
+                        None => format!(
+                            "on · in {}",
+                            s["remote"]["app"].as_str().unwrap_or("the Claude app")
+                        ),
+                    },
                     Style::default().fg(theme::green()),
+                ),
+                // Codex: the machine is on, but no phone can reach it yet.
+                "unpaired" => (
+                    "on · no phone paired yet (ask the overlord to pair one, or `rlord remote pair`)"
+                        .into(),
+                    theme::muted(),
                 ),
                 "connecting" => ("connecting…".into(), theme::muted()),
                 "pending" => (
@@ -2234,6 +2249,7 @@ impl App {
             Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
+            Mode::RemotePair(_) => Some("phone pairing — see dialog".to_string()),
             Mode::Help => Some("help: any key closes".to_string()),
             Mode::Command(l) => Some(format!(
                 "command: {}▏   (enter: run · tab: complete · ↑↓: choose · esc: close)",
@@ -2555,7 +2571,7 @@ fn others_up(s: &Value) -> String {
 fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
-        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
+        Some("connecting" | "stopped" | "pending" | "disconnecting" | "unpaired") => {
             Span::styled(" ⇄", theme::faint())
         }
         Some("failed") | Some("unavailable") => {

@@ -456,9 +456,12 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let remote_control = params["remote_control"].as_bool().unwrap_or(false);
     if remote_control && !agent.has_remote_control() {
         bail!(
-            "Remote Control is a Claude Code feature; {} has none",
+            "Remote Control is a Claude Code and Codex feature; {} has none",
             agent.label()
         );
+    }
+    if remote_control && agent == Agent::Codex && crate::overlord::is_overlord_role(&role) {
+        bail!("Codex's Remote Control is for sessions only, not the overlord");
     }
     // Each agent has its own models: the default is that agent's.
     let model = p_opt("model").or_else(|| {
@@ -528,6 +531,16 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         && !codex::needs_embedded(&extra_args)
     {
         spec["codex_host"] = json!(codex::HOST_DAEMON);
+    }
+    // Codex's Remote Control reaches only threads on that server: there
+    // from the start (and back in the pane when it's turned off).
+    if agent == Agent::Codex && remote.is_some() && !codex::on_daemon(&spec) {
+        if codex::needs_embedded(&extra_args) {
+            bail!("these Codex flags make it run in its pane, out of Remote Control's reach");
+        }
+        spec["codex_host"] = json!(codex::HOST_DAEMON);
+        spec["codex_host_by_remote"] = json!(true);
+        spec["remote_control_at"] = json!(now_ms());
     }
     let daemon = codex::on_daemon(&spec);
     let mut launch = agent.launch(

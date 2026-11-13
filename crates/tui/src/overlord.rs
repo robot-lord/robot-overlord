@@ -499,6 +499,7 @@ impl App {
                 self.status_line = "overlord set the view".into();
             }
             Some("overlord_setup") => self.check_overlord(),
+            Some("remote_pair") => self.open_pairing(),
             // Never over something the user is typing into.
             Some("keys") if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Keys(_)) => {
                 self.status_line =
@@ -657,13 +658,15 @@ impl App {
             }
         } else if !s.choice().remote {
             // The row is gone for this agent: say why, so it isn't missed.
-            lines.push(Line::from(Span::styled(
+            let why = if s.choice().name == "codex" {
+                "  ⇄ Codex's Remote Control is for sessions only, not the overlord.".to_string()
+            } else {
                 format!(
-                    "  ⇄ Remote Control is a Claude Code feature: none on {}.",
+                    "  ⇄ Remote Control for the overlord is a Claude Code feature: none on {}.",
                     s.choice().label
-                ),
-                theme::faint(),
-            )));
+                )
+            };
+            lines.push(Line::from(Span::styled(why, theme::faint())));
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(

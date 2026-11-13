@@ -190,10 +190,12 @@ enum Command {
         #[arg(long)]
         file: Option<String>,
     },
-    /// Remote Control: continue a Claude Code session from the Claude app or
-    /// claude.ai. `rlord remote` lists what's connected (and whether this
-    /// machine can use it); `rlord remote <session> on|off` turns it on or
-    /// off (remembered across restarts).
+    /// Remote Control: continue a session from your phone (Claude Code: the
+    /// Claude app or claude.ai; Codex: the ChatGPT app). `rlord remote`
+    /// lists what's connected (and whether this machine can use it);
+    /// `rlord remote <session> on|off` turns it on or off (remembered across
+    /// restarts). Codex's is machine-wide: `rlord remote machine on|off`
+    /// switches it, `rlord remote pair` shows a code to pair a phone.
     Remote {
         r#ref: Option<String>,
         /// on / off
@@ -1062,7 +1064,81 @@ fn main() -> Result<()> {
                     println!("note: {n}");
                 }
             };
+            // A yes from the user at this terminal, for the machine switch.
+            let confirm = |note: &str| -> Result<bool> {
+                use std::io::{BufRead, IsTerminal, Write};
+                println!("{note}");
+                if !std::io::stdin().is_terminal() {
+                    println!("(Run it in a terminal to answer.)");
+                    return Ok(false);
+                }
+                print!("Turn Codex Remote Control on for this whole machine? [y/N] ");
+                std::io::stdout().flush()?;
+                let mut a = String::new();
+                std::io::stdin().lock().read_line(&mut a)?;
+                Ok(matches!(a.trim(), "y" | "Y" | "yes"))
+            };
             match (r#ref, state.as_deref()) {
+                (Some(m), Some(s @ ("on" | "off"))) if m == "machine" => {
+                    let mut v = call("remote.machine", json!({"agent": "codex", "on": s == "on"}))?;
+                    if v["needs_confirm"] == true {
+                        if !confirm(
+                            "Codex's Remote Control is machine-wide: a phone paired with this machine can open and drive every Codex session on Codex's background server.",
+                        )? {
+                            println!("left off");
+                            return Ok(());
+                        }
+                        v = call(
+                            "remote.machine",
+                            json!({"agent": "codex", "on": true, "confirm_machine": true}),
+                        )?;
+                    }
+                    println!(
+                        "Codex Remote Control: {}",
+                        v["machine"].as_str().unwrap_or("?")
+                    );
+                    if v["needs_pairing"] == true {
+                        println!("no phone is paired yet: rlord remote pair");
+                    }
+                    if let Some(n) = v["note"].as_str() {
+                        println!("{n}");
+                    }
+                }
+                (Some(p), None) if p == "pair" => {
+                    use std::io::IsTerminal;
+                    // The code is for the user's eyes: never into a pipe
+                    // (an agent's shell, a log).
+                    if !std::io::stdout().is_terminal() {
+                        anyhow::bail!("the pairing code is shown only on a terminal");
+                    }
+                    call("remote.pair", json!({"agent": "codex", "ui": false}))?;
+                    let mut shown = false;
+                    loop {
+                        let c = call("remote.pair_code", json!({}))?;
+                        if c["open"] != true {
+                            println!("the code expired: run rlord remote pair again");
+                            break;
+                        }
+                        if !shown {
+                            println!(
+                                "Enter this code in the ChatGPT app on your phone (Codex, connect a computer):\n\n    {}\n",
+                                c["code"].as_str().unwrap_or("?")
+                            );
+                            if let Some(e) = c["expires_at"].as_i64() {
+                                println!(
+                                    "It works until {}. Waiting for your phone (Ctrl-C to stop)…",
+                                    fmt_ts(e)
+                                );
+                            }
+                            shown = true;
+                        }
+                        if c["claimed"] == true {
+                            println!("paired");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
                 (Some(r), Some(s @ ("on" | "off"))) => {
                     let restart = if now {
                         json!("now")
@@ -1071,10 +1147,22 @@ fn main() -> Result<()> {
                     } else {
                         Value::Null
                     };
-                    let v = call(
+                    let mut v = call(
                         "remote.set",
                         json!({"ref": r, "on": s == "on", "restart": restart}),
                     )?;
+                    if v["machine_wide"] == true {
+                        if !confirm(
+                            "Codex's Remote Control is machine-wide: a phone paired with this machine can open and drive every Codex session on Codex's background server, not only this one.",
+                        )? {
+                            println!("left off");
+                            return Ok(());
+                        }
+                        v = call(
+                            "remote.set",
+                            json!({"ref": r, "on": true, "restart": restart, "confirm_machine": true}),
+                        )?;
+                    }
                     if v["needs_confirm"] == true {
                         let why: Vec<&str> = v["work_going"]
                             .as_array()
@@ -1092,13 +1180,38 @@ fn main() -> Result<()> {
                     if let Some(n) = v["note"].as_str().filter(|n| !n.is_empty()) {
                         println!("{n}");
                     }
+                    if v["needs_pairing"] == true {
+                        println!("pair a phone: rlord remote pair");
+                    }
                 }
                 (_, Some(other)) => {
-                    anyhow::bail!("usage: rlord remote [session] [on|off] (got '{other}')")
+                    anyhow::bail!("usage: rlord remote [session|machine] [on|off], or rlord remote pair (got '{other}')")
                 }
                 (r, None) => {
                     let v = call("remote.status", json!({"ref": r, "force": true}))?;
                     avail(&v["availability"]);
+                    if let Some(c) = v["codex"].as_object() {
+                        let c = Value::Object(c.clone());
+                        if c["available"] == false {
+                            println!(
+                                "Codex Remote Control isn't available here: {}",
+                                c["reason"].as_str().unwrap_or("unknown")
+                            );
+                        } else {
+                            let paired = c["paired"]
+                                .as_u64()
+                                .map(|n| format!(", {n} phone(s) paired"))
+                                .unwrap_or_default();
+                            println!(
+                                "Codex Remote Control for this machine: {}{paired}{}",
+                                c["machine"].as_str().unwrap_or("?"),
+                                c["error"]
+                                    .as_str()
+                                    .map(|e| format!(" ({e})"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    }
                     match v["sessions"].as_array() {
                         Some(list) if list.is_empty() => {
                             println!("no session has Remote Control on")
