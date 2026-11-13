@@ -252,7 +252,9 @@ pub fn main(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
-            cmd::run(&mut create)?;
+            cmd::run(&mut create).with_context(|| {
+                format!("creating the release {tag} failed; if it left a release or tag behind (gh release view {tag} -R {REPO}), remove both with: gh release delete {tag} -R {REPO} --cleanup-tag --yes; then run this again")
+            })?;
             if mode == Mode::Dev {
                 println!("released: {}", release_url(&tag));
                 return Ok(());
@@ -539,8 +541,10 @@ fn draft_state(json: &str, tag: &str) -> Result<Option<bool>> {
 /// Whether the tag is on origin. `ls-remote --exit-code` exits 2 for no
 /// match; anything else but 0 is an error, never "not pushed".
 fn tag_on_origin(tag: &str) -> Result<bool> {
+    // The full ref: a bare name would also match e.g. refs/tags/x/<tag>.
     // git's reason for a failure is shown.
-    let status = cmd::status(git().args(["ls-remote", "--exit-code", "--tags", "origin", tag]))?;
+    let full = format!("refs/tags/{tag}");
+    let status = cmd::status(git().args(["ls-remote", "--exit-code", "origin", &full]))?;
     match status.code() {
         Some(0) => Ok(true),
         Some(2) => Ok(false),

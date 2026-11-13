@@ -56,18 +56,31 @@ pub fn publish(dry_run: bool) -> Result<()> {
         std::fs::write(path, pinned).with_context(|| format!("writing {path}"))?;
     }
 
+    if dry_run {
+        // All together: one at a time, a crate's dry run can't find its
+        // pinned sibling, which a dry run never uploads.
+        let mut publish = cargo();
+        publish.args(["publish", "--dry-run", "--allow-dirty"]);
+        for krate in CRATES {
+            publish.args(["-p", krate]);
+        }
+        return cmd::run(&mut publish);
+    }
     // Dependencies first; each must be on the index before the next.
     for krate in CRATES {
-        if !dry_run && cmd::succeeds(cargo().args(["info", &format!("{krate}@{ver}")]))? {
+        // --registry: inside the workspace, plain `cargo info` answers from
+        // the local crate, so every crate would read as published.
+        let on_index = cmd::succeeds(cargo().args([
+            "info",
+            &format!("{krate}@{ver}"),
+            "--registry",
+            "crates-io",
+        ]))?;
+        if on_index {
             println!("publish-crates: {krate} {ver} already published");
             continue;
         }
-        let mut publish = cargo();
-        publish.args(["publish", "-p", krate, "--allow-dirty"]);
-        if dry_run {
-            publish.arg("--dry-run");
-        }
-        cmd::run(&mut publish)?;
+        cmd::run(cargo().args(["publish", "-p", krate, "--allow-dirty"]))?;
     }
     Ok(())
 }
