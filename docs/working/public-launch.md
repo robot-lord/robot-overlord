@@ -129,6 +129,10 @@ Dependabot version updates, grouped weekly.
 
 ## After launch (tracked)
 
+- Codex daemon mode's owed items (`docs/working-archive/codex-daemon.md`):
+  a send typed into a thread mid-turn started from another client,
+  approvals with two clients, `/clear` and `/new` not followed, sub-agent
+  "needs you", `codex queue`, the Codex overlord on the daemon.
 - OpenCode: a draft in the input box doesn't hold a `send_to_session`.
 - Switching an existing overlord to another agent.
 - Narrower tool lists for Codex/OpenCode overlord subagents.

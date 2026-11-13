@@ -44,16 +44,10 @@ What L3 found (codex-cli 0.167.2, daemon 0.169.0, macOS):
   what the phone shows (L6 was never run; no phone was paired).
 - `thread/name/set` exists (could name a thread after its rlord session).
 
-Found on the way, and true of daemon mode too:
-
-- **The daemon holds a thread's writer lock after its last client leaves**
-  (unloaded under a minute later in the one measurement; poll `thread/read`
-  for `notLoaded` rather than wait a fixed time). `codex resume --no-daemon <id>` before then shows
-  "This conversation is open in another app" until it lets go (`thread/read`
-  says `notLoaded`). Anything that moves a session from the daemon back
-  into its pane must wait for that.
-- Moving the other way (an in-pane thread resumed on the daemon) works at
-  once.
+For moving a session between the pane and the daemon (Remote Control
+needs it): back into the pane must wait for the daemon to let go of the
+thread (architecture.md, the writer-lock bullet); onto the daemon works at
+once.
 
 ## Owed (daemon mode)
 
@@ -72,8 +66,9 @@ Found on the way, and true of daemon mode too:
   daemon thread without one.
 - A send can be typed into a daemon-mode thread mid-turn when the turn was
   started from another Codex client (the rlord pane's composer reads idle).
-  Fix: before the paste, ask the daemon (`codex_server::thread_state`,
-  `active`) and treat busy as "not now".
+  Fix: before the paste, ask the daemon (`codex_server::thread_state`)
+  and treat any `Active` as "not now", `waiting` (an approval or question
+  in the other client) included: the turn isn't over.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.

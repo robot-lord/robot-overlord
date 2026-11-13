@@ -302,8 +302,8 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
   `SessionStart` (folder rule) or the index.
 - **The daemon holds a thread's writer lock after its last client
   leaves**, until it unloads the thread (`thread/read` says `notLoaded`;
-  under a minute in the one measurement, and not a fixed time: poll for
-  it). `codex resume --no-daemon <id>` before then shows "This
+  seen from under a minute to several minutes: poll for it, don't wait a
+  fixed time). `codex resume --no-daemon <id>` before then shows "This
   conversation is open in another app".
 - **Another client on the same thread hides a running turn.** A turn
   started from a second client streams into the rlord pane, but its
