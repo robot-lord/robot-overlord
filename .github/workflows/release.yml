@@ -1,13 +1,16 @@
 # Stable releases (X.Y.Z) are built here, so anyone can see how the binaries
-# were made. scripts/release.sh pushes the tag, waits for this run, then
+# were made. `cargo xtask release` pushes the tag, waits for this run, then
 # updates the Homebrew tap and crates.io locally. Dev builds (X.Y.Z-dev.N)
-# are not built here: release.sh builds them on the maintainer's Mac.
+# are not built here: `cargo xtask release` builds them on the maintainer's
+# Mac.
 #
-# The build commands live in scripts/build-release.sh, shared with the local
-# fallback (scripts/release.sh --local). No build cache: release binaries are
-# built from scratch so a poisoned cache can't reach them.
+# The build commands live in `cargo xtask build-release` (xtask/src/build.rs),
+# shared with the local fallback (`cargo xtask release --local`); the
+# version rules, targets and asset names in xtask/src/version.rs. No build
+# cache: release binaries are built from scratch so a poisoned cache can't
+# reach them.
 name: release
-# scripts/release.sh finds a release's run by this title: "release vX.Y.Z",
+# `cargo xtask release` finds a release's run by this title: "release vX.Y.Z",
 # with " (dry run)" on runs that publish nothing.
 run-name: release ${{ inputs.tag || github.ref_name }}${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && ' (dry run)' || '' }}
 on:
@@ -42,39 +45,29 @@ env:
 jobs:
   # Fail fast, before any build: only merged code, a stable version, the
   # tag matching Cargo.toml. A dry run reports these as warnings. A tag
-  # whose release already exists (made by scripts/release.sh --local) is
-  # skipped, so a local fallback never races this workflow.
+  # whose release already exists (made by `cargo xtask release --local`) is
+  # skipped, so a local fallback never races this workflow. The checks are
+  # xtask/src/preflight.rs.
   preflight:
     runs-on: ubuntu-24.04
     outputs:
       skip: ${{ steps.check.outputs.skip }}
       tag: ${{ steps.check.outputs.tag }}
+      assets: ${{ steps.check.outputs.assets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Built in its own step and run directly (not through cargo), so no
+      # crate build script runs with the token.
+      - run: cargo build --locked --package xtask
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
-          tag=v$ver
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          problems=()
-          git merge-base --is-ancestor HEAD origin/main || problems+=("$(git rev-parse HEAD) is not on origin/main")
-          [[ $ver != *-* ]] || problems+=("$tag is not a stable version")
-          [[ "${REF#refs/tags/}" == "$tag" ]] || problems+=("ref $REF doesn't match Cargo.toml version $tag")
-          for p in "${problems[@]}"; do
-            if [[ $DRY_RUN == true ]]; then echo "::warning::$p (dry run: continuing)"; else echo "::error::$p"; fi
-          done
-          [[ $DRY_RUN == true || ${#problems[@]} == 0 ]] || exit 1
-          # Published releases only (drafts aren't visible to this token).
-          if [[ $DRY_RUN == false ]] && gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
-            echo "::notice::$tag is already published (scripts/release.sh --local); nothing to build"
-            echo skip=true >> "$GITHUB_OUTPUT"
-          fi
+        run: target/debug/xtask release-preflight
 
   build-macos:
     needs: preflight
@@ -88,7 +81,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
-      - run: scripts/build-release.sh macos dist
+      - run: cargo xtask build-release macos dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-macos
@@ -120,7 +113,7 @@ jobs:
           echo "$RUNNER_TEMP/$f" >> "$GITHUB_PATH"
       - name: Install packaging tools
         run: cargo install --locked cargo-zigbuild@0.24.1 cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
-      - run: scripts/build-release.sh linux dist
+      - run: cargo xtask build-release linux dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-linux
@@ -155,24 +148,21 @@ jobs:
       contents: write # the GitHub Release
       id-token: write # provenance attestations
       attestations: write
-    # No checkout: the tag comes from preflight, the files from the builds.
+    # No checkout: the tag and the expected files come from preflight, the
+    # files themselves from the builds.
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
+      ASSETS: ${{ needs.preflight.outputs.assets }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - name: Check version and assets
+      - name: Check assets
         run: |
-          tag=$TAG ver=${TAG#v}
-          for f in rlord-$tag-{aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl}.tar.gz; do
-            [[ -f dist/$f ]] || { echo "::error::missing $f"; exit 1; }
-          done
-          # Distro packages, one per arch (they write a pre-release '-' as '~').
-          rv=${ver//-/"~"}
-          for f in rlord_${rv}-1_{amd64,arm64}.deb rlord-$rv-1.{x86_64,aarch64}.rpm; do
+          [[ -n $ASSETS ]] || { echo "::error::preflight listed no assets"; exit 1; }
+          for f in $ASSETS; do
             [[ -f dist/$f ]] || { echo "::error::missing $f"; ls dist; exit 1; }
           done
       - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
@@ -185,7 +175,7 @@ jobs:
         with:
           name: release-${{ env.TAG }}
           path: dist/*
-      # A draft: scripts/release.sh publishes it after checking checksums
+      # A draft: `cargo xtask release` publishes it after checking checksums
       # and provenance. A draft left by an earlier failed run is replaced.
       - if: env.DRY_RUN == 'false'
         env:

@@ -25,7 +25,7 @@ toml_edit.workspace = true
 grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,6 +8,7 @@ rlord is a small Rust workspace:
 | `crates/daemon` | `robot-overlord-daemon` | the daemon, its socket API, the MCP server, the overlord |
 | `crates/tui` | `robot-overlord-tui` | the list, forms, overlay |
 | `crates/rlord` | `robot-overlord` | the `rlord` binary (CLI) |
+| `xtask` | `xtask` (not published) | project automation: `cargo xtask <task>` |
 
 `docs/architecture.md` explains how it fits together; `CLAUDE.md` holds the
 rules agents (and people) follow when changing it.
@@ -53,7 +54,7 @@ README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs
 ## Tests
 
 ```sh
-cargo fmt && cargo clippy --all-targets && cargo test
+cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace
 ```
 
 Never touch the default tmux server in tests or scripts: rlord runs on its
@@ -63,7 +64,7 @@ own socket (`tmux -L rlord`), and tests use scratch sockets
 ## Versions and releases
 
 Every PR bumps `[workspace.package] version` in `Cargo.toml` (and commits
-`Cargo.lock`); `scripts/check-version-bump.sh` enforces it (CI, and
+`Cargo.lock`); `cargo xtask check-version-bump` enforces it (CI, and
 `.githooks/pre-push` once you `git config core.hooksPath .githooks`).
 
 - **Development builds** `X.Y.Z-dev.N`: what ordinary PRs bump to (the next
@@ -76,32 +77,40 @@ After a PR merges, release from the merged `main`:
 
 ```sh
 git fetch origin && git checkout --detach origin/main
-scripts/release.sh
+cargo xtask release
 ```
+
+Release automation is Rust, in the `xtask` crate (`cargo xtask help`
+lists the tasks). `cargo xtask release --dry-run` publishes nothing: it
+warns where a real run would refuse and prints what it would do. A dev
+build or `--local` still builds here; a stable release built in CI stops
+after the checks, so rehearse that with a manual dry run of the workflow
+(below).
 
 - **Dev builds** are built on the maintainer's Apple Silicon Mac and uploaded
   as a pre-release.
 - **Stable releases** are built in GitHub Actions
   (`.github/workflows/release.yml`), so anyone can see how the binaries were
-  made. `release.sh` pushes the `vX.Y.Z` tag, which starts the workflow. A
+  made. `cargo xtask release` pushes the `vX.Y.Z` tag, which starts the workflow. A
   preflight job fails fast unless the tag is on `main`, stable and matches
   `Cargo.toml`. Then a macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
   the static musl builds (`cargo zigbuild`) and packages `.deb`/`.rpm`; both
   architectures are smoke-tested in Docker on Ubuntu, Debian, Fedora and
   Amazon Linux (`scripts/smoke-linux.sh`); the last job writes `SHA256SUMS`,
   attests build provenance and creates the release as a **draft**.
-  `release.sh` waits for the run, checks the assets against `SHA256SUMS`
+  `cargo xtask release` waits for the run, checks the assets against `SHA256SUMS`
   and `gh attestation verify`, publishes the draft, then does what still needs
-  local credentials: the Homebrew tap (`scripts/update-tap.sh`) and crates.io
-  (`scripts/publish-crates.sh`, once the repo is public).
+  local credentials: the Homebrew tap (`cargo xtask update-tap`) and crates.io
+  (`cargo xtask publish-crates`, once the repo is public).
 
-The build commands live in `scripts/build-release.sh`, which CI and local
-builds share. A manual run of the workflow with `dry_run` (the default for
+The build commands live in `cargo xtask build-release`, which CI and local
+builds share; the version rules, targets and asset names in
+`xtask/src/version.rs`. A manual run of the workflow with `dry_run` (the default for
 manual runs) builds and tests everything and uploads only workflow
 artifacts.
 
-If `release.sh` stops after pushing the tag (a failed run you then re-ran,
-a lost connection), `scripts/release.sh --resume` picks up from the tag's
+If the release stops after pushing the tag (a failed run you then re-ran,
+a lost connection), `cargo xtask release --resume` picks up from the tag's
 workflow run: watch, verify, publish the draft if it is still one, tap,
 crates.io. To re-run a failed release, dispatch it on the tag itself, so
 its run is titled `release vX.Y.Z` and `--resume` finds it (it ignores
@@ -118,10 +127,10 @@ is checked against `SHA256SUMS` and its provenance attestation
 If Actions is down, build a stable release locally instead: delete the tag
 on origin and locally (`git push origin :refs/tags/vX.Y.Z; git tag -d
 vX.Y.Z`) and any draft release CI left (`gh release delete vX.Y.Z --yes`),
-then `scripts/release.sh --local`. Creating that release pushes
+then `cargo xtask release --local`. Creating that release pushes
 the tag again, which starts the workflow; its preflight sees the release
 is already published and skips the build, so the two never race. If no
-run shows up for a pushed tag, `release.sh` also cancels any run queued
+run shows up for a pushed tag, `cargo xtask release` also cancels any run queued
 for it before suggesting `--local`. One-time setup for that:
 
 ```sh

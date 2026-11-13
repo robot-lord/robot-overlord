@@ -1,9 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
+members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord", "xtask"]
+# Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask out;
+# `--workspace` includes it (CI uses it).
+default-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]
-version = "0.23.0-dev.7"
+version = "0.23.0-dev.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/robot-lord/robot-overlord"
@@ -26,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 toml = "1.2"
 toml_edit = "0.25"
 thiserror = "2"
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

@@ -142,18 +142,19 @@ hasn't seen.
 
 ## Releases: cut one after every merge to main
 
-Every PR merged to `main` ships as a release, cut by `scripts/release.sh`.
-Dev builds are built on the maintainer's Apple Silicon Mac. Stable releases
-are built in GitHub Actions (`.github/workflows/release.yml`, started by the
-tag push); the build commands live in `scripts/build-release.sh`, shared
-with the local fallback. CONTRIBUTING.md has the full setup.
+Every PR merged to `main` ships as a release, cut by `cargo xtask release`
+(`xtask/src/release.rs`). Dev builds are built on the maintainer's Apple
+Silicon Mac. Stable releases are built in GitHub Actions
+(`.github/workflows/release.yml`, started by the tag push); the build
+commands live in `cargo xtask build-release`, shared with the local
+fallback. CONTRIBUTING.md has the full setup.
 
 - **In each PR:** bump `[workspace.package] version` in `Cargo.toml` and
   commit the regenerated `Cargo.lock`. Ordinary PRs bump to a **development
   build**: the next version with `-dev.N` (`0.18.0` → `0.19.0-dev.1` for a
   feature or `0.18.1-dev.1` for a fix, then `-dev.2`, … for later PRs
   toward it). A **stable release** (`X.Y.Z`, no suffix) only when the user
-  asks for one. `scripts/check-version-bump.sh` enforces a semver bump: CI
+  asks for one. `cargo xtask check-version-bump` enforces a semver bump: CI
   runs it on every PR, and `.githooks/pre-push` before pushing a branch
   (enable once per clone with `git config core.hooksPath .githooks`).
 - **After the PR merges, cutting the release is Claude's job.** Don't
@@ -165,22 +166,49 @@ with the local fallback. CONTRIBUTING.md has the full setup.
 
   ```bash
   git fetch origin && git checkout --detach origin/main
-  scripts/release.sh
+  cargo xtask release
   ```
 
   Then report the release URL to the user.
 
   The version decides the kind: a dev build is macOS only and a GitHub
   pre-release (installed by `[update] channel = "dev"`), built locally. For
-  a stable release `release.sh` pushes the tag, waits for the workflow
+  a stable release it pushes the tag, waits for the workflow
   (macOS + Linux tarballs, `.deb`/`.rpm`, Docker smoke tests, `SHA256SUMS`,
   provenance attestations, a draft GitHub Release), verifies the assets
   and attestations, publishes the draft, then updates the Homebrew tap and publishes to crates.io locally (those
   tokens aren't in CI). If it stops after the tag is pushed:
-  `scripts/release.sh --resume`. If Actions is down: delete the tag
-  (remote and local), then `scripts/release.sh --local`. `release.sh`
-  runs on macOS only and refuses a dirty tree, HEAD
-  not on `origin/main`, or an existing tag (the PR forgot the bump).
+  `cargo xtask release --resume`. If Actions is down: delete the tag
+  (remote and local), then `cargo xtask release --local`. It runs on
+  macOS only and refuses a dirty tree, HEAD not on `origin/main`, or an
+  existing tag (the PR forgot the bump). `cargo xtask release --dry-run`
+  publishes nothing: it warns instead of refusing and prints what it
+  would do. A dev build or `--local` still builds; a stable release
+  built in CI stops after the checks (rehearse that with a release.yml
+  dry run).
+
+## Automation lives in `cargo xtask`
+
+Project automation is Rust, in the `xtask` crate (`cargo xtask <task>`;
+`cargo xtask help` lists the tasks). It gets the same compiler, tests,
+clippy and fmt as the rest of the code and behaves the same on macOS and
+Linux.
+
+- Shell is for simple glue only: a short script that runs a few commands
+  in order with little logic. Once it parses JSON or output, retries,
+  keeps state or branches on many cases, move that logic into an xtask
+  task and keep at most a thin wrapper that calls it.
+- The exception is what end users run on a bare machine, where nothing
+  else can be assumed installed: `scripts/get.sh` (POSIX `sh`),
+  `scripts/install.sh` and `crates/rlord/update.sh` (bash) stay shell,
+  small and portable.
+- The version rules, release targets and asset names are in
+  `xtask/src/version.rs`. A workflow or script that needs one asks xtask
+  for it (release.yml takes the asset list from `release-preflight`).
+  Repeated by necessity, so change them together: the rustup `targets:`
+  in release.yml, and the target and tarball names the installers
+  (`get.sh`, `update.sh`) use, since they run without xtask.
+- Pure logic in xtask (parsing, naming, choosing) gets unit tests.
 
 ## Documentation
 
@@ -212,7 +240,8 @@ get handled without the user looking. For each one:
 
 - robot-overlord: push a version-bump commit with the regenerated
   `Cargo.lock` (stay below any version another open branch has claimed);
-- build, `cargo clippy --all-targets -- -D warnings` and test; fix
+- build, `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo test --workspace`; fix
   breakage from major bumps in the same PR, or drop an update whose fix
   would be large or risky and say why;
 - check the repo's Actions allow-list still permits every action used;

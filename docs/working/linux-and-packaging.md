@@ -12,7 +12,7 @@ CI for releases).
 - Targets: `aarch64-apple-darwin` only for macOS (no Intel). Linux:
   `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static: one
   binary for Ubuntu, Debian, Fedora, RHEL, Amazon Linux, Arch, Alpine).
-- Built in GitHub Actions (`release.yml`, `scripts/build-release.sh`):
+- Built in GitHub Actions (`release.yml`, `cargo xtask build-release`):
   Linux via `cargo zigbuild`, smoke-tested in Docker per arch before upload.
 - Install paths, first release: `curl -fsSL …/get.sh | sh` (detects
   platform, verifies the checksum, offers to install tmux with the system's
@@ -20,14 +20,14 @@ CI for releases).
   `depends_on "tmux"`), `.deb` / `.rpm` (depend on tmux), `SHA256SUMS`.
   crates.io prepared, published once the owner has a token. AUR: later.
 - Release channels:
-  - **stable** `X.Y.Z`: every platform, built in Actions on the tag `release.sh` pushes.
+  - **stable** `X.Y.Z`: every platform, built in Actions on the tag `cargo xtask release` pushes.
   - **dev** `X.Y.Z-dev.N`: macOS only, a GitHub pre-release; what ordinary
     PRs ship. `[update] channel = "dev"` makes `rlord update` take the
     newest release of either kind.
 
 ## Progress
 
-- [x] version channels: config, update, release.sh, version-bump check
+- [x] version channels: config, update, `cargo xtask release`, version-bump check
 - [x] Linux code: clipboard (wl-copy/xclip/xsel/OSC 52), appearance
       (gsettings, RLORD_APPEARANCE), systemd user unit, Alt-/Ctrl- key
       labels off macOS, XDG log path, portable process scan, C.UTF-8;
@@ -35,7 +35,7 @@ CI for releases).
 - [x] cross builds + .deb/.rpm + SHA256SUMS + smoke tests (Ubuntu 22.04/24.04,
       Debian 12, Fedora 41, Amazon Linux 2023 pass; amd64 via emulation)
 - [x] get.sh installer (offers tmux install; apt does `update` first)
-- [ ] Homebrew tap repo: `scripts/update-tap.sh` written; the repo itself
+- [ ] Homebrew tap repo: `cargo xtask update-tap` written; the repo itself
       must be created by the owner (`gh repo create` was blocked here)
 - [x] OSS files: licenses, README install, CONTRIBUTING; crates.io metadata
       (packages renamed robot-overlord*; dry-run of core passes)
@@ -49,7 +49,7 @@ CI for releases).
   default smoke set. AUR package: later.
 - The tap formula and curl installer only work once the repo is public
   (release assets of a private repo need auth).
-- crates.io: owner runs `cargo login`; `publish-crates.sh` pins internal
+- crates.io: owner runs `cargo login`; `cargo xtask publish-crates` pins internal
   dep versions at publish time.
 
 - tmux minimum version: audit features used (display-popup ≥3.2,

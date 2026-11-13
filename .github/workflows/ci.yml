@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   # Every PR ships a release (CLAUDE.md), so it must bump the version.
-  # Linux on purpose: this needs only git, and macOS minutes cost 10x.
+  # Linux on purpose: this needs only git and cargo, and macOS minutes cost 10x.
   version-bump:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -19,9 +19,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - run: scripts/check-version-bump.sh "origin/${{ github.base_ref }}" HEAD
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Not `cargo xtask` (--locked): a stale Cargo.lock must reach the
+      # check, which says to commit it.
+      - run: cargo run --package xtask -- check-version-bump "origin/${{ github.base_ref }}" HEAD
   # Linux on purpose: nothing here needs macOS, and macOS minutes cost 10x.
-  # Release binaries are built by release.yml (stable) or scripts/release.sh (dev).
+  # Release binaries are built by release.yml (stable) or `cargo xtask release` (dev).
   check:
     runs-on: ubuntu-latest
     steps:
