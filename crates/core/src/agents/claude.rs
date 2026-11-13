@@ -697,6 +697,12 @@ mod tests {
             map_hook_event("PermissionRequest", &json!({})).1,
             Effect::Set(Status::WaitingInput)
         );
+        // A turn that ended on an API error (a usage limit) is a turn end.
+        assert_eq!(
+            map_hook_event("StopFailure", &json!({})),
+            ("agent_stopped", Effect::Set(Status::Idle))
+        );
+        assert!(HOOK_EVENTS.iter().any(|(e, _)| *e == "StopFailure"));
         // The agent moved on.
         for e in ["PostToolUse", "PostToolUseFailure"] {
             assert_eq!(map_hook_event(e, &json!({})), ("tool", Effect::Resume));
