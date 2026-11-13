@@ -59,7 +59,9 @@ and switch between them: see "An overlord per agent" below.
   back to that conversation, and the current one joins the list); `esc`
   returns to the live pane.
 
-Inside the overlay, Option-O (or Option-D) closes it. The overlord sits at
+Inside the overlay, Option-O (or Option-D) closes it, as does a click on
+the ✕ at the right end of its top row. (tmux ignores clicks outside a
+popup, so the status bar's hints can't be clicked while it is up.) The overlord sits at
 the top of the list (◆ overlord); `enter` opens it full screen with its own
 lavender bar. When it moves you somewhere (a session, the list, a form) it
 closes itself first. `rlord` always runs its TUI inside tmux (it starts a

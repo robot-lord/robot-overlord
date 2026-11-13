@@ -12,6 +12,11 @@
 //! the switch key (`[tmux] overlord_switch`, Option-S), makes that agent's
 //! overlord the active one and shows its pane instead, without closing
 //! the overlay (`View`, `SwitchBar`).
+//!
+//! The top row ends in a close button (`CLOSE`): a click on it closes the
+//! overlay as the key does. tmux swallows clicks outside a popup, so the
+//! status bar's hints can't be clicked while it is up; this is the mouse
+//! way out.
 
 use std::time::{Duration, Instant};
 
@@ -265,6 +270,21 @@ impl SwitchBar {
 const ONLY_ONE: &str = "only one overlord: open :overlord <agent> to add another";
 const HINT_FOR: Duration = Duration::from_secs(4);
 
+/// The close button at the right end of the top row.
+const CLOSE: &str = " ✕ ";
+const CLOSE_W: u16 = 3;
+
+/// Whether the overlay has its top row (switcher and close button): only
+/// with room for it.
+fn has_top(height: u16) -> bool {
+    height > 3
+}
+
+/// Whether a click at `column` on the top row hits the close button.
+fn hits_close(width: u16, column: u16) -> bool {
+    column >= width.saturating_sub(CLOSE_W)
+}
+
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     view: &View,
@@ -379,7 +399,7 @@ fn run_loop(
                 let _ = tmux::cancel_mode(pane);
                 history_at_entry = None;
             }
-            let top = u16::from(switcher.is_some() && size.1 > 3);
+            let top = u16::from(has_top(size.1));
             if let Err(e) = tmux::resize_window(target, size.0, size.1 - top) {
                 error = Some(format!("{e:#}"));
             }
@@ -426,16 +446,31 @@ fn run_loop(
         }
         terminal.draw(|f| {
             let full = f.area();
-            // Under the switcher, when there is one (and room for it).
-            let top = u16::from(switcher.is_some() && full.height > 3);
-            if let Some((line, _)) = switcher.as_ref().filter(|_| top == 1) {
+            // Under the top row (switcher, close button), when there is
+            // room for it.
+            let top = u16::from(has_top(full.height));
+            if top == 1 {
+                let line = switcher
+                    .as_ref()
+                    .map(|(l, _)| l.clone())
+                    .unwrap_or_default();
                 f.render_widget(
-                    Paragraph::new(line.clone()).style(
+                    Paragraph::new(line).style(
                         ratatui::style::Style::default()
                             .fg(crate::theme::text())
                             .bg(crate::theme::chip()),
                     ),
                     ratatui::layout::Rect::new(full.x, full.y, full.width, 1),
+                );
+                let w = CLOSE_W.min(full.width);
+                f.render_widget(
+                    Paragraph::new(CLOSE).style(
+                        ratatui::style::Style::default()
+                            .bold()
+                            .fg(crate::theme::on_accent())
+                            .bg(crate::theme::overlord()),
+                    ),
+                    ratatui::layout::Rect::new(full.x + full.width - w, full.y, w, 1),
                 );
             }
             let a = ratatui::layout::Rect::new(full.x, full.y + top, full.width, full.height - top);
@@ -630,6 +665,15 @@ fn run_loop(
                         tmux::scroll(pane, true)
                     }
                     MouseEventKind::ScrollDown if in_mode => tmux::scroll(pane, false),
+                    // A click on the close button: as the close key.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if m.row == 0
+                            && terminal.size().is_ok_and(|s| {
+                                has_top(s.height) && hits_close(s.width, m.column)
+                            }) =>
+                    {
+                        return Ok(Exit::Close);
+                    }
                     // A click on an agent in the switcher: its overlord.
                     MouseEventKind::Down(MouseButton::Left) if m.row == 0 => {
                         let picked = switcher.as_ref().zip(view.bar.as_ref()).and_then(
@@ -1339,6 +1383,15 @@ mod tests {
         assert_eq!(name(ev(KeyCode::BackTab, KeyModifiers::SHIFT)), "BTab");
         assert_eq!(name(ev(KeyCode::PageUp, KeyModifiers::NONE)), "PPage");
         assert_eq!(name(ev(KeyCode::Up, KeyModifiers::CONTROL)), "C-Up");
+    }
+
+    #[test]
+    fn the_close_button_is_the_top_rows_last_cells() {
+        assert!(super::hits_close(80, 79));
+        assert!(super::hits_close(80, 77));
+        assert!(!super::hits_close(80, 76));
+        assert!(!super::has_top(3));
+        assert!(super::has_top(4));
     }
 
     #[test]
