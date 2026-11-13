@@ -51,8 +51,10 @@ pub fn publish(dry_run: bool) -> Result<()> {
     let mut restore = Restore(Vec::new());
     for path in MANIFESTS {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-        std::fs::write(path, pin_internal_deps(&text, &ver))?;
+        let pinned = pin_internal_deps(&text, &ver);
+        // Recorded before the write, so a failed write is put back too.
         restore.0.push((path, text));
+        std::fs::write(path, pinned).with_context(|| format!("writing {path}"))?;
     }
 
     // Dependencies first; each must be on the index before the next.
