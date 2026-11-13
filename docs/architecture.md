@@ -272,14 +272,14 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   a pane's TUI started has that pane's `TMUX` / `TMUX_PANE` (seen in its
   own environment), expected to reach its commands and MCP servers. Its
   hooks still go by thread: a daemon-mode pane has no `RLORD_SESSION_ID`,
-  so the hook client takes the gate path.) So a daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so
-  a daemon its TUI starts can't pass one on), and rlord starts the daemon
-  itself (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
-  `TMUX_PANE` removed) before such a pane when none runs (asked at most
-  once a minute, never failing the launch: if none runs and the ask was
-  skipped or failed, the pane's TUI starts one with the pane's
-  environment, or runs the turn in the pane). `rlord hook emit codex`
-  without `RLORD_SESSION_ID` reads the gate file
+  so the hook client takes the gate path.) So a daemon-mode pane gets no
+  `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
+  on), and rlord starts the daemon itself (`codex app-server daemon
+  start`, `RLORD_SESSION_ID`, `TMUX` and `TMUX_PANE` removed) before such
+  a pane when none runs (asked at most once a minute, never failing the
+  launch: if none runs and the ask was skipped or failed, the pane's TUI
+  starts one with the pane's environment, or runs the turn in the pane).
+  `rlord hook emit codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
   daemon-mode session's bound thread, and the folder of each still waiting
   for one) and sends only what it admits, marked `by: "thread"`; anything
