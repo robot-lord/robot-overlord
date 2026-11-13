@@ -17,7 +17,12 @@ merged). It has a machine switch that needs the user's explicit yes, phone
 pairing with the code shown only in the user's terminal (`remote_pair`),
 sessions moved onto the daemon and back, a stand-in control socket for
 tests (`codex_server::fake`), and docs. Re-check everything below against
-the Codex of the day first.
+the Codex of the day first. Rules to keep (Brandon's): the machine switch
+goes on only on the user's explicit yes (`confirm_machine`), never
+confirmed by the overlord for them; the pairing code never goes into MCP
+results, logs or events, only to the user's own terminal; turning it off
+for a session moves it back into its pane and says the phone may still
+reach it, offering the machine switch.
 
 Live checks named here (from the removed doc): L3 the Remote Control CLI
 and socket calls; L6 what a paired phone sees (never run).
@@ -70,8 +75,9 @@ its "After launch (tracked)" list:
   rlord pane's composer reads idle meanwhile. Fix: in `send::type_message`
   (which every caller goes through), for daemon-mode sessions only, ask
   the daemon (`codex_server::thread_state`) and treat any `Active` as "not
-  now", `waiting` included. It's a socket call of up to 3s under the
-  session's lock.
+  now", `waiting` included. `thread_state` waits up to 3s to connect and
+  3s to answer (about 6s worst case) under the session's lock: use a
+  shorter limit there.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.
@@ -85,6 +91,8 @@ its "After launch (tracked)" list:
 - The Codex overlord on the daemon: any `-c`, `--enable`, `--disable` or
   `--search` makes Codex run embedded, and the overlord's wiring is all
   `-c`; it would need its MCP server and settings some other way.
+- Linux: the daemon's backend, socket and sandbox (unchecked; Linux fixes
+  come after 1.0, Road to 1.0 item 1).
 - A daemon started by hand from an in-pane rlord session's pane would pass
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.

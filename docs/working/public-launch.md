@@ -61,8 +61,8 @@ done, in this order (decided with the user, 2026-11-12):
          fields, a first SessionStart bound by folder);
        - a daemon restart or update mid-turn, by hand (what the session
          shows; `notLoaded` should read as not running, so it stops once
-         the pane is gone);
-       - Linux: the daemon's backend, socket and sandbox.
+         the pane is gone).
+       (Linux is after launch, as in item 1: the residue's list.)
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
