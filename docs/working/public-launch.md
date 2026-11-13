@@ -14,25 +14,33 @@ done, in this order (decided with the user, 2026-11-12):
        (0.23.0-dev.5; `daemon/src/own.rs`).
 3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
        (0.23.0-dev.6; `.github/workflows/release.yml`, shared
-       `scripts/build-release.sh`). Tap and crates.io stay local; moving
+       `cargo xtask build-release`). Tap and crates.io stay local; moving
        their tokens into repo secrets is owed. Also owed (PR #25 review):
        toolchain parity for `--local` (a `rust-toolchain.toml`, pinned
        zig/cargo-zigbuild/cargo-deb/cargo-generate-rpm versions in
-       CONTRIBUTING to match release.yml); one helper for the version and
-       target list (now repeated in build-release.sh, release.sh,
-       update-tap.sh and release.yml); prebuilt packaging tools in CI
+       CONTRIBUTING to match release.yml); prebuilt packaging tools in CI
        instead of `cargo install` on every run.
-4. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
+4. [x] Release automation in `cargo xtask` (0.23.0-dev.8; the `xtask`
+       crate): release, build, tap, crates.io and the version-bump check
+       are Rust with unit tests; the version rules, targets and asset
+       names are in `xtask/src/version.rs` only. Shell is left for simple
+       glue and for what users run on a bare machine (`get.sh`,
+       `install.sh`, `update.sh`). Owed: `scripts/smoke-linux.sh` and
+       `scripts/dev-daemon.sh` still hold some logic in bash; the
+       stable paths of `cargo xtask release` (CI, `--resume`, `--local`,
+       tap, crates.io) have unit tests and a dry run but get their first
+       real run at 1.0.0.
+5. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
        a scheduled resume, a "limited" list filter, Option-S on the keys
        screen.
-5. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
+6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
        narrower helper tools.
-6. [ ] Codex daemon mode, with Codex Remote Control (whether it is in
+7. [ ] Codex daemon mode, with Codex Remote Control (whether it is in
        1.0 is the user's call, still open).
-7. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
+8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
-8. [ ] A fresh-install end-to-end test.
-9. [ ] 1.0.0 stable.
+9. [ ] A fresh-install end-to-end test.
+10. [ ] 1.0.0 stable.
 
 After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as
 repo secrets (to do later, not part of the CI release builds step).
@@ -95,7 +103,7 @@ Dependabot version updates, grouped weekly.
 - [ ] `scripts/go-public.sh`: secret scanning + push protection, private
       vulnerability reporting, approval for workflows on outside PRs (all
       unavailable on private repositories).
-- [ ] Publish to crates.io (`scripts/release.sh` does it once public).
+- [ ] Publish to crates.io (`cargo xtask release` does it once public).
 - [ ] README links that 404 while private: `/releases`, raw `get.sh`.
 - [ ] Move the tracked items below into GitHub issues.
 

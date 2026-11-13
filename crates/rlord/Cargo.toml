@@ -27,7 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
 
-# Distro packages (scripts/build-release.sh, run by the release workflow): the static musl binary, needing tmux.
+# Distro packages (`cargo xtask build-release`, run by the release workflow): the static musl binary, needing tmux.
 [package.metadata.deb]
 name = "rlord"
 maintainer = "ayersb <ayersb@users.noreply.github.com>"

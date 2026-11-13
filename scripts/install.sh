@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install (or upgrade) the rlord binary sitting next to this script into
-# ~/.local/bin. Shipped inside each release tarball; see scripts/release.sh.
+# ~/.local/bin. Shipped inside each release tarball; see xtask/src/build.rs.
 #
 # No daemon management needed: the next rlord command notices the running
 # daemon is from an older build and restarts it on the new binary.

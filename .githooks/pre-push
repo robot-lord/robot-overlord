@@ -9,7 +9,7 @@ zero=0000000000000000000000000000000000000000
 # Compares against the local origin/main ref (no fetch, so pushes stay fast;
 # a stale ref only makes the check more lenient — CI has the final say).
 git rev-parse -q --verify origin/main >/dev/null || exit 0
-[[ -x scripts/check-version-bump.sh ]] || exit 0  # branch predates the check
+[[ -f xtask/src/bump.rs ]] || exit 0  # branch predates the check
 
 status=0
 while read -r local_ref local_sha remote_ref _remote_sha; do
@@ -19,6 +19,6 @@ while read -r local_ref local_sha remote_ref _remote_sha; do
   # Nothing beyond main yet (e.g. a fresh branch): nothing to check.
   [[ -z "$(git rev-list -n1 "origin/main..$local_sha")" ]] && continue
   echo "pre-push: checking version bump for ${local_ref#refs/heads/}" >&2
-  scripts/check-version-bump.sh origin/main "$local_sha" >&2 || status=1
+  cargo xtask check-version-bump origin/main "$local_sha" >&2 || status=1
 done
 exit $status
