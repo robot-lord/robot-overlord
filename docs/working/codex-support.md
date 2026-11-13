@@ -98,11 +98,11 @@ Phases 1 and 2 are built (branch `codex-support`).
 Since then, on the same branch:
 
 - Codex launches with `--no-daemon` (hooks must run in the pane) and
-  `--no-alt-screen` (tmux scrollback). Since then `[session]
-  codex_daemon` can put sessions on Codex's shared server instead
-  (architecture.md; residue in `docs/working-archive/codex-daemon.md`).
-  Verified against real Codex by the
-  lead: hooks bind, status, search, `exec fork` summary.
+  `--no-alt-screen` (tmux scrollback). Verified in-pane against real Codex
+  by the lead: hooks bind, status, search, `exec fork` summary. (Since
+  then `[session] codex_daemon` can put sessions on Codex's shared server
+  instead: `docs/architecture.md` ("Codex on its shared background
+  server"); residue in `docs/working-archive/codex-daemon.md`.)
 - **Install hints** (`core/src/agents/install.rs`): one table of each
   vendor's install commands (Claude Code, Codex, OpenCode), the one for
   this machine suggested by `rlord agents`, `list_agents` (MCP), the form

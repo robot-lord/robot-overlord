@@ -295,6 +295,21 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
   else `turn/interrupt`; then up to 4s for the turn to end. The answer and
   the log say `turn: interrupted | still_running`.
 - **Restart re-attaches** (`codex resume <id>` without `--no-daemon`).
+- **Launch, then bind; never create the thread first.** A thread made by
+  `thread/start` has no rollout until its first turn, so `codex resume
+  <id>` on it fails ("no rollout found for thread id"; 0.167.2 / daemon
+  0.169.0). The pane's TUI creates the thread, bound by the first
+  `SessionStart` (folder rule) or the index.
+- **The daemon holds a thread's writer lock for about a minute** after its
+  last client leaves (it stays loaded until `thread/read` says
+  `notLoaded`). `codex resume --no-daemon <id>` before then shows "This
+  conversation is open in another app". Moving a thread from the pane onto
+  the daemon works at once.
+- **Another client on the same thread hides a running turn.** A turn
+  started from a second client streams into the rlord pane, but its
+  composer reads as idle (`› Ask Codex…`, no "esc to interrupt"), so
+  `Agent::at_prompt` can't tell the thread is busy and a send could be
+  typed in mid-turn. Escape in either client interrupts.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
@@ -955,7 +970,9 @@ including when the active one hits a usage limit.
   lowest `❯` line, where a `❯` under a `─` rule is the input box and
   higher ones are history; no OpenCode permission or question lines inside
   its bottom box). A status can't be trusted for this: a Codex session
-  without hooks reads as working while an approval is up. Sends also hold
+  without hooks reads as working while an approval is up. (A daemon-mode
+  Codex thread with a turn started from another client reads as at its
+  prompt: see "Codex on its shared background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
   placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
   isn't read yet), within 10s (`SETTLE`) of the last paste into that

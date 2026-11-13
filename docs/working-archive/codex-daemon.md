@@ -72,8 +72,6 @@ Found on the way, and true of daemon mode too:
 - The Codex overlord on the daemon: any `-c`, `--enable`, `--disable` or
   `--search` makes Codex run embedded, and the overlord's wiring is all
   `-c`; it would need its MCP server and settings some other way.
-- A daemon-mode pane can show Codex's update prompt at start
-  (`check_for_update_on_startup=false` is a `-c`).
 - Residual: a daemon started by hand from an in-pane rlord session's pane
   would pass that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every
   thread's hooks, which then pass the pane check for that session.
