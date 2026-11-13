@@ -664,11 +664,12 @@ Things that are not visible at the call site:
   injection would take a setup very different from the one rlord is built
   for. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for anyone
   who wants that (`write_files`): Claude lists rlord's tools one by one in
-  `--allowedTools` without it (`claude_allowed_tools`); Codex adds
-  `mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"`
+  `--allowedTools` without them (`claude_allowed_tools`); Codex adds
+  `mcp_servers.rlord.tools.<tool>.approval_mode="prompt"` for each
   (checked live on 0.167.2: Codex asks "Allow the rlord MCP server to run
   tool send_to_session?"); OpenCode adds an ask rule for
-  `rlord_send_to_session` after `rlord_*`.
+  `rlord_send_to_session` and `rlord_resume_after_limit` after `rlord_*`.
+  Both tools are `agents::SEND_TOOLS`.
 - **Codex's folder trust is passed as a whole table**
   (`-c 'projects={"<dir>"={trust_level="trusted"}}'`): a dotted override
   path can't hold a quoted key, and without trust Codex stops at a "trust

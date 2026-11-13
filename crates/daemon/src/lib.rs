@@ -205,7 +205,7 @@ impl Daemon {
             tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
                 "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");
         }
-        match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings) {
+        match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings, cfg.tmux.mouse) {
             Ok(conflicts) => {
                 for c in conflicts {
                     tracing::warn!(key = %c.key, bound_to = %c.bound_to,

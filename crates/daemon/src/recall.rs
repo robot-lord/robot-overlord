@@ -509,15 +509,33 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
             json!({"continued": conv, "switched_to": agent, "session": switched}),
         ));
     }
+    // Its agent must still be installed: else it couldn't start, and the
+    // user would be left on an overlord that can't run.
+    if let Some(why) =
+        rlord_core::agents::install::missing(rlord_core::agents::Agent::named(&p.o.agent)?)
+    {
+        bail!("{why}");
+    }
     // Made active without starting it: `continue_conversation` then starts
     // (or restarts) it once, onto that conversation.
-    {
+    let activate = |id: &str, from: String| -> Result<()> {
         let _send = d.overlord_send.lock().expect("overlord send lock");
-        let _session = d.sessions.lock(&p.o.id);
-        overlord::activate(&d.db(), &p.o.id, Some(active.agent.clone()), false)?;
-    }
+        let _session = d.sessions.lock(id);
+        overlord::activate(&d.db(), id, Some(from), false)
+    };
+    activate(&p.o.id, active.agent.clone())?;
     d.bind_nav_keys();
-    let mut v = continue_conversation(d, &json!({"id": conv}))?;
+    d.changed();
+    let mut v = match continue_conversation(d, &json!({"id": conv})) {
+        Ok(v) => v,
+        Err(e) => {
+            // Back to the overlord the user was on.
+            activate(&active.id, p.o.agent.clone())?;
+            d.bind_nav_keys();
+            d.changed();
+            return Err(e);
+        }
+    };
     v["switched_to"] = json!(agent);
     Ok(Some(v))
 }

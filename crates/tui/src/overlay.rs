@@ -124,6 +124,7 @@ struct View {
 
 /// The switcher row: every installed agent, the active overlord's first
 /// among equals.
+#[derive(Clone)]
 struct SwitchBar {
     /// (agent, its marker, active, has an overlord).
     agents: Vec<(String, String, bool, bool)>,
@@ -253,6 +254,9 @@ impl SwitchBar {
     }
 }
 
+/// Shown when the switch key is pressed with only one overlord.
+const ONLY_ONE: &str = "only one overlord: open :overlord <agent> to add another";
+
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     view: &View,
@@ -262,7 +266,7 @@ fn run_loop(
 ) -> Result<Exit> {
     let target = view.tmux.as_str();
     // The switcher takes the top row; the overlord's pane gets the rest.
-    let switcher = view.bar.as_ref().map(|b| b.line());
+    let mut switcher = view.bar.as_ref().map(|b| b.line());
     // tmux's copy mode on the overlord's pane: the overlay isn't a pane, so it
     // puts the real pane in copy mode, draws that mode's screen, and keys go
     // to the mode (the user's copy bindings: select, yank, search, q).
@@ -563,12 +567,18 @@ fn run_loop(
                     return Ok(Exit::Close);
                 }
                 // The switch key: the next agent's overlord, here.
-                // (With one agent there is nothing to switch to: the key
-                // goes to the agent like any other.)
+                // (With one overlord there is nothing to switch to: say
+                // how to add one rather than swallow the key silently.)
                 if let Some(bar) = view.bar.as_ref().filter(|_| keys.switches(&k)) {
                     match bar.next() {
                         Some(agent) => return Ok(Exit::Switch(agent)),
-                        None => continue,
+                        None => {
+                            let mut b = bar.clone();
+                            b.notice = Some(ONLY_ONE.into());
+                            switcher = Some(b.line());
+                            last = Instant::now() - Duration::from_secs(1);
+                            continue;
+                        }
                     }
                 }
                 let r = match (tmux_key(&k), repeat.take().filter(|_| in_mode)) {

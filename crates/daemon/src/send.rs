@@ -217,7 +217,12 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         overlay: overlay.as_deref(),
         draft: true,
     };
-    type_into(&s.id, &pane, text, &checks)
+    let r = type_into(&s.id, &pane, text, &checks)?;
+    if matches!(r, Typed::Done) {
+        // (So the prompt it makes isn't taken for the user's.)
+        d.limits.note_typed(&s.id, now_ms());
+    }
+    Ok(r)
 }
 
 /// `session.send {ref, text, when_idle}`.
@@ -362,7 +367,7 @@ fn next(s: Option<&Session>, limited: Option<i64>, now: i64) -> Next {
         return Next::Wait;
     }
     // On a usage limit: it comes back when the limit resets.
-    if limited.is_some_and(|t| t > now) {
+    if limited.is_some_and(|t| crate::limits::held(t, now)) {
         return Next::Wait;
     }
     let settled = s
@@ -583,6 +588,11 @@ mod tests {
         // A queued message waits for the reset, then goes as usual.
         assert_eq!(next(Some(&s), Some(now + 60_000), now), Next::Wait);
         assert_eq!(next(Some(&s), None, now), Next::Deliver);
+        // Just past the reset: still held for the margin, like resume jobs.
+        let margin = crate::limits::MARGIN_MS;
+        assert_eq!(next(Some(&s), Some(now - 1), now), Next::Wait);
+        assert_eq!(next(Some(&s), Some(now - margin + 1), now), Next::Wait);
+        assert_eq!(next(Some(&s), Some(now - margin), now), Next::Deliver);
         // Stopped on a limit and archived: dropped, not held.
         s.archived_at = Some(1);
         assert!(matches!(

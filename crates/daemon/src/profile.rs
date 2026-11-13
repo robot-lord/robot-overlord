@@ -29,16 +29,42 @@ fn choice(db: &Db, s: &Session) -> Result<Option<bool>> {
 
 /// `RLORD_TMUX_PROFILE` as the `rlord` that opened the list had it
 /// (`tmux.profile_mode`): `default` or `imported`, for that run. None:
-/// not set.
+/// not set. A testing override: it wins over each session's own choice.
+#[cfg(not(test))]
 static OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+// Per test thread under test: a test that sets it can't leak it into
+// another running alongside.
+#[cfg(test)]
+thread_local! {
+    static OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn override_mode() -> Option<String> {
-    OVERRIDE.lock().expect("profile override").clone()
+    #[cfg(not(test))]
+    return OVERRIDE.lock().expect("profile override").clone();
+    #[cfg(test)]
+    return OVERRIDE.with(|o| o.borrow().clone());
+}
+
+/// Set the override; whether it changed.
+fn set_override(env: Option<String>) -> bool {
+    #[cfg(not(test))]
+    let mut o = OVERRIDE.lock().expect("profile override");
+    #[cfg(test)]
+    return OVERRIDE.with(|o| o.replace(env.clone()) != env);
+    #[cfg(not(test))]
+    {
+        let changed = *o != env;
+        *o = env;
+        changed
+    }
 }
 
 /// Which tmux setup agent sessions get, and why: (`imported` uses the
-/// user's profile where a session's own choice allows; `default` is
-/// rlord's own everywhere, as a new user sees it).
+/// user's profile; `default` is rlord's own everywhere, as a new user sees
+/// it). Without `RLORD_TMUX_PROFILE`, each session's own choice still
+/// decides for it (`wanted`); with it, the override wins over those.
 pub fn mode(cfg: &Config) -> (&'static str, &'static str) {
     match override_mode().as_deref() {
         Some("default") => ("default", "RLORD_TMUX_PROFILE"),
@@ -74,13 +100,7 @@ pub fn profile_mode(d: &Daemon, params: &Value) -> Result<Value> {
                 anyhow::bail!("RLORD_TMUX_PROFILE={v}: use default or imported");
             }
         }
-        let changed = {
-            let mut o = OVERRIDE.lock().expect("profile override");
-            let changed = *o != env;
-            *o = env;
-            changed
-        };
-        if changed {
+        if set_override(env) {
             sync_all(d, false);
         }
     }
