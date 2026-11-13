@@ -62,21 +62,22 @@ needs it; main never does):
   open in another app".
 - Onto the daemon (an in-pane thread resumed there) works at once.
 
-## Owed (daemon mode), after launch
+## After launch (owed, daemon mode)
 
 The checks that keep Road to 1.0 item 7 open are listed there
 (`docs/working/public-launch.md`). These become issues with the rest of
 its "After launch (tracked)" list:
 
 - A message can be typed into a daemon-mode thread mid-turn when another
-  Codex client started that turn: `send_to_session` in the moment before
-  its hook reaches rlord (without hooks: until the transcript is read), and
-  a usage-limit resume at any point (it doesn't wait on the status). The
+  Codex client started that turn, in the moment before its hook reaches
+  rlord (without hooks: until the transcript is read): `send_to_session`,
+  held deliveries and a usage-limit resume alike. The
   rlord pane's composer reads idle meanwhile. Fix: in `send::type_message`
   (which every caller goes through), for daemon-mode sessions only, ask
   the daemon (`codex_server::thread_state`) and treat any `Active` as "not
-  now", `waiting` included. `thread_state` waits up to 3s to connect and
-  3s to answer (about 6s worst case) under the session's lock: use a
+  now", `waiting` included. `thread_state` is a handshake, `initialize`
+  and `thread/read`, each bounded only between 3s reads, so a stalling
+  daemon can hold the session's lock well past 10s: give it a much
   shorter limit there.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an

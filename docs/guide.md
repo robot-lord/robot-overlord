@@ -332,8 +332,8 @@ none runs, and never updates, restarts or stops it; `rlord agents` shows
 its version when it differs from your `codex` (it updates itself).
 Stopping or archiving such a session interrupts its running turn first,
 and says so if it wouldn't stop. The overlord, and a session launched
-with flags that need the pane (`-c`, `--enable`, `--disable`,
-`--search`), stay in the pane. Not followed yet on the server: `/clear`
+with flags that need the pane (`-c` / `--config`, `--enable`,
+`--disable`, `--search`), stay in the pane. Not followed yet on the server: `/clear`
 or `/new` in the session (it stays on its first thread), and "needs you"
 from a sub-agent's prompt. Its commands and MCP servers run with the
 background server's environment, not the pane's. Daemon mode has been

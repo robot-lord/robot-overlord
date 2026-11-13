@@ -135,7 +135,7 @@ Dependabot version updates, grouped weekly.
 
 ## After launch (tracked)
 
-- Codex daemon mode: the "After launch" items in
+- Codex daemon mode: "After launch (owed, daemon mode)" in
   `docs/working-archive/codex-daemon.md` (one issue each).
 - OpenCode: a draft in the input box doesn't hold a `send_to_session`.
 - Switching an existing overlord to another agent.

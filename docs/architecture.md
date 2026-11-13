@@ -260,9 +260,10 @@ hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
-`--disable` or `--search` in the TUI's own process, so a daemon-mode pane
-can't be given `check_for_update_on_startup=false` and can open on Codex's
-update prompt). `spec_args` adds `--no-daemon` for every other Codex
+`--disable` or `--search`, joined forms included, in the TUI's own
+process; so, unlike the overlord, a daemon-mode session can't be given
+`check_for_update_on_startup=false`, which in-pane sessions don't get
+either). `spec_args` adds `--no-daemon` for every other Codex
 session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
@@ -308,8 +309,8 @@ session. The rest is
   `send_to_session` and held deliveries wait; the gap is the moment before
   that hook lands (without hooks, before the transcript is read), and the
   whole turn for a thread the gate doesn't list (after `/clear` or `/new`). A
-  usage-limit resume doesn't wait on the status, so it can land in such a
-  turn. Escape in either client interrupts.
+  usage-limit resume has the same short gap: it is dropped once that
+  turn's hook or transcript shows the session was used. Escape in either client interrupts.
 - **Commands and MCP servers run in the daemon's environment**, like its
   hooks: whatever environment the daemon was started with (scrubbed when
   rlord started it), not the pane's.
@@ -975,8 +976,8 @@ including when the active one hits a usage limit.
   its bottom box). A status can't be trusted for this: a Codex session
   without hooks reads as working while an approval is up. (A daemon-mode
   Codex thread with a turn started from another client reads as at its
-  prompt; for sends and deliveries, not a usage-limit resume, its status
-  mostly catches it: see "Codex on its shared background server".) Sends also hold
+  prompt; its status or transcript mostly catches it: see "Codex on its
+  shared background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
   placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
   isn't read yet), within 10s (`SETTLE`) of the last paste into that
