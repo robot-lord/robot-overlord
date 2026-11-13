@@ -174,11 +174,12 @@ with the local fallback. CONTRIBUTING.md has the full setup.
   pre-release (installed by `[update] channel = "dev"`), built locally. For
   a stable release `release.sh` pushes the tag, waits for the workflow
   (macOS + Linux tarballs, `.deb`/`.rpm`, Docker smoke tests, `SHA256SUMS`,
-  provenance attestations, the GitHub Release), verifies the assets, then
-  updates the Homebrew tap and publishes to crates.io locally (those
+  provenance attestations, a draft GitHub Release), verifies the assets
+  and attestations, publishes the draft, then updates the Homebrew tap and publishes to crates.io locally (those
   tokens aren't in CI). If it stops after the tag is pushed:
   `scripts/release.sh --resume`. If Actions is down: delete the tag
-  (remote and local), then `scripts/release.sh --local`. `release.sh` refuses a dirty tree, HEAD
+  (remote and local), then `scripts/release.sh --local`. `release.sh`
+  runs on macOS only and refuses a dirty tree, HEAD
   not on `origin/main`, or an existing tag (the PR forgot the bump).
 
 ## Documentation

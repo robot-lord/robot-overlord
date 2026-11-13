@@ -10,16 +10,20 @@
 #   X.Y.Z        stable release: built in GitHub Actions
 #                (.github/workflows/release.yml). This script pushes the tag,
 #                waits for the run, checks the release assets against the
-#                CI-made SHA256SUMS, then does the steps that still need local
-#                credentials: the Homebrew formula and crates.io.
+#                CI-made SHA256SUMS and provenance attestations, publishes the
+#                draft release CI made, then does the steps that still need
+#                local credentials: the Homebrew formula and crates.io.
 #
 # --local      stable only, the fallback when Actions is down: build macOS +
 #              Linux here (scripts/build-release.sh, the same commands CI
 #              runs), smoke-test in Docker, and create the release from here.
+#              The tag push that creates also starts release.yml; its
+#              preflight sees the published release and skips the build.
 # --skip-smoke with --local: skip the Docker smoke test.
 # --resume     stable only: the tag is already pushed (an earlier run of this
 #              script stopped partway). Skip tagging; watch the tag's
-#              workflow run, verify, then do the tap and crates.io.
+#              workflow run, verify, publish the draft (if still a draft),
+#              then do the tap and crates.io.
 #
 # Assets: rlord-v<ver>-<target>.tar.gz (rlord, install.sh, licenses),
 # SHA256SUMS; stable also rlord_<ver>_<arch>.deb, rlord-<ver>.<arch>.rpm.
@@ -53,10 +57,20 @@ dev=0
 [[ $dev == 1 && $local_build == 1 ]] && { echo "--local is for stable releases; dev builds are always local" >&2; exit 2; }
 [[ $dev == 1 && $resume == 1 ]] && { echo "--resume is for stable releases" >&2; exit 2; }
 [[ $local_build == 1 && $resume == 1 ]] && { echo "--local and --resume don't mix" >&2; exit 2; }
-[[ $smoke == 0 && $local_build == 0 ]] && { echo "--skip-smoke only applies with --local (CI always smoke-tests)" >&2; exit 2; }
+if [[ $smoke == 0 && $dev == 1 ]]; then
+  echo "--skip-smoke: dev builds have no smoke test; ignored" >&2
+elif [[ $smoke == 0 && $local_build == 0 ]]; then
+  echo "--skip-smoke only applies with --local (CI always smoke-tests)" >&2; exit 2
+fi
 build_here=$(( dev == 1 || local_build == 1 ))
+# Every mode runs macOS tools later (BSD sed, shasum, codesign): check now,
+# before anything is tagged or pushed.
+[[ "$(uname -s)" == Darwin ]] || { echo "release.sh runs on macOS only (it uses BSD sed, shasum, codesign); on Linux, trigger the release workflow from Actions instead" >&2; exit 1; }
+for c in gh git shasum; do
+  command -v "$c" >/dev/null || { echo "release.sh needs $c" >&2; exit 1; }
+done
 if [[ $build_here == 1 ]]; then
-  [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "build from an Apple Silicon Mac" >&2; exit 1; }
+  [[ "$(uname -m)" == arm64 ]] || { echo "build from an Apple Silicon Mac" >&2; exit 1; }
 fi
 
 # Refuse anything that would make the release not match a pushed commit.
@@ -106,9 +120,10 @@ else
     git tag -f "$tag" "$head"
     git push origin "refs/tags/$tag" || { git tag -d "$tag" >/dev/null; echo "pushing $tag failed (local tag deleted)" >&2; exit 1; }
   fi
-  find_runs() { # all release.yml runs for this tag: "id status"
-    gh run list -R "$repo" -w release.yml -e push -c "$head" -L 20 \
-      --json databaseId,headBranch,status -q ".[] | select(.headBranch == \"$tag\") | \"\(.databaseId) \(.status)\""
+  find_runs() { # release.yml runs for this tag (push or dispatch), newest first: "id status"
+    gh run list -R "$repo" -w release.yml -L 50 \
+      --json databaseId,headBranch,headSha,status,event,createdAt \
+      -q "[.[] | select(.headSha == \"$head\" and (.event == \"push\" or .event == \"workflow_dispatch\") and (.headBranch == \"$tag\" or .event == \"workflow_dispatch\"))] | sort_by(.createdAt) | reverse | .[] | \"\(.databaseId) \(.status)\""
   }
   echo "waiting for the release workflow on $tag…"
   run=
@@ -129,8 +144,8 @@ else
   fi
   gh run watch "$run" -R "$repo" --exit-status ||
     { echo "release workflow failed: https://github.com/$repo/actions/runs/$run — fix and re-run it, then scripts/release.sh --resume; or $undo" >&2; exit 1; }
-  # Check every asset against the CI-made SHA256SUMS, and the tarballs'
-  # provenance, before trusting them.
+  # CI leaves a draft. Check every asset against the CI-made SHA256SUMS,
+  # and the tarballs' provenance, before publishing it.
   gh release download "$tag" -R "$repo" -D "$dist"
   (cd "$dist" && shasum -a 256 -c SHA256SUMS)
   for t in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
@@ -138,6 +153,9 @@ else
     grep -q " $f\$" "$dist/SHA256SUMS" || { echo "SHA256SUMS lacks $f" >&2; exit 1; }
     gh attestation verify "$dist/$f" -R "$repo" >/dev/null || { echo "provenance check failed for $f" >&2; exit 1; }
   done
+  if [[ $(gh release view "$tag" -R "$repo" --json isDraft -q .isDraft) == true ]]; then
+    gh release edit "$tag" -R "$repo" --draft=false --latest
+  fi
 fi
 
 scripts/update-tap.sh "$ver" "$dist/SHA256SUMS" "$tap"

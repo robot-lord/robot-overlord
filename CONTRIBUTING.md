@@ -83,13 +83,15 @@ scripts/release.sh
   as a pre-release.
 - **Stable releases** are built in GitHub Actions
   (`.github/workflows/release.yml`), so anyone can see how the binaries were
-  made. `release.sh` pushes the `vX.Y.Z` tag, which starts the workflow: a
-  macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
+  made. `release.sh` pushes the `vX.Y.Z` tag, which starts the workflow. A
+  preflight job fails fast unless the tag is on `main`, stable and matches
+  `Cargo.toml`. Then a macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
   the static musl builds (`cargo zigbuild`) and packages `.deb`/`.rpm`; both
   architectures are smoke-tested in Docker on Ubuntu, Debian, Fedora and
   Amazon Linux (`scripts/smoke-linux.sh`); the last job writes `SHA256SUMS`,
-  attests build provenance and creates the release. `release.sh` waits for
-  the run, checks the assets against `SHA256SUMS`, then does what still needs
+  attests build provenance and creates the release as a **draft**.
+  `release.sh` waits for the run, checks the assets against `SHA256SUMS`
+  and `gh attestation verify`, publishes the draft, then does what still needs
   local credentials: the Homebrew tap (`scripts/update-tap.sh`) and crates.io
   (`scripts/publish-crates.sh`, once the repo is public).
 
@@ -100,15 +102,17 @@ artifacts.
 
 If `release.sh` stops after pushing the tag (a failed run you then re-ran,
 a lost connection), `scripts/release.sh --resume` picks up from the tag's
-workflow run: watch, verify (checksums and `gh attestation verify`), tap,
-crates.io.
+workflow run (push or manual): watch, verify, publish the draft if it is
+still one, tap, crates.io. Re-running a failed workflow replaces any draft
+it left.
 
 If Actions is down, build a stable release locally instead: delete the tag
 on origin and locally (`git push origin :refs/tags/vX.Y.Z; git tag -d
-vX.Y.Z`), then `scripts/release.sh --local`. If no run shows up for the
-tag, `release.sh` first cancels any run queued for it, since a run that
-starts late could otherwise race a local release; check Actions anyway
-before going local. One-time setup for that:
+vX.Y.Z`), then `scripts/release.sh --local`. Creating that release pushes
+the tag again, which starts the workflow; its preflight sees the release
+is already published and skips the build, so the two never race. If no
+run shows up for a pushed tag, `release.sh` also cancels any run queued
+for it before suggesting `--local`. One-time setup for that:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl

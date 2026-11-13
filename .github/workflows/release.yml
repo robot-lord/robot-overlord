@@ -37,7 +37,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fail fast, before any build: only merged code, a stable version, the
+  # tag matching Cargo.toml. A dry run reports these as warnings. A tag
+  # whose release already exists (made by scripts/release.sh --local) is
+  # skipped, so a local fallback never races this workflow.
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag=v$ver
+          problems=()
+          git merge-base --is-ancestor HEAD origin/main || problems+=("$(git rev-parse HEAD) is not on origin/main")
+          [[ $ver != *-* ]] || problems+=("$tag is not a stable version")
+          [[ "${REF#refs/tags/}" == "$tag" ]] || problems+=("ref $REF doesn't match Cargo.toml version $tag")
+          for p in "${problems[@]}"; do
+            if [[ $DRY_RUN == true ]]; then echo "::warning::$p (dry run: continuing)"; else echo "::error::$p"; fi
+          done
+          [[ $DRY_RUN == true || ${#problems[@]} == 0 ]] || exit 1
+          # Published releases only (drafts aren't visible to this token).
+          if [[ $DRY_RUN == false ]] && gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag is already published (scripts/release.sh --local); nothing to build"
+            echo skip=true >> "$GITHUB_OUTPUT"
+          fi
+
   build-macos:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +89,8 @@ jobs:
           if-no-files-found: error
 
   build-linux:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     env:
       ZIG_VERSION: 0.14.1
@@ -122,10 +159,6 @@ jobs:
         run: |
           ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           tag=v$ver
-          if [[ $DRY_RUN == false ]]; then
-            [[ $ver != *-* ]] || { echo "::error::$tag is not a stable version"; exit 1; }
-            [[ "${REF#refs/tags/}" == "$tag" ]] || { echo "::error::ref $REF doesn't match Cargo.toml version $tag"; exit 1; }
-          fi
           for f in rlord-$tag-{aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl}.tar.gz; do
             [[ -f dist/$f ]] || { echo "::error::missing $f"; exit 1; }
           done
@@ -145,7 +178,13 @@ jobs:
         with:
           name: release-${{ env.TAG }}
           path: dist/*
+      # A draft: scripts/release.sh publishes it after checking checksums
+      # and provenance. A draft left by an earlier failed run is replaced.
       - if: env.DRY_RUN == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes
+        run: |
+          if [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null) == true ]]; then
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --generate-notes
