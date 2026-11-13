@@ -64,7 +64,11 @@ impl Version {
             None => (s, None),
         };
         let nums: Vec<&str> = core.split('.').collect();
-        if nums.len() != 3 || pre.is_some_and(|p| p.is_empty()) {
+        // Pre-release identifiers as semver allows them: non-empty,
+        // [0-9A-Za-z-] only (so no build metadata either).
+        let ident =
+            |i: &str| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if nums.len() != 3 || pre.is_some_and(|p| !p.split('.').all(ident)) {
             bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
         }
         // Digits only: u64's parser would also take a leading `+`.
@@ -277,6 +281,11 @@ mod tests {
             "01.2.3",
             "1.2.3-dev.01",
             "+1.2.3",
+            "1.2.3-dev.",
+            "1.2.3-dev..1",
+            "1.2.3-dev.1+abc",
+            "1.2.3-dev_1",
+            "1.2.3-dev.+1",
         ] {
             assert!(Version::parse(bad).is_err(), "{bad}");
         }
@@ -309,8 +318,6 @@ mod tests {
         assert!(v("1.0.0-dev") < v("1.0.0-dev.1"));
         assert!(v("1.0.0-1") < v("1.0.0-dev"));
         assert!(v("1.0.0-dev.9") < v("1.0.0-dev.10"));
-        // A `+` makes it a word, not a number.
-        assert_ne!(v("1.0.0-dev.+1").cmp(&v("1.0.0-dev.1")), Ordering::Equal);
     }
 
     #[test]

@@ -272,6 +272,8 @@ pub fn main(args: &[String]) -> Result<()> {
 
     tap::update(&ver, &dist.join("SHA256SUMS"), TAP)?;
     // crates.io publishes the source: only once the repo itself is public.
+    // The release is out by now: a failed lookup skips crates.io with a
+    // note rather than stopping before "released".
     let visibility = cmd::output(gh().args([
         "repo",
         "view",
@@ -280,9 +282,12 @@ pub fn main(args: &[String]) -> Result<()> {
         "visibility",
         "-q",
         ".visibility",
-    ]))?;
+    ]));
+    cmd::check_interrupted()?;
     let logged_in = crates_io_token_available();
-    if visibility != "PUBLIC" {
+    if let Err(e) = &visibility {
+        eprintln!("crates.io: couldn't tell whether {REPO} is public ({e:#}) — skipped (publish with cargo xtask publish-crates)");
+    } else if visibility.as_deref().ok() != Some("PUBLIC") {
         eprintln!("crates.io: {REPO} is private — skipped (publish later with cargo xtask publish-crates)");
     } else if logged_in {
         publish::publish(false)?;

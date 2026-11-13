@@ -31,7 +31,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Make Ctrl-C (and SIGTERM, SIGHUP) stop xtask by unwinding, not by killing it, so the `Drop`
+/// Make Ctrl-C (and SIGHUP) stop xtask by unwinding, not by killing it, so the `Drop`
 /// guards run (scratch folders removed, manifests put back) as the
 /// scripts' `trap … EXIT` did. The child running at the time gets the
 /// SIGINT itself and exits; `run`, `output` and `sleep` then return
@@ -42,7 +42,10 @@ pub fn on_interrupt() {
     let handler = on_sigint as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an atomic.
     unsafe {
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // Not SIGTERM: it reaches only xtask, which would then wait for the
+        // running child (a whole `gh run watch`) before stopping. SIGINT
+        // and SIGHUP reach the child too.
+        for signal in [libc::SIGINT, libc::SIGHUP] {
             libc::signal(signal, handler as libc::sighandler_t);
         }
     }
