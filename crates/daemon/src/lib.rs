@@ -663,6 +663,7 @@ impl Daemon {
             "ui.overlord" => ui::overlord(self, params),
             "admin.reset" => ui::reset(self, params),
             "tmux.profile" => profile::profile(self, params),
+            "tmux.profile_mode" => profile::profile_mode(self, params),
             "tmux.reload" => profile::reload(self),
             "ui.overlay.close_on" => ui::close_overlay_on(self, params),
             "ui.overlay.report" => {

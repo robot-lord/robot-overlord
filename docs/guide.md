@@ -518,8 +518,11 @@ Anthropic's servers.
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated
-config: no status bar, no prefix key, mouse on. The only keys it binds are
-Option-D (to the list) and Option-O (the overlord). Your personal tmux is never
+config: no prefix key, mouse on. The only keys it binds are Option-D (to
+the list) and Option-O (the overlord). Agent sessions get a slim status bar:
+the session's name on the left, `⌥d list · ⌥o overlord` on the right. Click
+a hint to do what its key does (with `[tmux] mouse` on; a click elsewhere
+on the bar is tmux's own). Your personal tmux is never
 touched. Starting `rlord` from inside your own tmux nests cleanly. Put your
 own tweaks for rlord's tmux in `~/.local/share/robot-overlord/tmux.local.conf`.
 
@@ -541,8 +544,16 @@ and one session's profile never affects another.
   copy mode) when a profile is imported.
 - Agent sessions show rlord's keys on their status bar (`⌥d list · ⌥o
   overlord`): in front of your status-right with the profile on, or on a
-  slim bar of their own without it.
+  slim bar of their own without it. The hints are clickable either way.
 - Per session: `rlord tmux profile on|off|toggle|default [REF]`.
+- **To see the setup a new user gets** without removing your profile, open
+  the list with `RLORD_TMUX_PROFILE=default rlord`. That run puts every
+  agent session on rlord's own tmux; the next plain `rlord` puts your
+  profile back (`RLORD_TMUX_PROFILE=imported` forces it on). Running
+  sessions switch at once. To make it stick, set `[tmux] profile = false`
+  (takes effect on `rlord reset` or the next start).
+- `rlord tmux profile` (outside a session) prints which setup is active
+  and why: `RLORD_TMUX_PROFILE`, `[tmux] profile`, or no profile imported.
 - rlord tracks the agent's pane, so splits never confuse the preview or
   status.
 

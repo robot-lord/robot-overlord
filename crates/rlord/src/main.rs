@@ -448,6 +448,12 @@ fn main() -> Result<()> {
             if !tmux::inside_rlord() {
                 use std::os::unix::process::CommandExt;
                 ensure_daemon_current();
+                // This run's tmux setup: `RLORD_TMUX_PROFILE=default` shows
+                // rlord's own, as a new user gets it (unset: back to config).
+                let env = std::env::var("RLORD_TMUX_PROFILE").ok();
+                if let Err(e) = call("tmux.profile_mode", json!({"set": true, "env": env})) {
+                    eprintln!("rlord: {e:#}");
+                }
                 tmux::write_conf()?;
                 let cmd = format!("exec {} tui", tmux::shell_quote(&methods::rlord_bin()));
                 let err = tmux::command()
@@ -1251,13 +1257,22 @@ fn tmux_profile_cmd(state: Option<String>, r: Option<String>) -> Result<()> {
         }
         x => x,
     };
-    let r = match r {
-        Some(r) => r,
+    // Which setup agent sessions get, and why.
+    let m = call("tmux.profile_mode", json!({}))?;
+    println!(
+        "tmux profile: {} ({})",
+        m["mode"].as_str().unwrap_or("?"),
+        m["why"].as_str().unwrap_or("?")
+    );
+    let current = tmux::current_session()
+        // rlord's tmux sessions: `<name>-rlord` (older: `rlord-…`).
+        .filter(|s| s.ends_with("-rlord") || s.starts_with("rlord-"));
+    let r = match (r, current) {
+        (Some(r), _) => r,
         // resolve_ref accepts the tmux session name too.
-        None => tmux::current_session()
-            // rlord's tmux sessions: `<name>-rlord` (older: `rlord-…`).
-            .filter(|s| s.ends_with("-rlord") || s.starts_with("rlord-"))
-            .context("not in an rlord session: give a session REF")?,
+        (None, Some(c)) => c,
+        (None, None) if state.is_none() => return Ok(()),
+        (None, None) => anyhow::bail!("not in an rlord session: give a session REF"),
     };
     let mut params = json!({"ref": r});
     if let Some(s) = &state {

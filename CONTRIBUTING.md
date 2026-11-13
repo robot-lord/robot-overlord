@@ -32,6 +32,11 @@ rlord stop <ref> && rlord restart <ref>           # resume with full context
 rlord search <words> / rlord history <ref>        # past work
 ```
 
+Checking what a new user's tmux looks like while you have your own profile
+imported: `RLORD_TMUX_PROFILE=default rlord` (agent sessions switch to
+rlord's own bar and clickable hints for that run; a plain `rlord` switches
+back). `rlord tmux profile` says which setup is active and why.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
