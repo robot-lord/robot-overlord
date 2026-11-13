@@ -8,24 +8,33 @@
       stable channel stop installing 0.18.1. Needs `colima start` for the
       Linux smoke tests; check OpenCode and Codex on Linux in them.
 - [x] Codex overlord's read-only sandbox on Linux: blocks unix-socket
-      connects (checked 2026-11-12, codex-cli 0.167.2, ubuntu:24.04 arm64
-      in Docker, `codex sandbox -c sandbox_mode="read-only" -c
-      approval_policy="on-request" -- …` against a live `tmux -L tsock`):
-      `tmux list-sessions` and `send-keys` fail with `error connecting to
-      /tmp/tmux-0/tsock (Operation not permitted)`; a Python `AF_UNIX`
-      connect and a TCP `socket()` both raise `PermissionError: [Errno 1]`
-      (seccomp, not only a netns); writes to `/tmp` and the workdir fail
-      with `Read-only file system`. No fix needed. Notes:
-      - Where unprivileged user namespaces are blocked (Ubuntu 24.04's
-        `kernel.apparmor_restrict_unprivileged_userns=1`, Docker's default
-        seccomp), bwrap can't start and every sandboxed command fails
-        (`bwrap: loopback: Failed RTM_NEWADDR` / `No permissions to create
-        a new namespace`). Fails closed, but a Codex overlord on stock
-        Ubuntu 24.04 may be unable to run any shell command. Check this
-        on a real Ubuntu host before calling Codex-on-Linux supported, and
-        document it if so.
-      - x86_64 not exercised: under QEMU bwrap couldn't create
-        namespaces either. Same sandbox code; low risk.
+      connects, as root on a `/tmp` socket (checked 2026-11-12,
+      codex-cli 0.167.2 from npm, `ubuntu:24.04` arm64 on colima). Run
+      as root in `docker run --rm --privileged ubuntu:24.04` (root and
+      `--privileged` were the only way bwrap could start there), with
+      `codex sandbox -c sandbox_mode="read-only" -c
+      approval_policy="on-request" -- …` against a live `tmux -L tsock`
+      (`/tmp/tmux-0/tsock`):
+      - `tmux list-sessions` and `send-keys`: `error connecting to
+        /tmp/tmux-0/tsock (Operation not permitted)`; pane untouched.
+      - Python `AF_UNIX` connect and a TCP `socket()`: `PermissionError:
+        [Errno 1] Operation not permitted` (seccomp at socket creation,
+        not only a netns).
+      - writes to `/tmp` and the workdir: `Read-only file system`.
+
+      Not covered: a non-root user and rlord's real socket path
+      (`/tmp/tmux-<uid>/rlord`); that's the next item. As non-root,
+      bwrap wouldn't start in this setup (Docker's default seccomp: `No
+      permissions to create a new namespace`; with `--privileged` or
+      seccomp/apparmor unconfined, the colima VM's
+      `kernel.apparmor_restrict_unprivileged_userns=1`: `bwrap: loopback:
+      Failed RTM_NEWADDR: Operation not permitted`). x86_64 under QEMU
+      couldn't create namespaces either.
+- [ ] Codex overlord on a real Ubuntu 24.04 host
+      (`apparmor_restrict_unprivileged_userns=1`): does bwrap start, as
+      non-root, with rlord's real socket path? If it doesn't, every shell
+      command fails (closed, but unusable): document it, and see the
+      owed detection item in `codex-support.md`.
 - [ ] Fresh install end to end on a clean machine or account: `get.sh` and
       `brew install`, then first-run setup per agent, including a machine
       without Claude Code.
