@@ -364,7 +364,7 @@ and without a model and a restart of a session OpenCode no longer had.
   "The overlord on OpenCode").
 - Screenshots retaken with the OpenCode demo session (README pass, 0.22.0-dev.4).
 - `docs/architecture.md` got the OpenCode facts in its agent section; the
-  larger reconcile owed by the Codex doc still stands.
+  larger reconcile owed by `docs/working/codex-support.md` still stands.
 
 ## Codex Remote Control: deferred
 

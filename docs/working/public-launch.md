@@ -51,12 +51,12 @@ done, in this order (decided with the user, 2026-11-12):
        providers' 429s (OpenCode retries those as throttles).
 6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
        narrower helper tools.
-7. [x] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
+7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
-       `docs/working-archive/codex-daemon.md`. Not yet checked live
-       (owed there): hooks through the real daemon into rlord, a daemon
-       restart or update mid-turn (L8), Linux (L9).
+       `docs/working-archive/codex-daemon.md`. Open before it's done
+       (owed there): live checks of hooks through the real daemon into
+       rlord, a daemon restart or update mid-turn (L8), Linux (L9).
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
