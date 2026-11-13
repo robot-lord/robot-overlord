@@ -410,7 +410,7 @@ impl App {
             bar.extend(key(Action::ToggleArchived));
             // In the archived view: how to get back (Esc, unless the search
             // filter would take it first). Clicking it goes back too.
-            if self.show_archived && self.filter.is_empty() {
+            if self.esc_leaves_archived() {
                 if let Some(k) = key(Action::Cancel) {
                     let back = press(Action::Cancel);
                     bar.push((Span::raw(" "), None));
@@ -538,7 +538,7 @@ impl App {
                 ]))
             })
             .collect();
-        let block = theme::panel(theme::title("Groups"), self.group_focus);
+        let block = self.archived_tint(theme::panel(theme::title("Groups"), self.group_focus));
         if items.is_empty() {
             let msg = vec![
                 Line::from(""),
@@ -605,6 +605,16 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Esc would leave the archived view now: nothing nearer takes it (the
+    /// search filter, an earlier overlord conversation in the preview, or
+    /// the inside of a group, which Esc leaves for the group list).
+    pub(crate) fn esc_leaves_archived(&self) -> bool {
+        self.show_archived
+            && self.filter.is_empty()
+            && self.conv_sel == 0
+            && !(self.tab == Tab::Groups && !self.group_focus)
     }
 
     /// The archived view's panes sit on their own faint tint

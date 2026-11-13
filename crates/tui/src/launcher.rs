@@ -13,7 +13,7 @@ use rlord_core::usage::UsageMetric;
 #[derive(Default)]
 pub(crate) struct Launcher {
     pub(crate) buf: String,
-    pub(crate) sel: usize,
+    sel: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +146,12 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
 ];
 
 impl Launcher {
+    /// The highlighted match's index.
+    #[cfg(test)]
+    pub(crate) fn sel(&self) -> usize {
+        self.sel
+    }
+
     /// Highlight the `i`th match (a click on it).
     pub(crate) fn select(&mut self, i: usize) {
         self.sel = i;
@@ -393,10 +399,8 @@ impl App {
             head("Commands"),
             row(k(Action::Command), "launcher: keys, sort, log, archived…"),
             row(":keys".into(), "change a key (tests it reaches rlord)"),
-            row(
-                "↑↓ ^N/^P ^J/^K".into(),
-                "move in the launcher, menus, pickers",
-            ),
+            row("ctrl-n/j".into(), "down in launcher, menus, pickers"),
+            row("ctrl-p/k".into(), "up there (↑ ↓ work too)"),
             Line::from(""),
             head("Mouse"),
             Line::styled(

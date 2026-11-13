@@ -49,10 +49,20 @@ pub fn run(config: Config) -> Result<()> {
     result
 }
 
-/// `ratatui::init` plus xterm modifyOtherKeys (mode 1), so modified keys
-/// such as Shift-Enter arrive distinct from plain ones (rlord's tmux has
-/// `extended-keys on` and passes them through). Terminals that don't support
-/// it ignore the request; Shift-Enter then reads as Enter.
+/// For tests: a terminal to hand the key handlers. Never drawn to: they
+/// only take it to hand the screen to an editor or tmux. A fixed viewport
+/// asks no tty.
+#[cfg(test)]
+pub(crate) fn handler_term() -> DefaultTerminal {
+    ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+        },
+    )
+    .unwrap()
+}
+
 /// A move in a picker list (the launcher, menus, form pickers): `Some(true)`
 /// down, `Some(false)` up. Arrows, plus Ctrl-J/Ctrl-N and Ctrl-K/Ctrl-P as
 /// in fzf. Ctrl-J is LF, but in raw mode (always, here) crossterm reports it
@@ -68,6 +78,10 @@ pub(crate) fn picker_step(k: &KeyEvent) -> Option<bool> {
     }
 }
 
+/// `ratatui::init` plus xterm modifyOtherKeys (mode 1), so modified keys
+/// such as Shift-Enter arrive distinct from plain ones (rlord's tmux has
+/// `extended-keys on` and passes them through). Terminals that don't support
+/// it ignore the request; Shift-Enter then reads as Enter.
 fn init_terminal() -> DefaultTerminal {
     let t = ratatui::init();
     // The mouse: clicks and the wheel reach the list (see mouse.rs).
@@ -889,6 +903,9 @@ impl App {
             Action::ToggleArchived => {
                 self.show_archived = !self.show_archived;
                 self.table.select(Some(0));
+                // An earlier overlord conversation in the preview belongs to
+                // the list just left.
+                self.conv_sel = 0;
                 self.dirty = true;
             }
             Action::Sort => {
@@ -953,7 +970,7 @@ impl App {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.dirty = true;
-                } else if self.show_archived {
+                } else if self.esc_leaves_archived() {
                     self.do_action(Action::ToggleArchived, terminal)?;
                 }
             }
@@ -3336,15 +3353,7 @@ mod tests {
             "archived_at": null, "pinned": false, "role": "", "agent": "claude"})];
         app.table.select(Some(0));
         let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
-        // (Never drawn to: the key handlers only take it to hand the
-        // screen to an editor or tmux. A fixed viewport asks no tty.)
-        let mut real = ratatui::Terminal::with_options(
-            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .unwrap();
+        let mut real = handler_term();
         let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         app.handle_key(x, &mut real).unwrap();
         assert!(matches!(app.mode, Mode::Confirm(_)), "x opens the confirm");

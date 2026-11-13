@@ -104,7 +104,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: None,
         surface: i(236),
-        archived_bg: h(0x26221a),
+        archived_bg: i(235),
         chip: i(237),
         border: i(238),
         faint: i(240),
@@ -129,7 +129,7 @@ pub const THEMES: &[Palette] = &[
         // text on black.
         bg: Some(i(255)),
         surface: i(254),
-        archived_bg: h(0xf2ead6),
+        archived_bg: i(230),
         chip: i(253),
         border: i(250),
         faint: i(246),
@@ -473,19 +473,50 @@ mod tests {
 
     use super::*;
 
-    /// Every theme has an archived tint: off the background (so it shows)
-    /// and off the selected row's `surface` (so the selection still does),
-    /// but near the background's lightness (subtle, text stays readable).
+    /// Approximate RGB of a colour (xterm's 256-colour palette for an
+    /// index; the 16 base colours vary by terminal and aren't used here).
+    fn approx(c: Rgb) -> (i32, i32, i32) {
+        match c {
+            Rgb::Hex(r, g, b) => (r as i32, g as i32, b as i32),
+            Rgb::Indexed(n @ 16..=231) => {
+                let lvl = |v: u8| if v == 0 { 0 } else { 55 + 40 * v as i32 };
+                let n = n - 16;
+                (lvl(n / 36), lvl(n / 6 % 6), lvl(n % 6))
+            }
+            Rgb::Indexed(n @ 232..=255) => {
+                let v = 8 + 10 * (n as i32 - 232);
+                (v, v, v)
+            }
+            Rgb::Indexed(n) => panic!("base colour {n} has no fixed RGB"),
+        }
+    }
+
+    /// Every theme has an archived tint: visibly off the background (so it
+    /// shows) and off the selected row's `surface` (so the selection still
+    /// does), but near the background's lightness (subtle, text readable).
+    /// rlord-dark has no background of its own: its tint stays as dark as
+    /// a typical terminal's, under `surface`.
     #[test]
     fn every_theme_has_a_subtle_archived_tint() {
-        let lum = |c: Rgb| match c {
-            Rgb::Hex(r, g, b) => (r as i32 + g as i32 + b as i32) / 3,
-            Rgb::Indexed(_) => panic!("archived_bg is RGB"),
+        let dist = |a: (i32, i32, i32), b: (i32, i32, i32)| {
+            (a.0 - b.0).abs() + (a.1 - b.1).abs() + (a.2 - b.2).abs()
         };
+        let lum = |c: (i32, i32, i32)| (c.0 + c.1 + c.2) / 3;
+        assert_eq!(approx(i(235)), (38, 38, 38));
+        assert_eq!(approx(i(230)), (255, 255, 215));
         for p in THEMES {
-            assert_ne!(Some(p.archived_bg), p.bg, "{}", p.name);
-            assert_ne!(p.archived_bg, p.surface, "{}", p.name);
-            let l = lum(p.archived_bg);
+            let tint = approx(p.archived_bg);
+            let surface = approx(p.surface);
+            assert!(dist(tint, surface) >= 12, "{}: too near surface", p.name);
+            match p.bg {
+                Some(bg) => {
+                    let bg = approx(bg);
+                    assert!(dist(tint, bg) >= 9, "{}: too near bg", p.name);
+                    assert!(dist(tint, bg) <= 70, "{}: too loud", p.name);
+                }
+                None => assert!(lum(tint) < lum(surface), "{}", p.name),
+            }
+            let l = lum(tint);
             assert!(if p.dark { l < 70 } else { l > 190 }, "{}: {l}", p.name);
         }
     }

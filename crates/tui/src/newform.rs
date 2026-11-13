@@ -696,31 +696,21 @@ impl App {
                 .unwrap_or(0)
                 .min(n.saturating_sub(1));
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            let step = picker_step(&k);
+            // One direction for every move key (plain j/k type here).
+            let down = picker_step(&k).or(match code {
+                KeyCode::Tab => Some(true),
+                KeyCode::BackTab => Some(false),
+                _ => None,
+            });
             match code {
                 KeyCode::Esc => {}
-                KeyCode::Tab => {
-                    finder
-                        .state
-                        .select(Some(if n == 0 { 0 } else { (i + 1) % n }));
-                    f.finder = Some(finder);
-                }
-                _ if step == Some(true) => {
-                    finder
-                        .state
-                        .select(Some(if n == 0 { 0 } else { (i + 1) % n }));
-                    f.finder = Some(finder);
-                }
-                KeyCode::BackTab => {
-                    finder
-                        .state
-                        .select(Some(if n == 0 { 0 } else { (i + n - 1) % n }));
-                    f.finder = Some(finder);
-                }
-                _ if step == Some(false) => {
-                    finder
-                        .state
-                        .select(Some(if n == 0 { 0 } else { (i + n - 1) % n }));
+                _ if down.is_some() => {
+                    let j = match down {
+                        _ if n == 0 => 0,
+                        Some(true) => (i + 1) % n,
+                        _ => (i + n - 1) % n,
+                    };
+                    finder.state.select(Some(j));
                     f.finder = Some(finder);
                 }
                 KeyCode::Enter => {
@@ -753,23 +743,21 @@ impl App {
         if let Some((kind, items, mut state)) = f.picker.take() {
             let n = items.len();
             let i = state.selected().unwrap_or(0);
-            let step = picker_step(&k);
+            // One direction for every move key (no text here: j/k move).
+            let down = picker_step(&k).or(match code {
+                KeyCode::Char('j') | KeyCode::Tab => Some(true),
+                KeyCode::Char('k') | KeyCode::BackTab => Some(false),
+                _ => None,
+            });
             match code {
                 KeyCode::Esc => {}
-                _ if step == Some(true) => {
-                    state.select(Some((i + 1) % n.max(1)));
-                    f.picker = Some((kind, items, state));
-                }
-                _ if step == Some(false) => {
-                    state.select(Some((i + n.max(1) - 1) % n.max(1)));
-                    f.picker = Some((kind, items, state));
-                }
-                KeyCode::Char('j') | KeyCode::Tab => {
-                    state.select(Some((i + 1) % n.max(1)));
-                    f.picker = Some((kind, items, state));
-                }
-                KeyCode::Char('k') | KeyCode::BackTab => {
-                    state.select(Some((i + n.max(1) - 1) % n.max(1)));
+                _ if down.is_some() => {
+                    let n = n.max(1);
+                    state.select(Some(if down == Some(true) {
+                        (i + 1) % n
+                    } else {
+                        (i + n - 1) % n
+                    }));
                     f.picker = Some((kind, items, state));
                 }
                 KeyCode::Enter => match kind {

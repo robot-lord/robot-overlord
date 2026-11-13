@@ -756,28 +756,30 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
         let n = m.items.len();
-        let step = picker_step(&k);
-        match k.code {
-            _ if step == Some(true) => m.sel = (m.sel + 1).min(n - 1),
-            _ if step == Some(false) => m.sel = m.sel.saturating_sub(1),
-            KeyCode::Char('j') => m.sel = (m.sel + 1).min(n - 1),
-            KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
-            // Run it as its key would (the menu is closed by now).
-            KeyCode::Enter => {
-                return self.run_menu_item(&m.target, m.items[m.sel].2.clone(), terminal)
-            }
-            // One of the listed keys runs that entry; anything else closes.
-            _ => {
-                let item = m.items.iter().find(|(_, _, pick)| {
-                    matches!(pick, Pick::Key(key) if key.code == k.code
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                            == k.modifiers.contains(KeyModifiers::CONTROL))
-                });
-                return match item {
-                    Some((_, _, pick)) => self.run_menu_item(&m.target, pick.clone(), terminal),
-                    None => Ok(false),
-                };
-            }
+        // Run it as its key would (the menu is closed by now).
+        if k.code == KeyCode::Enter {
+            return self.run_menu_item(&m.target, m.items[m.sel].2.clone(), terminal);
+        }
+        // One of the listed keys runs that entry, even one that would
+        // otherwise move (a user's ctrl-n, say).
+        let item = m.items.iter().find(|(_, _, pick)| {
+            matches!(pick, Pick::Key(key) if key.code == k.code
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                    == k.modifiers.contains(KeyModifiers::CONTROL))
+        });
+        if let Some((_, _, pick)) = item {
+            return self.run_menu_item(&m.target, pick.clone(), terminal);
+        }
+        // Then moves; anything else closes.
+        let down = picker_step(&k).or(match k.code {
+            KeyCode::Char('j') => Some(true),
+            KeyCode::Char('k') => Some(false),
+            _ => None,
+        });
+        match down {
+            Some(true) => m.sel = (m.sel + 1).min(n - 1),
+            Some(false) => m.sel = m.sel.saturating_sub(1),
+            None => return Ok(false),
         }
         self.mode = Mode::Menu(m);
         Ok(false)
@@ -1004,17 +1006,6 @@ mod tests {
         assert_eq!(app.hits.at(x, y), Some(Hit::Row(10)));
     }
 
-    /// A terminal to hand the key handlers (never drawn to).
-    fn handler_term() -> DefaultTerminal {
-        ratatui::Terminal::with_options(
-            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .unwrap()
-    }
-
     /// Ctrl-J/N and Ctrl-K/P move in the launcher as the arrows do; plain
     /// j/k still type into its filter. (In raw mode Ctrl-J arrives as
     /// Ctrl+'j', not Enter, so it runs nothing.)
@@ -1045,7 +1036,7 @@ mod tests {
         let mut term = handler_term();
         app.mode = Mode::Command(Box::default());
         let sel = |app: &App| match &app.mode {
-            Mode::Command(l) => (l.sel, l.buf.clone()),
+            Mode::Command(l) => (l.sel(), l.buf.clone()),
             _ => panic!("the launcher closed"),
         };
         for (k, want) in [
@@ -1060,6 +1051,37 @@ mod tests {
         app.handle_key(plain('j'), &mut term).unwrap();
         app.handle_key(plain('k'), &mut term).unwrap();
         assert_eq!(sel(&app), (0, "jk".to_string()));
+    }
+
+    /// In a menu, an entry bound to a key wins over that key moving the
+    /// highlight; keys no entry has move it.
+    #[test]
+    fn menu_entry_keys_win_over_moves() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut app = fleet();
+        let mut term = handler_term();
+        let menu = || {
+            Mode::Menu(Box::new(Menu {
+                x: 0,
+                y: 0,
+                target: Target::Session("s1".into()),
+                title: "t".into(),
+                items: vec![
+                    ("ctrl-j".into(), "one", Pick::Key(ctrl('j'))),
+                    ("x".into(), "two", Pick::Key(ctrl('x'))),
+                ],
+                sel: 0,
+            }))
+        };
+        app.mode = menu();
+        app.handle_key(ctrl('n'), &mut term).unwrap();
+        assert!(
+            matches!(&app.mode, Mode::Menu(m) if m.sel == 1),
+            "ctrl-n moves"
+        );
+        app.mode = menu();
+        app.handle_key(ctrl('j'), &mut term).unwrap();
+        assert!(!matches!(app.mode, Mode::Menu(_)), "ctrl-j ran its entry");
     }
 
     /// The archived view looks apart (tinted panes, "Archived" in yellow),
@@ -1119,6 +1141,23 @@ mod tests {
         app.handle_key(a, &mut term).unwrap();
         app.handle_key(a, &mut term).unwrap();
         assert!(!app.show_archived);
+
+        // Inside a group Esc goes to the group list first, and an earlier
+        // overlord conversation in the preview takes it too: no back hint
+        // then. Leaving the view resets the conversation.
+        app.handle_key(a, &mut term).unwrap();
+        app.tab = Tab::Groups;
+        app.group_focus = false;
+        assert!(!app.esc_leaves_archived());
+        app.group_focus = true;
+        assert!(app.esc_leaves_archived());
+        app.tab = Tab::Sessions;
+        app.conv_sel = 1;
+        assert!(!app.esc_leaves_archived());
+        assert!(!drawn(&mut app).iter().any(|r| r.contains(" back")));
+        app.handle_key(a, &mut term).unwrap();
+        assert!(!app.show_archived);
+        assert_eq!(app.conv_sel, 0, "the view change resets the conversation");
 
         // The live list: no tint, no back hint.
         let rows = drawn(&mut app);
