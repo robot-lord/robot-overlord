@@ -51,8 +51,19 @@ done, in this order (decided with the user, 2026-11-12):
        providers' 429s (OpenCode retries those as throttles).
 6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
        narrower helper tools.
-7. [ ] Codex daemon mode, with Codex Remote Control (Brandon: in 1.0).
-       Daemon mode built (`codex-daemon.md`, PR 1); Remote Control next.
+7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
+       deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
+       official. Findings and branch `codex-remote`:
+       `docs/working-archive/codex-daemon.md`. Open until these live
+       checks are done:
+       - a daemon-mode session's hooks through the real daemon into
+         rlord, once a release with the gate is installed (the payload
+         fields, a first SessionStart bound by folder);
+       - a daemon restart or update mid-turn, by hand (what the session
+         shows; `notLoaded` should read as not running, so it stops once
+         the pane is gone).
+       Linux is not a blocker (as in item 1): it is on the "After launch
+       (owed, daemon mode)" list in `docs/working-archive/codex-daemon.md`.
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
@@ -125,12 +136,15 @@ Dependabot version updates, grouped weekly.
 
 ## After launch (tracked)
 
+- Codex daemon mode: "After launch (owed, daemon mode)" in
+  `docs/working-archive/codex-daemon.md` (one issue each).
 - OpenCode: a draft in the input box doesn't hold a `send_to_session`.
 - Switching an existing overlord to another agent.
 - Narrower tool lists for Codex/OpenCode overlord subagents.
 - `session.subagents` reads unread sub-agent transcripts in full.
 - A hooked Codex session whose tmux session is killed stays "working".
-- Codex Remote Control (daemon mode is built: `codex-daemon.md`).
+- Codex Remote Control, once Codex makes it official (deferred; see
+  `docs/working-archive/codex-daemon.md`).
 - "↑/↓ N more" can't be clicked; the Groups tab has no more-counts.
 - `accent_dim` contrast on light themes.
 - Context-window table (`models::context_window`) upkeep.

@@ -258,19 +258,28 @@ Codex runs one app-server daemon per user; a TUI started without
 `--no-daemon` is a client of it, and the daemon runs the turn and its
 hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
-(`methods::session_new`), never for the overlord or a session whose flags
-need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
-`--disable` or `--search` in the TUI's own process). `spec_args` adds
-`--no-daemon` for every other Codex session. The rest is
-`daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
+(`methods::session_new`), never for the overlord or a session whose
+internal `extra_args` need the pane (only rlord's own wiring passes those;
+`codex::needs_embedded`: Codex runs any `-c` / `--config`, `--enable`,
+`--disable` or `--search`, in any of their spellings (`-cK=V`,
+`--config=V`, …), in the TUI's own process; `-m` / `--model` doesn't). So
+a daemon-mode pane can't be given `-c check_for_update_on_startup=false`
+(the overlord's) and, like an in-pane session, can open on Codex's update
+prompt. `spec_args` adds `--no-daemon` for every other Codex session. The
+rest is `daemon/src/codex_daemon.rs`, with the client in
+`agents::codex_server`. Daemon mode is plumbing: no new-session hint or
+list marker, only the details line (`codex  shared server · its turn goes
+on when the pane closes`).
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
-  environment of whatever started the daemon, never the session's. So a
-  daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
-  starts can't pass one on), and rlord starts the daemon itself
-  (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
-  `TMUX_PANE` removed) before such a pane when none runs. `rlord hook emit
-  codex` without `RLORD_SESSION_ID` reads the gate file
+  environment of whatever started the daemon. So a daemon-mode pane gets
+  no `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
+  on), and rlord starts the daemon itself (`codex app-server daemon
+  start`, `RLORD_SESSION_ID`, `TMUX` and `TMUX_PANE` removed) before such
+  a pane when none runs (asked at most once a minute, never failing the
+  launch; when none runs and rlord didn't start one, the pane's TUI does,
+  with the pane's environment, or runs the turn in the pane). `rlord hook
+  emit codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
   daemon-mode session's bound thread, and the folder of each still waiting
   for one) and sends only what it admits, marked `by: "thread"`; anything
@@ -290,11 +299,30 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
   (`thread/read`; the transcript when it can't be asked) every few passes
   and stops the session only once no turn runs; meanwhile it stays as the
   hooks say, logged once as `pane_gone_turn_running`.
+- **Fresh restarts don't interrupt**: `session_fresh` is used only for
+  the overlord ("Fresh restarts" below), which never runs on the daemon.
+  Used on a daemon-mode session, it would leave the turn running there
+  while a new thread starts.
 - **Stop and archive interrupt first**, before the DB lock: Escape into
   the pane when it is up with no dialog (it interrupts from any client),
   else `turn/interrupt`; then up to 4s for the turn to end. The answer and
   the log say `turn: interrupted | still_running`.
 - **Restart re-attaches** (`codex resume <id>` without `--no-daemon`).
+- **Launch, then bind; never create the thread first.** A thread made by
+  `thread/start` has no rollout until its first turn, so `codex resume
+  <id>` on it fails ("no rollout found for thread id"; 0.167.2 / daemon
+  0.169.0). The pane's TUI creates it; binding is as above.
+- **Another client on the same thread**: a turn started there streams
+  into the rlord pane, but the pane's composer reads as idle (`› Ask
+  Codex…`, no "esc to interrupt"), so `Agent::at_prompt` alone can't tell.
+  Its hooks are matched by thread, so the session turns working and
+  `send_to_session` and held deliveries wait; the gap is the moment before
+  that hook lands (without hooks, before the transcript is read), and the
+  whole turn for a thread the gate doesn't list (after `/clear` or `/new`). A
+  usage-limit resume doesn't wait on the status (it sends while working
+  too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
+  or the transcript past the limit), so its gap is the same moment.
+  Escape in either client interrupts.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)
@@ -955,7 +983,10 @@ including when the active one hits a usage limit.
   lowest `❯` line, where a `❯` under a `─` rule is the input box and
   higher ones are history; no OpenCode permission or question lines inside
   its bottom box). A status can't be trusted for this: a Codex session
-  without hooks reads as working while an approval is up. Sends also hold
+  without hooks reads as working while an approval is up. (A daemon-mode
+  Codex thread with a turn started from another client reads as at its
+  prompt: see "Another client on the same thread" under "Codex on its
+  shared background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
   placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
   isn't read yet), within 10s (`SETTLE`) of the last paste into that

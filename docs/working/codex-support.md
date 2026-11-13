@@ -23,7 +23,7 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
 | Messaging a session | overlord's Claude peer tools (`SendMessage`) | **`codex queue --thread <id> --message …`**: delivered without typing | better than Claude's; new rlord tool |
 | Overlord | `--mcp-config`, `--allowedTools`, `--effort`, `.claude/agents` | `-c mcp_servers.rlord.*` + `default_tools_approval_mode="approve"`, `-c model_reasoning_effort`, AGENTS.md (already written), `[agents]` | doable; later phase |
 | Models | opus/sonnet/haiku catalog | `codex debug models` / `models_cache.json` | per-agent catalog |
-| Remote Control | Claude app bridge | `codex remote-control` (experimental) | later; report unavailable |
+| Remote Control | Claude app bridge | `codex remote-control` (experimental) | deferred until Codex makes it official; reported unavailable |
 | Key shadows | Claude defaults + keybindings.json | `tui.keymap.*` (only `alt-r` default) | later; verify Alt-O/Alt-D by hand |
 
 ## Plan (phases)
@@ -43,7 +43,8 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
    under Progress. **Requirement before the repo goes public (Brandon's
    decision):** the overlord must run on Codex, and preferably on OpenCode
    too. Both do now.
-5. Later: Codex Remote Control, key shadows, Gemini.
+5. Later: key shadows, Gemini. Codex Remote Control: deferred until Codex
+   makes it official (`docs/working-archive/codex-daemon.md`).
 
 ## Decisions (with Brandon)
 
@@ -97,10 +98,11 @@ Phases 1 and 2 are built (branch `codex-support`).
 Since then, on the same branch:
 
 - Codex launches with `--no-daemon` (hooks must run in the pane) and
-  `--no-alt-screen` (tmux scrollback). Since then `[session]
-  codex_daemon` can put sessions on Codex's shared server instead:
-  `codex-daemon.md`. Verified against real Codex by the
-  lead: hooks bind, status, search, `exec fork` summary.
+  `--no-alt-screen` (tmux scrollback). Verified in-pane against real Codex
+  by the lead: hooks bind, status, search, `exec fork` summary. (Since
+  then `[session] codex_daemon` can put sessions on Codex's shared server
+  instead: `docs/architecture.md` ("Codex on its shared background
+  server"); residue in `docs/working-archive/codex-daemon.md`.)
 - **Install hints** (`core/src/agents/install.rs`): one table of each
   vendor's install commands (Claude Code, Codex, OpenCode), the one for
   this machine suggested by `rlord agents`, `list_agents` (MCP), the form
