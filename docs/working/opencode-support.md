@@ -366,10 +366,7 @@ and without a model and a restart of a session OpenCode no longer had.
 - `docs/architecture.md` got the OpenCode facts in its agent section; the
   larger reconcile owed by the Codex doc still stands.
 
-## Also queued: Codex Remote Control
+## Codex Remote Control: deferred
 
-Codex's Remote Control is machine-wide (`codex remote-control start/pair`)
-and reaches threads run by Codex's background app-server, not rlord's
-in-pane (`--no-daemon`) sessions. Supporting it means running remote Codex
-sessions through the app-server and matching their hooks by conversation
-id; it pairs naturally with a Codex overlord.
+Not supported until Codex makes it official (Brandon, 2026-11-13); findings
+and branch `codex-remote` in `docs/working-archive/codex-daemon.md`.

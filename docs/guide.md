@@ -335,7 +335,9 @@ and says so if it wouldn't stop. The overlord, and a session launched
 with flags that need the pane (`-c`, `--enable`, `--disable`,
 `--search`), stay in the pane. Not followed yet on the server: `/clear`
 or `/new` in the session (it stays on its first thread), and "needs you"
-from a sub-agent's prompt.
+from a sub-agent's prompt. Such a session can show Codex's "update
+available" prompt as it starts (rlord can't turn that off without
+`-c`).
 
 Not yet: importing Codex
 conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
