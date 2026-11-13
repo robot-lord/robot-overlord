@@ -48,6 +48,10 @@ session from last week decide? rlord is built around a few ideas:
   strong model at medium effort and keeps its own work light, delegating
   anything heavy: bulk upkeep and research go to subagents, real work
   becomes a session of its own.
+- **An overlord on each agent.** Out of usage on one? Switch the overlord
+  to Codex or OpenCode with a click or a key, and back again later: each
+  keeps its own conversation. Sessions stopped by a usage limit show when
+  it resets, and can pick up by themselves then if you ask.
 - **An overlord that doesn't bloat.** After sitting idle it starts a fresh
   conversation, and looks up what you talked about before only when you
   refer to it. The list shows when it last started fresh ("fresh 2h ago ·
@@ -167,7 +171,8 @@ from the last week"*.
   resume`, OpenCode's `-s`).
 - **The overlord is one agent session with rlord's tools** (an MCP
   server), floating over whatever you're looking at, on whichever agent
-  you choose (Claude Code, Codex, OpenCode). It runs a strong model at medium
+  you choose (Claude Code, Codex, OpenCode; one on each if you like, with
+  one active at a time). It runs a strong model at medium
   effort: look-ups, small edits and short answers it does itself; anything
   that takes more goes to a subagent or a new session, so it stays quick
   and its own conversation stays small.

@@ -117,6 +117,9 @@ pub struct TmuxKeys {
     /// From any pane: jump to rlord with the overlord overlay open; in rlord:
     /// toggle the overlay.
     pub overlord: String,
+    /// In the overlord's overlay: switch to the next agent's overlord (the
+    /// overlay reads it; tmux doesn't bind it). Empty = off.
+    pub overlord_switch: String,
     /// Agent sessions use your imported tmux profile (`rlord tmux import`):
     /// your prefix, bindings and status bar, in that session only. Turn it
     /// on/off per session with `rlord tmux profile` or `T` in the list.
@@ -136,6 +139,7 @@ impl Default for TmuxKeys {
             next: String::new(),
             prev: String::new(),
             overlord: "M-o".into(),
+            overlord_switch: "M-s".into(),
             profile: true,
             mouse: true,
         }
@@ -156,10 +160,35 @@ impl TmuxKeys {
         .map(|(k, v)| (k.as_str(), v))
         .collect()
     }
+
+    /// The tmux binding (`next`, `prev`, …) that also uses the overlay's
+    /// `overlord_switch` key, if one does. One key would then do two jobs
+    /// (in the overlay and out of it), so the switch key is off instead
+    /// (and the daemon warns).
+    pub fn switch_overlap(&self) -> Option<&'static str> {
+        let k = self.overlord_switch.trim();
+        if k.is_empty() {
+            return None;
+        }
+        self.bindings()
+            .into_iter()
+            .find(|(b, _)| b.trim() == k)
+            .map(|(_, verb)| verb)
+    }
+
+    /// `overlord_switch`, or "" (off) when a tmux binding takes it.
+    pub fn switch_key(&self) -> &str {
+        if self.switch_overlap().is_some() {
+            ""
+        } else {
+            &self.overlord_switch
+        }
+    }
 }
 
 /// The overlord: the long-running session you talk to in order to drive
-/// rlord itself (launch sessions, search, navigate, set views). One session:
+/// rlord itself (launch sessions, search, navigate, set views). One session
+/// (one per agent, if the user switches to another agent's):
 /// a strong model at medium effort, which does light work itself and sends
 /// anything heavier to a subagent or a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +498,24 @@ pub struct Config {
     pub tmux: TmuxKeys,
     pub archive: ArchiveConfig,
     pub update: UpdateConfig,
+    pub limits: LimitsConfig,
+}
+
+/// Sessions stopped by a usage limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// What a session is sent when it is resumed after its limit resets
+    /// (`resume_after_limit`, only when asked for).
+    pub resume_message: String,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            resume_message: "continue".into(),
+        }
+    }
 }
 
 /// `rlord update`: which releases it installs.
@@ -536,6 +583,7 @@ impl Default for Config {
             tmux: TmuxKeys::default(),
             archive: ArchiveConfig::default(),
             update: UpdateConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -700,6 +748,9 @@ claude_tui = "default"          # Claude's renderer here: "default" (inline: tmu
 # rlord's MCP tools; add your own standing instructions in
 # ~/.config/robot-overlord/overlord.md.
 # One session (Alt-O; Option-O on a Mac): a strong model at medium effort.
+# Each agent can have its own, with one active: switch in the overlay's top
+# row (or Alt-S there), or `rlord overlord switch <agent>`. `agent` here is
+# the first one's; `model` and `effort` apply to the overlord on `agent`.
 # It does light work itself (look-ups, small edits, short answers) and sends
 # anything heavier to a subagent or a new session.
 [overlord]
@@ -757,8 +808,10 @@ command = ":"           # command launcher (keys, sort, log, archived, …)
 [tmux]
 back = "M-d"    # back to the rlord TUI (or detach if you attached from outside tmux)
 next = ""       # e.g. "M-g"
-prev = ""       # e.g. "M-s"
+prev = ""       # e.g. "M-p"
 overlord = "M-o" # from any pane: the overlord over it
+overlord_switch = "M-s" # in the overlay: the next agent's overlord
+                        # (not the same key as back/next/prev/overlord)
 profile = true   # agent sessions use your tmux (after `rlord tmux import`)
 mouse = true     # click and scroll in the list, the overlay and agent panes
                  # (drag-select then needs Shift; Option in some macOS
@@ -780,6 +833,12 @@ summary_max_tokens = 150000   # bigger conversations: summarized from excerpts
 # (development builds, macOS only, included).
 [update]
 channel = "stable"
+
+# A session stopped by a usage limit shows "limited until <time>". Ask the
+# overlord (or `rlord resume-after-limit`) to pick it up when the limit
+# resets: it is sent this message then, if nobody touched it meanwhile.
+[limits]
+resume_message = "continue"
 "##;
 
 #[cfg(test)]
@@ -856,6 +915,12 @@ mod tests {
         assert_eq!(c.keys.attach, "enter");
         // back disabled, next/prev off by default; the overlord remains
         assert_eq!(c.tmux.bindings(), [("M-o", "overlord")]);
+        assert_eq!(c.tmux.switch_overlap(), None);
+        assert_eq!(c.tmux.switch_key(), "M-s");
+        let mut t = c.tmux.clone();
+        t.prev = "M-s".into();
+        assert_eq!(t.switch_overlap(), Some("prev"));
+        assert_eq!(t.switch_key(), "");
     }
 
     /// A config from the two-seat overlord: the mastermind's keys become

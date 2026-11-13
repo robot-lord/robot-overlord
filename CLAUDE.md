@@ -7,7 +7,12 @@ main way users drive rlord, and it does most of the upkeep: tagging sessions
 into groups, writing descriptions and notes, organizing the list. It only
 knows what its instructions and tool descriptions tell it.
 
-The overlord is one session, on a strong model at medium effort. Its built-in
+An overlord is one session, on a strong model at medium effort. There can
+be one per agent (Claude Code, Codex, OpenCode); exactly one is **active**
+and gets every request, and only the user switches which ("One per agent,
+one active" in `docs/architecture.md`). A feature that talks to the
+overlord uses the active one (`overlord::session`); one that keeps
+overlords healthy covers all of them (`overlord::all`). The built-in
 instructions are `crates/daemon/src/overlord.md`. They are compiled in and
 written to its folder as `CLAUDE.md`, `AGENTS.md` and `GEMINI.md` on every
 start, with the user's `~/.config/robot-overlord/overlord.md` appended.
@@ -15,6 +20,9 @@ It runs on Claude Code, Codex or OpenCode (`[overlord] agent`), so a
 feature that gives the overlord something (a tool, an allowed action, a
 subagent) must be wired for each agent: `overlord::write_files`, and
 "The overlord" in `docs/architecture.md` for how each differs.
+
+The same instructions go to every overlord, so they can't assume which
+agent is reading them or that it is the only one.
 
 `overlord.md` opens with one rule that every feature must respect: the overlord does only light work itself (look-ups,
 small edits to rlord's metadata, short answers); anything heavier goes to a

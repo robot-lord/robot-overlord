@@ -112,7 +112,7 @@ pub fn state(d: &Daemon) -> Result<Value> {
     let terminal = match &user {
         None => json!({"kind": "none", "note": "no terminal attached to tmux"}),
         Some(c) if Some(&c.session) == home.as_ref() => json!({"kind": "session_list"}),
-        Some(c) if c.session == overlord::TMUX_NAME => json!({"kind": "overlord"}),
+        Some(c) if overlord::is_tmux_name(&c.session) => json!({"kind": "overlord"}),
         Some(c) => {
             let db = d.db();
             let all = db.sessions(&SessionQuery {
@@ -188,7 +188,11 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         hide_overlord(d);
         return Ok(json!({"overlord": "hidden"}));
     }
-    if params.get("from").and_then(Value::as_str) == Some(overlord::TMUX_NAME) {
+    if params
+        .get("from")
+        .and_then(Value::as_str)
+        .is_some_and(overlord::is_tmux_name)
+    {
         return Ok(json!({"overlord": "already here"}));
     }
     if d.db().overlord()?.is_none() {
@@ -231,10 +235,17 @@ pub fn overlord(d: &Daemon, params: &Value) -> Result<Value> {
         tmux::shell_quote(&methods::rlord_bin()),
     );
     // When this conversation started and how many came before: the
-    // overlord restarts on a fresh one after sitting idle.
+    // overlord restarts on a fresh one after sitting idle. (With several
+    // agents to run an overlord on, the overlay's own switcher row says
+    // it, for whichever is active: this title can't change once open.)
+    let several = rlord_core::agents::Agent::ALL
+        .into_iter()
+        .filter(|a| rlord_core::agents::install::missing(*a).is_none())
+        .count()
+        > 1;
     let fresh = {
         let db = d.db();
-        let found = overlord::session(&db)?;
+        let found = overlord::session(&db)?.filter(|_| !several);
         found
             .map(|o| crate::recall::summary(&db, &o))
             .and_then(|v| crate::recall::fresh_label(&v))
@@ -336,14 +347,14 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         db.resolve_ref(&s.id)?
     };
     d.changed();
-    if overlord::is_overlord_role(&s.role) {
-        // Full screen: hand the window's size back from any overlay.
-        let _ = tmux::auto_size_window(overlord::TMUX_NAME);
-    }
     let t = s
         .tmux_session
         .as_deref()
         .context("session has no tmux session")?;
+    if overlord::is_overlord_role(&s.role) {
+        // Full screen: hand the window's size back from any overlay.
+        let _ = tmux::auto_size_window(t);
+    }
     hide_overlord(d);
     switch_user_to(t)?;
     Ok(json!({"switched_to": {"id": s.id, "name": s.name}}))

@@ -1,10 +1,22 @@
-//! The overlord: a singleton, long-running agent session whose job is to
-//! drive rlord itself. It is an ordinary session in every respect (tmux,
-//! hooks, resume) plus three things: `role = 'overlord'`, a fixed tmux name
-//! (so the TUI can embed it without a lookup), and rlord's MCP
-//! server wired in with its tools pre-allowed.
+//! The overlord: a long-running agent session whose job is to drive rlord
+//! itself. It is an ordinary session in every respect (tmux, hooks,
+//! resume) plus three things: `role = 'overlord'`, a fixed tmux name, and
+//! rlord's MCP server wired in with its tools pre-allowed.
 //!
-//! One session: a strong model at medium effort. It does light work itself and
+//! There can be one overlord per agent (Claude Code, Codex, OpenCode), and
+//! exactly one of them is **active**: the one the overlay shows and every
+//! request goes to (`n`, `rlord overlord ask`, Remote Control's "you").
+//! The others keep running in the background with their own conversation,
+//! and get nothing. The user switches by hand (`switch`): an agent's
+//! overlord is created the first time it is switched to, with that agent's
+//! defaults (`model_effort_for`), and switching back finds it where it
+//! was. Nothing switches by itself. In the DB each is a row with the
+//! overlord's role, told apart by its agent; kv `overlord_active` names
+//! the active one's id (none: the oldest, i.e. the one row an older
+//! install has). Each has its own folder and tmux session (`dir_for`,
+//! `free_tmux_name`).
+//!
+//! Each one: a strong model at medium effort. It does light work itself and
 //! sends anything heavier to a subagent or a new session (`overlord.md`).
 //! It is restarted on a fresh conversation once it has sat idle
 //! (`start_fresh_keeper`), and looks its own past up with `recall`
@@ -22,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::agents::{codex, opencode, transcript, Agent};
@@ -36,9 +48,13 @@ use crate::methods;
 
 /// The overlord's role in the DB, and its display name.
 pub const ROLE: &str = "overlord";
-/// Its fixed tmux session name (the overlay embeds its pane).
+/// The first overlord's tmux session name. One added later for another
+/// agent is `overlord-rlord-<agent>` (`free_tmux_name`). The overlay embeds
+/// the active one's pane.
 pub const TMUX_NAME: &str = "overlord-rlord";
-/// kv: when the overlord last started a fresh conversation (ms).
+/// kv: when an overlord last started a fresh conversation (ms), per
+/// overlord (`fresh_at`). On its own (no id): the one overlord of an
+/// older install.
 pub const FRESH_AT: &str = "overlord_fresh_at";
 /// kv: don't offer this default model for the overlord again.
 pub const DEFAULT_DECLINED: &str = "default_declined:overlord";
@@ -65,20 +81,91 @@ pub fn is_overlord_role(role: &str) -> bool {
     role == ROLE
 }
 
-/// The overlord's session, if it has been set up.
+/// The active overlord's session, if one has been set up.
 pub fn session(db: &Db) -> Result<Option<Session>> {
     db.overlord()
 }
 
-/// The folder a new overlord gets.
+/// Every overlord (one per agent at most), oldest first.
+pub fn all(db: &Db) -> Result<Vec<Session>> {
+    db.overlords()
+}
+
+/// The overlord that runs on `agent`, if it has been started.
+pub fn for_agent(db: &Db, agent: Agent) -> Result<Option<Session>> {
+    Ok(all(db)?.into_iter().find(|s| s.agent == agent.name()))
+}
+
+/// The first overlord's folder.
 fn default_dir() -> PathBuf {
     paths::data_dir().join(ROLE)
 }
 
-/// Every folder an overlord has run in: its conversations there are its
-/// own (full of searches), never search results.
+/// The folder an overlord added for `agent` gets when the first one's is
+/// taken.
+fn agent_dir(agent: Agent) -> PathBuf {
+    paths::data_dir().join(format!("{ROLE}-{}", agent.name()))
+}
+
+/// The folder a new overlord on `agent` gets: its own. Each agent finds
+/// its conversations by folder (Claude resumes and lists them per folder;
+/// a Codex thread is bound by where it started), so two overlords in one
+/// folder would see each other's. The first overlord gets the plain
+/// folder, any later one its agent's.
+fn dir_for(db: &Db, agent: Agent) -> Result<PathBuf> {
+    // (Not by comparing folders: a session's is stored resolved, and an
+    // overlord that began as the mastermind lives in neither.)
+    Ok(if all(db)?.is_empty() {
+        default_dir()
+    } else {
+        agent_dir(agent)
+    })
+}
+
+/// Every folder an overlord has run in or may: its conversations there
+/// are its own (full of searches), never search results.
 pub fn dirs() -> Vec<PathBuf> {
-    vec![default_dir(), paths::data_dir().join(OLD_MASTERMIND)]
+    let mut v = vec![default_dir(), paths::data_dir().join(OLD_MASTERMIND)];
+    v.extend(Agent::ALL.into_iter().map(agent_dir));
+    v
+}
+
+/// Whether `name` is an overlord's tmux session name.
+pub fn is_tmux_name(name: &str) -> bool {
+    name == TMUX_NAME
+        || name
+            .strip_prefix(TMUX_NAME)
+            .and_then(|r| r.strip_prefix('-'))
+            .is_some_and(|a| Agent::parse(a).is_some())
+}
+
+/// The tmux name for an overlord on `agent` that has none of its own yet:
+/// the plain one while no other overlord holds it.
+pub fn free_tmux_name(db: &Db, agent: &str) -> String {
+    if db.tmux_name_taken(TMUX_NAME).unwrap_or(false) {
+        format!("{TMUX_NAME}-{}", agent.trim())
+    } else {
+        TMUX_NAME.to_string()
+    }
+}
+
+fn fresh_at_key(id: &str) -> String {
+    format!("{FRESH_AT}:{id}")
+}
+
+/// When overlord `id` last started a fresh conversation (0: never known).
+pub fn fresh_at(db: &Db, id: &str) -> Result<i64> {
+    let v = match db.kv_get(&fresh_at_key(id))? {
+        Some(v) => Some(v),
+        // (From before there could be several.)
+        None => db.kv_get(FRESH_AT)?,
+    };
+    Ok(v.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Overlord `id` starts a fresh conversation now (`ts`).
+pub fn set_fresh_at(db: &Db, id: &str, ts: i64) -> Result<()> {
+    db.kv_set(&fresh_at_key(id), &ts.to_string())
 }
 
 /// User-authored standing instructions appended to the generated ones.
@@ -306,21 +393,111 @@ fn claude_allowed_tools(confirm_sends: bool) -> String {
     tools.join(",")
 }
 
-/// Make sure the overlord exists and is running; returns its session.
-/// Creates it on first use (with `agent` / `model` / `effort` /
-/// `remote_control` from params, else config), restarts it (resuming the
-/// conversation) if stopped. An existing overlord's model is its own —
-/// changed only via `set_model`.
+/// Make sure the active overlord exists and is running; returns its
+/// session. Creates the first one on first use (with `agent` / `model` /
+/// `effort` / `remote_control` from params, else config), restarts it
+/// (resuming the conversation) if stopped. An existing overlord's model is
+/// its own — changed only via `set_model`.
 pub fn ensure(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
-    let v = ensure_running(db, cfg, params)?;
-    style(cfg);
+    let cur = session(db)?;
+    ensure_one(db, cfg, cur, params)
+}
+
+/// `ensure` for overlord `id`, active or not (the Remote Control keeper).
+pub fn ensure_session(db: &Db, cfg: &Config, id: &str) -> Result<Value> {
+    let s = db.resolve_ref(id)?;
+    if !is_overlord_role(&s.role) {
+        bail!("{} is not an overlord", s.name);
+    }
+    ensure_one(db, cfg, Some(s), &json!({}))
+}
+
+/// `ensure` for one overlord: `cur`, or (None) a new one from `params`.
+fn ensure_one(db: &Db, cfg: &Config, cur: Option<Session>, params: &Value) -> Result<Value> {
+    let v = ensure_running(db, cfg, cur, params)?;
+    style(db, cfg);
     // The user's keys and the window name, on every path that starts it.
-    if let Some(s) = session(db)? {
+    if let Some(s) = v["id"].as_str().and_then(|id| db.resolve_ref(id).ok()) {
         if let Err(e) = crate::profile::sync(db, cfg, &s, false) {
             tracing::debug!(error = %e, "syncing the overlord's tmux");
         }
     }
     Ok(v)
+}
+
+/// Make the overlord on `agent` the active one, starting it if it isn't
+/// running and creating it the first time (that agent's default model and
+/// effort). The one it replaces keeps running, untouched: switching back
+/// finds its conversation where it was. Returns the now-active session
+/// with `switched` (false: it already was).
+pub fn switch(db: &Db, cfg: &Config, agent: &str) -> Result<Value> {
+    let agent = Agent::named(agent)?;
+    if let Some(why) = rlord_core::agents::install::missing(agent) {
+        bail!("{why}");
+    }
+    let before = session(db)?;
+    if before.is_none() {
+        // Nothing to switch from: this is setting the overlord up.
+        let mut v = ensure(db, cfg, &json!({"agent": agent.name()}))?;
+        v["switched"] = json!(true);
+        v["created"] = json!(true);
+        return Ok(v);
+    }
+    let target = for_agent(db, agent)?;
+    let created = target.is_none();
+    let mut v = ensure_one(db, cfg, target, &json!({"agent": agent.name()}))?;
+    let id = v["id"].as_str().context("no session id")?.to_string();
+    let switched = before.as_ref().is_some_and(|b| b.id != id);
+    if switched {
+        db.set_active_overlord(&id)?;
+        db.insert_event(
+            &id,
+            rlord_core::types::now_ms(),
+            "overlord_active",
+            &json!({"from": before.map(|b| b.agent), "created": created}).to_string(),
+        )?;
+        tracing::info!(
+            agent = agent.name(),
+            created,
+            "switched the active overlord"
+        );
+    }
+    v["switched"] = json!(switched);
+    v["created"] = json!(created);
+    Ok(v)
+}
+
+/// The agents an overlord can run on, for the switchers (the overlay's
+/// bar, the list's menu and row, `rlord overlord switch`): each with
+/// whether it is installed, has an overlord, is the active one, and is up.
+/// Starts nothing. Takes `roster_rows`, read under the DB guard and
+/// passed in once it is dropped: this runs tmux and the install checks.
+pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
+    Agent::ALL
+        .into_iter()
+        .map(|a| {
+            let o = all.iter().find(|s| s.agent == a.name());
+            let running = o.is_some_and(|s| {
+                s.status != Status::Stopped
+                    && s.tmux_session.as_deref().is_some_and(tmux::has_session)
+            });
+            json!({
+                "agent": a.name(), "label": a.label(),
+                "installed": rlord_core::agents::install::missing(a).is_none(),
+                "exists": o.is_some(),
+                "active": o.is_some_and(|s| Some(&s.id) == active.as_ref()),
+                "running": running,
+                "id": o.map(|s| s.id.clone()),
+                "status": o.map(|s| s.status),
+                "tmux_session": o.and_then(|s| s.tmux_session.clone()),
+            })
+        })
+        .collect()
+}
+
+/// What `roster` needs from the DB: every overlord, and the active one's id.
+pub fn roster_rows(db: &Db) -> Result<(Vec<Session>, Option<String>)> {
+    Ok((all(db)?, session(db)?.map(|s| s.id)))
 }
 
 /// The overlay popup's style: a wash of the overlord's colour.
@@ -336,10 +513,17 @@ pub fn color(cfg: &Config) -> String {
         .tmux()
 }
 
-/// Its tmux bar: viewed full screen it should be unmistakable, otherwise it
-/// looks like any session. Re-run when the theme changes (`overlord.style`).
-pub fn style(cfg: &Config) {
-    if !tmux::has_session(TMUX_NAME) {
+/// Each overlord's tmux bar: viewed full screen it should be unmistakable,
+/// otherwise it looks like any session. Re-run when the theme changes
+/// (`overlord.style`).
+pub fn style(db: &Db, cfg: &Config) {
+    let names: Vec<String> = all(db)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| s.tmux_session)
+        .filter(|t| tmux::has_session(t))
+        .collect();
+    if names.is_empty() {
         return;
     }
     let p = themes::resolve(&cfg.theme, themes::system_is_dark());
@@ -352,16 +536,18 @@ pub fn style(cfg: &Config) {
         "#[bold] ◆ OVERLORD #[nobold]· {} list  ",
         rlord_core::tmux::key_label(back)
     );
-    if let Err(e) = tmux::style_session(
-        TMUX_NAME,
-        &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
-        &label,
-    ) {
-        tracing::debug!(error = %e, "styling the overlord's session");
+    for name in names {
+        if let Err(e) = tmux::style_session(
+            &name,
+            &format!("bg={},fg={}", p.overlord.tmux(), p.on_accent.tmux()),
+            &label,
+        ) {
+            tracing::debug!(error = %e, "styling the overlord's session");
+        }
     }
 }
 
-fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+fn ensure_running(db: &Db, cfg: &Config, cur: Option<Session>, params: &Value) -> Result<Value> {
     let pick = |k: &str| {
         params
             .get(k)
@@ -370,7 +556,7 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
-    match session(db)? {
+    match cur {
         None => {
             let agent_name = pick("agent").unwrap_or_else(|| cfg.overlord.agent.clone());
             let agent = Agent::named(&agent_name)?;
@@ -384,11 +570,17 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                 Some(e) => e.trim().to_string(),
                 None => dflt_effort,
             };
-            let d = default_dir();
+            if for_agent(db, agent)?.is_some() {
+                bail!("there is already an overlord on {}", agent.label());
+            }
+            let first = all(db)?.is_empty();
+            let d = dir_for(db, agent)?;
             let extra_args = write_files(&d, agent, &effort, cfg.overlord.confirm_sends)?;
             // Created now, with a model the user chose (or the default): never
             // "offer the default" back to it.
-            db.kv_set(DEFAULT_DECLINED, cfg.overlord.model.trim())?;
+            if first || cfg.overlord.agent.trim() == agent.name() {
+                db.kv_set(DEFAULT_DECLINED, cfg.overlord.model.trim())?;
+            }
             let remote =
                 params["remote_control"].as_bool().unwrap_or(false) && agent.has_remote_control();
             let v = methods::session_new(
@@ -401,13 +593,18 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                     "name": ROLE,
                     "model": model,
                     "role": ROLE,
-                    "tmux_name": TMUX_NAME,
+                    "tmux_name": free_tmux_name(db, agent.name()),
                     "extra_args": extra_args,
                     "remote_control": remote,
                 }),
             )?;
             // Its first conversation starts now.
-            db.kv_set(FRESH_AT, &rlord_core::types::now_ms().to_string())?;
+            if let Some(id) = v["id"].as_str() {
+                set_fresh_at(db, id, rlord_core::types::now_ms())?;
+                if first {
+                    db.set_active_overlord(id)?;
+                }
+            }
             Ok(v)
         }
         Some(s) => {
@@ -435,7 +632,7 @@ fn ensure_running(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                 && !crate::discover::bind_now(db, &s)?;
             if unbound {
                 let v = methods::session_fresh(db, &json!({"ref": s.id, "reason": "unbound"}))?;
-                db.kv_set(FRESH_AT, &rlord_core::types::now_ms().to_string())?;
+                set_fresh_at(db, &s.id, rlord_core::types::now_ms())?;
                 return Ok(v);
             }
             methods::session_restart(db, &json!({"ref": s.id}))
@@ -478,10 +675,23 @@ pub fn start_fresh_keeper(d: &std::sync::Arc<crate::Daemon>) {
     });
 }
 
+/// Every overlord is looked at, active or not: each has its own
+/// conversation to keep small.
 fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
-    let Some(s) = session(&d.db())? else {
-        return Ok(());
+    let (overlords, active) = {
+        let db = d.db();
+        (all(&db)?, session(&db)?.map(|s| s.id))
     };
+    for s in overlords {
+        let is_active = Some(&s.id) == active.as_ref();
+        if let Err(e) = fresh_one_if_idle(d, s, is_active, mins) {
+            tracing::debug!(error = %e, "overlord fresh start");
+        }
+    }
+    Ok(())
+}
+
+fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> Result<()> {
     // Only between turns: idle, or "waiting for input" (Claude flips an idle
     // session to that about a minute after its turn). Whether it actually
     // asked the user something is checked below.
@@ -503,11 +713,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         return Ok(());
     }
     // Nothing new since the last fresh start: nothing to clear.
-    let fresh_at: i64 = d
-        .db()
-        .kv_get(FRESH_AT)?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let fresh_at = fresh_at(&d.db(), &s.id)?;
     if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
         return Ok(());
     }
@@ -523,12 +729,15 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
     }
     // ...and that reply didn't ask the user something (a question, or a form
     // to confirm): then it's waiting on them, whatever the status says.
-    if waiting_on_user(d, &s)? {
+    if waiting_on_user(d, &s, active)? {
         return Ok(());
     }
-    // Someone is looking at it: its overlay is open, or a terminal shows it.
-    let overlay_open = d.overlay.lock().expect("ui mutex").is_some();
-    let attached = tmux::list_clients().iter().any(|c| c.session == TMUX_NAME);
+    // Someone is looking at it: its overlay is open (the active one's), or
+    // a terminal shows it.
+    let overlay_open = active && d.overlay.lock().expect("ui mutex").is_some();
+    let attached = tmux::list_clients()
+        .iter()
+        .any(|c| Some(c.session.as_str()) == s.tmux_session.as_deref());
     if overlay_open || attached {
         return Ok(());
     }
@@ -540,7 +749,7 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
         let _session = d.sessions.lock(&s.id);
         let db = d.db();
         // Re-check under the lock: a request may have just landed.
-        let cur = session(&db)?.context("overlord vanished")?;
+        let cur = db.resolve_ref(&s.id).context("overlord vanished")?;
         if !matches!(cur.status, Status::Idle | Status::WaitingInput)
             || cur.last_user_msg_at != s.last_user_msg_at
         {
@@ -552,23 +761,28 @@ fn fresh_if_idle(d: &crate::Daemon, mins: u64) -> Result<()> {
             &db,
             &json!({"ref": s.id, "reason": "idle", "idle_mins": mins}),
         )?;
-        db.kv_set(FRESH_AT, &now.to_string())?;
+        set_fresh_at(&db, &s.id, now)?;
     }
-    tracing::info!("overlord idle: restarted on a fresh conversation");
+    tracing::info!(agent = %s.agent, "overlord idle: restarted on a fresh conversation");
     d.changed();
     Ok(())
 }
 
 /// Whether the overlord's last turn waits on the user: its reply ends in a
 /// question, or a new-session form it reopened is still out for confirming.
-fn waiting_on_user(d: &crate::Daemon, s: &rlord_core::types::Session) -> Result<bool> {
-    // A reopened form counts for an hour (it may have been dismissed).
+fn waiting_on_user(
+    d: &crate::Daemon,
+    s: &rlord_core::types::Session,
+    active: bool,
+) -> Result<bool> {
+    // A reopened form counts for an hour (it may have been dismissed). It
+    // was the active overlord that reopened it.
     let pending: i64 = d
         .db()
         .kv_get("confirm_pending")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if rlord_core::types::now_ms() - pending < 60 * 60_000 {
+    if active && rlord_core::types::now_ms() - pending < 60 * 60_000 {
         return Ok(true);
     }
     let Some(src) = d.db().transcript_source(&s.id)? else {
@@ -596,6 +810,8 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         "default_model": cfg.overlord.model,
         "default_effort": cfg.overlord.effort,
     });
+    // Which agents an overlord runs on, has one, and which is active.
+    out["overlords"] = roster(roster_rows(db)?);
     let Some(s) = session(db)? else {
         out["exists"] = json!(false);
         // The agents it can run on (installed ones), each with what the
@@ -1048,6 +1264,93 @@ mod tests {
             role,
         })
         .unwrap();
+    }
+
+    fn overlord_row(db: &Db, id: &str, agent: &str, tmux: &str, dir: &str, created_at: i64) {
+        db.insert_session(&rlord_core::db::NewSession {
+            id,
+            name: ROLE,
+            agent,
+            agent_session: None,
+            project_path: dir,
+            tmux_session: Some(tmux),
+            launch_spec: "{}",
+            created_at,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: ROLE,
+        })
+        .unwrap();
+    }
+
+    /// One overlord per agent, exactly one active: the one row of an older
+    /// install without being told, then whichever was switched to.
+    #[test]
+    fn one_overlord_per_agent_and_one_is_active() {
+        let db = Db::open_in_memory().unwrap();
+        let first = default_dir().to_string_lossy().into_owned();
+        // Nothing yet: the first gets the plain folder and tmux name.
+        assert_eq!(dir_for(&db, Agent::Codex).unwrap(), default_dir());
+        assert_eq!(free_tmux_name(&db, "codex"), TMUX_NAME);
+        // An install from before: one row, no kv. It is the active one.
+        overlord_row(&db, "01a", "claude", TMUX_NAME, &first, 10);
+        db.kv_set(FRESH_AT, "42").unwrap();
+        assert_eq!(session(&db).unwrap().unwrap().id, "01a");
+        assert_eq!(fresh_at(&db, "01a").unwrap(), 42);
+        // A second agent's gets its own folder and tmux name.
+        assert_eq!(dir_for(&db, Agent::Codex).unwrap(), agent_dir(Agent::Codex));
+        let name = free_tmux_name(&db, "codex");
+        assert_eq!(name, "overlord-rlord-codex");
+        let dir = agent_dir(Agent::Codex).to_string_lossy().into_owned();
+        overlord_row(&db, "01b", "codex", &name, &dir, 20);
+        // Still the first, until the user switches.
+        assert_eq!(session(&db).unwrap().unwrap().id, "01a");
+        assert_eq!(all(&db).unwrap().len(), 2);
+        db.set_active_overlord("01b").unwrap();
+        assert_eq!(session(&db).unwrap().unwrap().agent, "codex");
+        // "overlord" (every one's name) means the active one.
+        assert_eq!(db.resolve_ref("overlord").unwrap().id, "01b");
+        assert_eq!(for_agent(&db, Agent::Claude).unwrap().unwrap().id, "01a");
+        assert!(for_agent(&db, Agent::OpenCode).unwrap().is_none());
+        // Each keeps its own "fresh" clock.
+        set_fresh_at(&db, "01b", 99).unwrap();
+        assert_eq!(fresh_at(&db, "01b").unwrap(), 99);
+        assert_eq!(fresh_at(&db, "01a").unwrap(), 42);
+        // Both are fixed rows, and neither is in the session list.
+        assert!(all(&db).unwrap().iter().all(|s| is_overlord_role(&s.role)));
+        assert!(db.list_sessions(true).unwrap().is_empty());
+        // The active one gone (never in practice): back to the oldest.
+        db.set_active_overlord("nope").unwrap();
+        assert_eq!(session(&db).unwrap().unwrap().id, "01a");
+
+        let roster = roster(roster_rows(&db).unwrap());
+        let of = |a: &str| {
+            roster
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["agent"] == a)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(of("claude")["active"], true);
+        assert_eq!(of("codex")["exists"], true);
+        assert_eq!(of("codex")["active"], false);
+        assert_eq!(of("opencode")["exists"], false);
+    }
+
+    #[test]
+    fn overlord_tmux_names() {
+        assert!(is_tmux_name("overlord-rlord"));
+        assert!(is_tmux_name("overlord-rlord-codex"));
+        assert!(is_tmux_name("overlord-rlord-opencode"));
+        assert!(!is_tmux_name("overlord-rlord-2"));
+        assert!(!is_tmux_name("overlord-rlordx"));
+        assert!(!is_tmux_name("web-rlord"));
+        // Every folder an overlord may run in is known to search.
+        assert!(dirs().contains(&agent_dir(Agent::Codex)));
+        assert!(dirs().contains(&default_dir()));
     }
 
     #[test]

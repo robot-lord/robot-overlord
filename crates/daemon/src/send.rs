@@ -194,7 +194,7 @@ fn agent_pane(s: &Session) -> Result<String> {
 
 /// Type a message into session `s` (read under its lock, just now), after
 /// the last checks (`type_into`).
-fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed> {
+pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed> {
     let pane = agent_pane(s)?;
     let overlay = d
         .overlay

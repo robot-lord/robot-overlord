@@ -14,6 +14,9 @@
 //! - the list: "fresh 2h ago · 14 earlier" on the overlord's row, its past
 //!   conversations in the details pane, one of them in the preview.
 //!
+//! With an overlord on more than one agent, the list shows the active
+//! one's own conversations; `recall` reads every overlord's (`pasts`).
+//!
 //! Plain code, no model call; every answer is bounded.
 
 use std::collections::{HashMap, VecDeque};
@@ -329,41 +332,94 @@ const RECALL_LIMIT: usize = 6;
 /// Characters a digest's exchanges may take in all.
 const DIGEST_BUDGET: usize = 6_000;
 
-/// `overlord.recall {query?, conversation?, limit?}`: the overlord's own
-/// earlier conversations. With `query`: the ones that mention every word,
-/// newest first, each with a few short dated snippets. Without: a digest of
-/// the previous conversation (or `conversation`, by id): what the user
-/// asked and what the overlord answered, clipped.
+/// A conversation `recall` can reach, and whose it was.
+struct Past {
+    o: Session,
+    c: Conv,
+    /// When it ended; for another overlord's current one, when it was
+    /// last spoken in.
+    when: Option<i64>,
+}
+
+/// What `recall` reads: every overlord's earlier conversations, and the
+/// *other* overlords' current ones, newest first. Across all of them on
+/// purpose: to the user there is one overlord desk, and they switch agents
+/// by hand (often because one hit its usage limit), so "as I said
+/// earlier" may well have been said to the other one. Only the active
+/// overlord's own current conversation is left out: it is in its context.
+fn pasts(d: &Daemon) -> Result<Vec<Past>> {
+    let db = d.db();
+    let active = overlord::session(&db)?.context("no overlord yet")?;
+    let mut out = Vec::new();
+    for o in overlord::all(&db)? {
+        let (cur, earlier) = list(&db, &o)?;
+        if o.id != active.id {
+            if let Some(c) = cur {
+                let when = o.last_user_msg_at.max(o.last_agent_msg_at);
+                out.push(Past {
+                    o: o.clone(),
+                    c,
+                    when,
+                });
+            }
+        }
+        out.extend(earlier.into_iter().map(|c| Past {
+            o: o.clone(),
+            when: c.ended_at,
+            c,
+        }));
+    }
+    out.sort_by(|a, b| b.when.cmp(&a.when).then(b.c.id.cmp(&a.c.id)));
+    Ok(out)
+}
+
+fn find_past<'a>(pasts: &'a [Past], id: &str) -> Result<&'a Past> {
+    let id = id.trim();
+    let mut m = pasts.iter().filter(|p| p.c.id.starts_with(id));
+    match (m.next(), m.next()) {
+        (Some(p), None) if !id.is_empty() => Ok(p),
+        (Some(_), Some(_)) => bail!("more than one earlier conversation starts with {id:?}"),
+        _ => bail!("no earlier conversation {id:?}"),
+    }
+}
+
+/// `overlord.recall {query?, conversation?, limit?}`: with a query, search
+/// the overlords' earlier conversations (`pasts`); without, a digest of
+/// the previous one (or of `conversation`).
 pub fn recall(d: &Daemon, params: &Value) -> Result<Value> {
-    let (o, _, earlier) = load(d)?;
+    let pasts = pasts(d)?;
     let ago = |ts: Option<i64>| ts.map(|t| format!("{} ago", rel_age(Some(t))));
+    // Whose it was, said only when there is more than one overlord.
+    let several = overlord::all(&d.db())?.len() > 1;
+    let whose = |p: &Past| several.then(|| p.o.agent.clone());
     let query = params["query"].as_str().unwrap_or("").trim();
     if !query.is_empty() {
         let limit = params["limit"]
             .as_u64()
             .map_or(RECALL_LIMIT, |n| n.clamp(1, 15) as usize);
-        let mut by_path: HashMap<PathBuf, &Conv> = HashMap::new();
+        let mut by_path: HashMap<PathBuf, &Past> = HashMap::new();
         let mut paths = Vec::new();
-        for c in &earlier {
-            if let Some(p) = transcript_of(&d.db(), &o, &c.id) {
-                by_path.insert(p.clone(), c);
-                paths.push(p);
+        for p in &pasts {
+            if let Some(path) = transcript_of(&d.db(), &p.o, &p.c.id) {
+                by_path.insert(path.clone(), p);
+                paths.push(path);
             }
         }
-        let mut found: Vec<(&Conv, history::FileHits)> = history::search(&paths, query, 3)
+        let mut found: Vec<(&Past, history::FileHits)> = history::search(&paths, query, 3)
             .into_iter()
             .filter_map(|fh| Some((*by_path.get(&fh.path)?, fh)))
             .collect();
-        found.sort_by_key(|(c, _)| std::cmp::Reverse(c.ended_at));
+        found.sort_by_key(|(p, _)| std::cmp::Reverse(p.when));
         let total = found.len();
         let rows: Vec<Value> = found
             .into_iter()
             .take(limit)
-            .map(|(c, fh)| {
+            .map(|(p, fh)| {
                 json!({
-                    "conversation": c.id,
-                    "ended": ago(c.ended_at),
-                    "ended_at": c.ended_at.map(fmt_ts),
+                    "conversation": p.c.id,
+                    "overlord": whose(p),
+                    "ended": ago(p.c.ended_at),
+                    "ended_at": p.c.ended_at.map(fmt_ts),
                     "transcript": fh.path,
                     "mentions": fh.total,
                     "hits": fh.hits,
@@ -375,32 +431,31 @@ pub fn recall(d: &Daemon, params: &Value) -> Result<Value> {
             "conversations": rows,
             "more": total.saturating_sub(limit),
             "searched": paths.len(),
-            "note": "your own earlier conversations only (search_history covers the sessions). \
-                     read_history with a `transcript` and a hit's `line` reads around it",
+            "note": "the overlord's own earlier conversations only, on every agent it runs on \
+                     (search_history covers the sessions). read_history with a `transcript` \
+                     and a hit's `line` reads around it",
         }));
     }
-    // A digest: the one asked for, else the latest that said anything.
     let pick = match params["conversation"].as_str().map(str::trim) {
         Some(id) if !id.is_empty() => {
-            let c = find(&earlier, id)?;
-            let p = transcript_of(&d.db(), &o, &c.id)
+            let p = find_past(&pasts, id)?;
+            let path = transcript_of(&d.db(), &p.o, &p.c.id)
                 .context("that conversation's transcript is no longer on disk")?;
-            Some((c, digest(&p)))
+            Some((p, digest(&path)))
         }
-        _ => earlier.iter().take(20).find_map(|c| {
-            // (The path first: the DB isn't held while the file is read.)
-            let p = transcript_of(&d.db(), &o, &c.id)?;
-            let dg = digest(&p);
-            (dg.turns > 0).then_some((c, dg))
+        _ => pasts.iter().take(20).find_map(|p| {
+            let path = transcript_of(&d.db(), &p.o, &p.c.id)?;
+            let dg = digest(&path);
+            (dg.turns > 0).then_some((p, dg))
         }),
     };
-    let Some((c, dg)) = pick else {
+    let Some((p, dg)) = pick else {
         return Ok(json!({
-            "earlier": earlier.len(),
+            "earlier": pasts.len(),
             "note": "no earlier conversation with anything in it",
         }));
     };
-    // Within budget, dropping the oldest exchanges first.
+    let c = &p.c;
     let mut used = 0;
     let mut kept: Vec<Value> = Vec::new();
     for (at, you, reply) in dg.exchanges.iter().rev() {
@@ -413,24 +468,64 @@ pub fn recall(d: &Daemon, params: &Value) -> Result<Value> {
     kept.reverse();
     Ok(json!({
         "conversation": c.id,
+        "overlord": whose(p),
         "started": ago(c.started_at.or(dg.first_at)),
         "ended": ago(c.ended_at),
-        "why_it_ended": why(c),
+        "why_it_ended": if c.ended_at.is_some() {
+            why(c)
+        } else {
+            format!("still open on the {} overlord (the user switched to you)", p.o.agent)
+        },
         "turns": dg.turns,
         "exchanges_shown": kept.len(),
         "exchanges": kept,
-        "earlier": earlier.len(),
-        "note": "the last exchanges of your previous conversation, clipped. `query` searches all \
-                 your earlier conversations; `conversation` (an id from a search) digests another",
+        "earlier": pasts.len(),
+        "note": "the last exchanges of the previous conversation, clipped. `query` searches all \
+                 the earlier conversations; `conversation` (an id from a search) digests another",
     }))
+}
+
+/// `overlord.continue {id}` for a conversation another agent's overlord
+/// had: switch to that overlord, then continue it there (if it isn't
+/// that overlord's current one already). None: it is the active one's.
+fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
+    let (active, _, earlier) = load(d)?;
+    if find(&earlier, id).is_ok() {
+        return Ok(None);
+    }
+    let pasts = pasts(d)?;
+    let Ok(p) = find_past(&pasts, id) else {
+        return Ok(None);
+    };
+    if p.o.id == active.id {
+        return Ok(None);
+    }
+    let (conv, agent) = (p.c.id.clone(), p.o.agent.clone());
+    let current = p.o.agent_session.as_deref() == Some(conv.as_str());
+    let switched = d.rpc("overlord.switch", json!({"agent": agent}))?;
+    if current {
+        return Ok(Some(
+            json!({"continued": conv, "switched_to": agent, "session": switched}),
+        ));
+    }
+    let mut v = continue_conversation(d, &json!({"id": conv}))?;
+    v["switched_to"] = json!(agent);
+    Ok(Some(v))
 }
 
 /// `overlord.continue {id}`: go back to an earlier conversation. The
 /// overlord is restarted resuming it, and the current one ends (it stays in
-/// the list), as at an idle restart. Only between turns.
+/// the list), as at an idle restart. Only between turns. One another
+/// agent's overlord had (from `recall`): that overlord is switched to
+/// first (`continue_elsewhere`).
 pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     // (Where the agent's command is: asked before any lock is taken.)
     rlord_core::agents::install::warm();
+    // Another agent's overlord's: switch to it first (before any lock:
+    // the switch takes its own).
+    if let Some(v) = continue_elsewhere(d, params["id"].as_str().unwrap_or(""))? {
+        return Ok(v);
+    }
     // Nothing may be pasted into the pane while it's being replaced.
     let _send = d.overlord_send.lock().expect("overlord send lock");
     let _session = d.lock_overlord();
@@ -455,7 +550,7 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     // (The agent wrote it: it is there to resume.)
     db.set_agent_session(&o.id, &c.id, "hook")?;
     db.upsert_transcript_source(&o.id, &path.to_string_lossy())?;
-    db.kv_set(overlord::FRESH_AT, &now.to_string())?;
+    overlord::set_fresh_at(&db, &o.id, now)?;
     // Exactly one restart onto the conversation: `ensure` restarts it when
     // it isn't running (stopped, or its pane is gone) and leaves a running
     // one alone, which is restarted here.

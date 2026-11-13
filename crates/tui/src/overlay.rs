@@ -6,6 +6,12 @@
 //!
 //! Option-O (or Option-D) closes it: inside a popup, keys reach this program
 //! rather than tmux's key table, so the key that opened it closes it.
+//!
+//! With more than one agent installed, the top row is a switcher: each
+//! agent's marker, the active overlord's highlighted. A click on one, or
+//! the switch key (`[tmux] overlord_switch`, Option-S), makes that agent's
+//! overlord the active one and shows its pane instead, without closing
+//! the overlay (`View`, `SwitchBar`).
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +19,7 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Text;
@@ -31,7 +37,6 @@ const FRAME_MS: u64 = 40;
 /// `token` identifies this overlay to the daemon (it was minted when the
 /// daemon opened the popup).
 pub fn run(token: Option<u64>) -> Result<()> {
-    let pane = tmux::pane_id(overlord::TMUX_NAME)?;
     let report = |open: bool| {
         let _ = client_call(
             &paths::socket_path(),
@@ -51,14 +56,7 @@ pub fn run(token: Option<u64>) -> Result<()> {
         &cfg.theme,
         rlord_core::themes::system_is_dark(),
     ));
-    // The user's tmux prefix there (prefix then `[` enters copy mode).
-    let prefix = tmux::session_option(overlord::TMUX_NAME, "prefix")
-        .ok()
-        .and_then(|p| parse_key(&p));
-    let r = run_loop(&mut terminal, &pane, &keys, prefix);
-    // Never leave the overlord in copy mode: what's sent to it next would be
-    // taken by the mode's keys.
-    let _ = tmux::cancel_mode(&pane);
+    let r = show(&mut terminal, &keys);
     let _ = ratatui::crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
@@ -66,17 +64,198 @@ pub fn run(token: Option<u64>) -> Result<()> {
     );
     ratatui::restore();
     report(false);
-    // The window follows clients again once nobody is embedding it.
-    let _ = tmux::auto_size_window(overlord::TMUX_NAME);
     r
+}
+
+/// Show the active overlord until the overlay is closed; when the user
+/// switches, the newly active one, in the same overlay.
+fn show(terminal: &mut ratatui::DefaultTerminal, keys: &OverlayKeys) -> Result<()> {
+    // Why the last switch didn't happen (shown in the switcher).
+    let mut notice: Option<String> = None;
+    loop {
+        let view = View::load(keys, notice.take());
+        let pane = tmux::pane_id(&view.tmux)?;
+        // The user's tmux prefix there (prefix then `[` enters copy mode).
+        let prefix = tmux::session_option(&view.tmux, "prefix")
+            .ok()
+            .and_then(|p| parse_key(&p));
+        let exit = run_loop(terminal, &view, &pane, keys, prefix);
+        // Never leave the overlord in copy mode: what's sent to it next
+        // would be taken by the mode's keys.
+        let _ = tmux::cancel_mode(&pane);
+        // The window follows clients again once nobody is embedding it.
+        let _ = tmux::auto_size_window(&view.tmux);
+        match exit? {
+            Exit::Close => return Ok(()),
+            Exit::Switch(agent) => {
+                // (Starting one for the first time takes a moment.)
+                terminal.draw(|f| {
+                    f.render_widget(
+                        Paragraph::new(format!(" switching the overlord to {agent}…"))
+                            .fg(crate::theme::overlord()),
+                        f.area(),
+                    )
+                })?;
+                if let Err(e) = client_call(
+                    &paths::socket_path(),
+                    "overlord.switch",
+                    json!({"agent": agent}),
+                ) {
+                    notice = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+}
+
+/// How `run_loop` ended.
+enum Exit {
+    Close,
+    /// Make this agent's overlord the active one, and show it.
+    Switch(String),
+}
+
+/// What the overlay shows: the active overlord's tmux session, and the
+/// switcher when there is more than one agent to run an overlord on.
+struct View {
+    tmux: String,
+    bar: Option<SwitchBar>,
+}
+
+/// The switcher row: every installed agent, the active overlord's first
+/// among equals.
+struct SwitchBar {
+    /// (agent, its marker, active, has an overlord).
+    agents: Vec<(String, String, bool, bool)>,
+    /// About the active one: "fresh 2h ago · 14 earlier", a usage limit.
+    info: String,
+    /// It is stopped on a usage limit (the info says until when).
+    limited: bool,
+    /// The switch key, as it reads ("⌥s").
+    key: String,
+    /// Why the last switch failed.
+    notice: Option<String>,
+}
+
+impl View {
+    fn load(keys: &OverlayKeys, notice: Option<String>) -> View {
+        let o = client_call(&paths::socket_path(), "overlord.get", json!({})).unwrap_or_default();
+        let tmux = o["tmux_session"]
+            .as_str()
+            .unwrap_or(overlord::TMUX_NAME)
+            .to_string();
+        let agents: Vec<(String, String, bool, bool)> = o["overlords"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|a| a["installed"] == true || a["active"] == true)
+            .filter_map(|a| {
+                let name = a["agent"].as_str()?;
+                let marker = rlord_core::agents::install::tool(name)
+                    .map(|t| t.marker.iter().map(|(text, _)| *text).collect::<String>())
+                    .unwrap_or_default();
+                Some((
+                    name.to_string(),
+                    marker,
+                    a["active"] == true,
+                    a["exists"] == true,
+                ))
+            })
+            .collect();
+        let limit = o["limit"]["until"].as_str();
+        let info = match (
+            limit,
+            rlord_daemon::recall::fresh_label(&o["conversations"]),
+        ) {
+            (Some(until), _) => format!("out of usage until {until}: switch to another"),
+            (None, Some(fresh)) => fresh,
+            (None, None) => String::new(),
+        };
+        let bar = (agents.len() > 1).then(|| SwitchBar {
+            agents,
+            info,
+            limited: limit.is_some(),
+            key: keys.switch.as_ref().map(|k| k.label()).unwrap_or_default(),
+            notice,
+        });
+        View { tmux, bar }
+    }
+}
+
+impl SwitchBar {
+    /// The row, and where each agent is on it: (first column, one past the
+    /// last, agent).
+    fn line(&self) -> (ratatui::text::Line<'static>, Vec<(u16, u16, String)>) {
+        use crate::theme;
+        use ratatui::style::Style;
+        use ratatui::text::Span;
+        use unicode_width::UnicodeWidthStr;
+        let hue = theme::overlord();
+        let mut spans = Vec::new();
+        let mut hits = Vec::new();
+        let mut x = 0u16;
+        for (i, (agent, marker, active, exists)) in self.agents.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("│", Style::default().fg(theme::faint_c())));
+                x += 1;
+            }
+            let text = format!(" {marker} {agent} ");
+            let w = text.width() as u16;
+            let style = if *active {
+                Style::default().bold().fg(theme::on_accent()).bg(hue)
+            } else if *exists {
+                Style::default().fg(theme::text())
+            } else {
+                // Not started yet: the first switch starts it.
+                Style::default().fg(theme::muted_c())
+            };
+            spans.push(Span::styled(text, style));
+            hits.push((x, x + w, agent.clone()));
+            x += w;
+        }
+        let mut tail = Vec::new();
+        if let Some(n) = &self.notice {
+            spans.push(Span::styled(
+                format!("  {n}"),
+                Style::default().fg(theme::red()),
+            ));
+        } else {
+            if !self.info.is_empty() {
+                tail.push(self.info.clone());
+            }
+            if !self.key.is_empty() {
+                tail.push(format!("{} or click to switch", self.key));
+            }
+            spans.push(Span::styled(
+                format!("  {}", tail.join(" · ")),
+                Style::default().fg(if self.limited {
+                    theme::yellow()
+                } else {
+                    theme::muted_c()
+                }),
+            ));
+        }
+        (ratatui::text::Line::from(spans), hits)
+    }
+
+    /// The agent after the active one (round again at the end).
+    fn next(&self) -> Option<String> {
+        let at = self.agents.iter().position(|a| a.2)?;
+        let next = &self.agents[(at + 1) % self.agents.len()];
+        (!next.2).then(|| next.0.clone())
+    }
 }
 
 fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
+    view: &View,
     pane: &str,
     keys: &OverlayKeys,
     prefix: Option<(bool, bool, char)>,
-) -> Result<()> {
+) -> Result<Exit> {
+    let target = view.tmux.as_str();
+    // The switcher takes the top row; the overlord's pane gets the rest.
+    let switcher = view.bar.as_ref().map(|b| b.line());
     // tmux's copy mode on the overlord's pane: the overlay isn't a pane, so it
     // puts the real pane in copy mode, draws that mode's screen, and keys go
     // to the mode (the user's copy bindings: select, yank, search, q).
@@ -84,11 +263,11 @@ fn run_loop(
     let mut after_prefix = false;
     // vi copy mode's prompts (search, jump) draw on the client, under the
     // popup: the overlay reads them itself.
-    let vi = tmux::session_option(overlord::TMUX_NAME, "mode-keys").is_ok_and(|m| m == "vi");
+    let vi = tmux::session_option(target, "mode-keys").is_ok_and(|m| m == "vi");
     let mut prompt: Option<Prompt> = None;
     // The user's own keys into copy mode: the session's key table (e.g.
     // M-a) and after the prefix (e.g. a, PPage; `[` always).
-    let table = tmux::session_option(overlord::TMUX_NAME, "key-table")
+    let table = tmux::session_option(target, "key-table")
         .ok()
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "root".into());
@@ -169,7 +348,8 @@ fn run_loop(
                 let _ = tmux::cancel_mode(pane);
                 history_at_entry = None;
             }
-            if let Err(e) = tmux::resize_window(overlord::TMUX_NAME, size.0, size.1) {
+            let top = u16::from(switcher.is_some() && size.1 > 3);
+            if let Err(e) = tmux::resize_window(target, size.0, size.1 - top) {
                 error = Some(format!("{e:#}"));
             }
             last = Instant::now() - Duration::from_secs(1);
@@ -214,7 +394,20 @@ fn run_loop(
             }
         }
         terminal.draw(|f| {
-            let a = f.area();
+            let full = f.area();
+            // Under the switcher, when there is one (and room for it).
+            let top = u16::from(switcher.is_some() && full.height > 3);
+            if let Some((line, _)) = switcher.as_ref().filter(|_| top == 1) {
+                f.render_widget(
+                    Paragraph::new(line.clone()).style(
+                        ratatui::style::Style::default()
+                            .fg(crate::theme::text())
+                            .bg(crate::theme::chip()),
+                    ),
+                    ratatui::layout::Rect::new(full.x, full.y, full.width, 1),
+                );
+            }
+            let a = ratatui::layout::Rect::new(full.x, full.y + top, full.width, full.height - top);
             match &error {
                 Some(e) => f.render_widget(
                     Paragraph::new(format!("overlord unavailable: {e}")).fg(Color::Red),
@@ -360,7 +553,16 @@ fn run_loop(
                 }
                 // The overlord's key (or the back key) closes the overlay.
                 if keys.closes(&k) {
-                    return Ok(());
+                    return Ok(Exit::Close);
+                }
+                // The switch key: the next agent's overlord, here.
+                // (With one agent there is nothing to switch to: the key
+                // goes to the agent like any other.)
+                if let Some(bar) = view.bar.as_ref().filter(|_| keys.switches(&k)) {
+                    match bar.next() {
+                        Some(agent) => return Ok(Exit::Switch(agent)),
+                        None => continue,
+                    }
                 }
                 let r = match (tmux_key(&k), repeat.take().filter(|_| in_mode)) {
                     (Some(TmuxKey::Text(t)), Some(n)) => tmux::send_key_repeat(pane, n, &t, true),
@@ -388,6 +590,24 @@ fn run_loop(
                         tmux::scroll(pane, true)
                     }
                     MouseEventKind::ScrollDown if in_mode => tmux::scroll(pane, false),
+                    // A click on an agent in the switcher: its overlord.
+                    MouseEventKind::Down(MouseButton::Left) if m.row == 0 => {
+                        let picked = switcher.as_ref().zip(view.bar.as_ref()).and_then(
+                            |((_, hits), bar)| {
+                                let (_, _, agent) =
+                                    hits.iter().find(|(a, b, _)| (*a..*b).contains(&m.column))?;
+                                // (The active one: already here.)
+                                bar.agents
+                                    .iter()
+                                    .any(|x| &x.0 == agent && !x.2)
+                                    .then(|| agent.clone())
+                            },
+                        );
+                        match picked {
+                            Some(agent) => return Ok(Exit::Switch(agent)),
+                            None => continue,
+                        }
+                    }
                     _ => continue,
                 };
                 if let Err(e) = r {
@@ -771,6 +991,8 @@ fn highlight(text: &mut Text<'static>, (a, b): ((u16, u16), (u16, u16))) {
 struct OverlayKeys {
     overlord: Option<rlord_core::keys::Key>,
     close: Option<rlord_core::keys::Key>,
+    /// The next agent's overlord (`[tmux] overlord_switch`; empty: off).
+    switch: Option<rlord_core::keys::Key>,
 }
 
 /// Whether a key event is the tmux key `spec` (`M-a`, `a`, `[`, `C-Space`,
@@ -841,7 +1063,15 @@ impl OverlayKeys {
             overlord: Key::parse(&cfg.tmux.overlord).or_else(|| Key::parse("M-o")),
             // Off is off (the overlord's key still closes it).
             close: Key::parse(&cfg.tmux.back),
+            switch: Key::parse(cfg.tmux.switch_key()),
         }
+    }
+
+    /// Whether this key switches to the next agent's overlord. (Never a
+    /// key that closes the overlay: that wins.)
+    fn switches(&self, k: &KeyEvent) -> bool {
+        let got = crate::keyscreen::key_of(k);
+        got.is_some() && self.switch == got
     }
 
     /// Whether this key closes the overlay.
@@ -904,6 +1134,50 @@ fn tmux_key(k: &KeyEvent) -> Option<TmuxKey> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The switcher: every agent on the row, clickable where it is drawn;
+    /// the key goes round them.
+    #[test]
+    fn the_switcher_row_says_where_each_agent_is() {
+        use unicode_width::UnicodeWidthStr;
+        let agent = |n: &str, m: &str, active: bool| (n.to_string(), m.to_string(), active, true);
+        let mut bar = super::SwitchBar {
+            agents: vec![agent("claude", "✻", true), agent("codex", ">_", false)],
+            info: "fresh 2h ago · 14 earlier".into(),
+            limited: false,
+            key: "⌥s".into(),
+            notice: None,
+        };
+        let (line, hits) = bar.line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            " ✻ claude │ >_ codex   fresh 2h ago · 14 earlier · ⌥s or click to switch"
+        );
+        // Each hit covers exactly its agent's text.
+        for (a, b, name) in &hits {
+            let mut col = 0;
+            let covered: String = text
+                .chars()
+                .filter(|c| {
+                    let at = col;
+                    col += c.to_string().width() as u16;
+                    (*a..*b).contains(&at)
+                })
+                .collect();
+            assert!(covered.trim().ends_with(name.as_str()), "{covered:?}");
+        }
+        assert_eq!(hits.len(), 2);
+        assert_eq!(bar.next().as_deref(), Some("codex"));
+        bar.agents[0].2 = false;
+        bar.agents[1].2 = true;
+        assert_eq!(bar.next().as_deref(), Some("claude"), "round again");
+        // A failed switch says why, in place of the hints.
+        bar.notice = Some("codex isn't installed".into());
+        let (line, _) = bar.line();
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("codex isn't installed"), "{text}");
+    }
 
     fn b(k: &str, c: &str) -> (String, String) {
         (k.to_string(), c.to_string())

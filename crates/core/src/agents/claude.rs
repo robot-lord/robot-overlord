@@ -118,6 +118,9 @@ pub fn map_hook_event(event: &str, payload: &Value) -> (&'static str, Effect) {
         "SessionStart" => ("session_start", Set(Status::Idle)),
         "UserPromptSubmit" => ("prompt_submitted", Set(Status::Working)),
         "Stop" => ("agent_stopped", Set(Status::Idle)),
+        // A turn that ended on an API error (a usage limit included) ends
+        // here instead of `Stop`.
+        "StopFailure" => ("agent_stopped", Set(Status::Idle)),
         "PermissionRequest" => ("permission_request", Set(Status::WaitingInput)),
         "PreToolUse" if payload["tool_name"] == "AskUserQuestion" => {
             ("question_asked", Set(Status::WaitingInput))
@@ -167,6 +170,7 @@ pub(crate) const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", None),
     ("UserPromptSubmit", None),
     ("Stop", None),
+    ("StopFailure", None),
     ("Notification", None),
     ("PermissionRequest", None),
     ("PreToolUse", Some("AskUserQuestion")),
@@ -354,6 +358,34 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
         "user" => Some(false),
         _ => None,
     }
+}
+
+/// A usage limit stopped the turn: Claude Code writes a synthetic
+/// assistant line for it (`"You've hit your 5-hour limit · resets 1:30pm
+/// (America/Los_Angeles)"`) with `isApiErrorMessage: true`, `apiError:
+/// "usage_limit_reached"`, `error: "rate_limit"` and the reset time as
+/// epoch seconds in `apiErrorParams.rate_limit_info.resetsAt` (also
+/// `quotaLimits.resetsAt`). A plain 429 (`error: "rate_limit"` alone, a
+/// throttle the CLI retries) is not one: it needs `apiError:
+/// "usage_limit_reached"` or the limit's `status: "rejected"`. Returns (when it resets in ms, which limit:
+/// `five_hour`, …). Other API errors (`server_error`, …) and messages that
+/// only talk about limits are not this; the text is never parsed.
+pub(crate) fn usage_limit(v: &Value) -> Option<(i64, String)> {
+    if v["type"] != "assistant" || v["isApiErrorMessage"] != true {
+        return None;
+    }
+    let infos = [&v["apiErrorParams"]["rate_limit_info"], &v["quotaLimits"]];
+    let rejected = infos.iter().any(|i| i["status"] == "rejected");
+    if v["apiError"] != "usage_limit_reached" && !rejected {
+        return None;
+    }
+    let info = infos
+        .into_iter()
+        .find(|i| i["resetsAt"].as_i64().is_some())?;
+    Some((
+        info["resetsAt"].as_i64()? * 1000,
+        info["rateLimitType"].as_str().unwrap_or("").to_string(),
+    ))
 }
 
 // ---- its screen ----
@@ -665,6 +697,12 @@ mod tests {
             map_hook_event("PermissionRequest", &json!({})).1,
             Effect::Set(Status::WaitingInput)
         );
+        // A turn that ended on an API error (a usage limit) is a turn end.
+        assert_eq!(
+            map_hook_event("StopFailure", &json!({})),
+            ("agent_stopped", Effect::Set(Status::Idle))
+        );
+        assert!(HOOK_EVENTS.iter().any(|(e, _)| *e == "StopFailure"));
         // The agent moved on.
         for e in ["PostToolUse", "PostToolUseFailure"] {
             assert_eq!(map_hook_event(e, &json!({})), ("tool", Effect::Resume));
