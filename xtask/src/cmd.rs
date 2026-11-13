@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -25,10 +25,26 @@ pub fn usage<T>(msg: impl Into<String>) -> Result<T> {
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-extern "C" fn on_sigint(_: libc::c_int) {
-    // Only an atomic store: anything more isn't safe in a signal handler.
+extern "C" fn on_sigint(signal: libc::c_int) {
+    // Only atomic stores: anything more isn't safe in a signal handler.
+    SIGNAL.store(signal, Ordering::SeqCst);
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// After the cleanup, die by the signal that interrupted xtask, so a
+/// calling shell sees it (a script stops on a Ctrl-C'd child only when the
+/// child died of SIGINT, not when it exited 130).
+pub fn die_by_signal() {
+    let signal = SIGNAL.load(Ordering::SeqCst);
+    if signal != 0 {
+        // SAFETY: restoring the default action and raising it.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
 }
 
 /// Make Ctrl-C (and SIGHUP) stop xtask by unwinding, not by killing it, so the `Drop`
@@ -117,6 +133,20 @@ pub fn status_quiet(cmd: &mut Command) -> Result<ExitStatus> {
     let status = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("couldn't start {}", describe(cmd)))?;
+    if !status.success() {
+        check_interrupted()?;
+    }
+    Ok(status)
+}
+
+/// Run with stdout hidden and stderr shown; its exit status (interrupts as
+/// for `status_quiet`).
+pub fn status(cmd: &mut Command) -> Result<ExitStatus> {
+    check_interrupted()?;
+    let status = cmd
+        .stdout(Stdio::null())
         .status()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
     if !status.success() {

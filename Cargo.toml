@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord", "xtask"]
+# Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask out;
+# `--workspace` includes it (CI uses it).
+default-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]
 version = "0.23.0-dev.8"

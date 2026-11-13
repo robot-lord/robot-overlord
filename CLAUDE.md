@@ -240,7 +240,8 @@ get handled without the user looking. For each one:
 
 - robot-overlord: push a version-bump commit with the regenerated
   `Cargo.lock` (stay below any version another open branch has claimed);
-- build, `cargo clippy --all-targets -- -D warnings` and test; fix
+- build, `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo test --workspace`; fix
   breakage from major bumps in the same PR, or drop an update whose fix
   would be large or risky and say why;
 - check the repo's Actions allow-list still permits every action used;

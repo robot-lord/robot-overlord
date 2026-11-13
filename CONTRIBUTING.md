@@ -54,7 +54,7 @@ README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs
 ## Tests
 
 ```sh
-cargo fmt && cargo clippy --all-targets && cargo test
+cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace
 ```
 
 Never touch the default tmux server in tests or scripts: rlord runs on its

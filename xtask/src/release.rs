@@ -270,7 +270,12 @@ pub fn main(args: &[String]) -> Result<()> {
         }
     }
 
-    tap::update(&ver, &dist.join("SHA256SUMS"), TAP)?;
+    tap::update(&ver, &dist.join("SHA256SUMS"), TAP).with_context(|| {
+        format!(
+            "the GitHub release is out ({}), but the Homebrew tap wasn't updated; finish with: gh release download {tag} -R {REPO} -p SHA256SUMS; cargo xtask update-tap {ver} SHA256SUMS; cargo xtask publish-crates",
+            release_url(&tag)
+        )
+    })?;
     // crates.io publishes the source: only once the repo itself is public.
     // The release is out by now: a failed lookup skips crates.io with a
     // note rather than stopping before "released".
@@ -345,6 +350,25 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
             }
         }
     }
+    // From here on the tag is pushed and its run goes on without us.
+    wait_and_publish(ver, &tag, dist, &earlier, &find_runs, &undo).map_err(|e| {
+        if cmd::is_interrupted(&e) {
+            e.context(format!("{tag} is pushed and its workflow run goes on (https://github.com/{REPO}/actions): when it is done, cargo xtask release --resume"))
+        } else {
+            e
+        }
+    })
+}
+
+/// Wait for the tag's workflow run, check what it built, publish its draft.
+fn wait_and_publish(
+    ver: &Version,
+    tag: &str,
+    dist: &Path,
+    earlier: &[u64],
+    find_runs: &dyn Fn() -> Result<Vec<Run>>,
+    undo: &str,
+) -> Result<()> {
     println!("waiting for the release workflow on {tag}…");
     // A failed listing (a network blip) is tried again, like no run; but
     // if they keep failing, the run's state is unknown and nothing here may
@@ -402,16 +426,14 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     let id = run.id.to_string();
     match cmd::run(gh().args(["run", "watch", &id, "-R", REPO, "--exit-status"])) {
         Ok(()) => {}
-        Err(e) if cmd::is_interrupted(&e) => {
-            return Err(e.context(format!("stopped watching; the workflow run goes on (https://github.com/{REPO}/actions/runs/{id}): when it finishes, cargo xtask release --resume")));
-        }
+        Err(e) if cmd::is_interrupted(&e) => return Err(e),
         Err(_) => bail!("release workflow failed: https://github.com/{REPO}/actions/runs/{id} — fix and re-run it (gh workflow run release.yml --ref {tag} -f tag={tag} -f dry_run=false), then cargo xtask release --resume; or {undo}"),
     }
     // CI leaves a draft. Before publishing it, check every asset against
     // the CI-made SHA256SUMS, and the provenance attestation of every file
     // in it (tarballs, .deb, .rpm).
     cmd::run(
-        gh().args(["release", "download", &tag, "-R", REPO, "-D"])
+        gh().args(["release", "download", tag, "-R", REPO, "-D"])
             .arg(dist),
     )?;
     cmd::run(
@@ -448,7 +470,7 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     }
     // A failed lookup stops here: it must not read as "already published"
     // and go on to the tap and crates.io.
-    let draft = match release_state(&tag)? {
+    let draft = match release_state(tag)? {
         Some(draft) => draft,
         None => bail!("{tag} has no GitHub release after its workflow run"),
     };
@@ -456,7 +478,7 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
         cmd::run(gh().args([
             "release",
             "edit",
-            &tag,
+            tag,
             "-R",
             REPO,
             "--draft=false",
@@ -507,8 +529,8 @@ fn draft_state(json: &str, tag: &str) -> Result<Option<bool>> {
 /// Whether the tag is on origin. `ls-remote --exit-code` exits 2 for no
 /// match; anything else but 0 is an error, never "not pushed".
 fn tag_on_origin(tag: &str) -> Result<bool> {
-    let status =
-        cmd::status_quiet(git().args(["ls-remote", "--exit-code", "--tags", "origin", tag]))?;
+    // git's reason for a failure is shown.
+    let status = cmd::status(git().args(["ls-remote", "--exit-code", "--tags", "origin", tag]))?;
     match status.code() {
         Some(0) => Ok(true),
         Some(2) => Ok(false),

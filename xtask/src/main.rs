@@ -80,6 +80,8 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if cmd::is_interrupted(&e) => {
             eprintln!("{e:#}");
+            // Everything is cleaned up by now (the tasks' guards dropped).
+            cmd::die_by_signal();
             ExitCode::from(130)
         }
         Err(e) if e.downcast_ref::<cmd::Usage>().is_some() => {
