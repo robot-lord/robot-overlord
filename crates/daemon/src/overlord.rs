@@ -376,7 +376,7 @@ fn write_files(d: &Path, agent: Agent, effort: &str, confirm_sends: bool) -> Res
 
 /// Claude's `--allowedTools`: rlord's MCP server (`mcp__rlord`, every tool)
 /// and the read-only file tools. With `confirm_sends`, rlord's tools are
-/// listed one by one without `send_to_session`, which then asks.
+/// listed one by one without `SEND_TOOLS`, which then ask.
 fn claude_allowed_tools(confirm_sends: bool) -> String {
     let mut tools = vec!["mcp__rlord".to_string()];
     if confirm_sends {
@@ -385,7 +385,7 @@ fn claude_allowed_tools(confirm_sends: bool) -> String {
             .into_iter()
             .flatten()
             .filter_map(|t| t["name"].as_str())
-            .filter(|n| *n != "send_to_session")
+            .filter(|n| !rlord_core::agents::SEND_TOOLS.contains(n))
             .map(|n| format!("mcp__rlord__{n}"))
             .collect();
     }
@@ -449,22 +449,25 @@ pub fn switch(db: &Db, cfg: &Config, agent: &str) -> Result<Value> {
     let id = v["id"].as_str().context("no session id")?.to_string();
     let switched = before.as_ref().is_some_and(|b| b.id != id);
     if switched {
-        db.set_active_overlord(&id)?;
-        db.insert_event(
-            &id,
-            rlord_core::types::now_ms(),
-            "overlord_active",
-            &json!({"from": before.map(|b| b.agent), "created": created}).to_string(),
-        )?;
-        tracing::info!(
-            agent = agent.name(),
-            created,
-            "switched the active overlord"
-        );
+        activate(db, &id, before.map(|b| b.agent), created)?;
     }
     v["switched"] = json!(switched);
     v["created"] = json!(created);
     Ok(v)
+}
+
+/// Make overlord `id` the active one, starting nothing (`switch` starts
+/// it; `recall::continue_elsewhere` restarts it onto a conversation).
+pub fn activate(db: &Db, id: &str, from: Option<String>, created: bool) -> Result<()> {
+    db.set_active_overlord(id)?;
+    db.insert_event(
+        id,
+        rlord_core::types::now_ms(),
+        "overlord_active",
+        &json!({"from": from, "created": created}).to_string(),
+    )?;
+    tracing::info!(id, created, "switched the active overlord");
+    Ok(())
 }
 
 /// The agents an overlord can run on, for the switchers (the overlay's
@@ -810,8 +813,8 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         "default_model": cfg.overlord.model,
         "default_effort": cfg.overlord.effort,
     });
-    // Which agents an overlord runs on, has one, and which is active.
-    out["overlords"] = roster(roster_rows(db)?);
+    // (`overlords`, which agents have one and which is active, is added
+    // by the caller once the DB guard is gone: `roster`.)
     let Some(s) = session(db)? else {
         out["exists"] = json!(false);
         // The agents it can run on (installed ones), each with what the
@@ -1132,10 +1135,12 @@ mod tests {
         let on = claude_allowed_tools(true);
         let tools: Vec<&str> = on.split(',').collect();
         assert!(!tools.contains(&"mcp__rlord") && !on.contains("send_to_session"));
+        assert!(!on.contains("resume_after_limit"));
         assert!(tools.contains(&"mcp__rlord__list_sessions") && tools.contains(&"Read"));
         assert_eq!(
             tools.len(),
-            crate::mcp::tools().as_array().unwrap().len() - 1 + 3
+            crate::mcp::tools().as_array().unwrap().len() - rlord_core::agents::SEND_TOOLS.len()
+                + 3
         );
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("overlord");
@@ -1148,7 +1153,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
                 .unwrap();
         let rules = cfg["permissions"].as_array().unwrap();
-        assert_eq!(rules.last().unwrap()["action"], "rlord_send_to_session");
+        assert_eq!(rules.last().unwrap()["action"], "rlord_resume_after_limit");
     }
 
     /// Each agent gets rlord's MCP server with its tools pre-allowed, in

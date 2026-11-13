@@ -58,6 +58,8 @@ const MARGIN_MS: i64 = 60_000;
 const WATCH_MS: i64 = 15 * 60_000;
 /// A session that can't be typed into this long after its reset: given up.
 const GIVE_UP_MS: i64 = 60 * 60_000;
+/// After a send, a prompt seen within this long is our own message.
+const OWN_PROMPT_MS: i64 = 30_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
@@ -118,6 +120,29 @@ fn limits(d: &Daemon) -> Map<String, Value> {
     now.clone().unwrap_or_default()
 }
 
+/// When each session stopped on a usage limit now gets out of it (ms):
+/// `{id: resets_at}`. Takes the DB lock the first time: not under it.
+pub fn limited(d: &Daemon) -> HashMap<String, i64> {
+    let now = now_ms();
+    limits(d)
+        .into_iter()
+        .filter_map(|(id, l)| Some((id, l["resets_at"].as_i64().filter(|t| *t > now)?)))
+        .collect()
+}
+
+/// A hit whose record had no readable time (`at` 0) gets the time it was
+/// first seen: `known`'s (the same limit, seen before) or `now`. Without
+/// one it would read as long past, and its job be dropped at once.
+fn dated(mut h: LimitHit, known: Option<&Value>, now: i64) -> LimitHit {
+    if h.at <= 0 {
+        h.at = known
+            .filter(|k| k["resets_at"].as_i64() == Some(h.resets_at))
+            .and_then(|k| k["at"].as_i64())
+            .unwrap_or(now);
+    }
+    h
+}
+
 /// Look at every live session's transcript that changed since the last
 /// look (all of them the first time), and at limits that have reset.
 fn scan(d: &Daemon) -> Result<()> {
@@ -164,7 +189,8 @@ fn scan(d: &Daemon) -> Result<()> {
                 .filter(|l| l["resets_at"].as_i64().is_some_and(|t| t > now))
                 .cloned()
         } else {
-            current(transcript::limit_hit(path).as_ref(), now)
+            let hit = transcript::limit_hit(path).map(|h| dated(h, before.get(id), now));
+            current(hit.as_ref(), now)
         };
         if let Some(l) = state {
             after.insert(id.clone(), l);
@@ -324,6 +350,10 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
     // A limit newer than the one this job waits on, with nothing after it.
     let newer = hit.filter(|h| h.at > limit_at && !h.touched);
     if let Some(sent) = job["sent_at"].as_i64() {
+        // The user typed since (past our own message's echo): theirs now.
+        if s.last_user_msg_at.is_some_and(|t| t > sent + OWN_PROMPT_MS) {
+            return Step::Drop("the user took the session over after the resume", true);
+        }
         return match newer {
             Some(_) if job["attempts"].as_u64().unwrap_or(0) >= MAX_ATTEMPTS => {
                 Step::Drop("the limit kept hitting", false)
@@ -394,8 +424,11 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
             db.transcript_source(id).ok().flatten(),
         )
     };
-    let hit = src.and_then(|p| transcript::limit_hit(Path::new(&p)));
     let now = now_ms();
+    let known = limits(d).get(id).cloned();
+    let hit = src
+        .and_then(|p| transcript::limit_hit(Path::new(&p)))
+        .map(|h| dated(h, known.as_ref(), now));
     // Only the job read above: one rescheduled meanwhile (`limits.resume`
     // asked again) is left alone.
     let same = |j: &Value| ["limit_at", "asked_at"].iter().all(|k| j[*k] == job[*k]);
@@ -502,6 +535,17 @@ mod tests {
     }
 
     #[test]
+    fn an_undated_limit_is_dated_when_seen() {
+        let h = hit(0, 9_000, false);
+        assert_eq!(dated(h.clone(), None, 5_000).at, 5_000);
+        let known = json!({"at": 4_000, "resets_at": 9_000});
+        assert_eq!(dated(h.clone(), Some(&known), 5_000).at, 4_000);
+        let other = json!({"at": 4_000, "resets_at": 8_000});
+        assert_eq!(dated(h, Some(&other), 5_000).at, 5_000);
+        assert_eq!(dated(hit(7, 9_000, false), None, 5_000).at, 7);
+    }
+
+    #[test]
     fn a_job_waits_for_the_reset_then_sends_once() {
         let job = json!({"message": "continue", "limit_at": 1_000, "resets_at": 100_000,
                          "attempts": 0});
@@ -585,6 +629,19 @@ mod tests {
         assert_eq!(
             step(&sent, Some(&idle), Some(&old), 170_000 + WATCH_MS + 1),
             Step::Drop("resumed", true)
+        );
+        // The user typed after the resume: a later limit is theirs.
+        let mut took_over = session(Status::Idle);
+        took_over.last_user_msg_at = Some(170_000 + OWN_PROMPT_MS + 1);
+        assert!(matches!(
+            step(&sent, Some(&took_over), Some(&again), 400_000),
+            Step::Drop(_, true)
+        ));
+        // Our own message's prompt doesn't count.
+        took_over.last_user_msg_at = Some(170_500);
+        assert_eq!(
+            step(&sent, Some(&took_over), Some(&again), 180_000),
+            Step::Reschedule(175_000, 900_000)
         );
         // Not for ever.
         let mut many = sent.clone();

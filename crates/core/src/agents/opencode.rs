@@ -227,7 +227,7 @@ pub fn resume_argv(
 ///   for the shell under `agent.build` or `agent.general`) would otherwise
 ///   come last and win. Folder rules come after the user's global ones at
 ///   each level.
-/// - `confirm_sends` (`[overlord] confirm_sends`): `send_to_session` asks
+/// - `confirm_sends` (`[overlord] confirm_sends`): `SEND_TOOLS` ask
 ///   each time (a rule after `rlord_*`), instead of running unasked like
 ///   rlord's other tools.
 pub fn overlord_config(
@@ -247,7 +247,9 @@ pub fn overlord_config(
     rules.extend(subagents.iter().map(|n| rule("subagent", n, "allow")));
     rules.push(rule("rlord_*", "*", "allow"));
     if confirm_sends {
-        rules.push(rule("rlord_send_to_session", "*", "ask"));
+        for t in super::SEND_TOOLS {
+            rules.push(rule(&format!("rlord_{t}"), "*", "ask"));
+        }
     }
     let mut agents = serde_json::Map::new();
     for a in OVERLORD_AGENTS
@@ -1473,8 +1475,10 @@ pub(crate) mod tests {
         assert_eq!(last(&cfg)["action"], "rlord_*");
         // Sends confirmed: asked, after rlord's tools are allowed.
         let cfg = overlord_config("/bin/rlord", "/s", &[], &users, true);
-        assert_eq!(last(&cfg)["action"], "rlord_send_to_session");
+        assert_eq!(last(&cfg)["action"], "rlord_resume_after_limit");
         assert_eq!(last(&cfg)["effect"], "ask");
+        let rules = cfg["permissions"].as_array().unwrap();
+        assert_eq!(rules[rules.len() - 2]["action"], "rlord_send_to_session");
         assert_eq!(cfg["agents"]["mine"]["permissions"], cfg["permissions"]);
     }
 

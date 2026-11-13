@@ -992,7 +992,7 @@ pub fn set_hint_bar(name: &str, hints: &str, profile_on: bool) -> Result<()> {
                 .trim()
                 .parse()
                 .unwrap_or(40);
-            let want = (len + hints.chars().count() + 2).to_string();
+            let want = (len + visible_len(hints) + 2).to_string();
             run(&["set-option", "-t", &t, "status-right-length", &want])?;
         }
         return Ok(());
@@ -1155,6 +1155,7 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
     let prefix = run(&["show-options", "-gv", "prefix"]).unwrap_or_default();
     let root = root_bindings()?;
     let mut conflicts = Vec::new();
+    let mut clickable = Vec::new();
     for (key, verb) in bindings {
         if *key == prefix {
             conflicts.push(KeyConflict {
@@ -1171,6 +1172,9 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
             continue;
         }
         let cmd = format!("{} nav {verb}", shell_quote(bin));
+        if let Some(range) = hint_range(verb) {
+            clickable.push((range, cmd.clone()));
+        }
         run(&["bind-key", "-n", key, "run-shell", "-b", &cmd])?;
         // Sessions with the user's profile use their own key table (it does
         // not fall back to root): rlord's keys must be there too.
@@ -1184,7 +1188,78 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
             &cmd,
         ])?;
     }
+    // A click on a hint (`hint_range`) does what its key does. Only with
+    // `[tmux] mouse` on; otherwise nothing is bound, so tmux's own (or the
+    // user's imported) status click stays.
+    let mouse = crate::config::Config::load().map_or(true, |c| c.tmux.mouse);
+    if mouse {
+        for table in ["root", PROFILE_TABLE] {
+            let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
+            let cmd = status_click(&clickable);
+            args.extend(cmd.iter().map(String::as_str));
+            run(&args)?;
+        }
+    }
     Ok(conflicts)
+}
+
+/// The status-line mouse key rlord binds for its clickable hints.
+const STATUS_CLICK: &str = "MouseDown1Status";
+/// tmux's own binding for it: switch to the clicked window.
+const STATUS_CLICK_DEFAULT: &str = "switch-client -t =";
+
+/// The status-line range a nav verb's hint carries, if it has a hint.
+pub fn hint_range(verb: &str) -> Option<&'static str> {
+    match verb {
+        "home" => Some("rlord-list"),
+        "overlord" => Some("rlord-overlord"),
+        _ => None,
+    }
+}
+
+/// `MouseDown1Status`'s command (as argv): the clicked hint's range runs
+/// that key's command (`clicks`: range, command), anything else tmux's
+/// default.
+fn status_click(clicks: &[(&str, String)]) -> Vec<String> {
+    let cond = |r: &str| format!("#{{==:#{{mouse_status_range}},{r}}}");
+    let run_cmd = |c: &str| format!("run-shell -b {}", tmux_dq(c));
+    let Some(((r0, c0), others)) = clicks.split_first() else {
+        return STATUS_CLICK_DEFAULT.split(' ').map(String::from).collect();
+    };
+    // The others nest as the else, innermost (tmux's default) last.
+    let mut rest = STATUS_CLICK_DEFAULT.to_string();
+    for (r, c) in others.iter().rev() {
+        rest = format!(
+            "if-shell -F {} {} {}",
+            tmux_dq(&cond(r)),
+            tmux_dq(&run_cmd(c)),
+            tmux_dq(&rest)
+        );
+    }
+    // The outermost as argv: bind-key takes the command's words.
+    vec!["if-shell".into(), "-F".into(), cond(r0), run_cmd(c0), rest]
+}
+
+/// How many characters a status-line string shows (`#[...]` styles and
+/// ranges take none).
+fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut rest = s;
+    while let Some(i) = rest.find("#[") {
+        n += rest[..i].chars().count();
+        rest = rest[i..].split_once(']').map_or("", |(_, r)| r);
+    }
+    n + rest.chars().count()
+}
+
+/// A tmux double-quoted string.
+fn tmux_dq(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+    )
 }
 
 /// `(key, command)` pairs of one key table.
@@ -1462,6 +1537,25 @@ mod tests {
             assert_eq!(key_label("M-d"), "Alt-d");
             assert_eq!(key_label("C-M-x"), "Ctrl-Alt-x");
         }
+
+        // Clickable hints: ranges count no width, and a status click on a
+        // range runs that key's command (tmux's own click otherwise).
+        assert_eq!(visible_len("#[range=user|rlord-list]⌥d list#[norange]"), 7);
+        bind_nav_keys("/bin/rl'x", &[("M-d", "home"), ("M-o", "overlord")]).unwrap();
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(k.contains("mouse_status_range"), "{k}");
+            assert!(
+                k.contains("rlord-list") && k.contains("rlord-overlord"),
+                "{k}"
+            );
+            assert!(k.contains("nav home") && k.contains("nav overlord"), "{k}");
+            assert!(k.contains("switch-client -t ="), "{k}");
+        }
+        assert_eq!(
+            status_click(&[]),
+            ["switch-client", "-t", "="].map(String::from)
+        );
 
         kill_session(name).unwrap();
         assert!(!has_session(name));

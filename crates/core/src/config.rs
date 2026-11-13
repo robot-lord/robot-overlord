@@ -170,9 +170,10 @@ impl TmuxKeys {
         if k.is_empty() {
             return None;
         }
+        let k = key_norm(k);
         self.bindings()
             .into_iter()
-            .find(|(b, _)| b.trim() == k)
+            .find(|(b, _)| key_norm(b.trim()) == k)
             .map(|(_, verb)| verb)
     }
 
@@ -184,6 +185,19 @@ impl TmuxKeys {
             &self.overlord_switch
         }
     }
+}
+
+/// A tmux key as tmux reads it: modifiers (`M-`, `C-`, `S-`) in any case,
+/// the key itself as written (`m-s` is `M-s`; `M-S` is not).
+fn key_norm(k: &str) -> String {
+    let (mods, key) = match k.strip_suffix("--") {
+        Some(m) => (format!("{m}-"), "-"),
+        None => match k.rsplit_once('-') {
+            Some((m, key)) if !key.is_empty() => (format!("{m}-"), key),
+            _ => (String::new(), k),
+        },
+    };
+    format!("{}{key}", mods.to_ascii_uppercase())
 }
 
 /// The overlord: the long-running session you talk to in order to drive
@@ -921,6 +935,13 @@ mod tests {
         t.prev = "M-s".into();
         assert_eq!(t.switch_overlap(), Some("prev"));
         assert_eq!(t.switch_key(), "");
+        // Modifiers in any case are the same key; the key's own case is not.
+        t.prev = "m-s".into();
+        assert_eq!(t.switch_overlap(), Some("prev"));
+        t.prev = "M-S".into();
+        assert_eq!(t.switch_overlap(), None);
+        assert_eq!(key_norm("c-m--"), "C-M--");
+        assert_eq!(key_norm("enter"), "enter");
     }
 
     /// A config from the two-seat overlord: the mastermind's keys become

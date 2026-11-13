@@ -27,11 +27,65 @@ fn choice(db: &Db, s: &Session) -> Result<Option<bool>> {
     })
 }
 
+/// `RLORD_TMUX_PROFILE` as the `rlord` that opened the list had it
+/// (`tmux.profile_mode`): `default` or `imported`, for that run. None:
+/// not set.
+static OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn override_mode() -> Option<String> {
+    OVERRIDE.lock().expect("profile override").clone()
+}
+
+/// Which tmux setup agent sessions get, and why: (`imported` uses the
+/// user's profile where a session's own choice allows; `default` is
+/// rlord's own everywhere, as a new user sees it).
+pub fn mode(cfg: &Config) -> (&'static str, &'static str) {
+    match override_mode().as_deref() {
+        Some("default") => ("default", "RLORD_TMUX_PROFILE"),
+        Some(_) if tmux_profile::exists() => ("imported", "RLORD_TMUX_PROFILE"),
+        _ if !tmux_profile::exists() => ("default", "no profile imported"),
+        _ if cfg.tmux.profile => ("imported", "[tmux] profile = true"),
+        _ => ("default", "[tmux] profile = false"),
+    }
+}
+
 fn wanted(db: &Db, cfg: &Config, s: &Session) -> Result<bool> {
     if overlord::is_overlord_role(&s.role) || !tmux_profile::exists() {
         return Ok(false);
     }
-    Ok(choice(db, s)?.unwrap_or(cfg.tmux.profile))
+    match override_mode().as_deref() {
+        Some("default") => Ok(false),
+        Some(_) => Ok(true),
+        None => Ok(choice(db, s)?.unwrap_or(cfg.tmux.profile)),
+    }
+}
+
+/// `tmux.profile_mode {env?}`: the `rlord` opening the list reports its
+/// `RLORD_TMUX_PROFILE` (absent: none). A change re-applies every session.
+/// Without `set`, only reports.
+pub fn profile_mode(d: &Daemon, params: &Value) -> Result<Value> {
+    if params.get("set") == Some(&Value::Bool(true)) {
+        let env = params["env"]
+            .as_str()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        if let Some(v) = &env {
+            if v != "default" && v != "imported" {
+                anyhow::bail!("RLORD_TMUX_PROFILE={v}: use default or imported");
+            }
+        }
+        let changed = {
+            let mut o = OVERRIDE.lock().expect("profile override");
+            let changed = *o != env;
+            *o = env;
+            changed
+        };
+        if changed {
+            sync_all(d, false);
+        }
+    }
+    let (mode, why) = mode(&d.config());
+    Ok(json!({"mode": mode, "why": why, "imported": tmux_profile::exists()}))
 }
 
 /// Bring one session's tmux in line: its profile, and its window named
@@ -44,7 +98,7 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
     // The overlord keeps its own bar but gets the user's keys (copy mode,
     // prefix, pane moves), when they have a profile.
     if overlord::is_overlord_role(&s.role) {
-        tmux::set_profile_keys(name, tmux_profile::exists() && cfg.tmux.profile)?;
+        tmux::set_profile_keys(name, mode(cfg).0 == "imported")?;
         tmux::name_agent_window(name, &s.name)?;
         return Ok(());
     }
@@ -66,12 +120,23 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
 
 /// `⌥d list · ⌥o overlord`: the configured keys rlord actually bound.
 fn hints(cfg: &Config) -> String {
-    [(&cfg.tmux.back, "list"), (&cfg.tmux.overlord, "overlord")]
-        .into_iter()
-        .filter(|(k, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
-        .map(|(k, what)| format!("{} {what}", tmux::key_label(k)))
-        .collect::<Vec<_>>()
-        .join(" · ")
+    [
+        (&cfg.tmux.back, "home", "list"),
+        (&cfg.tmux.overlord, "overlord", "overlord"),
+    ]
+    .into_iter()
+    .filter(|(k, _, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
+    // Each a status-line range: a click does what the key does
+    // (`tmux::bind_nav_keys`).
+    .map(|(k, verb, what)| {
+        let hint = format!("{} {what}", tmux::key_label(k));
+        match tmux::hint_range(verb) {
+            Some(r) => format!("#[range=user|{r}]{hint}#[norange]"),
+            None => hint,
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 pub fn sync_ref(d: &Daemon, r: &str) {
@@ -143,4 +208,30 @@ pub fn reload(d: &Daemon) -> Result<Value> {
     d.bind_nav_keys();
     sync_all(d, true);
     Ok(json!({"reloaded": true, "imported": tmux_profile::exists()}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RLORD_TMUX_PROFILE=default` wins for that run, whatever the
+    /// config; unset, the config decides again; anything else is refused.
+    #[test]
+    fn the_env_override_picks_the_default_setup() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let set = |env: Value| profile_mode(&d, &json!({"set": true, "env": env}));
+        let v = set(json!("default")).unwrap();
+        assert_eq!(
+            (v["mode"].as_str(), v["why"].as_str()),
+            (Some("default"), Some("RLORD_TMUX_PROFILE"))
+        );
+        assert!(set(json!("mine")).is_err());
+        let v = set(Value::Null).unwrap();
+        assert_ne!(v["why"], "RLORD_TMUX_PROFILE");
+        // Without `set`: only reports.
+        set(json!("default")).unwrap();
+        let v = profile_mode(&d, &json!({})).unwrap();
+        assert_eq!(v["mode"], "default");
+        set(Value::Null).unwrap();
+    }
 }

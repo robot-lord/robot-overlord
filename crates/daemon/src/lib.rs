@@ -73,6 +73,10 @@ pub struct Daemon {
     pub(crate) summaries: summary::Summaries,
     /// Sessions stopped on a usage limit (limits.rs).
     pub(crate) limits: limits::Limits,
+    /// The last `overlord::roster`, keyed by the rows it was built from
+    /// (it runs tmux and the install checks; the TUI asks on every
+    /// refresh).
+    roster: Mutex<Option<(std::time::Instant, String, Value)>>,
 }
 
 impl Daemon {
@@ -94,11 +98,34 @@ impl Daemon {
             remote: Default::default(),
             summaries: Default::default(),
             limits: Default::default(),
+            roster: Mutex::new(None),
         })
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
         self.db.lock().expect("db mutex poisoned")
+    }
+
+    /// `overlord::roster`, reused while its rows are unchanged and it is
+    /// fresher than `ROSTER_TTL` (a tmux session dying, an agent being
+    /// installed, shows up within that). Not under the DB guard.
+    pub(crate) fn roster(&self, rows: (Vec<rlord_core::types::Session>, Option<String>)) -> Value {
+        const ROSTER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let key = serde_json::to_string(&json!({
+            "active": rows.1,
+            "rows": rows.0.iter().map(|s| json!([s.id, s.agent, s.status, s.tmux_session]))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap_or_default();
+        if let Some((at, k, v)) = self.roster.lock().expect("roster mutex").as_ref() {
+            if *k == key && at.elapsed() < ROSTER_TTL {
+                return v.clone();
+            }
+        }
+        let v = overlord::roster(rows);
+        *self.roster.lock().expect("roster mutex") =
+            Some((std::time::Instant::now(), key, v.clone()));
+        v
     }
 
     pub(crate) fn changed(&self) {
@@ -523,7 +550,7 @@ impl Daemon {
                         return v;
                     }
                     // The other agents' overlords, for the switchers.
-                    v["overlords"] = overlord::roster(rows);
+                    v["overlords"] = self.roster(rows);
                     // Stopped on a usage limit: the row and the overlay say
                     // so (the user may switch to another agent's).
                     let mut rows = [v];
@@ -566,10 +593,19 @@ impl Daemon {
             }
             "overlord.status" => {
                 // The db guard must drop before offer() locks it again.
-                let st = overlord::status(&self.db(), &self.config());
-                st.map(|mut v| {
+                let (st, rows) = {
+                    let db = self.db();
+                    (
+                        overlord::status(&db, &self.config()),
+                        overlord::roster_rows(&db),
+                    )
+                };
+                // (Without the guard: `roster` runs tmux and the install
+                // checks.)
+                st.and_then(|mut v| {
+                    v["overlords"] = self.roster(rows?);
                     v["remote"] = remote::offer(self);
-                    v
+                    Ok(v)
                 })
             }
             // Don't offer Remote Control for the overlord again.
@@ -627,6 +663,7 @@ impl Daemon {
             "ui.overlord" => ui::overlord(self, params),
             "admin.reset" => ui::reset(self, params),
             "tmux.profile" => profile::profile(self, params),
+            "tmux.profile_mode" => profile::profile_mode(self, params),
             "tmux.reload" => profile::reload(self),
             "ui.overlay.close_on" => ui::close_overlay_on(self, params),
             "ui.overlay.report" => {

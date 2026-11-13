@@ -136,7 +136,7 @@ runs a command.
   not arbitrary content. Prompt injection would take a setup very
   different from the one rlord is built for. Codex's read-only sandbox
   stops the overlord's shell commands reaching rlord's tmux socket, but not
-  this tool. `[overlord] confirm_sends = true` makes each send ask, for
+  this tool. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for
   anyone who wants that (Claude then lists rlord's tools one by one without
   it; Codex sets that tool's `approval_mode = "prompt"`; OpenCode adds an
   ask rule for `rlord_send_to_session`).
@@ -161,9 +161,11 @@ when it is the configured agent).
 - **In the overlay**: with more than one agent installed, the top row
   shows each agent's marker, the active one highlighted
   (`✻ claude │ >_ codex`). Click one, or press **Option-S** to go to the
-  next (`[tmux] overlord_switch`; "" turns the key off, and so does giving
-  it the same key as `back`, `next`, `prev` or `overlord`). The overlay stays
-  open and shows the other overlord.
+  next overlord that exists (`[tmux] overlord_switch`; "" turns the key
+  off, and so does giving it the same key as `back`, `next`, `prev` or
+  `overlord`). The key never creates one: a click on an agent without an
+  overlord, `:overlord <agent>` or the CLI does. The overlay stays open and
+  shows the other overlord.
 - **In the list**: right-click the overlord's row for "Switch overlord to
   Codex" (one entry per installed agent), or `:overlord codex` in the
   command launcher (`:overlord` lists them).
@@ -516,8 +518,11 @@ Anthropic's servers.
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated
-config: no status bar, no prefix key, mouse on. The only keys it binds are
-Option-D (to the list) and Option-O (the overlord). Your personal tmux is never
+config: no prefix key, mouse on. The only keys it binds are Option-D (to
+the list) and Option-O (the overlord). Agent sessions get a slim status bar:
+the session's name on the left, `⌥d list · ⌥o overlord` on the right. Click
+a hint to do what its key does (with `[tmux] mouse` on; a click elsewhere
+on the bar is tmux's own). Your personal tmux is never
 touched. Starting `rlord` from inside your own tmux nests cleanly. Put your
 own tweaks for rlord's tmux in `~/.local/share/robot-overlord/tmux.local.conf`.
 
@@ -539,8 +544,16 @@ and one session's profile never affects another.
   copy mode) when a profile is imported.
 - Agent sessions show rlord's keys on their status bar (`⌥d list · ⌥o
   overlord`): in front of your status-right with the profile on, or on a
-  slim bar of their own without it.
+  slim bar of their own without it. The hints are clickable either way.
 - Per session: `rlord tmux profile on|off|toggle|default [REF]`.
+- **To see the setup a new user gets** without removing your profile, open
+  the list with `RLORD_TMUX_PROFILE=default rlord`. That run puts every
+  agent session on rlord's own tmux; the next plain `rlord` puts your
+  profile back (`RLORD_TMUX_PROFILE=imported` forces it on). Running
+  sessions switch at once. To make it stick, set `[tmux] profile = false`
+  (takes effect on `rlord reset` or the next start).
+- `rlord tmux profile` (outside a session) prints which setup is active
+  and why: `RLORD_TMUX_PROFILE`, `[tmux] profile`, or no profile imported.
 - rlord tracks the agent's pane, so splits never confuse the preview or
   status.
 

@@ -292,9 +292,16 @@ hooks and `discover` keep the stored status to themselves.
   `LimitHit::touched`) and the reset time is ahead. A tick (15s) stats
   each live session's transcript and re-reads only those that changed
   (one scan at a time; a file's stamp is kept only once what was read
-  from it is saved);
+  from it is saved; a tail without `usage_limit_reached` or `"rejected"`
+  isn't parsed; a record with no readable time is dated when first
+  seen, `limits::dated`);
   kv `limits` holds the current ones, and rows carry `limit`
   (`limits::annotate`).
+- **Nothing else is typed into a limited session** (it would only get
+  another limit reply). `send_to_session` refuses it ("stopped on a usage
+  limit until …"); with `when_idle`, and for a message already queued,
+  it waits for the reset (`send::refusal`/`next`, from
+  `limits::limited`). Its hook state reads `idle` all the same.
 - **Resuming is only ever asked for** (`limits.resume`: the
   `resume_after_limit` tool, `rlord resume-after-limit`, the list's
   menu). Each session gets a job in kv `limit_resume`, so a daemon
@@ -309,7 +316,9 @@ hooks and `discover` keep the stored status to themselves.
   only writes back over itself (same `limit_at` and `asked_at`), so
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules
-  the job to that reset (five sends at most). The overlords are never
+  the job to that reset (five sends at most), unless the user typed a
+  prompt since the send (more than 30s after it, past our own message's
+  echo): then the session is theirs and the job ends. The overlords are never
   resumed this way: the user switches to another agent's.
 
 ## Transcript store (raw conversation data)
@@ -624,7 +633,7 @@ prompt, a prompt for anything that writes or runs a command.
 
 | | MCP server and its tools | Everything else | Subagents |
 |---|---|---|---|
-| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` (with `confirm_sends`: rlord's tools listed without `send_to_session`) | asks | `.claude/agents/*.md` |
+| Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` (with `confirm_sends`: rlord's tools listed without `send_to_session` and `resume_after_limit`) | asks | `.claude/agents/*.md` |
 | Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"`, `-c check_for_update_on_startup=false` | `.codex/agents/*.toml` |
 | OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`, rlord's own subagents by name, `rlord_*` allow (last match wins); repeated under `agents.<name>` | `.opencode/agents/*.md` |
 
@@ -653,7 +662,7 @@ Things that are not visible at the call site:
   own data and the user's requests, not arbitrary content. So it can type
   into sessions without asking. That is what lets it orchestrate. Prompt
   injection would take a setup very different from the one rlord is built
-  for. `[overlord] confirm_sends = true` makes each send ask, for anyone
+  for. `[overlord] confirm_sends = true` makes each send (and `resume_after_limit`) ask, for anyone
   who wants that (`write_files`): Claude lists rlord's tools one by one in
   `--allowedTools` without it (`claude_allowed_tools`); Codex adds
   `mcp_servers.rlord.tools.send_to_session.approval_mode="prompt"`
@@ -755,12 +764,19 @@ including when the active one hits a usage limit.
 - **The switchers** all call `overlord.switch`: the overlay (it draws a
   top row with each installed agent's marker when there are two or more;
   a click, or `[tmux] overlord_switch`, default `M-s`, read by the
-  overlay and never bound in tmux; the overlay then shows the other
+  overlay and never bound in tmux. The key goes round the overlords that
+  exist and never creates one; a click on an agent without one, the
+  list's menu, `:overlord <agent>` or the CLI does. If a tmux binding
+  uses the same key (modifiers compared case-insensitively, as tmux
+  does), the switch key is off with a warning. The overlay then shows the other
   pane without closing: `overlay::show`), the overlord row's right-click
   menu, `:overlord <agent>`, and `rlord overlord switch <agent>`.
   `overlord.get` and `overlord.status` carry `overlords`
   (`overlord::roster`: per agent installed / exists / active / running),
-  which is what they draw from. The popup's title is set by tmux when it
+  which is what they draw from. `roster` runs tmux and the install
+  checks, so it is built after the DB guard drops and cached for a few
+  seconds while its rows are unchanged (`Daemon::roster`): the TUI asks
+  for `overlord.get` on every refresh. The popup's title is set by tmux when it
   opens and can't change, so with several agents the "fresh 2h ago"
   label moves from the title to the overlay's own row.
 - **`recall` reads every overlord's conversations**: all their earlier
@@ -770,8 +786,9 @@ including when the active one hits a usage limit.
   another one. The list's "fresh · N earlier" and the earlier
   conversations in the details pane stay the active overlord's own.
   `overlord.continue` given another overlord's conversation (an id from
-  `recall`, whose hits name their overlord) switches to that overlord
-  first, then continues it there.
+  `recall`, whose hits name their overlord) makes that overlord active
+  without starting it (`overlord::activate`), then continues it there,
+  so it starts once, onto that conversation.
 
 - **Asking** (`daemon/src/ask.rs`): `overlord.ask` pastes text into the
   overlord's agent pane (`send::type_into`: bracketed paste, then Enter),
