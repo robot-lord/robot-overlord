@@ -268,7 +268,8 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
-  environment of whatever started the daemon, never the session's. So a
+  environment of whatever started the daemon, not the session's (unless
+  that session's pane started it: see below). So a
   daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
   starts can't pass one on), and rlord starts the daemon itself
   (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
@@ -296,6 +297,9 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   (`thread/read`; the transcript when it can't be asked) every few passes
   and stops the session only once no turn runs; meanwhile it stays as the
   hooks say, logged once as `pane_gone_turn_running`.
+- **Fresh restarts don't interrupt**: `session_fresh` is used only for
+  the overlord, which never runs on the daemon. Using it on a daemon-mode
+  session would leave its turn running there while a new thread starts.
 - **Stop and archive interrupt first**, before the DB lock: Escape into
   the pane when it is up with no dialog (it interrupts from any client),
   else `turn/interrupt`; then up to 4s for the turn to end. The answer and
@@ -984,7 +988,7 @@ including when the active one hits a usage limit.
   its bottom box). A status can't be trusted for this: a Codex session
   without hooks reads as working while an approval is up. (A daemon-mode
   Codex thread with a turn started from another client reads as at its
-  prompt; its status or transcript mostly catches it: see "Codex on its
+  prompt: see "Another client on the same thread" under "Codex on its
   shared background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
   placeholder isn't one: Claude's input box, Codex's composer; OpenCode's

@@ -19,7 +19,10 @@ sessions moved onto the daemon and back, a stand-in control socket for
 tests (`codex_server::fake`), and docs. Re-check everything below against
 the Codex of the day first. Where the branch's own working doc differs
 (it was written before MFA was on and before the lock was timed twice),
-this file is newer. Rebase it and bump to the next free version. Rules to keep (Brandon's): the machine switch
+this file is newer. Rebasing it onto main conflicts on
+`docs/working/codex-daemon.md` (deleted here): keep it deleted, take what
+is needed from this file, and bump to the next free version. Rules to
+keep (Brandon's): the machine switch
 goes on only on the user's explicit yes (`confirm_machine`), never
 confirmed by the overlord for them; the pairing code never goes into MCP
 results, logs or events, only to the user's own terminal; turning it off
@@ -71,10 +74,8 @@ The checks that keep Road to 1.0 item 7 open are listed there
 its "After launch (tracked)" list:
 
 - A message can be typed into a daemon-mode thread mid-turn when another
-  Codex client started that turn, in the moment before its hook reaches
-  rlord (without hooks: until the transcript is read): `send_to_session`,
-  held deliveries and a usage-limit resume alike. The
-  rlord pane's composer reads idle meanwhile. Fix: in `send::type_message`
+  Codex client started that turn (architecture.md, "Another client on the
+  same thread"). Fix: in `send::type_message`
   (which every caller goes through), for daemon-mode sessions only, ask
   the daemon (`codex_server::thread_state`) and treat any `Active` as "not
   now", `waiting` included. `thread_state` is a handshake, `initialize`
@@ -91,8 +92,8 @@ its "After launch (tracked)" list:
   (its thread isn't in the gate).
 - `send_to_session` still types into the pane; `codex queue` would reach a
   daemon thread without one.
-- The Codex overlord on the daemon: any `-c`, `--enable`, `--disable` or
-  `--search` makes Codex run embedded, and the overlord's wiring is all
+- The Codex overlord on the daemon: any flag `codex::needs_embedded`
+  matches makes Codex run embedded, and the overlord's wiring is all
   `-c`; it would need its MCP server and settings some other way.
 - Linux: the daemon's backend, socket and sandbox (unchecked; Linux fixes
   come after 1.0, Road to 1.0 item 1).

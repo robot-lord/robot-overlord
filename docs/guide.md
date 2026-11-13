@@ -328,7 +328,7 @@ off by default): new Codex sessions run their conversation on Codex's
 per-user background server instead of in the pane. The turn keeps going
 when the pane closes, and a restart attaches to it again. The session's
 details say "codex: shared server". rlord starts that server itself when
-none runs, and never updates, restarts or stops it; `rlord agents` shows
+none runs (if that fails, the pane's Codex may start it), and never updates, restarts or stops it; `rlord agents` shows
 its version when it differs from your `codex` (it updates itself).
 Stopping or archiving such a session interrupts its running turn first,
 and says so if it wouldn't stop. The overlord, and a session launched
@@ -340,9 +340,9 @@ servers run in the background server, so they should get the
 environment of whatever started that server (usually rlord; with rlord
 as a launchd or systemd service, without what your shell's rc files
 set; a server started earlier by your own `codex`, that one's) rather
-than the pane's. Not checked yet. Starting a turn on the same
-conversation from another Codex client can race a message rlord sends
-it. Daemon mode has been checked on macOS only so far.
+than the pane's. Not checked yet. Avoid starting turns on the same
+conversation from another Codex client: rlord can't always tell, and
+may type a message into that turn. Daemon mode has been checked on macOS only so far.
 
 Not yet: importing Codex
 conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
