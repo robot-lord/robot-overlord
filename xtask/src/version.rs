@@ -65,10 +65,9 @@ impl Version {
         };
         let nums: Vec<&str> = core.split('.').collect();
         let bad = || anyhow::anyhow!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
-        // Semver's rules: numbers are digits only (u64's parser would also
-        // take a `+`) with no leading zero, so versions that compare equal
-        // are the same text; pre-release identifiers are non-empty
-        // [0-9A-Za-z-] (so no build metadata).
+        // Numbers are digits only (u64's parser would also take a `+`)
+        // with no leading zero, as semver says, so versions that compare
+        // equal are the same text.
         let number = |n: &str| {
             let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
             digits && (n == "0" || !n.starts_with('0'))

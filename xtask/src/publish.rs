@@ -10,8 +10,8 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::cmd::{self, cargo};
-use crate::version::{self, Version, CRATES};
+use crate::cmd::{self, cargo, gh};
+use crate::version::{self, Version, CRATES, REPO};
 
 const MANIFESTS: [&str; 3] = [
     "crates/daemon/Cargo.toml",
@@ -45,6 +45,22 @@ pub fn publish(dry_run: bool) -> Result<()> {
     let ver = version::current()?;
     if ver.is_dev() {
         bail!("publish-crates: {ver} is a dev build; only stable releases go to crates.io");
+    }
+    // crates.io publishes the source, which can't be taken back: only once
+    // the repository itself is public.
+    if !dry_run {
+        let visibility = cmd::output(gh().args([
+            "repo",
+            "view",
+            REPO,
+            "--json",
+            "visibility",
+            "-q",
+            ".visibility",
+        ]))?;
+        if visibility != "PUBLIC" {
+            bail!("publish-crates: {REPO} is not public; crates.io waits until it is");
+        }
     }
 
     let mut restore = Restore(Vec::new());

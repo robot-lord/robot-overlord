@@ -299,12 +299,13 @@ pub fn main(args: &[String]) -> Result<()> {
         // Tried whenever the repo is public: cargo knows best whether it
         // has a token (a credentials file, an env var, a credential
         // provider), and says so if it hasn't.
-        publish::publish(false).with_context(|| {
-            format!(
-                "crates.io publish failed; the GitHub release and tap are done ({}). Log in if needed (cargo login), then: cargo xtask publish-crates",
-                release_url(&tag)
-            )
-        })?;
+        if let Err(e) = publish::publish(false) {
+            // The release itself shipped: say so before the failure.
+            println!("released: {}", release_url(&tag));
+            return Err(e.context(
+                "crates.io publish failed; the GitHub release and tap are done. Log in if needed (cargo login), then: cargo xtask publish-crates",
+            ));
+        }
     }
     println!("released: {}", release_url(&tag));
     Ok(())
@@ -411,8 +412,9 @@ fn wait_and_publish(
         cmd::sleep(Duration::from_secs(10))?;
         let mut not_cancelled = Vec::new();
         for late in find_runs().map_err(unknown)? {
-            // An earlier attempt's run isn't this push's to cancel.
-            if late.status != "completed" && !earlier.contains(&late.id) {
+            // Every unfinished run for the tag, an earlier attempt's too:
+            // any of them could publish over a --local release.
+            if late.status != "completed" {
                 let id = late.id.to_string();
                 if cmd::run(gh().args(["run", "cancel", &id, "-R", REPO])).is_err() {
                     not_cancelled.push(id);
