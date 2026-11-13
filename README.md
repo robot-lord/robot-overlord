@@ -78,8 +78,9 @@ session from last week decide? rlord is built around a few ideas:
   sessions can use your own tmux config (`rlord tmux import`). Every key can
   be rebound, and the key screen tells you whether a key will actually reach
   rlord.
-- **Remote Control.** Pick a Claude Code session up from the Claude app on
-  your phone while it keeps running at your desk.
+- **Remote Control.** Pick a Claude Code session up from the Claude app, or
+  a Codex session from the ChatGPT app, on your phone while it keeps
+  running at your desk.
 - **macOS and Linux.**
 
 ## Install

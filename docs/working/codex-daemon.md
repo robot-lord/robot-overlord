@@ -1,4 +1,4 @@
-**Status:** in progress (PR 1, daemon mode, built on `codex-daemon`, 0.23.0-dev.12; PR 2, Remote Control, next)
+**Status:** in progress (PR 1, daemon mode, shipped in 0.23.0-dev.12; PR 2, Remote Control, built on `codex-remote` (0.23.0-dev.15), waiting on L6)
 
 # Codex daemon mode and Codex Remote Control
 
@@ -378,6 +378,73 @@ Not run:
   restart|update`, which rlord's checks don't run. Owed, by hand.
 - **L3, L6**: PR 2.
 - **L9** Linux backend/socket/sandbox.
+
+## PR 2 as built (differs from the plan)
+
+- **Everything over the control socket**, not the CLI: `codex remote-control
+  start` and `daemon enable-remote-control` / `disable-remote-control` all
+  restart the daemon (L3), which would cut off every turn on it. The
+  socket's `remoteControl/enable` / `disable` don't, and persist the
+  switch (`~/.codex/app-server-daemon/settings.json`). Pairing goes over
+  the socket too, so the code never lands in a command's output file.
+- **Off waits for the daemon to let go.** The daemon keeps a thread loaded
+  (its writer lock held) for about a minute after the last client leaves;
+  `codex resume --no-daemon` before then shows "This conversation is open
+  in another app" (seen live). So off stops the pane and the keeper
+  resumes it in the pane once `thread/read` says `notLoaded` (5 min cap).
+- A session in daemon mode by config (not moved by Remote Control) stays
+  on the daemon when it's turned off, and says so.
+- `remote_pair` / `remote.pair` push `remote_pair` to the TUI, which asks
+  `remote.pair_code` itself; `rlord remote pair` prints only to a terminal.
+- CLI: `rlord remote machine on|off` (asks at the terminal) and
+  `rlord remote pair`; `rlord remote` shows the machine line.
+- `remote.status` and `list_sessions` carry `remote_reason`.
+
+### L3 (2026-11-13, codex-cli 0.167.2, daemon 0.169.0)
+
+- Before: switch `disabled`, no `settings.json` switch seen, no threads
+  loaded. After: `disabled` (`settings.json` `remoteControlEnabled:
+  false`), daemon running. The daemon was restarted three times by the CLI
+  commands below (pid changed; nothing was loaded).
+- `remoteControl/status/changed` arrives right after `initialize`
+  (`{status, serverName, installationId, environmentId}`); the other
+  `remoteControl/*` methods need `capabilities.experimentalApi`.
+- `codex remote-control start --json`: restarts the daemon, sets the
+  switch on, and exits 1 with "Remote control is enabled on <host> but the
+  connection is errored." (nothing on stdout).
+- Enrollment is refused: `HTTP 403 ... {"detail":"Multi-factor
+  authentication required"}`. ChatGPT needs MFA on the account; status
+  `errored`.
+- `codex remote-control pair --json`: fails with the same enrollment
+  error (exit 1); doesn't restart the daemon.
+- `daemon disable-remote-control` / `enable-remote-control`: restart the
+  daemon (`shutdown_requested`, new pid), daemon stays up, print
+  `{"status":"disabled|enabled","remoteControlEnabled":...}`, exit 0.
+- `remoteControl/disable` over the socket: no restart, persisted.
+  `remoteControl/enable`: no restart; with the 403 it errors at once and
+  leaves the switch off.
+- `remoteControl/pairing/start` while off: "requires remote control to be
+  enabled". `/pairing/status` takes `pairingCode` or `manualPairingCode`.
+  `/client/list` needs `environmentId` (a string).
+- Not seen (blocked on MFA): a connected status, a pairing code's shape,
+  `claimed`, the client list's shape. Parsed from the third-party
+  description, tolerant of variants.
+- Also on 0.169.0: `thread/name/set` exists (could name the thread after
+  the rlord session for the app; not used).
+
+### Stand-in end to end (scratch rlord, `RLORD_NO_LOGIN_SHELL=1`)
+
+Stand-in `codex` (learned `login status`) plus a stand-in control socket
+(not committed): MCP `remote_control on` → `needs_confirm` +
+`machine_wide`; with the 403 → the MFA line, nothing changed; confirmed →
+switched on, resumed without `--no-daemon`, `unpaired`, `needs_pairing`;
+`remote_pair` → the TUI dialog showed the code (the answer didn't),
+then "✓ paired" once claimed; state `on`; the code in no file under the
+scratch dirs nor the event log. Off → stopped, `disconnecting`, then
+resumed with `--no-daemon` once the thread read `notLoaded`. Machine off.
+`create_session {agent: codex, remote_control: true}` → launched on the
+daemon, `needs_confirm` + `machine_wide`. The same MCP calls against the
+real daemon: the MFA line, the switch left off, the daemon not restarted.
 
 ## Owed (after PR 1)
 

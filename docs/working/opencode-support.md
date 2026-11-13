@@ -368,8 +368,6 @@ and without a model and a restart of a session OpenCode no longer had.
 
 ## Also queued: Codex Remote Control
 
-Codex's Remote Control is machine-wide (`codex remote-control start/pair`)
-and reaches threads run by Codex's background app-server, not rlord's
-in-pane (`--no-daemon`) sessions. Supporting it means running remote Codex
-sessions through the app-server and matching their hooks by conversation
-id; it pairs naturally with a Codex overlord.
+Built (no longer queued): Codex sessions on Codex's background server,
+reached through a machine-wide switch and a paired phone. See
+architecture.md "Codex Remote Control". Not for a Codex overlord.

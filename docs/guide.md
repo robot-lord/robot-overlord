@@ -96,7 +96,7 @@ runs a command.
 | Instructions | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` |
 | Subagents (tidy, import) | `.claude/agents` | `.codex/agents` | `.opencode/agents` |
 | Effort | `--effort` | `model_reasoning_effort` | none |
-| Remote Control | yes | no | no |
+| Remote Control | yes | no (Codex sessions can have it) | no |
 | Passing work to a session | `send_to_session` | `send_to_session` | `send_to_session` |
 
 - Nothing is written to your own agent config: Codex gets its settings as
@@ -337,9 +337,10 @@ with flags that need the pane (`-c`, `--enable`, `--disable`,
 or `/new` in the session (it stays on its first thread), and "needs you"
 from a sub-agent's prompt.
 
-Not yet: importing Codex
-conversations started outside rlord, sub-agent tracking, Remote Control. A session blocked
-on a permission prompt shows "needs you" only with trusted hooks.
+Remote Control works for Codex sessions (see "Remote Control"). Not yet:
+importing Codex conversations started outside rlord, sub-agent tracking.
+A session blocked on a permission prompt shows "needs you" only with
+trusted hooks.
 
 ## OpenCode sessions
 
@@ -532,7 +533,8 @@ A call to one of them on the read-only server is refused.
 
 Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control)
 lets you continue a session from the Claude app (Code tab) or claude.ai while
-it keeps running on this machine. rlord manages it per session:
+it keeps running on this machine. (Codex sessions: see below.) rlord manages
+it per session:
 
 - **Ask the overlord**: "turn on remote control for the web app". It
   replies with the link, or with the reason it can't. The overlord has it
@@ -557,6 +559,38 @@ available. On Team and Enterprise an admin must allow it first; rlord can't
 see that setting, so a session that never connects is reported as such
 after a few tries. While connected, the conversation is also stored on
 Anthropic's servers.
+
+### Codex sessions (the ChatGPT app)
+
+Codex's Remote Control (experimental in Codex) lets the ChatGPT app on your
+phone continue Codex conversations on this machine. It works differently
+from Claude Code's:
+
+- **It's one switch for the whole machine**, on Codex's shared background
+  server. Once it's on, a paired phone can open and drive every Codex
+  conversation on that server, not just one session. So the overlord asks
+  you before switching it on, and only turns it on after your yes
+  (`rlord remote machine on|off` asks at the terminal).
+- **You pair a phone once.** Ask the overlord ("pair my phone"), or run
+  `rlord remote pair`. The code shows on your screen (a dialog in the
+  list, or the terminal); you enter it in the ChatGPT app. It never goes
+  through the overlord or rlord's logs.
+- **The session runs on Codex's background server**: only those
+  conversations are reachable. Turning it on for a session in its pane
+  moves it there (a restart; the conversation resumes). Turning it off
+  moves it back: the session stops for about a minute while Codex's
+  server lets go of the conversation, then resumes in its pane. The
+  machine switch stays on until you turn it off, and a paired phone may
+  still open the conversation as a past one.
+- The session shows under its conversation's title in the app, not its
+  rlord name. Sessions you start from the phone don't show in rlord.
+- Turning the switch on or off never restarts Codex's background server,
+  so running turns go on.
+- Not for a Codex overlord: its settings make Codex run it in its pane.
+
+It needs Codex logged in with ChatGPT (not an API key). ChatGPT also
+requires multi-factor authentication on the account; rlord passes on
+ChatGPT's reason when it refuses this machine.
 
 ## rlord's tmux
 

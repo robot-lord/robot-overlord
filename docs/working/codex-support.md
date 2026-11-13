@@ -23,7 +23,7 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
 | Messaging a session | overlord's Claude peer tools (`SendMessage`) | **`codex queue --thread <id> --message …`**: delivered without typing | better than Claude's; new rlord tool |
 | Overlord | `--mcp-config`, `--allowedTools`, `--effort`, `.claude/agents` | `-c mcp_servers.rlord.*` + `default_tools_approval_mode="approve"`, `-c model_reasoning_effort`, AGENTS.md (already written), `[agents]` | doable; later phase |
 | Models | opus/sonnet/haiku catalog | `codex debug models` / `models_cache.json` | per-agent catalog |
-| Remote Control | Claude app bridge | `codex remote-control` (experimental) | later; report unavailable |
+| Remote Control | Claude app bridge | `codex remote-control` (experimental) | built: machine switch + pairing, sessions on the daemon (`remote_codex.rs`); not the overlord |
 | Key shadows | Claude defaults + keybindings.json | `tui.keymap.*` (only `alt-r` default) | later; verify Alt-O/Alt-D by hand |
 
 ## Plan (phases)
@@ -43,7 +43,8 @@ the overlord on Codex. Researched against codex-cli 0.167.2 (local binary,
    under Progress. **Requirement before the repo goes public (Brandon's
    decision):** the overlord must run on Codex, and preferably on OpenCode
    too. Both do now.
-5. Later: Codex Remote Control, key shadows, Gemini.
+5. Later: key shadows, Gemini. (Codex Remote Control: built, see
+   architecture.md "Codex Remote Control".)
 
 ## Decisions (with Brandon)
 
@@ -191,7 +192,8 @@ codex-cli 0.167.2:
   ordinary promptless and resumed Codex sessions, which stayed "starting".
 - An overlord that stopped with no conversation bound starts fresh.
 - The setup dialog lists Codex when installed; its Remote Control row is
-  only shown for an agent that has it.
+  only shown for an agent whose overlord can have it (Codex's is for
+  sessions only, and the dialog says so).
 
 Verified live (one throwaway overlord in a scratch rlord, its own XDG dirs
 and tmux socket; the three Codex threads deleted afterwards):

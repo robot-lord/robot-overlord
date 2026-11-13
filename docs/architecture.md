@@ -228,9 +228,10 @@ facts live in its module) is what the rest of rlord asks:
   `<opencode.db>/<session id>`, and `agents::opencode` answers the same
   questions from the database (opened read-only; only those two tables,
   since the database also holds OpenCode's credentials).
-- **Capabilities**: `has_remote_control`, `tracks_subagents`,
-  `runs_overlord`, `importable` (callers ask instead of comparing names).
-  Every agent runs the overlord; the other three are Claude-only today.
+- **Capabilities**: `has_remote_control` (Claude, Codex),
+  `overlord_remote_control` (Claude), `tracks_subagents`, `runs_overlord`,
+  `importable` (callers ask instead of comparing names). Every agent runs
+  the overlord; the rest are Claude-only today unless said.
 
 Status has more than one source, and that is not part of `Agent`: hook
 events (`methods::hook_emit`); for agents not reporting through hooks
@@ -304,6 +305,52 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c`, `--enable`,
 - rlord never runs `daemon update`, `restart` or `stop`; the daemon updates
   itself and can be newer than the CLI (`rlord agents` shows its version
   then).
+
+### Codex Remote Control
+
+Claude Code's Remote Control is a launch flag per session
+(`daemon/src/remote.rs`). Codex's is machine-wide: a switch on the daemon,
+the phones paired with it, and only threads on the daemon are reachable.
+`daemon/src/remote_codex.rs` handles Codex sessions for `remote.set` and
+the keeper; the calls are in `agents::codex_remote`:
+
+- **Everything goes through the control socket** with the
+  `experimentalApi` capability: `remoteControl/status/read` (`disabled |
+  connecting | connected | errored`), `remoteControl/enable` / `disable`,
+  `remoteControl/pairing/start` and `/pairing/status`,
+  `remoteControl/client/list {environmentId}`. Switching over the socket
+  never restarts the daemon and persists the switch. The CLI's
+  `codex remote-control start` and `daemon enable-remote-control` /
+  `disable-remote-control` restart the daemon (cutting off its turns), so
+  rlord doesn't run them. Enabling enrolls the machine with ChatGPT and
+  fails at once when ChatGPT refuses (an account without multi-factor
+  authentication); `codex_remote::explain` turns that into a line.
+- **The machine switch needs the user's yes.** `remote.set {on: true}` with
+  the switch off answers `needs_confirm` + `machine_wide` and changes
+  nothing; only `confirm_machine: true` switches it (kv
+  `codex_remote_enabled_by_rlord`). `remote.machine` is the switch alone.
+- **A session's wish** is the same spec key as Claude's (`remote_control`);
+  it adds no flag. On moves an in-pane session onto the daemon
+  (`codex_host = "daemon"` plus `codex_host_by_remote`) with a restart,
+  under the same work-going check. Off moves only such a session back.
+  The daemon keeps a thread loaded, holding its writer lock, for about a
+  minute after its last client leaves, and an in-pane Codex started before
+  then shows "open in another app". So off stops the pane
+  (`codex_leaving_since`), and the keeper resumes it in the pane once
+  `thread/read` says `notLoaded` (or after a few minutes).
+- **State** per session: `on` when the machine is connected with a phone
+  paired (or the paired count is unknown), `unpaired`, `connecting`,
+  `failed` (switch off, enrollment refused, daemon down), `pending`,
+  `disconnecting`, `stopped`, `unavailable`. A daemon-mode session without
+  the wish reads `on` while a phone can reach it. The machine state is
+  cached for 15s and the paired count (a call to ChatGPT) for a minute.
+- **The pairing code** stays in the daemon's memory (`codex_remote::Secret`
+  never prints). `remote.pair` starts a pairing and pushes `remote_pair`
+  to the TUI, which asks `remote.pair_code` for it; `rlord remote pair`
+  prints it only to a terminal. The MCP layer never asks for it (a test
+  checks), so it never reaches the overlord, a log line or an event. The
+  keeper polls `/pairing/status` while a code is shown.
+- **Not for a Codex overlord**: its `-c` wiring keeps it in the pane.
 
 ## Status engine
 
