@@ -19,6 +19,10 @@ sessions moved onto the daemon and back, a stand-in control socket for
 tests (`codex_server::fake`), and docs. Re-check everything below against
 the Codex of the day first.
 
+Live checks named here (from the removed doc): L3 the Remote Control CLI
+and socket calls; L6 what a paired phone sees (never run); L8 a daemon
+restart or update mid-turn; L9 Linux.
+
 What L3 found (codex-cli 0.167.2, daemon 0.169.0, macOS):
 
 - `codex remote-control start`, `codex app-server daemon
@@ -72,11 +76,12 @@ Before launch:
 
 After launch:
 
-- A send can be typed into a daemon-mode thread mid-turn when the turn was
-  started from another Codex client (the rlord pane's composer reads idle).
-  Fix: before the paste, ask the daemon (`codex_server::thread_state`)
-  and treat any `Active` as "not now", `waiting` (an approval or question
-  in the other client) included: the turn isn't over.
+- A send can be typed into a daemon-mode thread mid-turn in the moment
+  between another Codex client starting a turn and its hook reaching rlord
+  (without hooks: until the transcript is read); the rlord pane's composer
+  reads idle meanwhile. Fix: in `send::type_into`, for daemon-mode
+  sessions only, ask the daemon (`codex_server::thread_state`) and treat
+  any `Active` as "not now", `waiting` included.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.

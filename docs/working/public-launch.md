@@ -56,7 +56,7 @@ done, in this order (decided with the user, 2026-11-12):
        official. Findings and branch `codex-remote`:
        `docs/working-archive/codex-daemon.md`. Open until its "Before
        launch" items are done (live checks: hooks through the real
-       daemon, L8, L9).
+       daemon, a daemon restart or update mid-turn, Linux).
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
 9. [ ] A fresh-install end-to-end test.
