@@ -250,7 +250,9 @@ Known limits, accepted:
   and `granular`. Kept `on-request`. Live: the overlord ran `tmux -L
   <scratch socket> list-sessions` unasked and the sandbox refused it
   (`error connecting to … (Operation not permitted)`); rlord's tools ran
-  with no prompt. Linux is unverified: owed below.
+  with no prompt. Linux checked later (2026-11-12, PR #22): blocked,
+  seccomp refuses socket creation (as root in Docker; see
+  `public-launch.md` for the non-root real-host check still owed).
 - **Killed mid-turn, then resumed**: the rollout ends on `task_started`.
   `follow` now counts only lines since the (re)start while a session is
   starting (`transcript::working_since`), and leaves the incremental
@@ -326,10 +328,13 @@ the daemon restarts.
 
 ## Owed
 
-- Linux: check that the overlord's read-only sandbox refuses a connection
-  to rlord's tmux socket (`tmux -L rlord list-sessions` from the overlord).
-  If it doesn't, find a Codex setting that does (a permissions profile's
-  network rules, or an execpolicy rule), since `"untrusted"` is gone.
+- Linux: detect when the Codex sandbox can't start (bwrap can't create
+  user namespaces, e.g. stock Ubuntu 24.04's
+  `apparmor_restrict_unprivileged_userns=1`) and say so clearly in the
+  overlord or `rlord agents`, instead of every shell command failing
+  silently, or with repeated prompts to run it unsandboxed (which,
+  approved, would reach rlord's socket). (The socket check itself is done: blocked; see
+  `public-launch.md`.)
 - `codex queue --thread <id> --message …` could deliver to a busy Codex
   session without typing; `send_to_session` types for every agent today.
 - Moving an existing overlord to another agent (the agent is fixed when it

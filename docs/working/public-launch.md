@@ -7,7 +7,9 @@
 The first stable release is 1.0.0, cut only after everything below is
 done, in this order (decided with the user, 2026-11-12):
 
-1. [ ] Linux Codex sandbox check (below, "Before flipping it public").
+1. [ ] Linux Codex sandbox check. Partial (0.23.0-dev.4): blocked as
+       root in a privileged container; the check on real Ubuntu as a
+       non-root user is still open (below, "Before flipping it public").
 2. [x] rlord's own pastes no longer count as the user's prompts
        (0.23.0-dev.5; `daemon/src/own.rs`).
 3. [ ] CI release builds: macOS on a Mac runner, Linux on a Linux runner.
@@ -31,9 +33,34 @@ repo secrets (to do later, not part of the CI release builds step).
 - [ ] Stable release (`X.Y.Z`, no suffix) so `get.sh`, Homebrew and the
       stable channel stop installing 0.18.1. Needs `colima start` for the
       Linux smoke tests; check OpenCode and Codex on Linux in them.
-- [ ] Codex overlord's read-only sandbox on Linux: confirm it refuses
-      unix-socket connects (`codex sandbox`, e.g. in Docker). If not, fix
-      or document before Linux users get a Codex overlord.
+- [ ] Codex overlord's read-only sandbox on Linux. Partial: it blocked a
+      unix-socket connect as root on a `/tmp` socket (checked 2026-11-12,
+      codex-cli 0.167.2 from npm, `ubuntu:24.04` arm64 on colima). Run
+      as root in `docker run --rm --privileged ubuntu:24.04` (root and
+      `--privileged` were the only way bwrap could start there), with
+      `codex sandbox` (check `codex sandbox --help` for the exact form;
+      it doesn't exercise the overlord's on-request escalation) against a live `tmux -L tsock`
+      (`/tmp/tmux-0/tsock`):
+      - `tmux list-sessions` and `send-keys`: `error connecting to
+        /tmp/tmux-0/tsock (Operation not permitted)`; pane untouched.
+      - Python `AF_UNIX` connect and a TCP `socket()`: `PermissionError:
+        [Errno 1] Operation not permitted` (whether at `socket()` or
+        `connect()` wasn't told apart).
+      - writes to `/tmp` and the workdir: `Read-only file system`.
+
+      Not covered: a non-root user and rlord's real socket path
+      (`/tmp/tmux-<uid>/rlord`); that's the next item. As non-root,
+      bwrap wouldn't start in this setup (Docker's default seccomp: `No
+      permissions to create a new namespace`; with `--privileged` or
+      seccomp/apparmor unconfined, the colima VM's
+      `kernel.apparmor_restrict_unprivileged_userns=1`: `bwrap: loopback:
+      Failed RTM_NEWADDR: Operation not permitted`). x86_64 under QEMU
+      couldn't create namespaces either.
+- [ ] Codex overlord on a real Ubuntu 24.04 host
+      (`apparmor_restrict_unprivileged_userns=1`): does bwrap start, as
+      non-root, with rlord's real socket path? If it doesn't, every shell
+      command fails (closed, but unusable): document it, and see the
+      owed detection item in `codex-support.md`.
 - [ ] Fresh install end to end on a clean machine or account: `get.sh` and
       `brew install`, then first-run setup per agent, including a machine
       without Claude Code.
