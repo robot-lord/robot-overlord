@@ -7,9 +7,34 @@
 - [ ] Stable release (`X.Y.Z`, no suffix) so `get.sh`, Homebrew and the
       stable channel stop installing 0.18.1. Needs `colima start` for the
       Linux smoke tests; check OpenCode and Codex on Linux in them.
-- [ ] Codex overlord's read-only sandbox on Linux: confirm it refuses
-      unix-socket connects (`codex sandbox`, e.g. in Docker). If not, fix
-      or document before Linux users get a Codex overlord.
+- [ ] Codex overlord's read-only sandbox on Linux. Partial: it blocked a
+      unix-socket connect as root on a `/tmp` socket (checked 2026-11-12,
+      codex-cli 0.167.2 from npm, `ubuntu:24.04` arm64 on colima). Run
+      as root in `docker run --rm --privileged ubuntu:24.04` (root and
+      `--privileged` were the only way bwrap could start there), with
+      `codex sandbox` (check `codex sandbox --help` for the exact form;
+      it doesn't exercise the overlord's on-request escalation) against a live `tmux -L tsock`
+      (`/tmp/tmux-0/tsock`):
+      - `tmux list-sessions` and `send-keys`: `error connecting to
+        /tmp/tmux-0/tsock (Operation not permitted)`; pane untouched.
+      - Python `AF_UNIX` connect and a TCP `socket()`: `PermissionError:
+        [Errno 1] Operation not permitted` (whether at `socket()` or
+        `connect()` wasn't told apart).
+      - writes to `/tmp` and the workdir: `Read-only file system`.
+
+      Not covered: a non-root user and rlord's real socket path
+      (`/tmp/tmux-<uid>/rlord`); that's the next item. As non-root,
+      bwrap wouldn't start in this setup (Docker's default seccomp: `No
+      permissions to create a new namespace`; with `--privileged` or
+      seccomp/apparmor unconfined, the colima VM's
+      `kernel.apparmor_restrict_unprivileged_userns=1`: `bwrap: loopback:
+      Failed RTM_NEWADDR: Operation not permitted`). x86_64 under QEMU
+      couldn't create namespaces either.
+- [ ] Codex overlord on a real Ubuntu 24.04 host
+      (`apparmor_restrict_unprivileged_userns=1`): does bwrap start, as
+      non-root, with rlord's real socket path? If it doesn't, every shell
+      command fails (closed, but unusable): document it, and see the
+      owed detection item in `codex-support.md`.
 - [ ] Fresh install end to end on a clean machine or account: `get.sh` and
       `brew install`, then first-run setup per agent, including a machine
       without Claude Code.

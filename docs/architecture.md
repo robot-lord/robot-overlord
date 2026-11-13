@@ -660,8 +660,13 @@ Things that are not visible at the call site:
   the read-only sandbox unasked, and anything needing more asks.
   `"untrusted"` (ask for anything not known to be read-only) would be
   stricter, but Codex 0.167 refuses it ("no longer supported"). The
-  sandbox keeps a shell command from reaching rlord's tmux socket (macOS
-  refuses the connection, checked live; Linux is unverified). It doesn't
+  sandbox keeps a shell command from reaching rlord's tmux socket: the
+  connection is refused on macOS, and on Linux too where Codex's sandbox
+  can start (see the launch checklist for what has been checked). Where it
+  can't start (e.g. stock Ubuntu 24.04 for a non-root user, with
+  `kernel.apparmor_restrict_unprivileged_userns=1`), commands fail in the
+  sandbox and, under `on-request`, Codex asks to run them without it:
+  approving that lets a command reach the socket. It doesn't
   stop the overlord typing into sessions: `send_to_session` does that, on
   every agent, without a prompt (below).
 - **`send_to_session` runs unasked, by design.** rlord expects to be run
