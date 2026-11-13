@@ -228,7 +228,7 @@ impl App {
                 self.group_focus = true;
                 return true;
             }
-            _ if !self.group_focus && action == Some(Action::Cancel) => {
+            _ if action == Some(Action::Cancel) && self.esc_target() == EscTarget::GroupList => {
                 self.group_focus = true;
                 return true;
             }
@@ -425,7 +425,10 @@ impl App {
                     let back = press(Action::Cancel);
                     bar.push((Span::raw(" "), None));
                     bar.push(k);
-                    bar.push((Span::styled(" back", theme::muted()), back));
+                    // (Tighter tiers: the keycap alone.)
+                    if tier < 2 {
+                        bar.push((Span::styled(" back", theme::muted()), back));
+                    }
                 }
             }
             bar
@@ -626,7 +629,7 @@ impl App {
             EscTarget::GroupList
         } else if self.conv_sel > 0 {
             EscTarget::Conversation
-        } else if !self.filter.trim().is_empty() {
+        } else if !self.filter.is_empty() {
             EscTarget::Filter
         } else if self.show_archived {
             EscTarget::LeaveArchived

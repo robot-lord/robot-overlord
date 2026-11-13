@@ -1176,13 +1176,17 @@ mod tests {
         assert!(app.group_focus && app.show_archived);
         assert_eq!(app.esc_target(), EscTarget::LeaveArchived);
         app.tab = Tab::Sessions;
+        // A whitespace filter is still cleared first (nothing shows it as
+        // a search, so no back hint while it's there either way).
         app.filter = "  ".into();
-        assert_eq!(app.esc_target(), EscTarget::LeaveArchived);
+        assert_eq!(app.esc_target(), EscTarget::Filter);
         app.mode = Mode::Help;
         assert!(!drawn(&mut app).iter().any(|r| r.contains(" esc  back")));
         app.mode = Mode::Normal;
         app.handle_key(esc, &mut term).unwrap();
-        assert!(!app.show_archived && app.filter.is_empty());
+        assert!(app.show_archived && app.filter.is_empty());
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(!app.show_archived);
 
         // The live list: no tint, no back hint.
         let rows = drawn(&mut app);

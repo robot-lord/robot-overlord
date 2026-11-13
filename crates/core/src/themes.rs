@@ -57,8 +57,8 @@ pub struct Palette {
     /// Selected row.
     pub surface: Rgb,
     /// Behind the session list and details while the archived view is
-    /// shown: a faint tint of the background (warm where the theme has
-    /// RGB; on rlord-dark, a darker grey), so it is clearly not the
+    /// shown: a faint tint (warm where the theme paints its own background;
+    /// on rlord-dark, which doesn't, a grey tint), so it is clearly not the
     /// live list. Kept off `surface` so the selected row still stands out.
     pub archived_bg: Rgb,
     /// Chips: tabs, keycaps.

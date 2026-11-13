@@ -462,8 +462,8 @@ shows its pane, an archived one shows **what it did**: a short summary
 written when it was archived, plus its notes and dates.
 
 `a` (or `:archived`) switches the list to archived sessions. The list and
-details panes sit on a faint tint (warm on most themes, a darker grey
-on rlord-dark) and the list's title reads **Archived** in yellow, so it
+details panes sit on a faint tint (warm on most themes, a grey tint on
+rlord-dark) and the list's title reads **Archived** in yellow, so it
 can't pass for the live list. `esc` (or `a` again) goes back. Anything
 nearer takes `esc` first: an open popup, the search filter, and inside a
 group `esc` returns to the group list first.

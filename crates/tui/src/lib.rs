@@ -86,8 +86,9 @@ pub(crate) fn handler_term() -> DefaultTerminal {
 /// in fzf. Ctrl-J is LF, but in raw mode (always, here) crossterm reports it
 /// as Ctrl+'j', never as Enter, so it can't be mistaken for one.
 pub(crate) fn picker_step(k: &KeyEvent) -> Option<bool> {
-    // Ctrl alone (Ctrl-Alt-J is some other key).
-    let ctrl = k.modifiers == KeyModifiers::CONTROL;
+    // Ctrl, not Alt (Ctrl-Alt-J is some other key).
+    let ctrl =
+        k.modifiers.contains(KeyModifiers::CONTROL) && !k.modifiers.contains(KeyModifiers::ALT);
     match k.code {
         KeyCode::Down => Some(true),
         KeyCode::Up => Some(false),
@@ -922,6 +923,7 @@ impl App {
             Action::ToggleArchived => {
                 self.show_archived = !self.show_archived;
                 self.table.select(Some(0));
+                self.conv_sel = 0;
                 self.dirty = true;
             }
             Action::Sort => {
@@ -981,8 +983,6 @@ impl App {
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
             // Esc peels one layer (`esc_target`).
             Action::Cancel => match self.esc_target() {
-                // (Normally taken first by `handle_groups_key`.)
-                groups::EscTarget::GroupList => self.group_focus = true,
                 groups::EscTarget::Conversation => self.show_conversation(0),
                 groups::EscTarget::Filter => {
                     self.filter.clear();
@@ -992,7 +992,8 @@ impl App {
                     self.filter.clear();
                     self.do_action(Action::ToggleArchived, terminal)?;
                 }
-                groups::EscTarget::Nothing => {}
+                // GroupList: `handle_groups_key` took it already.
+                groups::EscTarget::GroupList | groups::EscTarget::Nothing => {}
             },
         }
         Ok(false)
@@ -1828,7 +1829,7 @@ impl App {
                 )
             }
         };
-        let block = theme::panel(title, false).title(switch);
+        let block = self.archived_tint(theme::panel(title, false).title(switch));
         // A conversation is prose: wrapped (a pane is drawn as it is).
         let p = Paragraph::new(text).block(block);
         if self.preview == Preview::Pane && self.conv_sel > 0 {
