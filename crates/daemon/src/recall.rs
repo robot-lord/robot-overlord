@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use rlord_core::agents::transcript::{self, clip, Format};
 use rlord_core::agents::Agent;
+use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::history;
 use rlord_core::timefmt::{fmt_ts, rel_age};
@@ -571,6 +572,32 @@ fn can_continue(db: &Db, o: &Session, conv: &str) -> Result<PathBuf> {
     transcript_of(db, o, conv).context("that conversation's transcript is no longer on disk")
 }
 
+/// Undo a failed continue: overlord `o` (as it was before) back on its
+/// conversation and transcript (none, if it had none), and its pane as it
+/// was: up again if it was running, stopped if the attempt started it.
+fn restore(
+    db: &Db,
+    cfg: &Config,
+    o: &Session,
+    source: Option<&str>,
+    was_running: bool,
+) -> Result<()> {
+    db.clear_agent_session(&o.id)?;
+    if let Some(prev) = o.agent_session.as_deref() {
+        db.set_agent_session(&o.id, prev, &o.agent_session_trust)?;
+    }
+    if let Some(src) = source {
+        db.upsert_transcript_source(&o.id, src)?;
+    }
+    let up = overlord::running(&db.resolve_ref(&o.id)?);
+    if was_running && !up {
+        overlord::ensure_session(db, cfg, &o.id)?;
+    } else if !was_running && up {
+        crate::methods::session_stop(db, &json!({"ref": o.id}))?;
+    }
+    Ok(())
+}
+
 /// `overlord.continue {id}`: go back to an earlier conversation. The
 /// overlord is restarted resuming it, and the current one ends (it stays in
 /// the list), as at an idle restart. Only between turns. One another
@@ -610,18 +637,7 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
         Ok(v) => v,
         Err(e) => {
             // Back on the conversation it had, and up again if it was.
-            let undo = || -> Result<()> {
-                if let Some(prev) = o.agent_session.as_deref() {
-                    db.set_agent_session(&o.id, prev, &o.agent_session_trust)?;
-                }
-                if let Some(src) = source.as_deref() {
-                    db.upsert_transcript_source(&o.id, src)?;
-                }
-                if running && !overlord::running(&db.resolve_ref(&o.id)?) {
-                    overlord::ensure_session(&db, &d.config(), &o.id)?;
-                }
-                Ok(())
-            };
+            let undo = || restore(&db, &d.config(), &o, source.as_deref(), running);
             if let Err(u) = undo() {
                 tracing::warn!(error = %u, "undoing a failed continue");
             }
@@ -643,6 +659,51 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed continue puts the overlord back exactly: a conversation
+    /// and transcript it didn't have are cleared, ones it had come back.
+    #[test]
+    fn a_failed_continue_is_undone() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "o1",
+            name: "overlord",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "overlord",
+        })
+        .unwrap();
+        let cfg = Config::default();
+        let before = db.resolve_ref("o1").unwrap();
+        db.set_agent_session("o1", "conv-b", "hook").unwrap();
+        db.upsert_transcript_source("o1", "/tmp/b.jsonl").unwrap();
+        restore(&db, &cfg, &before, None, false).unwrap();
+        let after = db.resolve_ref("o1").unwrap();
+        assert_eq!(after.agent_session, None);
+        assert_eq!(db.transcript_source("o1").unwrap(), None);
+        // It had one: that one back.
+        db.set_agent_session("o1", "conv-a", "hook").unwrap();
+        db.upsert_transcript_source("o1", "/tmp/a.jsonl").unwrap();
+        let before = db.resolve_ref("o1").unwrap();
+        db.set_agent_session("o1", "conv-b", "hook").unwrap();
+        db.upsert_transcript_source("o1", "/tmp/b.jsonl").unwrap();
+        restore(&db, &cfg, &before, Some("/tmp/a.jsonl"), false).unwrap();
+        assert_eq!(
+            db.resolve_ref("o1").unwrap().agent_session.as_deref(),
+            Some("conv-a")
+        );
+        assert_eq!(
+            db.transcript_source("o1").unwrap().as_deref(),
+            Some("/tmp/a.jsonl")
+        );
+    }
 
     fn ev(ts: i64, kind: &str, p: Value) -> (i64, String, Value) {
         (ts, kind.to_string(), p)

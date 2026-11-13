@@ -145,11 +145,12 @@ impl Daemon {
 
     /// Swap the config for one changed by `f` (a copy: readers holding the
     /// old one keep it).
-    pub(crate) fn update_config(&self, f: impl FnOnce(&mut Config)) {
+    pub(crate) fn update_config<T>(&self, f: impl FnOnce(&mut Config) -> T) -> T {
         let mut w = self.config.write().expect("config lock");
         let mut cfg = (**w).clone();
-        f(&mut cfg);
+        let r = f(&mut cfg);
         *w = Arc::new(cfg);
+        r
     }
 
     /// The config as last loaded.
@@ -163,10 +164,11 @@ impl Daemon {
         let mut cfg = Config::load()?;
         // (Not in the file: the `rlord` that opened the list set it. Kept
         // under the same lock as the swap, so a concurrent set isn't lost.)
-        self.update_config(|c| {
-            cfg.tmux.profile_env = c.tmux.profile_env.take();
-            *c = cfg;
-        });
+        {
+            let mut w = self.config.write().expect("config lock");
+            cfg.tmux.profile_env = w.tmux.profile_env.clone();
+            *w = Arc::new(cfg);
+        }
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());

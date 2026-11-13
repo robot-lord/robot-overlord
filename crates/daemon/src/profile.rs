@@ -66,9 +66,13 @@ pub fn profile_mode(d: &Daemon, params: &Value) -> Result<Value> {
                 anyhow::bail!("RLORD_TMUX_PROFILE={v}: use default or imported");
             }
         }
-        let changed = d.config().tmux.profile_env != env;
+        // (Compared and set under one lock: two at once can't both miss.)
+        let changed = d.update_config(|c| {
+            let changed = c.tmux.profile_env != env;
+            c.tmux.profile_env = env;
+            changed
+        });
         if changed {
-            d.update_config(|c| c.tmux.profile_env = env);
             sync_all(d, false);
         }
     }

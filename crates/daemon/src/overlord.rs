@@ -470,16 +470,17 @@ pub fn activate(db: &Db, id: &str, from: Option<String>, created: bool) -> Resul
     Ok(())
 }
 
+/// Whether a session's pane is up: not stopped, and its tmux session
+/// still there (a pane can die without a hook saying so). Runs tmux.
+pub fn running(s: &Session) -> bool {
+    s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session)
+}
+
 /// The agents an overlord can run on, for the switchers (the overlay's
 /// bar, the list's menu and row, `rlord overlord switch`): each with
 /// whether it is installed, has an overlord, is the active one, and is up.
 /// Starts nothing. Takes `roster_rows`, read under the DB guard and
 /// passed in once it is dropped: this runs tmux and the install checks.
-/// Its pane is up: not stopped, and its tmux session there.
-pub fn running(s: &Session) -> bool {
-    s.status != Status::Stopped && s.tmux_session.as_deref().is_some_and(tmux::has_session)
-}
-
 pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
     Agent::ALL
         .into_iter()

@@ -382,6 +382,9 @@ pub struct LimitHit {
     /// The conversation went on after it: the user typed a prompt, or the
     /// agent answered again. Then it is no longer stopped on that limit.
     pub touched: bool,
+    /// Which record it is (a hash of its line, FNV-1a: stable across
+    /// builds): the same record read again has the same key.
+    pub key: u64,
 }
 
 /// The last usage limit near the end of a transcript, if it hit one
@@ -426,11 +429,18 @@ pub fn limit_in(format: Format, lines: &[Value]) -> Option<LimitHit> {
         let l = format.line(v);
         l.prompt().is_some() || (v["type"] == "assistant" && l.reply().is_some())
     });
+    let key = lines[i]
+        .to_string()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
     Some(LimitHit {
         at,
         resets_at,
         kind,
         touched,
+        key,
     })
 }
 

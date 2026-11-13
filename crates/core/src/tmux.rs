@@ -1198,8 +1198,21 @@ pub fn bind_nav_keys(
     // then) goes back to tmux's own.
     if mouse {
         for table in ["root", PROFILE_TABLE] {
+            // A click the user bound themselves is kept (`saved_click`)
+            // and still runs outside the hints.
+            let fallback = match click_binding(table) {
+                Click::Default => {
+                    let _ = run(&["set-option", "-gu", &saved_click_opt(table)]);
+                    STATUS_CLICK_DEFAULT.to_string()
+                }
+                Click::Ours => saved_click(table).unwrap_or_else(|| STATUS_CLICK_DEFAULT.into()),
+                Click::User(cmd) => {
+                    run(&["set-option", "-g", &saved_click_opt(table), &cmd])?;
+                    cmd
+                }
+            };
             let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
-            let cmd = status_click(&clickable);
+            let cmd = status_click(&clickable, &fallback);
             args.extend(cmd.iter().map(String::as_str));
             run(&args)?;
         }
@@ -1209,22 +1222,77 @@ pub fn bind_nav_keys(
     Ok(conflicts)
 }
 
+/// Whose a table's status click is.
+enum Click {
+    /// Unbound, or tmux's own.
+    Default,
+    /// rlord's (`status_click`).
+    Ours,
+    /// The user's: its command.
+    User(String),
+}
+
+fn click_binding(table: &str) -> Click {
+    let line = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap_or_default();
+    let cmd = line
+        .lines()
+        .next()
+        .and_then(|l| {
+            l.find(STATUS_CLICK)
+                .map(|i| l[i + STATUS_CLICK.len()..].trim())
+        })
+        .unwrap_or("");
+    if cmd.is_empty() || cmd == STATUS_CLICK_DEFAULT {
+        Click::Default
+    } else if cmd.contains("mouse_status_range") && cmd.contains(" nav ") {
+        Click::Ours
+    } else {
+        Click::User(cmd.to_string())
+    }
+}
+
+/// The tmux option holding the user's own click of a table, while
+/// rlord's is bound over it.
+fn saved_click_opt(table: &str) -> String {
+    format!("@rlord_saved_click_{table}")
+}
+
+fn saved_click(table: &str) -> Option<String> {
+    run(&["show-options", "-gqv", &saved_click_opt(table)])
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Undo rlord's status click (`bind_nav_keys` with mouse on), and only
-/// rlord's: a click the user bound themselves, in root or in their
-/// profile's table, is left as it is. Either table gets tmux's default
-/// back. Best effort: no server, nothing to undo.
+/// rlord's: the user's own click comes back if rlord bound over one
+/// (`saved_click`), else tmux's default, in either table (the profile's
+/// doesn't fall back to root: never left unbound). A click the user bound
+/// since is left alone. Best effort: no server, nothing to undo.
 fn reset_status_click() {
     for table in ["root", PROFILE_TABLE] {
-        let bound = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap_or_default();
-        let ours = bound.contains("mouse_status_range") && bound.contains(" nav ");
-        if !ours {
+        if !matches!(click_binding(table), Click::Ours) {
             continue;
         }
-        // (Both tables: the profile's doesn't fall back to root, so an
-        // unbound key there would leave no status click at all.)
-        let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
-        args.extend(STATUS_CLICK_DEFAULT.split(' '));
-        let _ = run(&args);
+        match saved_click(table) {
+            // (Its command as tmux printed it: read back by tmux's parser.)
+            Some(cmd) => {
+                let line = format!("bind-key -T {table} {STATUS_CLICK} {cmd}\n");
+                let path =
+                    std::env::temp_dir().join(format!("rlord-click-{}.conf", std::process::id()));
+                if std::fs::write(&path, line).is_ok() {
+                    let _ = run(&["source-file", &path.to_string_lossy()]);
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            None => {
+                let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
+                let cmd = status_click(&[], STATUS_CLICK_DEFAULT);
+                args.extend(cmd.iter().map(String::as_str));
+                let _ = run(&args);
+            }
+        }
+        let _ = run(&["set-option", "-gu", &saved_click_opt(table)]);
     }
 }
 
@@ -1243,16 +1311,20 @@ pub fn hint_range(verb: &str) -> Option<&'static str> {
 }
 
 /// `MouseDown1Status`'s command (as argv): the clicked hint's range runs
-/// that key's command (`clicks`: range, command), anything else tmux's
-/// default.
-fn status_click(clicks: &[(&str, String)]) -> Vec<String> {
+/// that key's command (`clicks`: range, command), anything else
+/// `fallback` (a tmux command: tmux's default, or the user's own click).
+fn status_click(clicks: &[(&str, String)], fallback: &str) -> Vec<String> {
     let cond = |r: &str| format!("#{{==:#{{mouse_status_range}},{r}}}");
     let run_cmd = |c: &str| format!("run-shell -b {}", tmux_dq(c));
     let Some(((r0, c0), others)) = clicks.split_first() else {
-        return STATUS_CLICK_DEFAULT.split(' ').map(String::from).collect();
+        if fallback == STATUS_CLICK_DEFAULT {
+            return STATUS_CLICK_DEFAULT.split(' ').map(String::from).collect();
+        }
+        // (Parsed by tmux when clicked.)
+        return ["if-shell", "-F", "1", fallback].map(String::from).to_vec();
     };
-    // The others nest as the else, innermost (tmux's default) last.
-    let mut rest = STATUS_CLICK_DEFAULT.to_string();
+    // The others nest as the else, innermost (the fallback) last.
+    let mut rest = fallback.to_string();
     for (r, c) in others.iter().rev() {
         rest = format!(
             "if-shell -F {} {} {}",
@@ -1579,7 +1651,7 @@ mod tests {
             assert!(k.contains("switch-client -t ="), "{k}");
         }
         assert_eq!(
-            status_click(&[]),
+            status_click(&[], STATUS_CLICK_DEFAULT),
             ["switch-client", "-t", "="].map(String::from)
         );
         // Mouse off (or unbound): tmux's own click again, none of rlord's.
@@ -1620,6 +1692,22 @@ mod tests {
         for table in ["root", PROFILE_TABLE] {
             let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
             assert!(k.contains("mine"), "{k}");
+        }
+        // Mouse on over the user's own click: rlord's hints, theirs for
+        // any other click; theirs back exactly when rlord's goes.
+        bind_nav_keys("/bin/rl'x", &[("M-d", "home")], true).unwrap();
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(k.contains(" nav ") && k.contains("mine"), "{k}");
+        }
+        unbind_nav_keys(&[("M-d", "home")]).unwrap();
+        for table in ["root", PROFILE_TABLE] {
+            let k = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap();
+            assert!(
+                !k.contains(" nav ") && k.contains("display-message mine"),
+                "{k}"
+            );
+            assert_eq!(saved_click(table), None);
         }
 
         kill_session(name).unwrap();

@@ -69,7 +69,8 @@ const MAX_CHARS: usize = 20_000;
 
 /// One paste at a time (they share tmux's `rlord_paste` buffer), and when
 /// each session was last typed into. Taken last (locks.rs), and nothing
-/// else is taken while it is held.
+/// else is taken while it is held. (The caller's session lock keeps two
+/// pastes into one session apart; this, pastes into different ones.)
 static TYPING: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
 /// What to check right before typing into a session's pane.
@@ -86,6 +87,9 @@ pub struct Checks<'a> {
     pub overlay: Option<&'a str>,
     /// Not while its input holds a draft (`draft`).
     pub draft: bool,
+    /// Run right before the paste, once every check passed
+    /// (`limits::before_paste`: the resume job's "rlord typed" marker).
+    pub before_paste: Option<&'a dyn Fn()>,
 }
 
 /// What `type_into` did.
@@ -104,9 +108,15 @@ pub enum Typed {
 /// whose pane, remembered for `SETTLE`. The caller holds the session's
 /// lock (locks.rs).
 pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Result<Typed> {
-    let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
-    let last = typed.get_or_insert_with(HashMap::new);
-    if checks.settle && last.get(session).is_some_and(|t| t.elapsed() < SETTLE) {
+    let settled = || {
+        let typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
+        !checks.settle
+            || typed
+                .as_ref()
+                .and_then(|m| m.get(session))
+                .is_none_or(|t| t.elapsed() >= SETTLE)
+    };
+    if !settled() {
         return Ok(Typed::NotNow(
             "it was typed into moments ago (its turn may not have started yet)".into(),
         ));
@@ -131,6 +141,12 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
+    // (Without `TYPING`: it may take the DB.)
+    if let Some(f) = checks.before_paste {
+        f();
+    }
+    let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
+    let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
     tmux::paste(pane, text)?;
     std::thread::sleep(Duration::from_millis(150));
@@ -223,11 +239,8 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
+        before_paste: Some(&|| crate::limits::before_paste(d, s)),
     };
-    // A prompt of the user's it will type over is kept first (the resume
-    // job's takeover check; rlord's own typing is told apart from the
-    // event written after it).
-    crate::limits::before_typing(d, s);
     type_into(&s.id, &pane, text, &checks)
 }
 
@@ -660,6 +673,7 @@ mod tests {
             attached: None,
             overlay: None,
             draft: true,
+            before_paste: None,
         };
         let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));

@@ -60,10 +60,9 @@ const WATCH_MS: i64 = 15 * 60_000;
 const GIVE_UP_MS: i64 = 60 * 60_000;
 /// After a send, a prompt seen within this long is our own message.
 const OWN_PROMPT_MS: i64 = 30_000;
-/// Slack the other way: rlord's event is written once the paste is in,
-/// so its prompt can be stamped up to this long before. (A prompt of the
-/// user's in that window was kept on the job first, `before_typing`.)
-const TYPED_EARLY_MS: i64 = 10_000;
+/// Clock slack: a prompt stamped this much before rlord's marker
+/// (`typed_at`, written right before the paste) is still rlord's (clock slack).
+const TYPED_SLACK_MS: i64 = 1_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
@@ -79,49 +78,46 @@ pub struct Limits {
     now: Mutex<Option<Map<String, Value>>>,
 }
 
-/// The events rlord writes when it has typed into a session.
-const TYPED_EVENTS: [&str; 3] = ["message_sent", "message_delivered", "limit_resumed"];
-
-/// When rlord last typed into a session, from its events (durable: a
-/// restarted daemon still knows). Looks at the latest few only.
-fn typed_at(db: &Db, id: &str) -> Option<i64> {
-    db.list_events(id, 50)
-        .ok()?
-        .into_iter()
-        .rev()
-        .find(|e| TYPED_EVENTS.contains(&e.kind.as_str()))
-        .map(|e| e.ts)
+/// When rlord last typed into the session of a resume job: the job's
+/// `typed_at`, written right before each paste (`before_paste`).
+fn typed_at(job: &Value) -> Option<i64> {
+    job["typed_at"].as_i64()
 }
 
-/// rlord is about to type into `s` (`send::type_message`, under its
-/// lock). The prompt it makes replaces `last_user_msg_at`: a prompt of
-/// the user's there now is kept on the session's resume job first
-/// (`user_at`), so a takeover sticks.
-pub fn before_typing(d: &Daemon, s: &Session) {
+/// rlord is about to paste into `s` (`send::type_into`, after its checks,
+/// under the session's lock). Only a session with a resume job cares.
+/// First, a prompt of the user's that rlord's will replace in
+/// `last_user_msg_at` is kept on the job (`user_at`), so a takeover
+/// sticks; then the job's `typed_at` marks the prompt to come as rlord's.
+/// Durable (kv): a restarted daemon still tells them apart.
+pub fn before_paste(d: &Daemon, s: &Session) {
     let db = d.db();
-    let Some(t) = user_prompt_at(s, typed_at(&db, &s.id)) else {
+    let Ok(mut jobs) = kv_map(&db, JOBS_KEY) else {
         return;
     };
-    if let Ok(mut jobs) = kv_map(&db, JOBS_KEY) {
-        if let Some(job) = jobs.get_mut(&s.id).and_then(Value::as_object_mut) {
-            if job.get("user_at").and_then(Value::as_i64) < Some(t) {
-                job.insert("user_at".into(), json!(t));
-                let _ = save_map(&db, JOBS_KEY, &jobs);
-            }
+    let Some(job) = jobs.get_mut(&s.id).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let own = job.get("typed_at").and_then(Value::as_i64);
+    if let Some(t) = user_prompt_at(s, own) {
+        if job.get("user_at").and_then(Value::as_i64) < Some(t) {
+            job.insert("user_at".into(), json!(t));
         }
     }
+    job.insert("typed_at".into(), json!(now_ms()));
+    let _ = save_map(&db, JOBS_KEY, &jobs);
 }
 
-/// The session's last prompt, if the user typed it: one from
-/// `TYPED_EARLY_MS` before rlord's last typing event (`own`) to
-/// `OWN_PROMPT_MS` after is rlord's.
+/// The session's last prompt, if the user typed it: one from just before
+/// rlord's marker (`own`, `TYPED_SLACK_MS`) to `OWN_PROMPT_MS` after it
+/// is rlord's.
 fn user_prompt_at(s: &Session, own: Option<i64>) -> Option<i64> {
     s.last_user_msg_at
-        .filter(|t| !own.is_some_and(|o| *t >= o - TYPED_EARLY_MS && *t - o <= OWN_PROMPT_MS))
+        .filter(|t| !own.is_some_and(|o| *t >= o - TYPED_SLACK_MS && *t - o <= OWN_PROMPT_MS))
 }
 
 /// The latest prompt the user typed: the session's, or one kept on the
-/// job before rlord typed over it (`before_typing`).
+/// job before rlord typed over it (`before_paste`).
 fn user_since(job: &Value, s: &Session, own: Option<i64>) -> Option<i64> {
     user_prompt_at(s, own).max(job["user_at"].as_i64())
 }
@@ -217,9 +213,11 @@ fn dated_for(job: &Value, h: LimitHit, known: Option<&Value>, now: i64) -> Limit
         job["resets_at"].as_i64().unwrap_or(0),
     );
     // Only the job's own record: before its message was sent, or one its
-    // message came after (touched). An untouched record after the send is
+    // message came after (touched), or the one it was sent on. An untouched record after the send is
     // a new limit, even with the same reset time.
-    let own = job["sent_at"].is_null() || h.touched;
+    // (Or the very record that was there when it was sent, `sent_hit`,
+    // should the agent not have written the message after it.)
+    let own = job["sent_at"].is_null() || h.touched || job["sent_hit"].as_u64() == Some(h.key);
     // (Likewise the list's record: one dated before the send is the old
     // limit's.)
     let sent = job["sent_at"].as_i64().unwrap_or(0);
@@ -425,7 +423,7 @@ enum Step {
 
 /// Decide a job's next step from the session (None: gone) and what its
 /// transcript says now.
-/// `own`: when rlord last typed into it (`typed_at`, from its events).
+/// `own`: when rlord last typed into it (`typed_at`).
 fn step(
     job: &Value,
     s: Option<&Session>,
@@ -543,7 +541,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
         }
         Ok(())
     };
-    let own = typed_at(&d.db(), id);
+    let own = typed_at(&job);
     match step(&job, s.as_ref(), hit.as_ref(), own, now) {
         Step::Wait => return Ok(()),
         Step::Drop(why, done) => {
@@ -580,9 +578,13 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
                 }
                 Typed::Done => {
                     let attempts = job["attempts"].as_u64().unwrap_or(0) + 1;
+                    // The record it was sent on: the old limit's, however
+                    // it reads later (`dated_for`).
+                    let sent_hit = hit.as_ref().map(|h| h.key);
                     update(&|j| {
                         if let Some(job) = j.get_mut(id).and_then(Value::as_object_mut) {
                             job.insert("sent_at".into(), json!(now));
+                            job.insert("sent_hit".into(), json!(sent_hit));
                             job.insert("attempts".into(), json!(attempts));
                         }
                     })?;
@@ -620,6 +622,7 @@ mod tests {
             resets_at,
             kind: "five_hour".into(),
             touched,
+            key: at.unsigned_abs() ^ (resets_at.unsigned_abs() << 20),
         }
     }
 
@@ -770,12 +773,12 @@ mod tests {
             step(&sent, Some(&typed), Some(&again), Some(200_000), 400_000),
             Step::Drop(_, true)
         ));
-        // Stamped a little before rlord noted it was typing: still rlord's.
+        // Stamped just before rlord marked its paste: still rlord's (clock slack).
         assert_eq!(
-            step(&sent, Some(&typed), Some(&again), Some(301_500), 400_000),
+            step(&sent, Some(&typed), Some(&again), Some(300_800), 400_000),
             Step::Reschedule(175_000, 900_000)
         );
-        // The user typed, then rlord typed over it (`before_typing` kept
+        // The user typed, then rlord typed over it (`before_paste` kept
         // theirs on the job): the takeover sticks.
         let mut kept = sent.clone();
         kept["user_at"] = json!(250_000);
@@ -806,6 +809,12 @@ mod tests {
         );
         let own = dated_for(&sent, hit(0, 100_000, true), None, 180_000);
         assert_eq!(own.at, 1_000);
+        // The record it was sent on, untouched still (the agent didn't
+        // write the message after it): the old one, not dated now.
+        let old = hit(0, 100_000, false);
+        let mut sent_on = sent.clone();
+        sent_on["sent_hit"] = json!(old.key);
+        assert_eq!(dated_for(&sent_on, old, None, 180_000).at, 1_000);
         // Not for ever.
         let mut many = sent.clone();
         many["attempts"] = json!(MAX_ATTEMPTS);
@@ -879,20 +888,28 @@ mod tests {
         assert!(!limited(&d).contains_key("s1"));
     }
 
-    /// When rlord last typed comes from its events, so a restarted daemon
-    /// still tells its own prompt from the user's.
+    /// rlord marks its paste on the job (durable), after keeping a prompt
+    /// of the user's it is about to type over; no job, nothing written.
     #[test]
-    fn rlord_typing_is_read_from_events() {
+    fn rlord_marks_its_paste_on_the_job() {
         let d = daemon_with(Path::new("/nonexistent.jsonl"));
-        assert_eq!(typed_at(&d.db(), "s1"), None);
-        d.db()
-            .insert_event("s1", 1_000, "message_sent", "{}")
-            .unwrap();
-        d.db()
-            .insert_event("s1", 2_000, "limit_resumed", "{}")
-            .unwrap();
-        d.db().insert_event("s1", 3_000, "stopped", "{}").unwrap();
-        assert_eq!(typed_at(&d.db(), "s1"), Some(2_000));
+        let mut s = d.db().resolve_ref("s1").unwrap();
+        s.last_user_msg_at = Some(5_000);
+        before_paste(&d, &s);
+        assert!(kv_map(&d.db(), JOBS_KEY).unwrap().is_empty());
+        let mut jobs = Map::new();
+        jobs.insert("s1".into(), json!({"limit_at": 1_000, "resets_at": 2_000}));
+        save_map(&d.db(), JOBS_KEY, &jobs).unwrap();
+        before_paste(&d, &s);
+        let job = kv_map(&d.db(), JOBS_KEY).unwrap()["s1"].clone();
+        assert_eq!(job["user_at"], 5_000);
+        let at = typed_at(&job).unwrap();
+        assert!(at > 5_000);
+        // rlord's prompt lands after the marker: not the user's.
+        s.last_user_msg_at = Some(at + 200);
+        assert_eq!(user_prompt_at(&s, Some(at)), None);
+        s.last_user_msg_at = Some(at + OWN_PROMPT_MS + 1);
+        assert!(user_prompt_at(&s, Some(at)).is_some());
     }
 
     /// Scans at once (the tick and a `limits.resume`) never lose a limit
