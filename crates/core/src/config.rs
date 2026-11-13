@@ -78,7 +78,7 @@ impl Default for Keys {
             new: "n".into(),
             new_manual: "N".into(),
             restart: "r".into(),
-            stop: "s".into(),
+            stop: "S".into(),
             archive: "x".into(),
             unarchive: "u".into(),
             rename: "R".into(),
@@ -809,7 +809,7 @@ attach = "enter"
 new = "n"               # new session: describe it, the overlord launches it
 new_manual = "N"        # new session: the manual form
 restart = "r"
-stop = "s"
+stop = "S"              # Shift-S: stops the agent, keeps the session listed
 archive = "x"
 unarchive = "u"
 rename = "R"
