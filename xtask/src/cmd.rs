@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -35,9 +35,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
 /// guards run (scratch folders removed, manifests put back) as the
 /// scripts' `trap … EXIT` did. The child running at the time gets the
 /// SIGINT itself and exits; `run`, `output` and `sleep` then return
-/// `Interrupted`, and no new command starts (`succeeds` reports failure
-/// without running; callers that act on its answer check
-/// `check_interrupted` first).
+/// `Interrupted`, and no new command starts.
 pub fn on_interrupt() {
     let handler = on_sigint as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an atomic.
@@ -106,15 +104,22 @@ pub fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// Run without output; true if it succeeded.
-pub fn succeeds(cmd: &mut Command) -> bool {
-    if INTERRUPTED.load(Ordering::SeqCst) {
-        return false;
-    }
-    cmd.stdout(Stdio::null())
+/// Run without output; its exit status. Ctrl-C before or during it is
+/// `Interrupted`, never a status to act on.
+pub fn status_quiet(cmd: &mut Command) -> Result<ExitStatus> {
+    check_interrupted()?;
+    let status = cmd
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .with_context(|| format!("couldn't start {}", describe(cmd)))?;
+    check_interrupted()?;
+    Ok(status)
+}
+
+/// Run without output; whether it succeeded (see `status_quiet`).
+pub fn succeeds(cmd: &mut Command) -> Result<bool> {
+    Ok(status_quiet(cmd)?.success())
 }
 
 /// Run and return what it printed (trimmed); an error if it fails.

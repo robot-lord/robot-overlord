@@ -58,7 +58,7 @@ pub fn publish(dry_run: bool) -> Result<()> {
 
     // Dependencies first; each must be on the index before the next.
     for krate in CRATES {
-        if !dry_run && cmd::succeeds(cargo().args(["info", &format!("{krate}@{ver}")])) {
+        if !dry_run && cmd::succeeds(cargo().args(["info", &format!("{krate}@{ver}")]))? {
             println!("publish-crates: {krate} {ver} already published");
             continue;
         }

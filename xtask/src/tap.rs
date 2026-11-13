@@ -42,7 +42,7 @@ pub fn update(ver: &Version, sums: &Path, tap: &str) -> Result<()> {
         c
     };
     cmd::run(in_clone().args(["add", "Formula/rlord.rb"]))?;
-    if cmd::succeeds(in_clone().args(["diff", "--cached", "--quiet"])) {
+    if cmd::succeeds(in_clone().args(["diff", "--cached", "--quiet"]))? {
         println!("update-tap: formula already at {ver}");
         return Ok(());
     }

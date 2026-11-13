@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 pub const REPO: &str = "robot-lord/robot-overlord";
 pub const TAP: &str = "robot-lord/homebrew-tap";
@@ -64,35 +64,30 @@ impl Version {
             None => (s, None),
         };
         let nums: Vec<&str> = core.split('.').collect();
-        // Pre-release identifiers as semver allows them: non-empty,
-        // [0-9A-Za-z-] only (so no build metadata either).
-        let ident =
-            |i: &str| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-        if nums.len() != 3 || pre.is_some_and(|p| !p.split('.').all(ident)) {
-            bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
-        }
-        // Digits only: u64's parser would also take a leading `+`.
-        let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
-        if !nums.iter().all(|n| digits(n)) {
-            bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
-        }
-        // No leading zeros (as semver says), so two versions that compare
-        // equal are also the same text.
-        let leading_zero =
-            |n: &str| n.len() > 1 && n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit());
-        if nums
-            .iter()
-            .copied()
-            .chain(pre.into_iter().flat_map(|p| p.split('.')))
-            .any(leading_zero)
+        let bad = || anyhow::anyhow!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
+        // Semver's rules: numbers are digits only (u64's parser would also
+        // take a `+`) with no leading zero, so versions that compare equal
+        // are the same text; pre-release identifiers are non-empty
+        // [0-9A-Za-z-] (so no build metadata).
+        let number = |n: &str| {
+            let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            digits && (n == "0" || !n.starts_with('0'))
+        };
+        let ident = |i: &str| {
+            let chars = !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            let numeric = i.bytes().all(|b| b.is_ascii_digit());
+            chars && (!numeric || number(i))
+        };
+        if nums.len() != 3
+            || !nums.iter().all(|n| number(n))
+            || pre.is_some_and(|p| !p.split('.').all(ident))
         {
-            bail!("{s:?} is not a version (a number has a leading zero)");
+            return Err(bad());
         }
         let mut parsed = [0u64; 3];
         for (slot, n) in parsed.iter_mut().zip(&nums) {
-            *slot = n
-                .parse()
-                .with_context(|| format!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)"))?;
+            // Only too large a number fails here.
+            *slot = n.parse().map_err(|_| bad())?;
         }
         Ok(Self {
             raw: s.to_string(),

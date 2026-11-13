@@ -39,10 +39,16 @@ fn main() -> ExitCode {
     // Every task works from the repository root; a path argument is still
     // read from where the command was run.
     let invoked_from = std::env::current_dir().unwrap_or_default();
-    // `cargo run` sets CARGO_MANIFEST_DIR for the checkout it ran in; the
-    // compile-time one covers running the binary directly.
+    // `cargo run` sets CARGO_MANIFEST_DIR for the checkout it ran in (used
+    // only if it is xtask's: an outer cargo may have set it for another
+    // crate); the compile-time one covers running the binary directly.
+    let is_xtask = |dir: &PathBuf| {
+        std::fs::read_to_string(dir.join("Cargo.toml"))
+            .is_ok_and(|toml| toml.lines().any(|l| l == "name = \"xtask\""))
+    };
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
+        .filter(is_xtask)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let Some(root) = manifest_dir.parent() else {
         eprintln!("xtask: {} has no parent", manifest_dir.display());

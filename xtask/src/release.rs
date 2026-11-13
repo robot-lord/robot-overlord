@@ -166,7 +166,7 @@ pub fn main(args: &[String]) -> Result<()> {
     let head = cmd::output(git().args(["rev-parse", "HEAD"]))?;
     // Only merged code ships: HEAD must be on origin/main, not just on some
     // pushed branch (a PR branch would burn the version before it merges).
-    if !cmd::succeeds(git().args(["merge-base", "--is-ancestor", &head, "origin/main"])) {
+    if !cmd::succeeds(git().args(["merge-base", "--is-ancestor", &head, "origin/main"]))? {
         refuse(format!(
             "HEAD {head} is not on origin/main — release only merged code"
         ))?;
@@ -335,7 +335,7 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
                 return Err(e.context(format!("interrupted while pushing {tag}: if `git ls-remote --tags origin {tag}` lists it, cargo xtask release --resume")));
             }
             Err(_) => {
-                cmd::succeeds(git().args(["tag", "-d", &tag]));
+                let _ = cmd::succeeds(git().args(["tag", "-d", &tag]));
                 bail!("pushing {tag} failed (local tag deleted)");
             }
         }
@@ -415,6 +415,17 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
     )?;
     let sums = std::fs::read_to_string(dist.join("SHA256SUMS"))?;
     let listed = summed_files(&sums);
+    // Only listed files are checked below, so the draft may hold no other.
+    let unlisted: Vec<String> = cmd::file_names(dist)?
+        .into_iter()
+        .filter(|f| f != "SHA256SUMS" && !listed.contains(&f.as_str()))
+        .collect();
+    if !unlisted.is_empty() {
+        bail!(
+            "the draft {tag} has files SHA256SUMS doesn't list: {}",
+            unlisted.join(", ")
+        );
+    }
     for asset in ver.workflow_assets() {
         if !listed.contains(&asset.as_str()) {
             bail!("SHA256SUMS lacks {asset}");
@@ -471,41 +482,42 @@ fn release_url(tag: &str) -> String {
 }
 
 /// The tag's GitHub release: `None` if there is none, else whether it is a
-/// draft. Any other failure of gh (auth, network) is an error, never "no
-/// release".
+/// draft. From the release list (drafts included), so a failure of gh
+/// (auth, network) is an error, never "no release".
 fn release_state(tag: &str) -> Result<Option<bool>> {
-    cmd::check_interrupted()?;
-    let out = gh()
-        .args([
-            "release", "view", tag, "-R", REPO, "--json", "isDraft", "-q", ".isDraft",
-        ])
-        .output()
-        .context("couldn't start gh release view")?;
-    cmd::check_interrupted()?;
-    if out.status.success() {
-        return match String::from_utf8_lossy(&out.stdout).trim() {
-            "true" => Ok(Some(true)),
-            "false" => Ok(Some(false)),
-            other => bail!("gh release view {tag}: unexpected {other:?}"),
-        };
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.contains("release not found") {
-        return Ok(None);
-    }
-    bail!("gh release view {tag} failed: {}", err.trim())
+    let json = cmd::output(gh().args([
+        "release",
+        "list",
+        "-R",
+        REPO,
+        "-L",
+        "1000",
+        "--json",
+        "tagName,isDraft",
+    ]))?;
+    draft_state(&json, tag)
+}
+
+/// `release_state` from `gh release list --json tagName,isDraft`.
+fn draft_state(json: &str, tag: &str) -> Result<Option<bool>> {
+    let releases: Vec<serde_json::Value> =
+        serde_json::from_str(json).context("reading gh release list")?;
+    releases
+        .iter()
+        .find(|r| r["tagName"].as_str() == Some(tag))
+        .map(|r| {
+            r["isDraft"]
+                .as_bool()
+                .context("gh release list: no isDraft")
+        })
+        .transpose()
 }
 
 /// Whether the tag is on origin. `ls-remote --exit-code` exits 2 for no
 /// match; anything else but 0 is an error, never "not pushed".
 fn tag_on_origin(tag: &str) -> Result<bool> {
-    cmd::check_interrupted()?;
-    let status = git()
-        .args(["ls-remote", "--exit-code", "--tags", "origin", tag])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .context("couldn't start git ls-remote")?;
-    cmd::check_interrupted()?;
+    let status =
+        cmd::status_quiet(git().args(["ls-remote", "--exit-code", "--tags", "origin", tag]))?;
     match status.code() {
         Some(0) => Ok(true),
         Some(2) => Ok(false),
@@ -672,6 +684,15 @@ mod tests {
             Some("commit")
         );
         assert_eq!(tagged_commit(""), None);
+    }
+
+    #[test]
+    fn reads_the_release_state() {
+        let json = r#"[{"tagName":"v1.0.0","isDraft":true},{"tagName":"v0.9.0","isDraft":false}]"#;
+        assert_eq!(draft_state(json, "v1.0.0").unwrap(), Some(true));
+        assert_eq!(draft_state(json, "v0.9.0").unwrap(), Some(false));
+        assert_eq!(draft_state(json, "v1.0.1").unwrap(), None);
+        assert!(draft_state("not json", "v1.0.0").is_err());
     }
 
     #[test]

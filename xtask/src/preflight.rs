@@ -31,7 +31,7 @@ pub fn main(args: &[String]) -> Result<()> {
     ];
 
     let head = cmd::output(git().args(["rev-parse", "HEAD"]))?;
-    let merged = cmd::succeeds(git().args(["merge-base", "--is-ancestor", "HEAD", "origin/main"]));
+    let merged = cmd::succeeds(git().args(["merge-base", "--is-ancestor", "HEAD", "origin/main"]))?;
     let problems = problems(&ver, &reference, (!merged).then_some(head.as_str()));
     for p in &problems {
         if dry_run {
@@ -46,7 +46,7 @@ pub fn main(args: &[String]) -> Result<()> {
     // Published releases only (drafts aren't visible to this token).
     if !failed
         && !dry_run
-        && cmd::succeeds(gh().args(["api", &format!("repos/{repo}/releases/tags/{tag}")]))
+        && cmd::succeeds(gh().args(["api", &format!("repos/{repo}/releases/tags/{tag}")]))?
     {
         println!(
             "::notice::{tag} is already published (cargo xtask release --local); nothing to build"

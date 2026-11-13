@@ -29,7 +29,9 @@ done, in this order (decided with the user, 2026-11-12):
        `scripts/dev-daemon.sh` still hold some logic in bash; the
        stable paths of `cargo xtask release` (CI, `--resume`, `--local`,
        tap, crates.io) have unit tests and a dry run but get their first
-       real run at 1.0.0.
+       real run at 1.0.0. SIGTERM ends xtask without its cleanup
+       (`publish-crates` leaves the manifests pinned); Ctrl-C and SIGHUP
+       unwind.
 5. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
        a scheduled resume, a "limited" list filter, Option-S on the keys
        screen.
