@@ -1189,14 +1189,16 @@ pub fn bind_nav_keys(bin: &str, bindings: &[(&str, &str)]) -> Result<Vec<KeyConf
         ])?;
     }
     // A click on a hint (`hint_range`) does what its key does. Only with
-    // `[tmux] mouse` on; otherwise tmux's own status click.
+    // `[tmux] mouse` on; otherwise nothing is bound, so tmux's own (or the
+    // user's imported) status click stays.
     let mouse = crate::config::Config::load().map_or(true, |c| c.tmux.mouse);
-    let click = if mouse { clickable } else { Vec::new() };
-    for table in ["root", PROFILE_TABLE] {
-        let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
-        let cmd = status_click(&click);
-        args.extend(cmd.iter().map(String::as_str));
-        run(&args)?;
+    if mouse {
+        for table in ["root", PROFILE_TABLE] {
+            let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
+            let cmd = status_click(&clickable);
+            args.extend(cmd.iter().map(String::as_str));
+            run(&args)?;
+        }
     }
     Ok(conflicts)
 }
