@@ -12,8 +12,8 @@ CI for releases).
 - Targets: `aarch64-apple-darwin` only for macOS (no Intel). Linux:
   `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (static: one
   binary for Ubuntu, Debian, Fedora, RHEL, Amazon Linux, Arch, Alpine).
-- Built on the Mac: Linux via `cargo zigbuild`. Smoke-tested in Docker
-  (colima) before upload.
+- Built in GitHub Actions (`release.yml`, `scripts/build-release.sh`):
+  Linux via `cargo zigbuild`, smoke-tested in Docker per arch before upload.
 - Install paths, first release: `curl -fsSL …/get.sh | sh` (detects
   platform, verifies the checksum, offers to install tmux with the system's
   package manager after asking), Homebrew tap (`robot-lord/homebrew-tap`,

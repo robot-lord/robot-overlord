@@ -4,7 +4,8 @@
 # are not built here: release.sh builds them on the maintainer's Mac.
 #
 # The build commands live in scripts/build-release.sh, shared with the local
-# fallback (scripts/release.sh --local).
+# fallback (scripts/release.sh --local). No build cache: release binaries are
+# built from scratch so a poisoned cache can't reach them.
 name: release
 on:
   push:
@@ -25,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -45,7 +46,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: scripts/build-release.sh macos dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -65,7 +65,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # zig from ziglang.org, checksum-pinned (no third-party setup action).
       - name: Install zig
         run: |
@@ -130,10 +129,15 @@ jobs:
           for f in rlord-$tag-{aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl}.tar.gz; do
             [[ -f dist/$f ]] || { echo "::error::missing $f"; exit 1; }
           done
-          ls dist/*.deb dist/*.rpm >/dev/null
+          # Distro packages, one per arch (they write a pre-release '-' as '~').
+          rv=${ver//-/"~"}
+          for f in rlord_${rv}-1_{amd64,arm64}.deb rlord-$rv-1.{x86_64,aarch64}.rpm; do
+            [[ -f dist/$f ]] || { echo "::error::missing $f"; ls dist; exit 1; }
+          done
           echo "TAG=$tag" >> "$GITHUB_ENV"
       - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      - if: env.DRY_RUN == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
       - if: env.DRY_RUN == 'true'

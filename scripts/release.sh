@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish rlord as a GitHub release from the merged main.
 #
-#   scripts/release.sh [--local] [--skip-smoke]
+#   scripts/release.sh [--local [--skip-smoke] | --resume]
 #
 # The version in Cargo.toml decides the kind of release:
 #   X.Y.Z-dev.N  development build: built here on the maintainer's Apple
@@ -17,6 +17,9 @@
 #              Linux here (scripts/build-release.sh, the same commands CI
 #              runs), smoke-test in Docker, and create the release from here.
 # --skip-smoke with --local: skip the Docker smoke test.
+# --resume     stable only: the tag is already pushed (an earlier run of this
+#              script stopped partway). Skip tagging; watch the tag's
+#              workflow run, verify, then do the tap and crates.io.
 #
 # Assets: rlord-v<ver>-<target>.tar.gz (rlord, install.sh, licenses),
 # SHA256SUMS; stable also rlord_<ver>_<arch>.deb, rlord-<ver>.<arch>.rpm.
@@ -32,10 +35,12 @@ tap=robot-lord/homebrew-tap
 
 smoke=1
 local_build=0
+resume=0
 for a in "$@"; do
   case $a in
     --skip-smoke) smoke=0 ;;
     --local) local_build=1 ;;
+    --resume) resume=1 ;;
     *) echo "unknown option $a" >&2; exit 2 ;;
   esac
 done
@@ -46,6 +51,9 @@ tag="v$ver"
 dev=0
 [[ $ver == *-* ]] && dev=1
 [[ $dev == 1 && $local_build == 1 ]] && { echo "--local is for stable releases; dev builds are always local" >&2; exit 2; }
+[[ $dev == 1 && $resume == 1 ]] && { echo "--resume is for stable releases" >&2; exit 2; }
+[[ $local_build == 1 && $resume == 1 ]] && { echo "--local and --resume don't mix" >&2; exit 2; }
+[[ $smoke == 0 && $local_build == 0 ]] && { echo "--skip-smoke only applies with --local (CI always smoke-tests)" >&2; exit 2; }
 build_here=$(( dev == 1 || local_build == 1 ))
 if [[ $build_here == 1 ]]; then
   [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "build from an Apple Silicon Mac" >&2; exit 1; }
@@ -59,8 +67,15 @@ head=$(git rev-parse HEAD)
 # pushed branch (a PR branch would burn the version before it merges).
 git merge-base --is-ancestor "$head" origin/main ||
   { echo "HEAD $head is not on origin/main — release only merged code" >&2; exit 1; }
-if gh release view "$tag" -R "$repo" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
-  echo "$tag already exists — bump the version in Cargo.toml" >&2; exit 1
+if [[ $resume == 1 ]]; then
+  # The tag must be pushed, and point at HEAD.
+  remote=$(git ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" | awk '{print $1}' | tail -1)
+  [[ -n $remote ]] || { echo "--resume: $tag isn't on origin" >&2; exit 1; }
+  [[ $remote == "$head" ]] || { echo "--resume: $tag is $remote, HEAD is $head" >&2; exit 1; }
+elif gh release view "$tag" -R "$repo" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+  echo "$tag already exists — bump the version in Cargo.toml" >&2
+  [[ $dev == 0 ]] && echo "(if an earlier run of this script pushed it and stopped: scripts/release.sh --resume)" >&2
+  exit 1
 fi
 
 # Under the checkout, not the system temp dir: Docker on the Mac (colima)
@@ -86,24 +101,42 @@ if [[ $build_here == 1 ]]; then
   [[ $dev == 1 ]] && exit 0
 else
   # Stable in CI: the tag push starts .github/workflows/release.yml.
-  git tag "$tag" "$head"
-  git push origin "refs/tags/$tag"
+  undo="delete the tag (git push origin :refs/tags/$tag; git tag -d $tag), then scripts/release.sh --local"
+  if [[ $resume == 0 ]]; then
+    git tag -f "$tag" "$head"
+    git push origin "refs/tags/$tag" || { git tag -d "$tag" >/dev/null; echo "pushing $tag failed (local tag deleted)" >&2; exit 1; }
+  fi
+  find_runs() { # all release.yml runs for this tag: "id status"
+    gh run list -R "$repo" -w release.yml -e push -c "$head" -L 20 \
+      --json databaseId,headBranch,status -q ".[] | select(.headBranch == \"$tag\") | \"\(.databaseId) \(.status)\""
+  }
   echo "waiting for the release workflow on $tag…"
   run=
   for _ in $(seq 60); do
-    run=$(gh run list -R "$repo" -w release.yml -e push -c "$head" -L 5 \
-      --json databaseId,headBranch -q "map(select(.headBranch == \"$tag\"))[0].databaseId // empty")
+    run=$(find_runs | awk 'NR==1 {print $1}')
     [[ -n $run ]] && break
     sleep 5
   done
-  [[ -n $run ]] || { echo "no release workflow run for $tag — check Actions" >&2; exit 1; }
+  if [[ -z $run ]]; then
+    # Race: the run may register just after we give up. Cancel anything
+    # queued for the tag so a late run can't publish over a --local release.
+    sleep 10
+    find_runs | while read -r id st; do
+      [[ $st == completed ]] || gh run cancel "$id" -R "$repo" || true
+    done
+    echo "no release workflow run for $tag (any late run was cancelled) — check Actions; to build here: $undo" >&2
+    exit 1
+  fi
   gh run watch "$run" -R "$repo" --exit-status ||
-    { echo "release workflow failed: https://github.com/$repo/actions/runs/$run (fallback: delete the tag, then scripts/release.sh --local)" >&2; exit 1; }
-  # Check every asset against the CI-made SHA256SUMS before trusting it.
+    { echo "release workflow failed: https://github.com/$repo/actions/runs/$run — fix and re-run it, then scripts/release.sh --resume; or $undo" >&2; exit 1; }
+  # Check every asset against the CI-made SHA256SUMS, and the tarballs'
+  # provenance, before trusting them.
   gh release download "$tag" -R "$repo" -D "$dist"
   (cd "$dist" && shasum -a 256 -c SHA256SUMS)
   for t in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-    grep -q " rlord-$tag-$t.tar.gz\$" "$dist/SHA256SUMS" || { echo "SHA256SUMS lacks $t" >&2; exit 1; }
+    f=rlord-$tag-$t.tar.gz
+    grep -q " $f\$" "$dist/SHA256SUMS" || { echo "SHA256SUMS lacks $f" >&2; exit 1; }
+    gh attestation verify "$dist/$f" -R "$repo" >/dev/null || { echo "provenance check failed for $f" >&2; exit 1; }
   done
 fi
 

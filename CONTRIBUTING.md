@@ -98,8 +98,17 @@ builds share. A manual run of the workflow with `dry_run` (the default for
 manual runs) builds and tests everything and uploads only workflow
 artifacts.
 
+If `release.sh` stops after pushing the tag (a failed run you then re-ran,
+a lost connection), `scripts/release.sh --resume` picks up from the tag's
+workflow run: watch, verify (checksums and `gh attestation verify`), tap,
+crates.io.
+
 If Actions is down, build a stable release locally instead: delete the tag
-if it was pushed, then `scripts/release.sh --local`. One-time setup for that:
+on origin and locally (`git push origin :refs/tags/vX.Y.Z; git tag -d
+vX.Y.Z`), then `scripts/release.sh --local`. If no run shows up for the
+tag, `release.sh` first cancels any run queued for it, since a run that
+starts late could otherwise race a local release; check Actions anyway
+before going local. One-time setup for that:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
