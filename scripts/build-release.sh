@@ -57,9 +57,12 @@ case $platform in
       pack "$t" "target/$t/release/rlord"
     done
     # Distro packages: the same static binaries, requiring tmux.
+    # RPM forbids '-' in a version; '~' sorts as a pre-release (only a dry
+    # run of a dev version gets here).
+    rpmver=(); [[ $ver == *-* ]] && rpmver=(-s "version = \"${ver//-/"~"}\"")
     for t in "${linux[@]}"; do
       cargo deb -p robot-overlord --target "$t" --no-build --no-strip --output "$dist/" >/dev/null
-      cargo generate-rpm -p crates/rlord --target "$t" --auto-req disabled -o "$dist/" >/dev/null
+      cargo generate-rpm -p crates/rlord --target "$t" --auto-req disabled ${rpmver[@]+"${rpmver[@]}"} -o "$dist/" >/dev/null
     done
     ;;
   *) echo "unknown platform $platform (macos|linux)" >&2; exit 2 ;;
