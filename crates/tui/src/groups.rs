@@ -11,6 +11,16 @@
 use super::*;
 use ratatui::widgets::{List, ListItem};
 
+/// What Esc does in the list (`App::esc_target`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EscTarget {
+    GroupList,
+    Conversation,
+    Filter,
+    LeaveArchived,
+    Nothing,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tab {
     Sessions,
@@ -408,9 +418,9 @@ impl App {
                 archived,
             ));
             bar.extend(key(Action::ToggleArchived));
-            // In the archived view: how to get back (Esc, unless the search
-            // filter would take it first). Clicking it goes back too.
-            if self.esc_leaves_archived() {
+            // In the archived view: how to get back, when Esc would really
+            // go there (list showing, nothing nearer takes Esc). Clicking it goes back too.
+            if matches!(self.mode, Mode::Normal) && self.esc_target() == EscTarget::LeaveArchived {
                 if let Some(k) = key(Action::Cancel) {
                     let back = press(Action::Cancel);
                     bar.push((Span::raw(" "), None));
@@ -607,14 +617,22 @@ impl App {
         }
     }
 
-    /// Esc would leave the archived view now: nothing nearer takes it (the
-    /// search filter, an earlier overlord conversation in the preview, or
-    /// the inside of a group, which Esc leaves for the group list).
-    pub(crate) fn esc_leaves_archived(&self) -> bool {
-        self.show_archived
-            && self.filter.is_empty()
-            && self.conv_sel == 0
-            && !(self.tab == Tab::Groups && !self.group_focus)
+    /// Where Esc goes in the list, nearest layer first: out of a group (to
+    /// the group list), back from an earlier overlord conversation, the
+    /// search filter cleared, then out of the archived view. The Cancel
+    /// handler and the toolbar's `esc back` hint both ask this.
+    pub(crate) fn esc_target(&self) -> EscTarget {
+        if self.tab == Tab::Groups && !self.group_focus {
+            EscTarget::GroupList
+        } else if self.conv_sel > 0 {
+            EscTarget::Conversation
+        } else if !self.filter.trim().is_empty() {
+            EscTarget::Filter
+        } else if self.show_archived {
+            EscTarget::LeaveArchived
+        } else {
+            EscTarget::Nothing
+        }
     }
 
     /// The archived view's panes sit on their own faint tint

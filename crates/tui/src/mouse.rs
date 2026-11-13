@@ -762,23 +762,27 @@ impl App {
         }
         // One of the listed keys runs that entry, even one that would
         // otherwise move (a user's ctrl-n, say).
-        let item = m.items.iter().find(|(_, _, pick)| {
-            matches!(pick, Pick::Key(key) if key.code == k.code
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                    == k.modifiers.contains(KeyModifiers::CONTROL))
-        });
+        // Every modifier counts, except Shift on a character: its case
+        // carries that (terminals differ on also reporting SHIFT).
+        let mods = |e: &KeyEvent| match e.code {
+            KeyCode::Char(_) => e.modifiers - KeyModifiers::SHIFT,
+            _ => e.modifiers,
+        };
+        let item = m.items.iter().find(
+            |(_, _, pick)| matches!(pick, Pick::Key(key) if key.code == k.code && mods(key) == mods(&k)),
+        );
         if let Some((_, _, pick)) = item {
             return self.run_menu_item(&m.target, pick.clone(), terminal);
         }
         // Then moves; anything else closes.
         let down = picker_step(&k).or(match k.code {
+            _ if !k.modifiers.is_empty() => None,
             KeyCode::Char('j') => Some(true),
             KeyCode::Char('k') => Some(false),
             _ => None,
         });
         match down {
-            Some(true) => m.sel = (m.sel + 1).min(n - 1),
-            Some(false) => m.sel = m.sel.saturating_sub(1),
+            Some(down) => m.sel = clamp_step(m.sel, n, down),
             None => return Ok(false),
         }
         self.mode = Mode::Menu(m);
@@ -1080,8 +1084,25 @@ mod tests {
             "ctrl-n moves"
         );
         app.mode = menu();
+        // Alt-Ctrl-J isn't the entry's key: it closes, runs nothing.
+        let alt = KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        app.handle_key(alt, &mut term).unwrap();
+        assert!(!matches!(app.mode, Mode::Menu(_)));
+        app.mode = menu();
         app.handle_key(ctrl('j'), &mut term).unwrap();
         assert!(!matches!(app.mode, Mode::Menu(_)), "ctrl-j ran its entry");
+        assert_eq!((clamp_step(1, 2, true), clamp_step(0, 2, false)), (1, 0));
+        assert_eq!(
+            (
+                wrap_step(1, 2, true),
+                wrap_step(0, 2, false),
+                wrap_step(3, 0, true)
+            ),
+            (0, 1, 0)
+        );
     }
 
     /// The archived view looks apart (tinted panes, "Archived" in yellow),
@@ -1142,26 +1163,30 @@ mod tests {
         app.handle_key(a, &mut term).unwrap();
         assert!(!app.show_archived);
 
-        // Inside a group Esc goes to the group list first, and an earlier
-        // overlord conversation in the preview takes it too: no back hint
-        // then. Leaving the view resets the conversation.
+        // Inside a group Esc goes to the group list first: no back hint
+        // then, and Esc does that. A whitespace filter doesn't count. A
+        // popup over the list: no hint either.
+        use crate::groups::EscTarget;
         app.handle_key(a, &mut term).unwrap();
         app.tab = Tab::Groups;
         app.group_focus = false;
-        assert!(!app.esc_leaves_archived());
-        app.group_focus = true;
-        assert!(app.esc_leaves_archived());
+        assert_eq!(app.esc_target(), EscTarget::GroupList);
+        assert!(!drawn(&mut app).iter().any(|r| r.contains(" esc  back")));
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(app.group_focus && app.show_archived);
+        assert_eq!(app.esc_target(), EscTarget::LeaveArchived);
         app.tab = Tab::Sessions;
-        app.conv_sel = 1;
-        assert!(!app.esc_leaves_archived());
-        assert!(!drawn(&mut app).iter().any(|r| r.contains(" back")));
-        app.handle_key(a, &mut term).unwrap();
-        assert!(!app.show_archived);
-        assert_eq!(app.conv_sel, 0, "the view change resets the conversation");
+        app.filter = "  ".into();
+        assert_eq!(app.esc_target(), EscTarget::LeaveArchived);
+        app.mode = Mode::Help;
+        assert!(!drawn(&mut app).iter().any(|r| r.contains(" esc  back")));
+        app.mode = Mode::Normal;
+        app.handle_key(esc, &mut term).unwrap();
+        assert!(!app.show_archived && app.filter.is_empty());
 
         // The live list: no tint, no back hint.
         let rows = drawn(&mut app);
-        assert!(!rows.iter().any(|r| r.contains(" back")));
+        assert!(!rows.iter().any(|r| r.contains(" esc  back")));
         assert!(rows.iter().any(|r| r.contains("Sessions  ")));
     }
 

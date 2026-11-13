@@ -705,12 +705,9 @@ impl App {
             match code {
                 KeyCode::Esc => {}
                 _ if down.is_some() => {
-                    let j = match down {
-                        _ if n == 0 => 0,
-                        Some(true) => (i + 1) % n,
-                        _ => (i + n - 1) % n,
-                    };
-                    finder.state.select(Some(j));
+                    finder
+                        .state
+                        .select(Some(wrap_step(i, n, down == Some(true))));
                     f.finder = Some(finder);
                 }
                 KeyCode::Enter => {
@@ -752,12 +749,7 @@ impl App {
             match code {
                 KeyCode::Esc => {}
                 _ if down.is_some() => {
-                    let n = n.max(1);
-                    state.select(Some(if down == Some(true) {
-                        (i + 1) % n
-                    } else {
-                        (i + n - 1) % n
-                    }));
+                    state.select(Some(wrap_step(i, n, down == Some(true))));
                     f.picker = Some((kind, items, state));
                 }
                 KeyCode::Enter => match kind {

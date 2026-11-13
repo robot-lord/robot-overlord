@@ -57,7 +57,8 @@ pub struct Palette {
     /// Selected row.
     pub surface: Rgb,
     /// Behind the session list and details while the archived view is
-    /// shown: a faint warm wash of the background, so it is clearly not the
+    /// shown: a faint tint of the background (warm where the theme has
+    /// RGB; on rlord-dark, a darker grey), so it is clearly not the
     /// live list. Kept off `surface` so the selected row still stands out.
     pub archived_bg: Rgb,
     /// Chips: tabs, keycaps.
@@ -104,7 +105,7 @@ pub const THEMES: &[Palette] = &[
         dark: true,
         bg: None,
         surface: i(236),
-        archived_bg: i(235),
+        archived_bg: i(234),
         chip: i(237),
         border: i(238),
         faint: i(240),
@@ -502,19 +503,22 @@ mod tests {
             (a.0 - b.0).abs() + (a.1 - b.1).abs() + (a.2 - b.2).abs()
         };
         let lum = |c: (i32, i32, i32)| (c.0 + c.1 + c.2) / 3;
-        assert_eq!(approx(i(235)), (38, 38, 38));
+        assert_eq!(approx(i(234)), (28, 28, 28));
         assert_eq!(approx(i(230)), (255, 255, 215));
         for p in THEMES {
             let tint = approx(p.archived_bg);
             let surface = approx(p.surface);
-            assert!(dist(tint, surface) >= 12, "{}: too near surface", p.name);
+            // A real gap to the selected row, or the selection vanishes.
+            assert!(dist(tint, surface) >= 20, "{}: too near surface", p.name);
             match p.bg {
                 Some(bg) => {
                     let bg = approx(bg);
                     assert!(dist(tint, bg) >= 9, "{}: too near bg", p.name);
                     assert!(dist(tint, bg) <= 70, "{}: too loud", p.name);
                 }
-                None => assert!(lum(tint) < lum(surface), "{}", p.name),
+                // No background of its own: at least a clear step of
+                // lightness under the selected row.
+                None => assert!(lum(surface) - lum(tint) >= 15, "{}", p.name),
             }
             let l = lum(tint);
             assert!(if p.dark { l < 70 } else { l > 190 }, "{}: {l}", p.name);

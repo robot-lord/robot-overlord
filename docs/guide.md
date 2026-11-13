@@ -462,9 +462,11 @@ shows its pane, an archived one shows **what it did**: a short summary
 written when it was archived, plus its notes and dates.
 
 `a` (or `:archived`) switches the list to archived sessions. The list and
-details panes sit on a faint warm tint and the list's title reads
-**Archived** in yellow, so it can't pass for the live list. `esc` (or `a`
-again) goes back; a search filter or an open popup takes `esc` first.
+details panes sit on a faint tint (warm on most themes, a darker grey
+on rlord-dark) and the list's title reads **Archived** in yellow, so it
+can't pass for the live list. `esc` (or `a` again) goes back. Anything
+nearer takes `esc` first: an open popup, the search filter, and inside a
+group `esc` returns to the group list first.
 
 The summary is written once, in the background, on a cheap model (`[archive]
 summary_model`, Haiku by default). Claude reads a fork of the whole

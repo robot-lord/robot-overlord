@@ -49,6 +49,24 @@ pub fn run(config: Config) -> Result<()> {
     result
 }
 
+/// One step in a list of `n`, stopping at the ends.
+pub(crate) fn clamp_step(i: usize, n: usize, down: bool) -> usize {
+    if down {
+        (i + 1).min(n.saturating_sub(1))
+    } else {
+        i.saturating_sub(1)
+    }
+}
+
+/// One step in a list of `n`, wrapping round (0 when empty).
+pub(crate) fn wrap_step(i: usize, n: usize, down: bool) -> usize {
+    match n {
+        0 => 0,
+        _ if down => (i + 1) % n,
+        _ => (i + n - 1) % n,
+    }
+}
+
 /// For tests: a terminal to hand the key handlers. Never drawn to: they
 /// only take it to hand the screen to an editor or tmux. A fixed viewport
 /// asks no tty.
@@ -68,7 +86,8 @@ pub(crate) fn handler_term() -> DefaultTerminal {
 /// in fzf. Ctrl-J is LF, but in raw mode (always, here) crossterm reports it
 /// as Ctrl+'j', never as Enter, so it can't be mistaken for one.
 pub(crate) fn picker_step(k: &KeyEvent) -> Option<bool> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl alone (Ctrl-Alt-J is some other key).
+    let ctrl = k.modifiers == KeyModifiers::CONTROL;
     match k.code {
         KeyCode::Down => Some(true),
         KeyCode::Up => Some(false),
@@ -903,9 +922,6 @@ impl App {
             Action::ToggleArchived => {
                 self.show_archived = !self.show_archived;
                 self.table.select(Some(0));
-                // An earlier overlord conversation in the preview belongs to
-                // the list just left.
-                self.conv_sel = 0;
                 self.dirty = true;
             }
             Action::Sort => {
@@ -963,17 +979,21 @@ impl App {
             }
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
-            Action::Cancel if self.conv_sel > 0 => self.show_conversation(0),
-            // Esc peels one layer: the search filter, then the archived
-            // view (back to the live list).
-            Action::Cancel => {
-                if !self.filter.is_empty() {
+            // Esc peels one layer (`esc_target`).
+            Action::Cancel => match self.esc_target() {
+                // (Normally taken first by `handle_groups_key`.)
+                groups::EscTarget::GroupList => self.group_focus = true,
+                groups::EscTarget::Conversation => self.show_conversation(0),
+                groups::EscTarget::Filter => {
                     self.filter.clear();
                     self.dirty = true;
-                } else if self.esc_leaves_archived() {
+                }
+                groups::EscTarget::LeaveArchived => {
+                    self.filter.clear();
                     self.do_action(Action::ToggleArchived, terminal)?;
                 }
-            }
+                groups::EscTarget::Nothing => {}
+            },
         }
         Ok(false)
     }

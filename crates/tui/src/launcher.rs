@@ -184,11 +184,7 @@ impl App {
         let m = l.matches();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(down) = picker_step(&k) {
-            l.sel = if down {
-                (l.sel + 1).min(m.len().saturating_sub(1))
-            } else {
-                l.sel.saturating_sub(1)
-            };
+            l.sel = clamp_step(l.sel, m.len(), down);
             self.mode = Mode::Command(l);
             return Ok(());
         }
