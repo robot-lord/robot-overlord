@@ -204,7 +204,7 @@ pub fn resume_argv(
 /// while everything else asks. OpenCode has no flags for these; its server
 /// reads the config of the folder a session runs in.
 ///
-/// - `mcp.servers.rlord`: `rlord mcp --socket <socket>`. The server process
+/// - `mcp.servers.rlord`: `rlord mcp --overlord --socket <socket>`. The server process
 ///   belongs to OpenCode's shared server, whose environment is whatever
 ///   first started it (another rlord's, or none), so where the daemon is
 ///   is given, never looked up; and what `rlord mcp` would read from its
@@ -1832,7 +1832,7 @@ pub(crate) mod tests {
         assert_eq!(server["type"], "local");
         assert_eq!(
             server["command"],
-            serde_json::json!(["/bin/rlord", "mcp", "--socket", "/run/d.sock"])
+            serde_json::json!(["/bin/rlord", "mcp", "--overlord", "--socket", "/run/d.sock"])
         );
         // The caller's id isn't inherited from whichever pane started
         // OpenCode's shared server.

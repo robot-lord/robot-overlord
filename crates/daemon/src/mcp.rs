@@ -30,6 +30,42 @@ fn b(desc: &str) -> Value {
 
 const SESSION_REF: &str = "Session id, id prefix, or name";
 
+/// The tools `rlord mcp` serves without `--overlord`: look-ups that change
+/// nothing (no session, tag, view, kv watermark or UI state), start no
+/// session, model call or agent CLI. Any session may add this server.
+/// Left out though they only read: `get_session_defaults` and
+/// `list_agents` (they warm the agent install cache or list models by
+/// running agent CLIs), `triage` and `scan_agent_sessions` (overlord
+/// upkeep and import prep).
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "list_sessions",
+    "get_session",
+    "read_screen",
+    "get_ui_state",
+    "search_history",
+    "read_history",
+    "recall",
+    "list_groups",
+    "find_repos",
+    "keys_list",
+];
+
+/// The tools served: all of them for the overlord, else the read-only set.
+pub fn tools_for(overlord: bool) -> Value {
+    let all = tools();
+    if overlord {
+        return all;
+    }
+    Value::Array(
+        all.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| READ_ONLY_TOOLS.contains(&t["name"].as_str().unwrap_or("")))
+            .cloned()
+            .collect(),
+    )
+}
+
 pub fn tools() -> Value {
     let sort = json!({"type": "string", "enum": ["updated", "user", "state", "created", "name", "usage"],
                       "description": "updated = last message (from the user, the agent, or one you sent it; a resume or status flip alone does not count); user = the user's own last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change; usage = most used first, by the usage measure (see `usage`)"});
@@ -684,5 +720,64 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             d.rpc(method, json!({"ref": s["id"]}))
         }
         other => bail!("unknown tool '{other}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tool, classified. A new tool must be placed here: read-only
+    /// only if it changes nothing and starts nothing.
+    const MUTATING: &[&str] = &[
+        "goto_session",
+        "show_list",
+        "summarize_sessions",
+        "open_keys",
+        "set_list_view",
+        "get_session_defaults",
+        "list_agents",
+        "propose_session",
+        "confirm_new_session",
+        "create_session",
+        "update_session",
+        "remote_control",
+        "set_group_order",
+        "rename_group",
+        "organize",
+        "triage",
+        "mark_reviewed",
+        "scan_agent_sessions",
+        "import_sessions",
+        "send_to_session",
+        "resume_after_limit",
+        "session_action",
+    ];
+
+    #[test]
+    fn read_only_tools_are_an_explicit_allow_list() {
+        let all: Vec<String> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for name in &all {
+            let ro = READ_ONLY_TOOLS.contains(&name.as_str());
+            let rw = MUTATING.contains(&name.as_str());
+            assert!(
+                ro != rw,
+                "{name}: classify it in READ_ONLY_TOOLS or MUTATING"
+            );
+        }
+        for name in READ_ONLY_TOOLS.iter().chain(MUTATING) {
+            assert!(all.iter().any(|n| n == name), "{name} is no tool");
+        }
+        for t in rlord_core::agents::SEND_TOOLS {
+            assert!(!READ_ONLY_TOOLS.contains(t));
+        }
+        let served = tools_for(false);
+        assert_eq!(served.as_array().unwrap().len(), READ_ONLY_TOOLS.len());
+        assert_eq!(tools_for(true), tools());
     }
 }

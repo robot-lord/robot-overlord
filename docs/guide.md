@@ -510,6 +510,24 @@ decisions into a new session. Its own conversations aren't in these
 results: it reads those with `recall`. Any session can run `rlord search`
 itself.
 
+## rlord's MCP server in any session
+
+Any agent session, in rlord or not, can add rlord's MCP server to look up
+other sessions. It is read-only: it lists sessions and their details,
+reads their screens, searches and reads their history (`search_history`,
+`read_history`, `recall`), and lists groups, repos and keys. It changes
+nothing and starts nothing, not even the daemon: with no daemon running
+its tools return an error. Add it like any other stdio server:
+
+    claude mcp add rlord -- rlord mcp       # Claude Code (add --scope user for every project)
+    codex mcp add rlord -- rlord mcp        # Codex (~/.codex/config.toml)
+    opencode mcp add rlord -- rlord mcp     # OpenCode (add --global for every project)
+
+Tools that change things (sending to a session, stopping, archiving,
+renaming, tagging, moving the user's view, creating sessions) are only
+served to the overlord, which rlord starts with `rlord mcp --overlord`.
+A call to one of them on the read-only server is refused.
+
 ## Remote Control (from your phone)
 
 Claude Code's [Remote Control](https://code.claude.com/docs/en/remote-control)

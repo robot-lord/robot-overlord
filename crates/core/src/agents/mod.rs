@@ -46,7 +46,7 @@ use transcript::Format;
 /// What `rlord mcp` (the overlord's MCP server) reads from its
 /// environment: which session is calling (only logged). Where the daemon
 /// is never comes from the environment: every overlord config passes
-/// `rlord mcp --socket <path>`. Each agent's wiring is derived from this
+/// `rlord mcp --overlord --socket <path>`. Each agent's wiring is derived from this
 /// one list: Codex, which starts the server with a short environment of
 /// its own, passes these on (`codex::overlord_args`); OpenCode, whose
 /// shared server would hand on whichever pane started it, blanks them
@@ -57,9 +57,16 @@ pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 /// `[overlord] confirm_sends` each asks the user first, on every agent.
 pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit"];
 
-/// The arguments for `rlord mcp`, talking to the daemon at `socket`.
+/// The arguments for the overlord's `rlord mcp`: the full toolset
+/// (`--overlord`; without it the server is read-only), talking to the
+/// daemon at `socket`.
 pub fn mcp_args(socket: &str) -> Vec<String> {
-    vec!["mcp".into(), "--socket".into(), socket.into()]
+    vec![
+        "mcp".into(),
+        "--overlord".into(),
+        "--socket".into(),
+        socket.into(),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

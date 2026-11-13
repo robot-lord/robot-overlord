@@ -1183,7 +1183,7 @@ mod tests {
         assert!(has("sandbox_mode=\"read-only\""));
         assert!(has("approval_policy=\"on-request\""));
         assert!(has(&format!(
-            "mcp_servers.rlord.args=[\"mcp\",\"--socket\",\"{}\"]",
+            "mcp_servers.rlord.args=[\"mcp\",\"--overlord\",\"--socket\",\"{}\"]",
             paths::socket_path().display()
         )));
         assert!(has("model_reasoning_effort=\"low\""));
@@ -1201,10 +1201,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(d.join("opencode.json")).unwrap())
                 .unwrap();
         assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][1], "mcp");
-        assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][2], "--socket");
+        assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][2], "--overlord");
+        assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][3], "--socket");
         let mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(d.join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--socket");
+        assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--overlord");
+        assert_eq!(mcp["mcpServers"]["rlord"]["args"][2], "--socket");
 
         for f in [
             "CLAUDE.md",
