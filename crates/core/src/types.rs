@@ -90,6 +90,68 @@ pub struct Session {
     #[serde(default)]
     pub summary: String,
     pub summary_at: Option<i64>,
+    /// When rlord itself last typed a prompt into it (`send_to_session`,
+    /// a held `when_idle` message, a resume after a usage limit).
+    /// `last_user_msg_at` is the user's own prompts only; `overlord ask`
+    /// carries what the user typed, so it counts as the user's.
+    #[serde(default)]
+    pub last_rlord_msg_at: Option<i64>,
+}
+
+impl Session {
+    /// The last prompt it got, whoever typed it: the user or rlord.
+    pub fn last_prompt_at(&self) -> Option<i64> {
+        self.last_user_msg_at.max(self.last_rlord_msg_at)
+    }
+}
+
+/// What rlord keeps of a prompt's text to recognise it again: never the
+/// text itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMark {
+    /// `PromptMark::hash_of` the text.
+    pub hash: String,
+    /// The agent may have changed the text between the paste and its
+    /// report (a paste placeholder left in it, `PLACEHOLDERS`, or a text
+    /// long enough to be cut or stored aside), so the hash can miss.
+    pub pasted: bool,
+}
+
+impl PromptMark {
+    /// Texts this long (characters) count as `pasted`.
+    pub const LONG_CHARS: usize = 1000;
+
+    /// How each agent's input shows a large paste (the start of it):
+    /// Claude Code `[Pasted text #1 +30 lines]`, OpenCode `[Pasted ~30
+    /// lines]` (2.2.7), Codex `[Pasted Content 1234 chars]` (0.167).
+    pub const PLACEHOLDERS: &[&str] = &["[Pasted text #", "[Pasted ~", "[Pasted Content "];
+
+    pub fn of(text: &str) -> Self {
+        PromptMark {
+            hash: Self::hash_of(text),
+            pasted: Self::PLACEHOLDERS.iter().any(|p| text.contains(p))
+                || text.chars().count() >= Self::LONG_CHARS,
+        }
+    }
+
+    /// A hash of a prompt's text, the same for what rlord pasted and what
+    /// the agent reports of it: whitespace runs count as one space (a
+    /// paste may change line ends), the ends are trimmed. FNV-1a, written
+    /// out: the hook client and the daemon must agree across versions.
+    pub fn hash_of(text: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for (i, word) in text.split_whitespace().enumerate() {
+            if i > 0 {
+                eat(b' ');
+            }
+            word.bytes().for_each(&mut eat);
+        }
+        format!("{h:016x}")
+    }
 }
 
 pub fn now_ms() -> i64 {

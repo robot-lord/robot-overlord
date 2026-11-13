@@ -707,7 +707,7 @@ fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> 
     }
     let now = rlord_core::types::now_ms();
     let last = [
-        s.last_user_msg_at,
+        s.last_prompt_at(),
         s.last_agent_msg_at,
         s.last_state_change_at,
     ]
@@ -720,7 +720,9 @@ fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> 
     }
     // Nothing new since the last fresh start: nothing to clear.
     let fresh_at = fresh_at(&d.db(), &s.id)?;
-    if s.last_user_msg_at.is_none_or(|u| u <= fresh_at) {
+    // (Any prompt. `overlord ask` counts as the user's; a message rlord
+    // typed in is a prompt to clear all the same.)
+    if s.last_prompt_at().is_none_or(|u| u <= fresh_at) {
         return Ok(());
     }
     // Its turn must really be over: the transcript ends in a final reply
@@ -757,7 +759,7 @@ fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> 
         // Re-check under the lock: a request may have just landed.
         let cur = db.resolve_ref(&s.id).context("overlord vanished")?;
         if !matches!(cur.status, Status::Idle | Status::WaitingInput)
-            || cur.last_user_msg_at != s.last_user_msg_at
+            || cur.last_prompt_at() != s.last_prompt_at()
         {
             return Ok(());
         }

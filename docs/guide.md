@@ -196,7 +196,7 @@ Sorts (`o` cycles them, `O` reverses; the time column follows the sort):
 
 | Sort | Newest first by |
 |---|---|
-| **last message** (default) | the last message from you or the agent (a resume or a status flip alone doesn't count) |
+| **last message** (default) | the last message from you, the agent, or the overlord sending to it (a resume or a status flip alone doesn't count) |
 | **last prompt** | the last message *you* sent: what you were just working with |
 | **status change** | the last time it started, stopped, finished or needed you |
 | **created** | when it started |

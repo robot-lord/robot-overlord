@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use rlord_core::agents::Agent;
 use rlord_core::tmux;
@@ -117,10 +117,10 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
                     // (The user's own message: a draft of theirs in the
                     // overlord's pane is theirs to merge.)
                     draft: false,
-                    before_paste: None,
-                    paste_failed: None,
+                    // (And its prompt is theirs: not marked as rlord's.)
+                    source: None,
                 };
-                if let Typed::NotNow(why) = type_into(&s.id, &pane, text, &checks)? {
+                if let Typed::NotNow(why) = type_into(d, &s.id, &pane, text, &checks)? {
                     bail!(
                         "not sent to the overlord: {why}. Answer it first ({}-O)",
                         rlord_core::keys::alt_name()
@@ -143,21 +143,16 @@ pub const PROVENANCE_KEY: &str = "request_provenance";
 /// Requests remembered (oldest dropped first).
 const PROVENANCE_KEEP: usize = 20;
 
-fn provenance_map(d: &Daemon) -> Result<Map<String, Value>> {
+/// The provenance of form request `id` (Null if unknown).
+pub fn provenance_of(d: &Daemon, id: &str) -> Result<Value> {
     Ok(d.db()
-        .kv_get(PROVENANCE_KEY)?
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        .and_then(|v| v.as_object().cloned())
+        .kv_map(PROVENANCE_KEY)?
+        .remove(id.trim())
         .unwrap_or_default())
 }
 
-/// The provenance of form request `id` (Null if unknown).
-pub fn provenance_of(d: &Daemon, id: &str) -> Result<Value> {
-    Ok(provenance_map(d)?.remove(id.trim()).unwrap_or_default())
-}
-
 fn remember_provenance(d: &Daemon, id: &str, v: Option<Value>) -> Result<()> {
-    let mut m = provenance_map(d)?;
+    let mut m = d.db().kv_map(PROVENANCE_KEY)?;
     match v {
         Some(v) => {
             m.insert(id.to_string(), v);

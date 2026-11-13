@@ -2396,13 +2396,19 @@ fn context_line(ctx: Vec<(String, &'static str)>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The list's "Last message" column: the latest message either way (not a
-/// resume or a state flip), else when it was created.
+/// The list's "Last message" column: the latest message either way,
+/// what rlord typed in included (not a resume or a state flip), else when
+/// it was created.
 fn updated_at(s: &Value) -> Option<i64> {
-    ["last_agent_msg_at", "last_user_msg_at", "created_at"]
-        .iter()
-        .filter_map(|k| s[*k].as_i64())
-        .max()
+    [
+        "last_agent_msg_at",
+        "last_user_msg_at",
+        "last_rlord_msg_at",
+        "created_at",
+    ]
+    .iter()
+    .filter_map(|k| s[*k].as_i64())
+    .max()
 }
 
 /// The details pane's usage line: all three, whatever the column shows

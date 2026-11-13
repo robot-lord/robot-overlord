@@ -2,6 +2,32 @@
 
 # Making the repository public
 
+## Road to 1.0
+
+The first stable release is 1.0.0, cut only after everything below is
+done, in this order (decided with the user, 2026-11-12):
+
+1. [ ] Linux Codex sandbox check. Partial (0.23.0-dev.4): blocked as
+       root in a privileged container; the check on real Ubuntu as a
+       non-root user is still open (below, "Before flipping it public").
+2. [x] rlord's own pastes no longer count as the user's prompts
+       (0.23.0-dev.5; `daemon/src/own.rs`).
+3. [ ] CI release builds: macOS on a Mac runner, Linux on a Linux runner.
+4. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
+       a scheduled resume, a "limited" list filter, Option-S on the keys
+       screen.
+5. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
+       narrower helper tools.
+6. [ ] Codex daemon mode, with Codex Remote Control (whether it is in
+       1.0 is the user's call, still open).
+7. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
+       contrast, website phone screenshots.
+8. [ ] A fresh-install end-to-end test.
+9. [ ] 1.0.0 stable.
+
+After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as
+repo secrets (to do later, not part of the CI release builds step).
+
 ## Before flipping it public
 
 - [ ] Stable release (`X.Y.Z`, no suffix) so `get.sh`, Homebrew and the

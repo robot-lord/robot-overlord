@@ -396,7 +396,7 @@ fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool> {
         let l = s.agent_session.as_deref().and_then(|a| live.get(a));
         let now = rlord_core::types::now_ms();
         let quiet = l.is_none_or(|l| now - l.status_at > QUIET_MS)
-            && s.last_user_msg_at.is_none_or(|u| now - u > QUIET_MS);
+            && s.last_prompt_at().is_none_or(|u| now - u > QUIET_MS);
         if !quiet || !work_going(&s, l).is_empty() {
             return Ok(false);
         }

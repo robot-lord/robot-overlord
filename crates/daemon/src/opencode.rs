@@ -46,7 +46,7 @@ use rlord_core::agents::opencode::{self, Turn};
 use rlord_core::agents::opencode_service::{map_event, Events, Service, Signal, EVENT_TYPES};
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
-use rlord_core::types::{now_ms, Session, Status};
+use rlord_core::types::{now_ms, PromptMark, Session, Status};
 
 use crate::Daemon;
 
@@ -273,7 +273,7 @@ fn step(cur: Status, blocked: &mut BTreeSet<String>, signal: &Signal) -> Step {
             kind: (cur == Starting).then_some("session_start"),
             ..Default::default()
         },
-        Signal::Prompt => Step {
+        Signal::Prompt(_) => Step {
             // (Sent while it waits on a permission: still waiting.)
             status: matches!(cur, Starting | Idle).then_some(Working),
             kind: Some("prompt_submitted"),
@@ -323,7 +323,8 @@ fn step(cur: Status, blocked: &mut BTreeSet<String>, signal: &Signal) -> Step {
 }
 
 /// Write a step. Returns whether anything changed.
-fn write(db: &Db, s: &Session, step: &Step, from: &str) -> Result<bool> {
+/// `text`: what identifies a prompt's text, when the signal had it.
+fn write(db: &Db, s: &Session, step: &Step, from: &str, text: Option<&PromptMark>) -> Result<bool> {
     let Some(kind) = step.kind else {
         return Ok(false);
     };
@@ -331,13 +332,18 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str) -> Result<bool> {
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
-    if step.user_msg {
-        db.touch_last_user_msg(&s.id, now)?;
-    }
+    // A prompt: the user's, or one rlord typed (`own.rs`: by its text
+    // when the event carried it, else by time).
+    let (kind, source) = if step.user_msg {
+        crate::own::prompt(db, &s.id, text, now, crate::own::Via::Events)?
+    } else {
+        (kind, None)
+    };
     if step.agent_msg {
         db.touch_last_agent_msg(&s.id, now)?;
     }
-    db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
+    let detail = crate::own::with_source(json!({ "from": from }), source);
+    db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
 }
 
@@ -351,7 +357,11 @@ fn apply(db: &Db, blocked: &mut Blocked, s: &Session, signal: &Signal) -> Result
     if waits.is_empty() {
         blocked.remove(&s.id);
     }
-    write(db, s, &step, "opencode events")
+    let text = match signal {
+        Signal::Prompt(text) => text.as_ref(),
+        _ => None,
+    };
+    write(db, s, &step, "opencode events", text)
 }
 
 /// The rlord session an OpenCode session id belongs to. A permission
@@ -579,14 +589,18 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         db.set_status(&s.id, want, now)?;
         let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
+        let mut source = None;
         let (kind, from) = match want {
             // What it waited on was answered while rlord wasn't listening:
             // not a message (as from the event stream).
             Status::Working if s.status == Status::WaitingInput => ("answered", "opencode session"),
             Status::Working => {
                 let busy = turn.and_then(|t| t.busy).unwrap_or(now);
-                db.touch_last_user_msg(&s.id, busy)?;
-                ("prompt_submitted", "opencode session")
+                // (The user's, or one rlord typed: `own.rs`, by time.)
+                let (kind, by) =
+                    crate::own::prompt(&db, &s.id, None, busy, crate::own::Via::Session)?;
+                source = by;
+                (kind, "opencode session")
             }
             Status::WaitingInput => ("permission_request", "opencode session"),
             // Just (re)started, and no turn running: it is up.
@@ -602,7 +616,8 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if seen == Seen::NotRunning => ("agent_stopped", "opencode turn not running"),
             _ => ("agent_stopped", "opencode server gone"),
         };
-        db.insert_event(&s.id, now, kind, &json!({ "from": from }).to_string())?;
+        let detail = crate::own::with_source(json!({ "from": from }), source);
+        db.insert_event(&s.id, now, kind, &detail.to_string())?;
         changed = true;
     }
     Ok(changed)
@@ -726,7 +741,7 @@ mod tests {
         assert_eq!((s.status, s.kind), (Some(Idle), Some("session_start")));
         assert_eq!(step(Idle, &mut b, &Signal::Created), Step::default());
         // A prompt is a message from the user, and starts the turn.
-        let s = step(Idle, &mut b, &Signal::Prompt);
+        let s = step(Idle, &mut b, &Signal::Prompt(None));
         assert_eq!(
             (s.status, s.user_msg, s.agent_msg),
             (Some(Working), true, false)
@@ -734,7 +749,7 @@ mod tests {
         // The turn starting right after changes nothing more.
         assert_eq!(step(Working, &mut b, &Signal::Busy), Step::default());
         // A prompt sent mid-turn is still a message; the status stays.
-        let s = step(Working, &mut b, &Signal::Prompt);
+        let s = step(Working, &mut b, &Signal::Prompt(None));
         assert_eq!(
             (s.status, s.kind, s.user_msg),
             (None, Some("prompt_submitted"), true)
@@ -965,7 +980,7 @@ mod tests {
             (get().last_user_msg_at, get().last_agent_msg_at),
             (None, None)
         );
-        assert!(on(Signal::Prompt));
+        assert!(on(Signal::Prompt(None)));
         assert!(get().last_user_msg_at.is_some());
         let n = events();
         // Nothing new: nothing written.

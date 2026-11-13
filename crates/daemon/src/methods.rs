@@ -1071,12 +1071,25 @@ pub(crate) fn hook_emit_with(
         }
         // Only a prompt and a finished turn are messages: a permission
         // prompt, a question or a tool call never moves "updated".
-        match kind {
-            _ if whose == Whose::Other => {}
-            "prompt_submitted" => db.touch_last_user_msg(&s.id, now)?,
-            "agent_stopped" => db.touch_last_agent_msg(&s.id, now)?,
-            _ => {}
-        }
+        // A prompt rlord typed itself (`own.rs`: matched by the hash of
+        // its text, or by time when the payload has none) is logged as
+        // such, and is not the user's.
+        let mut source = None;
+        let kind = match kind {
+            _ if whose == Whose::Other => kind,
+            "prompt_submitted" => {
+                let text = crate::own::mark_of_payload(&payload);
+                let (kind, by) =
+                    crate::own::prompt(db, &s.id, text.as_ref(), now, crate::own::Via::Hook)?;
+                source = by;
+                kind
+            }
+            "agent_stopped" => {
+                db.touch_last_agent_msg(&s.id, now)?;
+                kind
+            }
+            _ => kind,
+        };
         // A late hook from an agent that is exiting after its session was
         // stopped (a kill, a reset) must not mark it alive again: a stopped
         // session only comes back if its tmux session really exists.
@@ -1095,7 +1108,8 @@ pub(crate) fn hook_emit_with(
                 (Whose::Other, _) => "tool",
                 _ => kind,
             };
-            db.insert_event(&s.id, now, kind, &json!({"hook": event}).to_string())?;
+            let detail = crate::own::with_source(json!({"hook": event}), source);
+            db.insert_event(&s.id, now, kind, &detail.to_string())?;
         }
     } else {
         db.insert_event(

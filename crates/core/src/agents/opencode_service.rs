@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use super::opencode::is_session_id;
+use crate::types::PromptMark;
 
 /// How to reach the server.
 #[derive(Clone, PartialEq, Eq)]
@@ -618,8 +619,9 @@ pub const EVENT_TYPES: &[&str] = &[
 pub enum Signal {
     /// The session exists now (its TUI is up).
     Created,
-    /// The user sent a prompt.
-    Prompt,
+    /// A prompt was sent (by the user, or typed in by rlord), with what
+    /// identifies its text when the event carried it.
+    Prompt(Option<PromptMark>),
     /// A turn is running.
     Busy,
     /// The turn is over (finished, failed or interrupted).
@@ -649,7 +651,11 @@ pub fn map_event(v: &Value) -> Option<(String, Signal)> {
             "idle" => Signal::Ended,
             _ => return None,
         },
-        "session.inbox.enqueued" if data["item"]["type"] == "user" => Signal::Prompt,
+        // (`item.payload.text`: the prompt, as OpenCode 2.2.7's
+        // `Session.Inbox.UserPayload` has it.)
+        "session.inbox.enqueued" if data["item"]["type"] == "user" => {
+            Signal::Prompt(data["item"]["payload"]["text"].as_str().map(PromptMark::of))
+        }
         "permission.asked" => Signal::Asked(id("perm", &data["id"])?),
         "permission.replied" => Signal::Answered(id("perm", &data["requestID"])?),
         "form.created" => {
@@ -899,7 +905,21 @@ mod tests {
                 json!({"sessionID": s, "inboxID": "msg_1", "item": {"type": ty}}),
             ))
         };
-        assert_eq!(inbox("user"), Some((s.into(), Signal::Prompt)));
+        assert_eq!(inbox("user"), Some((s.into(), Signal::Prompt(None))));
+        // With its text: only what identifies it is kept.
+        let with_text = ev(
+            "session.inbox.enqueued",
+            json!({"sessionID": s, "inboxID": "msg_2",
+                   "item": {"type": "user", "delivery": "queue",
+                            "payload": {"text": "fix the\nbuild"}}}),
+        );
+        assert_eq!(
+            map_event(&with_text),
+            Some((
+                s.into(),
+                Signal::Prompt(Some(PromptMark::of("fix the build")))
+            ))
+        );
         assert_eq!(inbox("synthetic"), None);
         // Nothing rlord follows, or nothing it can place.
         assert_eq!(on("session.usage.updated"), None);

@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_transcript_cursors.sql"),
     include_str!("../migrations/0007_summary.sql"),
     include_str!("../migrations/0008_usage.sql"),
+    include_str!("../migrations/0009_rlord_msg.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -24,7 +25,8 @@ pub const OVERLORD_ACTIVE: &str = "overlord_active";
 const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_session_trust, \
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
-     repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at";
+     repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at, \
+     last_rlord_msg_at";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -511,13 +513,14 @@ impl Db {
             format!("WHERE {}", conds.join(" AND "))
         };
         let (expr, natural) = match q.sort {
-            // Messages only: a resume or an idle notification changes the
+            // Messages only (the user's, the agent's, and what rlord
+            // typed in): a resume or an idle notification changes the
             // state (the State sort), not the conversation.
             // (Usage: in this order until the daemon sorts by usage, which
             // keeps it among equals, reversed or not.)
             SortMode::Activity | SortMode::Usage => (
                 "MAX(created_at, COALESCE(last_agent_msg_at, 0), \
-                 COALESCE(last_user_msg_at, 0))",
+                 COALESCE(last_user_msg_at, 0), COALESCE(last_rlord_msg_at, 0))",
                 "DESC",
             ),
             SortMode::User => ("COALESCE(last_user_msg_at, created_at)", "DESC"),
@@ -966,6 +969,38 @@ impl Db {
         Ok(())
     }
 
+    /// A kv value that is a JSON object (`{}` when unset or unreadable).
+    pub fn kv_map(&self, key: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+        Ok(self
+            .kv_get(key)?
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default())
+    }
+
+    /// Store a JSON object under `key`; an empty one deletes the key.
+    pub fn kv_set_map(
+        &self,
+        key: &str,
+        m: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        if m.is_empty() {
+            self.kv_delete(key)
+        } else {
+            self.kv_set(key, &serde_json::Value::Object(m.clone()).to_string())
+        }
+    }
+
+    /// A prompt rlord itself typed into the session (never
+    /// `last_user_msg_at`: that is the user's own).
+    pub fn touch_last_rlord_msg(&self, id: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET last_rlord_msg_at = ?2 WHERE id = ?1",
+            params![id, ts],
+        )?;
+        Ok(())
+    }
+
     pub fn touch_last_agent_msg(&self, id: &str, ts: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET last_agent_msg_at = ?2 WHERE id = ?1",
@@ -1315,6 +1350,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         role: r.get(22)?,
         summary: r.get(23)?,
         summary_at: r.get(24)?,
+        last_rlord_msg_at: r.get(25)?,
     })
 }
 
@@ -1571,7 +1607,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
         for table in [
             "sessions",
             "tags",
@@ -1599,7 +1635,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 8);
+        assert_eq!(db.schema_version().unwrap(), 9);
     }
 
     #[test]

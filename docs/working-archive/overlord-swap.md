@@ -20,17 +20,9 @@ and `docs/guide.md`. The working doc is in git history.
 - **`recall` treats the active overlord as the caller.** `rlord mcp`
   knows the calling session's id (`agents::MCP_ENV`, only logged);
   passing it through would make a background overlord's `recall` exact.
-- **Tell rlord's prompts apart at the source.** Today a resume job
-  stamps `typed_at` before each paste and treats a prompt from 1s
-  before it to 30s after as rlord's (`limits::user_prompt_at`); a user
-  prompt typed within those 30s reads as rlord's, and sessions without
-  a job aren't covered. The root fix: stamp the pending paste where the
-  prompt hook (`prompt_submitted`, `methods.rs`) handles it, so
-  `last_user_msg_at` never records rlord's pastes. Deferred from #21:
-  it changes the hook path every agent shares, and the review asked for
-  it as a separate change.
 - No test drives the "job rescheduled while it runs" race end to end;
   the guard (`limit_at`/`asked_at` compare) is small and reviewed only.
 
-Done since: the `M-s`/`m-s` overlap check compares modifiers
+Done since: rlord's pastes no longer count as the user's prompts
+(0.23.0-dev.5; what that still owes is in `docs/working/own-prompts.md`); the `M-s`/`m-s` overlap check compares modifiers
 case-insensitively; `continue_elsewhere` starts the target overlord once.

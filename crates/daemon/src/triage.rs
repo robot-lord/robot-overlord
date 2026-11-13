@@ -40,7 +40,7 @@ pub fn updated_at(s: &Session) -> i64 {
     let failed = (s.status == Status::Error)
         .then_some(s.last_state_change_at)
         .flatten();
-    [s.last_agent_msg_at, s.last_user_msg_at, failed]
+    [s.last_agent_msg_at, s.last_prompt_at(), failed]
         .into_iter()
         .flatten()
         .fold(s.created_at, i64::max)

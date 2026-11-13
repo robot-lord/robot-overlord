@@ -1126,6 +1126,7 @@ fn main() -> Result<()> {
             println!("  dir        {}", g("project_path"));
             println!("  created    {}", t("created_at"));
             println!("  user msg   {}", t("last_user_msg_at"));
+            println!("  rlord msg  {}", t("last_rlord_msg_at"));
             println!("  agent msg  {}", t("last_agent_msg_at"));
             println!("  state      {}", t("last_state_change_at"));
             println!("  tags       {}   group {}", tags_of(&s), g("group_path"));
@@ -2027,6 +2028,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
                 [
                     "last_agent_msg_at",
                     "last_user_msg_at",
+                    "last_rlord_msg_at",
                     "last_state_change_at",
                     "created_at"
                 ]

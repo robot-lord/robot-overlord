@@ -28,6 +28,10 @@
 //!   terminal the overlord's overlay is open on doesn't count: the user is
 //!   typing to the overlord in the popup, not to the session behind it.
 //!
+//! Once every check passed, the prompt the paste will make is marked as
+//! rlord's (`own.rs`), so the agent's report of it never counts as the
+//! user typing.
+//!
 //! A queued message held back by these is logged once ("message_held",
 //! with why), so a message stuck in the queue shows in the session's log.
 
@@ -36,13 +40,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use rlord_core::agents::{strip_ansi, Agent};
 use rlord_core::db::Db;
 use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
 
+use crate::own::{self, Source};
 use crate::Daemon;
 
 /// kv key: pending messages, `{session id: {"text", "at"}}`.
@@ -87,11 +92,10 @@ pub struct Checks<'a> {
     pub overlay: Option<&'a str>,
     /// Not while its input holds a draft (`draft`).
     pub draft: bool,
-    /// Run right before the paste, once every check passed
-    /// (`limits::before_paste`: the resume job's "rlord typed" marker).
-    pub before_paste: Option<&'a dyn Fn()>,
-    /// Run if the paste or its Enter failed after `before_paste` (undo it).
-    pub paste_failed: Option<&'a dyn Fn()>,
+    /// Who is typing, when it is rlord's own message: the prompt this
+    /// makes is marked as rlord's (`own::mark`), not the user's. None:
+    /// the text is the user's own (`overlord ask`), and so is its prompt.
+    pub source: Option<Source>,
 }
 
 /// What `type_into` did.
@@ -107,9 +111,18 @@ pub enum Typed {
 /// pane, never whatever pane is active) and submit it, unless `checks`
 /// say not now: out of copy mode first (its keys would take the Enter),
 /// one bracketed paste, a moment for it to land, then Enter. `session`:
-/// whose pane, remembered for `SETTLE`. The caller holds the session's
-/// lock (locks.rs).
-pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Result<Typed> {
+/// whose pane, remembered for `SETTLE`. Right before the paste the prompt
+/// to come is marked as rlord's (`own::mark`, durable; not for the
+/// user's own text, `Checks::source`), so it is never taken for the
+/// user's; a paste that fails takes its marker back. The
+/// caller holds the session's lock (locks.rs), and not the DB.
+pub fn type_into(
+    d: &Daemon,
+    session: &str,
+    pane: &str,
+    text: &str,
+    checks: &Checks,
+) -> Result<Typed> {
     let settled = || {
         let typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
         !checks.settle
@@ -143,10 +156,20 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
             "its input holds unsent text (the message would be added to it)".into(),
         ));
     }
-    // (Without `TYPING`: it may take the DB.)
-    if let Some(f) = checks.before_paste {
-        f();
-    }
+    // (Without `TYPING`: this takes the DB.) Not typed without its
+    // marker: the prompt would be counted as the user's.
+    let marked = match checks.source {
+        Some(source) => match own::mark(&d.db(), session, text, source, now_ms()) {
+            Ok(at) => Some(at),
+            Err(e) => {
+                tracing::warn!(session, error = %e, "marking rlord's own prompt");
+                return Ok(Typed::NotNow(
+                    "rlord couldn't record that it is the one typing (its database)".into(),
+                ));
+            }
+        },
+        None => None,
+    };
     let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
     let last = typed.get_or_insert_with(HashMap::new);
     let _ = tmux::cancel_mode(pane);
@@ -154,12 +177,13 @@ pub fn type_into(session: &str, pane: &str, text: &str, checks: &Checks) -> Resu
         std::thread::sleep(Duration::from_millis(150));
         tmux::send_keys(pane, &["Enter"])
     });
-    if pasted.is_err() {
-        if let Some(f) = checks.paste_failed {
-            f();
+    if let Err(e) = pasted {
+        drop(typed);
+        if let Some(at) = marked {
+            let _ = own::unmark(&d.db(), session, at);
         }
+        return Err(e);
     }
-    pasted?;
     last.insert(session.to_string(), Instant::now());
     Ok(Typed::Done)
 }
@@ -233,8 +257,8 @@ fn agent_pane(s: &Session) -> Result<String> {
 }
 
 /// Type a message into session `s` (read under its lock, just now), after
-/// the last checks (`type_into`).
-pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed> {
+/// the last checks (`type_into`). `source`: who sends it.
+pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str, source: Source) -> Result<Typed> {
     let pane = agent_pane(s)?;
     let overlay = d
         .overlay
@@ -242,18 +266,15 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         .expect("ui mutex")
         .as_ref()
         .map(|(client, _)| client.clone());
-    // (The marker `before_paste` replaced: back if the paste fails.)
-    let prev = std::cell::Cell::new(None);
     let checks = Checks {
         agent: Agent::named(&s.agent)?,
         settle: true,
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
-        before_paste: Some(&|| prev.set(crate::limits::before_paste(d, s))),
-        paste_failed: Some(&|| crate::limits::paste_failed(d, &s.id, prev.get())),
+        source: Some(source),
     };
-    type_into(&s.id, &pane, text, &checks)
+    type_into(d, &s.id, &pane, text, &checks)
 }
 
 /// `session.send {ref, text, when_idle}`.
@@ -302,7 +323,7 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         return not_now(d, &s, text, when_idle, &why);
     }
     // (tmux without the DB lock.)
-    if let Typed::NotNow(why) = type_message(d, &s, text)? {
+    if let Typed::NotNow(why) = type_message(d, &s, text, Source::Send)? {
         return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
     }
     let db = d.db();
@@ -338,31 +359,15 @@ fn not_now(d: &Daemon, s: &Session, text: &str, when_idle: bool, why: &str) -> R
     )
 }
 
-fn pending(db: &Db) -> Result<Map<String, Value>> {
-    Ok(db
-        .kv_get(PENDING_KEY)?
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default())
-}
-
-fn save_pending(db: &Db, m: &Map<String, Value>) -> Result<()> {
-    if m.is_empty() {
-        db.kv_delete(PENDING_KEY)
-    } else {
-        db.kv_set(PENDING_KEY, &Value::Object(m.clone()).to_string())
-    }
-}
-
 /// Hold `text` for session `id` until its turn is over. Returns whether it
 /// replaced one already waiting.
 fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
-    let mut m = pending(db)?;
+    let mut m = db.kv_map(PENDING_KEY)?;
     let now = now_ms();
     let replaced = m
         .insert(id.to_string(), json!({"text": text, "at": now}))
         .is_some();
-    save_pending(db, &m)?;
+    db.kv_set_map(PENDING_KEY, &m)?;
     db.insert_event(
         id,
         now,
@@ -376,11 +381,11 @@ fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
 /// Drop session `id`'s pending message, if it has one (logged as dropped,
 /// `why`, replaced). Returns whether there was one.
 fn unqueue(db: &Db, id: &str, why: &str) -> Result<bool> {
-    let mut m = pending(db)?;
+    let mut m = db.kv_map(PENDING_KEY)?;
     if m.remove(id).is_none() {
         return Ok(false);
     }
-    save_pending(db, &m)?;
+    db.kv_set_map(PENDING_KEY, &m)?;
     db.insert_event(
         id,
         now_ms(),
@@ -438,7 +443,7 @@ fn tick(d: &Daemon) -> Result<()> {
     let limited = crate::limits::limited(d);
     let due: Vec<String> = {
         let db = d.db();
-        let mut m = pending(&db)?;
+        let mut m = db.kv_map(PENDING_KEY)?;
         if m.is_empty() {
             return Ok(());
         }
@@ -465,7 +470,7 @@ fn tick(d: &Daemon) -> Result<()> {
             }
         }
         if dropped {
-            save_pending(&db, &m)?;
+            db.kv_set_map(PENDING_KEY, &m)?;
         }
         due
     };
@@ -485,7 +490,8 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         let Ok(s) = db.resolve_ref(id) else {
             return Ok(()); // (gone: the next tick drops it)
         };
-        let Some(text) = pending(&db)?
+        let Some(text) = db
+            .kv_map(PENDING_KEY)?
             .get(id)
             .and_then(|v| v["text"].as_str())
             .map(str::to_string)
@@ -498,17 +504,17 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
         return Ok(());
     }
     // Without the DB lock: tmux.
-    let r = type_message(d, &s, &text);
+    let r = type_message(d, &s, &text, Source::Send);
     if let Ok(Typed::NotNow(why)) = &r {
         // A later tick; said once, so a stuck queue is visible.
         return held(d, id, &text, why);
     }
     let db = d.db();
-    let mut m = pending(&db)?;
+    let mut m = db.kv_map(PENDING_KEY)?;
     // (Queued and sent under this lock: still this text.)
     if m.get(id).and_then(|v| v["text"].as_str()) == Some(text.as_str()) {
         m.remove(id);
-        save_pending(&db, &m)?;
+        db.kv_set_map(PENDING_KEY, &m)?;
     }
     let (kind, detail) = match &r {
         Ok(_) => (
@@ -527,7 +533,7 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
 /// is marked `held`; a newer message starts unmarked).
 fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
     let db = d.db();
-    let mut m = pending(&db)?;
+    let mut m = db.kv_map(PENDING_KEY)?;
     let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -535,7 +541,7 @@ fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
         return Ok(());
     }
     entry.insert("held".into(), json!(true));
-    save_pending(&db, &m)?;
+    db.kv_set_map(PENDING_KEY, &m)?;
     db.insert_event(
         id,
         now_ms(),
@@ -697,10 +703,13 @@ mod tests {
             attached: None,
             overlay: None,
             draft: true,
-            before_paste: None,
-            paste_failed: None,
+            source: Some(Source::Send),
         };
-        let r = type_into(id, "%no-such-pane", "hi", &checks).unwrap();
+        let d = Daemon::new(
+            Db::open_in_memory().unwrap(),
+            rlord_core::config::Config::default(),
+        );
+        let r = type_into(&d, id, "%no-such-pane", "hi", &checks).unwrap();
         assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));
     }
 
@@ -750,7 +759,7 @@ mod tests {
         held(&d, &id, "first", "a dialog is up").unwrap();
         held(&d, &id, "first", "a dialog is up").unwrap();
         assert_eq!(held_count(), 1);
-        assert_eq!(pending(&d.db()).unwrap()[&id]["text"], "first");
+        assert_eq!(d.db().kv_map(PENDING_KEY).unwrap()[&id]["text"], "first");
         // (Not this message's text: nothing.)
         held(&d, &id, "other", "x").unwrap();
         assert_eq!(held_count(), 1);
@@ -769,7 +778,7 @@ mod tests {
         assert!(!unqueue(&db, &id, "x").unwrap());
         queue(&db, &id, "older").unwrap();
         assert!(unqueue(&db, &id, "replaced by a newer message, sent directly").unwrap());
-        assert!(pending(&db).unwrap().is_empty());
+        assert!(db.kv_map(PENDING_KEY).unwrap().is_empty());
         let log = db.list_events(&id, 10).unwrap();
         let dropped = log.iter().find(|e| e.kind == "message_dropped").unwrap();
         assert_eq!(dropped.payload["replaced"], true, "{}", dropped.payload);
@@ -846,15 +855,47 @@ mod tests {
         let v = send(&d, &json!({"ref": &id, "text": "two"})).unwrap();
         assert_eq!(v["sent"], true, "{v}");
         assert_eq!(v["replaced_pending"], true, "{v}");
-        assert!(pending(&d.db()).unwrap().is_empty());
+        assert!(d.db().kv_map(PENDING_KEY).unwrap().is_empty());
         std::thread::sleep(Duration::from_millis(200));
         assert!(screen().contains("two"), "{}", screen());
+        // The prompt to come is marked as rlord's (durable); the agent's
+        // report of it is then not the user's.
+        let marked = d.db().kv_get(own::KEY).unwrap().unwrap_or_default();
+        let two = rlord_core::types::PromptMark::hash_of("two");
+        assert!(marked.contains(&two), "{marked}");
+        let (kind, source) = own::prompt(&d.db(), &id, None, now_ms(), own::Via::Hook).unwrap();
+        assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("send")));
+        let s = d.db().resolve_ref(&id).unwrap();
+        assert!(s.last_user_msg_at.is_none() && s.last_rlord_msg_at.is_some());
 
         // Right after: one paste per settle.
         let e = send(&d, &json!({"ref": &id, "text": "three"})).unwrap_err();
         assert!(e.to_string().contains("moments ago"), "{e}");
         let q = send(&d, &json!({"ref": &id, "text": "three", "when_idle": true})).unwrap();
         assert_eq!(q["queued"], true);
+
+        // The user's own text (`overlord ask`: no source) is typed the
+        // same way but not marked: its prompt is the user's, and a resume
+        // job sees them take the session over.
+        let checks = Checks {
+            agent: Agent::Codex,
+            settle: false,
+            attached: None,
+            overlay: None,
+            draft: false,
+            source: None,
+        };
+        let pane = tmux::pane_id("rlord_s1").unwrap();
+        let asked = "what is left to do";
+        let before = d.db().kv_get(own::KEY).unwrap();
+        let r = type_into(&d, &id, &pane, asked, &checks).unwrap();
+        assert_eq!(r, Typed::Done);
+        assert_eq!(d.db().kv_get(own::KEY).unwrap(), before);
+        let text = rlord_core::types::PromptMark::of(asked);
+        let (kind, source) =
+            own::prompt(&d.db(), &id, Some(&text), now_ms(), own::Via::Hook).unwrap();
+        assert_eq!((kind, source), ("prompt_submitted", None));
+        assert!(d.db().resolve_ref(&id).unwrap().last_user_msg_at.is_some());
 
         tmux::kill_session("rlord_s1").unwrap();
         tx(&["kill-server"]);
@@ -866,12 +907,12 @@ mod tests {
         let id = insert(&db);
         assert!(!queue(&db, &id, "first").unwrap());
         assert!(queue(&db, &id, "second").unwrap());
-        let m = pending(&db).unwrap();
+        let m = db.kv_map(PENDING_KEY).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[&id]["text"], "second");
         let log = db.list_events(&id, 10).unwrap();
         assert_eq!(log.iter().filter(|e| e.kind == "message_queued").count(), 2);
-        save_pending(&db, &Map::new()).unwrap();
+        db.kv_set_map(PENDING_KEY, &serde_json::Map::new()).unwrap();
         assert!(db.kv_get(PENDING_KEY).unwrap().is_none());
     }
 }
