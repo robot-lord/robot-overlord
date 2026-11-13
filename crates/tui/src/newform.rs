@@ -1197,7 +1197,7 @@ impl App {
             let list = List::new(rows.iter().map(|(_, label)| ListItem::new(label.as_str())))
                 .highlight_style(theme::selected())
                 .highlight_symbol(theme::SELECT_BAR);
-            let mut st = finder.state.clone();
+            let mut st = finder.state;
             f.render_stateful_widget(list, list_area, &mut st);
             // Click a repo to pick it.
             for i in st.offset()..rows.len().min(st.offset() + list_area.height as usize) {
@@ -1221,7 +1221,7 @@ impl App {
                 ))
                 .highlight_style(theme::selected())
                 .highlight_symbol(theme::SELECT_BAR);
-            let mut st = state.clone();
+            let mut st = *state;
             f.render_stateful_widget(list, inner, &mut st);
             // Click a choice to pick it (inside the list's own border).
             let body = Rect {

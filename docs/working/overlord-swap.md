@@ -1,6 +1,6 @@
 # Parallel overlords with a hot swap; resume after a usage limit
 
-**Status:** in progress
+**Status:** in progress (built, PR open; reconcile into docs when it merges)
 
 Two features, one PR (0.23.0-dev.1).
 
@@ -36,8 +36,17 @@ Design calls:
   "usage_limit_reached"`, `resetsAt` epoch seconds). Seen on CLI 2.1.322,
   one sample (a 5-hour limit).
 - `limits.rs`: kv `limits` (what is limited now), kv `limit_resume` (jobs).
+- Checked in the demo (stand-in agents, scratch tmux): a limit record
+  appended to a transcript shows as limited, `rlord resume-after-limit`
+  schedules, and "continue" is typed in a minute after the reset.
+  Switching in the overlay (key), CLI and the list was checked the same
+  way; a click on the switcher row is covered by a unit test only.
 
 ## Owed
+
+- `recall` treats the active overlord as the caller. `rlord mcp` knows the
+  calling session's id (`agents::MCP_ENV`, only logged today); passing it
+  through would make a background overlord's `recall` exact.
 
 - Codex limit detection: no rollout on this machine ever hit a limit, so
   its record's shape is unverified. Likely signal: `token_count`
