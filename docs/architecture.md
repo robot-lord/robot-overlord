@@ -300,8 +300,9 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   and stops the session only once no turn runs; meanwhile it stays as the
   hooks say, logged once as `pane_gone_turn_running`.
 - **Fresh restarts don't interrupt**: `session_fresh` is used only for
-  the overlord ("Fresh restarts" below), which never runs on the daemon. Using it on a daemon-mode
-  session would leave its turn running there while a new thread starts.
+  the overlord ("Fresh restarts" below), which never runs on the daemon.
+  Used on a daemon-mode session, it would leave the turn running there
+  while a new thread starts.
 - **Stop and archive interrupt first**, before the DB lock: Escape into
   the pane when it is up with no dialog (it interrupts from any client),
   else `turn/interrupt`; then up to 4s for the turn to end. The answer and
