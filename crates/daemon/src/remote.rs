@@ -415,6 +415,14 @@ pub(crate) fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool>
             return Ok(false);
         }
     }
+    // A Codex session moving off its background server: its pane stops
+    // first (the server holds the thread a while), and the keeper resumes
+    // it in the pane after (`remote_codex::finish_leaving`).
+    if crate::remote_codex::must_leave(&d.db(), id) {
+        crate::remote_codex::leave_server(&d.db(), id)?;
+        d.changed();
+        return Ok(true);
+    }
     // (Where the agent's command is: asked before the DB lock is taken.)
     rlord_core::agents::install::warm();
     methods::session_restart(&d.db(), &json!({"ref": id}))?;
@@ -424,15 +432,22 @@ pub(crate) fn restart(d: &Daemon, id: &str, only_if_quiet: bool) -> Result<bool>
 
 /// One keeper pass: run deferred restarts whose sessions went quiet, and
 /// refresh each session's state for the list. Returns the states.
-fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
+pub(crate) fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     let _one = d.remote.tick.lock().expect("remote tick");
     let sessions = d.db().sessions(&all_sessions())?;
     let live = live();
     let mut wants = HashMap::new();
     let mut turned_off = HashSet::new();
+    let mut leaving = HashSet::new();
     {
         let db = d.db();
         for s in &sessions {
+            if s.agent == Agent::Codex.name()
+                && serde_json::from_str::<Value>(&db.launch_spec(&s.id)?)
+                    .is_ok_and(|sp| crate::remote_codex::is_leaving(&sp))
+            {
+                leaving.insert(s.id.clone());
+            }
             if let Some(w) = wanted(&db, &s.id)? {
                 wants.insert(s.id.clone(), w);
             } else if turned_off_spec(&db, &s.id) {
@@ -492,7 +507,10 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
     let codex = Agent::Codex.name();
     let codex_seen = sessions
         .iter()
-        .any(|s| s.agent == codex && (wants.contains_key(&s.id) || s.codex_daemon))
+        .any(|s| {
+            s.agent == codex
+                && (wants.contains_key(&s.id) || s.codex_daemon || leaving.contains(&s.id))
+        })
         .then(|| d.remote.codex.seen(false));
     let codex_avail = codex_seen.as_ref().map(|_| {
         if sessions
@@ -511,6 +529,7 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
         }
     });
     crate::remote_codex::watch_pairing(d);
+    crate::remote_codex::finish_leaving(d, &sessions);
     let mut out = HashMap::new();
     for s in &sessions {
         let want = wants.get(&s.id);
@@ -525,6 +544,7 @@ fn pass(d: &Daemon) -> Result<HashMap<String, Value>> {
                 avail,
                 d.remote.codex.last_error().as_deref(),
                 queued.contains_key(&s.id),
+                leaving.contains(&s.id),
             );
             if st["state"] != "off" {
                 out.insert(s.id.clone(), st);

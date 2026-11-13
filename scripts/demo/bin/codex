@@ -11,7 +11,10 @@
 # Without --no-daemon it plays a thread on Codex's shared background
 # server: its hooks run without the pane's RLORD_SESSION_ID / TMUX_PANE (as
 # the daemon's do), and the index lists it as an app-server client's.
-# `codex app-server daemon version|start` answer as the real one does.
+# `codex app-server daemon version|start` answer as the real one does, and
+# `codex login status` says it's logged in with ChatGPT. (Its control
+# socket, which Remote Control goes through, isn't stood in for here: the
+# tests use rlord's own, `codex_server::fake`.)
 set -u
 demo=${RLORD_DEMO_DIR:?}
 home=${CODEX_HOME:?}
@@ -23,6 +26,10 @@ if [[ ${1:-} == app-server && ${2:-} == daemon ]]; then
   esac
   st=stopped; [[ -e $home/stand-in-daemon ]] && st=running
   printf '{"status":"%s","backend":"pid","socketPath":"%s/app-server-control/app-server-control.sock","cliVersion":"0.167.2","appServerVersion":"0.169.0"}\n' "$st" "$home"
+  exit 0
+fi
+if [[ ${1:-} == login && ${2:-} == status ]]; then
+  echo "Logged in using ChatGPT" >&2
   exit 0
 fi
 args=("$@")

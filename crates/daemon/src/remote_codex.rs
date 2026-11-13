@@ -19,6 +19,13 @@
 //!   (a restart; the conversation resumes) and marks the spec
 //!   `codex_host_by_remote`; turning it off moves such a session back into
 //!   its pane. A session in daemon mode by config stays there.
+//! - **Back into the pane takes a minute.** The server keeps a thread
+//!   loaded, holding its writer lock, for about a minute after its last
+//!   client leaves; an in-pane Codex started before then shows "This
+//!   conversation is open in another app". So rlord stops the session's
+//!   pane (`codex_leaving_since` in its spec), and the keeper resumes it in
+//!   the pane once the server no longer has the thread loaded
+//!   (`finish_leaving`), or after a few minutes regardless.
 //!
 //! The wish is the same spec key as Claude's (`remote_control`,
 //! `remote_control_at`); Codex has no per-session flag, so it changes no
@@ -52,6 +59,14 @@ const PAIRING_MAX: Duration = Duration::from_secs(10 * 60);
 const CLAIM_POLL: Duration = Duration::from_secs(2);
 
 pub(crate) const ENABLED_BY_RLORD: &str = "codex_remote_enabled_by_rlord";
+
+/// Spec marks for a session moving off the server into its pane: it is
+/// to move (set when Remote Control is turned off), and since when its
+/// pane has been stopped for that (ms).
+const LEAVING: &str = "codex_leaving_server";
+const LEAVING_SINCE: &str = "codex_leaving_since";
+/// The longest the keeper waits for the server to let go of a thread.
+const LEAVE_WAIT_MS: i64 = 5 * 60_000;
 
 /// What rlord last saw of the machine.
 #[derive(Debug, Clone, Default)]
@@ -191,6 +206,13 @@ impl CodexRemote {
         Seen { machine, paired }
     }
 
+    /// Whether the server has the thread loaded (and so its writer lock).
+    /// None: the server can't be asked (then nothing holds it).
+    fn thread_loaded(&self, thread: &str) -> Option<bool> {
+        codex_server::thread_state(&self.socket(), thread)
+            .map(|t| t != codex_server::ThreadState::NotLoaded)
+    }
+
     fn forget(&self) {
         *self.machine.lock().expect("codex remote mutex") = None;
         *self.paired.lock().expect("codex remote mutex") = None;
@@ -309,7 +331,8 @@ fn running(s: &Session) -> bool {
 }
 
 /// `{state, reason?, wanted, app}` for one Codex session. `want`: it has
-/// the wish; `queued`: its restart onto the server waits for its work.
+/// the wish; `queued`: its restart waits for its work; `leaving`: it is
+/// moving off the server into its pane.
 pub(crate) fn state_of(
     s: &Session,
     want: bool,
@@ -317,9 +340,15 @@ pub(crate) fn state_of(
     avail: &Availability,
     last_error: Option<&str>,
     queued: bool,
+    leaving: bool,
 ) -> Value {
     let on_daemon = s.codex_daemon;
-    let (state, reason): (&str, Option<String>) = if !want {
+    let (state, reason): (&str, Option<String>) = if leaving && !want {
+        (
+            "disconnecting",
+            Some("moves back into its own pane once Codex's server lets go of the conversation (about a minute)".into()),
+        )
+    } else if !want {
         // Not asked for, but a phone can reach a thread on the server.
         if on_daemon && s.status != Status::Stopped && seen.reachable() {
             (
@@ -365,6 +394,69 @@ pub(crate) fn state_of(
     };
     json!({"state": state, "reason": reason, "wanted": want,
            "app": Agent::Codex.remote_app()})
+}
+
+/// Whether the session is moving off the server (its pane not yet stopped
+/// for it).
+pub(crate) fn must_leave(db: &Db, id: &str) -> bool {
+    let sp = spec_of(db, id);
+    sp[LEAVING] == true && sp.get(LEAVING_SINCE).is_none()
+}
+
+pub(crate) fn is_leaving(spec: &Value) -> bool {
+    spec[LEAVING] == true
+}
+
+/// Instead of a restart (the caller holds the session's lock): stop its
+/// pane, the server's client, so the server lets go of the thread; the
+/// keeper resumes it in its pane after (`finish_leaving`).
+pub(crate) fn leave_server(db: &Db, id: &str) -> Result<()> {
+    crate::methods::session_stop(db, &json!({"ref": id}))?;
+    let mut sp = spec_of(db, id);
+    sp[LEAVING_SINCE] = json!(rlord_core::types::now_ms());
+    db.set_launch_spec(id, &sp.to_string())?;
+    db.insert_event(
+        id,
+        rlord_core::types::now_ms(),
+        "codex_leaving_server",
+        r#"{"why":"Remote Control off: back into its pane once Codex's server lets go"}"#,
+    )?;
+    Ok(())
+}
+
+/// The keeper: a session stopped to leave the server is resumed in its
+/// pane once the server no longer has its thread loaded (or after a few
+/// minutes). One started meanwhile by someone else is left as it is.
+pub(crate) fn finish_leaving(d: &Daemon, sessions: &[Session]) {
+    let now = rlord_core::types::now_ms();
+    for s in sessions.iter().filter(|s| s.agent == Agent::Codex.name()) {
+        let sp = spec_of(&d.db(), &s.id);
+        let Some(since) = sp[LEAVING_SINCE].as_i64() else {
+            continue;
+        };
+        let clear = |d: &Daemon| {
+            let mut sp = spec_of(&d.db(), &s.id);
+            if let Some(o) = sp.as_object_mut() {
+                o.remove(LEAVING);
+                o.remove(LEAVING_SINCE);
+            }
+            d.db().set_launch_spec(&s.id, &sp.to_string())
+        };
+        if s.status != Status::Stopped {
+            let _ = clear(d);
+            continue;
+        }
+        let free = s
+            .agent_session
+            .as_deref()
+            .is_none_or(|t| d.remote.codex.thread_loaded(t) != Some(true));
+        if !free && now - since < LEAVE_WAIT_MS {
+            continue;
+        }
+        if let Err(e) = clear(d).and_then(|_| crate::remote::restart(d, &s.id, false).map(|_| ())) {
+            tracing::warn!(session = %s.id, error = %e, "Codex Remote Control: resuming in its pane");
+        }
+    }
 }
 
 /// This machine's switch, for `remote.status` and `rlord remote`.
@@ -472,6 +564,10 @@ pub(crate) fn set(
             if moved {
                 o.remove("codex_host");
                 o.remove("codex_host_by_remote");
+                // Its pane is a client of the server until it restarts.
+                if restart {
+                    o.insert(LEAVING.into(), json!(true));
+                }
             }
         }
     }
@@ -488,7 +584,12 @@ pub(crate) fn set(
             restarted = true;
         }
     }
+    let leaving = spec_of(&d.db(), &s.id)[LEAVING] == true;
     d.changed();
+    // The list's states too (as Claude's answer does).
+    if let Err(e) = crate::remote::pass(d) {
+        tracing::debug!(error = %e, "remote control: refreshing states");
+    }
     let seen = codex.seen(machine_off);
     let s = d.db().resolve_ref(&s.id)?;
     let avail = codex.cached_availability().unwrap_or_default();
@@ -499,6 +600,7 @@ pub(crate) fn set(
         &avail,
         codex.last_error().as_deref(),
         deferred,
+        leaving,
     );
     let mut out = json!({"session": s.id, "name": s.name, "remote": st,
                          "restarted": restarted, "restarts_when_idle": deferred});
@@ -528,6 +630,8 @@ pub(crate) fn set(
             "{}; Remote Control is still on for this machine, so a paired phone may still open this conversation. Offer to switch it off for the whole machine (remote_control with machine: true, on: false)",
             if deferred {
                 "it moves back into its own pane when its work is done"
+            } else if leaving {
+                "it stops for about a minute while Codex's server lets go of the conversation, then resumes in its own pane"
             } else {
                 "back in its own pane"
             }
@@ -606,15 +710,18 @@ pub(crate) fn pair(d: &Daemon, params: &Value) -> Result<Value> {
     let expires = codex.pair_start()?;
     tracing::info!("Codex Remote Control: pairing started");
     let ui = params["ui"] != false;
-    if ui {
+    // The list opens the dialog (now, or when it next starts); the user's
+    // terminal is switched to it when one is attached.
+    let switched = ui && {
         d.ui_cmd(json!({"cmd": "remote_pair"}));
-        crate::ui::show_list(d)?;
-    }
-    Ok(json!({
-        "shown": ui,
-        "expires_at": expires,
-        "note": "the pairing code is on the user's screen in rlord's list; they enter it in the ChatGPT app (Codex). Don't ask for the code or repeat it.",
-    }))
+        crate::ui::show_list(d).is_ok()
+    };
+    let note = if !ui || switched {
+        "the pairing code is on the user's screen in rlord's list; they enter it in the ChatGPT app (Codex). Don't ask for the code or repeat it."
+    } else {
+        "the pairing code is waiting in rlord's list, but no terminal is attached: tell the user to open rlord (or run `rlord remote pair` in a terminal). Don't ask for the code or repeat it."
+    };
+    Ok(json!({"shown": ui, "on_screen": switched, "expires_at": expires, "note": note}))
 }
 
 /// `remote.pair_code`: the code on show, for the user's own terminal (the
@@ -667,8 +774,9 @@ mod tests {
             available: true,
             ..Default::default()
         };
-        let st =
-            |s: &Session, want, sn: &Seen, q| state_of(s, want, sn, &ok, None, q)["state"].clone();
+        let st = |s: &Session, want, sn: &Seen, q| {
+            state_of(s, want, sn, &ok, None, q, false)["state"].clone()
+        };
         let idle = sess(true, Status::Idle);
         assert_eq!(
             st(&idle, true, &seen(Link::Connected, Some(1)), false),
@@ -725,7 +833,7 @@ mod tests {
             reason: Some("Codex isn't logged in".into()),
             ..Default::default()
         };
-        let v = state_of(&idle, true, &Seen::default(), &no, None, false);
+        let v = state_of(&idle, true, &Seen::default(), &no, None, false, false);
         assert_eq!(v["state"], "unavailable");
         assert_eq!(v["app"], "the ChatGPT app");
         // The enrollment error is the reason for an errored machine.
@@ -736,8 +844,41 @@ mod tests {
             &ok,
             Some("needs MFA"),
             false,
+            false,
         );
         assert_eq!(v["reason"], "needs MFA");
+        // Turned off, on its way back into its pane.
+        let v = state_of(
+            &idle,
+            false,
+            &seen(Link::Connected, Some(1)),
+            &ok,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(v["state"], "disconnecting");
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01lv",
+            name: "lv",
+            agent: "codex",
+            agent_session: Some("t-1"),
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: r#"{"agent":"codex","codex_leaving_server":true}"#,
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        assert!(must_leave(&db, "01lv"));
+        leave_server(&db, "01lv").unwrap();
+        // Stopped for it once: the keeper finishes it, not another stop.
+        assert!(!must_leave(&db, "01lv"));
+        assert_eq!(db.resolve_ref("01lv").unwrap().status, Status::Stopped);
     }
 
     /// The whole path against a stand-in control socket: the machine switch
