@@ -14,6 +14,7 @@ mod release;
 mod tap;
 mod version;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -79,7 +80,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if cmd::is_interrupted(&e) => {
-            eprintln!("{e:#}");
+            // Not eprintln!: after SIGHUP the terminal is gone, and a failed
+            // write must not panic before the signal is re-raised.
+            let _ = writeln!(std::io::stderr(), "{e:#}");
             // Everything is cleaned up by now (the tasks' guards dropped).
             cmd::die_by_signal();
             ExitCode::from(130)

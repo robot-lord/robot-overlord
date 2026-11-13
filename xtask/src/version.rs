@@ -73,15 +73,15 @@ impl Version {
             let digits = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
             digits && (n == "0" || !n.starts_with('0'))
         };
-        let ident = |i: &str| {
-            let chars = !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-            let numeric = i.bytes().all(|b| b.is_ascii_digit());
-            chars && (!numeric || number(i))
+        // The one pre-release form rlord uses, `<word>.<N>` (dev.8, rc.1):
+        // for it cargo-deb writes the `~` that `package_version` predicts
+        // (it rewrites other forms differently).
+        let pre_ok = |p: &str| {
+            p.split_once('.').is_some_and(|(word, n)| {
+                !word.is_empty() && word.bytes().all(|b| b.is_ascii_lowercase()) && number(n)
+            })
         };
-        if nums.len() != 3
-            || !nums.iter().all(|n| number(n))
-            || pre.is_some_and(|p| !p.split('.').all(ident))
-        {
+        if nums.len() != 3 || !nums.iter().all(|n| number(n)) || pre.is_some_and(|p| !pre_ok(p)) {
             return Err(bad());
         }
         let mut parsed = [0u64; 3];
@@ -108,8 +108,8 @@ impl Version {
     }
 
     /// The version as distro packages write it. RPM forbids `-` in a
-    /// version; `~` sorts as a pre-release (cargo-deb does the same on its
-    /// own).
+    /// version; `~` sorts as a pre-release. cargo-deb writes the same on its
+    /// own for the one pre-release form `parse` allows (`<word>.<N>`).
     pub fn package_version(&self) -> String {
         self.raw.replace('-', "~")
     }
@@ -281,6 +281,11 @@ mod tests {
             "1.2.3-dev.1+abc",
             "1.2.3-dev_1",
             "1.2.3-dev.+1",
+            "1.2.3-dev",
+            "1.2.3-1",
+            "1.2.3-dev.1.2",
+            "1.2.3-rc-1.1",
+            "1.2.3-Dev.1",
         ] {
             assert!(Version::parse(bad).is_err(), "{bad}");
         }
@@ -310,9 +315,8 @@ mod tests {
 
     #[test]
     fn pre_release_identifiers() {
-        assert!(v("1.0.0-dev") < v("1.0.0-dev.1"));
-        assert!(v("1.0.0-1") < v("1.0.0-dev"));
         assert!(v("1.0.0-dev.9") < v("1.0.0-dev.10"));
+        assert!(v("1.0.0-dev.10") < v("1.0.0-rc.1"));
     }
 
     #[test]

@@ -429,6 +429,16 @@ fn wait_and_publish(
         Err(e) if cmd::is_interrupted(&e) => return Err(e),
         Err(_) => bail!("release workflow failed: https://github.com/{REPO}/actions/runs/{id} — fix and re-run it (gh workflow run release.yml --ref {tag} -f tag={tag} -f dry_run=false), then cargo xtask release --resume; or {undo}"),
     }
+    verify_and_publish(ver, tag, dist).map_err(|e| {
+        if cmd::is_interrupted(&e) {
+            return e;
+        }
+        e.context(format!("{tag}'s workflow run passed but its draft isn't published; once this is fixed, cargo xtask release --resume finishes the release"))
+    })
+}
+
+/// Check the draft the workflow made, then publish it.
+fn verify_and_publish(ver: &Version, tag: &str, dist: &Path) -> Result<()> {
     // CI leaves a draft. Before publishing it, check every asset against
     // the CI-made SHA256SUMS, and the provenance attestation of every file
     // in it (tarballs, .deb, .rpm).

@@ -129,20 +129,11 @@ pub fn run(cmd: &mut Command) -> Result<()> {
 /// Run without output; its exit status. Ctrl-C before it, or during a run
 /// that then failed, is `Interrupted`, never a status to act on.
 pub fn status_quiet(cmd: &mut Command) -> Result<ExitStatus> {
-    check_interrupted()?;
-    let status = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("couldn't start {}", describe(cmd)))?;
-    if !status.success() {
-        check_interrupted()?;
-    }
-    Ok(status)
+    status(cmd.stderr(Stdio::null()))
 }
 
-/// Run with stdout hidden and stderr shown; its exit status (interrupts as
-/// for `status_quiet`).
+/// Run with stdout hidden (stderr as set, shown by default); its exit
+/// status, with interrupts as for `status_quiet`.
 pub fn status(cmd: &mut Command) -> Result<ExitStatus> {
     check_interrupted()?;
     let status = cmd
