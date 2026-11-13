@@ -236,7 +236,12 @@ fn dated_for(job: &Value, h: LimitHit, known: Option<&Value>, now: i64) -> Limit
     // it was sent on (`sent_hit`; a job sent before that was recorded:
     // taken as its own). Any other record after the send is a new limit,
     // even with the same reset time.
-    let own = job["sent_at"].is_null() || job["sent_hit"].as_u64().is_none_or(|k| k == h.key);
+    // (A missing key is an older job; a `null` one was sent with no record
+    // read, so every later record is new.)
+    let own = job["sent_at"].is_null()
+        || job
+            .get("sent_hit")
+            .is_none_or(|k| k.as_u64() == Some(h.key));
     // (Likewise the list's record: one dated before the send is the old
     // limit's.)
     let sent = job["sent_at"].as_i64().unwrap_or(0);
