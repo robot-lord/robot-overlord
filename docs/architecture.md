@@ -260,19 +260,17 @@ hooks. `[session] codex_daemon` (off by default) puts new Codex sessions
 there: launch spec `codex_host = "daemon"`, set only at creation
 (`methods::session_new`), never for the overlord or a session whose flags
 need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
-`--enable`, `--disable` (also as `-cK=V` or `--flag=V`) or `--search` in
-the TUI's own process). So a daemon-mode pane can't be given
+`--enable`, `--disable` or `--search`, in any of their spellings (`-cK=V`,
+`--config=V`, …), in the TUI's own process). So a daemon-mode pane can't be given
 `-c check_for_update_on_startup=false` (the overlord's) and, like an
 in-pane session, can open on Codex's update prompt. `spec_args` adds
 `--no-daemon` for every other Codex session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
-  environment of whatever started the daemon, not the session's. (A daemon
-  a pane's TUI started has that pane's `TMUX` / `TMUX_PANE` (seen in its
-  own environment), expected to reach its commands and MCP servers. Its
-  hooks still go by thread: a daemon-mode pane has no `RLORD_SESSION_ID`,
-  so the hook client takes the gate path.) So a daemon-mode pane gets no
+  environment of whatever started the daemon, not the session's (even when
+  a pane's TUI started it: a daemon-mode pane has no `RLORD_SESSION_ID`,
+  so the hook client takes the gate path). So a daemon-mode pane gets no
   `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
   on), and rlord starts the daemon itself (`codex app-server daemon
   start`, `RLORD_SESSION_ID`, `TMUX` and `TMUX_PANE` removed) before such
@@ -327,8 +325,9 @@ in-pane session, can open on Codex's update prompt. `spec_args` adds
   environment, as its hooks do, not the pane's; not checked live). Started
   by rlord, that is the rlord daemon's environment less its session
   variables: the shell that first started rlord, or the launchd/systemd
-  service's. A daemon something else started (a plain `codex`, an
-  editor) keeps that one's.
+  service's. A daemon a daemon-mode pane's TUI started has that pane's
+  `TMUX` / `TMUX_PANE` (seen in its own environment). A daemon something
+  else started (a plain `codex`, an editor) keeps that one's.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
   socket. rlord's client only reads (`thread/read`, `thread/turns/list`)

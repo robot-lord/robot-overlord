@@ -113,6 +113,10 @@ its "After launch (tracked)" list:
   runs without the Codex folder the pane adds to PATH, so a Codex that
   needs it (npm under nvm, rlord as a service) fails there and the pane
   starts the daemon.
+- When no daemon could be started, Codex runs a daemon-mode session's
+  turn in the pane, but rlord still treats it as on the daemon: a pane
+  killed mid-turn ends the turn, `thread_state` can't be asked, and the
+  rollout's unclosed turn keeps it "working" (`pane_gone_turn_running`).
 - `starts_on_codex_daemon` for `session.new` ignores the overlord role and
   `codex::needs_embedded`, so rlord starts (and waits on) Codex's daemon
   for sessions that will run in the pane; `session_new` has the real test.

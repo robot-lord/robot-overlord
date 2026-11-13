@@ -339,8 +339,8 @@ thread), and "needs you" from a sub-agent's prompt.
 
 The server's commands and MCP servers run with the environment of
 whatever started the server, not your session's pane. That is usually
-rlord. When rlord's start fails or doesn't happen (a session reopened
-after its tmux session died, say), the pane's Codex starts the server,
+rlord. When no server is running and rlord couldn't start one (for
+example, Codex isn't on rlord's own PATH), the pane's Codex starts it,
 with that pane's environment, tmux variables included. A server started
 earlier by your own `codex` keeps that one's. Not checked live yet.
 
