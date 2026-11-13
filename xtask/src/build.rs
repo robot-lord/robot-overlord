@@ -46,6 +46,7 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
     let dist = dist.canonicalize()?;
     let ver = version::current()?;
     let stage = TempDir::new_in(Path::new("target"), "pack")?;
+    let target_dir = target_dir()?;
 
     match platform {
         Platform::Macos => {
@@ -53,7 +54,7 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
                 bail!("build macOS on Apple Silicon");
             }
             cargo_build("build", MAC)?;
-            let bin = binary(MAC);
+            let bin = binary(&target_dir, MAC);
             // The linker ad-hoc signs, but post-link strip can leave the
             // signature stale; re-sign so the binary runs on other Macs
             // (arm64 refuses unsigned code).
@@ -72,7 +73,7 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
         Platform::Linux => {
             for t in LINUX {
                 cargo_build("zigbuild", t)?;
-                pack(&ver, t, &binary(t), stage.path(), &dist)?;
+                pack(&ver, t, &binary(&target_dir, t), stage.path(), &dist)?;
             }
             // Distro packages: the same static binaries, requiring tmux.
             let out_dir = format!("{}/", dist.display());
@@ -110,10 +111,19 @@ fn cargo_build(subcommand: &str, target: Target) -> Result<()> {
     ]))
 }
 
-fn binary(target: Target) -> PathBuf {
-    Path::new("target")
-        .join(target.triple)
-        .join("release/rlord")
+/// Where cargo builds, as it resolves it (CARGO_TARGET_DIR,
+/// `build.target-dir`), so the files packed are the ones just built.
+fn target_dir() -> Result<PathBuf> {
+    let json = cmd::output(cargo().args(["metadata", "--format-version", "1", "--no-deps"]))?;
+    let meta: serde_json::Value = serde_json::from_str(&json).context("reading cargo metadata")?;
+    meta["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
+        .context("cargo metadata has no target_directory")
+}
+
+fn binary(target_dir: &Path, target: Target) -> PathBuf {
+    target_dir.join(target.triple).join("release/rlord")
 }
 
 /// One tarball per target: the binary, the installer, the licenses.

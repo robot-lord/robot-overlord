@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -22,6 +24,43 @@ pub fn usage<T>(msg: impl Into<String>) -> Result<T> {
     Err(Usage(msg.into()).into())
 }
 
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: libc::c_int) {
+    // Only an atomic store: anything more isn't safe in a signal handler.
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Make Ctrl-C stop xtask by unwinding, not by killing it, so the `Drop`
+/// guards run (scratch folders removed, manifests put back) as the
+/// scripts' `trap … EXIT` did. The child running at the time gets the
+/// SIGINT itself and exits; `run`, `output` and `sleep` then return an
+/// error.
+pub fn on_interrupt() {
+    let handler = on_sigint as extern "C" fn(libc::c_int);
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+    }
+}
+
+fn check_interrupted() -> Result<()> {
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        bail!("interrupted");
+    }
+    Ok(())
+}
+
+/// Wait, unless Ctrl-C is pressed.
+pub fn sleep(d: Duration) -> Result<()> {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        check_interrupted()?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    check_interrupted()
+}
+
 fn describe(cmd: &Command) -> String {
     let mut s = cmd.get_program().to_string_lossy().into_owned();
     for a in cmd.get_args().take(3) {
@@ -36,6 +75,7 @@ pub fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
+    check_interrupted()?;
     if !status.success() {
         bail!("{} failed ({status})", describe(cmd));
     }
@@ -56,6 +96,7 @@ pub fn output(cmd: &mut Command) -> Result<String> {
         .stderr(Stdio::inherit())
         .output()
         .with_context(|| format!("couldn't start {}", describe(cmd)))?;
+    check_interrupted()?;
     if !out.status.success() {
         bail!("{} failed ({})", describe(cmd), out.status);
     }

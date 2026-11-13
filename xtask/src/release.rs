@@ -338,14 +338,14 @@ fn release_from_ci(ver: &Version, head: &str, resume: bool, dist: &Path) -> Resu
             break;
         }
         if attempt < 59 {
-            std::thread::sleep(Duration::from_secs(5));
+            cmd::sleep(Duration::from_secs(5))?;
         }
     }
     let Some(run) = run else {
         // Race: the run may register just after we give up. Cancel anything
         // queued for the tag so a late run can't publish over a --local
         // release.
-        std::thread::sleep(Duration::from_secs(10));
+        cmd::sleep(Duration::from_secs(10))?;
         let mut not_cancelled = Vec::new();
         for late in find_runs().map_err(unknown)? {
             if late.status != "completed" {

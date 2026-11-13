@@ -29,8 +29,7 @@ done, in this order (decided with the user, 2026-11-12):
        `scripts/dev-daemon.sh` still hold some logic in bash; the
        stable paths of `cargo xtask release` (CI, `--resume`, `--local`,
        tap, crates.io) have unit tests and a dry run but get their first
-       real run at 1.0.0; `cargo xtask publish-crates` doesn't put the
-       manifests back on Ctrl-C (`git checkout -- crates/*/Cargo.toml`).
+       real run at 1.0.0.
 5. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
        a scheduled resume, a "limited" list filter, Option-S on the keys
        screen.

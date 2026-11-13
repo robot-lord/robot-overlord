@@ -34,6 +34,7 @@ usage: cargo xtask <task>
       the release workflow's checks (run by .github/workflows/release.yml)";
 
 fn main() -> ExitCode {
+    cmd::on_interrupt();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Every task works from the repository root; a path argument is still
     // read from where the command was run.

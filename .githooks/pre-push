@@ -10,12 +10,12 @@ zero=0000000000000000000000000000000000000000
 # a stale ref only makes the check more lenient — CI has the final say).
 git rev-parse -q --verify origin/main >/dev/null || exit 0
 [[ -f xtask/src/bump.rs ]] || exit 0  # branch predates the check
-# Not --locked (unlike the `cargo xtask` alias): a stale Cargo.lock must
-# reach the check, which reports it. If xtask can't build (no cargo,
-# offline on a fresh clone), skip: CI checks.
-cargo build -q --package xtask 2>/dev/null ||
-  { echo "pre-push: couldn't build xtask; version bump not checked (CI will)" >&2; exit 0; }
 
+# Built once, on the first branch that needs checking. Not --locked
+# (unlike the `cargo xtask` alias): a stale Cargo.lock must reach the
+# check, which reports it. If xtask can't build (no cargo, offline on a
+# fresh clone), skip: CI checks.
+built=0
 status=0
 while read -r local_ref local_sha remote_ref _remote_sha; do
   [[ "$local_sha" == "$zero" ]] && continue              # branch deletion
@@ -24,6 +24,11 @@ while read -r local_ref local_sha remote_ref _remote_sha; do
   # Nothing beyond main yet (e.g. a fresh branch): nothing to check.
   [[ -z "$(git rev-list -n1 "origin/main..$local_sha")" ]] && continue
   echo "pre-push: checking version bump for ${local_ref#refs/heads/}" >&2
+  if [[ $built == 0 ]]; then
+    cargo build -q --package xtask 2>/dev/null ||
+      { echo "pre-push: couldn't build xtask; version bump not checked (CI will)" >&2; exit 0; }
+    built=1
+  fi
   cargo run -q --package xtask -- check-version-bump origin/main "$local_sha" >&2 || status=1
 done
 exit $status

@@ -5,9 +5,8 @@
 //!
 //! The workspace's internal dependencies are path-only in git (so PRs don't
 //! have to bump them); crates.io needs a version on each, so this pins them
-//! to the release version for the publish and puts the files back after.
-//! (If it is interrupted, put them back with
-//! `git checkout -- crates/*/Cargo.toml`.)
+//! to the release version for the publish and puts the files back after,
+//! also on Ctrl-C (`cmd::on_interrupt`).
 
 use anyhow::{bail, Context, Result};
 

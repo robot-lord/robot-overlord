@@ -67,6 +67,18 @@ impl Version {
         if nums.len() != 3 || pre.is_some_and(|p| p.is_empty()) {
             bail!("{s:?} is not a version (X.Y.Z or X.Y.Z-dev.N)");
         }
+        // No leading zeros (as semver says), so two versions that compare
+        // equal are also the same text.
+        let leading_zero =
+            |n: &str| n.len() > 1 && n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit());
+        if nums
+            .iter()
+            .copied()
+            .chain(pre.into_iter().flat_map(|p| p.split('.')))
+            .any(leading_zero)
+        {
+            bail!("{s:?} is not a version (a number has a leading zero)");
+        }
         let mut parsed = [0u64; 3];
         for (slot, n) in parsed.iter_mut().zip(&nums) {
             *slot = n
@@ -243,7 +255,16 @@ mod tests {
         assert!(!v("1.2.3").is_dev());
         assert!(v("0.23.0-dev.8").is_dev());
         assert_eq!(v("0.23.0-dev.8").to_string(), "0.23.0-dev.8");
-        for bad in ["", "1.2", "1.2.3.4", "1.x.3", "1.2.3-", "v1.2.3"] {
+        for bad in [
+            "",
+            "1.2",
+            "1.2.3.4",
+            "1.x.3",
+            "1.2.3-",
+            "v1.2.3",
+            "01.2.3",
+            "1.2.3-dev.01",
+        ] {
             assert!(Version::parse(bad).is_err(), "{bad}");
         }
     }
