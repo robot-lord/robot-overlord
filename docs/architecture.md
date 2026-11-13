@@ -263,8 +263,8 @@ need the pane (`codex::needs_embedded`: Codex runs any `-c` / `--config`,
 `--enable`, `--disable` or `--search`, joined forms included, in the TUI's
 own process). So a daemon-mode pane can't be given
 `-c check_for_update_on_startup=false` (the overlord's) and, like an
-in-pane session, can open on Codex's update prompt. `spec_args` adds `--no-daemon` for every other Codex
-session. The rest is
+in-pane session, can open on Codex's update prompt. `spec_args` adds
+`--no-daemon` for every other Codex session. The rest is
 `daemon/src/codex_daemon.rs`, with the client in `agents::codex_server`:
 
 - **Hooks go by thread, not pane.** The daemon's hooks carry the
@@ -272,7 +272,9 @@ session. The rest is
   daemon-mode pane gets no `RLORD_SESSION_ID` (unset, so a daemon its TUI
   starts can't pass one on), and rlord starts the daemon itself
   (`codex app-server daemon start`, `RLORD_SESSION_ID`, `TMUX` and
-  `TMUX_PANE` removed) before such a pane when none runs. `rlord hook emit
+  `TMUX_PANE` removed) before such a pane when none runs (asked at most
+  once a minute, never failing the launch: if it's skipped or fails, the
+  pane's TUI starts it with the pane's environment). `rlord hook emit
   codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
   daemon-mode session's bound thread, and the folder of each still waiting
@@ -311,7 +313,8 @@ session. The rest is
   whole turn for a thread the gate doesn't list (after `/clear` or `/new`). A
   usage-limit resume doesn't wait on the status (it sends while working
   too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
-  or the transcript past the limit), so its gap is the same moment. Escape in either client interrupts.
+  or the transcript past the limit), so its gap is the same moment.
+  Escape in either client interrupts.
 - **Commands and MCP servers run in the daemon** (expected to get its
   environment, as its hooks do, not the pane's; not checked live). Started
   by rlord, that is the rlord daemon's environment less its session

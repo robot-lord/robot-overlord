@@ -333,11 +333,15 @@ its version when it differs from your `codex` (it updates itself).
 Stopping or archiving such a session interrupts its running turn first,
 and says so if it wouldn't stop. The overlord, and a session launched
 with flags that need the pane (`-c` / `--config`, `--enable`,
-`--disable`, `--search`), stay in the pane. Not followed yet on the server: `/clear`
+`--disable`, `--search`), stay in the pane. Not followed yet on the
+server: `/clear`
 or `/new` in the session (it stays on its first thread), and "needs you"
 from a sub-agent's prompt. Its commands and MCP servers run in the
-background server, with the environment that server was started with
-rather than the pane's. Daemon mode has been
+background server, so they should get that server's environment rather
+than the pane's (not checked yet; with rlord as a launchd or systemd
+service, that leaves out what your shell's rc files set). Starting a turn
+on the same conversation from another Codex client can race a message
+rlord sends it. Daemon mode has been
 checked on macOS only so far.
 
 Not yet: importing Codex

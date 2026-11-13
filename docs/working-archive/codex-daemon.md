@@ -103,3 +103,7 @@ its "After launch (tracked)" list:
 - A daemon started by hand from an in-pane rlord session's pane would pass
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.
+- A daemon started by a daemon-mode pane's own TUI (rlord's
+  `ensure_running` asks at most once a minute and never fails the launch)
+  carries that pane's `TMUX` / `TMUX_PANE` into every thread's hooks,
+  commands and MCP servers.
