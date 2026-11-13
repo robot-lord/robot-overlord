@@ -20,7 +20,7 @@ CI for releases).
   `depends_on "tmux"`), `.deb` / `.rpm` (depend on tmux), `SHA256SUMS`.
   crates.io prepared, published once the owner has a token. AUR: later.
 - Release channels:
-  - **stable** `X.Y.Z`: every platform, `release.sh` on main.
+  - **stable** `X.Y.Z`: every platform, built in Actions on the tag `release.sh` pushes.
   - **dev** `X.Y.Z-dev.N`: macOS only, a GitHub pre-release; what ordinary
     PRs ship. `[update] channel = "dev"` makes `rlord update` take the
     newest release of either kind.

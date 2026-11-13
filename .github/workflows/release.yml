@@ -1,0 +1,146 @@
+# Stable releases (X.Y.Z) are built here, so anyone can see how the binaries
+# were made. scripts/release.sh pushes the tag, waits for this run, then
+# updates the Homebrew tap and crates.io locally. Dev builds (X.Y.Z-dev.N)
+# are not built here: release.sh builds them on the maintainer's Mac.
+#
+# The build commands live in scripts/build-release.sh, shared with the local
+# fallback (scripts/release.sh --local).
+name: release
+on:
+  push:
+    # Whole-ref match: -dev tags don't trigger.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z). Empty builds the selected branch.
+        type: string
+        default: ''
+      dry_run:
+        description: Build and test everything; upload workflow artifacts only, no GitHub Release.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # A tag push always publishes; a manual run publishes only if asked.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+  REF: ${{ inputs.tag || github.ref }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: scripts/build-release.sh macos dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-macos
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # zig from ziglang.org, checksum-pinned (no third-party setup action).
+      - name: Install zig
+        run: |
+          f=zig-x86_64-linux-$ZIG_VERSION
+          curl -fsSLo "$RUNNER_TEMP/$f.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$f.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/$f.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$f.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$f" >> "$GITHUB_PATH"
+      - name: Install packaging tools
+        run: cargo install --locked cargo-zigbuild@0.24.1 cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - run: scripts/build-release.sh linux dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux
+          path: dist/*
+          if-no-files-found: error
+
+  # Install each build with get.sh on several distros, natively per arch.
+  smoke-linux:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-linux
+          path: dist
+      # get.sh verifies the tarball against SHA256SUMS.
+      - run: cd dist && sha256sum -- * > SHA256SUMS
+      - run: scripts/smoke-linux.sh dist ubuntu:22.04 ubuntu:24.04 debian:12 fedora:41 amazonlinux:2023
+
+  release:
+    needs: [build-macos, build-linux, smoke-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # the GitHub Release
+      id-token: write # provenance attestations
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Check version and assets
+        run: |
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag=v$ver
+          if [[ $DRY_RUN == false ]]; then
+            [[ $ver != *-* ]] || { echo "::error::$tag is not a stable version"; exit 1; }
+            [[ "${REF#refs/tags/}" == "$tag" ]] || { echo "::error::ref $REF doesn't match Cargo.toml version $tag"; exit 1; }
+          fi
+          for f in rlord-$tag-{aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl}.tar.gz; do
+            [[ -f dist/$f ]] || { echo "::error::missing $f"; exit 1; }
+          done
+          ls dist/*.deb dist/*.rpm >/dev/null
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ env.TAG }}
+          path: dist/*
+      - if: env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --generate-notes

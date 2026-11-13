@@ -72,25 +72,43 @@ Every PR bumps `[workspace.package] version` in `Cargo.toml` (and commits
 - **Stable releases** `X.Y.Z`: a PR that drops the suffix. Released for every
   platform, with the Homebrew formula and crates.io.
 
-Releases are built on an Apple Silicon Mac, no CI: after the PR merges,
+After a PR merges, release from the merged `main`:
 
 ```sh
 git fetch origin && git checkout --detach origin/main
 scripts/release.sh
 ```
 
-For a stable release that cross-compiles the Linux builds (`cargo zigbuild`),
-packages `.deb`/`.rpm`, smoke-tests them in Docker on Ubuntu, Debian, Fedora
-and Amazon Linux (`scripts/smoke-linux.sh`), uploads everything with
-`SHA256SUMS`, updates the Homebrew tap (`scripts/update-tap.sh`) and publishes
-to crates.io (`scripts/publish-crates.sh`). One-time setup for that:
+- **Dev builds** are built on the maintainer's Apple Silicon Mac and uploaded
+  as a pre-release.
+- **Stable releases** are built in GitHub Actions
+  (`.github/workflows/release.yml`), so anyone can see how the binaries were
+  made. `release.sh` pushes the `vX.Y.Z` tag, which starts the workflow: a
+  macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
+  the static musl builds (`cargo zigbuild`) and packages `.deb`/`.rpm`; both
+  architectures are smoke-tested in Docker on Ubuntu, Debian, Fedora and
+  Amazon Linux (`scripts/smoke-linux.sh`); the last job writes `SHA256SUMS`,
+  attests build provenance and creates the release. `release.sh` waits for
+  the run, checks the assets against `SHA256SUMS`, then does what still needs
+  local credentials: the Homebrew tap (`scripts/update-tap.sh`) and crates.io
+  (`scripts/publish-crates.sh`, once the repo is public).
+
+The build commands live in `scripts/build-release.sh`, which CI and local
+builds share. A manual run of the workflow with `dry_run` (the default for
+manual runs) builds and tests everything and uploads only workflow
+artifacts.
+
+If Actions is down, build a stable release locally instead: delete the tag
+if it was pushed, then `scripts/release.sh --local`. One-time setup for that:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 brew install zig colima docker && colima start
 cargo install --locked cargo-zigbuild cargo-deb cargo-generate-rpm
-cargo login   # crates.io token
 ```
+
+Stable releases also need push access to `robot-lord/homebrew-tap` and
+`cargo login` (crates.io token).
 
 ## License
 

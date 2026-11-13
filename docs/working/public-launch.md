@@ -12,7 +12,10 @@ done, in this order (decided with the user, 2026-11-12):
        non-root user is still open (below, "Before flipping it public").
 2. [x] rlord's own pastes no longer count as the user's prompts
        (0.23.0-dev.5; `daemon/src/own.rs`).
-3. [ ] CI release builds: macOS on a Mac runner, Linux on a Linux runner.
+3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
+       (0.23.0-dev.6; `.github/workflows/release.yml`, shared
+       `scripts/build-release.sh`). Tap and crates.io stay local; moving
+       their tokens into repo secrets is owed.
 4. [ ] Limits completion: Codex and OpenCode limit detection, cancelling
        a scheduled resume, a "limited" list filter, Option-S on the keys
        screen.
