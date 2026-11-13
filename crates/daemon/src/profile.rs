@@ -66,12 +66,23 @@ pub fn sync(db: &Db, cfg: &Config, s: &Session, refresh: bool) -> Result<()> {
 
 /// `⌥d list · ⌥o overlord`: the configured keys rlord actually bound.
 fn hints(cfg: &Config) -> String {
-    [(&cfg.tmux.back, "list"), (&cfg.tmux.overlord, "overlord")]
-        .into_iter()
-        .filter(|(k, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
-        .map(|(k, what)| format!("{} {what}", tmux::key_label(k)))
-        .collect::<Vec<_>>()
-        .join(" · ")
+    [
+        (&cfg.tmux.back, "home", "list"),
+        (&cfg.tmux.overlord, "overlord", "overlord"),
+    ]
+    .into_iter()
+    .filter(|(k, _, _)| !k.trim().is_empty() && tmux::nav_key_bound(k))
+    // Each a status-line range: a click does what the key does
+    // (`tmux::bind_nav_keys`).
+    .map(|(k, verb, what)| {
+        let hint = format!("{} {what}", tmux::key_label(k));
+        match tmux::hint_range(verb) {
+            Some(r) => format!("#[range=user|{r}]{hint}#[norange]"),
+            None => hint,
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 pub fn sync_ref(d: &Daemon, r: &str) {
