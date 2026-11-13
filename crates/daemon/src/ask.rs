@@ -68,8 +68,7 @@ pub fn send(d: &Daemon, text: &str) -> Result<Value> {
             // DB), then a fresh look.
             let _session = d.sessions.lock(&id);
             let s = d.db().overlord()?.context("overlord vanished")?;
-            let running = s.status != Status::Stopped
-                && s.tmux_session.as_deref().is_some_and(tmux::has_session);
+            let running = crate::overlord::running(&s);
             let s = if !started || !running {
                 // Start it (or pick up fresh flags) once; again only if it
                 // stopped while we waited, and not over and over (an agent

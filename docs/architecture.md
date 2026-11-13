@@ -297,7 +297,7 @@ hooks and `discover` keep the stored status to themselves.
   seen, `limits::dated`);
   kv `limits` holds the current ones, each until a minute past its
   reset (`limits::held`), and rows carry `limit` (`limits::annotate`:
-  "resuming soon" once the reset time has passed).
+  `reset` once the reset time has passed, shown as "limit reset").
 - **Nothing else is typed into a limited session** (it would only get
   another limit reply). `send_to_session` refuses it ("stopped on a usage
   limit until …"); with `when_idle`, and for a message already queued,

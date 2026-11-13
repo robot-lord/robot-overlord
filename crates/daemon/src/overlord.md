@@ -137,7 +137,8 @@ in a line each, most recent first. Say them in those words.
 ## Usage limits
 
 A session whose agent stopped on a usage limit shows `limited`, with
-`limited_until` (when the limit resets). It does nothing until then.
+`limited_until` (when the limit resets). It does nothing until then;
+`limit_reset` means it reset just now and comes back within a minute.
 "Pick these up when the limit resets", "resume them at 3": call
 `resume_after_limit` (no `sessions`: every limited one). rlord then sends
 each one a short message once its limit has reset, unless someone used the

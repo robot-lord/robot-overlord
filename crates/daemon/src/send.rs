@@ -170,11 +170,18 @@ fn refusal(s: &Session, limited: Option<i64>) -> Option<String> {
         return Some(format!("{} is archived", s.name));
     }
     if let Some(t) = limited {
-        return Some(format!(
-            "{} is stopped on a usage limit until {}",
-            s.name,
-            crate::limits::until(t, now_ms())
-        ));
+        return Some(if t > now_ms() {
+            format!(
+                "{} is stopped on a usage limit until {}",
+                s.name,
+                rlord_core::timefmt::clock(t)
+            )
+        } else {
+            format!(
+                "{}'s usage limit reset just now: try again in a minute",
+                s.name
+            )
+        });
     }
     match s.status {
         Status::Stopped => Some(format!(
@@ -217,14 +224,11 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str) -> Result<Typed>
         overlay: overlay.as_deref(),
         draft: true,
     };
-    // Noted before the paste (the prompt's stamp can come before Enter
-    // returns), so the prompt it makes isn't taken for the user's.
-    let prev = crate::limits::before_typing(d, s);
-    let r = type_into(&s.id, &pane, text, &checks);
-    if !matches!(r, Ok(Typed::Done)) {
-        crate::limits::typing_failed(d, &s.id, prev);
-    }
-    r
+    // A prompt of the user's it will type over is kept first (the resume
+    // job's takeover check; rlord's own typing is told apart from the
+    // event written after it).
+    crate::limits::before_typing(d, s);
+    type_into(&s.id, &pane, text, &checks)
 }
 
 /// `session.send {ref, text, when_idle}`.
@@ -585,8 +589,11 @@ mod tests {
         let now = 100_000;
         let mut s = session(Status::Idle, "");
         s.last_state_change_at = Some(0);
-        let why = refusal(&s, Some(now + 60_000)).unwrap();
+        let why = refusal(&s, Some(now_ms() + 60_000)).unwrap();
         assert!(why.contains("stopped on a usage limit until"), "{why}");
+        // Past its reset, held for the margin: said so, not a past time.
+        let why = refusal(&s, Some(now_ms() - 1_000)).unwrap();
+        assert!(why.contains("reset just now"), "{why}");
         // A queued message waits for the reset, then goes as usual.
         assert_eq!(next(Some(&s), Some(now + 60_000), now), Next::Wait);
         assert_eq!(next(Some(&s), None, now), Next::Deliver);

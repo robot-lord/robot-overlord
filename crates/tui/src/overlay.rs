@@ -170,6 +170,7 @@ impl View {
             limit,
             rlord_daemon::recall::fresh_label(&o["conversations"]),
         ) {
+            (Some(_), _) if o["limit"]["reset"] == true => "usage limit reset just now".into(),
             (Some(until), _) => format!("out of usage until {until}: switch to another"),
             (None, Some(fresh)) => fresh,
             (None, None) => String::new(),

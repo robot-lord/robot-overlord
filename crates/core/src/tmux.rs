@@ -1211,9 +1211,8 @@ pub fn bind_nav_keys(
 
 /// Undo rlord's status click (`bind_nav_keys` with mouse on), and only
 /// rlord's: a click the user bound themselves, in root or in their
-/// profile's table, is left as it is. Root gets tmux's default back; the
-/// profile table (no fallback to root) loses rlord's. Best effort: no
-/// server, nothing to undo.
+/// profile's table, is left as it is. Either table gets tmux's default
+/// back. Best effort: no server, nothing to undo.
 fn reset_status_click() {
     for table in ["root", PROFILE_TABLE] {
         let bound = run(&["list-keys", "-T", table, STATUS_CLICK]).unwrap_or_default();
@@ -1221,13 +1220,11 @@ fn reset_status_click() {
         if !ours {
             continue;
         }
-        if table == "root" {
-            let mut args = vec!["bind-key", "-T", "root", STATUS_CLICK];
-            args.extend(STATUS_CLICK_DEFAULT.split(' '));
-            let _ = run(&args);
-        } else {
-            let _ = run(&["unbind-key", "-T", table, STATUS_CLICK]);
-        }
+        // (Both tables: the profile's doesn't fall back to root, so an
+        // unbound key there would leave no status click at all.)
+        let mut args = vec!["bind-key", "-T", table, STATUS_CLICK];
+        args.extend(STATUS_CLICK_DEFAULT.split(' '));
+        let _ = run(&args);
     }
 }
 
@@ -1590,8 +1587,9 @@ mod tests {
             let root = run(&["list-keys", "-T", "root", STATUS_CLICK]).unwrap();
             assert!(!root.contains("rlord"), "{root}");
             assert!(root.contains("switch-client -t ="), "{root}");
-            let mine = run(&["list-keys", "-T", PROFILE_TABLE, STATUS_CLICK]).unwrap_or_default();
+            let mine = run(&["list-keys", "-T", PROFILE_TABLE, STATUS_CLICK]).unwrap();
             assert!(!mine.contains(" nav "), "{mine}");
+            assert!(mine.contains("switch-client -t ="), "{mine}");
         };
         bind_nav_keys("/bin/rl'x", &[("M-d", "home")], false).unwrap();
         restored();

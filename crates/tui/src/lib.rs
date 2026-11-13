@@ -2433,6 +2433,15 @@ fn state_chip(s: &Value, full: bool) -> Span<'static> {
         return theme::status_chip(s["status"].as_str().unwrap_or("-"));
     };
     let resume = if l["resume"] == true { " ↻" } else { "" };
+    // Its reset time passed: held a minute more.
+    if l["reset"] == true {
+        let text = match (full, resume.is_empty()) {
+            (true, false) => "◷ limit reset · resuming".to_string(),
+            (true, true) => "◷ limit reset just now".to_string(),
+            (false, _) => format!("◷ reset{resume}"),
+        };
+        return Span::styled(text, Style::default().fg(theme::yellow()));
+    }
     let text = if full {
         format!(
             "◷ limited until {until}{}",

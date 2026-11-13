@@ -545,8 +545,7 @@ fn keep_overlord_up(d: &Daemon, last: &mut Option<Instant>) -> Result<()> {
     let Some(o) = found else {
         return Ok(()); // no overlord set up, or none with it on
     };
-    let up =
-        o.status != Status::Stopped && o.tmux_session.as_deref().is_some_and(tmux::has_session);
+    let up = crate::overlord::running(&o);
     if up || last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
         return Ok(());
     }

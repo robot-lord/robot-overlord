@@ -510,23 +510,10 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
         ));
     }
     // `continue_conversation`'s checks first, so a switch that can't
-    // carry on is never made: its agent installed (else it couldn't
-    // start), the conversation's transcript still there, between turns.
-    if let Some(why) = rlord_core::agents::install::missing(Agent::named(&p.o.agent)?) {
-        bail!("{why}");
-    }
+    // carry on is never made.
     let before = d.db().resolve_ref(&p.o.id)?;
-    if transcript_of(&d.db(), &before, &conv).is_none() {
-        bail!("that conversation's transcript is no longer on disk");
-    }
-    if !matches!(
-        before.status,
-        Status::Idle | Status::WaitingInput | Status::Stopped
-    ) {
-        bail!("the {agent} overlord is busy: continue it once its turn is over");
-    }
-    let source = d.db().transcript_source(&before.id)?;
-    let was_running = running(&before);
+    can_continue(&d.db(), &before, &conv)?;
+    let was_running = overlord::running(&before);
     // Made active without starting it: `continue_conversation` then starts
     // (or restarts) it once, onto that conversation.
     let activate = |id: &str, from: String| -> Result<()> {
@@ -541,19 +528,14 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
         Ok(v) => v,
         Err(e) => {
             // Back as it was: the user's overlord active again, and this
-            // one on its own conversation, stopped if it was.
+            // one stopped if it was (`continue_conversation` already put
+            // it back on its own conversation).
             let undo = || -> Result<()> {
                 {
                     let _session = d.sessions.lock(&before.id);
                     let db = d.db();
-                    if let Some(prev) = before.agent_session.as_deref() {
-                        db.set_agent_session(&before.id, prev, &before.agent_session_trust)?;
-                    }
-                    if let Some(src) = source.as_deref() {
-                        db.upsert_transcript_source(&before.id, src)?;
-                    }
                     let now = db.resolve_ref(&before.id)?;
-                    if !was_running && running(&now) {
+                    if !was_running && overlord::running(&now) {
                         crate::methods::session_stop(&db, &json!({"ref": before.id}))?;
                     }
                 }
@@ -571,12 +553,22 @@ fn continue_elsewhere(d: &Daemon, id: &str) -> Result<Option<Value>> {
     Ok(Some(v))
 }
 
-/// Its pane is up (not stopped, its tmux session there).
-fn running(s: &Session) -> bool {
-    s.status != Status::Stopped
-        && s.tmux_session
-            .as_deref()
-            .is_some_and(rlord_core::tmux::has_session)
+/// Whether overlord `o` can go back to conversation `conv` now: its
+/// agent installed, between turns, the transcript still on disk (where).
+fn can_continue(db: &Db, o: &Session, conv: &str) -> Result<PathBuf> {
+    if let Some(why) = rlord_core::agents::install::missing(Agent::named(&o.agent)?) {
+        bail!("{why}");
+    }
+    if !matches!(
+        o.status,
+        Status::Idle | Status::WaitingInput | Status::Stopped
+    ) {
+        bail!(
+            "the {} overlord is busy: continue it once its turn is over",
+            o.agent
+        );
+    }
+    transcript_of(db, o, conv).context("that conversation's transcript is no longer on disk")
 }
 
 /// `overlord.continue {id}`: go back to an earlier conversation. The
@@ -597,15 +589,46 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
     let _session = d.lock_overlord();
     let (o, _, earlier) = load(d)?;
     let c = find(&earlier, params["id"].as_str().unwrap_or(""))?;
-    if !matches!(
-        o.status,
-        Status::Idle | Status::WaitingInput | Status::Stopped
-    ) {
-        bail!("the overlord is busy: continue it once its turn is over");
-    }
     let db = d.db();
-    let path = transcript_of(&db, &o, &c.id)
-        .context("that conversation's transcript is no longer on disk")?;
+    let path = can_continue(&db, &o, &c.id)?;
+    // Onto the conversation, then exactly one restart: `ensure` restarts
+    // it when it isn't running (stopped, or its pane is gone) and leaves a
+    // running one alone, which is restarted here.
+    let source = db.transcript_source(&o.id)?;
+    // (The agent wrote it: it is there to resume.)
+    db.set_agent_session(&o.id, &c.id, "hook")?;
+    db.upsert_transcript_source(&o.id, &path.to_string_lossy())?;
+    let running = overlord::running(&db.resolve_ref(&o.id)?);
+    let started = overlord::ensure(&db, &d.config(), &json!({})).and_then(|v| {
+        if running {
+            crate::methods::session_restart(&db, &json!({"ref": o.id}))
+        } else {
+            Ok(v)
+        }
+    });
+    let v = match started {
+        Ok(v) => v,
+        Err(e) => {
+            // Back on the conversation it had, and up again if it was.
+            let undo = || -> Result<()> {
+                if let Some(prev) = o.agent_session.as_deref() {
+                    db.set_agent_session(&o.id, prev, &o.agent_session_trust)?;
+                }
+                if let Some(src) = source.as_deref() {
+                    db.upsert_transcript_source(&o.id, src)?;
+                }
+                if running && !overlord::running(&db.resolve_ref(&o.id)?) {
+                    overlord::ensure_session(&db, &d.config(), &o.id)?;
+                }
+                Ok(())
+            };
+            if let Err(u) = undo() {
+                tracing::warn!(error = %u, "undoing a failed continue");
+            }
+            return Err(e);
+        }
+    };
+    // Only now that it is on it: the conversation changed.
     let now = now_ms();
     db.insert_event(
         &o.id,
@@ -613,20 +636,7 @@ pub fn continue_conversation(d: &Daemon, params: &Value) -> Result<Value> {
         "fresh_conversation",
         &json!({"from": o.agent_session, "to": c.id, "reason": "continued"}).to_string(),
     )?;
-    // (The agent wrote it: it is there to resume.)
-    db.set_agent_session(&o.id, &c.id, "hook")?;
-    db.upsert_transcript_source(&o.id, &path.to_string_lossy())?;
     overlord::set_fresh_at(&db, &o.id, now)?;
-    // Exactly one restart onto the conversation: `ensure` restarts it when
-    // it isn't running (stopped, or its pane is gone) and leaves a running
-    // one alone, which is restarted here.
-    let running = running(&db.resolve_ref(&o.id)?);
-    let v = overlord::ensure(&db, &d.config(), &json!({}))?;
-    let v = if running {
-        crate::methods::session_restart(&db, &json!({"ref": o.id}))?
-    } else {
-        v
-    };
     Ok(json!({"continued": c.id, "session": v}))
 }
 

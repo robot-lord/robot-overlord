@@ -2019,6 +2019,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             truncate(get("name"), 23),
             // Stopped on a usage limit: that, and until when.
             match s["limit"]["until"].as_str() {
+                Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
                 Some(until) => truncate(&format!("till {until}"), 16),
                 None => rlord_core::types::Status::label_of(get("status")).to_string(),
             },

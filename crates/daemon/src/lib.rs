@@ -161,9 +161,12 @@ impl Daemon {
     /// depends on it: the global keys and each session's key hints.
     pub(crate) fn reload_config(&self) -> Result<Value> {
         let mut cfg = Config::load()?;
-        // (Not in the file: the `rlord` that opened the list set it.)
-        cfg.tmux.profile_env = self.config().tmux.profile_env.clone();
-        *self.config.write().expect("config lock") = Arc::new(cfg);
+        // (Not in the file: the `rlord` that opened the list set it. Kept
+        // under the same lock as the swap, so a concurrent set isn't lost.)
+        self.update_config(|c| {
+            cfg.tmux.profile_env = c.tmux.profile_env.take();
+            *c = cfg;
+        });
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
