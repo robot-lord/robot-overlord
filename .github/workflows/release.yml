@@ -29,8 +29,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # A tag push always publishes; a manual run publishes only if asked.
-  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+  # A tag push publishes; a manual run only when dry_run is off. Anything
+  # else is a dry run.
+  DRY_RUN: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && 'true' || 'false' }}
   REF: ${{ inputs.tag || github.ref }}
   CARGO_TERM_COLOR: always
 
