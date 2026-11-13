@@ -1,0 +1,197 @@
+# Stable releases (X.Y.Z) are built here, so anyone can see how the binaries
+# were made. scripts/release.sh pushes the tag, waits for this run, then
+# updates the Homebrew tap and crates.io locally. Dev builds (X.Y.Z-dev.N)
+# are not built here: release.sh builds them on the maintainer's Mac.
+#
+# The build commands live in scripts/build-release.sh, shared with the local
+# fallback (scripts/release.sh --local). No build cache: release binaries are
+# built from scratch so a poisoned cache can't reach them.
+name: release
+# scripts/release.sh finds a release's run by this title: "release vX.Y.Z",
+# with " (dry run)" on runs that publish nothing.
+run-name: release ${{ inputs.tag || github.ref_name }}${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && ' (dry run)' || '' }}
+on:
+  push:
+    # Whole-ref match: -dev tags don't trigger.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (vX.Y.Z). Empty builds the selected branch.
+        type: string
+        default: ''
+      dry_run:
+        description: Build and test everything; upload workflow artifacts only, no GitHub Release.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # A tag push publishes; a manual run only when dry_run is off. Anything
+  # else is a dry run.
+  DRY_RUN: ${{ !((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && 'true' || 'false' }}
+  REF: ${{ inputs.tag || github.ref }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail fast, before any build: only merged code, a stable version, the
+  # tag matching Cargo.toml. A dry run reports these as warnings. A tag
+  # whose release already exists (made by scripts/release.sh --local) is
+  # skipped, so a local fallback never races this workflow.
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+          fetch-depth: 0
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag=v$ver
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          problems=()
+          git merge-base --is-ancestor HEAD origin/main || problems+=("$(git rev-parse HEAD) is not on origin/main")
+          [[ $ver != *-* ]] || problems+=("$tag is not a stable version")
+          [[ "${REF#refs/tags/}" == "$tag" ]] || problems+=("ref $REF doesn't match Cargo.toml version $tag")
+          for p in "${problems[@]}"; do
+            if [[ $DRY_RUN == true ]]; then echo "::warning::$p (dry run: continuing)"; else echo "::error::$p"; fi
+          done
+          [[ $DRY_RUN == true || ${#problems[@]} == 0 ]] || exit 1
+          # Published releases only (drafts aren't visible to this token).
+          if [[ $DRY_RUN == false ]] && gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag is already published (scripts/release.sh --local); nothing to build"
+            echo skip=true >> "$GITHUB_OUTPUT"
+          fi
+
+  build-macos:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: scripts/build-release.sh macos dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-macos
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.14.1
+      ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+      # zig from ziglang.org, checksum-pinned (no third-party setup action).
+      - name: Install zig
+        run: |
+          f=zig-x86_64-linux-$ZIG_VERSION
+          curl -fsSLo "$RUNNER_TEMP/$f.tar.xz" "https://ziglang.org/download/$ZIG_VERSION/$f.tar.xz"
+          echo "$ZIG_SHA256  $RUNNER_TEMP/$f.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$f.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$f" >> "$GITHUB_PATH"
+      - name: Install packaging tools
+        run: cargo install --locked cargo-zigbuild@0.24.1 cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - run: scripts/build-release.sh linux dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux
+          path: dist/*
+          if-no-files-found: error
+
+  # Install each build with get.sh on several distros, natively per arch.
+  smoke-linux:
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-linux
+          path: dist
+      # get.sh verifies the tarball against SHA256SUMS.
+      - run: cd dist && sha256sum -- * > SHA256SUMS
+      - run: scripts/smoke-linux.sh dist ubuntu:22.04 ubuntu:24.04 debian:12 fedora:41 amazonlinux:2023
+
+  release:
+    needs: [preflight, build-macos, build-linux, smoke-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # the GitHub Release
+      id-token: write # provenance attestations
+      attestations: write
+    # No checkout: the tag comes from preflight, the files from the builds.
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Check version and assets
+        run: |
+          tag=$TAG ver=${TAG#v}
+          for f in rlord-$tag-{aarch64-apple-darwin,x86_64-unknown-linux-musl,aarch64-unknown-linux-musl}.tar.gz; do
+            [[ -f dist/$f ]] || { echo "::error::missing $f"; exit 1; }
+          done
+          # Distro packages, one per arch (they write a pre-release '-' as '~').
+          rv=${ver//-/"~"}
+          for f in rlord_${rv}-1_{amd64,arm64}.deb rlord-$rv-1.{x86_64,aarch64}.rpm; do
+            [[ -f dist/$f ]] || { echo "::error::missing $f"; ls dist; exit 1; }
+          done
+      - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - if: env.DRY_RUN == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ env.TAG }}
+          path: dist/*
+      # A draft: scripts/release.sh publishes it after checking checksums
+      # and provenance. A draft left by an earlier failed run is replaced.
+      - if: env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null) == true ]]; then
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --generate-notes
