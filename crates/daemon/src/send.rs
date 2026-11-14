@@ -198,13 +198,13 @@ fn user_active(clients: &[tmux::Client], t: &str, overlay: Option<&str>, now_s: 
 }
 
 /// Text typed in the agent's input and not sent (`screen` captured with
-/// attributes). Claude's input box (`remote::input_text`) and Codex's
-/// composer (`codex::draft`) are read; OpenCode's prompt box isn't yet.
+/// attributes): Claude's input box (`remote::input_text`), Codex's
+/// composer (`codex::draft`), OpenCode's prompt box (`opencode::draft`).
 fn draft(agent: Agent, screen: &str) -> Option<String> {
     match agent {
         Agent::Claude => crate::remote::input_text(screen),
         Agent::Codex => rlord_core::agents::codex::draft(screen),
-        Agent::OpenCode => None,
+        Agent::OpenCode => rlord_core::agents::opencode::draft(screen),
     }
 }
 

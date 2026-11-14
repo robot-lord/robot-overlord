@@ -494,6 +494,101 @@ fn dialog_line(line: &str) -> bool {
         || has("⇆ select", "enter confirm")
 }
 
+/// What is typed in OpenCode's prompt box (`screen` captured with
+/// attributes, `capture-pane -e`), if anything. The box is the lowest run
+/// of `┃` lines closed by a `╹` line; its last line is the agent and model
+/// (`Build · <model> <provider>`), the lines above it the input. The
+/// placeholder ("Ask anything… \"Fix broken tests\"") is drawn in the
+/// theme's muted colour, the same as the `·` on the agent line, and typed
+/// text isn't, so whatever is in that colour is dropped (checked at
+/// OpenCode 2.2.7).
+pub fn draft(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let plain = |l: &str| super::strip_ansi(l).trim().to_string();
+    let close = lines.iter().rposition(|l| plain(l).starts_with('╹'))?;
+    let top = lines[..close]
+        .iter()
+        .rposition(|l| !plain(l).starts_with('┃'))
+        .map_or(0, |i| i + 1);
+    let (agent_line, input) = lines[top..close].split_last()?;
+    let muted = fg_of(agent_line, '·');
+    let text: Vec<String> = input
+        .iter()
+        .map(|l| {
+            let kept: String = colored(l)
+                .into_iter()
+                .filter(|(_, fg)| muted.is_none() || fg != &muted)
+                .map(|(c, _)| c)
+                .collect();
+            kept.trim_start_matches(|c: char| c.is_whitespace() || c == '┃')
+                .trim_end()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    let text = text.join("\n");
+    let text = text.trim_matches([' ', '\u{a0}']);
+    // A placeholder in a capture without attributes.
+    (!text.is_empty() && !text.starts_with("Ask anything")).then(|| text.to_string())
+}
+
+/// The foreground colour (its SGR parameters, `None` for the default) the
+/// first `c` in `line` is drawn in.
+fn fg_of(line: &str, c: char) -> Option<String> {
+    colored(line).into_iter().find(|(ch, _)| *ch == c)?.1
+}
+
+/// Each character of `s` with its foreground colour (its SGR parameters,
+/// `None` for the default).
+fn colored(s: &str) -> Vec<(char, Option<String>)> {
+    let mut out = Vec::new();
+    let mut fg: Option<String> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            let mut params = String::new();
+            let mut fin = ' ';
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    fin = c;
+                    break;
+                }
+                params.push(c);
+            }
+            if fin != 'm' {
+                continue;
+            }
+            let ps: Vec<&str> = params.split(';').collect();
+            let mut i = 0;
+            while i < ps.len() {
+                match ps[i] {
+                    "" | "0" | "39" => fg = None,
+                    "38" | "48" | "58" => {
+                        let n = match ps.get(i + 1) {
+                            Some(&"5") => 2,
+                            Some(&"2") => 4,
+                            _ => 0,
+                        };
+                        if ps[i] == "38" {
+                            fg = Some(ps[i..(i + 1 + n).min(ps.len())].join(";"));
+                        }
+                        i += n;
+                    }
+                    p if p.len() == 2 && (p.starts_with('3') || p.starts_with('9')) => {
+                        fg = Some(p.to_string());
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            out.push((c, fg.clone()));
+        }
+    }
+    out
+}
+
 /// A sub-agent file for OpenCode (`.opencode/agents/<name>.md`): when to
 /// use it, then its instructions as the body. It gets the folder's rules
 /// (`overlord_config`), like the overlord.
@@ -1613,6 +1708,35 @@ pub(crate) mod tests {
         );
         assert!(!dialog_shown(&draft));
         assert!(crate::agents::Agent::OpenCode.at_prompt(idle));
+    }
+
+    /// OpenCode 2.2.7's prompt box as `capture-pane -e` draws it.
+    fn oc_box(input: &str) -> String {
+        let b = "\x1b[38;2;92;156;245m┃\x1b[38;2;255;255;255m\x1b[48;2;30;30;30m";
+        format!(
+            "  \x1b[38;2;92;156;245m┃\x1b[0m earlier prompt in the history\n\n\
+             {b}                    \x1b[48;2;10;10;10m\n\
+             {b}  {input}\x1b[38;2;255;255;255m          \x1b[48;2;10;10;10m\n\
+             {b}                    \x1b[48;2;10;10;10m\n\
+             {b}  \x1b[38;2;92;156;245mBuild\x1b[38;2;255;255;255m \x1b[38;2;128;128;128m·\x1b[38;2;255;255;255m \x1b[38;2;238;238;238mDeepSeek V4.1 Flash Free\x1b[38;2;255;255;255m \x1b[38;2;128;128;128mOpenCode\x1b[48;2;10;10;10m\n\
+             \x1b[38;2;92;156;245m╹\x1b[38;2;30;30;30m▀▀▀▀▀▀▀▀\n\
+             \x1b[38;2;128;128;128m~/proj\x1b[38;2;255;255;255m  \x1b[38;2;238;238;238mshift+tab \x1b[38;2;128;128;128magents\n"
+        )
+    }
+
+    #[test]
+    fn a_draft_in_the_prompt_box() {
+        let empty = oc_box("\x1b[38;2;128;128;128mAsk anything… \"Fix broken tests\"");
+        assert_eq!(draft(&empty), None);
+        let typed = oc_box("\x1b[38;2;238;238;238mhalf a draft here");
+        assert_eq!(draft(&typed).as_deref(), Some("half a draft here"));
+        // Without attributes the placeholder is known by its words.
+        let plain = |s: &str| crate::agents::strip_ansi(s);
+        assert_eq!(draft(&plain(&empty)), None);
+        assert_eq!(draft(&plain(&typed)).as_deref(), Some("half a draft here"));
+        // No box on screen (a dialog over it, another program): nothing.
+        assert_eq!(draft("$ ls\n"), None);
+        assert_eq!(draft(""), None);
     }
 
     pub(crate) const SES: &str = "ses_e3192cfeeffeUElN5gOL3f5nhg";
