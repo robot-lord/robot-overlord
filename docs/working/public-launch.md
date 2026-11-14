@@ -53,8 +53,18 @@ done, in this order (decided with the user, 2026-11-12):
        Codex API-key quota, OpenCode `provider.chatgpt-limit` and
        `provider.quota`, and other providers' 429s (OpenCode retries
        those as throttles).
-6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
-       narrower helper tools.
+6. [x] Robustness (0.23.0-dev.19): a draft in OpenCode's prompt box
+       holds a send (`opencode::draft`, from a live capture of 2.2.7:
+       the placeholder is in the muted colour of the agent line's `·`);
+       `session.subagents` reads only sub-agent transcripts at most 4 MB
+       behind and queues the rest on the warm-up; rlord's subagents on
+       OpenCode are allowed only the rlord tools their definition lists
+       (`agents.<name>.permissions` in `opencode.json`, everything else
+       asks). Codex's subagents still inherit the overlord's tools: a
+       `.codex/agents/*.toml` can't narrow MCP tools (see "After
+       launch"). Not checked live: a draft held in a running OpenCode
+       session through rlord, and a subagent asking for an unlisted tool
+       on OpenCode.
 7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
@@ -142,10 +152,9 @@ Dependabot version updates, grouped weekly.
 
 - Codex daemon mode: "After launch (owed, daemon mode)" in
   `docs/working-archive/codex-daemon.md` (one issue each).
-- OpenCode: a draft in the input box doesn't hold a `send_to_session`.
 - Switching an existing overlord to another agent.
-- Narrower tool lists for Codex/OpenCode overlord subagents.
-- `session.subagents` reads unread sub-agent transcripts in full.
+- Narrower tool lists for Codex overlord subagents (OpenCode's are
+  narrowed since 0.23.0-dev.19).
 - A hooked Codex session whose tmux session is killed stays "working".
 - Codex Remote Control, once Codex makes it official (deferred; see
   `docs/working-archive/codex-daemon.md`).

@@ -356,9 +356,6 @@ and without a model and a restart of a session OpenCode no longer had.
 - Import (`session_v2` has directory, title, model).
 - `send_to_session` types into the pane; `POST …/prompt {delivery:
   queue}` could deliver to a busy OpenCode session without typing.
-- A draft in OpenCode's prompt box isn't detected (Claude's and Codex's
-  are): a send would be added to it. Needs a capture of the box with
-  attributes (its placeholder is drawn differently from typed text).
 - Sub-agent tracking (child sessions: `parent_id`).
 - A question form, checked by hand (a real permission prompt was: see
   "The overlord on OpenCode").
