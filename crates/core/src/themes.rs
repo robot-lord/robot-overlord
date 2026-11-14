@@ -138,7 +138,7 @@ pub const THEMES: &[Palette] = &[
         text: i(236),
         on_accent: i(231),
         accent: i(26),
-        accent_dim: i(67),
+        accent_dim: i(24),
         overlord: i(91),
         green: i(28),
         yellow: i(136),
@@ -226,7 +226,7 @@ pub const THEMES: &[Palette] = &[
         text: h(0x3760bf),
         on_accent: h(0xe1e2e7),
         accent: h(0x2e7de9),
-        accent_dim: h(0x4b76c1),
+        accent_dim: h(0x385fa8),
         overlord: h(0x9854f1),
         green: h(0x587539),
         yellow: h(0x8c6c3e),
@@ -270,7 +270,7 @@ pub const THEMES: &[Palette] = &[
         text: h(0x3c3836),
         on_accent: h(0xfbf1c7),
         accent: h(0x076678),
-        accent_dim: h(0x458588),
+        accent_dim: h(0x3a7578),
         overlord: h(0x8f3f71),
         green: h(0x79740e),
         yellow: h(0xb57614),
@@ -314,7 +314,7 @@ pub const THEMES: &[Palette] = &[
         text: h(0x586e75),
         on_accent: h(0xfdf6e3),
         accent: h(0x268bd2),
-        accent_dim: h(0x4583aa),
+        accent_dim: h(0x2f6f99),
         overlord: h(0x6c71c4),
         green: h(0x859900),
         yellow: h(0xb58900),
@@ -522,6 +522,37 @@ mod tests {
             }
             let l = lum(tint);
             assert!(if p.dark { l < 70 } else { l > 190 }, "{}: {l}", p.name);
+        }
+    }
+
+    /// WCAG contrast ratio of two colours.
+    fn contrast(a: Rgb, b: Rgb) -> f64 {
+        let lum = |c: Rgb| {
+            let (r, g, b) = approx(c);
+            let ch = |v: i32| {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// `accent_dim` labels text (switchable column headers, toolbar
+    /// values): on a light background it must still read as text (WCAG
+    /// AA, 4.5:1), not fade into it.
+    #[test]
+    fn accent_dim_reads_on_light_themes() {
+        for p in THEMES.iter().filter(|p| !p.dark) {
+            let bg = p.bg.expect("light themes paint a background");
+            let c = contrast(p.accent_dim, bg);
+            assert!(c >= 4.5, "{}: accent_dim {c:.2}:1", p.name);
+            assert_ne!(p.accent_dim, p.accent, "{}", p.name);
         }
     }
 

@@ -27,6 +27,11 @@ pub(crate) enum Hit {
     /// A session row / a group, by index.
     Row(usize),
     Group(usize),
+    /// An "↑ n more" / "↓ n more" count on the list's border: select
+    /// this row (a page that way), which scrolls the list.
+    More(usize),
+    /// The same on the group column: select this group.
+    MoreGroups(usize),
     /// A sortable column header: sort by it, or flip the direction if the
     /// list is already sorted by it.
     SortBy(rlord_core::db::SortMode),
@@ -363,6 +368,16 @@ impl App {
                     // As Enter: attach (an archived row says how to open it).
                     return self.do_action(Action::Attach, terminal);
                 }
+            }
+            Hit::More(i) if !right && i < self.sessions.len() => {
+                self.group_focus = false;
+                self.table.select(Some(i));
+                self.preview_soon();
+            }
+            Hit::MoreGroups(i) if !right && i < self.groups.len() => {
+                self.group_focus = true;
+                let cur = self.group_state.selected().unwrap_or(0);
+                self.move_group(i as isize - cur as isize);
             }
             Hit::Group(i) if i < self.groups.len() => {
                 self.group_focus = true;
@@ -1016,6 +1031,17 @@ mod tests {
         assert_eq!(up + shown, 11, "{}", rows.join("\n"));
         let (x, y) = find(&list_half(&rows), "sess-09");
         assert_eq!(app.hits.at(x, y), Some(Hit::Row(10)));
+        // The counts are clickable: a page that way.
+        let (x, y) = find(&list_half(&rows), "↑ ");
+        assert_eq!(app.hits.at(x, y), Some(Hit::More(up.saturating_sub(shown))));
+        app.table.select(Some(0));
+        let rows = drawn_at(&mut app, 150, 12);
+        let (up, shown, _) = more_and_shown(&rows);
+        assert_eq!((up, shown), (0, 5));
+        // Six rows show (the overlord's too); a page down is row 11, past
+        // the end, so the last.
+        let (x, y) = find(&list_half(&rows), "↓ ");
+        assert_eq!(app.hits.at(x, y), Some(Hit::More(10)));
     }
 
     /// Ctrl-J/N and Ctrl-K/P move in the launcher as the arrows do; plain
