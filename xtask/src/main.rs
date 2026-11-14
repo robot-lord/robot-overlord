@@ -8,9 +8,11 @@
 mod build;
 mod bump;
 mod cmd;
+mod demo_wrap;
 mod preflight;
 mod publish;
 mod release;
+mod screenshots;
 mod tap;
 mod version;
 
@@ -32,7 +34,11 @@ usage: cargo xtask <task>
   publish-crates [--dry-run]
       publish a stable release's crates to crates.io
   release-preflight
-      the release workflow's checks (run by .github/workflows/release.yml)";
+      the release workflow's checks (run by .github/workflows/release.yml)
+  screenshots --website DIR [--out DIR]
+      phone-sized screenshots of the demo into the website's public/img
+  demo-wrap COLS
+      wrap the demo's stand-in screens (stdin) to COLS columns";
 
 fn main() -> ExitCode {
     cmd::on_interrupt();
@@ -71,6 +77,8 @@ fn main() -> ExitCode {
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
+        "screenshots" => screenshots::main(rest, &invoked_from),
+        "demo-wrap" => demo_wrap::main(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

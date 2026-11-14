@@ -237,7 +237,10 @@ card always has all three.
 As the list narrows, its columns give way in this order: Project first,
 then Groups (shrinking to a count, `#3`, before it goes), then names
 shrink to their minimum (the time column's header shortens on the way),
-and Usage only at the smallest widths.
+and Usage only at the smallest widths. Under 60 columns (a phone) the
+list is laid out for names instead: Status shows only its symbol, the
+time column only its value (`12m`), and the name takes the rest. The
+groups tab's group column drops its counts there.
 
 Headers that can change read in a quieter blue: the time column (it
 follows the sort) and the Usage column (it follows `U`). The one the list

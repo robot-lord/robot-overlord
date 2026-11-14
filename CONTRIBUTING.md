@@ -51,6 +51,21 @@ demo's PATH exist) and a stand-in `SHELL`: set both in any scratch rlord you
 build yourself, so it can never launch a real agent. `scripts/demo/screenshots.sh DIR` retakes the
 README's images in `docs/images` with [vhs](https://github.com/charmbracelet/vhs).
 
+The website's phone screenshots (`public/img/phone-*.webp` in
+robot-lord/website) come from the same demo:
+
+```sh
+(cd ../website && npm ci && npx playwright install webkit)  # once
+cargo xtask screenshots --website ../website
+```
+
+It starts the demo, opens the list in a 48-column terminal on a scratch
+tmux server (`rlord-shots`), captures the list, the groups tab and the
+overlord's pane with `tmux capture-pane -e`, turns each into an HTML page
+and has Playwright screenshot it as an iPhone 15 would show it. The PNGs,
+captures and pages stay in `target/screenshots`. Needs `tmux`, `cwebp`,
+`sqlite3` and `python3`.
+
 ## Tests
 
 ```sh

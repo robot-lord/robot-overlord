@@ -72,7 +72,17 @@ effort = "medium"
 EOF
 
 B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
-box() { printf '%s\n' "${D}────────────────────────────────────────────────────────────────────────${R}" "> $1" "${D}────────────────────────────────────────────────────────────────────────${R}" "  ${D}? for shortcuts${R}"; }
+# DEMO_COLS: how wide the stand-in agents draw their input box (`cargo
+# xtask screenshots` sets it to the phone width it captures at).
+rule=$(printf '%*s' "${DEMO_COLS:-72}" '' | sed 's/ /─/g')
+box() { printf '%s\n' "${D}${rule}${R}" "> $1" "${D}${rule}${R}" "  ${D}? for shortcuts${R}"; }
+
+# wrap: a screen (stdin) wrapped to DEMO_COLS by `cargo xtask demo-wrap`
+# when `cargo xtask screenshots` runs the demo (it sets DEMO_XTASK);
+# otherwise as written.
+wrap() {
+  if [[ -n ${DEMO_XTASK:-} ]]; then "$DEMO_XTASK" demo-wrap "$((${DEMO_COLS:-72} - 2))"; else cat; fi
+}
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
 # AGENT=codex add …: a Codex session; AGENT=opencode: an OpenCode one.
@@ -83,7 +93,7 @@ add() {
   mkdir -p "$dir"
   printf '%s' "$state" > "$d/states/$name"
   printf '%s\n' "${USAGE:-3 20000}" > "$d/usage/$name"
-  { printf '%s\n\n' "${D}${proj}${R}"; printf '%s\n' "> $prompt" ""; cat; printf '\n'; box ""; } > "$d/screens/$name.txt"
+  { printf '%s\n\n' "${D}${proj}${R}"; printf '%s\n' "> $prompt" ""; wrap; printf '\n'; box ""; } > "$d/screens/$name.txt"
   rlord new --agent "${AGENT:-claude}" --project "$dir" --name "$name" "$prompt" >/dev/null
   # shellcheck disable=SC2086
   rlord tag "$name" $tags >/dev/null
@@ -229,7 +239,7 @@ sql "update sessions set pinned=1 where name='checkout-redesign'"
 
 # The overlord (the stand-in draws its screen).
 printf '%s\n' "5 36000" > "$d/usage/overlord"
-cat > "$d/screens/overlord.txt" <<EOF
+wrap > "$d/screens/overlord.txt" <<EOF
 ${M}${B}◆ overlord${R}
 
 > what's waiting on me?

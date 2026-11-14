@@ -1430,6 +1430,8 @@ impl App {
         // Which columns fit, and how wide: `ListCols::for_width`.
         let ListCols {
             compact,
+            narrow,
+            status_w,
             time_w,
             name_w,
             usage: show_usage,
@@ -1483,14 +1485,18 @@ impl App {
             Cell::from(""),
             Cell::from(""),
             head("Name", arrow_on_name, false),
-            Cell::from("Status"),
-            head(time_label, !arrow_on_name && !arrow_on_usage, true),
+            Cell::from(if narrow { "" } else { "Status" }),
+            head(
+                if narrow { "" } else { time_label },
+                !arrow_on_name && !arrow_on_usage,
+                true,
+            ),
         ];
         let mut widths = vec![
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(name_w),
-            Constraint::Length(13),
+            Constraint::Length(status_w),
             Constraint::Length(time_w),
         ];
         if show_usage {
@@ -1547,7 +1553,14 @@ impl App {
                     Cell::from(Line::from(vec![
                         // Not loaded yet (the daemon's warm-up): say so
                         // rather than show half-known data.
-                        state_chip(s, false),
+                        if narrow {
+                            // The glyph alone (`○`, `●`, `◷`).
+                            let chip = state_chip(s, false);
+                            let glyph: String = chip.content.chars().take(1).collect();
+                            Span::styled(glyph, chip.style)
+                        } else {
+                            state_chip(s, false)
+                        },
                         // Its sub-agents are still loading (warm-up): the
                         // status is known, the agent counts aren't yet.
                         Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
@@ -1652,7 +1665,7 @@ impl App {
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
-            .column_spacing(2)
+            .column_spacing(if narrow { 1 } else { 2 })
             .row_highlight_style(theme::selected())
             .highlight_symbol(Span::styled(
                 theme::SELECT_BAR,
@@ -1727,7 +1740,7 @@ impl App {
         }
         // The headers of the sortable columns: Name and the time column,
         // placed by the same layout the table uses (inside the border and
-        // padding, after the highlight symbol, two cells between columns).
+        // padding, after the highlight symbol, as many cells between columns as it puts).
         let cols_area = Rect::new(
             area.x + 2 + sel_w,
             area.y + 1,
@@ -1736,7 +1749,7 @@ impl App {
         );
         let cols = RLayout::horizontal(widths_for_hits.clone())
             .flex(ratatui::layout::Flex::Start)
-            .spacing(2)
+            .spacing(if narrow { 1 } else { 2 })
             .split(cols_area);
         let (name_x, name_w) = (cols[2].x, cols[2].width);
         let (time_x, time_hw) = (cols[4].x, cols[4].width);
@@ -2684,6 +2697,14 @@ mod list_cols {
     /// one ("Message ▼").
     pub const TIME_W: u16 = 15;
     pub const TIME_W_COMPACT: u16 = 10;
+    /// The Status column: its glyph and label (`○ your turn`).
+    pub const STATUS_W: u16 = 13;
+    /// Under this width (a phone) the list goes narrow: the name gets the
+    /// room, Status shows its glyph alone and the time just its value
+    /// (`12m`). Usage, Groups and Project are left out.
+    pub const NARROW: u16 = 60;
+    pub const STATUS_W_NARROW: u16 = 1;
+    pub const TIME_W_NARROW: u16 = 4;
     /// The highlight symbol's width (drawn left of every row).
     pub fn sel_w() -> u16 {
         crate::theme::SELECT_BAR.chars().count() as u16
@@ -2691,7 +2712,7 @@ mod list_cols {
     /// Everything but the name, Usage and the time column: borders and
     /// padding, the highlight symbol, number, pin, status, 4 gaps.
     pub fn base() -> u16 {
-        2 + 2 + sel_w() + 1 + 1 + 13 + 2 * 4
+        2 + 2 + sel_w() + 1 + 1 + STATUS_W + 2 * 4
     }
     /// What the list needs to show a readable name, Status, the full time
     /// column and Usage: the side layout widens the list to this when its
@@ -2711,6 +2732,10 @@ mod list_cols {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListCols {
     compact: bool,
+    /// Under `NARROW`: Status as its glyph, the time without a header
+    /// label (see `list_cols::NARROW`).
+    narrow: bool,
+    status_w: u16,
     time_w: u16,
     name_w: u16,
     usage: bool,
@@ -2722,6 +2747,20 @@ struct ListCols {
 impl ListCols {
     fn for_width(width: u16) -> Self {
         use list_cols::*;
+        if width < NARROW {
+            // (Its columns 1 apart, not 2.)
+            let fixed = base() - STATUS_W + STATUS_W_NARROW + TIME_W_NARROW - 4;
+            return ListCols {
+                compact: true,
+                narrow: true,
+                status_w: STATUS_W_NARROW,
+                time_w: TIME_W_NARROW,
+                name_w: width.saturating_sub(fixed).max(NAME_MIN),
+                usage: false,
+                tags_w: 0,
+                project: false,
+            };
+        }
         let base = base();
         // The time column's header names its sort; where a readable name
         // wouldn't fit beside it and Usage (under `core_width`), the short
@@ -2750,6 +2789,8 @@ impl ListCols {
         let project = room >= NAME_MAX + 2 + 12;
         ListCols {
             compact,
+            narrow: false,
+            status_w: STATUS_W,
             time_w,
             name_w,
             usage,
