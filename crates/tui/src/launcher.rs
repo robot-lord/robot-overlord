@@ -28,6 +28,8 @@ enum Cmd {
     Switch(&'static str),
     /// Pick the selected session up when its usage limit resets.
     ResumeAfterLimit,
+    /// Call off the selected session's scheduled resume.
+    CancelResume,
 }
 
 /// (name, what it does, command)
@@ -68,6 +70,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         "resume after limit",
         "the selected session carries on when its usage limit resets",
         Cmd::ResumeAfterLimit,
+    ),
+    (
+        "cancel resume",
+        "the selected session no longer carries on when its limit resets",
+        Cmd::CancelResume,
     ),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
     (
@@ -241,6 +248,7 @@ impl App {
             Cmd::Usage(m) => self.set_usage(m),
             Cmd::Switch(agent) => self.switch_overlord(agent),
             Cmd::ResumeAfterLimit => self.resume_after_limit(),
+            Cmd::CancelResume => self.cancel_resume(),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(

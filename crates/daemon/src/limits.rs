@@ -278,6 +278,9 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
 /// sessions stopped on a limit get one; the overlords never (the user
 /// switches to another agent's instead).
 pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
+    if params["cancel"] == true {
+        return cancel(d, params);
+    }
     // What is limited right now, not as of the last tick.
     scan(d)?;
     let limits = limits(d);
@@ -357,6 +360,58 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         "each is sent the message once its limit resets, unless someone touches it first"
     };
     Ok(json!({"scheduled": scheduled, "skipped": skipped, "message": message, "note": note}))
+}
+
+/// `limits.resume {cancel: true, sessions?: [ref]}`: drop the scheduled
+/// resume of each session named, or with none of every session that has
+/// one. The limit itself stays shown; only the send is called off.
+fn cancel(d: &Daemon, params: &Value) -> Result<Value> {
+    let named: Vec<&str> = params["sessions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut skipped = Vec::new();
+    let ids: Vec<(String, String)> = {
+        let db = d.db();
+        if named.is_empty() {
+            db.kv_map(JOBS_KEY)?
+                .keys()
+                .map(|id| {
+                    let name = db
+                        .resolve_ref(id)
+                        .map(|s| s.name)
+                        .unwrap_or_else(|_| id.clone());
+                    (id.clone(), name)
+                })
+                .collect()
+        } else {
+            let mut v = Vec::new();
+            for r in named {
+                match db.resolve_ref(r) {
+                    Ok(s) => v.push((s.id, s.name)),
+                    Err(e) => skipped.push(json!({"session": r, "why": format!("{e:#}")})),
+                }
+            }
+            v
+        }
+    };
+    let now = now_ms();
+    let mut cancelled = Vec::new();
+    for (id, name) in ids {
+        // Its lock: a job running now finishes before it is dropped.
+        let _session = d.sessions.lock(&id);
+        let db = d.db();
+        let mut jobs = db.kv_map(JOBS_KEY)?;
+        if jobs.remove(&id).is_none() {
+            skipped.push(json!({"session": name, "why": "no resume scheduled"}));
+            continue;
+        }
+        db.kv_set_map(JOBS_KEY, &jobs)?;
+        db.insert_event(&id, now, "limit_resume_cancelled", "{}")?;
+        cancelled.push(json!(name));
+    }
+    d.changed();
+    Ok(json!({"cancelled": cancelled, "skipped": skipped}))
 }
 
 /// What to do with a job now.
@@ -869,5 +924,25 @@ mod tests {
             assert!(limits(&d).contains_key("s1"));
             assert!(d.db().kv_map(LIMITS_KEY).unwrap().contains_key("s1"));
         }
+    }
+
+    /// Scheduling a resume, then cancelling it: the job is gone, the
+    /// limit still shows, and cancelling again says there is none.
+    #[test]
+    fn a_scheduled_resume_can_be_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, format!("{}\n", limit_line(99999999999))).unwrap();
+        let d = daemon_with(&path);
+        let r = resume(&d, &json!({"sessions": ["s1"]})).unwrap();
+        assert_eq!(r["scheduled"].as_array().unwrap().len(), 1, "{r}");
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+        let r = resume(&d, &json!({"cancel": true})).unwrap();
+        assert_eq!(r["cancelled"], json!(["web"]), "{r}");
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        assert!(limits(&d).contains_key("s1"));
+        let r = resume(&d, &json!({"sessions": ["web"], "cancel": true})).unwrap();
+        assert_eq!(r["cancelled"], json!([]));
+        assert_eq!(r["skipped"][0]["why"], "no resume scheduled");
     }
 }

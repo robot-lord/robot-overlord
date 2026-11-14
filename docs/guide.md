@@ -423,6 +423,13 @@ alone. If the limit hits again, it waits for the next reset. A scheduled
 resume shows as `↻` next to the time and survives restarting rlord.
 Nothing is resumed unless you ask.
 
+To call a scheduled resume off: right-click the session, "Cancel
+scheduled resume" (or `:cancel resume`), `rlord resume-after-limit
+--cancel [sessions]` (no sessions: every scheduled one), or ask the
+overlord. The session stays limited; it just won't be sent anything.
+`status:limited` in the search box (or `rlord ls status:limited`) lists
+the sessions waiting on a limit.
+
 If it is the overlord's agent that is out of usage, switch to another
 agent's overlord ("An overlord per agent", above): the overlay's top row
 says "out of usage until …" when the active one is limited.
@@ -690,7 +697,8 @@ A session's status means one thing: **working**; **needs you** (blocked
 mid-turn on a permission prompt or a question, until you answer); **your
 turn** (it finished; the next prompt is yours); **stopped**. Filter with
 `status:needs`, `status:turn`, `status:working`. (A session stopped on a
-usage limit shows that instead: see "Usage limits".) Run `rlord install-hooks`
+usage limit shows that instead, and `status:limited` lists those: see
+"Usage limits".) Run `rlord install-hooks`
 again after updating rlord: "needs you" clearing when the agent moves on
 uses hooks added later (and Codex asks you to trust changed hooks again).
 
@@ -724,7 +732,9 @@ awkward"), or `:keys`. The key screen lists every key rlord binds and what
 stands in each one's way: another rlord key or your tmux prefix (taken), or
 something rlord takes it from in every session: Claude Code's keys
 (including `~/.claude/keybindings.json`), your shell's line editing, your
-imported tmux bindings (shadows). To change one, press the new key: that
+imported tmux bindings (shadows). The overlay's switch key (Option-S,
+`[tmux] overlord_switch`) is there too, checked against the keys that
+reach the overlay. To change one, press the new key: that
 tests it actually reaches rlord. A key your terminal, macOS or another app
 takes never arrives; Option typing `∂` instead of sending Option-D is caught
 and the terminal setting to fix it named. Saved keys go into `config.toml`

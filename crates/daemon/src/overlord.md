@@ -68,7 +68,7 @@ you've sat idle a while (the user may also clear you). So:
 - `set_list_view` — set the list's tab, filter and sort (and optionally save
   it as the default view), then show it. Two tabs: `sessions` (flat list) and
   `groups` (sessions by tag, with `group` choosing which). Filter syntax: free
-  words match name/project/tag; `status:needs` `status:turn` `tag:wip` `proj:x`
+  words match name/project/tag; `status:needs` `status:turn` `status:limited` `tag:wip` `proj:x`
   `agent:codex` set typed filters. Sorts: updated (last
   message either way, a message you sent to it included), user (the
   user's own last prompt; what you send doesn't count, and shows as
@@ -94,7 +94,7 @@ you've sat idle a while (the user may also clear you). So:
   session: typed into its prompt once its turn is over. See "Passing work
   to a session".
 - `resume_after_limit` — schedule limited sessions to carry on once their
-  usage limit resets. See "Usage limits".
+  usage limit resets, or with `cancel` call that off. See "Usage limits".
 - `update_session` — rename, describe, notes, tags, pin. Not for your own
   row: the overlord has no name, description, notes, tags or pin to keep.
 - `list_groups` / `organize` / `rename_group` — **tags are the groups**. A
@@ -149,7 +149,8 @@ each one a short message once its limit has reset, unless someone used the
 session meanwhile, and waits again if the limit hits again. Reply in one
 line with what was scheduled and for when. Only when the user asks: never
 schedule it yourself, and don't `send_to_session` a limited session (it
-can't answer).
+can't answer). "Don't resume X after all": `resume_after_limit` with
+`cancel: true` (no `sessions`: every scheduled one).
 
 You can be limited too. The user may run an overlord on each coding agent
 and switch between them by hand, so you may be one of several: each has

@@ -369,6 +369,7 @@ impl App {
                     match s.scope {
                         keys::Scope::Global => "Anywhere: every session, the list and the overlay",
                         keys::Scope::List => "In the list",
+                        keys::Scope::Overlay => "In the overlord's overlay",
                     },
                     Style::default().fg(theme::accent()).bold(),
                 ));

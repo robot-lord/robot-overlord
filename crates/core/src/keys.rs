@@ -31,6 +31,9 @@ pub enum Scope {
     Global,
     /// The session list's own keys.
     List,
+    /// Read by the overlord's overlay (not bound in tmux): works only
+    /// while the overlay is open.
+    Overlay,
 }
 
 impl Scope {
@@ -38,6 +41,7 @@ impl Scope {
         match self {
             Scope::Global => "anywhere",
             Scope::List => "list",
+            Scope::Overlay => "overlay",
         }
     }
 }
@@ -110,6 +114,13 @@ pub const SLOTS: &[Slot] = &[
     g("overlord", "open the overlord", true),
     g("next", "next session", true),
     g("prev", "previous session", true),
+    Slot {
+        section: "tmux",
+        field: "overlord_switch",
+        does: "switch to the next agent's overlord",
+        scope: Scope::Overlay,
+        optional: true,
+    },
     l("overlord", "show/hide the overlord"),
     l("new", "new session (ask the overlord)"),
     l("new_manual", "new session (form)"),
@@ -529,9 +540,15 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             continue;
         }
         let text = match (slot.scope, other.scope) {
+            // The overlay and the list are never on screen at once.
+            (Scope::List, Scope::Overlay) | (Scope::Overlay, Scope::List) => continue,
             (a, b) if a == b => format!("{label} already does \"{}\" ({})", other.does, other.id()),
             (Scope::List, Scope::Global) => format!(
                 "{label} is rlord's key to \"{}\" everywhere: tmux takes it before the list sees it",
+                other.does
+            ),
+            (Scope::Overlay, Scope::Global) => format!(
+                "{label} is rlord's key to \"{}\" everywhere: tmux takes it before the overlay sees it",
                 other.does
             ),
             _ => format!(
@@ -556,7 +573,7 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
         );
     }
     if env.prefixes.contains(key) {
-        let level = if slot.scope == Scope::Global {
+        let level = if slot.scope != Scope::List {
             Level::Taken
         } else {
             Level::Note
@@ -581,7 +598,17 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
             add(Level::Taken, why.to_string());
         }
     }
-    if slot.scope != Scope::Global {
+    if slot.scope == Scope::List {
+        return out;
+    }
+    if slot.scope == Scope::Overlay {
+        // Typed into the overlord's input box when it isn't the key.
+        if !key.ctrl && !key.alt {
+            add(
+                Level::Taken,
+                format!("a plain {label} in the overlay would stop you typing it"),
+            );
+        }
         return out;
     }
     if let Some((_, what)) = PANE_ESSENTIAL
@@ -737,6 +764,14 @@ mod tests {
                                            // The two overlord keys match on purpose.
         let lo = slot("keys.overlord").unwrap();
         assert_eq!(lv("M-o", lo), None);
+        // The overlay's switch key (Option-S): its own place.
+        let sw = slot("tmux.overlord_switch").unwrap();
+        assert_eq!(sw.current(&cfg), "M-s");
+        assert_eq!(lv("M-s", sw), None);
+        assert_eq!(lv("M-d", sw), Some(Level::Taken)); // tmux's first
+        assert_eq!(lv("C-a", sw), Some(Level::Taken)); // their prefix
+        assert_eq!(lv("s", sw), Some(Level::Taken)); // typed in the overlay
+        assert_eq!(lv("M-s", quit), None); // the list never sees the overlay's keys
     }
 
     #[test]

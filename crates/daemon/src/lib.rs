@@ -456,6 +456,12 @@ impl Daemon {
                 params["interrupt"] = codex_daemon::interrupt(&s).to_json();
             }
         }
+        // `status:limited`: not a stored status (`limits.rs`), so it is
+        // taken out of the query and matched on the annotated rows; any
+        // other statuses asked for alongside it still count (either one).
+        let limited_filter = (method == "session.list")
+            .then(|| take_limited(&mut params))
+            .flatten();
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
@@ -502,6 +508,14 @@ impl Daemon {
                 }
                 remote::annotate(self, &mut rows);
                 limits::annotate(self, &mut rows);
+                if let Some(others) = &limited_filter {
+                    rows.retain(|r| {
+                        !r["limit"].is_null()
+                            || r["status"]
+                                .as_str()
+                                .is_some_and(|s| others.iter().any(|o| o == s))
+                    });
+                }
                 usage::list(self, &params, &mut rows);
                 Ok(Value::Array(rows))
             }
@@ -1078,9 +1092,70 @@ fn drain_spool() -> Result<Vec<Value>> {
     Ok(events)
 }
 
+/// A `session.list` query's `status` naming `limited`: take that status
+/// filter out of the query (the DB doesn't store it) and return the other
+/// statuses it named, to be matched with it after annotating.
+fn take_limited(params: &mut Value) -> Option<Vec<String>> {
+    let st = params.get("status")?.as_array()?;
+    if !st.iter().any(|v| v == "limited") {
+        return None;
+    }
+    let others = st
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|s| *s != "limited")
+        .map(str::to_string)
+        .collect();
+    params["status"] = json!([]);
+    Some(others)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_limited_is_taken_out_of_the_db_query() {
+        let mut p = json!({"status": ["limited", "waiting_input"]});
+        assert_eq!(
+            take_limited(&mut p),
+            Some(vec!["waiting_input".to_string()])
+        );
+        assert_eq!(p["status"], json!([]));
+        let mut p = json!({"status": ["idle"]});
+        assert_eq!(take_limited(&mut p), None);
+        assert_eq!(p["status"], json!(["idle"]));
+        // Nothing limited: the list is empty, not every session.
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        d.db()
+            .insert_session(&rlord_core::db::NewSession {
+                id: "s1",
+                name: "a",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/p",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1000,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        assert_eq!(
+            d.rpc("session.list", json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let rows = d
+            .rpc("session.list", json!({"status": ["limited"]}))
+            .unwrap();
+        assert_eq!(rows, json!([]));
+    }
 
     #[test]
     fn the_read_only_mcp_server_refuses_mutating_tools() {
