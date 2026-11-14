@@ -377,6 +377,21 @@ impl App {
         }
     }
 
+    /// Call off the selected session's scheduled resume (its menu,
+    /// `:cancel resume`).
+    pub(crate) fn cancel_resume(&mut self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        if let Some(v) = self.call("limits.resume", json!({"sessions": [id], "cancel": true})) {
+            self.status_line = match v["skipped"][0]["why"].as_str() {
+                Some(why) => format!("not cancelled: {why}"),
+                None => "resume cancelled: it stays stopped".into(),
+            };
+            self.dirty = true;
+        }
+    }
+
     /// Show `m` in the Usage column (the toolbar, its key, `:usage`), saved
     /// with the daemon so it's kept across restarts, over config `usage`;
     /// None forgets the pick (config `usage` again). Only once saved: if
@@ -2217,7 +2232,7 @@ impl App {
         let prompt = match &self.mode {
             Mode::Normal => None,
             Mode::Filter(b) => Some(format!(
-                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working · tag: · proj:)"
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working|limited · tag: · proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),

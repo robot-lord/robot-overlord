@@ -286,13 +286,16 @@ enum Command {
     /// Pick sessions up when their usage limit resets: each session that
     /// stopped on a usage limit is sent a message ("continue") once the
     /// limit has reset, unless you used it meanwhile. Without sessions:
-    /// every limited one.
+    /// every limited one. `--cancel` calls scheduled resumes off.
     ResumeAfterLimit {
         /// Sessions (id, prefix or name)
         sessions: Vec<String>,
         /// What to send (default: `[limits] resume_message`)
         #[arg(long, short)]
         message: Option<String>,
+        /// Cancel the scheduled resume instead (without sessions: all)
+        #[arg(long, conflicts_with = "message")]
+        cancel: bool,
         #[arg(long)]
         json: bool,
     },
@@ -665,9 +668,13 @@ fn main() -> Result<()> {
         Command::ResumeAfterLimit {
             sessions,
             message,
+            cancel,
             json,
         } => {
             let mut p = json!({});
+            if cancel {
+                p["cancel"] = json!(true);
+            }
             if !sessions.is_empty() {
                 p["sessions"] = json!(sessions);
             }
@@ -678,6 +685,9 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
+            }
+            for s in r["cancelled"].as_array().into_iter().flatten() {
+                println!("{}: resume cancelled", s.as_str().unwrap_or("?"));
             }
             for s in r["scheduled"].as_array().into_iter().flatten() {
                 println!(
@@ -694,7 +704,9 @@ fn main() -> Result<()> {
                     s["why"].as_str().unwrap_or("")
                 );
             }
-            println!("{}", r["note"].as_str().unwrap_or(""));
+            if let Some(n) = r["note"].as_str() {
+                println!("{n}");
+            }
             Ok(())
         }
         Command::Daemon => run_daemon(),

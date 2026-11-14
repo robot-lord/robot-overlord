@@ -34,21 +34,25 @@ done, in this order (decided with the user, 2026-11-12):
        real run at 1.0.0. SIGTERM ends xtask without its cleanup
        (`publish-crates` leaves the manifests pinned); Ctrl-C and SIGHUP
        unwind.
-5. [ ] Limits completion: cancelling a scheduled resume, a "limited"
-       list filter, Option-S on the keys screen. Done: Codex and OpenCode
-       limit detection (0.23.0-dev.11), from their source at Codex
-       0.167.2 and OpenCode 2.2.7 with hand-written fixtures; no real
-       limit was hit for it. Unconfirmed until one is seen (check the
-       first real one against `docs/architecture.md`, "Usage limits"):
-       whether Codex's 429 snapshot carries `resets_at` (its tests send
-       none; rlord then takes the window's reset from an earlier
-       `token_count`, so a limit hit on a session's first request after
-       a restart, with no earlier snapshot in the tail, isn't seen), and
-       whether OpenCode Go's `retry-after` is the time to the limit's
-       reset (OpenCode's own timeline takes it so). Not detected, no
-       reset recorded: Codex API-key quota, OpenCode
-       `provider.chatgpt-limit` and `provider.quota`, and other
-       providers' 429s (OpenCode retries those as throttles).
+5. [x] Limits completion (0.23.0-dev.18): cancelling a scheduled resume
+       (`resume_after_limit` `cancel`, `rlord resume-after-limit
+       --cancel`, the list's menu and `:cancel resume`), a
+       `status:limited` list filter, and Option-S (`[tmux]
+       overlord_switch`) on the keys screen, where it was missing.
+       Codex and OpenCode limit detection (0.23.0-dev.11) came from
+       their source at Codex 0.167.2 and OpenCode 2.2.7 with
+       hand-written fixtures; no real limit was hit for it. Live
+       confirmations still owed (check the first real one against
+       `docs/architecture.md`, "Usage limits"): whether Codex's 429
+       snapshot carries `resets_at` (its tests send none; rlord then
+       takes the window's reset from an earlier `token_count`, so a
+       limit hit on a session's first request after a restart, with no
+       earlier snapshot in the tail, isn't seen), and whether OpenCode
+       Go's `retry-after` is the time to the limit's reset (OpenCode's
+       own timeline takes it so). Not detected, no reset recorded:
+       Codex API-key quota, OpenCode `provider.chatgpt-limit` and
+       `provider.quota`, and other providers' 429s (OpenCode retries
+       those as throttles).
 6. [ ] Robustness: OpenCode draft detection, bounded sub-agent reads,
        narrower helper tools.
 7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control

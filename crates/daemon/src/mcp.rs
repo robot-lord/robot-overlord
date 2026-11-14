@@ -88,7 +88,7 @@ pub fn tools() -> Value {
         tool("list_sessions",
             "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
-                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working tag:x proj:x agent:x filter"),
+                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
                 "sort": sort.clone(),
                 "usage": usage,
@@ -268,11 +268,12 @@ pub fn tools() -> Value {
                 "when_idle": b("Session mid-turn: deliver when its turn is over instead of refusing (default false)"),
             }), &["session", "text"]),
         tool("resume_after_limit",
-            "Pick sessions up when their usage limit resets. A session the agent stopped on a usage limit shows `status: limited` with `limited_until`. This schedules one resume per session: once its limit has reset (plus a minute) the session is sent the message, typed in as send_to_session types, unless it was used since the limit hit (the user typed, or it answered): then it is left alone. If the limit hits again the resume waits for the next reset. Scheduled resumes survive an rlord restart. Only when the user asks; nothing is resumed automatically. Without `sessions`: every session limited right now.",
+            "Pick sessions up when their usage limit resets. A session the agent stopped on a usage limit shows `status: limited` with `limited_until`. This schedules one resume per session: once its limit has reset (plus a minute) the session is sent the message, typed in as send_to_session types, unless it was used since the limit hit (the user typed, or it answered): then it is left alone. If the limit hits again the resume waits for the next reset. Scheduled resumes survive an rlord restart. Only when the user asks; nothing is resumed automatically. Without `sessions`: every session limited right now. With `cancel: true` it calls scheduled resumes off instead (without `sessions`: all of them); the limit stays shown.",
             json!({
                 "sessions": {"type": "array", "items": {"type": "string"},
                              "description": "Sessions (id, id prefix or name). Omit for every limited session."},
                 "message": s("What to send (default: the user's configured resume message, \"continue\")"),
+                "cancel": b("Cancel the scheduled resume instead of scheduling one (default false)"),
             }), &[]),
         tool("session_action",
             "Lifecycle: restart (resumes the conversation), stop (resumable), archive (stop + hide), unarchive.",
@@ -695,7 +696,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         ),
         "resume_after_limit" => {
             let mut p = Map::new();
-            for k in ["sessions", "message"] {
+            for k in ["sessions", "message", "cancel"] {
                 if let Some(v) = args.get(k).filter(|v| !v.is_null()) {
                     p.insert(k.into(), v.clone());
                 }

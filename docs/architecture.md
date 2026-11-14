@@ -435,7 +435,12 @@ hooks and `discover` keep the stored status to themselves.
   never moves `last_user_msg_at` ("Typing into a pane"). The
   record a resume was sent on is kept as `sent_hit` (a hash of its line),
   so it stays the old limit even if nothing gets written after it. The overlords are never
-  resumed this way: the user switches to another agent's.
+  resumed this way: the user switches to another agent's. Cancelling
+  (`limits.resume` with `cancel`) removes the job under the session's
+  lock and logs `limit_resume_cancelled`; the limit itself stays.
+- **`status:limited`** is not a stored status, so `session.list` takes
+  it out of the DB query and keeps the annotated rows with a `limit`
+  (or any other status asked for alongside it).
 
 ## Transcript store (raw conversation data)
 

@@ -248,6 +248,8 @@ pub(crate) enum Pick {
     SwitchOverlord(&'static str),
     /// Pick the session up when its usage limit resets.
     ResumeAfterLimit,
+    /// Call off its scheduled resume.
+    CancelResume,
 }
 
 /// "Switch overlord to Codex", for the agents an overlord runs on.
@@ -595,6 +597,10 @@ impl App {
                 self.resume_after_limit();
                 return Ok(false);
             }
+            Pick::CancelResume => {
+                self.cancel_resume();
+                return Ok(false);
+            }
         };
         // (The menu came from a click: stop and restart ask first; archive
         // asks by itself.)
@@ -705,6 +711,8 @@ impl App {
                     }
                 } else if !s["limit"].is_null() && s["limit"]["resume"] != true {
                     items.push((String::new(), "Resume after limit", Pick::ResumeAfterLimit));
+                } else if s["limit"]["resume"] == true {
+                    items.push((String::new(), "Cancel scheduled resume", Pick::CancelResume));
                 }
             }
         }
@@ -1655,6 +1663,10 @@ mod tests {
         assert!(!picks(&app)
             .iter()
             .any(|(_, p)| *p == Pick::ResumeAfterLimit));
+        assert_eq!(
+            picks(&app).last(),
+            Some(&("Cancel scheduled resume", Pick::CancelResume))
+        );
         app.mode = Mode::Normal;
         let rows = drawn(&mut app);
         find(&rows, "◷ 3:00pm ↻");
