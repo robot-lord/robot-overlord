@@ -274,6 +274,20 @@ fn subagent_parts(text: &str) -> (String, String, String) {
     )
 }
 
+/// The rlord tools a subagent definition's `tools:` line lists
+/// (`mcp__rlord__<tool>`), by rlord name.
+fn subagent_tools(text: &str) -> Vec<&str> {
+    text.strip_prefix("---\n")
+        .and_then(|t| t.split_once("\n---\n"))
+        .and_then(|(head, _)| head.lines().find_map(|l| l.strip_prefix("tools:")))
+        .map(|l| {
+            l.split(',')
+                .filter_map(|t| t.trim().strip_prefix("mcp__rlord__"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Write the overlord's folder (instruction files, each agent's MCP config
 /// and subagents); return the adapter flags `agent` must always be
 /// launched with. Every agent's files are written, whichever runs it: they
@@ -295,15 +309,18 @@ fn write_files(d: &Path, agent: Agent, effort: &str, confirm_sends: bool) -> Res
     }}});
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)?;
     // OpenCode: no flags, the folder's config (see `overlord_config`).
+    // rlord's sub-agents get only the rlord tools their definition lists.
+    let tools: Vec<(&str, Vec<&str>)> = SUBAGENTS
+        .iter()
+        .map(|(f, text)| (f.trim_end_matches(".md"), subagent_tools(text)))
+        .collect();
+    let subagents: Vec<(&str, &[&str])> = tools.iter().map(|(n, t)| (*n, t.as_slice())).collect();
     std::fs::write(
         d.join("opencode.json"),
         serde_json::to_string_pretty(&opencode::overlord_config(
             &bin,
             &socket,
-            &SUBAGENTS
-                .iter()
-                .map(|(f, _)| f.trim_end_matches(".md"))
-                .collect::<Vec<_>>(),
+            &subagents,
             // (The user's own global agents get the folder's rules too.)
             &opencode::user_agents(),
             confirm_sends,
@@ -1203,6 +1220,15 @@ mod tests {
         assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][1], "mcp");
         assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][2], "--overlord");
         assert_eq!(cfg["mcp"]["servers"]["rlord"]["command"][3], "--socket");
+        // rlord-tidy's OpenCode rules allow its own tools only.
+        let tidy = cfg["agents"]["rlord-tidy"]["permissions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tidy[0]["effect"], "ask");
+        assert!(tidy.iter().any(|r| r["action"] == "rlord_triage"));
+        assert!(!tidy.iter().any(|r| r["action"] == "rlord_*"
+            || r["action"] == "rlord_send_to_session"
+            || r["action"] == "read"));
         let mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(d.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["rlord"]["args"][1], "--overlord");
