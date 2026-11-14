@@ -222,6 +222,9 @@ pub fn resume_argv(
 ///   conversation in the folder can run as: OpenCode's built-in ones
 ///   (`build`, `plan`, `general`, `explore`), rlord's sub-agents, and the
 ///   agents the user defined globally (`user_agents`, names only).
+///   rlord's own sub-agents get narrower rules: everything asks, then
+///   only the rlord tools their definition lists (`subagents`: name and
+///   tool names, without the `rlord_` prefix) are allowed.
 ///   OpenCode applies every file's top-level rules first and the
 ///   agent-level ones after, so a user's own global agent rule (an `allow`
 ///   for the shell under `agent.build` or `agent.general`) would otherwise
@@ -233,7 +236,7 @@ pub fn resume_argv(
 pub fn overlord_config(
     rlord_bin: &str,
     socket: &str,
-    subagents: &[&str],
+    subagents: &[(&str, &[&str])],
     user_agents: &[String],
     confirm_sends: bool,
 ) -> Value {
@@ -244,7 +247,7 @@ pub fn overlord_config(
         rule("glob", "*", "allow"),
         rule("grep", "*", "allow"),
     ];
-    rules.extend(subagents.iter().map(|n| rule("subagent", n, "allow")));
+    rules.extend(subagents.iter().map(|(n, _)| rule("subagent", n, "allow")));
     rules.push(rule("rlord_*", "*", "allow"));
     if confirm_sends {
         for t in super::SEND_TOOLS {
@@ -254,11 +257,27 @@ pub fn overlord_config(
     let mut agents = serde_json::Map::new();
     for a in OVERLORD_AGENTS
         .iter()
-        .chain(subagents)
         .map(|a| a.to_string())
         .chain(user_agents.iter().cloned())
     {
         agents.insert(a, serde_json::json!({"permissions": rules}));
+    }
+    // A sub-agent's rules come after the top-level ones: its own `*` ask
+    // overrides `rlord_*` allow, and only its tools are allowed again.
+    for (name, tools) in subagents {
+        let mut own = vec![rule("*", "*", "ask")];
+        let sends: Vec<String> = if confirm_sends {
+            super::SEND_TOOLS.iter().map(|t| t.to_string()).collect()
+        } else {
+            vec![]
+        };
+        own.extend(
+            tools
+                .iter()
+                .filter(|t| !sends.iter().any(|s| s == *t))
+                .map(|t| rule(&format!("rlord_{t}"), "*", "allow")),
+        );
+        agents.insert(name.to_string(), serde_json::json!({"permissions": own}));
     }
     let environment: serde_json::Map<String, Value> = super::MCP_ENV
         .iter()
@@ -1649,8 +1668,8 @@ pub(crate) mod tests {
     #[test]
     fn every_agent_gets_the_rules() {
         let users = vec!["mine".to_string()];
-        let cfg = overlord_config("/bin/rlord", "/s", &["rlord-tidy"], &users, false);
-        for a in ["build", "plan", "general", "explore", "rlord-tidy", "mine"] {
+        let cfg = overlord_config("/bin/rlord", "/s", &[TIDY], &users, false);
+        for a in ["build", "plan", "general", "explore", "mine"] {
             assert_eq!(cfg["agents"][a]["permissions"], cfg["permissions"], "{a}");
         }
         let last = |c: &Value| {
@@ -1951,7 +1970,7 @@ pub(crate) mod tests {
     /// with its tools allowed after everything was set to ask.
     #[test]
     fn overlord_config_allows_only_what_it_names() {
-        let cfg = overlord_config("/bin/rlord", "/run/d.sock", &["rlord-tidy"], &[], false);
+        let cfg = overlord_config("/bin/rlord", "/run/d.sock", &[TIDY], &[], false);
         let server = &cfg["mcp"]["servers"]["rlord"];
         assert_eq!(server["type"], "local");
         assert_eq!(
@@ -1987,11 +2006,22 @@ pub(crate) mod tests {
         assert_eq!(sub.len(), 1);
         assert_eq!(sub[0]["resource"], "rlord-tidy");
         // The same rules at agent level (applied after every file's
-        // top-level rules), for the overlord's agents and rlord's.
-        for a in ["build", "plan", "rlord-tidy"] {
+        // top-level rules), for the overlord's agents.
+        for a in ["build", "plan"] {
             assert_eq!(cfg["agents"][a]["permissions"], cfg["permissions"], "{a}");
         }
+        // rlord's sub-agent: everything asks, then only its own tools.
+        assert_eq!(
+            cfg["agents"]["rlord-tidy"]["permissions"],
+            serde_json::json!([
+                {"action": "*", "resource": "*", "effect": "ask"},
+                {"action": "rlord_triage", "resource": "*", "effect": "allow"},
+                {"action": "rlord_organize", "resource": "*", "effect": "allow"},
+            ])
+        );
     }
+
+    const TIDY: (&str, &[&str]) = ("rlord-tidy", &["triage", "organize"]);
 
     #[test]
     fn a_subagent_file_has_its_description_up_front() {
