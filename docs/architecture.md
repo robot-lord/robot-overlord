@@ -276,8 +276,9 @@ on when the pane closes`).
   no `RLORD_SESSION_ID` (unset, so a daemon its TUI starts can't pass one
   on), and rlord starts the daemon itself (`codex app-server daemon
   start`, `RLORD_SESSION_ID`, `TMUX` and `TMUX_PANE` removed) before such
-  a pane when none runs (asked at most once a minute, never failing the
-  launch; when none runs and rlord didn't start one, the pane's TUI does,
+  a pane when none runs, with Codex's own folder first on `PATH` as the
+  pane has it (not tried again for a minute after a failed start, never
+  failing the launch; when none runs and rlord didn't start one, the pane's TUI does,
   with the pane's environment, or runs the turn in the pane). `rlord hook
   emit codex` without `RLORD_SESSION_ID` reads the gate file
   (`<data>/codex-daemon-threads`, `agents::codex_gate`: each live
@@ -301,7 +302,7 @@ on when the pane closes`).
   hooks say, logged once as `pane_gone_turn_running`.
 - **Fresh restarts don't interrupt**: `session_fresh` is used only for
   the overlord ("Fresh restarts" below), which never runs on the daemon.
-  Used on a daemon-mode session, it would leave the turn running there
+  It refuses a daemon-mode session: it would leave the turn running there
   while a new thread starts.
 - **Stop and archive interrupt first**, before the DB lock: Escape into
   the pane when it is up with no dialog (it interrupts from any client),
@@ -316,12 +317,13 @@ on when the pane closes`).
   into the rlord pane, but the pane's composer reads as idle (`› Ask
   Codex…`, no "esc to interrupt"), so `Agent::at_prompt` alone can't tell.
   Its hooks are matched by thread, so the session turns working and
-  `send_to_session` and held deliveries wait; the gap is the moment before
-  that hook lands (without hooks, before the transcript is read), and the
-  whole turn for a thread the gate doesn't list (after `/clear` or `/new`). A
-  usage-limit resume doesn't wait on the status (it sends while working
-  too); it is dropped once that turn's prompt is seen (`last_user_msg_at`,
-  or the transcript past the limit), so its gap is the same moment.
+  `send_to_session` and held deliveries wait. Typing itself also asks the
+  daemon (`send::type_message`, `codex_daemon::busy_for_send`, half a
+  second per step) and holds back while any turn runs on the thread,
+  waiting on input included (a usage-limit resume too, which doesn't wait
+  on the status). What's left: a daemon that can't be asked (the status
+  decides), and a thread the session isn't bound to (after `/clear` or
+  `/new`).
   Escape in either client interrupts.
 - **The control socket** (`~/.codex/app-server-control/
   app-server-control.sock`) speaks JSON-RPC over WebSocket over the Unix
