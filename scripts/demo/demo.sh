@@ -77,6 +77,27 @@ B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
 rule=$(printf '%*s' "${DEMO_COLS:-72}" '' | sed 's/ /─/g')
 box() { printf '%s\n' "${D}${rule}${R}" "> $1" "${D}${rule}${R}" "  ${D}? for shortcuts${R}"; }
 
+# wrap: stdin's lines wrapped at word breaks to fit DEMO_COLS, each piece
+# indented under the text after its bullet. A line styled as a whole
+# (${D}…${R}) keeps its style on every piece.
+wrap() {
+  python3 -c '
+import re, sys, textwrap
+w = int(sys.argv[1])
+for line in sys.stdin.read().rstrip("\n").split("\n"):
+    m = re.fullmatch(r"(\x1b\[[0-9;]*m)?(.*?)(\x1b\[0m)?", line)
+    pre, body, post = m.group(1) or "", m.group(2), m.group(3) or ""
+    if len(body) <= w or "\x1b" in body:
+        print(line)
+        continue
+    lead = len(body) - len(body.lstrip(" "))
+    rest = body[lead:]
+    hang = 2 if rest[:2] in ("● ", "• ", "✻ ") else 3 if rest[:3] in ("⎿  ", "└ ") else 0
+    for piece in textwrap.wrap(rest, w - lead, subsequent_indent=" " * hang):
+        print(pre + " " * lead + piece + post)
+' "$((${DEMO_COLS:-72} - 2))"
+}
+
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
 # AGENT=codex add …: a Codex session; AGENT=opencode: an OpenCode one.
 # USAGE="TURNS CONTEXT": how far its conversation has got (the stand-in
@@ -86,7 +107,7 @@ add() {
   mkdir -p "$dir"
   printf '%s' "$state" > "$d/states/$name"
   printf '%s\n' "${USAGE:-3 20000}" > "$d/usage/$name"
-  { printf '%s\n\n' "${D}${proj}${R}"; printf '%s\n' "> $prompt" ""; cat; printf '\n'; box ""; } > "$d/screens/$name.txt"
+  { printf '%s\n\n' "${D}${proj}${R}"; printf '%s\n' "> $prompt" ""; wrap; printf '\n'; box ""; } > "$d/screens/$name.txt"
   rlord new --agent "${AGENT:-claude}" --project "$dir" --name "$name" "$prompt" >/dev/null
   # shellcheck disable=SC2086
   rlord tag "$name" $tags >/dev/null

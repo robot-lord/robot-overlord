@@ -235,6 +235,7 @@ fn page(name: &str, ansi: &str) -> String {
          font-family: Menlo, \"DejaVu Sans Mono\", monospace;\n\
          font-size: calc((100vw - 16px) / ({COLS} * 0.6021)); line-height: 1.22; }}\n\
          .b {{ font-weight: bold; }} .d {{ opacity: 0.6; }} .i {{ font-style: italic; }} .u {{ text-decoration: underline; }}\n\
+         .c {{ display: inline-block; width: 1ch; }}\n\
          </style>\n<pre>{body}</pre>\n"
     )
 }
@@ -438,6 +439,13 @@ pub fn ansi_to_html(ansi: &str) -> String {
             '<' => run.push_str("&lt;"),
             '>' => run.push_str("&gt;"),
             c if c.is_control() => {}
+            // One cell each, whatever width the font that has it gives
+            // it (a fallback font may draw `⎿` wider and push the row).
+            c if !c.is_ascii() => {
+                run.push_str("<span class=\"c\">");
+                run.push(c);
+                run.push_str("</span>");
+            }
             c => run.push(c),
         }
     }
@@ -486,6 +494,11 @@ mod tests {
             ansi_to_html("\x1b[2ma\nb\x1b[0m"),
             "<span class=\"d\">a</span>\n<span class=\"d\">b</span>"
         );
+    }
+
+    #[test]
+    fn non_ascii_gets_one_cell() {
+        assert_eq!(ansi_to_html("a⎿"), "a<span class=\"c\">⎿</span>");
     }
 
     #[test]
