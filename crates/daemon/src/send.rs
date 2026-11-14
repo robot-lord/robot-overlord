@@ -260,6 +260,11 @@ fn agent_pane(s: &Session) -> Result<String> {
 /// the last checks (`type_into`). `source`: who sends it.
 pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str, source: Source) -> Result<Typed> {
     let pane = agent_pane(s)?;
+    // On Codex's daemon another client may have started a turn rlord's
+    // status doesn't show: the daemon says.
+    if let Some(why) = crate::codex_daemon::busy_for_send(s) {
+        return Ok(Typed::NotNow(why));
+    }
     let overlay = d
         .overlay
         .lock()

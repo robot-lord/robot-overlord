@@ -32,7 +32,6 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use rlord_core::agents::Agent;
 use rlord_core::config::Config;
 use rlord_core::db::Db;
 use rlord_core::{paths, tmux};
@@ -555,23 +554,20 @@ impl Daemon {
     /// Codex's shared background server. Asked before any lock is taken.
     fn starts_on_codex_daemon(&self, method: &str, params: &Value) -> bool {
         match method {
-            "session.new" => {
-                let cfg = self.config();
-                let agent = params["agent"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                    .unwrap_or(&cfg.session.agent)
-                    .to_string();
-                agent == Agent::Codex.name() && cfg.session.codex_daemon
-            }
+            "session.new" => methods::new_params_on_codex_daemon(&self.config(), params),
             "session.restart" | "ui.goto" => params["ref"]
                 .as_str()
                 .and_then(|r| self.db().resolve_ref(r).ok())
-                // (`ui.goto` starts only a stopped one.)
+                // (`ui.goto` restarts one that is stopped or whose tmux
+                // session is gone, as `ui::goto` does.)
                 .is_some_and(|s| {
                     s.codex_daemon
-                        && (method != "ui.goto" || s.status == rlord_core::types::Status::Stopped)
+                        && (method != "ui.goto"
+                            || s.status == rlord_core::types::Status::Stopped
+                            || !s
+                                .tmux_session
+                                .as_deref()
+                                .is_some_and(rlord_core::tmux::has_session))
                 }),
             _ => false,
         }
