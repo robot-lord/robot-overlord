@@ -163,7 +163,10 @@ lock is released:
   reached), so long archived lists don't re-read files. The worker reloads
   a saved position before reading too. `session.subagents` (every TUI
   selection, MCP `get_session`) follows the same bound for the main
-  transcript. A transcript with no position,
+  transcript and each sub-agent's: a sub-agent transcript with no
+  position or more than 4 MB behind isn't read on the request; the
+  session goes to the warm-up (`Job::Full`, so it shows as loading) and
+  the request answers with the rows as they are. A transcript with no position,
   or more than 4 MB behind, goes to the warm-up worker (`Job::Usage`, its
   own pending set, so it doesn't mark sub-agents loading); the row says
   `usage_loading` meanwhile. Once read it can be queued again; one whose
@@ -769,7 +772,7 @@ prompt, a prompt for anything that writes or runs a command.
 |---|---|---|---|
 | Claude | `--mcp-config <folder>/mcp.json`, `--allowedTools mcp__rlord,Read,Grep,Glob` (with `confirm_sends`: rlord's tools listed without `send_to_session` and `resume_after_limit`) | asks | `.claude/agents/*.md` |
 | Codex | `-c mcp_servers.rlord.{command,args,env_vars}`, `default_tools_approval_mode="approve"` (`codex::overlord_args`) | `-c sandbox_mode="read-only"`, `-c approval_policy="on-request"`, `-c check_for_update_on_startup=false` | `.codex/agents/*.toml` |
-| OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`, rlord's own subagents by name, `rlord_*` allow (last match wins); repeated under `agents.<name>` | `.opencode/agents/*.md` |
+| OpenCode | `<folder>/opencode.json`: `mcp.servers.rlord` (`opencode::overlord_config`); no flags | its `permissions`: `*` asks, then `read`/`glob`/`grep`, rlord's own subagents by name, `rlord_*` allow (last match wins); repeated under `agents.<name>`, except rlord's subagents: `*` asks, then only their own rlord tools | `.opencode/agents/*.md` |
 
 Things that are not visible at the call site:
 
@@ -851,8 +854,10 @@ Things that are not visible at the call site:
   there does it start fresh.
 - Subagent definitions are kept once, in Claude's format (`tidy.md`,
   `import.md`), and converted (`overlord::subagent_parts`). A Codex or
-  OpenCode subagent inherits the overlord's tools: only Claude's file can
-  narrow them. A plain copy goes to `<folder>/subagents/` for an overlord
+  OpenCode subagent inherits the overlord's tools. Claude's file narrows
+  them (`tools:`); OpenCode's are narrowed in the folder's
+  `opencode.json` (`agents.<name>.permissions`: everything asks, then the
+  rlord tools from the `tools:` line are allowed); a Codex one can't be. A plain copy goes to `<folder>/subagents/` for an overlord
   that can't start one.
 
 ### One per agent, one active
@@ -995,8 +1000,9 @@ including when the active one hits a usage limit.
   prompt: see "Another client on the same thread" under "Codex on its
   shared background server".) Sends also hold
   off while the input holds a draft (read with attributes, so a dim
-  placeholder isn't one: Claude's input box, Codex's composer; OpenCode's
-  isn't read yet), within 10s (`SETTLE`) of the last paste into that
+  placeholder isn't one: Claude's input box, Codex's composer, OpenCode's
+  prompt box, whose placeholder is in the muted colour of the `·` on its
+  agent line), within 10s (`SETTLE`) of the last paste into that
   session (checked under the paste guard, so two can't race), and while a
   tmux client attached to it was used in the last 5s (someone typing
   there; not the client the overlord's overlay is open on, where the user

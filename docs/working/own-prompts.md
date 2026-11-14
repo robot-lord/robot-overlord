@@ -41,8 +41,8 @@ owed; it goes away once those are done or dropped.
 - **A marker whose prompt never came** matches the user typing the very
   same text within 10 minutes.
 - **A paste that lands in a draft** doesn't match by hash and counts as
-  the user's. (`type_into` holds off on a draft where it can read one;
-  OpenCode's isn't read yet.)
+  the user's. (`type_into` holds off on a draft where it can read one:
+  Claude's, Codex's and, since 0.23.0-dev.19, OpenCode's.)
 - **Resume jobs in flight across the upgrade** from before 0.23.0-dev.5:
   `last_user_msg_at` may still hold the old daemon's paste time, so a
   job inside its 15-minute watch can end as a takeover. One-time.
