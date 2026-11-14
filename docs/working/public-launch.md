@@ -86,10 +86,9 @@ done, in this order (decided with the user, 2026-11-12):
        passes WCAG AA (4.5:1) against its background, checked by a test.
        Done in 0.23.0-dev.21: phone screenshots on the website, made by
        `cargo xtask screenshots` from the demo fleet (a 48-column
-       terminal rendered by Playwright). Owed: at phone width the list
-       cuts names to 7 letters and the groups tab's session column to
-       one, so the groups shot is made but not on the site; a narrow-width
-       layout for both is a design call.
+       terminal rendered by Playwright). Under 60 columns the list now
+       goes narrow (names first, Status as its glyph, the time as its
+       value) and the groups column drops its counts.
 9. [ ] A fresh-install end-to-end test.
 10. [ ] 1.0.0 stable.
 
@@ -168,7 +167,6 @@ Dependabot version updates, grouped weekly.
     can't narrow MCP tools.
   - OpenCode subagents get `ask` (not `deny`) for tools outside their
     list: `deny` in that format is unconfirmed.
-- Phone-width list and groups tab: names cut to 7 letters (see item 8).
 - A hooked Codex session whose tmux session is killed stays "working".
 - Codex Remote Control, once Codex makes it official (deferred; see
   `docs/working-archive/codex-daemon.md`).

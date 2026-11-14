@@ -524,8 +524,23 @@ impl App {
             .max()
             .unwrap_or(12)
             .clamp(18, 30) as u16;
+        // A phone: the sessions' names come first, so the column is just
+        // wide enough for its labels, without counts (the sessions pane's
+        // title has the selected group's).
+        let narrow = area.width < crate::list_cols::NARROW;
+        let col_w = if narrow {
+            self.groups
+                .iter()
+                .map(|(t, _)| group_label(t).chars().count() as u16 + 8)
+                .max()
+                .unwrap_or(12)
+                .clamp(10, col_w)
+                .min(area.width / 3)
+        } else {
+            col_w
+        };
         let [left, right] =
-            RLayout::horizontal([Constraint::Length(col_w), Constraint::Min(20)]).areas(area);
+            RLayout::horizontal([Constraint::Length(col_w), Constraint::Min(1)]).areas(area);
         let items: Vec<ListItem> = self
             .groups
             .iter()
@@ -546,8 +561,19 @@ impl App {
                         Style::default().fg(theme::yellow()),
                     ),
                     Span::styled(label, style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(format!("{n:>2}"), theme::faint()),
+                    Span::raw(if narrow {
+                        String::new()
+                    } else {
+                        " ".repeat(pad)
+                    }),
+                    Span::styled(
+                        if narrow {
+                            String::new()
+                        } else {
+                            format!("{n:>2}")
+                        },
+                        theme::faint(),
+                    ),
                 ]))
             })
             .collect();

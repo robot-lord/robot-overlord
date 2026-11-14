@@ -1461,8 +1461,11 @@ mod tests {
     /// goes away).
     #[test]
     fn widening_never_narrows_a_name() {
-        let mut last = crate::ListCols::for_width(30);
-        for w in 31..=300u16 {
+        // (Under `NARROW` the list is laid out for a phone instead:
+        // `narrow_list_gives_names_the_room`.)
+        let narrow = crate::list_cols::NARROW;
+        let mut last = crate::ListCols::for_width(narrow);
+        for w in narrow + 1..=300u16 {
             let c = crate::ListCols::for_width(w);
             assert!(c.name_w >= last.name_w, "width {w}: {last:?} then {c:?}");
             assert!(
@@ -1476,6 +1479,67 @@ mod tests {
         let core = crate::list_cols::core_width();
         assert!(crate::ListCols::for_width(core - 1).compact);
         assert!(!crate::ListCols::for_width(core).compact);
+    }
+
+    /// At a phone's width the name gets the room: Status shrinks to its
+    /// glyph, the time to its value, the optional columns go.
+    #[test]
+    fn narrow_list_gives_names_the_room() {
+        let c = crate::ListCols::for_width(48);
+        assert!(c.narrow && !c.usage && !c.project);
+        assert_eq!((c.status_w, c.time_w, c.tags_w), (1, 4, 0));
+        assert_eq!(c.name_w, 31);
+        // Below the cut-off it still widens with the list.
+        let mut last = crate::ListCols::for_width(30);
+        for w in 31..crate::list_cols::NARROW {
+            let c = crate::ListCols::for_width(w);
+            assert!(c.narrow && c.name_w >= last.name_w, "width {w}");
+            last = c;
+        }
+        assert!(!crate::ListCols::for_width(crate::list_cols::NARROW).narrow);
+    }
+
+    /// A phone-sized screen: names readable in the list and in the groups
+    /// tab's sessions.
+    #[test]
+    fn phone_width_names_are_readable() {
+        let mut app = fleet();
+        let names: Vec<String> = app
+            .sessions
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(String::from))
+            .collect();
+        let (w, h) = (48, 40);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let screen =
+            |app: &mut crate::App, term: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+                term.draw(|f| app.draw(f)).unwrap();
+                let buf = term.backend().buffer().clone();
+                (0..h)
+                    .map(|y| {
+                        (0..w)
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+        let list = screen(&mut app, &mut term);
+        for n in names.iter().filter(|n| n.chars().count() <= 20) {
+            assert!(list.contains(n.as_str()), "{n} cut in:\n{list}");
+        }
+        app.switch_tab(crate::groups::Tab::Groups);
+        let groups = screen(&mut app, &mut term);
+        // The selected group's sessions show at least 10 letters of a name.
+        let shown = app
+            .sessions
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .any(|n| {
+                let head: String = n.chars().take(10).collect();
+                head.chars().count() == 10 && groups.contains(&head)
+            });
+        assert!(shown, "{groups}");
     }
 
     /// Headers whose content can be switched read differently: the sorted
