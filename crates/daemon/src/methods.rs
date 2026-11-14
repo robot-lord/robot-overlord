@@ -301,7 +301,6 @@ pub fn set_claude_tui(cfg: &Config) {
     let _ = CLAUDE_TUI.set(cfg.session.claude_tui.clone());
 }
 
-/// A string-array param (missing / wrong type = empty).
 /// Whether a new session runs on Codex's shared background server: Codex
 /// with `[session] codex_daemon` on, but not the overlord (its wiring is
 /// `-c` overrides, which Codex runs only in the pane), nor a session whose
@@ -333,6 +332,7 @@ pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
     )
 }
 
+/// A string-array param (missing / wrong type = empty).
 pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
     params
         .get(key)
