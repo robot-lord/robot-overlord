@@ -78,16 +78,18 @@ done, in this order (decided with the user, 2026-11-12):
          the pane is gone).
        Linux is not a blocker (as in item 1): it is on the "After launch
        (owed, daemon mode)" list in `docs/working-archive/codex-daemon.md`.
-8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
+8. [x] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
        Done in 0.23.0-dev.20: the "↑/↓ n more" counts page the list when
        clicked; the groups tab's group column counts its hidden groups the
        same way (also clickable); `accent_dim` on every light theme now
        passes WCAG AA (4.5:1) against its background, checked by a test.
-       Left: website phone screenshots (robot-lord/website). Needs a
-       design choice (real device frames vs. a narrow-terminal render,
-       which views to show) and a curated demo fleet, not the user's
-       real sessions.
+       Done in 0.23.0-dev.21: phone screenshots on the website, made by
+       `cargo xtask screenshots` from the demo fleet (a 48-column
+       terminal rendered by Playwright). Owed: at phone width the list
+       cuts names to 7 letters and the groups tab's session column to
+       one, so the groups shot is made but not on the site; a narrow-width
+       layout for both is a design call.
 9. [ ] A fresh-install end-to-end test.
 10. [ ] 1.0.0 stable.
 
@@ -161,8 +163,12 @@ Dependabot version updates, grouped weekly.
 - Codex daemon mode: "After launch (owed, daemon mode)" in
   `docs/working-archive/codex-daemon.md` (one issue each).
 - Switching an existing overlord to another agent.
-- Narrower tool lists for Codex overlord subagents (OpenCode's are
-  narrowed since 0.23.0-dev.19).
+- Known gaps, accepted for now (Brandon, 2026-11-14: leave them):
+  - Codex subagents get every overlord tool: a `.codex/agents/*.toml`
+    can't narrow MCP tools.
+  - OpenCode subagents get `ask` (not `deny`) for tools outside their
+    list: `deny` in that format is unconfirmed.
+- Phone-width list and groups tab: names cut to 7 letters (see item 8).
 - A hooked Codex session whose tmux session is killed stays "working".
 - Codex Remote Control, once Codex makes it official (deferred; see
   `docs/working-archive/codex-daemon.md`).

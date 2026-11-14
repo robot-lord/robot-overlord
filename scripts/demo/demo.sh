@@ -72,7 +72,10 @@ effort = "medium"
 EOF
 
 B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
-box() { printf '%s\n' "${D}────────────────────────────────────────────────────────────────────────${R}" "> $1" "${D}────────────────────────────────────────────────────────────────────────${R}" "  ${D}? for shortcuts${R}"; }
+# DEMO_COLS: how wide the stand-in agents draw their input box (`cargo
+# xtask screenshots` sets it to the phone width it captures at).
+rule=$(printf '%*s' "${DEMO_COLS:-72}" '' | sed 's/ /─/g')
+box() { printf '%s\n' "${D}${rule}${R}" "> $1" "${D}${rule}${R}" "  ${D}? for shortcuts${R}"; }
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
 # AGENT=codex add …: a Codex session; AGENT=opencode: an OpenCode one.
@@ -235,18 +238,23 @@ ${M}${B}◆ overlord${R}
 > what's waiting on me?
 
 ● Two sessions are waiting on you:
-  • ${B}billing-webhooks${R}: asks how long failed Stripe events should be
-    retried (3 days, or alert #billing-oncall)
-  • ${B}docs-navigation${R}: the new sidebar is ready; it wants to open a PR
+  • ${B}billing-webhooks${R}: how long to retry
+    failed Stripe events (3 days, or
+    alert #billing-oncall)
+  • ${B}docs-navigation${R}: the new sidebar is
+    ready; it wants to open a PR
 
-> tell docs-navigation to go ahead and open the PR
+> tell docs-navigation to open the PR
 
-● Sent. docs-navigation is pushing the branch.
+● Sent. docs-navigation is pushing the
+  branch.
 
-> start a session on the slow product search page
+> start a session on the slow product
+  search page
 
-● Launched ${B}slow-product-search${R} in acme-web, on its own worktree,
-  tagged web and perf.
+● Launched ${B}slow-product-search${R} in
+  acme-web, on its own worktree, tagged
+  web and perf.
 
 $(box "")
 EOF

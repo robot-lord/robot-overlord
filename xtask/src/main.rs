@@ -11,6 +11,7 @@ mod cmd;
 mod preflight;
 mod publish;
 mod release;
+mod screenshots;
 mod tap;
 mod version;
 
@@ -32,7 +33,9 @@ usage: cargo xtask <task>
   publish-crates [--dry-run]
       publish a stable release's crates to crates.io
   release-preflight
-      the release workflow's checks (run by .github/workflows/release.yml)";
+      the release workflow's checks (run by .github/workflows/release.yml)
+  screenshots --website DIR [--out DIR]
+      phone-sized screenshots of the demo into the website's public/img";
 
 fn main() -> ExitCode {
     cmd::on_interrupt();
@@ -71,6 +74,7 @@ fn main() -> ExitCode {
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
+        "screenshots" => screenshots::main(rest, &invoked_from),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
