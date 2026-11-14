@@ -8,6 +8,7 @@
 mod build;
 mod bump;
 mod cmd;
+mod demo_wrap;
 mod preflight;
 mod publish;
 mod release;
@@ -35,7 +36,9 @@ usage: cargo xtask <task>
   release-preflight
       the release workflow's checks (run by .github/workflows/release.yml)
   screenshots --website DIR [--out DIR]
-      phone-sized screenshots of the demo into the website's public/img";
+      phone-sized screenshots of the demo into the website's public/img
+  demo-wrap COLS
+      wrap the demo's stand-in screens (stdin) to COLS columns";
 
 fn main() -> ExitCode {
     cmd::on_interrupt();
@@ -75,6 +78,7 @@ fn main() -> ExitCode {
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
         "screenshots" => screenshots::main(rest, &invoked_from),
+        "demo-wrap" => demo_wrap::main(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

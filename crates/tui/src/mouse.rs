@@ -1481,6 +1481,29 @@ mod tests {
         assert!(!crate::ListCols::for_width(core).compact);
     }
 
+    /// At a phone's width (columns 1 apart) the sortable headers are
+    /// clickable where they are drawn.
+    #[test]
+    fn narrow_headers_can_be_clicked() {
+        use rlord_core::db::SortMode;
+        let mut app = fleet();
+        let (w, h) = (48, 40);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let (nx, ny) = find(&rows, "Name");
+        assert_eq!(app.hits.at(nx, ny), Some(Hit::SortBy(SortMode::Name)));
+        let row = &rows[ny as usize];
+        let arrow = row.chars().position(|c| c == '▼').unwrap() as u16;
+        assert_eq!(
+            app.hits.at(arrow, ny),
+            Some(Hit::SortBy(SortMode::Activity))
+        );
+    }
+
     /// At a phone's width the name gets the room: Status shrinks to its
     /// glyph, the time to its value, the optional columns go.
     #[test]

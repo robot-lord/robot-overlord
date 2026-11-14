@@ -1740,7 +1740,7 @@ impl App {
         }
         // The headers of the sortable columns: Name and the time column,
         // placed by the same layout the table uses (inside the border and
-        // padding, after the highlight symbol, two cells between columns).
+        // padding, after the highlight symbol, as many cells between columns as it puts).
         let cols_area = Rect::new(
             area.x + 2 + sel_w,
             area.y + 1,
@@ -1749,7 +1749,7 @@ impl App {
         );
         let cols = RLayout::horizontal(widths_for_hits.clone())
             .flex(ratatui::layout::Flex::Start)
-            .spacing(2)
+            .spacing(if narrow { 1 } else { 2 })
             .split(cols_area);
         let (name_x, name_w) = (cols[2].x, cols[2].width);
         let (time_x, time_hw) = (cols[4].x, cols[4].width);

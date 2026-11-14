@@ -77,25 +77,11 @@ B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' Y=$'\e[33m' M=$'\e[35m'
 rule=$(printf '%*s' "${DEMO_COLS:-72}" '' | sed 's/ /─/g')
 box() { printf '%s\n' "${D}${rule}${R}" "> $1" "${D}${rule}${R}" "  ${D}? for shortcuts${R}"; }
 
-# wrap: stdin's lines wrapped at word breaks to fit DEMO_COLS, each piece
-# indented under the text after its bullet. A line styled as a whole
-# (${D}…${R}) keeps its style on every piece.
+# wrap: a screen (stdin) wrapped to DEMO_COLS by `cargo xtask demo-wrap`
+# when `cargo xtask screenshots` runs the demo (it sets DEMO_XTASK);
+# otherwise as written.
 wrap() {
-  python3 -c '
-import re, sys, textwrap
-w = int(sys.argv[1])
-for line in sys.stdin.read().rstrip("\n").split("\n"):
-    m = re.fullmatch(r"(\x1b\[[0-9;]*m)?(.*?)(\x1b\[0m)?", line)
-    pre, body, post = m.group(1) or "", m.group(2), m.group(3) or ""
-    if len(body) <= w or "\x1b" in body:
-        print(line)
-        continue
-    lead = len(body) - len(body.lstrip(" "))
-    rest = body[lead:]
-    hang = 2 if rest[:2] in ("● ", "• ", "✻ ") else 3 if rest[:3] in ("⎿  ", "└ ") else 0
-    for piece in textwrap.wrap(rest, w - lead, subsequent_indent=" " * hang):
-        print(pre + " " * lead + piece + post)
-' "$((${DEMO_COLS:-72} - 2))"
+  if [[ -n ${DEMO_XTASK:-} ]]; then "$DEMO_XTASK" demo-wrap "$((${DEMO_COLS:-72} - 2))"; else cat; fi
 }
 
 # add NAME PROJECT STATE "TAGS" DESCRIPTION PROMPT  (screen body on stdin)
@@ -253,29 +239,24 @@ sql "update sessions set pinned=1 where name='checkout-redesign'"
 
 # The overlord (the stand-in draws its screen).
 printf '%s\n' "5 36000" > "$d/usage/overlord"
-cat > "$d/screens/overlord.txt" <<EOF
+wrap > "$d/screens/overlord.txt" <<EOF
 ${M}${B}◆ overlord${R}
 
 > what's waiting on me?
 
 ● Two sessions are waiting on you:
-  • ${B}billing-webhooks${R}: how long to retry
-    failed Stripe events (3 days, or
-    alert #billing-oncall)
-  • ${B}docs-navigation${R}: the new sidebar is
-    ready; it wants to open a PR
+  • ${B}billing-webhooks${R}: asks how long failed Stripe events should be
+    retried (3 days, or alert #billing-oncall)
+  • ${B}docs-navigation${R}: the new sidebar is ready; it wants to open a PR
 
-> tell docs-navigation to open the PR
+> tell docs-navigation to go ahead and open the PR
 
-● Sent. docs-navigation is pushing the
-  branch.
+● Sent. docs-navigation is pushing the branch.
 
-> start a session on the slow product
-  search page
+> start a session on the slow product search page
 
-● Launched ${B}slow-product-search${R} in
-  acme-web, on its own worktree, tagged
-  web and perf.
+● Launched ${B}slow-product-search${R} in acme-web, on its own worktree,
+  tagged web and perf.
 
 $(box "")
 EOF

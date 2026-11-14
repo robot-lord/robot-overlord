@@ -114,7 +114,9 @@ impl Demo {
         cmd::run(
             Command::new("scripts/demo/demo.sh")
                 .arg(&demo.dir)
-                .env("DEMO_COLS", (COLS - 2).to_string()),
+                .env("DEMO_COLS", (COLS - 2).to_string())
+                // The demo wraps its screens to DEMO_COLS with `demo-wrap`.
+                .env("DEMO_XTASK", std::env::current_exe()?),
         )?;
         // The phone layout: the list on top, the live pane and a short
         // details pane (its name, state, description and groups) below.
