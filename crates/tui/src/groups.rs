@@ -594,7 +594,7 @@ impl App {
             }
             // Groups off screen, counted on the border as the session list
             // does; a click selects a group a page that way.
-            let shown = (end - top).max(1);
+            let shown = end.saturating_sub(top).max(1);
             let mut more = |k: usize, arrow: &str, y: u16, to: usize| {
                 let l = Line::from(Span::styled(format!(" {arrow} {k} more "), theme::muted()));
                 let w = (l.width() as u16).min(left.width.saturating_sub(4));

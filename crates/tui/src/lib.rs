@@ -1710,7 +1710,7 @@ impl App {
         // A click on a count pages that way: the selection moves a page
         // past the edge, which scrolls the list.
         let n = self.sessions.len();
-        let shown = (n - top - below).max(1);
+        let shown = n.saturating_sub(top + below).max(1);
         if top > 0 && area.height >= 2 {
             let l = more(top, "↑");
             let r = more_at(&l, area.y);
