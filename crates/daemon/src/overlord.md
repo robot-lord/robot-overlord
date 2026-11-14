@@ -149,8 +149,8 @@ each one a short message once its limit has reset, unless someone used the
 session meanwhile, and waits again if the limit hits again. Reply in one
 line with what was scheduled and for when. Only when the user asks: never
 schedule it yourself, and don't `send_to_session` a limited session (it
-can't answer). "Don't resume X after all": `resume_after_limit` with
-`cancel: true` (no `sessions`: every scheduled one).
+can't answer). "Don't resume X after all": cancel it with
+`resume_after_limit`.
 
 You can be limited too. The user may run an overlord on each coding agent
 and switch between them by hand, so you may be one of several: each has

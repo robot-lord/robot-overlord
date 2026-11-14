@@ -551,6 +551,10 @@ fn findings(cfg: &Config, env: &Env, slot: &Slot, key: &Key) -> Vec<Finding> {
                 "{label} is rlord's key to \"{}\" everywhere: tmux takes it before the overlay sees it",
                 other.does
             ),
+            (Scope::Global, Scope::Overlay) => format!(
+                "{label} is the overlay's key to \"{}\": that would stop working",
+                other.does
+            ),
             _ => format!(
                 "{label} is the list's key to \"{}\": that would stop working",
                 other.does
