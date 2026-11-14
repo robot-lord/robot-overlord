@@ -302,6 +302,37 @@ pub fn set_claude_tui(cfg: &Config) {
 }
 
 /// A string-array param (missing / wrong type = empty).
+/// Whether a new session runs on Codex's shared background server: Codex
+/// with `[session] codex_daemon` on, but not the overlord (its wiring is
+/// `-c` overrides, which Codex runs only in the pane), nor a session whose
+/// own flags need the pane.
+pub(crate) fn new_on_codex_daemon(
+    agent: Agent,
+    codex_daemon: bool,
+    role: &str,
+    extra_args: &[String],
+) -> bool {
+    agent == Agent::Codex
+        && codex_daemon
+        && !crate::overlord::is_overlord_role(role)
+        && !codex::needs_embedded(extra_args)
+}
+
+/// `new_on_codex_daemon` for `session.new`'s params, read as `session_new`
+/// reads them (asked before it runs, to start the server first).
+pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
+    let field = |k: &str| params[k].as_str().map(str::trim).filter(|v| !v.is_empty());
+    let Ok(agent) = Agent::named(field("agent").unwrap_or(&cfg.session.agent)) else {
+        return false;
+    };
+    new_on_codex_daemon(
+        agent,
+        cfg.session.codex_daemon,
+        field("role").unwrap_or(""),
+        &str_list(params, "extra_args"),
+    )
+}
+
 pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
     params
         .get(key)
@@ -522,11 +553,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // On Codex's shared background server (`[session] codex_daemon`): not
     // the overlord (its wiring is `-c` overrides, which Codex runs only in
     // the pane), nor a session whose own flags need the pane.
-    if agent == Agent::Codex
-        && cfg.session.codex_daemon
-        && !crate::overlord::is_overlord_role(&role)
-        && !codex::needs_embedded(&extra_args)
-    {
+    if new_on_codex_daemon(agent, cfg.session.codex_daemon, &role, &extra_args) {
         spec["codex_host"] = json!(codex::HOST_DAEMON);
     }
     let daemon = codex::on_daemon(&spec);
@@ -862,6 +889,15 @@ fn tmux_name_of(db: &Db, s: &Session) -> Result<String> {
 /// `manual` otherwise).
 pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
+    // Only overlords start fresh, and they never run on Codex's daemon. A
+    // daemon-mode session would need its turn interrupted, the server
+    // started and the gate moved to the new thread first: refuse it.
+    if s.codex_daemon {
+        bail!(
+            "{} runs on Codex's background server: a fresh conversation isn't supported there",
+            s.name
+        );
+    }
     let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
@@ -1580,6 +1616,61 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_plain_codex_sessions_go_on_the_daemon() {
+        let none: Vec<String> = Vec::new();
+        assert!(new_on_codex_daemon(Agent::Codex, true, "", &none));
+        assert!(!new_on_codex_daemon(Agent::Codex, false, "", &none));
+        assert!(!new_on_codex_daemon(Agent::Claude, true, "", &none));
+        assert!(!new_on_codex_daemon(
+            Agent::Codex,
+            true,
+            crate::overlord::ROLE,
+            &none
+        ));
+        let pane_only = vec!["--search".to_string()];
+        assert!(!new_on_codex_daemon(Agent::Codex, true, "", &pane_only));
+        // From `session.new`'s params, as `session_new` reads them.
+        let mut cfg = Config::default();
+        cfg.session.codex_daemon = true;
+        cfg.session.agent = "codex".into();
+        assert!(new_params_on_codex_daemon(&cfg, &json!({})));
+        assert!(!new_params_on_codex_daemon(
+            &cfg,
+            &json!({"agent": "claude"})
+        ));
+        assert!(!new_params_on_codex_daemon(
+            &cfg,
+            &json!({"role": crate::overlord::ROLE})
+        ));
+        assert!(!new_params_on_codex_daemon(
+            &cfg,
+            &json!({"extra_args": ["--search"]})
+        ));
+    }
+
+    #[test]
+    fn fresh_refuses_a_daemon_mode_session() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "d1",
+            name: "d1",
+            agent: "codex",
+            agent_session: Some("t-1"),
+            project_path: "/src/app",
+            tmux_session: Some("rlord-test-none-d1"),
+            launch_spec: &json!({"agent": "codex", "codex_host": "daemon"}).to_string(),
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let e = session_fresh(&db, &json!({"ref": "d1"})).unwrap_err();
+        assert!(e.to_string().contains("background server"), "{e}");
+    }
 
     #[test]
     fn the_pane_runs_the_program_the_check_found() {

@@ -154,23 +154,26 @@ pub(crate) fn route(
     })
 }
 
-/// When `ensure_running` last asked.
-static ASKED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// When `ensure_running` last failed to start the daemon.
+static FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long after a failed start `ensure_running` doesn't try again.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether a start that last failed at `failed` may be tried now.
+fn may_try(failed: Option<Instant>, now: Instant) -> bool {
+    failed.is_none_or(|t| now.saturating_duration_since(t) >= RETRY_AFTER)
+}
 
 /// Make sure Codex's daemon runs before a daemon-mode pane starts (see the
-/// module doc). Bounded, and asked at most once a minute (whatever the
-/// answer: a Codex that can't start one isn't asked again at every
-/// launch). Never fails the launch: the TUI then starts one itself, or
-/// runs the turn in the pane, and its hooks still reach rlord by thread.
+/// module doc). Bounded. After a failed start it isn't tried again for a
+/// minute (a Codex that can't start one isn't asked at every launch); a
+/// success, or a Codex not resolved yet, leaves the next launch free to
+/// ask. Never fails the launch: the TUI then starts one itself, or runs
+/// the turn in the pane, and its hooks still reach rlord by thread.
 pub fn ensure_running() {
-    {
-        let Ok(mut t) = ASKED_AT.lock() else {
-            return;
-        };
-        if t.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
-            return;
-        }
-        *t = Some(Instant::now());
+    if !FAILED_AT.lock().is_ok_and(|t| may_try(*t, Instant::now())) {
+        return;
     }
     let Some(program) = install::resolved(Agent::Codex.name()) else {
         return;
@@ -179,8 +182,39 @@ pub fn ensure_running() {
         Ok(d) => {
             tracing::debug!(version = ?d.app_server_version, "Codex's background server is up")
         }
-        Err(e) => tracing::warn!(error = %e, "Codex's background server isn't running"),
+        Err(e) => {
+            tracing::warn!(error = %e, "Codex's background server isn't running");
+            if let Ok(mut t) = FAILED_AT.lock() {
+                *t = Some(Instant::now());
+            }
+        }
     }
+}
+
+/// How long a send waits on the daemon (each step) to learn whether a
+/// daemon-mode thread's turn runs. Short: the session's lock is held.
+const SEND_CHECK_LIMIT: Duration = Duration::from_millis(500);
+
+/// Why a message must not be typed into a daemon-mode session now: a turn
+/// runs on its thread (maybe started from another Codex client, which
+/// rlord's status doesn't see), waiting on input included. None: go ahead
+/// (also when the daemon can't be asked: rlord's own checks decide).
+pub(crate) fn busy_for_send(s: &Session) -> Option<String> {
+    if !s.codex_daemon {
+        return None;
+    }
+    let thread = s.agent_session.as_deref()?;
+    busy_why(codex_server::thread_state_within(
+        &codex_server::default_socket(),
+        thread,
+        SEND_CHECK_LIMIT,
+    ))
+}
+
+fn busy_why(state: Option<codex_server::ThreadState>) -> Option<String> {
+    state
+        .filter(|st| st.running())
+        .map(|_| "a turn is running on its thread (maybe from another Codex client)".to_string())
 }
 
 /// Whether a daemon-mode session's turn is running, without its pane:
@@ -281,6 +315,24 @@ pub(crate) fn interrupt(s: &Session) -> Stopped {
 mod tests {
     use super::*;
     use rlord_core::db::NewSession;
+
+    #[test]
+    fn retries_only_a_minute_after_a_failure() {
+        let now = Instant::now() + Duration::from_secs(600);
+        assert!(may_try(None, now));
+        assert!(!may_try(Some(now - Duration::from_secs(10)), now));
+        assert!(may_try(Some(now - RETRY_AFTER), now));
+    }
+
+    #[test]
+    fn busy_while_any_turn_runs() {
+        use codex_server::ThreadState as T;
+        assert!(busy_why(Some(T::Active { waiting: false })).is_some());
+        assert!(busy_why(Some(T::Active { waiting: true })).is_some());
+        assert!(busy_why(Some(T::Idle)).is_none());
+        assert!(busy_why(Some(T::NotLoaded)).is_none());
+        assert!(busy_why(None).is_none());
+    }
 
     fn session(db: &Db, id: &str, folder: &str, daemon: bool, thread: Option<&str>) {
         let spec = if daemon {

@@ -83,12 +83,29 @@ fn daemon_cmd(program: &Path, verb: &str) -> Command {
     for v in SCRUBBED_ENV {
         c.env_remove(v);
     }
+    // Codex's own folder first on PATH, as a pane has it: a Codex that
+    // needs it (npm under nvm, rlord run as a service) would otherwise
+    // fail here and leave the daemon for a pane's TUI to start.
+    let path = std::env::var("PATH").unwrap_or_default();
+    if let Some(p) = path_with_dir_of(program, &path) {
+        c.env("PATH", p);
+    }
     // Not in any session's folder (a worktree can be removed under it).
     if let Some(home) = std::env::var_os("HOME") {
         c.current_dir(home);
     }
     c.stderr(std::process::Stdio::null());
     c
+}
+
+/// `path` with `program`'s folder in front (None: nothing to add).
+fn path_with_dir_of(program: &Path, path: &str) -> Option<String> {
+    let dir = program.parent()?.to_str().filter(|d| !d.is_empty())?;
+    Some(if path.is_empty() {
+        dir.to_string()
+    } else {
+        format!("{dir}:{path}")
+    })
 }
 
 /// Where the output of a daemon command goes for a moment.
@@ -171,9 +188,15 @@ impl ThreadState {
 /// Whether a thread's turn is running on the daemon. None: the daemon
 /// couldn't be asked.
 pub fn thread_state(socket: &Path, thread: &str) -> Option<ThreadState> {
-    let mut c = Client::connect(socket, LIMIT).ok()?;
+    thread_state_within(socket, thread, LIMIT)
+}
+
+/// `thread_state`, each step (connect, `initialize`, `thread/read`)
+/// waiting at most `limit`.
+pub fn thread_state_within(socket: &Path, thread: &str, limit: Duration) -> Option<ThreadState> {
+    let mut c = Client::connect(socket, limit).ok()?;
     let r = c
-        .request("thread/read", json!({"threadId": thread}), LIMIT)
+        .request("thread/read", json!({"threadId": thread}), limit)
         .ok()?;
     ThreadState::parse(&r["thread"]["status"])
 }
@@ -464,6 +487,27 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_cmd_puts_codex_folder_on_path() {
+        assert_eq!(
+            path_with_dir_of(Path::new("/n/bin/codex"), "/usr/bin").as_deref(),
+            Some("/n/bin:/usr/bin")
+        );
+        assert_eq!(
+            path_with_dir_of(Path::new("/n/bin/codex"), "").as_deref(),
+            Some("/n/bin")
+        );
+        assert_eq!(path_with_dir_of(Path::new("codex"), "/usr/bin"), None);
+        let c = daemon_cmd(Path::new("/n/bin/codex"), "start");
+        let path = c
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .and_then(|v| v.to_str())
+            .unwrap_or("");
+        assert!(path.starts_with("/n/bin"), "{path}");
+    }
 
     #[test]
     fn daemon_version_json() {

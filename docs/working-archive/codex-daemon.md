@@ -74,16 +74,6 @@ The checks that keep Road to 1.0 item 7 open are listed there
 (`docs/working/public-launch.md`). These become issues with the rest of
 its "After launch (tracked)" list:
 
-- A message can be typed into a daemon-mode thread mid-turn when another
-  Codex client started that turn (architecture.md, "Another client on the
-  same thread"). Fix: in `send::type_message` (sends, deliveries and the
-  limit resume; `ask.rs` types into the overlord with `type_into`
-  directly), for daemon-mode sessions only, ask
-  the daemon (`codex_server::thread_state`) and treat any `Active` as "not
-  now", `waiting` included. `thread_state` is a handshake, `initialize`
-  and `thread/read`, each bounded only between 3s reads, so a stalling
-  daemon can hold the session's lock well past 10s: give it a much
-  shorter limit there.
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an
   approval raised in the other client shows in the rlord pane is untested.
@@ -107,19 +97,15 @@ its "After launch (tracked)" list:
   that pane's `RLORD_SESSION_ID` and `TMUX_PANE` to every thread's hooks,
   which then pass the pane check for that session.
 - A daemon started by a daemon-mode pane's own TUI carries that pane's
-  `TMUX` / `TMUX_PANE` into every thread's commands and MCP servers. Ways
-  rlord's own start doesn't happen first: `ensure_running` stamps its
-  one-a-minute throttle before it asks, so it applies after a success and
-  after a launch where Codex wasn't resolved yet (stamp only failures);
-  `ui.goto` restarts a session whose tmux session is gone without asking
-  (`starts_on_codex_daemon` checks only Stopped ones); and `daemon start`
-  runs without the Codex folder the pane adds to PATH, so a Codex that
-  needs it (npm under nvm, rlord as a service) fails there and the pane
-  starts the daemon.
+  `TMUX` / `TMUX_PANE` into every thread's commands and MCP servers.
+  rlord starts the daemon first on each daemon-mode launch (new, restart,
+  `ui.goto`), with Codex's folder on PATH; the pane still starts it when
+  rlord's start failed (retried after a minute) or Codex ran by hand
+  first.
 - When no daemon could be started, Codex runs a daemon-mode session's
   turn in the pane, but rlord still treats it as on the daemon: a pane
   killed mid-turn ends the turn, `thread_state` can't be asked, and the
   rollout's unclosed turn keeps it "working" (`pane_gone_turn_running`).
-- `starts_on_codex_daemon` for `session.new` ignores the overlord role and
-  `codex::needs_embedded`, so rlord starts (and waits on) Codex's daemon
-  for sessions that will run in the pane; `session_new` has the real test.
+- `send::type_message` asks the daemon with 500ms per read, but a daemon
+  that trickles partial frames can stretch one request past that (the
+  limit is per read, not total). Make it a deadline if it is ever seen.
