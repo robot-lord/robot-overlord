@@ -259,7 +259,26 @@ pub fn refresh(d: &Daemon, r: &str, request: bool) -> Result<Vec<Subagent>> {
     // are read). Every agent is checked, finished or not (a finished one may
     // still be resumed or get its last lines flushed).
     let running = s.status != Status::Stopped;
-    let scanned = claude::scan_subagents_read(&s.id, &src, running, &|_| true);
+    // On a request, only sub-agents with little new to read (or none to
+    // read: no transcript yet); the rest go to the warm-up, which reads
+    // them all, and the request answers with their rows as they are.
+    let dir = claude::subagents_dir(&src);
+    let deferred = std::cell::Cell::new(false);
+    let want = |id: &str| {
+        if !request {
+            return true;
+        }
+        let jsonl = dir.join(format!("agent-{id}.jsonl"));
+        let small = inline_read(&jsonl);
+        if !small {
+            deferred.set(true);
+        }
+        small
+    };
+    let scanned = claude::scan_subagents_read(&s.id, &src, running, &want);
+    if deferred.get() {
+        d.warm.enqueue(&s.id);
+    }
     let db = d.db();
     // Compare with the rows as they are now, not as they were before the
     // unlocked scan: a hook may have finished an agent meanwhile.
@@ -267,6 +286,17 @@ pub fn refresh(d: &Daemon, r: &str, request: bool) -> Result<Vec<Subagent>> {
     apply(&db, &known, &scanned)?;
     methods::save_cursors(&db);
     db.subagents(&s.id)
+}
+
+/// A request may read this sub-agent transcript now: it isn't there, or
+/// what is left to read of it is at most `usage::READ_INLINE_MAX` (one
+/// never read counts in full).
+fn inline_read(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let left = rlord_core::agents::transcript::unread_bytes(path).unwrap_or(meta.len());
+    left <= crate::usage::READ_INLINE_MAX
 }
 
 /// Write the scanned agents that differ from the known rows (or whose
@@ -324,6 +354,21 @@ pub fn enqueue_ref(d: &Daemon, r: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_reads_only_small_subagent_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        // None yet: nothing to read.
+        assert!(inline_read(&dir.path().join("agent-a.jsonl")));
+        let small = dir.path().join("agent-b.jsonl");
+        std::fs::write(&small, "{}\n").unwrap();
+        assert!(inline_read(&small));
+        // Never read and over the limit: left to the warm-up.
+        let big = dir.path().join("agent-c.jsonl");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(crate::usage::READ_INLINE_MAX + 1).unwrap();
+        assert!(!inline_read(&big));
+    }
 
     #[test]
     fn an_unread_subagent_transcript_replaces_nothing() {
