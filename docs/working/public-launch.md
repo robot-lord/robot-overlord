@@ -80,6 +80,14 @@ done, in this order (decided with the user, 2026-11-12):
        (owed, daemon mode)" list in `docs/working-archive/codex-daemon.md`.
 8. [ ] Polish: clickable "more" markers, groups-tab counts, light-theme
        contrast, website phone screenshots.
+       Done in 0.23.0-dev.20: the "↑/↓ n more" counts page the list when
+       clicked; the groups tab's group column counts its hidden groups the
+       same way (also clickable); `accent_dim` on every light theme now
+       passes WCAG AA (4.5:1) against its background, checked by a test.
+       Left: website phone screenshots (robot-lord/website). Needs a
+       design choice (real device frames vs. a narrow-terminal render,
+       which views to show) and a curated demo fleet, not the user's
+       real sessions.
 9. [ ] A fresh-install end-to-end test.
 10. [ ] 1.0.0 stable.
 
@@ -158,7 +166,5 @@ Dependabot version updates, grouped weekly.
 - A hooked Codex session whose tmux session is killed stays "working".
 - Codex Remote Control, once Codex makes it official (deferred; see
   `docs/working-archive/codex-daemon.md`).
-- "↑/↓ N more" can't be clicked; the Groups tab has no more-counts.
-- `accent_dim` contrast on light themes.
 - Context-window table (`models::context_window`) upkeep.
 - AUR package.

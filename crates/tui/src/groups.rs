@@ -586,9 +586,28 @@ impl App {
                 height: left.height.saturating_sub(2),
             };
             let top = self.group_state.offset();
-            for i in top..self.groups.len().min(top + inner.height as usize) {
+            let n = self.groups.len();
+            let end = n.min(top + inner.height as usize);
+            for i in top..end {
                 self.hits
                     .row(inner, inner.y + (i - top) as u16, mouse::Hit::Group(i));
+            }
+            // Groups off screen, counted on the border as the session list
+            // does; a click selects a group a page that way.
+            let shown = end.saturating_sub(top).max(1);
+            let mut more = |k: usize, arrow: &str, y: u16, to: usize| {
+                let l = Line::from(Span::styled(format!(" {arrow} {k} more "), theme::muted()));
+                let w = (l.width() as u16).min(left.width.saturating_sub(4));
+                let r = Rect::new(left.x + left.width.saturating_sub(w + 2), y, w, 1);
+                f.render_widget(Paragraph::new(l), r);
+                self.hits.add(r, mouse::Hit::MoreGroups(to));
+            };
+            if top > 0 && left.height >= 2 {
+                more(top, "↑", left.y, top.saturating_sub(shown));
+            }
+            if end < n && left.height >= 2 {
+                let to = (top + 2 * shown - 1).min(n - 1);
+                more(n - end, "↓", left.y + left.height - 1, to);
             }
         }
         self.draw_list(f, right);

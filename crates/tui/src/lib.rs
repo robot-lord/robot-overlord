@@ -1707,16 +1707,23 @@ impl App {
             let w = (line.width() as u16).min(area.width.saturating_sub(4));
             Rect::new(area.x + area.width.saturating_sub(w + 2), y, w, 1)
         };
+        // A click on a count pages that way: the selection moves a page
+        // past the edge, which scrolls the list.
+        let n = self.sessions.len();
+        let shown = n.saturating_sub(top + below).max(1);
         if top > 0 && area.height >= 2 {
             let l = more(top, "↑");
-            f.render_widget(Paragraph::new(l.clone()), more_at(&l, area.y));
+            let r = more_at(&l, area.y);
+            f.render_widget(Paragraph::new(l), r);
+            self.hits
+                .add(r, mouse::Hit::More(top.saturating_sub(shown)));
         }
         if below > 0 && area.height >= 2 {
             let l = more(below, "↓");
-            f.render_widget(
-                Paragraph::new(l.clone()),
-                more_at(&l, area.y + area.height - 1),
-            );
+            let r = more_at(&l, area.y + area.height - 1);
+            f.render_widget(Paragraph::new(l), r);
+            let to = (top + 2 * shown - 1).min(n - 1);
+            self.hits.add(r, mouse::Hit::More(to));
         }
         // The headers of the sortable columns: Name and the time column,
         // placed by the same layout the table uses (inside the border and
