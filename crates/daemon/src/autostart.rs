@@ -92,7 +92,7 @@ pub fn restart_daemon(socket: &Path) -> Result<()> {
         // SAFETY: plain syscalls, no memory involved.
         unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + STOP_TIMEOUT;
-        while unsafe { libc::kill(pid, 0) } == 0 {
+        while unsafe { libc::kill(pid, 0) } == 0 && !is_zombie(pid) {
             if Instant::now() > deadline {
                 bail!("old daemon (pid {pid}) did not exit within {STOP_TIMEOUT:?}");
             }
@@ -192,19 +192,43 @@ fn wait_for_new(socket: &Path, old: Option<i32>, mut child: Option<&mut Child>) 
 
 /// Whether `pid` is a live `rlord daemon` process (by its argv).
 fn is_rlord_daemon(pid: i32) -> bool {
-    let Ok(o) = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
+    // /proc first: minimal Linux systems (Debian's container image, among
+    // others) have no `ps`, and without it an upgrade would never replace
+    // the old daemon.
+    let cmd = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => String::from_utf8_lossy(&raw).replace('\0', " "),
+        Err(_) => {
+            let Ok(o) = Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .stderr(Stdio::null())
+                .output()
+            else {
+                return false;
+            };
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        }
     };
-    let cmd = String::from_utf8_lossy(&o.stdout);
     let mut argv = cmd.split_whitespace();
     let exe_is_rlord = argv
         .next()
         .is_some_and(|e| Path::new(e).file_name().is_some_and(|n| n == "rlord"));
     exe_is_rlord && argv.next() == Some("daemon")
+}
+
+/// The process has exited but its parent hasn't reaped it. The detached
+/// daemon's parent is PID 1, and in a container that is often something
+/// that never reaps (`sleep infinity` in a devcontainer): signal 0 still
+/// finds the zombie, so without this a restart waits for it forever.
+fn is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| stat_is_zombie(&s))
+}
+
+/// `/proc/<pid>/stat`'s state field (after the parenthesised command name,
+/// which may itself hold spaces and parentheses) is `Z`.
+fn stat_is_zombie(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
 }
 
 fn read_pid() -> Option<i32> {
@@ -380,4 +404,21 @@ pub fn acquire_instance_lock() -> Result<Option<File>> {
         return Err(e).with_context(|| format!("locking {}", path.display()));
     }
     Ok(Some(f))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_zombie_state_from_proc_stat() {
+        assert!(stat_is_zombie("2147 (rlord) Z 1 2147 2147 0 -1 4228"));
+        assert!(!stat_is_zombie("2147 (rlord) S 1 2147 2147 0 -1 4228"));
+        // The command name may hold spaces and parentheses.
+        assert!(stat_is_zombie("9 (a) Z (b)) Z 1 9"));
+        assert!(!stat_is_zombie("9 (a) Z (b)) R 1 9"));
+        assert!(!stat_is_zombie(""));
+        // This process is running.
+        assert!(!is_zombie(std::process::id() as i32));
+    }
 }

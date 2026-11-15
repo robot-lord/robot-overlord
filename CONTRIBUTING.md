@@ -118,6 +118,18 @@ after the checks, so rehearse that with a manual dry run of the workflow
   local credentials: the Homebrew tap (`cargo xtask update-tap`) and crates.io
   (`cargo xtask publish-crates`, once the repo is public).
 
+Before a stable release, run `cargo xtask fresh-install` (Docker; colima
+on the Mac). It builds the Linux release files and installs them on fresh
+Ubuntu, Debian and Fedora containers every way a user can (get.sh, the
+`.deb`/`.rpm`, and the newest stable from GitHub upgraded in place), then
+runs rlord as a new non-root user would: first run with no agent, then
+with stand-ins for Claude Code, Codex and OpenCode on PATH (no real agent,
+no model calls), sessions on rlord's own tmux server, `reset`, `update`,
+and removing the package. `--dist DIR` reuses built files, `--offline`
+skips GitHub, `--only` and image names narrow it; logs go to
+`target/fresh-install/`. It tests Linux only: a macOS fresh install needs
+a clean user account, by hand.
+
 The build commands live in `cargo xtask build-release`, which CI and local
 builds share; the version rules, targets and asset names in
 `xtask/src/version.rs`. A manual run of the workflow with `dry_run` (the default for
