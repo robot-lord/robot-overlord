@@ -68,6 +68,47 @@ needs it; main never does):
   open in another app".
 - Onto the daemon (an in-pane thread resumed there) works at once.
 
+## Live check: hooks through the daemon (2026-11-14)
+
+Road to 1.0 item 7's first check, on rlord 0.23.0-dev.21 (built from
+main), codex-cli and daemon 0.169.0, macOS. A scratch rlord (own XDG
+dirs, tmux socket, stand-in `SHELL`, `RLORD_NO_LOGIN_SHELL=1`) with
+`[session] codex_daemon = true` and its own `CODEX_HOME` (a copy of the
+login, rlord's hooks installed and trusted there), so its own daemon:
+the hooks a daemon runs are its `CODEX_HOME`'s, sent to the rlord its
+environment names, so the user's daemon would have sent them to the
+installed rlord (0.23.0-dev.3, no gate). rlord's `ensure_running`
+started that daemon (`codex app-server --listen unix://
+--analytics-default-enabled --managed-daemon`, under
+`$CODEX_HOME/packages/app-server-daemon/`). Two sessions, one turn each
+on `gpt-6-luna` ("Reply with just the word ok"), then archived and the
+scratch folder deleted.
+
+- Each hook ran as a child of the daemon process, with no
+  `RLORD_SESSION_ID`, `TMUX` or `TMUX_PANE`, and rlord's data folder from
+  the daemon's environment. (rlord was started outside tmux, so the
+  stripping of those variables in `ensure_running` wasn't exercised.)
+- Payload fields: `SessionStart`: `session_id`, `transcript_path`,
+  `cwd`, `hook_event_name`, `model`, `permission_mode`, `source`
+  (`startup`). `UserPromptSubmit`: those less `source`, plus `turn_id`
+  and `prompt`. `Stop`: plus `turn_id`, `stop_hook_active`,
+  `last_assistant_message`. `SessionEnd` (seen from a fork): `session_id`,
+  `transcript_path` (null), `cwd`, `hook_event_name`, `reason` (`other`).
+- The first `SessionStart` bound the session by folder
+  (`agent_session_trust = hook`), the gate then listed its thread, and
+  `UserPromptSubmit` / `Stop` went by thread to "your turn".
+- Found: archiving runs the summary as `codex exec fork <thread>
+  --ephemeral` in the session's folder. Its hooks (`SessionStart` with
+  `source = fork`, then a full turn and `SessionEnd`) carry no
+  `RLORD_SESSION_ID` either, so a daemon-mode session waiting for its
+  thread in the same folder would have been bound to the fork. Fixed in
+  0.23.0-dev.25: binding by folder takes only a `SessionStart` whose
+  `source` is `startup` (or missing), in the gate and in `route`
+  (`codex_gate::starts_fresh`).
+- The daemon-mode TUI shows a startup warning: project-local config in
+  `~/.codex` is off until the home folder is trusted. It comes from the
+  daemon's working folder (`$HOME`), not the session's; harmless.
+
 ## After launch (owed, daemon mode)
 
 The checks that keep Road to 1.0 item 7 open are listed there

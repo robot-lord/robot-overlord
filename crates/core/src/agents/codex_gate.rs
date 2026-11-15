@@ -68,7 +68,8 @@ impl Gate {
     }
 
     /// Whether a hook event (its slimmed payload) may be rlord's: its
-    /// thread is listed, or it is a `SessionStart` in a listed folder.
+    /// thread is listed, or it is a new thread's first `SessionStart`
+    /// (`starts_fresh`) in a listed folder.
     pub fn admits(&self, event: &str, payload: &Value) -> bool {
         if payload["session_id"]
             .as_str()
@@ -76,7 +77,7 @@ impl Gate {
         {
             return true;
         }
-        event == "SessionStart"
+        starts_fresh(event, payload)
             && payload["cwd"].as_str().is_some_and(|cwd| {
                 self.folders.contains(cwd)
                     || std::fs::canonicalize(cwd)
@@ -85,6 +86,16 @@ impl Gate {
                         .unwrap_or(false)
             })
     }
+}
+
+/// Whether a hook event is the first `SessionStart` of a thread started
+/// fresh, the only kind a waiting daemon-mode session can be bound to by
+/// its folder. Codex's `source` is `startup` for a new TUI's thread (and
+/// missing on a Codex too old to say). A `fork` (`codex exec fork`, as
+/// rlord's own archive summaries run), `resume` or `clear` in the same
+/// folder is another thread, or not a first start.
+pub fn starts_fresh(event: &str, payload: &Value) -> bool {
+    event == "SessionStart" && payload["source"].as_str().is_none_or(|s| s == "startup")
 }
 
 /// The gate as written (None: there is none, or it can't be read).
@@ -144,6 +155,19 @@ mod tests {
             &json!({"session_id": "t-3", "cwd": "/src/app"})
         ));
         assert!(!g.admits("SessionStart", &json!({"cwd": "/src/web"})));
+        // A new TUI's thread says `startup`; a fork from there (rlord's
+        // archive summary runs `codex exec fork`) or a resume isn't a
+        // first thread.
+        assert!(g.admits(
+            "SessionStart",
+            &json!({"session_id": "t-3", "cwd": "/src/app", "source": "startup"})
+        ));
+        for source in ["fork", "resume", "clear"] {
+            assert!(!g.admits(
+                "SessionStart",
+                &json!({"session_id": "t-4", "cwd": "/src/app", "source": source})
+            ));
+        }
         assert!(!g.admits("Stop", &json!({})));
     }
 
