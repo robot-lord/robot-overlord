@@ -9,7 +9,8 @@
 //! At most one scan per set of roots runs at a time, and a stuck one is not
 //! retried: whatever blocked it would block the retry too. Its roots keep
 //! their last result (or report `scanning`) until it finishes; changing
-//! `repo_roots` scans the new ones.
+//! `repo_roots` scans the new ones. Nothing scans until a look-up asks, so
+//! a privacy prompt the skip list misses never appears unprompted.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -99,17 +100,6 @@ impl Scanner {
         }
     }
 
-    /// Start a scan of `key` if one is due, without waiting for it (at
-    /// daemon start and after a config reload, so the first look-up has a
-    /// result).
-    pub fn prefetch<F>(&self, key: &Key, scan: F)
-    where
-        F: FnOnce(&Key) -> Vec<String> + Send + 'static,
-    {
-        let mut st = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-        self.refresh(&mut st, key, scan);
-    }
-
     /// Start a scan of `key` unless its result is fresh or one is running.
     fn refresh<F>(&self, st: &mut State, key: &Key, scan: F)
     where
@@ -122,6 +112,8 @@ impl Scanner {
         if fresh || st.running.contains_key(key) {
             return;
         }
+        // Only the roots asked for now are worth keeping a result for.
+        st.found.retain(|k, _| k == key);
         st.running.insert(key.clone(), Instant::now());
         let state = self.state.clone();
         let k = key.clone();
@@ -145,6 +137,13 @@ where
             let (lock, done) = &*self.0;
             let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
             st.running.remove(&self.1);
+            if std::thread::panicking() {
+                // Don't rerun a scan that panics on every look-up: an empty
+                // result, retried once it is stale.
+                tracing::warn!(roots = ?self.1.0, "repo scan panicked");
+                st.found
+                    .insert(self.1.clone(), (Instant::now(), Vec::new()));
+            }
             done.notify_all();
         }
     }
@@ -237,18 +236,21 @@ mod tests {
     }
 
     #[test]
-    fn panicking_scan_frees_its_roots() {
+    fn panicking_scan_leaves_an_empty_result() {
         let s = Scanner::with_timing(timing(5_000));
         let f = s.get(&key("a"), |_| panic!("scan blew up"));
         assert!(!f.scanning && f.repos.is_empty());
-        let f = s.get(&key("a"), |_| vec!["/a/x".into()]);
-        assert_eq!(f.repos, vec!["/a/x".to_string()]);
+        // Not rerun on the next look-up.
+        let f = s.get(&key("a"), |_| panic!("reran a scan that panicked"));
+        assert!(!f.scanning && f.repos.is_empty());
     }
 
     #[test]
-    fn prefetch_fills_the_first_look_up() {
-        let s = Scanner::with_timing(timing(50));
-        s.prefetch(&key("a"), |_| vec!["/a/x".into()]);
-        assert_eq!(settled(&s, &key("a")), vec!["/a/x".to_string()]);
+    fn only_the_current_roots_keep_a_result() {
+        let s = Scanner::with_timing(timing(5_000));
+        s.get(&key("a"), |_| vec!["/a/x".into()]);
+        s.get(&key("b"), |_| vec!["/b/y".into()]);
+        let st = s.state.0.lock().unwrap();
+        assert_eq!(st.found.keys().collect::<Vec<_>>(), vec![&key("b")]);
     }
 }

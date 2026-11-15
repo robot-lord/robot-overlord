@@ -174,7 +174,6 @@ impl Daemon {
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
-        self.prefetch_repos();
         Ok(json!({"reloaded": true}))
     }
 
@@ -205,13 +204,6 @@ impl Daemon {
             .repo_scan
             .get(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
         (f.repos, f.scanning)
-    }
-
-    /// Start the repo scan in the background (daemon start, config reload),
-    /// so the first look-up has a result.
-    pub fn prefetch_repos(&self) {
-        self.repo_scan
-            .prefetch(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
     }
 
     fn scan_key(&self) -> (Vec<String>, u8) {

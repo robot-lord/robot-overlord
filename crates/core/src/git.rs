@@ -216,14 +216,11 @@ fn guarded_home() -> Option<PathBuf> {
     std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok())
 }
 
-/// Path equality as the filesystem sees it: macOS volumes are usually
-/// case-insensitive, so a root spelled `/users/me` is still `$HOME`.
+/// Path equality as macOS sees it (only used there, via `guarded_home`):
+/// volumes are usually case-insensitive, so a root spelled `/users/me` is
+/// still `$HOME`.
 fn same_path(a: &Path, b: &Path) -> bool {
-    if cfg!(target_os = "macos") {
-        a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
-    } else {
-        a == b
-    }
+    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
 }
 
 /// `home`: skip its `PROTECTED_HOME_DIRS` children (`guarded_home`).

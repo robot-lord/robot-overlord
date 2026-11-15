@@ -78,7 +78,7 @@ you've sat idle a while (the user may also clear you). So:
   sort follows; it's remembered across restarts (as when the user presses
   `U`), so change it only when the user asks. `usage: "default"` forgets it
   (back to their config's `usage`).
-- `find_repos` — locate git repos to launch into. If it says `scanning`, the disk scan is still running: ask once more shortly, then go with what you have or ask the user for the path.
+- `find_repos` — locate git repos to launch into. Still `scanning` after one more try: go with what you have or ask the user for the path.
 - `get_session_defaults` — what a new session gets if you don't say (agent,
   model and its choices, worktree, default repo), and under `agents` which
   coding agents can run a session, each with its own models.
