@@ -126,8 +126,9 @@ pub(crate) fn route(
         _ => {}
     }
     // A first SessionStart in the folder of the one daemon-mode session
-    // waiting for its thread there.
-    if event != "SessionStart" {
+    // waiting for its thread there (a fresh thread's, not a fork's or a
+    // resume's: `codex_gate::starts_fresh`).
+    if !codex_gate::starts_fresh(event, payload) {
         return Ok(Route::Ignore("not a thread rlord follows"));
     }
     let Some(cwd) = payload["cwd"].as_str() else {
@@ -396,6 +397,22 @@ mod tests {
             r(
                 "SessionStart",
                 json!({"session_id": "t-2", "cwd": "/src/web"}),
+                None
+            ),
+            "thread:d2"
+        );
+        // A fork from that folder (rlord's archive summary of another
+        // session there runs `codex exec fork`) isn't its thread.
+        assert!(r(
+            "SessionStart",
+            json!({"session_id": "t-f", "cwd": "/src/web", "source": "fork"}),
+            None
+        )
+        .starts_with("ignore"));
+        assert_eq!(
+            r(
+                "SessionStart",
+                json!({"session_id": "t-2", "cwd": "/src/web", "source": "startup"}),
                 None
             ),
             "thread:d2"

@@ -291,7 +291,10 @@ on when the pane closes`).
   whose an event is: a live daemon-mode session bound to its thread
   (whoever the event says sent it), else the session `RLORD_SESSION_ID`
   names if that one is in the pane, else a first `SessionStart` in the
-  folder of exactly one waiting daemon-mode session. A stopped session's
+  folder of exactly one waiting daemon-mode session, from a thread started
+  fresh (`source` `startup` or none, `codex_gate::starts_fresh`): a
+  `fork` there, such as the `codex exec fork` of rlord's archive summary
+  of another session, never binds it. A stopped session's
   thread is ignored. Matched by thread, there is no pane check
   (`foreign_hook`), and a `SessionEnd` while the pane is up is ignored (a
   client leaving ends nothing). `sync_gate` rewrites the file whenever

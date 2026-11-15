@@ -70,10 +70,22 @@ done, in this order (decided with the user, 2026-11-12):
        official. Findings and branch `codex-remote`:
        `docs/working-archive/codex-daemon.md`. Open until these live
        checks are done:
-       - a daemon-mode session's hooks through the real daemon into
-         rlord, once a release with the gate is installed (the payload
-         fields, a first SessionStart bound by folder);
-       - a daemon restart or update mid-turn, by hand (what the session
+       - [x] a daemon-mode session's hooks through the real daemon into
+         rlord (the payload fields, a first SessionStart bound by
+         folder). Done 2026-11-14 on 0.23.0-dev.21, codex-cli and daemon
+         0.169.0, macOS: SessionStart, UserPromptSubmit and Stop ran in
+         the daemon's `codex app-server --managed-daemon` process with no
+         `RLORD_SESSION_ID`, `TMUX` or `TMUX_PANE`, passed the gate,
+         bound the session by folder (`agent_session_trust = hook`) and
+         set it to "your turn". Run in a scratch rlord with its own
+         `CODEX_HOME`, so a second daemon (the real Codex binary, started
+         by rlord's `ensure_running`): the hooks a daemon runs come from
+         its `CODEX_HOME` and go to the rlord its environment names, so
+         the user's own daemon would have sent them to the installed
+         rlord. Payloads and the bug it found (a `codex exec fork`
+         `SessionStart` could bind a waiting session; fixed in
+         0.23.0-dev.25): `docs/working-archive/codex-daemon.md`;
+       - [ ] a daemon restart or update mid-turn, by hand (what the session
          shows; `notLoaded` should read as not running, so it stops once
          the pane is gone).
        Linux is not a blocker (as in item 1): it is on the "After launch
