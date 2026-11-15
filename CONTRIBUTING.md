@@ -15,10 +15,14 @@ rules agents (and people) follow when changing it.
 
 ## Dev loop
 
+`rust-toolchain.toml` pins the Rust version (with rustfmt, clippy and the
+release targets) for CI, release builds and local work alike; rustup
+installs it on first use.
+
 ```sh
 cargo build
 ln -sfn "$PWD/target/debug/rlord" ~/.local/bin/rlord   # dev install: tracks every build
-scripts/dev-daemon.sh                                  # build + (re)start the daemon
+cargo xtask dev-daemon                                 # build + (re)start the daemon
 rlord claude install-hooks
 rlord
 ```
@@ -111,16 +115,31 @@ after the checks, so rehearse that with a manual dry run of the workflow
   `Cargo.toml`. Then a macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
   the static musl builds (`cargo zigbuild`) and packages `.deb`/`.rpm`; both
   architectures are smoke-tested in Docker on Ubuntu, Debian, Fedora and
-  Amazon Linux (`scripts/smoke-linux.sh`); the last job writes `SHA256SUMS`,
+  Amazon Linux (`cargo xtask smoke-linux`); the last job writes `SHA256SUMS`,
   attests build provenance and creates the release as a **draft**.
   `cargo xtask release` waits for the run, checks the assets against `SHA256SUMS`
   and `gh attestation verify`, publishes the draft, then does what still needs
   local credentials: the Homebrew tap (`cargo xtask update-tap`) and crates.io
   (`cargo xtask publish-crates`, once the repo is public).
 
+Before a stable release, run `cargo xtask fresh-install` (Docker; colima
+on the Mac). It builds the Linux release files and installs them on fresh
+Ubuntu, Debian and Fedora containers every way a user can (get.sh, the
+`.deb`/`.rpm`, and the newest stable from GitHub upgraded in place), then
+runs rlord as a new non-root user would: first run with no agent, then
+with stand-ins for Claude Code, Codex and OpenCode on PATH (no real agent,
+no model calls), sessions on rlord's own tmux server, `reset`, `update`,
+and removing the package. `--dist DIR` reuses built files, `--offline`
+skips GitHub, `--only` and image names narrow it; logs go to
+`target/fresh-install/`. It tests Linux only: a macOS fresh install needs
+a clean user account, by hand.
+
 The build commands live in `cargo xtask build-release`, which CI and local
 builds share; the version rules, targets and asset names in
-`xtask/src/version.rs`. A manual run of the workflow with `dry_run` (the default for
+`xtask/src/version.rs`; the packaging tools' versions (zig,
+cargo-zigbuild, cargo-deb, cargo-generate-rpm) in `xtask/src/tools.rs`,
+installed by `cargo xtask install-tools` into `target/release-tools`. The
+Linux build runs only those copies and refuses other versions. A manual run of the workflow with `dry_run` (the default for
 manual runs) builds and tests everything and uploads only workflow
 artifacts.
 
@@ -149,10 +168,13 @@ run shows up for a pushed tag, `cargo xtask release` also cancels any run queued
 for it before suggesting `--local`. One-time setup for that:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-brew install zig colima docker && colima start
-cargo install --locked cargo-zigbuild cargo-deb cargo-generate-rpm
+brew install colima docker && colima start
+cargo xtask install-tools   # again after a cargo clean or a pin change
 ```
+
+`cargo xtask smoke-linux DIST [IMAGE…]` runs the Docker smoke test on its
+own (images like `debian:12`, or `linux/amd64:ubuntu:24.04` for the
+emulated x86_64 build); `--local` runs it on the default set.
 
 Stable releases also need push access to `robot-lord/homebrew-tap` and
 `cargo login` (crates.io token).

@@ -112,8 +112,8 @@ scratch folder deleted.
 ## After launch (owed, daemon mode)
 
 The checks that keep Road to 1.0 item 7 open are listed there
-(`docs/working/public-launch.md`). These become issues with the rest of
-its "After launch (tracked)" list:
+(`docs/working/public-launch.md`). Each item below is a GitHub issue
+(#40 to #50, filed 2026-11-14, in this order):
 
 - Approval dialogs with two clients on one thread: not seen. Stop and
   archive send Escape when `codex::dialog_shown` is false; whether an

@@ -3,7 +3,7 @@
 #   scripts/install-launchd.sh            # install + start
 #   scripts/install-launchd.sh uninstall  # stop + remove
 # The agent runs `rlord` from your PATH (e.g. the ~/.local/bin dev symlink),
-# so rebuilding + `scripts/dev-daemon.sh` picks up new code.
+# so rebuilding + `cargo xtask dev-daemon` picks up new code.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

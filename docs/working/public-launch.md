@@ -17,18 +17,21 @@ done, in this order (decided with the user, 2026-11-12):
 3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
        (0.23.0-dev.6; `.github/workflows/release.yml`, shared
        `cargo xtask build-release`). Tap and crates.io stay local; moving
-       their tokens into repo secrets is owed. Also owed (PR #25 review):
-       toolchain parity for `--local` (a `rust-toolchain.toml`, pinned
-       zig/cargo-zigbuild/cargo-deb/cargo-generate-rpm versions in
-       CONTRIBUTING to match release.yml); prebuilt packaging tools in CI
-       instead of `cargo install` on every run.
+       their tokens into repo secrets is owed. Toolchain parity done
+       (0.23.0-dev.24): `rust-toolchain.toml` pins Rust for CI, release
+       and local builds; `cargo xtask install-tools` (`xtask/src/tools.rs`)
+       pins zig, cargo-zigbuild, cargo-deb and cargo-generate-rpm, prebuilt
+       and checksum-checked where upstream ships a binary
+       (cargo-generate-rpm is still `cargo install`ed: no upstream
+       binaries).
 4. [x] Release automation in `cargo xtask` (0.23.0-dev.8; the `xtask`
        crate): release, build, tap, crates.io and the version-bump check
        are Rust with unit tests; the version rules, targets and asset
        names are in `xtask/src/version.rs` only. Shell is left for simple
        glue and for what users run on a bare machine (`get.sh`,
-       `install.sh`, `update.sh`). Owed: `scripts/smoke-linux.sh` and
-       `scripts/dev-daemon.sh` still hold some logic in bash; the
+       `install.sh`, `update.sh`). The smoke test and dev loop moved too
+       (0.23.0-dev.24: `cargo xtask smoke-linux`, `cargo xtask
+       dev-daemon`; the scripts are thin wrappers). Owed: the
        stable paths of `cargo xtask release` (CI, `--resume`, `--local`,
        tap, crates.io) have unit tests and a dry run but get their first
        real run at 1.0.0. SIGTERM ends xtask without its cleanup
@@ -101,7 +104,28 @@ done, in this order (decided with the user, 2026-11-12):
        terminal rendered by Playwright). Under 60 columns the list now
        goes narrow (names first, Status as its glyph, the time as its
        value) and the groups column drops its counts.
-9. [ ] A fresh-install end-to-end test.
+9. [ ] A fresh-install end-to-end test. Linux done (0.23.0-dev.23):
+       `cargo xtask fresh-install` (CONTRIBUTING has the usage) installs
+       on throwaway ubuntu:24.04, debian:stable and fedora:latest
+       containers via get.sh (local files), the .deb/.rpm, and the newest
+       stable from GitHub upgraded in place, then runs rlord as a new
+       non-root user: first run with no agent (list, setup dialog,
+       `agents`, `new` refusing), then stand-in claude/codex/opencode on
+       PATH (`install-hooks`, a session each on rlord's own tmux server,
+       stop, `reset`, `update`, package removal). All 9 runs pass, and
+       x86_64 under emulation (tarball, deb). Found and fixed: `rlord
+       reset` hung on the old daemon's zombie where PID 1 doesn't reap
+       (containers, devcontainers); upgrades kept the old daemon where
+       there is no `ps` (Debian's image); `rlord update` on a .deb/.rpm
+       (or Homebrew, cargo) install put a second, older copy in
+       ~/.local/bin; the setup dialog called a missing agent "the only
+       one installed"; get.sh now says when no agent is installed; Mac-
+       built tarballs carried xattrs GNU tar warned about. Not done:
+       **macOS fresh install** needs a clean user account, by hand.
+       Noted, not changed: `rlord overlord status` with no agent says it
+       will create one on claude/opus; under qemu the list can't start
+       (ratatui ENOSYS: emulation only); the 0.18.1 stable tarballs
+       carry those xattr warnings.
 10. [ ] 1.0.0 stable.
 
 After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as
@@ -109,9 +133,13 @@ repo secrets (to do later, not part of the CI release builds step).
 
 ## Before flipping it public
 
+The repository is already public (checked 2026-11-14); the open items
+below still stand before announcing it.
+
 - [ ] Stable release (`X.Y.Z`, no suffix) so `get.sh`, Homebrew and the
       stable channel stop installing 0.18.1. Needs `colima start` for the
       Linux smoke tests; check OpenCode and Codex on Linux in them.
+      Still 0.18.1 (checked 2026-11-14: the latest non-pre-release).
 - [ ] Codex overlord's read-only sandbox on Linux. Partial: it blocked a
       unix-socket connect as root on a `/tmp` socket (checked 2026-11-12,
       codex-cli 0.167.2 from npm, `ubuntu:24.04` arm64 on colima). Run
@@ -143,7 +171,9 @@ repo secrets (to do later, not part of the CI release builds step).
 - [ ] Fresh install end to end on a clean machine or account: `get.sh` and
       `brew install`, then first-run setup per agent, including a machine
       without Claude Code.
-- [ ] Wrap up stale working docs (usage-column: shipped).
+- [x] Wrap up stale working docs (2026-11-14): `usage-column.md`,
+      `own-prompts.md` and `linux-and-packaging.md` reconciled and
+      archived (`docs/working-archive/README.md`).
 
 Done (2026-11-12): `main` ruleset fixed (it targeted no branch; now PR +
 `check`/`version-bump`/`advisories` required, no force-push or deletion,
@@ -156,31 +186,66 @@ Dependabot version updates, grouped weekly.
 
 ## Right after flipping it public
 
-- [ ] Re-create the `main protect` and `release tags` rulesets (lost: a free
+- [x] Re-create the `main protect` and `release tags` rulesets (lost: a free
       org can't use rulesets on a private repo; the repo moved to
       `robot-lord` on 2026-11-12). Same rules as before: PR + `check`,
       `version-bump`, `advisories` required; no force-push or deletion;
       admin bypass; squash only; `v*` tags can't be deleted or moved.
-
-- [ ] `scripts/go-public.sh`: secret scanning + push protection, private
+      Done (checked 2026-11-14): both are active with those rules, except
+      that neither has a bypass actor (no admin bypass). Adding one is the
+      owner's call.
+- [x] `scripts/go-public.sh`: secret scanning + push protection, private
       vulnerability reporting, approval for workflows on outside PRs (all
-      unavailable on private repositories).
+      unavailable on private repositories). Done (checked 2026-11-14):
+      all on, approval for all external contributors.
 - [ ] Publish to crates.io (`cargo xtask release` does it once public).
-- [ ] README links that 404 while private: `/releases`, raw `get.sh`.
-- [ ] Move the tracked items below into GitHub issues.
+      Not yet (checked 2026-11-14): none of `robot-overlord`,
+      `robot-overlord-core`, `robot-overlord-daemon`,
+      `robot-overlord-tui` exist on crates.io. It happens with the first
+      stable release.
+- [x] README links that 404 while private: `/releases`, raw `get.sh`.
+      Both return 200 (checked 2026-11-14).
+- [x] Move the tracked items below into GitHub issues (2026-11-14).
 
 ## After launch (tracked)
 
-- Codex daemon mode: "After launch (owed, daemon mode)" in
-  `docs/working-archive/codex-daemon.md` (one issue each).
-- Switching an existing overlord to another agent.
+Tracked as GitHub issues (filed 2026-11-14):
+
+- Codex daemon mode, from "After launch (owed, daemon mode)" in
+  `docs/working-archive/codex-daemon.md`:
+  [#40](https://github.com/robot-lord/robot-overlord/issues/40) approval
+  raised in another client,
+  [#41](https://github.com/robot-lord/robot-overlord/issues/41) `/clear`
+  and `/new`,
+  [#42](https://github.com/robot-lord/robot-overlord/issues/42) a
+  sub-agent's permission prompt,
+  [#43](https://github.com/robot-lord/robot-overlord/issues/43)
+  `send_to_session` via `codex queue`,
+  [#44](https://github.com/robot-lord/robot-overlord/issues/44) the Codex
+  overlord on the daemon,
+  [#45](https://github.com/robot-lord/robot-overlord/issues/45) Linux,
+  [#46](https://github.com/robot-lord/robot-overlord/issues/46) a daemon
+  thread's environment,
+  [#47](https://github.com/robot-lord/robot-overlord/issues/47) a daemon
+  started by hand from an rlord pane,
+  [#48](https://github.com/robot-lord/robot-overlord/issues/48) a daemon
+  started by a pane's TUI,
+  [#49](https://github.com/robot-lord/robot-overlord/issues/49) a session
+  that fell back to the pane,
+  [#50](https://github.com/robot-lord/robot-overlord/issues/50)
+  `type_message`'s read deadline.
+- [#51](https://github.com/robot-lord/robot-overlord/issues/51) Switching
+  an existing overlord to another agent.
 - Known gaps, accepted for now (Brandon, 2026-11-14: leave them):
-  - Codex subagents get every overlord tool: a `.codex/agents/*.toml`
-    can't narrow MCP tools.
-  - OpenCode subagents get `ask` (not `deny`) for tools outside their
-    list: `deny` in that format is unconfirmed.
-- A hooked Codex session whose tmux session is killed stays "working".
-- Codex Remote Control, once Codex makes it official (deferred; see
-  `docs/working-archive/codex-daemon.md`).
-- Context-window table (`models::context_window`) upkeep.
-- AUR package.
+  [#52](https://github.com/robot-lord/robot-overlord/issues/52) Codex
+  subagents get every overlord tool;
+  [#53](https://github.com/robot-lord/robot-overlord/issues/53) OpenCode
+  subagents get `ask`, not `deny`.
+- [#54](https://github.com/robot-lord/robot-overlord/issues/54) A hooked
+  Codex session whose tmux session is killed stays "working".
+- [#55](https://github.com/robot-lord/robot-overlord/issues/55) Codex
+  Remote Control, once Codex makes it official.
+- [#56](https://github.com/robot-lord/robot-overlord/issues/56)
+  Context-window table (`models::context_window`) upkeep.
+- [#57](https://github.com/robot-lord/robot-overlord/issues/57) AUR
+  package.

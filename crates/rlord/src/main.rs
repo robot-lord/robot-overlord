@@ -1489,6 +1489,20 @@ fn resolve_conversation(id: &str) -> Result<String> {
 const UPDATE_SH: &str = include_str!("../update.sh");
 
 fn update(tag: Option<String>, force: bool, channel: Option<String>) -> Result<()> {
+    // update.sh installs into ~/.local/bin: over a package's or Homebrew's
+    // copy that would leave two, the older one shadowing or shadowed.
+    if std::env::var_os("RLORD_INSTALL_DIR").is_none() {
+        let exe = std::env::current_exe().and_then(|e| e.canonicalize());
+        if let Some(how) = exe.as_deref().ok().and_then(installed_by) {
+            anyhow::bail!(
+                "this rlord ({}) came from {how}; `rlord update` only updates the copy \
+                 get.sh installs in ~/.local/bin",
+                exe.as_deref()
+                    .map(|e| e.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+    }
     let channel = channel.unwrap_or_else(|| {
         Config::load()
             .map(|c| c.update.channel)
@@ -2120,5 +2134,47 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let cut: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+/// How rlord was installed when it wasn't by get.sh or `rlord update`
+/// (which own ~/.local/bin), and how to update it that way. `exe` is the
+/// canonical path of the running binary.
+fn installed_by(exe: &std::path::Path) -> Option<&'static str> {
+    let p = exe.to_string_lossy();
+    if p.contains("/Cellar/") {
+        Some("Homebrew: update it with `brew upgrade rlord`")
+    } else if p.starts_with("/usr/bin/") {
+        Some(
+            "a .deb or .rpm package: install the newer release's package the same way \
+             (https://github.com/robot-lord/robot-overlord/releases)",
+        )
+    } else if p.contains("/.cargo/bin/") {
+        Some("cargo: update it with `cargo install robot-overlord`")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn knows_package_managed_installs() {
+        assert!(installed_by(Path::new("/usr/bin/rlord")).is_some_and(|h| h.contains(".deb")));
+        assert!(
+            installed_by(Path::new("/opt/homebrew/Cellar/rlord/1.0.0/bin/rlord"))
+                .is_some_and(|h| h.contains("brew upgrade"))
+        );
+        assert!(installed_by(Path::new("/home/me/.cargo/bin/rlord")).is_some());
+        assert_eq!(installed_by(Path::new("/home/me/.local/bin/rlord")), None);
+        assert_eq!(installed_by(Path::new("/usr/local/bin/rlord")), None);
+        // A dev symlink resolves into the checkout.
+        assert_eq!(
+            installed_by(Path::new("/src/rlord/target/release/rlord")),
+            None
+        );
     }
 }

@@ -24,5 +24,5 @@ and `docs/guide.md`. The working doc is in git history.
   the guard (`limit_at`/`asked_at` compare) is small and reviewed only.
 
 Done since: rlord's pastes no longer count as the user's prompts
-(0.23.0-dev.5; what that still owes is in `docs/working/own-prompts.md`); the `M-s`/`m-s` overlap check compares modifiers
+(0.23.0-dev.5; what that still owes is in `docs/working-archive/own-prompts.md`); the `M-s`/`m-s` overlap check compares modifiers
 case-insensitively; `continue_elsewhere` starts the target overlord once.

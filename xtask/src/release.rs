@@ -36,7 +36,7 @@
 //!
 //! Needs: gh; push access to robot-lord/homebrew-tap and `cargo login` for
 //! a stable release. `--local` also needs what `build-release linux` needs
-//! and Docker (colima) for the smoke test.
+//! (`cargo xtask install-tools`) and Docker (colima) for the smoke test.
 
 use std::path::Path;
 use std::process::Command;
@@ -47,7 +47,7 @@ use anyhow::{bail, Context, Result};
 use crate::build::{self, Platform};
 use crate::cmd::{self, gh, git, TempDir};
 use crate::version::{self, Version, REPO, TAP};
-use crate::{publish, tap};
+use crate::{publish, smoke, tap, tools};
 
 const USAGE: &str = "usage: cargo xtask release [--local [--skip-smoke] | --resume] [--dry-run]";
 
@@ -147,6 +147,10 @@ pub fn main(args: &[String]) -> Result<()> {
     if mode.builds_here() && !build::is_apple_silicon_mac() {
         bail!("build from an Apple Silicon Mac");
     }
+    if matches!(mode, Mode::StableLocal { .. }) {
+        // The same pinned packaging tools CI uses, before anything is built.
+        tools::ready()?;
+    }
 
     // Refuse anything that would make the release not match a pushed
     // commit. A dry run publishes nothing, so it only warns.
@@ -230,7 +234,7 @@ pub fn main(args: &[String]) -> Result<()> {
             // verifies them.
             write_sums(&dist)?;
             if mode == (Mode::StableLocal { smoke: true }) {
-                cmd::run(Command::new("scripts/smoke-linux.sh").arg(&dist))?;
+                smoke::run(&dist, &[])?;
             }
             let files = cmd::file_names(&dist)?;
             let mut create = gh();
@@ -555,7 +559,7 @@ fn tag_on_origin(tag: &str) -> Result<bool> {
 }
 
 /// SHA256SUMS for every file in `dist`.
-fn write_sums(dist: &Path) -> Result<()> {
+pub(crate) fn write_sums(dist: &Path) -> Result<()> {
     let files: Vec<String> = cmd::file_names(dist)?
         .into_iter()
         .filter(|f| f != "SHA256SUMS")

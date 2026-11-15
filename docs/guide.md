@@ -762,8 +762,10 @@ rlord update                 # newest stable release (then `rlord reset`s itself
 rlord update v0.18.0         # a specific one
 ```
 
-Homebrew and distro packages update the usual way (`brew upgrade`, `apt`,
-`dnf`). Development builds (`X.Y.Z-dev.N`, macOS only) come out between
+Homebrew updates the usual way (`brew upgrade rlord`). For a `.deb` or
+`.rpm`, install the newer release's package the same way you installed
+the first. `rlord update` says so for those instead of installing a second
+copy in `~/.local/bin`. Development builds (`X.Y.Z-dev.N`, macOS only) come out between
 stable releases; to get them, set in `~/.config/robot-overlord/config.toml`:
 
 ```toml
