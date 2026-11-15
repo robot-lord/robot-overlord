@@ -16,6 +16,7 @@ pub fn data_dir() -> PathBuf {
 
 /// Runtime root for the daemon socket: `$XDG_RUNTIME_DIR/robot-overlord`,
 /// falling back to the data dir (which at least has correct ownership).
+/// `cargo xtask dev-daemon` mirrors this to find the pid file.
 pub fn runtime_dir() -> PathBuf {
     env_dir("XDG_RUNTIME_DIR")
         .map(|d| d.join("robot-overlord"))

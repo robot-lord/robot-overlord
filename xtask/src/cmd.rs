@@ -176,7 +176,13 @@ pub fn gh() -> Command {
 /// cargo, without what `cargo run` set for xtask itself: a nested cargo or
 /// a cargo plugin must not take xtask's package for the one it works on.
 pub fn cargo() -> Command {
-    let mut c = Command::new("cargo");
+    cargo_plugin("cargo")
+}
+
+/// A cargo plugin binary run directly (`cargo-zigbuild zigbuild …`), with
+/// the same environment as `cargo()`.
+pub fn cargo_plugin(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut c = Command::new(program);
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy().into_owned();
         if k.starts_with("CARGO_PKG_") || k.starts_with("CARGO_MANIFEST_") {

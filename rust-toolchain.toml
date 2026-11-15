@@ -1,0 +1,11 @@
+# The Rust every build uses: CI, release builds (in CI and with `cargo
+# xtask release --local`) and local work, so they can't drift. rustup
+# installs it on first use; `rustup toolchain install` does it up front.
+# Bump it in its own PR and fix any new clippy lints there.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# The release targets (xtask/src/version.rs): macOS on Apple Silicon, and
+# the static Linux builds cross-compiled with cargo-zigbuild.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

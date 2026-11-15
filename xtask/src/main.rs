@@ -3,17 +3,21 @@
 //! Anything with real logic lives here rather than in shell: it gets the
 //! same compiler, tests, clippy and fmt as the rest of the code and behaves
 //! the same on macOS and Linux. The scripts end users run on a bare machine
-//! stay shell: get.sh (POSIX sh), install.sh and update.sh (bash).
+//! stay shell: get.sh (POSIX sh), install.sh and update.sh (bash), and
+//! smoke-in-container.sh (POSIX sh, run in a bare distro image).
 
 mod build;
 mod bump;
 mod cmd;
 mod demo_wrap;
+mod dev_daemon;
 mod preflight;
 mod publish;
 mod release;
 mod screenshots;
+mod smoke;
 mod tap;
+mod tools;
 mod version;
 
 use std::io::Write;
@@ -27,6 +31,10 @@ usage: cargo xtask <task>
       publish the version in Cargo.toml as a GitHub release, from the merged main
   build-release macos|linux DIST
       build one platform's release files into DIST
+  install-tools
+      the Linux build's packaging tools, pinned, into target/release-tools
+  smoke-linux DIST [IMAGE…]
+      install DIST with get.sh in Linux containers and run a few commands
   check-version-bump [BASE] [REV]
       fail unless REV bumps the version above BASE's (origin/main, HEAD)
   update-tap VERSION SHA256SUMS [TAP_REPO]
@@ -38,7 +46,9 @@ usage: cargo xtask <task>
   screenshots --website DIR [--out DIR]
       phone-sized screenshots of the demo into the website's public/img
   demo-wrap COLS
-      wrap the demo's stand-in screens (stdin) to COLS columns";
+      wrap the demo's stand-in screens (stdin) to COLS columns
+  dev-daemon
+      rebuild, then restart the daemon on the new binary";
 
 fn main() -> ExitCode {
     cmd::on_interrupt();
@@ -73,6 +83,9 @@ fn main() -> ExitCode {
     let result = match task.as_str() {
         "release" => release::main(rest),
         "build-release" => build::main(rest, &invoked_from),
+        "install-tools" => tools::main(rest),
+        "smoke-linux" => smoke::main(rest, &invoked_from),
+        "dev-daemon" => dev_daemon::main(rest),
         "check-version-bump" => bump::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),

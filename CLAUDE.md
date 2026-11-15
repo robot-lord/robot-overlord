@@ -201,9 +201,12 @@ Linux.
 - The exception is what end users run on a bare machine, where nothing
   else can be assumed installed: `scripts/get.sh` (POSIX `sh`),
   `scripts/install.sh` and `crates/rlord/update.sh` (bash) stay shell,
-  small and portable.
+  small and portable. So does `scripts/smoke-in-container.sh`, which
+  `cargo xtask smoke-linux` runs inside bare distro images.
 - The version rules, release targets and asset names are in
-  `xtask/src/version.rs`. A workflow or script that needs one asks xtask
+  `xtask/src/version.rs`; the packaging tools' versions and checksums in
+  `xtask/src/tools.rs` (`cargo xtask install-tools`); Rust's in
+  `rust-toolchain.toml`. A workflow or script that needs one asks xtask
   for it (release.yml takes the asset list from `release-preflight`).
   Repeated by necessity, so change them together: the rustup `targets:`
   in release.yml, and the target and tarball names the installers

@@ -3,16 +3,18 @@
 //! the release workflow and `cargo xtask release` both run it, so CI and a
 //! local build can't drift.
 //!
-//! Linux needs rustup targets x86_64/aarch64-unknown-linux-musl, zig,
-//! cargo-zigbuild, cargo-deb and cargo-generate-rpm. Writes no SHA256SUMS:
-//! the caller sums the full set of files.
+//! Linux needs the musl targets (rust-toolchain.toml installs them) and the
+//! packaging tools at their pinned versions (`cargo xtask install-tools`,
+//! xtask/src/tools.rs). Writes no SHA256SUMS: the caller sums the full set
+//! of files.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-use crate::cmd::{self, cargo, TempDir};
+use crate::cmd::{self, cargo, cargo_plugin, TempDir};
+use crate::tools;
 use crate::version::{self, Target, Version, LINUX, MAC};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +55,7 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
             if !is_apple_silicon_mac() {
                 bail!("build macOS on Apple Silicon");
             }
-            cargo_build("build", MAC)?;
+            cmd::run(cargo().arg("build").args(build_args(MAC)))?;
             let bin = binary(&target_dir, MAC);
             // The linker ad-hoc signs, but post-link strip can leave the
             // signature stale; re-sign so the binary runs on other Macs
@@ -71,21 +73,30 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
             pack(&ver, MAC, &bin, stage.path(), &dist)?;
         }
         Platform::Linux => {
+            // Only the pinned tools, run from their folder (not through
+            // cargo, which would prefer ~/.cargo/bin), with zig on PATH.
+            let bin = tools::ready()?;
+            let path = tools::path_with(&bin)?;
+            let tool = |name: &str| {
+                let mut c = cargo_plugin(bin.join(format!("cargo-{name}")));
+                c.arg(name).env("PATH", &path);
+                c
+            };
             for t in LINUX {
-                cargo_build("zigbuild", t)?;
+                cmd::run(tool("zigbuild").args(build_args(t)))?;
                 pack(&ver, t, &binary(&target_dir, t), stage.path(), &dist)?;
             }
             // Distro packages: the same static binaries, requiring tmux.
             let out_dir = format!("{}/", dist.display());
             for t in LINUX {
                 cmd::run(
-                    cargo()
-                        .args(["deb", "-p", version::PACKAGE, "--target", t.triple])
+                    tool("deb")
+                        .args(["-p", version::PACKAGE, "--target", t.triple])
                         .args(["--no-build", "--no-strip", "--output", &out_dir])
                         .stdout(Stdio::null()),
                 )?;
-                let mut rpm = cargo();
-                rpm.args(["generate-rpm", "-p", "crates/rlord", "--target", t.triple])
+                let mut rpm = tool("generate-rpm");
+                rpm.args(["-p", "crates/rlord", "--target", t.triple])
                     .args(["--auto-req", "disabled"])
                     // It doesn't ask cargo where the binary is (cargo-deb
                     // does): tell it, as the tarballs use.
@@ -104,20 +115,20 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cargo_build(subcommand: &str, target: Target) -> Result<()> {
-    cmd::run(cargo().arg(subcommand).args([
+fn build_args(target: Target) -> [&'static str; 6] {
+    [
         "--release",
         "--locked",
         "-p",
         version::PACKAGE,
         "--target",
         target.triple,
-    ]))
+    ]
 }
 
 /// Where cargo builds, as it resolves it (CARGO_TARGET_DIR,
 /// `build.target-dir`), so the files packed are the ones just built.
-fn target_dir() -> Result<PathBuf> {
+pub fn target_dir() -> Result<PathBuf> {
     let json = cmd::output(cargo().args(["metadata", "--format-version", "1", "--no-deps"]))?;
     let meta: serde_json::Value = serde_json::from_str(&json).context("reading cargo metadata")?;
     meta["target_directory"]
