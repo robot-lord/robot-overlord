@@ -1874,13 +1874,20 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
     // Calls in flight, so EOF can give them a moment to answer.
     let in_flight = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
     let spawn = |job: Box<dyn FnOnce() + Send>| {
-        let in_flight = in_flight.clone();
+        // Counts down on drop, so a panicking job still leaves.
+        struct Done(Arc<(Mutex<usize>, std::sync::Condvar)>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let (n, done) = &*self.0;
+                *n.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                done.notify_all();
+            }
+        }
         *in_flight.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        let guard = Done(in_flight.clone());
         std::thread::spawn(move || {
+            let _guard = guard;
             job();
-            let (n, done) = &*in_flight;
-            *n.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-            done.notify_all();
         });
     };
     let stdin = std::io::stdin();
@@ -1943,11 +1950,11 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         reply(&out, id, result)?;
     }
     // stdin closed. A client that half-closes still reads its replies, so
-    // give calls in flight a while to answer, but don't wait forever on one
-    // that may never return (a scan stuck on a privacy prompt).
+    // give calls in flight a few seconds to answer, but don't linger on one
+    // that may never return.
     let (n, done) = &*in_flight;
     let n = n.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = done.wait_timeout_while(n, std::time::Duration::from_secs(30), |n| *n > 0);
+    let _ = done.wait_timeout_while(n, std::time::Duration::from_secs(5), |n| *n > 0);
     Ok(())
 }
 

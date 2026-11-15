@@ -39,12 +39,6 @@ fn slow_tool_call_does_not_block_the_next() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    // A lost reply must fail the test, not hang it.
-    let pid = child.id();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(20));
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-    });
     let mut stdin = child.stdin.take().unwrap();
     for (id, name) in [(1, "slow"), (2, "fast")] {
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
@@ -54,14 +48,25 @@ fn slow_tool_call_does_not_block_the_next() {
     // stdin closes first: the slow call must still answer (a client that
     // half-closes reads on).
     drop(stdin);
-    let ids: Vec<i64> = BufReader::new(child.stdout.take().unwrap())
-        .lines()
-        .map(|l| {
-            serde_json::from_str::<Value>(&l.unwrap()).unwrap()["id"]
-                .as_i64()
-                .unwrap()
-        })
-        .collect();
+    // Read on a thread, so a lost reply fails the test instead of hanging it.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for l in BufReader::new(stdout).lines() {
+            let id = serde_json::from_str::<Value>(&l.unwrap()).unwrap()["id"].as_i64();
+            let _ = tx.send(id.unwrap());
+        }
+    });
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        match rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(id) => ids.push(id),
+            Err(_) => {
+                let _ = child.kill();
+                panic!("no reply within 20s; got {ids:?}");
+            }
+        }
+    }
     child.wait().unwrap();
     assert_eq!(ids, vec![2, 1]);
 }

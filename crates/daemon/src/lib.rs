@@ -37,13 +37,22 @@ use rlord_core::db::Db;
 use rlord_core::{paths, tmux};
 use rpc::{Request, Response};
 
+/// The repo finder's last scan (`Daemon::scanned_repos`).
+#[derive(Default)]
+struct RepoScan {
+    at: Option<std::time::Instant>,
+    repos: Vec<String>,
+    running: bool,
+}
+
 pub struct Daemon {
     db: Mutex<Db>,
     /// The user's config; `config.reload` swaps it after the key screen
     /// saves (read it with `config()`).
     config: std::sync::RwLock<Arc<Config>>,
-    /// Repo-finder scan cache (the scan walks the home dir; a minute is plenty).
-    repo_scan: Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// Repo-finder scan cache, refreshed in the background
+    /// (`scanned_repos`).
+    repo_scan: Arc<(Mutex<RepoScan>, std::sync::Condvar)>,
     /// Push stream to subscribers, one JSON line per message:
     /// `{"notify":"changed"}` — coarse tick, refetch what you display;
     /// `{"notify":"ui","cmd":{...}}` — a UI command for the TUI (set_view,
@@ -87,7 +96,7 @@ impl Daemon {
         Arc::new(Daemon {
             db: Mutex::new(db),
             config: std::sync::RwLock::new(Arc::new(config)),
-            repo_scan: Mutex::new(None),
+            repo_scan: Arc::default(),
             notify,
             ui_view: Mutex::new(Value::Null),
             pending_ui: Mutex::new(None),
@@ -196,20 +205,45 @@ impl Daemon {
         }
     }
 
-    /// Git repos under the configured roots, cached for 60s.
+    /// Git repos under the configured roots. A scan walks the disk and can
+    /// block for as long as it likes (a macOS privacy prompt, a dead network
+    /// mount), so it runs on its own thread and callers never wait on it
+    /// for long: they get the last result, refreshed in the background once
+    /// it is a minute old. Only the very first call waits, and only briefly.
     fn scanned_repos(&self) -> Vec<String> {
-        let mut cache = self.repo_scan.lock().expect("scan mutex poisoned");
-        if let Some((at, v)) = &*cache {
-            if at.elapsed() < std::time::Duration::from_secs(60) {
-                return v.clone();
-            }
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(60);
+        const FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        let (lock, done) = &*self.repo_scan;
+        let mut scan = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if scan.at.is_some_and(|at| at.elapsed() < FRESH) {
+            return scan.repos.clone();
         }
-        let v = rlord_core::git::find_repos(
-            &self.config().session.repo_roots,
-            self.config().session.repo_scan_depth,
-        );
-        *cache = Some((std::time::Instant::now(), v.clone()));
-        v
+        if !scan.running {
+            scan.running = true;
+            let state = self.repo_scan.clone();
+            let cfg = self.config();
+            std::thread::spawn(move || {
+                let repos = rlord_core::git::find_repos(
+                    &cfg.session.repo_roots,
+                    cfg.session.repo_scan_depth,
+                );
+                let (lock, done) = &*state;
+                let mut scan = lock.lock().unwrap_or_else(|e| e.into_inner());
+                *scan = RepoScan {
+                    at: Some(std::time::Instant::now()),
+                    repos,
+                    running: false,
+                };
+                done.notify_all();
+            });
+        }
+        if scan.at.is_none() {
+            scan = done
+                .wait_timeout_while(scan, FIRST_WAIT, |s| s.running)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        scan.repos.clone()
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no

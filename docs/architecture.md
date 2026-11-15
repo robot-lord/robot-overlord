@@ -1095,10 +1095,11 @@ including when the active one hits a usage limit.
   `mcp.tools` / `mcp.call`. Each `tools/list` and `tools/call` runs on its
   own thread and replies by id when done, so replies can come out of order
   and one slow tool doesn't hold up the rest; at EOF the shim waits up to
-  30s for calls in flight. Tools are defined in `daemon/src/mcp.rs` as thin,
-  param-whitelisted mappings onto daemon methods. A method that can be slow
-  (the repo scan behind `repo.find`) runs before `dispatch` takes the DB
-  lock.
+  5s for calls in flight. Tools are defined in `daemon/src/mcp.rs` as thin,
+  param-whitelisted mappings onto daemon methods. Nothing slow runs under
+  `dispatch`'s DB lock: the repo scan behind `repo.find` runs on its own
+  thread and callers get its last result (only the first call waits, up to
+  5s), since a walk can block on a macOS privacy prompt or a dead mount.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed
