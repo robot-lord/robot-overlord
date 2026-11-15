@@ -203,7 +203,8 @@ overlord go in `~/.config/robot-overlord/overlord.md`.
 rlord update
 ```
 
-Homebrew and distro packages update the usual way.
+Homebrew updates the usual way; for a `.deb` or `.rpm`, install the newer
+release's package.
 
 ## Status
 

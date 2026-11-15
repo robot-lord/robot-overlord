@@ -74,6 +74,9 @@ newer() {
 
 explicit=0
 [[ -n $tag ]] && explicit=1
+if [[ -z $tag && $channel == dev && $target != *apple-darwin ]]; then
+  echo "(dev builds are macOS only: the dev channel gets stable releases here)"
+fi
 if [[ -z $tag ]]; then
   while read -r t pre; do
     [[ -z $t ]] && continue

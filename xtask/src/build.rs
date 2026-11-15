@@ -148,6 +148,10 @@ fn pack(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) ->
     }
     cmd::run(
         Command::new("tar")
+            // No extended attributes: macOS tags files (com.apple.provenance)
+            // and GNU tar warns about every one when unpacking on Linux.
+            // (Both bsdtar and GNU tar take this.)
+            .arg("--no-xattrs")
             .arg("-czf")
             .arg(dist.join(ver.tarball(target)))
             .arg("-C")

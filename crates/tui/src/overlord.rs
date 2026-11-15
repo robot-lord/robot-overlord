@@ -28,6 +28,9 @@ pub(crate) struct Setup {
     remote: Option<bool>,
     /// Why it can't, or a caveat when it can.
     remote_why: Option<String>,
+    /// No agent that can run it is installed: the one offered is the
+    /// configured default, and launching says how to install it.
+    none_installed: bool,
     error: Option<String>,
 }
 
@@ -121,7 +124,8 @@ impl Setup {
             .as_array()
             .map(|a| a.iter().map(AgentChoice::from_status).collect())
             .unwrap_or_default();
-        if agents.is_empty() {
+        let none_installed = agents.is_empty();
+        if none_installed {
             // None found installed: offer the configured one (launching
             // says what's missing).
             agents.push(AgentChoice::from_status(&json!({
@@ -144,10 +148,14 @@ impl Setup {
             // On by default where it works: the point is to reach the
             // overlord from the Claude app.
             remote: (st["remote"]["available"] == true).then_some(true),
+            // Nothing installed: not "couldn't run claude" here, the agent
+            // row says it's missing.
             remote_why: st["remote"]["reason"]
                 .as_str()
                 .or(st["remote"]["note"].as_str())
+                .filter(|_| !none_installed)
                 .map(str::to_string),
+            none_installed,
             error: None,
         };
         // Start on the first row there is something to pick in.
@@ -579,7 +587,10 @@ impl App {
                     "Agent",
                     choice.label.clone(),
                     String::new(),
-                    if s.agents.len() > 1 {
+                    if s.none_installed {
+                        "Not installed (no agent is): `rlord agents` says how to get one."
+                            .into()
+                    } else if s.agents.len() > 1 {
                         "The coding agent that runs it. Changing it resets model and effort."
                             .into()
                     } else {
@@ -859,6 +870,20 @@ mod tests {
             s.rows(),
             [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
         );
+    }
+
+    #[test]
+    fn setup_with_no_agent_installed_offers_the_default_as_missing() {
+        // A fresh machine: the configured agent is offered, flagged as not
+        // installed, without the "couldn't run claude" Remote Control note.
+        let mut st = status(json!([]), false);
+        st["remote"]["reason"] = json!("couldn't run claude: No such file or directory");
+        let s = Setup::from_status(&st);
+        assert!(s.none_installed);
+        assert_eq!(s.choice().name, "claude");
+        assert_eq!(s.remote_why, None);
+        let s = Setup::from_status(&status(json!([claude()]), false));
+        assert!(!s.none_installed);
     }
 
     #[test]

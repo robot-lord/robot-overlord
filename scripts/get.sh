@@ -121,4 +121,8 @@ if ! tmux_ok; then
 fi
 
 say ""
+if ! has claude && ! has codex && ! has opencode; then
+  say "rlord runs Claude Code, Codex or OpenCode, and none is installed yet:"
+  say "\`rlord agents\` says how to install one."
+fi
 say "Next: run \`rlord install-hooks\` once (lets rlord see what Claude Code and Codex are doing), then \`rlord\`."
