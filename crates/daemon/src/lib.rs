@@ -13,6 +13,7 @@ pub mod own;
 pub mod profile;
 pub mod recall;
 pub mod remote;
+mod repo_scan;
 pub mod rpc;
 pub mod search;
 pub mod send;
@@ -42,8 +43,8 @@ pub struct Daemon {
     /// The user's config; `config.reload` swaps it after the key screen
     /// saves (read it with `config()`).
     config: std::sync::RwLock<Arc<Config>>,
-    /// Repo-finder scan cache (the scan walks the home dir; a minute is plenty).
-    repo_scan: Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// The repo finder's background disk scan (`repo_scan.rs`).
+    repo_scan: repo_scan::Scanner,
     /// Push stream to subscribers, one JSON line per message:
     /// `{"notify":"changed"}` — coarse tick, refetch what you display;
     /// `{"notify":"ui","cmd":{...}}` — a UI command for the TUI (set_view,
@@ -87,7 +88,7 @@ impl Daemon {
         Arc::new(Daemon {
             db: Mutex::new(db),
             config: std::sync::RwLock::new(Arc::new(config)),
-            repo_scan: Mutex::new(None),
+            repo_scan: repo_scan::Scanner::default(),
             notify,
             ui_view: Mutex::new(Value::Null),
             pending_ui: Mutex::new(None),
@@ -196,20 +197,14 @@ impl Daemon {
         }
     }
 
-    /// Git repos under the configured roots, cached for 60s.
-    fn scanned_repos(&self) -> Vec<String> {
-        let mut cache = self.repo_scan.lock().expect("scan mutex poisoned");
-        if let Some((at, v)) = &*cache {
-            if at.elapsed() < std::time::Duration::from_secs(60) {
-                return v.clone();
-            }
-        }
-        let v = rlord_core::git::find_repos(
-            &self.config().session.repo_roots,
-            self.config().session.repo_scan_depth,
-        );
-        *cache = Some((std::time::Instant::now(), v.clone()));
-        v
+    /// Git repos under the configured roots, and whether the first scan of
+    /// them is still running (`repo_scan.rs`: never blocks for long).
+    fn scanned_repos(&self, cfg: &Config) -> (Vec<String>, bool) {
+        let key = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
+        let f = self
+            .repo_scan
+            .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
+        (f.repos, f.scanning)
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -461,14 +456,22 @@ impl Daemon {
         let limited_filter = (method == "session.list")
             .then(|| take_limited(&mut params))
             .flatten();
+        // The repo scan walks the disk: never under the DB lock, or one slow
+        // folder stalls every other method.
+        // (One config read for both, so the roots reported are the ones
+        // scanned.)
+        let scanned = (method == "repo.find").then(|| {
+            let cfg = self.config();
+            (self.scanned_repos(&cfg), cfg)
+        });
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
-                let scanned = self.scanned_repos();
-                methods::repo_find(&db, &self.config(), scanned)
+                let ((repos, scanning), cfg) = scanned.expect("scanned for repo.find");
+                methods::repo_find(&db, &cfg, repos, scanning)
             }
             "session.defaults" => methods::session_defaults(&self.config()),
             "session.get" => methods::session_get(&db, &params),

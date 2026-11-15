@@ -1092,8 +1092,18 @@ including when the active one hits a usage limit.
   proposes what to import and imports what the user approves.
 - **MCP**: `rlord mcp` is a hand-rolled stdio JSON-RPC shim that speaks the
   protocol and forwards `tools/list` / `tools/call` to the daemon methods
-  `mcp.tools` / `mcp.call`. Tools are defined in `daemon/src/mcp.rs` as thin,
-  param-whitelisted mappings onto daemon methods.
+  `mcp.tools` / `mcp.call`, one request at a time, in order (calls that
+  change things and then read them back rely on it). Tools are defined in
+  `daemon/src/mcp.rs` as thin, param-whitelisted mappings onto daemon
+  methods. Since one slow call holds up the rest, the repo scan, which can
+  block indefinitely on a macOS privacy prompt or a dead mount, never runs
+  under `dispatch`'s DB lock nor makes a caller wait long. It runs on its
+  own thread (`daemon/src/repo_scan.rs`), only when a look-up asks (so a
+  missed privacy prompt never pops up unprompted); `repo.find` gets its
+  last result, with `scanning: true`
+  while roots never scanned have no result yet (waited on for a scan's
+  first 2s). One scan per set of roots at a time, and a stuck one is not
+  retried (the same folder would block the retry).
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed

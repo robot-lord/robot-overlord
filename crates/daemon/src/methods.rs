@@ -33,7 +33,8 @@ pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
 
 /// Everything the repo finder can offer: known repos (MRU, default first)
 /// followed by repos discovered under `repo_roots`, deduplicated.
-pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
+/// `scanning`: the disk scan is still running, so `scanned` may be short.
+pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>, scanning: bool) -> Result<Value> {
     let mut out = repo_list(db, cfg)?;
     let known: std::collections::HashSet<String> = out
         .as_array()
@@ -54,7 +55,10 @@ pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>) -> Result<Value> {
         .iter()
         .map(|r| expand_tilde(r))
         .collect();
-    Ok(json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth}))
+    Ok(
+        json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth,
+              "scanning": scanning}),
+    )
 }
 
 /// `[session]` as configured, plus what each agent offers: `agents` lists

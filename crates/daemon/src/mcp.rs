@@ -155,7 +155,7 @@ pub fn tools() -> Value {
                 "show": b("Take the user to the list (default true)"),
             }), &[]),
         tool("find_repos",
-            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk.",
+            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there.",
             json!({"query": s("Words that must appear in the path")}), &[]),
         tool("get_session_defaults",
             "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
@@ -485,7 +485,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Ok(json!({"repos": repos}))
+            let mut out = json!({"repos": repos});
+            if r["scanning"].as_bool() == Some(true) {
+                out["scanning"] = true.into();
+            }
+            Ok(out)
         }
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)

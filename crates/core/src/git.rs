@@ -175,21 +175,56 @@ const SKIP_DIRS: &[&str] = &[
 /// repo in `$HOME` must not hide everything under it, and vendored/nested
 /// repos are real repos too (worktrees live under hidden dirs and are
 /// skipped). Sorted, deduplicated.
+///
+/// On macOS the scan never walks into the home folders the system guards
+/// with a privacy prompt (`PROTECTED_HOME_DIRS`): reading one blocks until
+/// the user answers a dialog, so a scan of `~` sat for an hour and stalled
+/// every MCP call behind it. A root that is (or is inside) one of them is
+/// still scanned, since the user named it.
 pub fn find_repos(roots: &[String], depth: u8) -> Vec<String> {
+    let home = guarded_home();
     let mut found = Vec::new();
     for root in roots {
         let root = crate::config::expand_tilde(root);
         let Ok(root) = std::fs::canonicalize(&root) else {
             continue;
         };
-        walk(&root, depth, &mut found);
+        walk(&root, depth, home.as_deref(), &mut found);
     }
     found.sort();
     found.dedup();
     found
 }
 
-fn walk(dir: &Path, depth: u8, out: &mut Vec<String>) {
+/// Folders directly under `$HOME` that macOS guards with a privacy
+/// (TCC) prompt. `Library` is in `SKIP_DIRS` already.
+const PROTECTED_HOME_DIRS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+];
+
+/// The home folder whose `PROTECTED_HOME_DIRS` the scan stays out of: on
+/// macOS only.
+fn guarded_home() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok())
+}
+
+/// Path equality as macOS sees it (only used there, via `guarded_home`):
+/// volumes are usually case-insensitive, so a root spelled `/users/me` is
+/// still `$HOME`.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+}
+
+/// `home`: skip its `PROTECTED_HOME_DIRS` children (`guarded_home`).
+fn walk(dir: &Path, depth: u8, home: Option<&Path>, out: &mut Vec<String>) {
     if dir.join(".git").exists() {
         out.push(dir.to_string_lossy().into_owned());
     }
@@ -199,10 +234,14 @@ fn walk(dir: &Path, depth: u8, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let in_home = home.is_some_and(|h| same_path(h, dir));
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
+        if in_home && PROTECTED_HOME_DIRS.contains(&name.as_ref()) {
             continue;
         }
         // Don't follow symlinks: loops and duplicates aren't worth it.
@@ -210,7 +249,7 @@ fn walk(dir: &Path, depth: u8, out: &mut Vec<String>) {
             continue;
         };
         if ft.is_dir() {
-            walk(&entry.path(), depth - 1, out);
+            walk(&entry.path(), depth - 1, home, out);
         }
     }
 }
@@ -256,6 +295,27 @@ mod tests {
         assert!(found.contains(&canon(&b)));
         assert!(found.contains(&canon(dir.path())));
         assert_eq!(found.len(), 3, "{found:?}");
+    }
+
+    #[test]
+    fn find_repos_skips_protected_dirs_unless_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for rel in ["Documents/code/alpha", "src/beta"] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
+        }
+        let mut found = Vec::new();
+        walk(&root, 3, Some(&root), &mut found);
+        assert_eq!(found, vec![root.join("src/beta").to_string_lossy()]);
+        // Named as a root itself, it is scanned.
+        let mut found = Vec::new();
+        walk(&root.join("Documents"), 3, Some(&root), &mut found);
+        assert_eq!(
+            found,
+            vec![root.join("Documents/code/alpha").to_string_lossy()]
+        );
     }
 
     #[test]

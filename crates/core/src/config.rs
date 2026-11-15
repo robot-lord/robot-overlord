@@ -766,7 +766,7 @@ workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 repo_roots = ["~"]              # where the repo finder looks for git repos...
-repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs skipped)
+repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs and macOS ~/Documents etc. skipped)
 claude_tui = "default"          # Claude's renderer here: "default" (inline: tmux
                                 # scrollback and copy-mode search work),
                                 # "fullscreen", or "" for Claude's own setting

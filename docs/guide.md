@@ -284,7 +284,10 @@ else the repo around the current directory). `shift-enter`, `ctrl-s` or `Enter` 
 Launch launches; `Enter` on the repo line opens the repo list — default first (★), then
 every repo you've used, most recent first — plus "find another repo…" (a
 filter-as-you-type finder over every git repo under `repo_roots`, default
-`["~"]` to depth 3, MRU first; a typed path that is a repo is offered too)
+`["~"]` to depth 3, MRU first; a typed path that is a repo is offered too.
+On macOS the scan skips `~/Desktop`, `~/Documents`, `~/Downloads`,
+`~/Movies`, `~/Music` and `~/Pictures`, where reading waits on a privacy
+prompt; add one to `repo_roots` to scan it)
 and "no repo — plain folder…". `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
