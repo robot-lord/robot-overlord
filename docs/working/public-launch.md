@@ -89,7 +89,28 @@ done, in this order (decided with the user, 2026-11-12):
        terminal rendered by Playwright). Under 60 columns the list now
        goes narrow (names first, Status as its glyph, the time as its
        value) and the groups column drops its counts.
-9. [ ] A fresh-install end-to-end test.
+9. [ ] A fresh-install end-to-end test. Linux done (0.23.0-dev.23):
+       `cargo xtask fresh-install` (CONTRIBUTING has the usage) installs
+       on throwaway ubuntu:24.04, debian:stable and fedora:latest
+       containers via get.sh (local files), the .deb/.rpm, and the newest
+       stable from GitHub upgraded in place, then runs rlord as a new
+       non-root user: first run with no agent (list, setup dialog,
+       `agents`, `new` refusing), then stand-in claude/codex/opencode on
+       PATH (`install-hooks`, a session each on rlord's own tmux server,
+       stop, `reset`, `update`, package removal). All 9 runs pass, and
+       x86_64 under emulation (tarball, deb). Found and fixed: `rlord
+       reset` hung on the old daemon's zombie where PID 1 doesn't reap
+       (containers, devcontainers); upgrades kept the old daemon where
+       there is no `ps` (Debian's image); `rlord update` on a .deb/.rpm
+       (or Homebrew, cargo) install put a second, older copy in
+       ~/.local/bin; the setup dialog called a missing agent "the only
+       one installed"; get.sh now says when no agent is installed; Mac-
+       built tarballs carried xattrs GNU tar warned about. Not done:
+       **macOS fresh install** needs a clean user account, by hand.
+       Noted, not changed: `rlord overlord status` with no agent says it
+       will create one on claude/opus; under qemu the list can't start
+       (ratatui ENOSYS: emulation only); the 0.18.1 stable tarballs
+       carry those xattr warnings.
 10. [ ] 1.0.0 stable.
 
 After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as

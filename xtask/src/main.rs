@@ -9,6 +9,7 @@ mod build;
 mod bump;
 mod cmd;
 mod demo_wrap;
+mod fresh_install;
 mod preflight;
 mod publish;
 mod release;
@@ -35,6 +36,8 @@ usage: cargo xtask <task>
       publish a stable release's crates to crates.io
   release-preflight
       the release workflow's checks (run by .github/workflows/release.yml)
+  fresh-install [--dist DIR] [--offline] [--only tarball,deb,rpm,stable] [IMAGE…]
+      install rlord on fresh Linux containers and run it end to end (Docker)
   screenshots --website DIR [--out DIR]
       phone-sized screenshots of the demo into the website's public/img
   demo-wrap COLS
@@ -78,6 +81,7 @@ fn main() -> ExitCode {
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
         "screenshots" => screenshots::main(rest, &invoked_from),
+        "fresh-install" => fresh_install::main(rest, &invoked_from),
         "demo-wrap" => demo_wrap::main(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
