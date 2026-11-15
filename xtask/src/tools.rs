@@ -232,7 +232,8 @@ pub fn main(args: &[String]) -> Result<()> {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).with_context(|| format!("creating {}", bin.display()))?;
     let scratch = TempDir::new_in(Path::new("target"), "tools")?;
-    let scratch = scratch.path();
+    // Absolute: some steps run with the scratch folder as their directory.
+    let scratch = &std::path::absolute(scratch.path())?;
 
     for tool in &TOOLS {
         if installed(&bin, tool) {
