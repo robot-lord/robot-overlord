@@ -178,7 +178,16 @@ lock is released:
   else config `usage`. `SortMode::Usage` sorts by it: pinned first, most
   first, unknown last; equals stay most recently active first, reversed
   or not. The toolbar names the measure (the column may be hidden for
-  width).
+  width). Clicking the Usage header sorts or reverses like any other
+  header; it doesn't switch the measure (`:usage`, config or the
+  overlord's `set_list_view` do).
+- Known limits, accepted: the list refetches on daemon change notices,
+  so tokens and context move at turn boundaries, not mid-turn; a Claude
+  message split across a daemon restart can count twice (the last
+  counted message id isn't saved); a list of more archived sessions than
+  `STATS_CURSOR_CAP` reloads evicted positions from the DB on each list
+  (DB reads, no file reads). New model families need adding to
+  `models::context_window` (issue #56).
 
 ## tmux supervisor
 
