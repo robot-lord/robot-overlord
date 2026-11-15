@@ -1099,7 +1099,7 @@ including when the active one hits a usage limit.
   `dispatch`'s DB lock or blocks a caller: the repo scan behind
   `repo.find` runs on its own thread (`daemon/src/repo_scan.rs`) and
   callers get its last result, with `scanning: true` while roots never
-  scanned have no result yet (they are waited on for a scan's first 5s; a
+  scanned have no result yet (they are waited on for a scan's first 2s; a
   scan running over 5 minutes is presumed stuck and one retry starts, at
   most two in flight), since a walk can block on a macOS privacy prompt
   or a dead mount.

@@ -24,7 +24,7 @@ The overlord's `find_repos` hung for 66 minutes. After it, `list_groups`,
 - **Scan off the DB lock, in the background** (`daemon/src/repo_scan.rs`).
   Callers get the last result for their roots, with `scanning: true` while
   roots never scanned have no result yet.
-  - Those are waited on only during a scan's first 5s.
+  - Those are waited on only during a scan's first 2s.
   - A scan running over 5 minutes is presumed stuck: one retry starts, with
     at most two in flight.
   - A generation counter keeps only the newest scan's result.

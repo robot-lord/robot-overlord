@@ -485,10 +485,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut out = json!({"repos": repos});
             if r["scanning"].as_bool() == Some(true) {
-                return Ok(json!({"repos": repos, "scanning": true}));
+                out["scanning"] = true.into();
             }
-            Ok(json!({"repos": repos}))
+            Ok(out)
         }
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)

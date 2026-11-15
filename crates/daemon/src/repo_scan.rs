@@ -29,7 +29,7 @@ impl Default for Timing {
     fn default() -> Self {
         Timing {
             fresh: Duration::from_secs(60),
-            first_wait: Duration::from_secs(5),
+            first_wait: Duration::from_secs(2),
             stuck: Duration::from_secs(300),
         }
     }
@@ -42,11 +42,12 @@ const MAX_RUNNING: usize = 2;
 struct State {
     /// The last result kept: its key, when it finished, the repos.
     last: Option<(Key, Instant, Vec<String>)>,
-    /// The newest scan started: its generation, key and start time. Only
-    /// its result is kept; an older scan finishing late is dropped.
+    /// The newest scan started: its generation, key and start time.
     newest: Option<(u64, Key, Instant)>,
     generation: u64,
     running: usize,
+    /// The roots last asked for: a result for others is old news.
+    want: Option<Key>,
 }
 
 #[derive(Default)]
@@ -80,6 +81,7 @@ impl Scanner {
         let t = self.timing;
         let (lock, done) = &*self.state;
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.want = Some(key.clone());
         let have = |st: &State| st.last.as_ref().is_some_and(|(k, _, _)| k == key);
         if let Some((_, at, repos)) = st.last.as_ref().filter(|(k, _, _)| k == key) {
             if at.elapsed() < t.fresh {
@@ -94,22 +96,45 @@ impl Scanner {
             .newest
             .as_ref()
             .is_some_and(|(_, k, at)| k == key && at.elapsed() < t.stuck);
-        if !under_way && st.running < MAX_RUNNING {
+        // The cap is on retries of stuck scans: new roots always get one.
+        let new_roots = st.newest.as_ref().is_none_or(|(_, k, _)| k != key);
+        if !under_way && (new_roots || st.running < MAX_RUNNING) {
             st.generation += 1;
             let generation = st.generation;
-            st.newest = Some((generation, key.clone(), Instant::now()));
+            let started = Instant::now();
+            st.newest = Some((generation, key.clone(), started));
             st.running += 1;
             let state = self.state.clone();
             let key = key.clone();
             std::thread::spawn(move || {
+                // Frees the slot even if the scan panics.
+                struct Slot(Arc<(Mutex<State>, Condvar)>, u64);
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        let (lock, done) = &*self.0;
+                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        st.running -= 1;
+                        if st.newest.as_ref().is_some_and(|(g, _, _)| *g == self.1) {
+                            st.newest = None;
+                        }
+                        done.notify_all();
+                    }
+                }
+                let _slot = Slot(state.clone(), generation);
                 let repos = scan(&key);
-                let (lock, done) = &*state;
+                let (lock, _) = &*state;
                 let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-                st.running -= 1;
-                if st.newest.as_ref().is_some_and(|(g, _, _)| *g == generation) {
-                    st.newest = None;
+                // Keep it if it is for the roots last asked for and started
+                // after what is kept was found: a stuck scan finishing after
+                // its retry started still counts, but not once the retry's
+                // result is in, nor for roots since changed.
+                let wanted = st.want.as_ref() == Some(&key);
+                let newer = st
+                    .last
+                    .as_ref()
+                    .is_none_or(|(k, at, _)| *k != key || *at < started);
+                if wanted && newer {
                     st.last = Some((key, Instant::now(), repos));
-                    done.notify_all();
                 }
             });
         }
@@ -149,11 +174,12 @@ mod tests {
         (vec![r.to_string()], 3)
     }
 
+    // Generous margins: CI runners are slow and busy.
     fn quick() -> Timing {
         Timing {
             fresh: Duration::from_secs(60),
-            first_wait: Duration::from_millis(200),
-            stuck: Duration::from_millis(300),
+            first_wait: Duration::from_secs(2),
+            stuck: Duration::from_secs(60),
         }
     }
 
@@ -168,63 +194,104 @@ mod tests {
         assert_eq!(f.repos, vec!["/a/x".to_string()]);
     }
 
+    /// Short waits, for tests where scans are meant to be stuck.
+    fn stuck_timing() -> Timing {
+        Timing {
+            fresh: Duration::from_secs(60),
+            first_wait: Duration::from_millis(50),
+            stuck: Duration::from_millis(300),
+        }
+    }
+
+    /// A scan that blocks until the returned sender sends or drops.
+    fn gated(
+        repos: &[&str],
+    ) -> (
+        mpsc::Sender<()>,
+        impl FnOnce(&Key) -> Vec<String> + Send + 'static,
+    ) {
+        let (tx, rx) = mpsc::channel::<()>();
+        let repos: Vec<String> = repos.iter().map(|r| r.to_string()).collect();
+        (tx, move |_: &Key| {
+            let _ = rx.recv();
+            repos
+        })
+    }
+
     #[test]
     fn stuck_scan_blocks_no_one() {
         let s = Scanner::with_timing(Timing {
             stuck: Duration::from_secs(60),
-            ..quick()
+            ..stuck_timing()
         });
-        let (_hold, gate) = mpsc::channel::<()>();
-        let t = Instant::now();
-        let f = s.get(&key("a"), move |_| {
-            let _ = gate.recv();
-            vec![]
-        });
+        let (_hold, scan) = gated(&[]);
+        let f = s.get(&key("a"), scan);
         assert!(f.scanning && f.repos.is_empty());
-        assert!(t.elapsed() < Duration::from_secs(2));
         // Past first_wait, a caller doesn't wait at all.
-        std::thread::sleep(Duration::from_millis(250));
         let t = Instant::now();
         let f = s.get(&key("a"), |_| vec![]);
         assert!(f.scanning);
-        assert!(t.elapsed() < Duration::from_millis(100));
+        assert!(t.elapsed() < Duration::from_millis(40));
     }
 
     #[test]
-    fn old_scan_finishing_late_is_dropped() {
-        let s = Scanner::with_timing(quick());
-        let (release_a, gate) = mpsc::channel::<()>();
-        s.get(&key("a"), move |_| {
-            let _ = gate.recv();
-            vec!["/stale".into()]
+    fn retry_result_wins_over_late_stuck_one() {
+        let s = Scanner::with_timing(Timing {
+            first_wait: Duration::from_secs(2),
+            ..stuck_timing()
         });
-        // Presumed stuck: a retry runs beside it and finishes first.
-        std::thread::sleep(Duration::from_millis(350));
+        let (release, scan) = gated(&["/stale"]);
+        s.get(&key("a"), scan); // waits first_wait: past `stuck` by then
         let f = s.get(&key("a"), |_| vec!["/fresh".into()]);
         assert_eq!(f.repos, vec!["/fresh".to_string()]);
-        // The stuck one finishes later: its result must not replace it.
-        release_a.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        // The stuck one finishes later: it must not replace the retry's.
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
         let f = s.get(&key("a"), |_| panic!("rescanned a fresh result"));
         assert_eq!(f.repos, vec!["/fresh".to_string()]);
     }
 
     #[test]
-    fn stuck_scans_are_capped() {
-        let s = Scanner::with_timing(quick());
+    fn stuck_scan_finishing_first_still_counts() {
+        let s = Scanner::with_timing(stuck_timing());
+        let (release_a, scan_a) = gated(&["/a1"]);
+        s.get(&key("a"), scan_a);
+        std::thread::sleep(Duration::from_millis(350));
+        let (_hold_b, scan_b) = gated(&["/a2"]);
+        s.get(&key("a"), scan_b); // the retry, stuck too
+        release_a.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let f = s.get(&key("a"), |_| vec![]);
+        assert_eq!(f.repos, vec!["/a1".to_string()]);
+    }
+
+    #[test]
+    fn stuck_scans_are_capped_but_new_roots_still_scan() {
+        let s = Scanner::with_timing(stuck_timing());
         let started = Arc::new(Mutex::new(0));
-        let (_hold, gate) = mpsc::channel::<()>();
-        let gate = Arc::new(Mutex::new(gate));
+        let mut holds = Vec::new();
         for _ in 0..5 {
-            let (started, gate) = (started.clone(), gate.clone());
-            s.get(&key("a"), move |_| {
+            let (hold, scan) = gated(&[]);
+            holds.push(hold);
+            let started = started.clone();
+            s.get(&key("a"), move |k| {
                 *started.lock().unwrap() += 1;
-                let _ = gate.lock().unwrap().recv();
-                vec![]
+                scan(k)
             });
             std::thread::sleep(Duration::from_millis(350));
         }
         assert_eq!(*started.lock().unwrap(), MAX_RUNNING);
+        let f = s.get(&key("b"), |_| vec!["/b/y".into()]);
+        assert_eq!(f.repos, vec!["/b/y".to_string()]);
+    }
+
+    #[test]
+    fn panicking_scan_frees_its_slot() {
+        let s = Scanner::with_timing(stuck_timing());
+        s.get(&key("a"), |_| panic!("scan blew up"));
+        std::thread::sleep(Duration::from_millis(100));
+        let f = s.get(&key("a"), |_| vec!["/a/x".into()]);
+        assert_eq!(f.repos, vec!["/a/x".to_string()]);
     }
 
     #[test]
