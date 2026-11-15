@@ -11,11 +11,10 @@ use serde_json::{json, Value};
 /// answers on its own, so the fast one's reply comes first.
 #[test]
 fn slow_tool_call_does_not_block_the_next() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let sock = std::env::temp_dir().join(format!("rlord-mcp-{}-{nanos}.sock", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rlmcp{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("d.sock");
+    let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
@@ -48,17 +47,17 @@ fn slow_tool_call_does_not_block_the_next() {
                          "params": {"name": name, "arguments": {}}});
         writeln!(stdin, "{msg}").unwrap();
     }
-    // Closing stdin must still let the slow call answer before exit.
-    drop(stdin);
     let ids: Vec<i64> = BufReader::new(child.stdout.take().unwrap())
         .lines()
+        .take(2)
         .map(|l| {
             serde_json::from_str::<Value>(&l.unwrap()).unwrap()["id"]
                 .as_i64()
                 .unwrap()
         })
         .collect();
+    drop(stdin);
     child.wait().unwrap();
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(ids, vec![2, 1]);
 }

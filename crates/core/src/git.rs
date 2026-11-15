@@ -218,6 +218,16 @@ fn protected_home_dirs() -> Vec<PathBuf> {
     PROTECTED_HOME_DIRS.iter().map(|d| home.join(d)).collect()
 }
 
+/// Path equality as the filesystem sees it: macOS volumes are usually
+/// case-insensitive, so a root spelled `/users/me` still meets `~/Documents`.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
 fn walk(dir: &Path, depth: u8, skip: &[PathBuf], out: &mut Vec<String>) {
     if dir.join(".git").exists() {
         out.push(dir.to_string_lossy().into_owned());
@@ -239,7 +249,7 @@ fn walk(dir: &Path, depth: u8, skip: &[PathBuf], out: &mut Vec<String>) {
             continue;
         };
         let path = entry.path();
-        if ft.is_dir() && !skip.contains(&path) {
+        if ft.is_dir() && !skip.iter().any(|s| same_path(s, &path)) {
             walk(&path, depth - 1, skip, out);
         }
     }

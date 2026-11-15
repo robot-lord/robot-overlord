@@ -1589,11 +1589,16 @@ fn print_search(v: &Value) {
 }
 
 fn call(method: &str, params: Value) -> Result<Value> {
-    static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // A mutex, not a OnceLock check: `rlord mcp` calls this from several
+    // threads at once, and two must not start or restart the daemon.
+    static ENSURED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
     let socket = paths::socket_path();
-    if ENSURED.get().is_none() {
-        autostart::ensure_daemon(&socket)?;
-        ENSURED.set(()).ok();
+    {
+        let mut ensured = ENSURED.lock().unwrap_or_else(|e| e.into_inner());
+        if !*ensured {
+            autostart::ensure_daemon(&socket)?;
+            *ensured = true;
+        }
     }
     client_call(&socket, method, params)
 }
@@ -1834,9 +1839,9 @@ fn restart_daemon() -> Result<()> {
 /// Without `overlord` it is read-only (the daemon serves and accepts only
 /// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
 ///
-/// Each `tools/call` runs on its own thread and answers when done, in any
-/// order (JSON-RPC matches replies by id): one slow tool must not hold up
-/// the calls queued behind it.
+/// Each `tools/call` and `tools/list` runs on its own thread and answers
+/// when done, in any order (JSON-RPC matches replies by id): one slow tool
+/// must not hold up the calls queued behind it.
 fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
     use std::sync::{Arc, Mutex};
@@ -1866,7 +1871,6 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         writeln!(out, "{resp}")?;
         out.flush()
     };
-    let mut running: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -1881,10 +1885,19 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         };
         let method = msg["method"].as_str().unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
+        if method == "tools/list" {
+            let (call, out) = (call.clone(), out.clone());
+            std::thread::spawn(move || {
+                let result = call("mcp.tools", json!({"overlord": overlord}))
+                    .map(|t| json!({"tools": t}))
+                    .map_err(|e| (-32603, format!("{e:#}")));
+                let _ = reply(&out, id, result);
+            });
+            continue;
+        }
         if method == "tools/call" {
             let (call, out, caller) = (call.clone(), out.clone(), caller.clone());
-            running.retain(|t| !t.is_finished());
-            running.push(std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let r = call(
                     "mcp.call",
                     json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
@@ -1898,7 +1911,7 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
                 });
                 // stdout gone means the client left; nothing to tell it.
                 let _ = reply(&out, id, result);
-            }));
+            });
             continue;
         }
         let result: std::result::Result<Value, (i64, String)> = match method {
@@ -1913,17 +1926,12 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
                 },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
-                .map(|t| json!({"tools": t}))
-                .map_err(|e| (-32603, format!("{e:#}"))),
             other => Err((-32601, format!("method not found: {other}"))),
         };
         reply(&out, id, result)?;
     }
-    // stdin closed: let calls in flight answer before exiting.
-    for t in running {
-        let _ = t.join();
-    }
+    // stdin closed: the client is gone, so calls still in flight have no
+    // one to answer. Exit rather than wait on one that may never return.
     Ok(())
 }
 
