@@ -220,7 +220,7 @@ fn guarded_home() -> Option<PathBuf> {
 /// case-insensitive, so a root spelled `/users/me` is still `$HOME`.
 fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(target_os = "macos") {
-        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
     } else {
         a == b
     }

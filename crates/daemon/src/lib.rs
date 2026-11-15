@@ -40,10 +40,15 @@ use rpc::{Request, Response};
 /// The repo finder's last scan (`Daemon::scanned_repos`).
 #[derive(Default)]
 struct RepoScan {
+    /// What the last finished scan covered (roots, depth), when, and found.
+    key: Option<ScanKey>,
     at: Option<std::time::Instant>,
     repos: Vec<String>,
-    running: bool,
+    /// The scan in progress, if any, and when it started.
+    running: Option<(ScanKey, std::time::Instant)>,
 }
+
+type ScanKey = (Vec<String>, u8);
 
 pub struct Daemon {
     db: Mutex<Db>,
@@ -205,45 +210,58 @@ impl Daemon {
         }
     }
 
-    /// Git repos under the configured roots. A scan walks the disk and can
-    /// block for as long as it likes (a macOS privacy prompt, a dead network
-    /// mount), so it runs on its own thread and callers never wait on it
-    /// for long: they get the last result, refreshed in the background once
-    /// it is a minute old. Only the very first call waits, and only briefly.
-    fn scanned_repos(&self) -> Vec<String> {
+    /// Git repos under the configured roots, and whether a scan is still
+    /// running. A scan walks the disk and can block for as long as it
+    /// likes (a macOS privacy prompt, a dead network mount), so it runs on
+    /// its own thread and callers never wait on it for long: they get the
+    /// last result, refreshed in the background once it is a minute old.
+    /// Only a scan of roots never scanned before is waited on, and only in
+    /// its first 5s. A change of roots starts a new scan even if an old one
+    /// is stuck.
+    fn scanned_repos(&self) -> (Vec<String>, bool) {
         const FRESH: std::time::Duration = std::time::Duration::from_secs(60);
         const FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        let cfg = self.config();
+        let key: ScanKey = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
         let (lock, done) = &*self.repo_scan;
         let mut scan = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if scan.at.is_some_and(|at| at.elapsed() < FRESH) {
-            return scan.repos.clone();
+        let ours = scan.key.as_ref() == Some(&key);
+        if ours && scan.at.is_some_and(|at| at.elapsed() < FRESH) {
+            return (scan.repos.clone(), false);
         }
-        if !scan.running {
-            scan.running = true;
+        if scan.running.as_ref().map(|(k, _)| k) != Some(&key) {
+            scan.running = Some((key.clone(), std::time::Instant::now()));
             let state = self.repo_scan.clone();
-            let cfg = self.config();
+            let key = key.clone();
             std::thread::spawn(move || {
-                let repos = rlord_core::git::find_repos(
-                    &cfg.session.repo_roots,
-                    cfg.session.repo_scan_depth,
-                );
+                let repos = rlord_core::git::find_repos(&key.0, key.1);
                 let (lock, done) = &*state;
                 let mut scan = lock.lock().unwrap_or_else(|e| e.into_inner());
-                *scan = RepoScan {
-                    at: Some(std::time::Instant::now()),
-                    repos,
-                    running: false,
-                };
+                if scan.running.as_ref().map(|(k, _)| k) == Some(&key) {
+                    scan.running = None;
+                }
+                scan.key = Some(key);
+                scan.at = Some(std::time::Instant::now());
+                scan.repos = repos;
                 done.notify_all();
             });
         }
-        if scan.at.is_none() {
+        if !ours {
+            let started = scan.running.as_ref().map(|(_, at)| *at);
+            let left = started.map_or(std::time::Duration::ZERO, |at| {
+                FIRST_WAIT.saturating_sub(at.elapsed())
+            });
             scan = done
-                .wait_timeout_while(scan, FIRST_WAIT, |s| s.running)
+                .wait_timeout_while(scan, left, |s| s.key.as_ref() != Some(&key))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        scan.repos.clone()
+        let running = scan.running.as_ref().is_some_and(|(k, _)| k == &key);
+        if scan.key.as_ref() == Some(&key) {
+            (scan.repos.clone(), running)
+        } else {
+            (Vec::new(), running)
+        }
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -503,7 +521,10 @@ impl Daemon {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
-            "repo.find" => methods::repo_find(&db, &self.config(), scanned.unwrap_or_default()),
+            "repo.find" => {
+                let (repos, scanning) = scanned.unwrap_or_default();
+                methods::repo_find(&db, &self.config(), repos, scanning)
+            }
             "session.defaults" => methods::session_defaults(&self.config()),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),

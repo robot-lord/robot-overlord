@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-/// A slow tool must not hold up the call sent after it: each `tools/call`
+/// A slow look-up must not hold up the call sent after it: each `tools/call`
 /// answers on its own, so the fast one's reply comes first.
 #[test]
 fn slow_tool_call_does_not_block_the_next() {
@@ -22,7 +22,7 @@ fn slow_tool_call_does_not_block_the_next() {
                 BufReader::new(&conn).read_line(&mut line).unwrap();
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let name = req["params"]["name"].as_str().unwrap_or("").to_string();
-                if name == "slow" {
+                if name == "find_repos" {
                     std::thread::sleep(Duration::from_secs(2));
                 }
                 let resp = json!({"id": req["id"], "result": {"tool": name}});
@@ -40,7 +40,7 @@ fn slow_tool_call_does_not_block_the_next() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for (id, name) in [(1, "slow"), (2, "fast")] {
+    for (id, name) in [(1, "find_repos"), (2, "list_sessions")] {
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
                          "params": {"name": name, "arguments": {}}});
         writeln!(stdin, "{msg}").unwrap();

@@ -1871,6 +1871,8 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         writeln!(out, "{resp}")?;
         out.flush()
     };
+    // Taken by tools that change things, so those run in order.
+    let serial = Arc::new(Mutex::new(()));
     // Calls in flight, so EOF can give them a moment to answer.
     let in_flight = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
     let spawn = |job: Box<dyn FnOnce() + Send>| {
@@ -1916,7 +1918,14 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         }
         if method == "tools/call" {
             let (call, out, caller) = (call.clone(), out.clone(), caller.clone());
+            let serial = serial.clone();
             spawn(Box::new(move || {
+                // Look-ups run side by side; changes run one at a time, in
+                // the order sent, as they did before calls went parallel
+                // (several are multi-step: create, then go to it).
+                let name = params["name"].as_str().unwrap_or("");
+                let _turn = (!rlord_daemon::mcp::READ_ONLY_TOOLS.contains(&name))
+                    .then(|| serial.lock().unwrap_or_else(|e| e.into_inner()));
                 let r = call(
                     "mcp.call",
                     json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
@@ -1950,12 +1959,15 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         reply(&out, id, result)?;
     }
     // stdin closed. A client that half-closes still reads its replies, so
-    // give calls in flight a few seconds to answer, but don't linger on one
-    // that may never return.
+    // give calls in flight a while to answer, but don't linger on one that
+    // may never return.
     let (n, done) = &*in_flight;
     let n = n.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = done.wait_timeout_while(n, std::time::Duration::from_secs(5), |n| *n > 0);
-    Ok(())
+    let n = done.wait_timeout_while(n, std::time::Duration::from_secs(15), |n| *n > 0);
+    drop(n);
+    // Hold stdout as we exit, so no reply is cut off mid-line.
+    let _out = out.lock().unwrap_or_else(|e| e.into_inner());
+    std::process::exit(0)
 }
 
 /// `nav next|prev`: move to the neighbouring live session in list order.
