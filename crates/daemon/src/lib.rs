@@ -209,7 +209,7 @@ impl Daemon {
 
     /// Start the repo scan in the background (daemon start, config reload),
     /// so the first look-up has a result.
-    fn prefetch_repos(&self) {
+    pub fn prefetch_repos(&self) {
         self.repo_scan
             .prefetch(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
     }
@@ -301,10 +301,6 @@ impl Daemon {
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         tracing::info!("daemon listening");
-        // (Not in unit tests: their config scans the real home folder.)
-        if !cfg!(test) {
-            self.prefetch_repos();
-        }
         loop {
             let (stream, _addr) = listener.accept().await?;
             let daemon = self.clone();

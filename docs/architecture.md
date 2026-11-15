@@ -1101,8 +1101,8 @@ including when the active one hits a usage limit.
   own thread (`daemon/src/repo_scan.rs`), starting with the daemon and on
   a config reload; `repo.find` gets its last result, with `scanning: true`
   while roots never scanned have no result yet (waited on for a scan's
-  first 2s). A scan running over 5 minutes is presumed stuck and one
-  retry starts beside it.
+  first 2s). One scan per set of roots at a time, and a stuck one is not
+  retried (the same folder would block the retry).
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed

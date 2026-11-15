@@ -1658,6 +1658,8 @@ fn run_daemon() -> Result<()> {
         // Where each agent's command is (may ask the login shell): known
         // before the first launch needs it.
         std::thread::spawn(rlord_core::agents::install::warm);
+        // The repo finder's disk scan, so the first look-up has a result.
+        daemon.prefetch_repos();
         let listener = Daemon::bind(&paths::socket_path())?;
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;

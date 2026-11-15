@@ -25,9 +25,9 @@ The overlord's `find_repos` hung for 66 minutes. After it, `list_groups`,
   Callers get the last result for their roots, with `scanning: true` while
   roots never scanned have no result yet.
   - Those are waited on only during a scan's first 2s.
-  - A scan running over 5 minutes is presumed stuck: one retry starts, with
-    at most two in flight.
-  - A generation counter keeps only the newest scan's result.
+  - One scan per set of roots at a time. A stuck one is not retried,
+    since whatever blocked it would block the retry too.
+  - Results are kept per set of roots.
 - `find_repos` (MCP) and the TUI finder report "still scanning".
 - **Parallel MCP calls were tried and reverted.** Ordering broke: a write and
   then a read could swap, and so could a create and then a go-to. The shim
@@ -60,6 +60,13 @@ The overlord's `find_repos` hung for 66 minutes. After it, `list_groups`,
    granted. The finder shows "skipped ~/Documents (macOS asks permission)…".
 
 ## Owed and open
+
+- **A stuck walk is never retried.** A dead mount or an unanswered prompt
+  keeps those roots on their last result until the daemon restarts. Plan
+  item 4 (`st_dev`, `/Volumes`) keeps walks out of such places. A
+  per-folder time limit would skip them. Revisit if it bites.
+- **The TUI finder reads `repo.find` once.** While `scanning`, it says
+  "reopen to refresh" instead of re-polling.
 
 - **MCP cancellation.** A cancelled or timed-out MCP call isn't
   passed on (`notifications/cancelled` is dropped), so the daemon can't abort
