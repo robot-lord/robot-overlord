@@ -174,6 +174,7 @@ impl Daemon {
         self.bind_nav_keys();
         profile::sync_all(self, false);
         overlord::style(&self.db(), &self.config());
+        self.prefetch_repos();
         Ok(json!({"reloaded": true}))
     }
 
@@ -200,12 +201,22 @@ impl Daemon {
     /// Git repos under the configured roots, and whether the first scan of
     /// them is still running (`repo_scan.rs`: never blocks for long).
     fn scanned_repos(&self) -> (Vec<String>, bool) {
-        let cfg = self.config();
-        let key = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
         let f = self
             .repo_scan
-            .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
+            .get(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
         (f.repos, f.scanning)
+    }
+
+    /// Start the repo scan in the background (daemon start, config reload),
+    /// so the first look-up has a result.
+    fn prefetch_repos(&self) {
+        self.repo_scan
+            .prefetch(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
+    }
+
+    fn scan_key(&self) -> (Vec<String>, u8) {
+        let cfg = self.config();
+        (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth)
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -290,6 +301,10 @@ impl Daemon {
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> Result<()> {
         tracing::info!("daemon listening");
+        // (Not in unit tests: their config scans the real home folder.)
+        if !cfg!(test) {
+            self.prefetch_repos();
+        }
         loop {
             let (stream, _addr) = listener.accept().await?;
             let daemon = self.clone();

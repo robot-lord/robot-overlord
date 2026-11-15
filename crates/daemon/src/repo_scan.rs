@@ -35,19 +35,37 @@ impl Default for Timing {
     }
 }
 
-/// Scans in flight at most: one, plus one retry beside a stuck one.
-const MAX_RUNNING: usize = 2;
+/// Scans of the same roots in flight at most: one, plus one retry beside a
+/// stuck one.
+const MAX_RETRY: usize = 2;
+/// Scans in flight at most, of any roots (a stuck walk keeps its thread).
+const MAX_RUNNING: usize = 4;
+
+/// A finished scan's result.
+struct Last {
+    key: Key,
+    /// When its scan started (which result is newer) and finished (how
+    /// fresh it is).
+    started: Instant,
+    finished: Instant,
+    repos: Vec<String>,
+}
 
 #[derive(Default)]
 struct State {
-    /// The last result kept: its key, when it finished, the repos.
-    last: Option<(Key, Instant, Vec<String>)>,
+    last: Option<Last>,
     /// The newest scan started: its generation, key and start time.
     newest: Option<(u64, Key, Instant)>,
     generation: u64,
     running: usize,
     /// The roots last asked for: a result for others is old news.
     want: Option<Key>,
+}
+
+impl State {
+    fn result_for(&self, key: &Key) -> Option<&Last> {
+        self.last.as_ref().filter(|l| &l.key == key)
+    }
 }
 
 #[derive(Default)]
@@ -63,6 +81,8 @@ pub struct Found {
     /// empty for now.
     pub scanning: bool,
 }
+
+type Shared = Arc<(Mutex<State>, Condvar)>;
 
 impl Scanner {
     #[cfg(test)]
@@ -81,64 +101,8 @@ impl Scanner {
         let t = self.timing;
         let (lock, done) = &*self.state;
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-        st.want = Some(key.clone());
-        let have = |st: &State| st.last.as_ref().is_some_and(|(k, _, _)| k == key);
-        if let Some((_, at, repos)) = st.last.as_ref().filter(|(k, _, _)| k == key) {
-            if at.elapsed() < t.fresh {
-                return Found {
-                    repos: repos.clone(),
-                    scanning: false,
-                };
-            }
-        }
-        // Start a scan unless one for this key is under way and not stuck.
-        let under_way = st
-            .newest
-            .as_ref()
-            .is_some_and(|(_, k, at)| k == key && at.elapsed() < t.stuck);
-        // The cap is on retries of stuck scans: new roots always get one.
-        let new_roots = st.newest.as_ref().is_none_or(|(_, k, _)| k != key);
-        if !under_way && (new_roots || st.running < MAX_RUNNING) {
-            st.generation += 1;
-            let generation = st.generation;
-            let started = Instant::now();
-            st.newest = Some((generation, key.clone(), started));
-            st.running += 1;
-            let state = self.state.clone();
-            let key = key.clone();
-            std::thread::spawn(move || {
-                // Frees the slot even if the scan panics.
-                struct Slot(Arc<(Mutex<State>, Condvar)>, u64);
-                impl Drop for Slot {
-                    fn drop(&mut self) {
-                        let (lock, done) = &*self.0;
-                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        st.running -= 1;
-                        if st.newest.as_ref().is_some_and(|(g, _, _)| *g == self.1) {
-                            st.newest = None;
-                        }
-                        done.notify_all();
-                    }
-                }
-                let _slot = Slot(state.clone(), generation);
-                let repos = scan(&key);
-                let (lock, _) = &*state;
-                let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-                // Keep it if it is for the roots last asked for and started
-                // after what is kept was found: a stuck scan finishing after
-                // its retry started still counts, but not once the retry's
-                // result is in, nor for roots since changed.
-                let wanted = st.want.as_ref() == Some(&key);
-                let newer = st
-                    .last
-                    .as_ref()
-                    .is_none_or(|(k, at, _)| *k != key || *at < started);
-                if wanted && newer {
-                    st.last = Some((key, Instant::now(), repos));
-                }
-            });
-        }
-        if !have(&st) {
+        self.refresh(&mut st, key, scan);
+        if st.result_for(key).is_none() {
             let started = st
                 .newest
                 .as_ref()
@@ -148,13 +112,13 @@ impl Scanner {
                 t.first_wait.saturating_sub(at.elapsed())
             });
             st = done
-                .wait_timeout_while(st, left, |st| !have(st))
+                .wait_timeout_while(st, left, |st| st.result_for(key).is_none())
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
-        match st.last.as_ref().filter(|(k, _, _)| k == key) {
-            Some((_, _, repos)) => Found {
-                repos: repos.clone(),
+        match st.result_for(key) {
+            Some(l) => Found {
+                repos: l.repos.clone(),
                 scanning: false,
             },
             None => Found {
@@ -162,6 +126,91 @@ impl Scanner {
                 scanning: true,
             },
         }
+    }
+
+    /// Start a scan of `key` if one is due, without waiting for it (at
+    /// daemon start and after a config reload, so the first look-up has a
+    /// result).
+    pub fn prefetch<F>(&self, key: &Key, scan: F)
+    where
+        F: FnOnce(&Key) -> Vec<String> + Send + 'static,
+    {
+        let mut st = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.refresh(&mut st, key, scan);
+    }
+
+    /// Note `key` as wanted and start a scan of it unless its result is
+    /// fresh, a scan of it is under way and not stuck, or the caps are hit.
+    fn refresh<F>(&self, st: &mut State, key: &Key, scan: F)
+    where
+        F: FnOnce(&Key) -> Vec<String> + Send + 'static,
+    {
+        let t = self.timing;
+        st.want = Some(key.clone());
+        if st
+            .result_for(key)
+            .is_some_and(|l| l.finished.elapsed() < t.fresh)
+        {
+            return;
+        }
+        let under_way = st
+            .newest
+            .as_ref()
+            .is_some_and(|(_, k, at)| k == key && at.elapsed() < t.stuck);
+        let retry = st.newest.as_ref().is_some_and(|(_, k, _)| k == key);
+        let cap = if retry { MAX_RETRY } else { MAX_RUNNING };
+        if under_way || st.running >= cap {
+            return;
+        }
+        st.generation += 1;
+        let generation = st.generation;
+        let started = Instant::now();
+        let before = st.newest.replace((generation, key.clone(), started));
+        st.running += 1;
+        let state = self.state.clone();
+        let k = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("repo-scan".into())
+            .spawn(move || run(state, generation, started, k, scan));
+        if spawned.is_err() {
+            st.running -= 1;
+            st.newest = before;
+        }
+    }
+}
+
+/// One scan, on its own thread: keep the result if it is for the roots last
+/// asked for and its scan started after the kept one's (a stuck scan that
+/// finishes late still counts until a later-started scan's result is in).
+fn run<F>(state: Shared, generation: u64, started: Instant, key: Key, scan: F)
+where
+    F: FnOnce(&Key) -> Vec<String>,
+{
+    // Frees the slot even if the scan panics.
+    struct Slot(Shared, u64);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            let (lock, done) = &*self.0;
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.running -= 1;
+            if st.newest.as_ref().is_some_and(|(g, _, _)| *g == self.1) {
+                st.newest = None;
+            }
+            done.notify_all();
+        }
+    }
+    let _slot = Slot(state.clone(), generation);
+    let repos = scan(&key);
+    let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let wanted = st.want.as_ref() == Some(&key);
+    let newer = st.result_for(&key).is_none_or(|l| l.started < started);
+    if wanted && newer {
+        st.last = Some(Last {
+            key,
+            started,
+            finished: Instant::now(),
+            repos,
+        });
     }
 }
 
@@ -266,6 +315,31 @@ mod tests {
     }
 
     #[test]
+    fn retry_result_replaces_stuck_one_that_finished_first() {
+        let s = Scanner::with_timing(stuck_timing());
+        let (release_a, scan_a) = gated(&["/old"]);
+        s.get(&key("a"), scan_a);
+        std::thread::sleep(Duration::from_millis(350));
+        let (release_b, scan_b) = gated(&["/new"]);
+        s.get(&key("a"), scan_b);
+        release_a.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        release_b.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let f = s.get(&key("a"), |_| panic!("rescanned a fresh result"));
+        assert_eq!(f.repos, vec!["/new".to_string()]);
+    }
+
+    #[test]
+    fn prefetch_fills_the_first_look_up() {
+        let s = Scanner::with_timing(stuck_timing());
+        s.prefetch(&key("a"), |_| vec!["/a/x".into()]);
+        std::thread::sleep(Duration::from_millis(200));
+        let f = s.get(&key("a"), |_| panic!("rescanned a fresh result"));
+        assert_eq!(f.repos, vec!["/a/x".to_string()]);
+    }
+
+    #[test]
     fn stuck_scans_are_capped_but_new_roots_still_scan() {
         let s = Scanner::with_timing(stuck_timing());
         let started = Arc::new(Mutex::new(0));
@@ -280,7 +354,7 @@ mod tests {
             });
             std::thread::sleep(Duration::from_millis(350));
         }
-        assert_eq!(*started.lock().unwrap(), MAX_RUNNING);
+        assert_eq!(*started.lock().unwrap(), MAX_RETRY);
         let f = s.get(&key("b"), |_| vec!["/b/y".into()]);
         assert_eq!(f.repos, vec!["/b/y".to_string()]);
     }
