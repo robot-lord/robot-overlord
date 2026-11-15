@@ -17,18 +17,21 @@ done, in this order (decided with the user, 2026-11-12):
 3. [x] CI release builds: macOS on a Mac runner, Linux on a Linux runner
        (0.23.0-dev.6; `.github/workflows/release.yml`, shared
        `cargo xtask build-release`). Tap and crates.io stay local; moving
-       their tokens into repo secrets is owed. Also owed (PR #25 review):
-       toolchain parity for `--local` (a `rust-toolchain.toml`, pinned
-       zig/cargo-zigbuild/cargo-deb/cargo-generate-rpm versions in
-       CONTRIBUTING to match release.yml); prebuilt packaging tools in CI
-       instead of `cargo install` on every run.
+       their tokens into repo secrets is owed. Toolchain parity done
+       (0.23.0-dev.24): `rust-toolchain.toml` pins Rust for CI, release
+       and local builds; `cargo xtask install-tools` (`xtask/src/tools.rs`)
+       pins zig, cargo-zigbuild, cargo-deb and cargo-generate-rpm, prebuilt
+       and checksum-checked where upstream ships a binary
+       (cargo-generate-rpm is still `cargo install`ed: no upstream
+       binaries).
 4. [x] Release automation in `cargo xtask` (0.23.0-dev.8; the `xtask`
        crate): release, build, tap, crates.io and the version-bump check
        are Rust with unit tests; the version rules, targets and asset
        names are in `xtask/src/version.rs` only. Shell is left for simple
        glue and for what users run on a bare machine (`get.sh`,
-       `install.sh`, `update.sh`). Owed: `scripts/smoke-linux.sh` and
-       `scripts/dev-daemon.sh` still hold some logic in bash; the
+       `install.sh`, `update.sh`). The smoke test and dev loop moved too
+       (0.23.0-dev.24: `cargo xtask smoke-linux`, `cargo xtask
+       dev-daemon`; the scripts are thin wrappers). Owed: the
        stable paths of `cargo xtask release` (CI, `--resume`, `--local`,
        tap, crates.io) have unit tests and a dry run but get their first
        real run at 1.0.0. SIGTERM ends xtask without its cleanup

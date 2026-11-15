@@ -28,8 +28,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 /// finish starting, short enough that a wedged one fails fast.
 const LOCK_HOLDER_GRACE: Duration = Duration::from_secs(3);
 
-/// Where the daemon logs (shared with the service units and dev-daemon.sh).
-/// macOS: `~/Library/Logs/rlordd.log`. Elsewhere:
+/// Where the daemon logs (shared with the service units and `cargo xtask
+/// dev-daemon`, which mirrors this). macOS: `~/Library/Logs/rlordd.log`. Elsewhere:
 /// `$XDG_STATE_HOME/robot-overlord/rlordd.log` (default `~/.local/state`).
 pub fn log_path() -> PathBuf {
     let env = |v: &str| {

@@ -12,8 +12,8 @@
 //!
 //! - `--dist DIR`: release files already built (the Linux tarballs and
 //!   packages; SHA256SUMS is written if missing). Default: build them with
-//!   `build-release linux` (zig, cargo-zigbuild, cargo-deb,
-//!   cargo-generate-rpm).
+//!   `build-release linux` (the pinned packaging tools from `cargo xtask
+//!   install-tools`).
 //! - `--offline`: no GitHub: skips `stable` and the `rlord update` check.
 //! - `--only tarball,deb,rpm,stable`: just those ways.
 //! - IMAGE: `ubuntu:24.04`, or `linux/amd64:ubuntu:24.04` for another
