@@ -21,12 +21,13 @@ The overlord's `find_repos` hung for 66 minutes. After it, `list_groups`,
 
 - `find_repos` skips `~/{Desktop,Documents,Downloads,Movies,Music,Pictures}`
   on macOS unless one is named as a root.
-- **Scan off the DB lock, in the background.** Callers get the last result,
-  with `scanning: true` while a scan runs.
-  - Only roots that have never been scanned are waited on, during a scan's
-    first 5s.
-  - Changing the roots, or a scan running over 5 minutes, starts a new scan.
-  - Only the latest scan's result is kept.
+- **Scan off the DB lock, in the background** (`daemon/src/repo_scan.rs`).
+  Callers get the last result for their roots, with `scanning: true` while
+  roots never scanned have no result yet.
+  - Those are waited on only during a scan's first 5s.
+  - A scan running over 5 minutes is presumed stuck: one retry starts, with
+    at most two in flight.
+  - A generation counter keeps only the newest scan's result.
 - `find_repos` (MCP) and the TUI finder report "still scanning".
 - **Parallel MCP calls were tried and reverted.** Ordering broke: a write and
   then a read could swap, and so could a create and then a go-to. The shim

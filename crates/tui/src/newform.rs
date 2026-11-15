@@ -1174,7 +1174,7 @@ impl App {
                 .join(", ");
             let hint = if finder.scanning {
                 format!(
-                    "{} repos so far — still scanning {roots}; reopen to refresh",
+                    "{} known repos; still scanning {roots} (reopen to refresh) · enter pick · or type a repo path",
                     rows.len()
                 )
             } else if rows.is_empty() {
