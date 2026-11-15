@@ -182,14 +182,14 @@ const SKIP_DIRS: &[&str] = &[
 /// every MCP call behind it. A root that is (or is inside) one of them is
 /// still scanned, since the user named it.
 pub fn find_repos(roots: &[String], depth: u8) -> Vec<String> {
-    let skip = protected_home_dirs();
+    let home = guarded_home();
     let mut found = Vec::new();
     for root in roots {
         let root = crate::config::expand_tilde(root);
         let Ok(root) = std::fs::canonicalize(&root) else {
             continue;
         };
-        walk(&root, depth, &skip, &mut found);
+        walk(&root, depth, home.as_deref(), &mut found);
     }
     found.sort();
     found.dedup();
@@ -207,19 +207,17 @@ const PROTECTED_HOME_DIRS: &[&str] = &[
     "Pictures",
 ];
 
-/// The scan's no-go paths: `PROTECTED_HOME_DIRS` under `$HOME`, on macOS.
-fn protected_home_dirs() -> Vec<PathBuf> {
+/// The home folder whose `PROTECTED_HOME_DIRS` the scan stays out of: on
+/// macOS only.
+fn guarded_home() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
-        return Vec::new();
+        return None;
     }
-    let Some(home) = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok()) else {
-        return Vec::new();
-    };
-    PROTECTED_HOME_DIRS.iter().map(|d| home.join(d)).collect()
+    std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok())
 }
 
 /// Path equality as the filesystem sees it: macOS volumes are usually
-/// case-insensitive, so a root spelled `/users/me` still meets `~/Documents`.
+/// case-insensitive, so a root spelled `/users/me` is still `$HOME`.
 fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(target_os = "macos") {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
@@ -228,7 +226,8 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn walk(dir: &Path, depth: u8, skip: &[PathBuf], out: &mut Vec<String>) {
+/// `home`: skip its `PROTECTED_HOME_DIRS` children (`guarded_home`).
+fn walk(dir: &Path, depth: u8, home: Option<&Path>, out: &mut Vec<String>) {
     if dir.join(".git").exists() {
         out.push(dir.to_string_lossy().into_owned());
     }
@@ -238,19 +237,22 @@ fn walk(dir: &Path, depth: u8, skip: &[PathBuf], out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let in_home = home.is_some_and(|h| same_path(h, dir));
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
             continue;
         }
+        if in_home && PROTECTED_HOME_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
         // Don't follow symlinks: loops and duplicates aren't worth it.
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        let path = entry.path();
-        if ft.is_dir() && !skip.iter().any(|s| same_path(s, &path)) {
-            walk(&path, depth - 1, skip, out);
+        if ft.is_dir() {
+            walk(&entry.path(), depth - 1, home, out);
         }
     }
 }
@@ -307,13 +309,12 @@ mod tests {
             std::fs::create_dir_all(&p).unwrap();
             git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
         }
-        let skip = vec![root.join("Documents")];
         let mut found = Vec::new();
-        walk(&root, 3, &skip, &mut found);
+        walk(&root, 3, Some(&root), &mut found);
         assert_eq!(found, vec![root.join("src/beta").to_string_lossy()]);
         // Named as a root itself, it is scanned.
         let mut found = Vec::new();
-        walk(&root.join("Documents"), 3, &skip, &mut found);
+        walk(&root.join("Documents"), 3, Some(&root), &mut found);
         assert_eq!(
             found,
             vec![root.join("Documents/code/alpha").to_string_lossy()]

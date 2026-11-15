@@ -1092,8 +1092,13 @@ including when the active one hits a usage limit.
   proposes what to import and imports what the user approves.
 - **MCP**: `rlord mcp` is a hand-rolled stdio JSON-RPC shim that speaks the
   protocol and forwards `tools/list` / `tools/call` to the daemon methods
-  `mcp.tools` / `mcp.call`. Tools are defined in `daemon/src/mcp.rs` as thin,
-  param-whitelisted mappings onto daemon methods.
+  `mcp.tools` / `mcp.call`. Each `tools/list` and `tools/call` runs on its
+  own thread and replies by id when done, so replies can come out of order
+  and one slow tool doesn't hold up the rest; at EOF the shim waits up to
+  30s for calls in flight. Tools are defined in `daemon/src/mcp.rs` as thin,
+  param-whitelisted mappings onto daemon methods. A method that can be slow
+  (the repo scan behind `repo.find`) runs before `dispatch` takes the DB
+  lock.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed

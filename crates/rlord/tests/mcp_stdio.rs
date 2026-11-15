@@ -11,10 +11,8 @@ use serde_json::{json, Value};
 /// answers on its own, so the fast one's reply comes first.
 #[test]
 fn slow_tool_call_does_not_block_the_next() {
-    let dir = std::env::temp_dir().join(format!("rlmcp{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("d.sock");
-    let _ = std::fs::remove_file(&sock);
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("d.sock");
     let listener = UnixListener::bind(&sock).unwrap();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
@@ -41,23 +39,29 @@ fn slow_tool_call_does_not_block_the_next() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    // A lost reply must fail the test, not hang it.
+    let pid = child.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
     let mut stdin = child.stdin.take().unwrap();
     for (id, name) in [(1, "slow"), (2, "fast")] {
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
                          "params": {"name": name, "arguments": {}}});
         writeln!(stdin, "{msg}").unwrap();
     }
+    // stdin closes first: the slow call must still answer (a client that
+    // half-closes reads on).
+    drop(stdin);
     let ids: Vec<i64> = BufReader::new(child.stdout.take().unwrap())
         .lines()
-        .take(2)
         .map(|l| {
             serde_json::from_str::<Value>(&l.unwrap()).unwrap()["id"]
                 .as_i64()
                 .unwrap()
         })
         .collect();
-    drop(stdin);
     child.wait().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(ids, vec![2, 1]);
 }

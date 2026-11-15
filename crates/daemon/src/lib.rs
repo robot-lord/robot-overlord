@@ -461,15 +461,15 @@ impl Daemon {
         let limited_filter = (method == "session.list")
             .then(|| take_limited(&mut params))
             .flatten();
+        // The repo scan walks the disk: never under the DB lock, or one slow
+        // folder stalls every other method.
+        let scanned = (method == "repo.find").then(|| self.scanned_repos());
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
-            "repo.find" => {
-                let scanned = self.scanned_repos();
-                methods::repo_find(&db, &self.config(), scanned)
-            }
+            "repo.find" => methods::repo_find(&db, &self.config(), scanned.unwrap_or_default()),
             "session.defaults" => methods::session_defaults(&self.config()),
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),

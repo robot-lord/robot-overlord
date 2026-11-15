@@ -1871,6 +1871,18 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         writeln!(out, "{resp}")?;
         out.flush()
     };
+    // Calls in flight, so EOF can give them a moment to answer.
+    let in_flight = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+    let spawn = |job: Box<dyn FnOnce() + Send>| {
+        let in_flight = in_flight.clone();
+        *in_flight.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        std::thread::spawn(move || {
+            job();
+            let (n, done) = &*in_flight;
+            *n.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            done.notify_all();
+        });
+    };
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -1887,17 +1899,17 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         if method == "tools/list" {
             let (call, out) = (call.clone(), out.clone());
-            std::thread::spawn(move || {
+            spawn(Box::new(move || {
                 let result = call("mcp.tools", json!({"overlord": overlord}))
                     .map(|t| json!({"tools": t}))
                     .map_err(|e| (-32603, format!("{e:#}")));
                 let _ = reply(&out, id, result);
-            });
+            }));
             continue;
         }
         if method == "tools/call" {
             let (call, out, caller) = (call.clone(), out.clone(), caller.clone());
-            std::thread::spawn(move || {
+            spawn(Box::new(move || {
                 let r = call(
                     "mcp.call",
                     json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
@@ -1911,7 +1923,7 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
                 });
                 // stdout gone means the client left; nothing to tell it.
                 let _ = reply(&out, id, result);
-            });
+            }));
             continue;
         }
         let result: std::result::Result<Value, (i64, String)> = match method {
@@ -1930,8 +1942,12 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         };
         reply(&out, id, result)?;
     }
-    // stdin closed: the client is gone, so calls still in flight have no
-    // one to answer. Exit rather than wait on one that may never return.
+    // stdin closed. A client that half-closes still reads its replies, so
+    // give calls in flight a while to answer, but don't wait forever on one
+    // that may never return (a scan stuck on a privacy prompt).
+    let (n, done) = &*in_flight;
+    let n = n.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = done.wait_timeout_while(n, std::time::Duration::from_secs(30), |n| *n > 0);
     Ok(())
 }
 
