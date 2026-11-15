@@ -109,6 +109,8 @@ struct Finder {
     query: String,
     all: Vec<Value>,
     roots: Vec<String>,
+    /// The disk scan was still running: the list may be short.
+    scanning: bool,
     state: ListState,
 }
 
@@ -1022,6 +1024,7 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default(),
+            scanning: v["scanning"].as_bool().unwrap_or(false),
             state: ListState::default().with_selected(Some(0)),
         });
     }
@@ -1169,7 +1172,12 @@ impl App {
                 .map(|r| r.replacen(&home, "~", 1))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let hint = if rows.is_empty() {
+            let hint = if finder.scanning {
+                format!(
+                    "{} repos so far — still scanning {roots}; reopen to refresh",
+                    rows.len()
+                )
+            } else if rows.is_empty() {
                 format!("no repos match — scanned {roots} (config: [session] repo_roots) · or type a repo path")
             } else {
                 format!("{} repos · ↑↓/tab move · enter pick · esc back", rows.len())

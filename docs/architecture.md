@@ -1092,16 +1092,16 @@ including when the active one hits a usage limit.
   proposes what to import and imports what the user approves.
 - **MCP**: `rlord mcp` is a hand-rolled stdio JSON-RPC shim that speaks the
   protocol and forwards `tools/list` / `tools/call` to the daemon methods
-  `mcp.tools` / `mcp.call`. Each `tools/list` and `tools/call` runs on its
-  own thread and replies by id when done, so replies can come out of order
-  and one slow tool doesn't hold up the rest. Tools that change things
-  (not in `READ_ONLY_TOOLS`) still run one at a time, in order. At EOF the
-  shim waits up to 15s for calls in flight. Tools are defined in `daemon/src/mcp.rs` as thin,
-  param-whitelisted mappings onto daemon methods. Nothing slow runs under
-  `dispatch`'s DB lock: the repo scan behind `repo.find` runs on its own
-  thread and callers get its last result with `scanning: true` while one
-  runs (only roots never scanned are waited on, for a scan's first 5s),
-  since a walk can block on a macOS privacy prompt or a dead mount.
+  `mcp.tools` / `mcp.call`, one request at a time, in order (calls that
+  change things and then read them back rely on it). Tools are defined in
+  `daemon/src/mcp.rs` as thin, param-whitelisted mappings onto daemon
+  methods. Since one slow call holds up the rest, nothing slow runs under
+  `dispatch`'s DB lock or blocks a caller: the repo scan behind
+  `repo.find` runs on its own thread and callers get its last result,
+  with `scanning: true` while one runs (only roots never scanned are
+  waited on, for a scan's first 5s; one running over 5 minutes is
+  presumed stuck and another starts), since a walk can block on a macOS
+  privacy prompt or a dead mount.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed

@@ -216,8 +216,8 @@ impl Daemon {
     /// its own thread and callers never wait on it for long: they get the
     /// last result, refreshed in the background once it is a minute old.
     /// Only a scan of roots never scanned before is waited on, and only in
-    /// its first 5s. A change of roots starts a new scan even if an old one
-    /// is stuck.
+    /// its first 5s. A change of roots, or a scan running over 5 minutes,
+    /// starts a new scan beside the stuck one.
     fn scanned_repos(&self) -> (Vec<String>, bool) {
         const FRESH: std::time::Duration = std::time::Duration::from_secs(60);
         const FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -229,7 +229,14 @@ impl Daemon {
         if ours && scan.at.is_some_and(|at| at.elapsed() < FRESH) {
             return (scan.repos.clone(), false);
         }
-        if scan.running.as_ref().map(|(k, _)| k) != Some(&key) {
+        // A scan of these roots that has run this long is stuck (a prompt
+        // nobody answers, a dead mount): start another beside it.
+        const STUCK: std::time::Duration = std::time::Duration::from_secs(300);
+        let running_ours = scan
+            .running
+            .as_ref()
+            .is_some_and(|(k, at)| k == &key && at.elapsed() < STUCK);
+        if !running_ours {
             scan.running = Some((key.clone(), std::time::Instant::now()));
             let state = self.repo_scan.clone();
             let key = key.clone();
@@ -237,13 +244,15 @@ impl Daemon {
                 let repos = rlord_core::git::find_repos(&key.0, key.1);
                 let (lock, done) = &*state;
                 let mut scan = lock.lock().unwrap_or_else(|e| e.into_inner());
+                // Only the latest scan's result counts: one that finishes
+                // after the roots changed (or after a retry beat it) is old.
                 if scan.running.as_ref().map(|(k, _)| k) == Some(&key) {
                     scan.running = None;
+                    scan.key = Some(key);
+                    scan.at = Some(std::time::Instant::now());
+                    scan.repos = repos;
+                    done.notify_all();
                 }
-                scan.key = Some(key);
-                scan.at = Some(std::time::Instant::now());
-                scan.repos = repos;
-                done.notify_all();
             });
         }
         if !ours {

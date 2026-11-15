@@ -27,9 +27,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true
 
-[dev-dependencies]
-tempfile = "3"
-
 # Distro packages (`cargo xtask build-release`, run by the release workflow): the static musl binary, needing tmux.
 [package.metadata.deb]
 name = "rlord"

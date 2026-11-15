@@ -1589,16 +1589,11 @@ fn print_search(v: &Value) {
 }
 
 fn call(method: &str, params: Value) -> Result<Value> {
-    // A mutex, not a OnceLock check: `rlord mcp` calls this from several
-    // threads at once, and two must not start or restart the daemon.
-    static ENSURED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
-    {
-        let mut ensured = ENSURED.lock().unwrap_or_else(|e| e.into_inner());
-        if !*ensured {
-            autostart::ensure_daemon(&socket)?;
-            *ensured = true;
-        }
+    if ENSURED.get().is_none() {
+        autostart::ensure_daemon(&socket)?;
+        ENSURED.set(()).ok();
     }
     client_call(&socket, method, params)
 }
@@ -1838,61 +1833,20 @@ fn restart_daemon() -> Result<()> {
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
 /// Without `overlord` it is read-only (the daemon serves and accepts only
 /// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
-///
-/// Each `tools/call` and `tools/list` runs on its own thread and answers
-/// when done, in any order (JSON-RPC matches replies by id): one slow tool
-/// must not hold up the calls queued behind it.
 fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
-    use std::sync::{Arc, Mutex};
     let caller = std::env::var("RLORD_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty());
     // The daemon that wrote the overlord's config: only that one, never one
     // started here from whatever environment this process has.
-    let call = move |method: &str, params: Value| match &socket {
+    let call = |method: &str, params: Value| match &socket {
         Some(s) => client_call(s, method, params),
         None if overlord => call(method, params),
         None => call_running(method, params),
     };
-    let call = Arc::new(call);
-    let out = Arc::new(Mutex::new(std::io::stdout()));
-    let reply = |out: &Mutex<std::io::Stdout>,
-                 id: Value,
-                 result: std::result::Result<Value, (i64, String)>|
-     -> std::io::Result<()> {
-        let resp = match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err((code, message)) => {
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-            }
-        };
-        let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
-        writeln!(out, "{resp}")?;
-        out.flush()
-    };
-    // Taken by tools that change things, so those run in order.
-    let serial = Arc::new(Mutex::new(()));
-    // Calls in flight, so EOF can give them a moment to answer.
-    let in_flight = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
-    let spawn = |job: Box<dyn FnOnce() + Send>| {
-        // Counts down on drop, so a panicking job still leaves.
-        struct Done(Arc<(Mutex<usize>, std::sync::Condvar)>);
-        impl Drop for Done {
-            fn drop(&mut self) {
-                let (n, done) = &*self.0;
-                *n.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-                done.notify_all();
-            }
-        }
-        *in_flight.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        let guard = Done(in_flight.clone());
-        std::thread::spawn(move || {
-            let _guard = guard;
-            job();
-        });
-    };
     let stdin = std::io::stdin();
+    let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -1906,42 +1860,6 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         };
         let method = msg["method"].as_str().unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
-        if method == "tools/list" {
-            let (call, out) = (call.clone(), out.clone());
-            spawn(Box::new(move || {
-                let result = call("mcp.tools", json!({"overlord": overlord}))
-                    .map(|t| json!({"tools": t}))
-                    .map_err(|e| (-32603, format!("{e:#}")));
-                let _ = reply(&out, id, result);
-            }));
-            continue;
-        }
-        if method == "tools/call" {
-            let (call, out, caller) = (call.clone(), out.clone(), caller.clone());
-            let serial = serial.clone();
-            spawn(Box::new(move || {
-                // Look-ups run side by side; changes run one at a time, in
-                // the order sent, as they did before calls went parallel
-                // (several are multi-step: create, then go to it).
-                let name = params["name"].as_str().unwrap_or("");
-                let _turn = (!rlord_daemon::mcp::READ_ONLY_TOOLS.contains(&name))
-                    .then(|| serial.lock().unwrap_or_else(|e| e.into_inner()));
-                let r = call(
-                    "mcp.call",
-                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
-                           "caller": caller, "overlord": overlord}),
-                );
-                let result = Ok(match r {
-                    Ok(v) => json!({"content": [{"type": "text",
-                        "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
-                    Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}],
-                                     "isError": true}),
-                });
-                // stdout gone means the client left; nothing to tell it.
-                let _ = reply(&out, id, result);
-            }));
-            continue;
-        }
         let result: std::result::Result<Value, (i64, String)> = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -1954,20 +1872,34 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
                 },
             })),
             "ping" => Ok(json!({})),
+            "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
+                .map(|t| json!({"tools": t}))
+                .map_err(|e| (-32603, format!("{e:#}"))),
+            "tools/call" => {
+                let r = call(
+                    "mcp.call",
+                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
+                           "caller": caller, "overlord": overlord}),
+                );
+                Ok(match r {
+                    Ok(v) => json!({"content": [{"type": "text",
+                        "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
+                    Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}],
+                                     "isError": true}),
+                })
+            }
             other => Err((-32601, format!("method not found: {other}"))),
         };
-        reply(&out, id, result)?;
+        let resp = match result {
+            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+            Err((code, message)) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+            }
+        };
+        writeln!(out, "{resp}")?;
+        out.flush()?;
     }
-    // stdin closed. A client that half-closes still reads its replies, so
-    // give calls in flight a while to answer, but don't linger on one that
-    // may never return.
-    let (n, done) = &*in_flight;
-    let n = n.lock().unwrap_or_else(|e| e.into_inner());
-    let n = done.wait_timeout_while(n, std::time::Duration::from_secs(15), |n| *n > 0);
-    drop(n);
-    // Hold stdout as we exit, so no reply is cut off mid-line.
-    let _out = out.lock().unwrap_or_else(|e| e.into_inner());
-    std::process::exit(0)
+    Ok(())
 }
 
 /// `nav next|prev`: move to the neighbouring live session in list order.
