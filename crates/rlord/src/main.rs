@@ -1833,20 +1833,41 @@ fn restart_daemon() -> Result<()> {
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
 /// Without `overlord` it is read-only (the daemon serves and accepts only
 /// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
+///
+/// Each `tools/call` runs on its own thread and answers when done, in any
+/// order (JSON-RPC matches replies by id): one slow tool must not hold up
+/// the calls queued behind it.
 fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
+    use std::sync::{Arc, Mutex};
     let caller = std::env::var("RLORD_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty());
     // The daemon that wrote the overlord's config: only that one, never one
     // started here from whatever environment this process has.
-    let call = |method: &str, params: Value| match &socket {
+    let call = move |method: &str, params: Value| match &socket {
         Some(s) => client_call(s, method, params),
         None if overlord => call(method, params),
         None => call_running(method, params),
     };
+    let call = Arc::new(call);
+    let out = Arc::new(Mutex::new(std::io::stdout()));
+    let reply = |out: &Mutex<std::io::Stdout>,
+                 id: Value,
+                 result: std::result::Result<Value, (i64, String)>|
+     -> std::io::Result<()> {
+        let resp = match result {
+            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+            Err((code, message)) => {
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+            }
+        };
+        let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+        writeln!(out, "{resp}")?;
+        out.flush()
+    };
+    let mut running: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -1860,6 +1881,26 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         };
         let method = msg["method"].as_str().unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(json!({}));
+        if method == "tools/call" {
+            let (call, out, caller) = (call.clone(), out.clone(), caller.clone());
+            running.retain(|t| !t.is_finished());
+            running.push(std::thread::spawn(move || {
+                let r = call(
+                    "mcp.call",
+                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
+                           "caller": caller, "overlord": overlord}),
+                );
+                let result = Ok(match r {
+                    Ok(v) => json!({"content": [{"type": "text",
+                        "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
+                    Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}],
+                                     "isError": true}),
+                });
+                // stdout gone means the client left; nothing to tell it.
+                let _ = reply(&out, id, result);
+            }));
+            continue;
+        }
         let result: std::result::Result<Value, (i64, String)> = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -1875,29 +1916,13 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
             "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
                 .map(|t| json!({"tools": t}))
                 .map_err(|e| (-32603, format!("{e:#}"))),
-            "tools/call" => {
-                let r = call(
-                    "mcp.call",
-                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
-                           "caller": caller, "overlord": overlord}),
-                );
-                Ok(match r {
-                    Ok(v) => json!({"content": [{"type": "text",
-                        "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
-                    Err(e) => json!({"content": [{"type": "text", "text": format!("{e:#}")}],
-                                     "isError": true}),
-                })
-            }
             other => Err((-32601, format!("method not found: {other}"))),
         };
-        let resp = match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err((code, message)) => {
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-            }
-        };
-        writeln!(out, "{resp}")?;
-        out.flush()?;
+        reply(&out, id, result)?;
+    }
+    // stdin closed: let calls in flight answer before exiting.
+    for t in running {
+        let _ = t.join();
     }
     Ok(())
 }
