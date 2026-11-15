@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs inside a bare distro container for `cargo xtask smoke-linux`
-# (xtask/src/smoke.rs), which mounts the release files at /dist and get.sh
-# at /get.sh. POSIX sh: the image may have nothing else. Prints OK last
+# (xtask/src/smoke.rs, which compiles it in), mounted with the release
+# files at /dist and get.sh at /get.sh. POSIX sh: the image may have nothing else. Prints OK last
 # when everything worked.
 set -e
 # Minimal images may lack what get.sh itself needs.

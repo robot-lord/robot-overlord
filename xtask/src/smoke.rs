@@ -2,8 +2,9 @@
 //! Linux distros, in Docker (colima on the Mac). Each container installs
 //! with get.sh from the local files (it installs tmux too), then runs the
 //! daemon and a few commands on a scratch tmux socket
-//! (scripts/smoke-in-container.sh, POSIX sh since the image has nothing
-//! else).
+//! (`smoke_in_container.sh`, compiled in and written to a scratch folder
+//! for the container, as fresh-install does; POSIX sh since the image has
+//! nothing else).
 //!
 //! Native images by default; a `linux/amd64:IMAGE` entry runs the x86_64
 //! build under emulation when Docker has it. get.sh checks the tarball
@@ -15,7 +16,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-use crate::cmd;
+use crate::cmd::{self, TempDir};
+
+const SCRIPT: &str = include_str!("smoke_in_container.sh");
 
 const USAGE: &str = "usage: cargo xtask smoke-linux DIST [IMAGE…]";
 
@@ -89,7 +92,10 @@ pub fn run(dist: &Path, images: &[String]) -> Result<()> {
         bail!("Docker isn't running (colima start)");
     }
     let get_sh = std::path::absolute("scripts/get.sh")?;
-    let script = std::path::absolute("scripts/smoke-in-container.sh")?;
+    // Under target/, not the system temp dir: colima only mounts $HOME.
+    let files = TempDir::new_in(Path::new("target"), "smoke")?;
+    let script = std::path::absolute(files.path().join("smoke.sh"))?;
+    std::fs::write(&script, SCRIPT)?;
 
     let mut failed = Vec::new();
     for spec in &images {

@@ -76,7 +76,8 @@ pub fn main(args: &[String]) -> Result<()> {
         return cmd::usage(USAGE);
     }
     cmd::run(cargo().args(["build", "--workspace"]))?;
-    let bin = target_dir()?.join("debug/rlord");
+    let target = target_dir()?;
+    let bin = target.join("debug/rlord");
 
     let env = |k: &str| std::env::var(k).ok();
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
@@ -142,8 +143,23 @@ pub fn main(args: &[String]) -> Result<()> {
             .append(true)
             .open(&log)
             .with_context(|| format!("opening {}", log.display()))?;
-        // Not waited for: it outlives xtask.
-        Command::new("nohup")
+        // Not waited for: it outlives xtask. Without what cargo and rustup
+        // set for xtask: the daemon passes its environment on to the tmux
+        // server and every agent session.
+        let mut daemon = Command::new("nohup");
+        for (k, v) in std::env::vars_os() {
+            let k = k.to_string_lossy().into_owned();
+            match daemon_env(&k, &v.to_string_lossy(), &target) {
+                EnvAction::Keep => {}
+                EnvAction::Remove => {
+                    daemon.env_remove(&k);
+                }
+                EnvAction::Set(v) => {
+                    daemon.env(&k, v);
+                }
+            }
+        }
+        daemon
             .arg(&launch)
             .arg("daemon")
             .stdin(Stdio::null())
@@ -163,6 +179,62 @@ pub fn main(args: &[String]) -> Result<()> {
     cmd::run(Command::new(&bin).arg("ping").stdout(Stdio::null()))?;
     println!("daemon restarted (pid {new}, log: {})", log.display());
     Ok(())
+}
+
+/// What to do with one of xtask's environment variables for the daemon.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnvAction {
+    Keep,
+    Remove,
+    Set(String),
+}
+
+/// Variables cargo and rustup set for `cargo xtask` itself (the user's own
+/// CARGO_HOME, RUSTUP_HOME and CARGO_TARGET_DIR are left alone).
+fn cargo_injected(name: &str) -> bool {
+    matches!(
+        name,
+        "CARGO"
+            | "CARGO_CRATE_NAME"
+            | "CARGO_BIN_NAME"
+            | "CARGO_PRIMARY_PACKAGE"
+            | "RUSTUP_TOOLCHAIN"
+            | "RUSTUP_TOOLCHAIN_SOURCE"
+    ) || name.starts_with("CARGO_MANIFEST_")
+        || name.starts_with("CARGO_PKG_")
+}
+
+/// The library search paths cargo extends for the program it runs.
+const DYLIB_VARS: [&str; 3] = [
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+];
+
+/// The daemon's value for a variable xtask has: cargo's and rustup's own
+/// removed; from the library paths, the entries cargo added (the build's
+/// target dir, a rustup toolchain), keeping any the user set.
+pub fn daemon_env(name: &str, value: &str, target_dir: &Path) -> EnvAction {
+    if cargo_injected(name) {
+        return EnvAction::Remove;
+    }
+    if !DYLIB_VARS.contains(&name) {
+        return EnvAction::Keep;
+    }
+    let ours = |p: &Path| {
+        p.starts_with(target_dir) || p.components().any(|c| c.as_os_str() == "toolchains")
+    };
+    let kept: Vec<PathBuf> = std::env::split_paths(value)
+        .filter(|p| !p.as_os_str().is_empty() && !ours(p))
+        .collect();
+    if kept.is_empty() {
+        return EnvAction::Remove;
+    }
+    match std::env::join_paths(&kept) {
+        Ok(joined) if joined.to_string_lossy() == value => EnvAction::Keep,
+        Ok(joined) => EnvAction::Set(joined.to_string_lossy().into_owned()),
+        Err(_) => EnvAction::Keep,
+    }
 }
 
 fn systemd_loaded() -> Result<bool> {
@@ -234,6 +306,62 @@ mod tests {
         assert_eq!(
             default_log(&env_of(&[("XDG_STATE_HOME", "/s")]), home, false),
             Path::new("/s/robot-overlord/rlordd.log")
+        );
+    }
+
+    #[test]
+    fn strips_what_cargo_and_rustup_set() {
+        let t = Path::new("/src/target");
+        for name in [
+            "CARGO",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION",
+            "CARGO_CRATE_NAME",
+            "CARGO_BIN_NAME",
+            "CARGO_PRIMARY_PACKAGE",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_TOOLCHAIN_SOURCE",
+        ] {
+            assert_eq!(daemon_env(name, "x", t), EnvAction::Remove, "{name}");
+        }
+        for name in [
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "CARGO_TARGET_DIR",
+            "PATH",
+            "HOME",
+        ] {
+            assert_eq!(daemon_env(name, "/x", t), EnvAction::Keep, "{name}");
+        }
+    }
+
+    #[test]
+    fn strips_cargos_library_paths_only() {
+        let t = Path::new("/src/target");
+        let tc = "/u/.rustup/toolchains/1.100.0-aarch64-apple-darwin/lib";
+        // Only what cargo added: gone.
+        assert_eq!(
+            daemon_env(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                &format!("/src/target/debug/deps:/src/target/debug:{tc}"),
+                t
+            ),
+            EnvAction::Remove
+        );
+        // The user's own entries stay, in order.
+        assert_eq!(
+            daemon_env(
+                "LD_LIBRARY_PATH",
+                &format!("/src/target/debug/deps:{tc}:/opt/lib:/usr/local/lib"),
+                t
+            ),
+            EnvAction::Set("/opt/lib:/usr/local/lib".into())
+        );
+        assert_eq!(
+            daemon_env("LD_LIBRARY_PATH", "/opt/lib", t),
+            EnvAction::Keep
         );
     }
 

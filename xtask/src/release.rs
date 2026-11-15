@@ -559,7 +559,7 @@ fn tag_on_origin(tag: &str) -> Result<bool> {
 }
 
 /// SHA256SUMS for every file in `dist`.
-fn write_sums(dist: &Path) -> Result<()> {
+pub(crate) fn write_sums(dist: &Path) -> Result<()> {
     let files: Vec<String> = cmd::file_names(dist)?
         .into_iter()
         .filter(|f| f != "SHA256SUMS")
