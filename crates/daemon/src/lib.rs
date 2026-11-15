@@ -199,16 +199,12 @@ impl Daemon {
 
     /// Git repos under the configured roots, and whether the first scan of
     /// them is still running (`repo_scan.rs`: never blocks for long).
-    fn scanned_repos(&self) -> (Vec<String>, bool) {
+    fn scanned_repos(&self, cfg: &Config) -> (Vec<String>, bool) {
+        let key = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
         let f = self
             .repo_scan
-            .get(&self.scan_key(), |k| rlord_core::git::find_repos(&k.0, k.1));
+            .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
         (f.repos, f.scanning)
-    }
-
-    fn scan_key(&self) -> (Vec<String>, u8) {
-        let cfg = self.config();
-        (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth)
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -462,15 +458,20 @@ impl Daemon {
             .flatten();
         // The repo scan walks the disk: never under the DB lock, or one slow
         // folder stalls every other method.
-        let scanned = (method == "repo.find").then(|| self.scanned_repos());
+        // (One config read for both, so the roots reported are the ones
+        // scanned.)
+        let scanned = (method == "repo.find").then(|| {
+            let cfg = self.config();
+            (self.scanned_repos(&cfg), cfg)
+        });
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
-                let (repos, scanning) = scanned.unwrap_or_default();
-                methods::repo_find(&db, &self.config(), repos, scanning)
+                let ((repos, scanning), cfg) = scanned.expect("scanned for repo.find");
+                methods::repo_find(&db, &cfg, repos, scanning)
             }
             "session.defaults" => methods::session_defaults(&self.config()),
             "session.get" => methods::session_get(&db, &params),

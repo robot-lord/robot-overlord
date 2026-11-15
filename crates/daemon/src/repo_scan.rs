@@ -112,8 +112,6 @@ impl Scanner {
         if fresh || st.running.contains_key(key) {
             return;
         }
-        // Only the roots asked for now are worth keeping a result for.
-        st.found.retain(|k, _| k == key);
         st.running.insert(key.clone(), Instant::now());
         let state = self.state.clone();
         let k = key.clone();
@@ -243,14 +241,5 @@ mod tests {
         // Not rerun on the next look-up.
         let f = s.get(&key("a"), |_| panic!("reran a scan that panicked"));
         assert!(!f.scanning && f.repos.is_empty());
-    }
-
-    #[test]
-    fn only_the_current_roots_keep_a_result() {
-        let s = Scanner::with_timing(timing(5_000));
-        s.get(&key("a"), |_| vec!["/a/x".into()]);
-        s.get(&key("b"), |_| vec!["/b/y".into()]);
-        let st = s.state.0.lock().unwrap();
-        assert_eq!(st.found.keys().collect::<Vec<_>>(), vec![&key("b")]);
     }
 }

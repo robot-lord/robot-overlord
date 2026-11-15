@@ -1174,8 +1174,7 @@ impl App {
                 .join(", ");
             let hint = if finder.scanning {
                 format!(
-                    "{} known repos; still scanning {roots} (reopen to refresh) · ↑↓/tab move · enter pick · esc back",
-                    rows.len()
+                    "still scanning {roots}, so only repos you've used show (reopen to refresh) · or type a repo path · esc back"
                 )
             } else if rows.is_empty() {
                 format!("no repos match — scanned {roots} (config: [session] repo_roots) · or type a repo path")
