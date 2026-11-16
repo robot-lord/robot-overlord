@@ -116,6 +116,8 @@ pub struct Session {
 pub struct ForkRef {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Session {

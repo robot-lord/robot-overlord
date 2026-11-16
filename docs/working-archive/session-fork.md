@@ -38,9 +38,9 @@ Forking shipped in 0.23.0-dev.29; how it works is in
 
 ## Accepted edge cases
 
-- An OpenCode fork whose start fails after the fork call leaves that
-  OpenCode session behind (a worktree fork's worktree and branch are
-  removed).
+- A fork that fails before its pane starts is undone best effort: an
+  OpenCode fork whose `opencode session delete` fails stays in OpenCode
+  (logged).
 - An unhooked Codex user fork of a session started while that session's
   archive summary runs: the summary's `--ephemeral` thread isn't in the
   index, so it can't be picked.

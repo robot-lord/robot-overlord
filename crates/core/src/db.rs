@@ -350,7 +350,6 @@ impl Db {
         let rows = stmt.query_map([arg], row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
-        self.attach_forks(&mut sessions)?;
         self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
     }
@@ -597,31 +596,34 @@ impl Db {
         Ok(())
     }
 
-    /// Each session's forks (one query over the forks there are: the
-    /// index on `forked_from`).
-    fn attach_forks(&self, sessions: &mut [Session]) -> Result<()> {
+    /// Fill in these sessions' forks (one query, over the forks of these
+    /// sessions only: the index on `forked_from`). Where rows are shown
+    /// (`sessions`, `session.get`), not on every lookup (`resolve_ref`).
+    pub fn attach_forks(&self, sessions: &mut [Session]) -> Result<()> {
         if sessions.is_empty() {
             return Ok(());
         }
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         let mut stmt = self.conn.prepare(
-            "SELECT forked_from, id, name FROM sessions WHERE forked_from IS NOT NULL \
+            "SELECT forked_from, id, name, archived_at IS NOT NULL FROM sessions \
+             WHERE forked_from IN (SELECT value FROM json_each(?1)) \
              ORDER BY created_at, id",
         )?;
         let mut by_parent: std::collections::HashMap<String, Vec<crate::types::ForkRef>> =
             Default::default();
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([serde_json::to_string(&ids)?], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
+                crate::types::ForkRef {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    archived: r.get(3)?,
+                },
             ))
         })?;
         for row in rows {
-            let (parent, id, name) = row?;
-            by_parent
-                .entry(parent)
-                .or_default()
-                .push(crate::types::ForkRef { id, name });
+            let (parent, fork) = row?;
+            by_parent.entry(parent).or_default().push(fork);
         }
         for s in sessions {
             if let Some(f) = by_parent.remove(&s.id) {
@@ -661,6 +663,27 @@ impl Db {
             params![id, name],
         )?;
         Ok(())
+    }
+
+    /// Remove a session that never started (a fork whose pane didn't come
+    /// up): its row, and with it its tags, background rows, transcript and
+    /// sub-agent rows (cascade); its events; its kv keys (`<what>:<id>`).
+    /// Sessions that ran are archived, never deleted.
+    pub fn delete_session(&self, id: &str) -> Result<()> {
+        self.atomically(|| {
+            self.conn
+                .execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
+            self.conn.execute(
+                "DELETE FROM kv WHERE key LIKE '%:' || ?1 ESCAPE '\\'",
+                params![id
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")],
+            )?;
+            self.conn
+                .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+            Ok(())
+        })
     }
 
     /// Record that session `id` was forked from session `parent`.
@@ -1986,16 +2009,26 @@ mod tests {
         assert_eq!(f.forked_from.as_deref(), Some("p"));
         assert_eq!(f.forked_from_name.as_deref(), Some("n-p"));
         let p = db.resolve_ref("p").unwrap();
-        assert_eq!((p.forked_from, p.forked_from_name), (None, None));
-        let fork = |id: &str| crate::types::ForkRef {
+        assert_eq!(
+            (p.forked_from.as_deref(), p.forked_from_name.as_deref()),
+            (None, None)
+        );
+        let fork = |id: &str, archived| crate::types::ForkRef {
             id: id.into(),
             name: format!("n-{id}"),
+            archived,
         };
-        assert_eq!(p.forks, [fork("f"), fork("g")]);
+        // Not on a plain lookup (every hook makes one): where rows are shown.
+        assert!(p.forks.is_empty());
+        db.set_archived("g", Some(5)).unwrap();
+        let mut one = [p];
+        db.attach_forks(&mut one).unwrap();
+        assert_eq!(one[0].forks, [fork("f", false), fork("g", true)]);
         // In the list too.
         let listed = db.sessions(&SessionQuery::default()).unwrap();
         let p_row = listed.iter().find(|s| s.id == "p").unwrap();
-        assert_eq!(p_row.forks, [fork("f"), fork("g")]);
+        assert_eq!(p_row.forks, [fork("f", false), fork("g", true)]);
+        db.set_archived("g", None).unwrap();
         assert!(listed
             .iter()
             .find(|s| s.id == "x")
@@ -2045,6 +2078,49 @@ mod tests {
         assert_eq!(db.context_ack("f", "p.ack", 30).unwrap(), 0);
         // The parent's own rows are untouched.
         assert_eq!(db.context_rows("p").unwrap(), rows);
+    }
+
+    /// A session that never started goes with everything that names it,
+    /// and nothing else.
+    #[test]
+    fn a_session_that_never_started_is_removed_whole() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["gone", "kept"] {
+            db.insert_session(&NewSession {
+                id,
+                name: id,
+                agent: "claude",
+                agent_session: Some(id),
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.add_tag(id, "t").unwrap();
+            db.insert_event(id, 1, "launched", "{}").unwrap();
+            db.context_add(id, 1, "note", "n", "fork").unwrap();
+            db.upsert_transcript_source(id, "/t.jsonl").unwrap();
+            db.kv_set(&format!("context_on:{id}"), "1").unwrap();
+        }
+        db.kv_set("fork_name:gone-ish", "1").unwrap();
+        db.delete_session("gone").unwrap();
+        assert!(db.resolve_ref("gone").is_err());
+        assert!(db.list_events("gone", 10).unwrap().is_empty());
+        assert!(db.context_rows("gone").unwrap().is_empty());
+        assert_eq!(db.transcript_source("gone").unwrap(), None);
+        assert_eq!(db.kv_get("context_on:gone").unwrap(), None);
+        // Others' rows and keys stay (one ending in another id too).
+        let kept = db.resolve_ref("kept").unwrap();
+        assert_eq!(kept.tags, ["t"]);
+        assert_eq!(db.list_events("kept", 10).unwrap().len(), 1);
+        assert_eq!(db.context_rows("kept").unwrap().len(), 1);
+        assert!(db.kv_get("context_on:kept").unwrap().is_some());
+        assert!(db.kv_get("fork_name:gone-ish").unwrap().is_some());
     }
 
     #[test]

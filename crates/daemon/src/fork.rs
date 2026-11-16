@@ -83,6 +83,8 @@ pub(crate) struct Worktree {
     /// the new worktree (the worktree itself when the parent works at its
     /// top).
     pub project: std::path::PathBuf,
+    /// The commit it branches from: the parent's HEAD.
+    pub start: String,
 }
 
 /// What was done outside the lock.
@@ -181,9 +183,8 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
             bail!("{} was taken meanwhile: fork again", want.name);
         }
         made.uncommitted = git::has_changes(&want.parent.project_path) == Some(true);
-        let start = git::head_commit(&want.parent.project_path)?;
         git::ensure_excluded(&w.repo, &cfg.session.workspace_dir)?;
-        git::worktree_add_from(&w.repo, &w.branch, &w.dir, &start)?;
+        git::worktree_add_from(&w.repo, &w.branch, &w.dir, &w.start)?;
         // (A subfolder that isn't committed isn't in the new worktree.)
         if !w.project.is_dir() {
             discard(w);
@@ -193,14 +194,52 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
             );
         }
     }
+    let id = rlord_core::types::new_id();
     let mut started = false;
-    let r = finish(&d.db(), &want, &made, &base, &mut started);
-    // Failed before its pane started: nothing works in the worktree yet.
-    // (After that it is the fork's: kept, and the error returned.)
-    if let (Err(_), Some(w), false) = (&r, &want.worktree, started) {
-        discard(w);
+    let r = finish(&d.db(), &id, &want, &made, &base, &mut started);
+    // Failed before its pane started: nothing runs in what was made for
+    // it, so none of it stays. (After that it is the fork's: kept, and the
+    // error returned.)
+    if r.is_err() && !started {
+        // Its row (if it got that far) with its background rows and keys.
+        let gone = {
+            let db = d.db();
+            db.delete_session(&id)
+        };
+        if let Err(e) = gone {
+            tracing::warn!(session = %id, error = %e, "removing a fork that didn't start");
+        }
+        undo(&id, &want, &made, &base);
     }
     r
+}
+
+/// Remove what a fork that never started left outside the database, best
+/// effort (no lock held: it may run OpenCode's client): its background
+/// file, the worktree and branch made for it, and the fork OpenCode's
+/// server made.
+pub(crate) fn undo(id: &str, want: &Want, made: &Made, base: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(context::session_dir(base, id));
+    if let Some(w) = &want.worktree {
+        discard(w);
+    }
+    if let Some(oc) = &made.opencode_id {
+        let bin = install::resolved("opencode").unwrap_or_else(|| "opencode".into());
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(&opencode::delete_argv(oc)[1..])
+            .current_dir(&want.parent.project_path)
+            .env_remove("RLORD_SESSION_ID")
+            .stderr(std::process::Stdio::null());
+        let gone = rlord_core::process::run_to_file(
+            cmd,
+            &std::env::temp_dir(),
+            std::time::Duration::from_secs(opencode::CREATE_LIMIT_S),
+            None,
+        );
+        if !matches!(gone, Ok((st, _)) if st.success()) {
+            tracing::warn!(opencode_session = %oc, "a fork that didn't start is left in OpenCode");
+        }
+    }
 }
 
 /// Whether the parent's rows marked seen went into the conversation the
@@ -262,11 +301,15 @@ pub(crate) fn plan_worktree(want: &Want, cfg: &Config) -> Result<Option<Worktree
         .unwrap_or_else(|| git::sanitize_branch(&want.name));
     let dir = git::workspace_path(&repo, &cfg.session.workspace_dir, &branch);
     let project = dir.join(sub_folder(&top, &p.project_path));
+    // (A repo with nothing committed has no commit to branch from.)
+    let start = git::head_commit(&p.project_path)
+        .map_err(|_| anyhow::anyhow!("nothing committed yet: fork it in the same folder"))?;
     Ok(Some(Worktree {
         repo,
         branch,
         dir,
         project,
+        start,
     }))
 }
 
@@ -388,7 +431,10 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
             );
         }
     }
-    // Checked: the name is this fork's until it is done (`Reserved`).
+    let parent_mode = context::mode(db, &parent.id)?;
+    let parent_transcript = db.transcript_source(&parent.id)?;
+    // All read and checked: the name is this fork's until it is done
+    // (`Reserved`). Nothing after this can fail.
     if auto_name {
         db.kv_set(&reserve_key(&name), &now_ms().to_string())?;
     }
@@ -399,8 +445,8 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
         prompt: p_opt("prompt"),
         name,
         auto_name,
-        parent_mode: context::mode(db, &parent.id)?,
-        parent_transcript: db.transcript_source(&parent.id)?,
+        parent_mode,
+        parent_transcript,
         description: p_opt("description"),
         model: p_opt("model"),
         note,
@@ -510,20 +556,20 @@ pub(crate) fn rows(
 }
 
 /// The fork's launch spec: the parent's, without what is per session
-/// (Remote Control, Codex's daemon host), with the fork's prompt and
-/// model.
+/// (Remote Control's name and when it was turned on, Codex's daemon
+/// host), keeping a Remote Control the user turned off. Its model is the
+/// one asked for, else none: the conversation keeps the one it has (at
+/// the fork and at every resume), as the parent's own did.
 fn spec_of(want: &Want) -> Value {
     let mut spec = want.spec.clone();
     if let Some(o) = spec.as_object_mut() {
-        for k in ["remote_control", "remote_control_off", "codex_host"] {
+        for k in ["remote_control", "remote_control_at", "codex_host"] {
             o.remove(k);
         }
     }
     spec["agent"] = json!(want.agent.name());
     spec["prompt"] = json!(want.prompt);
-    if let Some(m) = &want.model {
-        spec["model"] = json!(m);
-    }
+    spec["model"] = json!(want.model);
     spec
 }
 
@@ -536,12 +582,12 @@ pub(crate) fn launch(
     first: Option<&str>,
     args: &[String],
 ) -> Result<Launch> {
-    let spec_model = want.spec["model"].as_str().filter(|m| !m.is_empty());
+    // (No model asked for: none passed, the conversation keeps its own.)
     match want.agent.fork(
         &want.conversation,
         project,
         first,
-        want.model.as_deref().or(spec_model),
+        want.model.as_deref(),
         args,
     ) {
         Fork::Native(l) => Ok(l),
@@ -562,6 +608,7 @@ pub(crate) fn launch(
 /// fork, and its worktree, in place).
 pub(crate) fn finish(
     db: &Db,
+    id: &str,
     want: &Want,
     made: &Made,
     base: &std::path::Path,
@@ -578,7 +625,6 @@ pub(crate) fn finish(
         (true, None) => default_name(db, &parent.name),
     };
     let agent = want.agent;
-    let id = rlord_core::types::new_id();
     let now = now_ms();
     let (project, folder, repo, workspace, branch) = match &want.worktree {
         Some(w) => {
@@ -608,9 +654,9 @@ pub(crate) fn finish(
         .collect();
     // A fork always has background: at least its note and link.
     let mode = context::delivery(agent, made.hooks);
-    let bg_file = context::file_path(base, &id);
+    let bg_file = context::file_path(base, id);
     let text = context::launch_file_text_rows(db, &name, &copied, &add, now);
-    let carried = match context::write_file(base, &id, &text) {
+    let carried = match context::write_file(base, id, &text) {
         Ok(_) => Some(mode),
         Err(e) => {
             tracing::warn!(session = %id, error = %e, "writing the background file");
@@ -627,7 +673,7 @@ pub(crate) fn finish(
     methods::start(
         db,
         Start {
-            id: &id,
+            id,
             name: &name,
             agent,
             launch_spec: &launch_spec,
@@ -655,9 +701,9 @@ pub(crate) fn finish(
         },
     )?;
     *started = true;
-    after_start(db, want, &parent, &id)?;
+    after_start(db, want, &parent, id)?;
     tracing::info!(session = %id, parent = %parent.id, name = %name, agent = agent.name(), "forked session");
-    let mut out = serde_json::to_value(db.resolve_ref(&id)?)?;
+    let mut out = serde_json::to_value(db.resolve_ref(id)?)?;
     out["warnings"] = json!(warnings(want, made));
     // (Said apart from `workspace_path`, which a fork in its parent's
     // worktree has too.)
@@ -735,6 +781,18 @@ pub(crate) fn pending(db: &Db, s: &Session) -> Result<Option<String>> {
 pub(crate) fn conversation_seen(db: &Db, id: &str, transcript: &str) -> Result<()> {
     if db.kv_get(&pending_key(id))?.is_some() && std::path::Path::new(transcript).exists() {
         db.kv_delete(&pending_key(id))?;
+    }
+    Ok(())
+}
+
+/// A fork's pane started again with a new fork of `parent` (`refork_argv`):
+/// an agent that picks its own id makes a new thread, so the one bound
+/// before (its rollout never written) goes, and the new one is bound as at
+/// the fork (`bind_fork`). (Claude keeps its own id: nothing to do.)
+pub(crate) fn reforked(db: &Db, s: &Session, parent: &str) -> Result<()> {
+    if Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()) {
+        db.clear_agent_session(&s.id)?;
+        db.kv_set(&methods::bind_fork_key(&s.id), parent)?;
     }
     Ok(())
 }
@@ -829,9 +887,27 @@ mod tests {
         let cfg = Config::default();
         let plan = |id: &str| {
             let w = want(&db, &json!({"ref": id, "workspace": true})).unwrap();
-            plan_worktree(&w, &cfg).unwrap().unwrap()
+            plan_worktree(&w, &cfg)
         };
+        // Nothing committed yet: said plainly (not git's own words).
+        let e = plan("sub").unwrap_err().to_string();
+        assert_eq!(e, "nothing committed yet: fork it in the same folder");
+        // (As `fork`'s `Reserved` does when it gives up.)
+        db.kv_delete(&reserve_key("sub-fork")).unwrap();
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
+        let plan = |id: &str| plan(id).unwrap().unwrap();
         let w = plan("sub");
+        assert_eq!(w.start.len(), 40);
         assert_eq!(w.branch, "sub-fork");
         assert_eq!(
             w.dir,
@@ -911,11 +987,20 @@ mod tests {
             (w.name.as_str(), w.prompt.as_deref(), w.model.as_deref()),
             ("mine", Some("try a queue"), Some("m-2"))
         );
-        // Its launch spec: the parent's, less what is per session.
+        // Its launch spec: the parent's, less what is per session, keeping
+        // a Remote Control the user turned off.
+        let mut w = w;
+        w.spec["remote_control_at"] = json!(5);
+        w.spec["remote_control_off"] = json!(true);
         let spec = spec_of(&w);
         assert_eq!(spec["model"], "m-2");
         assert_eq!(spec["prompt"], "try a queue");
         assert!(spec.get("remote_control").is_none() && spec.get("codex_host").is_none());
+        assert!(spec.get("remote_control_at").is_none());
+        assert_eq!(spec["remote_control_off"], true);
+        // No model asked for: none (the conversation keeps its own).
+        w.model = None;
+        assert!(spec_of(&w)["model"].is_null());
 
         // Warnings, by plain code.
         let mut w = want(&db, &json!({"ref": "p"})).unwrap();
@@ -1121,8 +1206,12 @@ mod tests {
             assert_eq!(&l.argv[4..6], ["--session-id", new.as_str()]);
             assert!(l.transcript.unwrap().ends_with(format!("{new}.jsonl")));
         }
-        // The parent's model, and no Remote Control.
-        assert!(l.argv.windows(2).any(|a| a == ["--model", "m-1"]));
+        // No model asked for: none passed (the conversation keeps its
+        // own, not the parent's launch model), and no Remote Control.
+        assert!(!l.argv.iter().any(|a| a == "--model"));
+        let w = want(&db, &json!({"ref": "cl", "model": "opus"})).unwrap();
+        let l = launch(&w, &Made::default(), here, None, &args(&w)).unwrap();
+        assert!(l.argv.windows(2).any(|a| a == ["--model", "opus"]));
         assert!(!l.argv.iter().any(|a| a == "--remote-control"));
 
         let w = want(&db, &json!({"ref": "cx"})).unwrap();
@@ -1142,6 +1231,84 @@ mod tests {
         assert_eq!(l.argv, ["opencode", "-s", "ses_2fork", "--prompt", "go"]);
         assert_eq!(l.session_id.as_deref(), Some("ses_2fork"));
         assert_eq!(l.deferred.unwrap().model, "a/b");
+    }
+
+    /// A Codex fork forked again at a restart makes a new thread: the one
+    /// bound before goes, and the new one is found as at the fork. Claude
+    /// keeps its own id.
+    #[test]
+    fn a_codex_refork_binds_its_new_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "cx", "codex", Some("t-stale"), here, "");
+        db.upsert_transcript_source("cx", "/r/rollout-t-stale.jsonl")
+            .unwrap();
+        mk(&db, "cl", "claude", Some("c-new"), here, "");
+        reforked(&db, &db.resolve_ref("cx").unwrap(), "t-parent").unwrap();
+        let s = db.resolve_ref("cx").unwrap();
+        assert_eq!(s.agent_session, None);
+        assert_eq!(db.transcript_source("cx").unwrap(), None);
+        assert_eq!(
+            db.kv_get(&methods::bind_fork_key("cx")).unwrap().as_deref(),
+            Some("t-parent")
+        );
+        reforked(&db, &db.resolve_ref("cl").unwrap(), "c-parent").unwrap();
+        assert_eq!(
+            db.resolve_ref("cl").unwrap().agent_session.as_deref(),
+            Some("c-new")
+        );
+        assert_eq!(db.kv_get(&methods::bind_fork_key("cl")).unwrap(), None);
+    }
+
+    /// A fork that never started leaves nothing behind outside the
+    /// database: its background folder, its worktree and branch.
+    #[test]
+    fn a_fork_that_never_started_is_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "one",
+        ]);
+        let r = repo.to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "codex", Some("t-p"), r, "");
+        let mut w = want(&db, &json!({"ref": "p"})).unwrap();
+        let wt = Worktree {
+            repo: r.into(),
+            branch: "p-fork".into(),
+            dir: repo.join(".worktrees/p-fork"),
+            project: repo.join(".worktrees/p-fork"),
+            start: git::head_commit(r).unwrap(),
+        };
+        git::worktree_add_from(r, &wt.branch, &wt.dir, &wt.start).unwrap();
+        w.worktree = Some(wt.clone());
+        let base = dir.path().join("data");
+        context::write_file(&base, "01new", "background").unwrap();
+        undo("01new", &w, &Made::default(), &base);
+        assert!(!context::session_dir(&base, "01new").exists());
+        assert!(!wt.dir.exists() && !git::branch_exists(r, "p-fork"));
     }
 
     #[test]

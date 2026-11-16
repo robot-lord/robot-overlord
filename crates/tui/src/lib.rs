@@ -290,6 +290,9 @@ struct App {
     setup_send: Option<setupform::SetupSend>,
     /// That form, to reopen once nothing else is open (the send failed).
     setup_retry: Option<Box<setupform::SetupForm>>,
+    /// A fork on its way (`session.fork` off the UI thread), and its form,
+    /// reopened with the error if it fails (`poll_fork`).
+    fork_send: Option<forkform::ForkSend>,
     /// The sent form's (first run, overlay after), for the overlord's
     /// answer (`open_setup_from`).
     setup_reply_flags: Option<(bool, bool)>,
@@ -359,6 +362,7 @@ impl App {
             last_suggestion: None,
             setup_send: None,
             setup_retry: None,
+            fork_send: None,
             setup_reply_flags: None,
             saved_sel: None,
             reported_view: Value::Null,
@@ -808,7 +812,7 @@ impl App {
             if pushed {
                 self.dirty = true;
             }
-            if self.poll_setup() || self.poll_setup_send() {
+            if self.poll_setup() || self.poll_setup_send() || self.poll_fork() {
                 self.dirty = true;
             }
             self.continue_startup();
@@ -2596,8 +2600,6 @@ fn updated_at(s: &Value) -> Option<i64> {
     .max()
 }
 
-/// The details pane's usage line: all three, whatever the column shows
-/// (`12 turns · 1.2M tokens · 42% of 200k context`).
 /// The names of a session row's `forks` (`Session::forks`).
 fn fork_names(v: &Value) -> Vec<String> {
     v["forks"]
@@ -2608,6 +2610,8 @@ fn fork_names(v: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The details pane's usage line: all three, whatever the column shows
+/// (`12 turns · 1.2M tokens · 42% of 200k context`).
 fn usage_details(u: &Value) -> String {
     use rlord_core::usage::compact;
     let Some(u) = Usage::from_json(u) else {

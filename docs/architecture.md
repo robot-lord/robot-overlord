@@ -1446,12 +1446,14 @@ add`); reading and inserting under it, through `methods::start`, the tail
 | Resumed at a restart once | its transcript is on disk (from its first message) | it is bound and its rollout is on disk | at once |
 | New worktree | yes (`--resume` finds the parent from another worktree of the repo, and from a subfolder of it) | yes (`tui.resume_cwd`: below) | no: the server gives a fork its parent's folder |
 
-Until then a restart forks again (kv `fork_pending`, `fork::pending`).
-The key goes once a hook or Codex's index names the fork's own
-transcript and it is on disk (`fork::conversation_seen`), or at a fresh
-start. An OpenCode fork call that fails (a time-out) may still have made
-the fork: a fork of the parent made since the call began that no session
-has (`opencode::user_fork_since`, not archived) is taken.
+Until then a restart forks again (kv `fork_pending`, `fork::pending`); a
+Codex fork forked again drops the thread bound before and is bound anew
+by `bind_fork` (`fork::reforked`). The key goes once a hook or Codex's
+index names the fork's own transcript and it is on disk
+(`fork::conversation_seen`), or at a fresh start. An OpenCode fork call
+that fails (a time-out) may still have made the fork: a fork of the
+parent made since the call began that no session has
+(`opencode::user_fork_since`, not archived) is taken.
 
 Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 2.2.7 (scratch setups, one short prompt each).
@@ -1459,45 +1461,58 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 - **Folder.** The parent's (`project_path`, its worktree, repo, branch),
   or with `workspace` a new worktree branched from the parent's `HEAD`
   (`git::worktree_add_from`), the fork working in the parent's subfolder
-  of it (`fork::plan_worktree`, which asks git outside the lock). A
+  of it (`fork::plan_worktree`, which asks git outside the lock; a repo
+  with nothing committed is refused: "nothing committed yet"). A
   subfolder that isn't committed isn't there: refused, the worktree
   removed. Changes not committed (untracked files too) don't come along,
-  and the answer says so when there are some. If the fork fails before
-  its pane starts, the worktree and its branch are removed (best
-  effort); after that they stay with the fork.
+  and the answer says so when there are some.
+- **A fork that fails before its pane starts leaves nothing**: its row
+  (if inserted) with its background rows, events and kv keys
+  (`Db::delete_session`), its background folder, the worktree and branch
+  made for it, and OpenCode's server-made fork (`fork::undo`, best
+  effort). After the pane is up, everything stays with the fork and the
+  error is returned.
 - **Name.** Given, or `<parent>-fork`, `-fork-2`… chosen under the first
-  lock and reserved while the fork is made (kv `fork_name:<name>`, ten
-  minutes at most), so two forks at once never pick the same one. A
-  worktree's branch follows it. Checked again before the worktree is
-  made and under the last lock: taken meanwhile by another session, a
-  worktree fork stops cleanly; any other picks the next free name.
+  lock (after every read that can fail) and reserved while the fork is
+  made (kv `fork_name:<name>`, ten minutes at most), so two forks at once
+  never pick the same one. A worktree's branch follows it. Checked again
+  before the worktree is made and under the last lock: taken meanwhile by
+  another session, a worktree fork stops cleanly; any other picks the
+  next free name.
 - **Codex in another folder.** `codex fork` started anywhere but the
   parent thread's last folder first asks which folder to work in, with
   the parent's highlighted; there its thread would be indexed under the
   parent's folder and never bound. The fork's argv sets
   `tui.resume_cwd="current"` for that run (`codex::FORK_CWD`): no
   question, and the thread's `cwd` is the folder it was started in.
-- **What it copies**: agent, model (or the one asked for), extra flags,
-  group, tags, description (or the one given), and the parent's
-  `session_context` rows with `at` and `source` (not which hook answer
-  carried them), but not the parent's own fork note (a fork of a fork
-  gets its own). Whether each was handed over (`seen_at`) is copied only
-  when the parent's rows went into the conversation the fork copies
-  (`fork::parent_saw`): by hook, or by the pointer line when its
-  transcript has it; with Claude's system prompt file (not part of the
-  conversation) they are copied unseen, so the fork is handed them. Not
-  notes (the user's own, per session), pin, summary, usage, Remote
-  Control, `codex_host`, role. It adds a note (`context::fork_note`) and
-  a link to the parent, both `source = 'fork'`, then the overlord's
-  `context` and `related`. Past `LINKS_MAX` the oldest copied links are
-  dropped, never the link to the parent nor a session named in
-  `related`. A fork always has background (`context_on`); its delivery
-  is worked out afresh, as for a launch. Nothing is added to the parent.
-- **Lineage**: `sessions.forked_from` (migration 0011); every session
-  row carries `forked_from_name` and its `forks` (id, name; one query
-  over the forks there are). The list marks a fork `⑂`; details and
-  `rlord show` say both ways. The fork's first event is `forked` (`from`,
-  `from_conversation`, argv) instead of `launched`.
+- **What it copies**: agent, extra flags, a Remote Control the user
+  turned off, group, tags, description (or the one given), and the
+  parent's `session_context` rows with `at` and `source` (not which hook
+  answer carried them), but not the parent's own fork note (a fork of a
+  fork gets its own). Its model is the one asked for, else none: no
+  `--model`, so the conversation goes on with the model it has (at the
+  fork and at every resume). Whether each row was handed over
+  (`seen_at`) is copied only when the parent's rows went into the
+  conversation the fork copies (`fork::parent_saw`): by hook, or by the
+  pointer line when its transcript has it; with Claude's system prompt
+  file (not part of the conversation) they are copied unseen, so the
+  fork is handed them. Not notes (the user's own, per session), pin,
+  summary, usage, Remote Control's name, `codex_host`, role. It adds a
+  note (`context::fork_note`) and a link to the parent, both `source =
+  'fork'`, then the overlord's `context` and `related`. Past `LINKS_MAX`
+  the oldest copied links are dropped, never the link to the parent nor
+  a session named in `related`. A fork always has background
+  (`context_on`); its delivery is worked out afresh, as for a launch.
+  Nothing is added to the parent.
+- **Lineage**: `sessions.forked_from` (migration 0011); rows carry
+  `forked_from_name`. Where rows are shown (`session.list`,
+  `session.get`), they also carry their `forks` (id, name, archived;
+  `Db::attach_forks`, one query over these rows' forks), never on a plain
+  lookup (`resolve_ref`, which every hook makes). MCP `list_sessions`
+  rows give a count (`live_forks`), `get_session` the list. The list
+  marks a fork `⑂`; details and `rlord show` say both ways. The fork's
+  first event is `forked` (`from`, `from_conversation`, argv) instead of
+  `launched`.
 - **Refused**: an overlord; no conversation yet (none bound, Claude's
   transcript not written, OpenCode's `ForkEmptyError`); a `scavenged` id;
   a parent whose folder is gone (archived ones fork while it's there); an

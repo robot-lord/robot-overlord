@@ -1065,7 +1065,10 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
 }
 
 pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
-    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let mut s = [db.resolve_ref(p_str(params, "ref")?)?];
+    // (Its forks: shown here, so read here, not on every lookup.)
+    db.attach_forks(&mut s)?;
+    let [s] = s;
     Ok(serde_json::to_value(s)?)
 }
 
@@ -1163,6 +1166,9 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     } else if refork.is_some() {
         // (Its thread, forked from the parent's, is one started from now.)
         note_first_prompt(db, &s.id, agent, None, now)?;
+    }
+    if let Some(parent) = &refork {
+        crate::fork::reforked(db, &s, parent)?;
     }
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.

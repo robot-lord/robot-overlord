@@ -18,6 +18,10 @@ pub(crate) enum Row {
     Fork,
 }
 
+/// A fork on its way: its answer (the session, or the error), and the form
+/// it came from.
+pub(crate) type ForkSend = (mpsc::Receiver<Result<Value, String>>, Box<ForkForm>);
+
 #[derive(Debug, Clone)]
 pub(crate) struct ForkForm {
     pub parent_id: String,
@@ -166,19 +170,52 @@ impl App {
             self.mode = Mode::Fork(f);
             return;
         }
+        if self.fork_send.is_some() {
+            f.error = Some("a fork is still being made: a moment".into());
+            self.mode = Mode::Fork(f);
+            return;
+        }
+        // Off the UI thread (OpenCode's fork call, a worktree, the hooks
+        // check take a while): the list stays live and says so.
         self.status_line = format!("forking {}…", f.parent_name);
-        match client_call(&paths::socket_path(), "session.fork", f.params()) {
+        let (tx, rx) = mpsc::channel();
+        let params = f.params();
+        std::thread::spawn(move || {
+            let r = client_call(&paths::socket_path(), "session.fork", params)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(r);
+        });
+        self.fork_send = Some((rx, f));
+    }
+
+    /// A fork sent from the form has an answer: the new session selected,
+    /// or the form again with what went wrong. Returns whether to redraw.
+    pub(crate) fn poll_fork(&mut self) -> bool {
+        let Some((rx, _)) = &self.fork_send else {
+            return false;
+        };
+        let r = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => Err("the request was lost".into()),
+        };
+        let (_, mut f) = self.fork_send.take().expect("checked");
+        match r {
             Ok(v) => {
                 self.status_line = fork_status(&v);
-                self.dirty = true;
                 // The new session, wherever the list puts it.
                 self.pending_select = v["id"].as_str().map(str::to_string);
             }
             Err(e) => {
-                f.error = Some(format!("{e:#}"));
-                self.mode = Mode::Fork(f);
+                self.status_line = format!("{} wasn't forked", f.parent_name);
+                f.error = Some(e);
+                // (Over whatever is open meanwhile only when nothing is.)
+                if matches!(self.mode, Mode::Normal) {
+                    self.mode = Mode::Fork(f);
+                }
             }
         }
+        true
     }
 
     pub(crate) fn draw_fork_form(&self, f: &mut Frame, s: &ForkForm) {
@@ -419,6 +456,37 @@ mod tests {
         ] {
             assert!(out.contains(want), "{want:?} missing:\n{out}");
         }
+    }
+
+    /// The fork's answer comes in while the list stays live: the new
+    /// session is selected, or the form comes back with the error.
+    #[test]
+    fn a_fork_answer_selects_it_or_reopens_the_form() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        assert!(!app.poll_fork(), "nothing on its way");
+        let form = || Box::new(ForkForm::for_session(&row("claude", Some("/src/api"))));
+        let (tx, answer) = mpsc::channel();
+        app.fork_send = Some((answer, form()));
+        assert!(!app.poll_fork(), "not answered yet");
+        tx.send(Ok(
+            json!({"id": "01f", "name": "api-fork", "forked_from_name": "api",
+                          "warnings": []}),
+        ))
+        .unwrap();
+        assert!(app.poll_fork());
+        assert_eq!(app.pending_select.as_deref(), Some("01f"));
+        assert_eq!(app.status_line, "forked api → api-fork");
+        assert!(app.fork_send.is_none());
+        let (tx, answer) = mpsc::channel();
+        app.fork_send = Some((answer, form()));
+        tx.send(Err("api's folder is gone".into())).unwrap();
+        assert!(app.poll_fork());
+        let Mode::Fork(f) = &app.mode else {
+            panic!("form not reopened")
+        };
+        assert_eq!(f.error.as_deref(), Some("api's folder is gone"));
     }
 
     #[test]

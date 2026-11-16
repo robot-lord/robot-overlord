@@ -215,7 +215,7 @@ pub fn tools() -> Value {
                             "description": "More related sessions for its background, as for create_session (the original is linked already)"},
                 "name": s("Its name (default: <original>-fork, then -fork-2, …)"),
                 "description": s("Its one-line description (default: the original's)"),
-                "model": s("Another model than the original's, one of that agent's (default: the original's)"),
+                "model": s("Another model than the original's, one of that agent's (default: none: the fork goes on with the model its conversation has)"),
                 "worktree": b("Work in a new git worktree branched from the original's last commit instead of its folder (default false). Claude Code and Codex only; uncommitted changes don't come along. Only when the user asks, or the two must not touch the same files."),
                 "branch": s("The new worktree's branch (default: derived from the name)"),
                 "go": b("Switch the user's terminal to the fork (default false)"),
@@ -361,9 +361,16 @@ fn summarize(s: &Value) -> Value {
     if let Some(from) = s["forked_from"].as_str() {
         row["forked_from"] = json!({"id": from, "name": s["forked_from_name"]});
     }
-    // The sessions forked from it (get_session).
-    if s["forks"].as_array().is_some_and(|f| !f.is_empty()) {
-        row["forks"] = s["forks"].clone();
+    // How many live sessions were forked from it (get_session lists them
+    // all, archived ones too).
+    let live_forks = s["forks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["archived"] != true)
+        .count();
+    if live_forks > 0 {
+        row["live_forks"] = json!(live_forks);
     }
     // Stopped on a usage limit: that, rather than the status under it.
     if !s["limit"].is_null() {
@@ -880,6 +887,23 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list row says what it was forked from and how many live forks it
+    /// has; `get_session` has the whole list.
+    #[test]
+    fn a_row_counts_its_live_forks() {
+        let s = json!({"id": "01p", "name": "api", "status": "idle", "archived_at": null,
+                       "forked_from": "01g", "forked_from_name": "base",
+                       "forks": [{"id": "01a", "name": "a", "archived": false},
+                                 {"id": "01b", "name": "b", "archived": true}]});
+        let row = summarize(&s);
+        assert_eq!(row["live_forks"], 1);
+        assert!(row.get("forks").is_none());
+        assert_eq!(row["forked_from"], json!({"id": "01g", "name": "base"}));
+        assert!(summarize(&json!({"id": "x", "forks": []}))
+            .get("live_forks")
+            .is_none());
+    }
 
     /// Every tool, classified. A new tool must be placed here: read-only
     /// only if it changes nothing and starts nothing.
