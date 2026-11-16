@@ -1242,6 +1242,8 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
             db.clear_agent_session(&s.id)?;
             db.kv_set(&bind_since_key(&s.id), &now.to_string())?;
             db.kv_set(&bind_prompt_key(&s.id), "")?;
+            // (A fresh conversation is no fork.)
+            db.kv_delete(&bind_fork_key(&s.id))?;
         }
     }
     db.set_status(&s.id, Status::Starting, now)?;
@@ -1492,8 +1494,7 @@ fn hook_emit_in(
         }
         if bound {
             // What binding from the agent's index would have needed.
-            db.kv_delete(&bind_since_key(&s.id))?;
-            db.kv_delete(&bind_prompt_key(&s.id))?;
+            clear_bind_keys(db, &s.id)?;
         }
         // The session's background, for its own conversation only (not a
         // sub-agent's thread; a forked or background copy was refused
@@ -1959,6 +1960,22 @@ pub(crate) fn bind_since_key(id: &str) -> String {
 /// how its thread is told from another started in the same folder.
 pub(crate) fn bind_prompt_key(id: &str) -> String {
     format!("bind_prompt:{id}")
+}
+
+/// kv key: for a user fork whose agent assigns its own id (Codex), the
+/// thread it was forked from: its conversation is the thread whose rollout
+/// says so (`discover::pick_thread`), not one picked by first message (a
+/// fork's is its parent's).
+pub(crate) fn bind_fork_key(id: &str) -> String {
+    format!("bind_fork:{id}")
+}
+
+/// What an agent that picks its own id needed to find a conversation, once
+/// one is bound.
+pub(crate) fn clear_bind_keys(db: &Db, id: &str) -> Result<()> {
+    db.kv_delete(&bind_since_key(id))?;
+    db.kv_delete(&bind_prompt_key(id))?;
+    db.kv_delete(&bind_fork_key(id))
 }
 
 #[cfg(test)]
