@@ -166,7 +166,7 @@ fn finder_note(
         })
         .collect();
     Some(format!(
-        "skipped {} · add one to repo_roots to scan it too",
+        "skipped {} · to scan a repo in one, add its own folder (not the whole one) to repo_roots",
         groups.join("; ")
     ))
 }
@@ -1806,12 +1806,12 @@ mod tests {
         let near = vec![("/hx/a".to_string(), p.clone())];
         assert_eq!(
             finder_note(&roots, &near, 0, "/h").unwrap(),
-            "skipped /hx/a (macOS asks permission) · add one to repo_roots to scan it too"
+            "skipped /hx/a (macOS asks permission) · to scan a repo in one, add its own folder (not the whole one) to repo_roots"
         );
         assert_eq!(
             finder_note(&roots, &skipped, 2, "/h").unwrap(),
             "skipped ~/Desktop, ~/Documents +1 (macOS asks permission); \
-             /mnt/nas +2 (another disk or network mount) · add one to repo_roots to scan it too"
+             /mnt/nas +2 (another disk or network mount) · to scan a repo in one, add its own folder (not the whole one) to repo_roots"
         );
     }
 

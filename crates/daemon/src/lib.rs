@@ -211,12 +211,7 @@ impl Daemon {
     /// for long). No roots: none. Nothing here touches the disk.
     fn scanned_repos(&self, cfg: &Config, roots: &[String]) -> repo_scan::Found {
         if roots.is_empty() {
-            return repo_scan::Found {
-                repos: Vec::new(),
-                skipped: Vec::new(),
-                skipped_more: 0,
-                scanning: false,
-            };
+            return repo_scan::Found::default();
         }
         let key = (roots.to_vec(), cfg.session.repo_scan_depth);
         self.repo_scan

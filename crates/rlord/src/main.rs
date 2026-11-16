@@ -132,7 +132,8 @@ enum Command {
     /// repo finder scans it). Without PATH, rlord suggests one from the
     /// projects it has seen and asks.
     Setup {
-        /// The folder (created if missing); no prompts
+        /// The folder (created if missing, except one macOS guards, which
+        /// is saved unchecked); no prompts
         path: Option<String>,
         /// Leave `[session] repo_roots` as it is (by default an old
         /// `repo_roots = ["~"]` switches to scanning the code folder)
@@ -1649,11 +1650,16 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
             },
             roots.join(", ")
         );
+        if r["checked"] == false {
+            println!(
+                "not checked: macOS guards this folder; create it yourself if it doesn't exist"
+            );
+        }
         println!("saved to {}", r["config"].as_str().unwrap_or(""));
     };
     if let Some(p) = path {
         let p = absolute_folder(&p, &cwd)?;
-        let roots = setup_roots_default(&configured, keep_roots, status["done"] == true);
+        let roots = roots_edit(&status["roots_default"], keep_roots);
         let r = call(
             "setup.apply",
             json!({"code_dir": p, "roots": roots, "create": true}),
@@ -1668,14 +1674,7 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         return Ok(());
     }
     let label = |c: &Value| {
-        let sources: Vec<(String, usize)> = sugg["sources"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as usize))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sources = rlord_core::code_dir::sources_of(&sugg["sources"]);
         let mut l = format!(
             "{}: {}",
             contract_tilde(c["path"].as_str().unwrap_or("")),
@@ -1726,7 +1725,7 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         return Ok(());
     };
     let folder = absolute_folder(&folder, &cwd)?;
-    let mut roots = setup_roots_default(&configured, keep_roots, status["done"] == true);
+    let mut roots = roots_edit(&status["roots_default"], keep_roots);
     let differs = !configured.is_empty()
         && configured
             .iter()
@@ -1735,6 +1734,7 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
             != [folder.clone()];
     if !keep_roots && differs {
         let default_yes = roots == "follow";
+        let roots_was = roots.clone();
         let q = format!(
             "The repo finder scans {} now. Scan {} instead? [{}] ",
             configured.join(", "),
@@ -1742,9 +1742,11 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
             if default_yes { "Y/n" } else { "y/N" }
         );
         roots = if yes_no(&ask(&q)?, default_yes) {
-            "follow"
+            json!("follow")
+        } else if default_yes {
+            json!("leave")
         } else {
-            "leave"
+            roots_was
         };
     }
     let guarded = rlord_core::privacy::Guard::new()
@@ -1765,15 +1767,14 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
     Ok(())
 }
 
-/// What `rlord setup` does with `repo_roots` unless asked: an old `["~"]`
-/// switches to the code folder the first time (`done`: a folder was saved
-/// before, so the roots are the user's); anything else is left
-/// (`--keep-roots` always leaves it).
-fn setup_roots_default(configured: &[String], keep_roots: bool, done: bool) -> &'static str {
-    if !keep_roots && !done && configured.len() == 1 && configured[0].trim() == "~" {
-        "follow"
+/// What `rlord setup` does with `repo_roots`: the daemon's
+/// `roots_default` (`setup.status`) as given, or leave them with
+/// `--keep-roots`.
+fn roots_edit(default: &Value, keep_roots: bool) -> Value {
+    if keep_roots || default.is_null() {
+        json!("leave")
     } else {
-        "leave"
+        default.clone()
     }
 }
 
@@ -2383,12 +2384,10 @@ mod tests {
 
     #[test]
     fn setup_prompt_helpers() {
-        let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(setup_roots_default(&v(&["~"]), false, false), "follow");
-        assert_eq!(setup_roots_default(&v(&["~"]), false, true), "leave");
-        assert_eq!(setup_roots_default(&v(&["~"]), true, false), "leave");
-        assert_eq!(setup_roots_default(&v(&["~/ko"]), false, false), "leave");
-        assert_eq!(setup_roots_default(&[], false, false), "leave");
+        assert_eq!(roots_edit(&json!("follow"), false), "follow");
+        assert_eq!(roots_edit(&json!("follow"), true), "leave");
+        assert_eq!(roots_edit(&json!("leave"), false), "leave");
+        assert_eq!(roots_edit(&Value::Null, false), "leave");
         assert_eq!(pick_folder("", Some("~/ko")).as_deref(), Some("~/ko"));
         assert_eq!(pick_folder("  ~/x ", Some("~/ko")).as_deref(), Some("~/x"));
         assert_eq!(pick_folder("", None), None);

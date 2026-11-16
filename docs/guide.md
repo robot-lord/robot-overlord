@@ -90,7 +90,8 @@ seen (Claude Code's project list, Codex's and OpenCode's sessions, rlord's
 own sessions and repos, the folder you started `rlord` in), with what it
 rests on ("14 of 17 projects rlord has seen"). ←/→ shows the alternatives;
 type to change it (a folder that doesn't exist is created once you press
-`enter` again to confirm). `enter` saves
+`enter` again to confirm; one macOS guards, like `~/Documents/x`, is saved
+without checking, so create it yourself). `enter` saves
 it. With an overlord, an optional box lets you describe it in your own
 words instead ("work in ~/ko, personal in ~/proj"): the overlord reopens
 the form with its reading of that, and saving saves what it shows. `esc`

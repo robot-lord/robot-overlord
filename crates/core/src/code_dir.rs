@@ -47,6 +47,18 @@ pub fn source_label(source: &str) -> &str {
     }
 }
 
+/// `sources` as `setup.suggest` returns them (`{"claude": 9, ...}`), for
+/// `basis`.
+pub fn sources_of(v: &serde_json::Value) -> Vec<(String, usize)> {
+    v.as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0) as usize))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What a suggestion rests on, in words: "14 of 17 projects rlord has
 /// seen (Claude Code 9, Codex 3, rlord 6)". `sources`: (source, count) in
 /// any order; sources with none are left out.
@@ -85,9 +97,9 @@ fn project_root(p: &str) -> Option<PathBuf> {
 
 /// Folders never suggested: `/`, `$HOME` and its ancestors, and the usual
 /// homes' parents.
-fn never(d: &Path, home: &Path) -> bool {
+fn never(d: &Path, homes: &[PathBuf]) -> bool {
     d.parent().is_none()
-        || home.starts_with(d)
+        || homes.iter().any(|h| h.starts_with(d))
         || d == Path::new("/Users")
         || d == Path::new("/home")
 }
@@ -96,7 +108,14 @@ fn never(d: &Path, home: &Path) -> bool {
 /// once, at most `max_depth` levels below the folder), and up to four
 /// alternatives. Ties go to the deeper folder (an ancestor that covers no
 /// more adds nothing), then the first by name.
-pub fn suggest(seen: &[Seen], home: &Path, excluded: &[PathBuf], max_depth: u8) -> Suggestion {
+/// `homes`: `$HOME` as given and resolved (it may sit behind a symlink,
+/// and paths are recorded either way).
+pub fn suggest(
+    seen: &[Seen],
+    homes: &[PathBuf],
+    excluded: &[PathBuf],
+    max_depth: u8,
+) -> Suggestion {
     let mut projects: BTreeMap<PathBuf, BTreeSet<&'static str>> = BTreeMap::new();
     for s in seen {
         let Some(p) = project_root(&s.path) else {
@@ -104,7 +123,7 @@ pub fn suggest(seen: &[Seen], home: &Path, excluded: &[PathBuf], max_depth: u8) 
         };
         // `$HOME` itself, a folder directly in `/`, rlord's data and temp
         // dirs: never a project.
-        if p == home
+        if homes.contains(&p)
             || p.parent().is_none_or(|d| d.parent().is_none())
             || excluded.iter().any(|e| p.starts_with(e))
         {
@@ -123,7 +142,7 @@ pub fn suggest(seen: &[Seen], home: &Path, excluded: &[PathBuf], max_depth: u8) 
     for p in projects.keys() {
         let depth = p.components().count();
         for d in p.ancestors().skip(1) {
-            if never(d, home) {
+            if never(d, homes) {
                 continue;
             }
             if depth - d.components().count() <= max_depth as usize {
@@ -186,7 +205,7 @@ mod tests {
 
     #[test]
     fn the_most_common_parent_wins() {
-        let home = Path::new("/h");
+        let home = &[PathBuf::from("/h")];
         let s = suggest(
             &seen(&[
                 "/h/ko/a",
@@ -223,7 +242,7 @@ mod tests {
 
     #[test]
     fn worktrees_and_duplicates_count_once() {
-        let home = Path::new("/h");
+        let home = &[PathBuf::from("/h")];
         let mut v = seen(&[
             "/h/ko/app/.worktrees/x",
             "/h/ko/app/.claude/worktrees/y",
@@ -241,7 +260,7 @@ mod tests {
 
     #[test]
     fn home_and_its_direct_projects_are_never_suggested() {
-        let home = Path::new("/h");
+        let home = &[PathBuf::from("/h")];
         // A project directly in $HOME adds nothing; $HOME itself is no project.
         let s = suggest(&seen(&["/h/dotfiles", "/h", "/h/.config"]), home, &[], 3);
         assert_eq!(s.best, None);
@@ -249,11 +268,19 @@ mod tests {
         let s = suggest(&seen(&["/srv", "rel/x"]), home, &[], 3);
         assert_eq!(s, Suggestion::default());
         assert_eq!(suggest(&[], home, &[], 3).best, None);
+        // `$HOME` behind a symlink: neither spelling is suggested.
+        let homes = &[PathBuf::from("/home/me"), PathBuf::from("/var/home/me")];
+        let s = suggest(&seen(&["/var/home/me/a", "/home/me/b"]), homes, &[], 3);
+        assert_eq!(s.best, None);
+        // (And `sources` parse for `basis`.)
+        let mut src = sources_of(&serde_json::json!({"claude": 2, "rlord": 1}));
+        src.sort();
+        assert_eq!(src, [("claude".to_string(), 2), ("rlord".to_string(), 1)]);
     }
 
     #[test]
     fn excluded_folders_are_dropped() {
-        let home = Path::new("/h");
+        let home = &[PathBuf::from("/h")];
         let s = suggest(
             &seen(&[
                 "/tmp/x/a",
@@ -270,7 +297,7 @@ mod tests {
 
     #[test]
     fn ties_go_to_the_deeper_folder() {
-        let home = Path::new("/h");
+        let home = &[PathBuf::from("/h")];
         let s = suggest(&seen(&["/h/ko/org/a", "/h/ko/org/b"]), home, &[], 3);
         assert_eq!(best(&s), Some("/h/ko/org"));
         // Alternatives are neither ancestors nor descendants of the best.

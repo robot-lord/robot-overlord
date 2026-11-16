@@ -82,6 +82,9 @@ pub(crate) struct SetupForm {
     /// The folder the user was told doesn't exist; saving it again
     /// creates it.
     confirm_create: Option<String>,
+    /// Reopened with an overlord proposal (`prefill`): a late suggestion
+    /// doesn't replace it.
+    proposal: bool,
     /// Which folders macOS would ask about (built once).
     guard: rlord_core::privacy::Guard,
     /// The line under the folder (`folder_hint`), worked out once per
@@ -117,14 +120,7 @@ impl SetupForm {
             .map(choice)
             .filter(|c| !c.path.is_empty())
             .collect();
-        let sources = sugg["sources"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as usize))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sources = rlord_core::code_dir::sources_of(&sugg["sources"]);
         let configured: Vec<String> = sugg["roots"]["configured"]
             .as_array()
             .map(|a| {
@@ -144,10 +140,9 @@ impl SetupForm {
         } else {
             (contract_tilde(current), true)
         };
-        // The old template's `["~"]` switches to the code folder, but only
-        // the first time: once a folder was saved, roots are the user's.
-        let done = sugg["done"] == true;
-        let roots = if configured.is_empty() || (configured == ["~"] && !done) {
+        // What saving rlord's suggestion does with the roots is the
+        // daemon's call (`roots_default`), used as given.
+        let roots = if configured.is_empty() || sugg["roots_default"] == "follow" {
             Roots::Follow
         } else {
             Roots::Keep(configured.clone())
@@ -171,6 +166,7 @@ impl SetupForm {
             loading: false,
             touched: false,
             confirm_create: None,
+            proposal: false,
             guard: rlord_core::privacy::Guard::new(),
             hint: String::new(),
         };
@@ -199,7 +195,7 @@ impl SetupForm {
         let known = json!({
             "code_dir": status["code_dir"],
             "roots": {"configured": status["repo_roots"]},
-            "done": status["done"],
+            "roots_default": status["roots_default"],
         });
         let mut f = SetupForm::from_suggest(&known, overlord, auto);
         f.loading = true;
@@ -217,12 +213,22 @@ impl SetupForm {
         if self.code_dir_chosen {
             new.code_dir = std::mem::take(&mut self.code_dir);
             new.code_dir_chosen = true;
-            new.roots_row = new.roots_differ();
         }
-        if self.touched {
-            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
-            new.touched = true;
+        // The user's choice, or the overlord's proposal, stays as it is.
+        if self.touched || self.proposal {
             new.roots = std::mem::replace(&mut self.roots, Roots::Follow);
+            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
+            new.touched = self.touched;
+        }
+        if self.proposal {
+            new.proposal = true;
+            new.note = self.note.take();
+            new.changed = std::mem::take(&mut self.changed);
+            new.confirmed = self.confirmed;
+        }
+        new.roots_row = self.roots_row || new.roots_differ();
+        if new.proposal || new.touched {
+            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
         }
         new.refresh_hint();
         *self = new;
@@ -260,8 +266,16 @@ impl SetupForm {
             };
             self.roots_row = true;
         } else {
+            // No roots proposed: the configured ones stay, whatever the
+            // first-run default would do (`["~"]` included).
+            self.roots = if self.configured.is_empty() {
+                Roots::Follow
+            } else {
+                Roots::Keep(self.configured.clone())
+            };
             self.roots_row = self.roots_differ();
         }
+        self.proposal = true;
         if let Some(d) = p["description"].as_str() {
             self.describe = Some(d.to_string());
         }
@@ -460,6 +474,14 @@ impl App {
         let Some(o) = self.call("overlord.get", Value::Null) else {
             return false;
         };
+        self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto, status)));
+        self.load_suggestion();
+        true
+    }
+
+    /// Work out rlord's suggestion on another thread (it reads the agents'
+    /// files); `poll_setup` fills the open form with it.
+    fn load_suggestion(&mut self) {
         let launch = std::env::current_dir()
             .ok()
             .and_then(|d| rlord_core::git::main_repo_root(&d.to_string_lossy()));
@@ -474,8 +496,6 @@ impl App {
             let _ = tx.send(v);
         });
         self.setup_rx = Some(rx);
-        self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto, status)));
-        true
     }
 
     /// The suggestion for an open form, if it has arrived (the event loop
@@ -509,11 +529,13 @@ impl App {
             Mode::Setup(f) => (f.auto, f.then_overlord),
             _ => (false, false),
         };
-        let sugg = &cmd["suggest"];
-        let mut f = SetupForm::from_suggest(sugg, true, auto);
+        // What is configured now came with the command (cheap); rlord's own
+        // suggestion, for ←/→, loads in the background.
+        let mut f = SetupForm::loading(true, auto, &cmd["status"]);
         f.then_overlord = then_overlord;
         f.prefill(&cmd["prefill"]);
         self.mode = Mode::Setup(Box::new(f));
+        self.load_suggestion();
     }
 
     /// The form closed (saved, sent or put off).
@@ -654,6 +676,11 @@ impl App {
                             roots.join(", ")
                         )
                     };
+                    if r["checked"] == false {
+                        self.status_line.push_str(
+                            " · not checked: macOS guards this folder; create it yourself if it doesn't exist",
+                        );
+                    }
                     self.close_setup(&f);
                 }
                 Err(e) => {
@@ -939,6 +966,8 @@ mod tests {
             "alternatives": [{"path": "/elsewhere/work", "projects": 1, "of": 4, "from": "vote", "prompts": false}],
             "sources": {"claude": 3, "rlord": 1},
             "roots": {"configured": configured, "effective": []},
+            // (As the daemon says before setup was done.)
+            "roots_default": if configured == ["~"] { "follow" } else { "leave" },
         })
     }
 
@@ -1089,7 +1118,8 @@ mod tests {
     /// the cheap status) are kept, never replaced by "follow".
     #[test]
     fn an_early_save_keeps_configured_roots() {
-        let st = json!({"needed": true, "code_dir": "", "repo_roots": ["/x"], "done": false});
+        let st =
+            json!({"needed": true, "code_dir": "", "repo_roots": ["/x"], "roots_default": "leave"});
         let mut f = SetupForm::loading(true, true, &st);
         assert_eq!(f.roots, Roots::Keep(vec!["/x".into()]));
         f.code_dir = "/c".into();
@@ -1102,19 +1132,43 @@ mod tests {
         assert_eq!(SetupForm::loading(false, false, &st).code_dir, "/c");
     }
 
-    /// `["~"]` follows the code folder only the first time.
+    /// The daemon's `roots_default` is used as given.
     #[test]
-    fn home_roots_are_kept_once_setup_was_done() {
+    fn the_roots_default_comes_from_the_daemon() {
         let mut s = sugg(Some("/elsewhere/ko"), &["~"]);
+        s["roots_default"] = json!("follow");
         assert_eq!(
             SetupForm::from_suggest(&s, false, false).roots,
             Roots::Follow
         );
-        s["done"] = json!(true);
+        s["roots_default"] = json!("leave");
         assert_eq!(
             SetupForm::from_suggest(&s, false, false).roots,
             Roots::Keep(vec!["~".into()])
         );
+    }
+
+    /// An overlord proposal that names no roots leaves `["~"]` alone, even
+    /// on first run where rlord's own suggestion would drop it; a late
+    /// suggestion doesn't change that.
+    #[test]
+    fn a_proposal_without_roots_leaves_home_roots() {
+        let st = json!({"code_dir": "", "repo_roots": ["~"], "roots_default": "follow"});
+        let mut f = SetupForm::loading(true, true, &st);
+        assert_eq!(f.roots, Roots::Follow);
+        f.prefill(&json!({"code_dir": "/elsewhere/ko", "note": "n"}));
+        assert_eq!(f.roots, Roots::Keep(vec!["~".into()]));
+        let mut s = sugg(Some("/elsewhere/work"), &["~"]);
+        s["roots_default"] = json!("follow");
+        f.fill(&s);
+        assert_eq!(f.roots, Roots::Keep(vec!["~".into()]));
+        assert_eq!(f.code_dir, "/elsewhere/ko");
+        assert!(f.confirmed && f.note.as_deref() == Some("n"));
+        assert_eq!(f.current(), Row::Save);
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(p["roots"], "leave");
     }
 
     /// The overlord's `repo_roots: []`: only the code folder.
@@ -1154,7 +1208,7 @@ mod tests {
         first.then_overlord = true;
         app.mode = Mode::Setup(Box::new(first));
         app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/new"},
-                                    "suggest": sugg(None, &[])}));
+                                    "status": {"code_dir": "", "repo_roots": []}}));
         let Mode::Setup(f) = &app.mode else {
             panic!("form not open")
         };
@@ -1169,7 +1223,7 @@ mod tests {
         let mut app = App::new(rx, Config::default(), keys);
         app.pending_setup = Some(json!({"cmd": "setup", "prefill": {"code_dir": "/old"}}));
         app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/new"},
-                                    "suggest": sugg(None, &[])}));
+                                    "status": {"code_dir": "", "repo_roots": []}}));
         assert!(app.pending_setup.is_none());
         let Mode::Setup(f) = &app.mode else {
             panic!("form not open")

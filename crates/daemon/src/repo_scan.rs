@@ -56,6 +56,7 @@ pub struct Scanner {
 }
 
 /// A scan's answer.
+#[derive(Default)]
 pub struct Found {
     pub repos: Vec<String>,
     /// Folders the scan stayed out of (`git::scan_repos`), and how many
@@ -102,10 +103,8 @@ impl Scanner {
                 scanning: false,
             },
             None => Found {
-                repos: Vec::new(),
-                skipped: Vec::new(),
-                skipped_more: 0,
                 scanning: st.running.contains_key(key),
+                ..Found::default()
             },
         }
     }

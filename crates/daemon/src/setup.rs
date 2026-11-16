@@ -35,20 +35,22 @@ pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
     cfg.session.code_dir_path().is_none() && db.kv_get(KV).ok().flatten().is_none()
 }
 
-/// `setup.status`: `needed`, the code folder (expanded, "" when unset), and
-/// whether the user skipped setup.
+/// `setup.status` (cheap: config and one kv row): `needed`, the code
+/// folder (expanded, "" when unset), whether the user skipped setup or
+/// saved a folder before (`done`), `repo_roots` as configured, and
+/// `roots_default`: what saving rlord's own suggestion does with them
+/// (`default_roots`). Every front end uses that as given.
 pub(crate) fn status(d: &Daemon) -> Result<Value> {
     let cfg = d.config();
     let db = d.db();
-    let answered = db.kv_get(KV)?;
+    let done = done(&db);
     Ok(json!({
         "needed": needed(&db, &cfg),
         "code_dir": cfg.session.code_dir_path().unwrap_or_default(),
-        "skipped": answered.as_deref().is_some_and(|a| a.starts_with("skipped")),
-        // A code folder was saved through setup before.
-        "done": answered.is_some_and(|a| a.starts_with("done")),
-        // As configured (`rlord setup <PATH>` picks what to do with them).
+        "skipped": db.kv_get(KV)?.is_some_and(|a| a.starts_with("skipped")),
+        "done": done,
         "repo_roots": cfg.session.repo_roots,
+        "roots_default": default_roots(&cfg, done),
     }))
 }
 
@@ -58,6 +60,38 @@ fn done(db: &Db) -> bool {
         .ok()
         .flatten()
         .is_some_and(|a| a.starts_with("done"))
+}
+
+/// What saving rlord's own suggestion does with `repo_roots`: the old
+/// template's `["~"]` is dropped ("follow": only the code folder), but only
+/// until a folder was saved once (`done`); anything else is left. An
+/// overlord proposal that names no roots always leaves them.
+pub(crate) fn default_roots(cfg: &Config, done: bool) -> &'static str {
+    let roots: Vec<&str> = cfg
+        .session
+        .repo_roots
+        .iter()
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if !done && roots == ["~"] {
+        "follow"
+    } else {
+        "leave"
+    }
+}
+
+/// `$HOME` as given and resolved (`/home` may be a symlink to
+/// `/var/home`): the suggestion never offers either or anything above.
+fn homes() -> Vec<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let mut v = vec![home.clone()];
+    if let Ok(c) = std::fs::canonicalize(&home) {
+        if c != home {
+            v.push(c);
+        }
+    }
+    v
 }
 
 /// Every folder rlord has seen work in. rlord's own rows under a short DB
@@ -98,16 +132,19 @@ fn collect(d: &Daemon, launch_dir: Option<&str>) -> Vec<Seen> {
 pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
     let seen = collect(d, params["launch_dir"].as_str());
     let cfg = d.config();
-    let needed = needed(&d.db(), &cfg);
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let (needed, done) = {
+        let db = d.db();
+        (needed(&db, &cfg), done(&db))
+    };
     let s = code_dir::suggest(
         &seen,
-        &home,
+        &homes(),
         &rlord_core::import::excluded_dirs(),
         cfg.session.repo_scan_depth,
     );
     let mut v = suggestion_value(&s, &cfg, needed, &Guard::new(), &|p| p.is_dir());
-    v["done"] = json!(done(&d.db()));
+    v["done"] = json!(done);
+    v["roots_default"] = json!(default_roots(&cfg, done));
     Ok(v)
 }
 
@@ -178,31 +215,19 @@ fn suggestion_value(
 
 /// `ui.confirm_setup` (the overlord's `confirm_setup`): open the
 /// code-folder form on the user's screen with what the overlord would
-/// save. The user's confirm there saves it (`setup.apply`).
+/// save. The user's confirm there saves it (`setup.apply`). Cheap: the
+/// form loads rlord's own suggestion (for ←/→) in the background.
 pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
-    // The overlord named the folder: no need to read every agent's files
-    // for alternatives.
-    let named = params["code_dir"]
-        .as_str()
-        .is_some_and(|c| !c.trim().is_empty());
-    let mut sugg = if named {
-        let cfg = d.config();
-        let needed = needed(&d.db(), &cfg);
-        suggestion_value(&Suggestion::default(), &cfg, needed, &Guard::new(), &|p| {
-            p.is_dir()
-        })
-    } else {
-        suggest(d, &json!({}))?
-    };
-    sugg["done"] = json!(done(&d.db()));
-    let r = queue_confirm(d, params, sugg)?;
+    let st = status(d)?;
+    let r = queue_confirm(d, params, st)?;
     crate::ui::show_list(d)?;
     Ok(r)
 }
 
 /// `confirm` up to showing the list: check the proposal and push the
-/// form's UI command, with `sugg` (`setup.suggest`) for its choices.
-fn queue_confirm(d: &Daemon, params: &Value, sugg: Value) -> Result<Value> {
+/// form's UI command, with `status` (`setup.status`) for what is
+/// configured now.
+fn queue_confirm(d: &Daemon, params: &Value, status: Value) -> Result<Value> {
     let mut prefill = serde_json::Map::new();
     if let Some(c) = params["code_dir"].as_str().filter(|c| !c.trim().is_empty()) {
         prefill.insert("code_dir".into(), json!(absolute_dir(c)?));
@@ -226,7 +251,7 @@ fn queue_confirm(d: &Daemon, params: &Value, sugg: Value) -> Result<Value> {
         prefill.insert("changed".into(), json!(c));
     }
     let prefill = Value::Object(prefill);
-    d.ui_cmd(json!({"cmd": "setup", "prefill": prefill, "suggest": sugg}));
+    d.ui_cmd(json!({"cmd": "setup", "prefill": prefill, "status": status}));
     Ok(json!({"shown": prefill,
               "note": "the form is open on the user's screen; rlord saves it when they confirm"}))
 }
@@ -244,8 +269,14 @@ pub(crate) fn apply(d: &Daemon, params: &Value) -> Result<Value> {
 
 /// `apply` writing the config at `path`; the caller reloads it. Returns
 /// what was saved: the folder, the roots the finder now scans, whether the
-/// folder was created, and the config file.
+/// folder was checked (false: macOS guards it, so it wasn't touched) and
+/// created, and the config file.
 fn apply_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
+    apply_with(d, params, path, &Guard::new())
+}
+
+/// `apply_at` with a given guard (tests).
+fn apply_with(d: &Daemon, params: &Value, path: &Path, guard: &Guard) -> Result<Value> {
     if params["skip"] == true {
         d.db().kv_set(KV, &format!("skipped:{}", now_ms()))?;
         return Ok(json!({"skipped": true}));
@@ -276,10 +307,12 @@ fn apply_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
         }
         other => bail!("roots: \"leave\", \"follow\" or a list of folders, not {other}"),
     };
-    // A folder macOS guards isn't touched (the user named it: it is saved
-    // as given); any other must exist, or be created when asked.
+    // A folder macOS guards isn't touched, not even to check it exists
+    // (that would raise the prompt): it is saved as given, unchecked. Any
+    // other must exist, or be created when asked.
+    let checked = guard.prompts(Path::new(&dir)).is_none();
     let mut created = false;
-    if Guard::new().prompts(Path::new(&dir)).is_none() && !Path::new(&dir).is_dir() {
+    if checked && !Path::new(&dir).is_dir() {
         if params["create"] != true {
             bail!("{} doesn't exist (create it?)", contract_tilde(&dir));
         }
@@ -298,6 +331,7 @@ fn apply_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
     Ok(json!({
         "code_dir": dir,
         "repo_roots": effective,
+        "checked": checked,
         "created": created,
         "config": file.to_string_lossy(),
     }))
@@ -432,7 +466,11 @@ mod tests {
         let (_, cmd) = d.pending_ui.lock().unwrap().clone().unwrap();
         assert_eq!(cmd["cmd"], "setup");
         assert_eq!(cmd["prefill"]["code_dir"], "/h/ko");
-        assert_eq!(cmd["suggest"], sugg);
+        assert_eq!(cmd["status"], sugg);
+        assert!(
+            cmd.get("suggest").is_none(),
+            "no suggestion in the MCP call"
+        );
         // Relative paths and `/` are refused, saying what to pass.
         let e = queue_confirm(&d, &json!({"code_dir": "ko"}), sugg.clone()).unwrap_err();
         assert!(e.to_string().contains("full path"), "{e}");
@@ -449,6 +487,54 @@ mod tests {
         let r = queue_confirm(&d, &json!({"code_dir": "/h/ko/"}), sugg).unwrap();
         assert!(r["shown"].get("repo_roots").is_none());
         assert_eq!(r["shown"]["code_dir"], "/h/ko");
+    }
+
+    /// The old `["~"]` is dropped by default only before setup was done;
+    /// status says so for every front end.
+    #[test]
+    fn default_roots_rule() {
+        let mut cfg = Config::default();
+        assert_eq!(default_roots(&cfg, false), "leave");
+        cfg.session.repo_roots = vec!["~".into()];
+        assert_eq!(default_roots(&cfg, false), "follow");
+        assert_eq!(default_roots(&cfg, true), "leave");
+        cfg.session.repo_roots = vec!["~/ko".into()];
+        assert_eq!(default_roots(&cfg, false), "leave");
+        let d = Daemon::new(Db::open_in_memory().unwrap(), {
+            let mut c = Config::default();
+            c.session.repo_roots = vec!["~".into()];
+            c
+        });
+        assert_eq!(status(&d).unwrap()["roots_default"], "follow");
+        d.db().kv_set(KV, "done:1").unwrap();
+        let st = status(&d).unwrap();
+        assert_eq!(
+            (st["roots_default"].as_str(), st["done"].as_bool()),
+            (Some("leave"), Some(true))
+        );
+    }
+
+    /// A folder macOS guards is saved as given: not checked, not created.
+    #[test]
+    fn a_guarded_folder_is_saved_unchecked() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let cfg = home.join("config.toml");
+        let code = home.join("Documents/code");
+        let guard = Guard::with(Some(&home), false);
+        let r = apply_with(
+            &d,
+            &json!({"code_dir": code.to_string_lossy(), "create": true}),
+            &cfg,
+            &guard,
+        )
+        .unwrap();
+        assert_eq!(
+            (r["checked"].as_bool(), r["created"].as_bool()),
+            (Some(false), Some(false))
+        );
+        assert!(!code.exists());
     }
 
     #[test]

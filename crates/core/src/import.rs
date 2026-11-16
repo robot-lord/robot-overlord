@@ -82,11 +82,15 @@ pub fn scan_claude(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candi
 
 /// The folders Claude Code conversations ran in, for the code-folder
 /// suggestion: the newest `limit` project dirs (by mtime) under
-/// `~/.claude/projects`, each read through its newest transcript's head and
-/// tail only.
+/// `~/.claude/projects`, each read through the head and tail of at most a
+/// few of its transcripts (no stat of every file).
 pub fn claude_project_folders(limit: usize) -> Vec<String> {
     claude_project_folders_in(&claude::config_dir().join("projects"), limit)
 }
+
+/// How many of one project dir's transcripts `claude_project_folders`
+/// reads at most looking for its folder.
+const TRANSCRIPTS_PER_DIR: usize = 3;
 
 /// `claude_project_folders` over an explicit projects dir (tests). The
 /// slug is lossy, so a dir's folder is a `cwd` from its transcript whose
@@ -109,24 +113,25 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some(newest) = std::fs::read_dir(&dir).ok().and_then(|files| {
-            files
-                .flatten()
-                .map(|f| f.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-                .max_by_key(|p| mtime(p))
-        }) else {
+        let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let (head, tail) = transcript::read_head_tail(&newest);
-        if let Some(cwd) = head
-            .iter()
-            .chain(tail.iter())
-            .filter_map(|v| v["cwd"].as_str())
-            .find(|c| claude::project_slug(c) == slug)
-        {
-            out.push(cwd.to_string());
-        }
+        // Any of a folder's transcripts names it: the first few that
+        // yield one, by name only (no stat of every file).
+        let found = files
+            .flatten()
+            .map(|f| f.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .take(TRANSCRIPTS_PER_DIR)
+            .find_map(|t| {
+                let (head, tail) = transcript::read_head_tail(&t);
+                head.iter()
+                    .chain(tail.iter())
+                    .filter_map(|v| v["cwd"].as_str())
+                    .find(|c| claude::project_slug(c) == slug)
+                    .map(str::to_string)
+            });
+        out.extend(found);
     }
     out
 }

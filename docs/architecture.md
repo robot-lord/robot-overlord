@@ -1201,8 +1201,8 @@ form records nothing, so it opens again next start.
 
 The suggestion is plain code (`core/src/code_dir.rs`) over folders rlord
 can read without walking the disk (`daemon/src/setup.rs`, bounded): the
-newest Claude Code project dirs (a `cwd` from the newest transcript whose
-slug matches), Codex's `threads.cwd`, OpenCode's top-level
+newest Claude Code project dirs (a `cwd` whose slug matches, from the
+first of a few transcripts that has one), Codex's `threads.cwd`, OpenCode's top-level
 `session_v2.directory` (only that table: the DB holds credentials), rlord's
 repos and session folders, and the launch folder. Each project counts
 once; the folder holding the most within `repo_scan_depth` wins (ties: the
@@ -1218,9 +1218,14 @@ it isn't called again. First run opens the form after the overlord
 dialog; `:setup`, `rlord setup` and the overlord open it later. The form
 opens at once with the configured roots (`setup.status`, cheap) and fills
 in the suggestion from another thread; it asks before creating a folder
-that doesn't exist. It offers to drop an old `repo_roots = ["~"]` only
-until a folder has been saved once. `confirm_setup` with a folder
-skips reading the agents' files.
+that doesn't exist. A folder macOS guards is saved unchecked
+(`checked: false`): checking or creating it would raise the prompt.
+What saving rlord's own suggestion does with `repo_roots` is the
+daemon's call (`setup::default_roots`, returned as `roots_default` and
+used as given by the TUI and the CLI): an old `["~"]` is dropped only
+until a folder has been saved once. An overlord proposal without
+`repo_roots` always leaves them. `confirm_setup` never reads the agents'
+files; the form loads the suggestion itself.
 
 ## Session creation
 
