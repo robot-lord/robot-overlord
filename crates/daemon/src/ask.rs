@@ -331,7 +331,10 @@ pub fn format_setup_request(p: &Value) -> Result<String> {
             } else {
                 "picked by the user"
             };
-            format!("- repo finder scans: {} ({whose})\n", list.join(", "))
+            format!(
+                "- repo finder scans: the code folder and {} ({whose})\n",
+                list.join(", ")
+            )
         }
         _ => "- repo finder scans: the code folder\n".to_string(),
     };
@@ -365,7 +368,7 @@ mod tests {
             "{m}"
         );
         assert!(
-            m.contains("- repo finder scans: ~ (from the user's config)\n"),
+            m.contains("- repo finder scans: the code folder and ~ (from the user's config)\n"),
             "{m}"
         );
         let m = format_setup_request(&json!({"description": "x", "code_dir": "",
@@ -373,7 +376,7 @@ mod tests {
         .unwrap();
         assert!(m.contains("- code folder: (not set)\n"), "{m}");
         assert!(
-            m.contains("- repo finder scans: /a, /b (picked by the user)\n"),
+            m.contains("- repo finder scans: the code folder and /a, /b (picked by the user)\n"),
             "{m}"
         );
         assert!(format_setup_request(&json!({"description": " "})).is_err());

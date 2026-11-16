@@ -1113,13 +1113,14 @@ including when the active one hits a usage limit.
   followed. A protected folder is entered when it holds a root or a
   folder a live session runs in (macOS grants it whole once allowed).
   Another filesystem is crossed only into a session folder or below one
-  (`Guard::allows`), never because something granted lies deeper. A code
-  folder under a root is scanned as a root of its own
-  (`setup::scan_roots`), so it is reached even below a mount or inside a
-  protected folder; a root nested in another is walked once. Session
+  (`Guard::allows`), never because something granted lies deeper. The code
+  folder is always a root of its own, so it is reached even below a mount
+  or inside a protected folder; a root nested in another, or named twice,
+  is walked once. Session
   folders are matched in both their stored and resolved forms
-  (`setup::granted_folders`), and the granted set is part of the scan
-  cache's key. A folder whose metadata can't be read is skipped silently.
+  (`setup::granted_folders`, resolved on the scan's thread). A result
+  made with other session folders is served and refreshed in the
+  background (still one scan per set of roots). A folder whose metadata can't be read is skipped silently.
   Skipped folders come back in `repo.find` (`skipped`, at most 50) and the
   finder and `find_repos` name them.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
@@ -1192,11 +1193,13 @@ navigation bindings).
 
 ### Setup: the code folder
 
-`[session] code_dir` is where the user keeps repos; `repo_roots` defaults
-to it (`SessionDefaults::scan_roots`). With neither set, the finder scans
+`[session] code_dir` is where the user keeps repos. The finder always
+scans it, plus each `repo_roots` entry, a folder named twice once
+(`SessionDefaults::scan_roots`). With neither set, the finder scans
 `~` until setup is answered, then nothing (`finder_roots`). Setup is
 answered when a kv row `setup_code_dir` exists (`done:` or `skipped:`): a
-skip never writes the config.
+skip ("don't ask again" on the form) never writes the config; Esc on the
+form records nothing, so it opens again next start.
 
 The suggestion is plain code (`core/src/code_dir.rs`) over folders rlord
 can read without walking the disk (`daemon/src/setup.rs`, bounded): the

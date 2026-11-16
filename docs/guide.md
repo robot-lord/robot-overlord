@@ -94,7 +94,9 @@ type to change it (a folder that doesn't exist is created once you press
 it. With an overlord, an optional box lets you describe it in your own
 words instead ("work in ~/ko, personal in ~/proj"): the overlord reopens
 the form with its reading of that, and saving saves what it shows. `esc`
-puts it off; `:setup` opens it any time, `rlord setup [PATH]` does the same
+puts it off until the next start; `ctrl-d` there stops asking (with no code
+folder, the finder then lists only repos you've used, unless `repo_roots`
+is set). `:setup` opens it any time, `rlord setup [PATH]` does the same
 from a terminal, and you can just tell the overlord "my code is in ~/ko".
 
 ### Which agent runs the overlord
@@ -300,10 +302,11 @@ every repo you've used, most recent first — plus "find another repo…" (a
 filter-as-you-type finder, MRU first; a typed path that is a repo is offered
 too) and "no repo — plain folder…".
 
-The finder scans your code folder (`code_dir`) to `repo_scan_depth` (3), or
-`repo_roots` when you set it (`repo_roots = ["~/ko", "~/proj"]`). Until you
-set a code folder, or put setup off, it scans `~`; after putting it off with
-none set, it lists only repos you've used. It stays out of folders where
+The finder scans your code folder (`code_dir`) to `repo_scan_depth` (3),
+plus any folders in `repo_roots` (`repo_roots = ["~/work"]`). Until you
+set a code folder, or say "don't ask again" on the form, it scans `~`;
+after that with none set (and no `repo_roots`), it lists only repos you've
+used. It stays out of folders where
 reading could stall, and says which it skipped: on macOS the folders that
 raise a privacy prompt (`~/Desktop`, `~/Documents`, `~/Downloads`,
 `~/Movies`, `~/Music`, `~/Pictures`, `~/Library`, anything under

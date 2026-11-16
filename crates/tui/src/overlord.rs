@@ -457,6 +457,11 @@ impl App {
             }
             _ => self.mode = Mode::OverlordUpgrade(u),
         }
+        // Closed: the code folder next, the first time (as after the
+        // overlord's own dialog).
+        if matches!(self.mode, Mode::Normal) {
+            self.check_setup();
+        }
     }
 
     /// Apply a `{query, sort, reverse, archived}` view.
@@ -799,6 +804,10 @@ impl App {
                 }
             },
             _ => self.mode = Mode::RemoteOffer(o),
+        }
+        // Closed: the code folder next, the first time.
+        if matches!(self.mode, Mode::Normal) {
+            self.check_setup();
         }
     }
 

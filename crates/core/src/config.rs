@@ -423,8 +423,8 @@ pub struct SessionDefaults {
     /// Where the user's repos live and new ones are created. Empty = not
     /// set (`rlord setup` sets it).
     pub code_dir: String,
-    /// Directories the repo finder scans (to `repo_scan_depth`). Empty =
-    /// the code folder (see `scan_roots`).
+    /// More folders for the repo finder to scan (to `repo_scan_depth`),
+    /// besides the code folder, which it always scans (`scan_roots`).
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: u8,
     /// Claude Code's renderer for rlord's sessions (`--settings
@@ -499,23 +499,26 @@ impl SessionDefaults {
         Some(expand_tilde(d))
     }
 
-    /// The folders the repo finder scans, as written: `repo_roots` when it
-    /// lists any, else the code folder when one is set, else none.
+    /// The folders the repo finder scans, as written: the code folder when
+    /// one is set, then each `repo_roots` entry. Every folder the user
+    /// names is scanned; one named twice (`~/ko` and `/Users/me/ko/`) once.
     pub fn scan_roots(&self) -> Vec<String> {
-        let roots: Vec<String> = self
-            .repo_roots
-            .iter()
-            .map(|r| r.trim())
-            .filter(|r| !r.is_empty())
-            .map(str::to_string)
-            .collect();
-        if !roots.is_empty() {
-            return roots;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let named = std::iter::once(self.code_dir.as_str())
+            .chain(self.repo_roots.iter().map(String::as_str));
+        for r in named.map(str::trim).filter(|r| !r.is_empty()) {
+            let e = expand_tilde(r);
+            let e = match e.trim_end_matches('/') {
+                "" => "/".to_string(),
+                t => t.to_string(),
+            };
+            if !seen.contains(&e) {
+                seen.push(e);
+                out.push(r.to_string());
+            }
         }
-        match self.code_dir.trim() {
-            "" => Vec::new(),
-            d => vec![d.to_string()],
-        }
+        out
     }
 
     /// `scan_roots`, except that with neither a code folder nor roots set
@@ -535,7 +538,7 @@ impl SessionDefaults {
 pub enum RootsEdit {
     /// Leave the key as it is.
     Leave,
-    /// Remove it: the finder scans the code folder.
+    /// Remove it: the finder scans only the code folder.
     Follow,
     /// Write these roots.
     Set(Vec<String>),
@@ -915,7 +918,8 @@ workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 code_dir = ""                   # where your repos live and new ones go, e.g.
                                 # "~/code" (`rlord setup` suggests one)
-# repo_roots = ["~/code"]       # where the repo finder looks; default: code_dir
+# repo_roots = ["~/work"]       # more folders the repo finder looks in (it
+                                # always looks in code_dir)
 repo_scan_depth = 3             # ...and how deep (hidden and heavy dirs skipped;
                                 # also other disks, and on macOS the folders that
                                 # raise a privacy prompt)
@@ -1102,9 +1106,21 @@ mod tests {
         let c = s("[session]\ncode_dir = \"~/ko\"\n");
         assert_eq!(c.scan_roots(), ["~/ko"]);
         assert_eq!(c.finder_roots(true), ["~/ko"]);
-        // Explicit roots win; the old template's `["~"]` still loads.
+        // Roots are added to the code folder; the old template's `["~"]`
+        // still loads.
         let c = s("[session]\ncode_dir = \"~/ko\"\nrepo_roots = [\"~\"]\n");
-        assert_eq!(c.scan_roots(), ["~"]);
+        assert_eq!(c.scan_roots(), ["~/ko", "~"]);
+        // Roots only: those.
+        assert_eq!(s("[session]\nrepo_roots = [\"/a\"]\n").scan_roots(), ["/a"]);
+        // The same folder twice (spelled two ways): once.
+        let mut d = SessionDefaults {
+            code_dir: "/c".into(),
+            repo_roots: vec!["/c/".into(), "/d".into(), "/d".into()],
+            ..Default::default()
+        };
+        assert_eq!(d.scan_roots(), ["/c", "/d"]);
+        d.code_dir = String::new();
+        assert_eq!(d.scan_roots(), ["/c/", "/d"]);
         // `[]` reads as unset.
         let c = s("[session]\ncode_dir = \"/c\"\nrepo_roots = []\n");
         assert_eq!(c.scan_roots(), ["/c"]);
@@ -1131,7 +1147,7 @@ mod tests {
         // Leave: an explicit `["~"]` stays.
         let out = set_code_dir_in(t, "~/ko", &RootsEdit::Leave).unwrap();
         let c: Config = toml::from_str(&out).unwrap();
-        assert_eq!(c.session.scan_roots(), ["~"]);
+        assert_eq!(c.session.scan_roots(), ["~/ko", "~"]);
         // Set: an array, keeping the line's comment.
         let set = RootsEdit::Set(vec!["~/ko".into(), "~/proj".into()]);
         let out = set_code_dir_in(t, "~/ko", &set).unwrap();

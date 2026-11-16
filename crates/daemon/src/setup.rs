@@ -35,27 +35,6 @@ pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
     cfg.session.code_dir_path().is_none() && db.kv_get(KV).ok().flatten().is_none()
 }
 
-/// What the repo scan walks: the finder's `roots` (as written), plus the
-/// code folder as a root of its own when it lies under one of them. A
-/// named folder is always scanned (the scan's roots count as named,
-/// `privacy::Guard::name`), even inside a protected folder or below a
-/// mount the walk from the outer root skips.
-pub(crate) fn scan_roots(cfg: &Config, roots: &[String]) -> Vec<String> {
-    let mut out = roots.to_vec();
-    if let Some(code) = cfg.session.code_dir_path() {
-        let code = Path::new(code.trim_end_matches('/'));
-        let under = roots.iter().any(|r| {
-            let r = expand_tilde(r);
-            let r = Path::new(r.trim_end_matches('/'));
-            code != r && code.starts_with(r)
-        });
-        if under {
-            out.push(cfg.session.code_dir.trim().to_string());
-        }
-    }
-    out
-}
-
 /// The folders the repo scan treats as granted (`privacy::Guard`): those
 /// sessions run in, `~` expanded, each also in its resolved form
 /// (`canon`: `/tmp` is `/private/tmp` on macOS, `/home` may be
@@ -385,23 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn the_code_folder_under_a_root_is_a_root_too() {
-        let mut cfg = Config::default();
-        cfg.session.code_dir = "/h/Documents/code".into();
-        assert_eq!(
-            scan_roots(&cfg, &["/h".into()]),
-            ["/h", "/h/Documents/code"]
-        );
-        // Not under a root, or the root itself: as is.
-        assert_eq!(scan_roots(&cfg, &["/elsewhere".into()]), ["/elsewhere"]);
-        assert_eq!(
-            scan_roots(&cfg, &["/h/Documents/code/".into()]),
-            ["/h/Documents/code/"]
-        );
-        assert_eq!(scan_roots(&Config::default(), &["/h".into()]), ["/h"]);
-    }
-
-    #[test]
     fn status_is_needed_until_answered() {
         let d = daemon();
         assert_eq!(status(&d).unwrap()["needed"], true);
@@ -551,7 +513,7 @@ mod tests {
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert!(text.contains("code_dir"), "{text}");
         assert!(d.db().kv_get(KV).unwrap().unwrap().starts_with("done:"));
-        // Explicit roots.
+        // Explicit roots: scanned besides the code folder.
         let r = apply_at(
             &d,
             &json!({"code_dir": code_s, "roots": ["/a", "/b"]}),
@@ -560,7 +522,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (r["created"].as_bool(), r["repo_roots"].clone()),
-            (Some(false), json!(["/a", "/b"]))
+            (Some(false), json!([code_s, "/a", "/b"]))
         );
         // `/` and relative paths are refused.
         assert!(apply_at(&d, &json!({"code_dir": "/"}), &cfg).is_err());

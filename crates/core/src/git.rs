@@ -210,8 +210,8 @@ pub const MAX_SKIPPED: usize = 50;
 /// `~` once sat for an hour), and on every platform another filesystem
 /// than the root's (a network mount, a removable disk), like `find -xdev`.
 /// Symlinks are never followed. A root is scanned whatever it is (the user
-/// named it), on its own device; a root nested in another is walked once,
-/// as its own root. Roots and `granted` (the folders the user named and
+/// named it: the code folder and each `repo_roots` entry), on its own
+/// device; a root nested in another, or named twice, is walked once. Roots and `granted` (the folders the user named and
 /// those sessions run in) count as granted: a protected folder holding one
 /// is entered, and another filesystem is crossed only into a granted
 /// folder or below one (`Guard::allows`). A folder whose metadata can't be
@@ -222,10 +222,16 @@ pub const MAX_SKIPPED: usize = 50;
 /// nested under a root is skipped and reported. Naming the folder in
 /// `repo_roots` scans it.
 pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
-    let canon: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(crate::config::expand_tilde(r)).ok())
-        .collect();
+    // (Two spellings of one folder, or a symlink to another root: walked
+    // once.)
+    let mut canon: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        if let Ok(c) = std::fs::canonicalize(crate::config::expand_tilde(r)) {
+            if !canon.contains(&c) {
+                canon.push(c);
+            }
+        }
+    }
     let guard = crate::privacy::Guard::new(granted);
     scan_in(&canon, depth, guard, &device)
 }

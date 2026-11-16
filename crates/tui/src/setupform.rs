@@ -18,7 +18,7 @@ use rlord_core::config::{contract_tilde, expand_tilde};
 /// What the repo finder scans, as the form will save it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Roots {
-    /// The code folder (`repo_roots` removed).
+    /// Only the code folder (`repo_roots` removed).
     Follow,
     /// The user's configured roots, as they are.
     Keep(Vec<String>),
@@ -82,6 +82,11 @@ pub(crate) struct SetupForm {
     /// The folder the user was told doesn't exist; saving it again
     /// creates it.
     confirm_create: Option<String>,
+    /// Which folders macOS would ask about (built once).
+    guard: rlord_core::privacy::Guard,
+    /// The line under the folder (`folder_hint`), worked out once per
+    /// edit, not per frame (it may look at the disk).
+    hint: String,
 }
 
 /// What Save does.
@@ -163,6 +168,8 @@ impl SetupForm {
             loading: false,
             touched: false,
             confirm_create: None,
+            guard: rlord_core::privacy::Guard::new(&[]),
+            hint: String::new(),
         };
         f.roots_row = f.roots_differ();
         // With a folder filled in, Enter saves it; with none, type one.
@@ -172,13 +179,20 @@ impl SetupForm {
             Row::Save
         };
         f.row = f.rows().iter().position(|r| *r == start).unwrap_or(0);
+        f.refresh_hint();
         f
+    }
+
+    /// Work out the line under the folder again (after an edit).
+    pub(crate) fn refresh_hint(&mut self) {
+        self.hint = folder_hint(self);
     }
 
     /// A form waiting on rlord's suggestion ("finding…").
     pub(crate) fn loading(overlord: bool, auto: bool) -> SetupForm {
         let mut f = SetupForm::from_suggest(&Value::Null, overlord, auto);
         f.loading = true;
+        f.refresh_hint();
         f
     }
 
@@ -198,6 +212,7 @@ impl SetupForm {
             new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
             new.touched = true;
         }
+        new.refresh_hint();
         *self = new;
     }
 
@@ -248,6 +263,7 @@ impl SetupForm {
             .as_str()
             .filter(|n| !n.is_empty())
             .map(str::to_string);
+        self.refresh_hint();
         self.confirmed = true;
         self.error = None;
         self.row = self
@@ -303,6 +319,7 @@ impl SetupForm {
         };
         self.code_dir = self.choices[to].path.clone();
         self.code_dir_chosen = true;
+        self.refresh_hint();
         if !self.roots_row {
             self.roots_row = self.roots_differ();
         }
@@ -453,8 +470,15 @@ impl App {
     /// (It replaces any proposal parked for `:setup`.)
     pub(crate) fn open_setup_from(&mut self, cmd: &Value) {
         self.pending_setup = None;
+        // Replacing the first-run form: it stays the first-run form (Esc,
+        // then the overlay, as before).
+        let (auto, then_overlord) = match &self.mode {
+            Mode::Setup(f) => (f.auto, f.then_overlord),
+            _ => (false, false),
+        };
         let sugg = &cmd["suggest"];
-        let mut f = SetupForm::from_suggest(sugg, true, false);
+        let mut f = SetupForm::from_suggest(sugg, true, auto);
+        f.then_overlord = then_overlord;
         f.prefill(&cmd["prefill"]);
         self.mode = Mode::Setup(Box::new(f));
     }
@@ -473,14 +497,26 @@ impl App {
         if ctrl && k.code == KeyCode::Char('s') {
             return self.save_setup_form(f);
         }
+        // Don't ask again (first run): recorded, so the form stops
+        // opening; with no code folder the finder then lists only repos
+        // already used (unless `repo_roots` is set).
+        if ctrl && k.code == KeyCode::Char('d') && f.auto {
+            let _ = self.call("setup.apply", json!({"skip": true}));
+            self.status_line =
+                "won't ask again · the finder lists only repos you've used · :setup any time"
+                    .into();
+            self.close_setup(&f);
+            return;
+        }
         if !matches!(k.code, KeyCode::Esc | KeyCode::Enter) {
             f.touched = true;
         }
         match k.code {
+            // Later: nothing is recorded, so it asks again next start.
             KeyCode::Esc => {
                 if f.auto {
-                    let _ = self.call("setup.apply", json!({"skip": true}));
-                    self.status_line = "no code folder set · :setup any time".into();
+                    self.status_line =
+                        "no code folder yet · asks again next start · :setup any time".into();
                 }
                 self.close_setup(&f);
                 return;
@@ -512,6 +548,7 @@ impl App {
                     f.code_dir.pop();
                     f.code_dir_chosen = true;
                     f.error = None;
+                    f.refresh_hint();
                 }
                 _ => {}
             },
@@ -529,6 +566,7 @@ impl App {
                     if !f.roots_row {
                         f.roots_row = f.roots_differ();
                     }
+                    f.refresh_hint();
                 }
                 _ => {}
             },
@@ -538,7 +576,7 @@ impl App {
     }
 
     fn save_setup_form(&mut self, mut f: Box<SetupForm>) {
-        let guard = rlord_core::privacy::Guard::new(&[]);
+        let guard = f.guard.clone();
         let exists = |p: &str| {
             let p = std::path::Path::new(p);
             guard.prompts(p).is_none().then(|| p.is_dir())
@@ -719,7 +757,7 @@ impl App {
                         spans.push(Span::styled("  ✦ updated", accent));
                     }
                     lines.push(Line::from(spans));
-                    let hint = folder_hint(s);
+                    let hint = s.hint.clone();
                     // (A long hint starts further left, to fit.)
                     let indent = if hint.chars().count() + 21 > width {
                         4
@@ -739,8 +777,11 @@ impl App {
                             (!s.configured.is_empty())
                                 .then(|| format!("  (was {})", s.configured.join(", "))),
                         ),
-                        Roots::Keep(r) => (format!("{} (as configured)", r.join(", ")), None),
-                        Roots::Set(r) => (r.join(", "), None),
+                        Roots::Keep(r) => (
+                            format!("the code folder and {} (as configured)", r.join(", ")),
+                            None,
+                        ),
+                        Roots::Set(r) => (format!("the code folder and {}", r.join(", ")), None),
                     };
                     let style = if marker("repo_roots") {
                         accent
@@ -791,8 +832,15 @@ impl App {
             ("enter", "save", Cap::Context),
             ("tab", "move", Cap::Global),
             ("←/→", "other suggestions", Cap::Global),
-            ("esc", "later (:setup)", Cap::Global),
+            ("esc", "ask me next start", Cap::Global),
         ]));
+        if s.auto {
+            lines.push(keys_line(&[("ctrl-d", "don't ask again", Cap::Global)]));
+            lines.push(Line::from(Span::styled(
+                "    then the finder lists only repos you've used, unless repo_roots is set",
+                theme::faint(),
+            )));
+        }
         if let Some(e) = &s.error {
             lines.push(Line::from(Span::styled(
                 format!("  {e}"),
@@ -830,7 +878,7 @@ fn folder_hint(s: &SetupForm) -> String {
         }
         let mut h = rlord_core::code_dir::basis(c.projects, c.of, &s.sources);
         if c.from_roots {
-            h.push_str(" · your repo_roots");
+            h.push_str(" · in your repo_roots");
         }
         return h;
     }
@@ -838,10 +886,7 @@ fn folder_hint(s: &SetupForm) -> String {
     if !std::path::Path::new(&path).is_absolute() {
         return "a full path, like ~/code".into();
     }
-    if rlord_core::privacy::Guard::new(&[])
-        .prompts(std::path::Path::new(&path))
-        .is_some()
-    {
+    if s.guard.prompts(std::path::Path::new(&path)).is_some() {
         return "macOS will ask permission for this folder once".into();
     }
     if !std::path::Path::new(&path).is_dir() {
@@ -876,7 +921,7 @@ mod tests {
         let f = SetupForm::from_suggest(&s, false, true);
         assert_eq!(f.current(), Row::Folder);
         assert_eq!(f.rows(), [Row::Folder, Row::Save]);
-        assert!(folder_hint(&f).starts_with("rlord found no projects yet"));
+        assert!(f.hint.starts_with("rlord found no projects yet"));
         assert!(f.save_call(&|_| Some(true)).is_err());
     }
 
@@ -977,7 +1022,7 @@ mod tests {
     fn a_late_suggestion_fills_the_form() {
         let mut f = SetupForm::loading(true, true);
         assert!(f.loading && f.code_dir.is_empty());
-        assert_eq!(folder_hint(&f), "finding where your projects are…");
+        assert_eq!(f.hint, "finding where your projects are…");
         assert!(f
             .save_call(&|_| Some(true))
             .unwrap_err()
@@ -1004,7 +1049,37 @@ mod tests {
         let mut f = SetupForm::loading(false, true);
         f.fill(&Value::Null);
         assert!(!f.loading);
-        assert!(folder_hint(&f).starts_with("rlord found no projects yet"));
+        assert!(f.hint.starts_with("rlord found no projects yet"));
+    }
+
+    /// The hint is worked out on edits, not on every frame.
+    #[test]
+    fn the_hint_follows_edits() {
+        let mut f = SetupForm::from_suggest(&sugg(Some("/elsewhere/ko"), &[]), false, true);
+        assert!(f.hint.starts_with("3 of 4 projects"), "{}", f.hint);
+        f.cycle(true);
+        assert!(f.hint.starts_with("1 of 4 projects"), "{}", f.hint);
+        f.code_dir = "rel".into();
+        f.refresh_hint();
+        assert_eq!(f.hint, "a full path, like ~/code");
+    }
+
+    /// The overlord replacing the first-run form keeps it the first-run
+    /// form.
+    #[test]
+    fn a_proposal_over_the_first_run_form_keeps_its_place() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut first = SetupForm::from_suggest(&sugg(None, &[]), true, true);
+        first.then_overlord = true;
+        app.mode = Mode::Setup(Box::new(first));
+        app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/new"},
+                                    "suggest": sugg(None, &[])}));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert!(f.auto && f.then_overlord);
     }
 
     /// A proposal parked for `:setup` is dropped once a newer one opens.

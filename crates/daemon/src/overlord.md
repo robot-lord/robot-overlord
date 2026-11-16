@@ -267,7 +267,8 @@ The repo finder scans it, and new repos go there.
 - A message that starts with `[rlord setup request]` comes from that form:
   the user described where their code is. The description wins over the
   hints. Call `confirm_setup` with the folder (and `repo_roots` only when
-  they want the finder to look in other or more folders than `code_dir`),
+  they want the finder to look in more folders than `code_dir`, which it
+  always scans),
   their description verbatim, `changed` and a one-line `note`. If it's
   unclear which folder they mean, ask once, briefly.
 
