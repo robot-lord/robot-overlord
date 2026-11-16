@@ -33,9 +33,32 @@ The overlord's `find_repos` hung for 66 minutes. After it, `list_groups`,
   then a read could swap, and so could a create and then a go-to. The shim
   stays serial, and the daemon-side fixes remove the stall.
 
-## Plan (agreed shape, not started)
+## In progress: items 2-4 (branch `repo-discovery-setup`, 0.23.0-dev.27)
 
-1. **The user's config:** `repo_roots = ["~/ko"]`. Waiting on the user's yes.
+One PR for items 2, 3 and 4. The user's calls on the plan's open questions:
+
+- rlord saves the confirmed code folder itself (plain code); the overlord
+  only proposes (`confirm_setup`). No `set_code_dir` tool.
+- The other-filesystem (`st_dev`) rule applies on every platform.
+- Creating a new repo (mkdir, `git init`) is not in this PR: owed.
+- With neither `code_dir` nor `repo_roots` set, the finder keeps scanning
+  `~` (with the item 4 guards) until setup is done or skipped.
+
+Progress: (updated per commit)
+
+- [ ] config: `code_dir`, `scan_roots`, `set_code_dir`
+- [ ] predictor: `privacy.rs`, `git::scan_repos`, `skipped`
+- [ ] finder and `find_repos` show skipped folders
+- [ ] suggestion: `code_dir.rs`, sources, `setup.*` methods
+- [ ] `rlord setup`
+- [ ] TUI setup form, first run, `:setup`
+- [ ] overlord: `confirm_setup`, setup request, `overlord.md`
+- [ ] fresh-install steps
+- [ ] docs and reconcile
+
+## Plan (agreed shape)
+
+1. **The user's config:** `repo_roots = ["~/ko"]`. Done (the user's own file).
 2. **`[session] code_dir`:** where repos live and new ones are created.
    - `repo_roots` defaults to `[code_dir]`, so scanning all of `~` becomes
      opt-in.
