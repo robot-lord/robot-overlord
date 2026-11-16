@@ -1206,7 +1206,9 @@ first of a few transcripts that has one), Codex's `threads.cwd`, OpenCode's top-
 `session_v2.directory` (only that table: the DB holds credentials), rlord's
 repos and session folders, and the launch folder. Each project counts
 once; the folder holding the most within `repo_scan_depth` wins (ties: the
-deeper), never `$HOME` or above. A single explicit root other than `~`
+deeper), never `$HOME` or above (as given or resolved), nor a system or
+mount parent (`/Volumes`, `/mnt`, `/run/media/<user>`, `/var`, …:
+`code_dir::NEVER`). A single explicit root other than `~`
 outranks it. Only the folders shown are `stat`-ed, and only when no
 privacy prompt guards them.
 

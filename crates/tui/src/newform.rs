@@ -141,11 +141,9 @@ fn finder_note(
             reasons.push(why);
         }
     }
-    let last = reasons.len() - 1;
     let groups: Vec<String> = reasons
         .iter()
-        .enumerate()
-        .map(|(i, why)| {
+        .map(|why| {
             let paths: Vec<&str> = skipped
                 .iter()
                 .filter(|(_, w)| w == why)
@@ -156,7 +154,7 @@ fn finder_note(
                 .take(2)
                 .map(|p| rlord_core::config::contract_tilde_in(p, home))
                 .collect();
-            let hidden = paths.len().saturating_sub(2) + if i == last { more } else { 0 };
+            let hidden = paths.len().saturating_sub(2);
             let plus = if hidden > 0 {
                 format!(" +{hidden}")
             } else {
@@ -165,8 +163,14 @@ fn finder_note(
             format!("{}{plus} ({why})", shown.join(", "))
         })
         .collect();
+    // (Folders past the list, of any reason: once, at the end.)
+    let more = if more > 0 {
+        format!(" · +{more} more")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "skipped {} · to scan a repo in one, add its own folder (not the whole one) to repo_roots",
+        "skipped {}{more} · to scan a repo in one, add its own folder (not the whole one) to repo_roots",
         groups.join("; ")
     ))
 }
@@ -1811,7 +1815,7 @@ mod tests {
         assert_eq!(
             finder_note(&roots, &skipped, 2, "/h").unwrap(),
             "skipped ~/Desktop, ~/Documents +1 (macOS asks permission); \
-             /mnt/nas +2 (another disk or network mount) · to scan a repo in one, add its own folder (not the whole one) to repo_roots"
+             /mnt/nas (another disk or network mount) · +2 more · to scan a repo in one, add its own folder (not the whole one) to repo_roots"
         );
     }
 

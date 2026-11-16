@@ -269,6 +269,9 @@ struct App {
     /// The code-folder form's suggestion, being worked out on another
     /// thread (`App::open_setup`).
     setup_rx: Option<mpsc::Receiver<Value>>,
+    /// The first-run code-folder form was put off (Esc) this run: closing
+    /// another dialog doesn't reopen it (`check_setup`).
+    setup_put_off: bool,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -329,6 +332,7 @@ impl App {
             pending_select: None,
             pending_setup: None,
             setup_rx: None,
+            setup_put_off: false,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),

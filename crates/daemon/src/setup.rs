@@ -81,14 +81,19 @@ pub(crate) fn default_roots(cfg: &Config, done: bool) -> &'static str {
     }
 }
 
-/// `$HOME` as given and resolved (`/home` may be a symlink to
-/// `/var/home`): the suggestion never offers either or anything above.
-fn homes() -> Vec<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let mut v = vec![home.clone()];
-    if let Ok(c) = std::fs::canonicalize(&home) {
-        if c != home {
-            v.push(c);
+/// Each folder as given and resolved (`/home` may be a symlink to
+/// `/var/home`; macOS's temp dir `/var/folders/…` is
+/// `/private/var/folders/…`), since recorded paths come either way.
+fn with_resolved(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for p in paths {
+        if let Ok(c) = std::fs::canonicalize(&p) {
+            if c != p && !v.contains(&c) {
+                v.push(c);
+            }
+        }
+        if !v.contains(&p) {
+            v.push(p);
         }
     }
     v
@@ -138,8 +143,12 @@ pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
     };
     let s = code_dir::suggest(
         &seen,
-        &homes(),
-        &rlord_core::import::excluded_dirs(),
+        // (`$HOME` and above are never offered; rlord's data and temp dirs
+        // hold no projects.)
+        &with_resolved(vec![PathBuf::from(
+            std::env::var_os("HOME").unwrap_or_default(),
+        )]),
+        &with_resolved(rlord_core::import::excluded_dirs()),
         cfg.session.repo_scan_depth,
     );
     let mut v = suggestion_value(&s, &cfg, needed, &Guard::new(), &|p| p.is_dir());
@@ -344,6 +353,24 @@ mod tests {
 
     fn daemon() -> std::sync::Arc<Daemon> {
         Daemon::new(Db::open_in_memory().unwrap(), Config::default())
+    }
+
+    /// A symlinked folder is compared in both forms.
+    #[test]
+    fn folders_are_compared_resolved_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let v = with_resolved(vec![link.clone()]);
+        assert!(v.contains(&link));
+        assert!(v.contains(&std::fs::canonicalize(&real).unwrap()));
+        // A folder that doesn't resolve stays as given.
+        assert_eq!(
+            with_resolved(vec![PathBuf::from("/no/such")]),
+            [PathBuf::from("/no/such")]
+        );
     }
 
     #[test]

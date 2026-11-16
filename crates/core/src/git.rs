@@ -222,17 +222,18 @@ pub const MAX_SKIPPED: usize = 50;
 /// nested under a root is skipped and reported. Naming the folder in
 /// `repo_roots` scans it.
 pub fn scan_repos(roots: &[String], depth: u8) -> Scan {
-    // (Two spellings of one folder, or a symlink to another root: walked
-    // once.)
+    // (Two spellings of one folder, a symlink to another root, or another
+    // case of it on macOS: walked once.)
+    let guard = crate::privacy::Guard::new();
     let mut canon: Vec<PathBuf> = Vec::new();
     for r in roots {
         if let Ok(c) = std::fs::canonicalize(crate::config::expand_tilde(r)) {
-            if !canon.contains(&c) {
+            if !canon.iter().any(|x| guard.same(x, &c)) {
                 canon.push(c);
             }
         }
     }
-    scan_in(&canon, depth, crate::privacy::Guard::new(), &device)
+    scan_in(&canon, depth, guard, &device)
 }
 
 /// `scan_repos` over canonical roots, with a given guard and device
@@ -252,15 +253,24 @@ fn scan_in(
     for root in roots {
         walk(root, root, depth, dev_of(root), &ctx, &mut out);
     }
-    finish(out)
+    finish(out, ctx.guard.folds_case())
 }
 
-/// Sort and dedupe, and cap the skipped list.
-fn finish(mut out: Scan) -> Scan {
-    out.repos.sort();
-    out.repos.dedup();
-    out.skipped.sort();
-    out.skipped.dedup();
+/// Sort and dedupe (ignoring ASCII case where paths do, `fold`), and cap
+/// the skipped list.
+fn finish(mut out: Scan, fold: bool) -> Scan {
+    let key = |p: &str| {
+        if fold {
+            p.to_ascii_lowercase()
+        } else {
+            p.to_string()
+        }
+    };
+    out.repos.sort_by_key(|p| key(p));
+    out.repos.dedup_by(|a, b| key(a) == key(b));
+    out.skipped.sort_by_key(|s| (key(&s.path), s.why));
+    out.skipped
+        .dedup_by(|a, b| key(&a.path) == key(&b.path) && a.why == b.why);
     if out.skipped.len() > MAX_SKIPPED {
         out.skipped_more = out.skipped.len() - MAX_SKIPPED;
         out.skipped.truncate(MAX_SKIPPED);
@@ -309,7 +319,7 @@ fn walk(dir: &Path, root: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &
             continue;
         }
         let path = entry.path();
-        if ctx.roots.contains(&path) {
+        if ctx.roots.iter().any(|r| ctx.guard.same(r, &path)) {
             continue;
         }
         // A skipped folder that holds a root isn't reported: the root
@@ -370,7 +380,7 @@ mod tests {
         };
         let mut out = Scan::default();
         walk(root, root, 3, dev_of(root), &ctx, &mut out);
-        finish(out)
+        finish(out, false)
     }
 
     #[test]
@@ -562,13 +572,27 @@ mod tests {
                 why: Why::OtherFilesystem,
             })
             .collect();
-        let out = finish(Scan {
-            skipped,
-            ..Scan::default()
-        });
+        let out = finish(
+            Scan {
+                skipped,
+                ..Scan::default()
+            },
+            false,
+        );
         assert_eq!(out.skipped.len(), MAX_SKIPPED);
         assert_eq!(out.skipped_more, 10);
         assert_eq!(out.skipped[0].path, "/x/00");
+    }
+
+    /// One folder in two cases is one repo where paths ignore case.
+    #[test]
+    fn results_dedupe_by_the_case_rule() {
+        let scan = || Scan {
+            repos: vec!["/a/Code/x".into(), "/a/code/x".into()],
+            ..Scan::default()
+        };
+        assert_eq!(finish(scan(), true).repos.len(), 1);
+        assert_eq!(finish(scan(), false).repos.len(), 2);
     }
 
     #[test]

@@ -206,32 +206,31 @@ impl SetupForm {
     /// The suggestion arrived (Null: none could be made). What the user
     /// already typed or picked stays.
     pub(crate) fn fill(&mut self, sugg: &Value) {
+        // Only the suggestion's own fields: the choices, what they rest
+        // on, and the folder when none is shown yet. What is configured
+        // (and the roots edit) came from `setup.status` and stays, so a
+        // failed suggestion can't turn Save into dropping `repo_roots`.
+        let new = SetupForm::from_suggest(sugg, false, self.auto);
+        self.choices = new.choices;
+        self.sources = new.sources;
         let at = self.current();
-        let mut new = SetupForm::from_suggest(sugg, self.describe.is_some(), self.auto);
-        new.describe = self.describe.take();
-        new.then_overlord = self.then_overlord;
-        if self.code_dir_chosen {
-            new.code_dir = std::mem::take(&mut self.code_dir);
-            new.code_dir_chosen = true;
+        if self.code_dir.trim().is_empty() && !self.code_dir_chosen {
+            self.code_dir = new.code_dir;
         }
-        // The user's choice, or the overlord's proposal, stays as it is.
-        if self.touched || self.proposal {
-            new.roots = std::mem::replace(&mut self.roots, Roots::Follow);
-            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
-            new.touched = self.touched;
-        }
-        if self.proposal {
-            new.proposal = true;
-            new.note = self.note.take();
-            new.changed = std::mem::take(&mut self.changed);
-            new.confirmed = self.confirmed;
-        }
-        new.roots_row = self.roots_row || new.roots_differ();
-        if new.proposal || new.touched {
-            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
-        }
-        new.refresh_hint();
-        *self = new;
+        self.loading = false;
+        self.roots_row = self.roots_row || self.roots_differ();
+        self.row = if self.touched || self.proposal {
+            self.rows().iter().position(|r| *r == at).unwrap_or(0)
+        } else {
+            // As a fresh form starts: on Save with a folder, else on it.
+            let start = if self.code_dir.is_empty() {
+                Row::Folder
+            } else {
+                Row::Save
+            };
+            self.rows().iter().position(|r| *r == start).unwrap_or(0)
+        };
+        self.refresh_hint();
     }
 
     /// The configured roots are explicit and aren't just the code folder.
@@ -441,6 +440,11 @@ impl App {
     /// First run: open the code-folder form when setup is needed. True
     /// when it opened.
     pub(crate) fn check_setup(&mut self) -> bool {
+        // Put off with Esc this run: not again until the next start (a
+        // parked overlord proposal still opens).
+        if self.setup_put_off && self.pending_setup.is_none() {
+            return false;
+        }
         // (A cheap look-up; the suggestion is worked out only if needed,
         // and off this thread.)
         let Some(st) = self.call("setup.status", Value::Null) else {
@@ -448,7 +452,7 @@ impl App {
         };
         let needed = st["needed"] == true;
         // The overlord proposed one while something else was open: that
-        // one, not rlord's own suggestion.
+        // one, not rlord's own suggestion (even if the form was put off).
         if let Some(cmd) = self.pending_setup.take() {
             self.open_setup_from(&cmd);
             if let Mode::Setup(f) = &mut self.mode {
@@ -570,6 +574,7 @@ impl App {
             // Later: nothing is recorded, so it asks again next start.
             KeyCode::Esc => {
                 if f.auto {
+                    self.setup_put_off = true;
                     self.status_line =
                         "no code folder yet · asks again next start · :setup any time".into();
                 }
@@ -1146,6 +1151,38 @@ mod tests {
             SetupForm::from_suggest(&s, false, false).roots,
             Roots::Keep(vec!["~".into()])
         );
+    }
+
+    /// The suggestion failed (Null): the configured roots stay, and Save
+    /// leaves them.
+    #[test]
+    fn a_failed_suggestion_keeps_the_roots() {
+        let st = json!({"code_dir": "", "repo_roots": ["/x"], "roots_default": "leave"});
+        let mut f = SetupForm::loading(false, true, &st);
+        f.fill(&Value::Null);
+        assert!(!f.loading);
+        assert_eq!(f.roots, Roots::Keep(vec!["/x".into()]));
+        f.code_dir = "/c".into();
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(p["roots"], "leave");
+    }
+
+    /// Put off with Esc: not opened again this run by `check_setup` (a
+    /// dialog closing); `:setup` and the overlord still open it.
+    #[test]
+    fn a_form_put_off_stays_off_this_run() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.setup_put_off = true;
+        // (No daemon is asked: it returns before any call.)
+        assert!(!app.check_setup());
+        assert!(matches!(app.mode, Mode::Normal));
+        app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/p"},
+                                    "status": {"code_dir": "", "repo_roots": []}}));
+        assert!(matches!(app.mode, Mode::Setup(_)));
     }
 
     /// An overlord proposal that names no roots leaves `["~"]` alone, even

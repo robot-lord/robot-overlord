@@ -130,6 +130,17 @@ impl Guard {
         None
     }
 
+    /// The same folder, as this machine compares paths (ASCII case folded
+    /// on macOS).
+    pub fn same(&self, a: &Path, b: &Path) -> bool {
+        a.components().count() == b.components().count() && self.is_within(a, b)
+    }
+
+    /// Paths compare case-insensitively here (macOS).
+    pub fn folds_case(&self) -> bool {
+        self.fold_case
+    }
+
     /// `inner` is `outer` or below it, component by component.
     pub fn is_within(&self, inner: &Path, outer: &Path) -> bool {
         let mut i = inner.components();
@@ -180,6 +191,16 @@ mod tests {
         let g = Guard::with(None, false);
         assert_eq!(g.prompts(Path::new("/Users/me/Documents")), None);
         assert_eq!(g.prompts(Path::new("/Volumes/X")), None);
+    }
+
+    #[test]
+    fn same_folder_follows_the_case_rule() {
+        let mac = Guard::with(Some(Path::new("/Users/me")), true);
+        assert!(mac.same(Path::new("/Users/me/Code"), Path::new("/users/ME/code")));
+        assert!(!mac.same(Path::new("/Users/me/Code"), Path::new("/Users/me/Code/x")));
+        let linux = Guard::with(None, false);
+        assert!(!linux.same(Path::new("/home/me/Code"), Path::new("/home/me/code")));
+        assert!(linux.same(Path::new("/home/me/code"), Path::new("/home/me/code")));
     }
 
     /// Inside a root the user named, its own guarded folder is read; any

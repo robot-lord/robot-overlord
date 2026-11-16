@@ -95,13 +95,31 @@ fn project_root(p: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Folders never suggested: `/`, `$HOME` and its ancestors, and the usual
-/// homes' parents.
+/// System and mount parents: never a code folder (a scan of a mount
+/// parent like `/Volumes` would skip every child, each another disk).
+const NEVER: &[&str] = &[
+    "/Users",
+    "/home",
+    "/Volumes",
+    "/private",
+    "/mnt",
+    "/media",
+    "/run",
+    "/run/media",
+    "/var",
+    "/tmp",
+    "/opt",
+    "/usr",
+    "/System",
+];
+
+/// Folders never suggested: `/`, `$HOME` and its ancestors, `NEVER`, and
+/// each user's folder under `/run/media` (a parent of mounts too).
 fn never(d: &Path, homes: &[PathBuf]) -> bool {
     d.parent().is_none()
         || homes.iter().any(|h| h.starts_with(d))
-        || d == Path::new("/Users")
-        || d == Path::new("/home")
+        || NEVER.iter().any(|n| d == Path::new(n))
+        || d.parent() == Some(Path::new("/run/media"))
 }
 
 /// The most common parent of the projects in `seen` (counting each project
@@ -272,6 +290,36 @@ mod tests {
         let homes = &[PathBuf::from("/home/me"), PathBuf::from("/var/home/me")];
         let s = suggest(&seen(&["/var/home/me/a", "/home/me/b"]), homes, &[], 3);
         assert_eq!(s.best, None);
+        // System and mount parents are never offered; what's under them is.
+        let s = suggest(
+            &seen(&[
+                "/Volumes/Ext/a",
+                "/Volumes/Ssd/b",
+                "/run/media/me/usb/c",
+                "/opt/x/d",
+            ]),
+            homes,
+            &[],
+            3,
+        );
+        let mut all: Vec<&str> = s
+            .best
+            .iter()
+            .chain(&s.alternatives)
+            .map(|c| c.path.as_str())
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "/Volumes/Ext",
+                "/Volumes/Ssd",
+                "/opt/x",
+                "/run/media/me/usb"
+            ]
+        );
+        assert!(never(Path::new("/run/media/me"), homes));
+        assert!(!never(Path::new("/srv/code"), homes));
         // (And `sources` parse for `basis`.)
         let mut src = sources_of(&serde_json::json!({"claude": 2, "rlord": 1}));
         src.sort();
