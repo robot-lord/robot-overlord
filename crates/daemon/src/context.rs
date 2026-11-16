@@ -187,9 +187,12 @@ fn notes_section(notes: &[&ContextRow], room: usize, file: Option<&Path>) -> Str
             used += n;
             kept.push(line);
         } else if kept.is_empty() {
-            let mut cut: String = line.chars().take(room.saturating_sub(40)).collect();
+            // The clipped note and its notice must fit in `room` together.
+            let notice = where_all("this note is clipped");
+            let take = room.saturating_sub(notice.chars().count() + 2);
+            let mut cut: String = line.chars().take(take).collect();
             cut.push_str("…\n");
-            cut.push_str(&where_all("this note is clipped"));
+            cut.push_str(&notice);
             used += cut.chars().count();
             kept.push(cut);
         } else {
@@ -630,6 +633,21 @@ mod tests {
         let text = render("s", &big, &[], Some(file), CLAUDE_BUDGET);
         assert!(text.chars().count() <= CLAUDE_BUDGET);
         assert!(text.contains("this note is clipped"));
+        // A clipped newest note with older ones left out and a long path:
+        // both notices fit inside the budget.
+        let long = PathBuf::from(format!("/{}/context.md", "p".repeat(300)));
+        let mixed = [
+            row(1, 0, "note", "older"),
+            row(2, 1, "note", &"z".repeat(20_000)),
+        ];
+        let text = render("s", &mixed, &[], Some(&long), CLAUDE_BUDGET);
+        assert!(
+            text.chars().count() <= CLAUDE_BUDGET,
+            "{}",
+            text.chars().count()
+        );
+        assert!(text.contains("this note is clipped"));
+        assert!(text.contains("1 older notes left out"));
     }
 
     #[test]
