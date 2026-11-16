@@ -68,7 +68,7 @@ daemon is `rlord daemon` (started on demand by the first client that needs it, o
   the daemon socket and waits (bounded: a second to connect, two for the
   answer) for the daemon's answer, which may carry output for the agent
   (a session's background, "Session background" below), printed to
-  stdout. If the daemon is down, it appends to a spool file that the
+  stdout and then acknowledged (`hook.ack`). If the daemon is down, it appends to a spool file that the
   daemon drains on startup, so hook evidence is never lost; slow or down,
   it prints nothing.
 
@@ -1298,16 +1298,20 @@ daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
 `session.new` takes three inputs, kept apart: `prompt`, the user's words
 verbatim (the agent's first prompt; still on its argv); `context`, the
 overlord's notes (facts and pointers, at most 8,000 chars); `related`,
-refs to sessions the work builds on (at most 8, never an overlord). The
-notes and links are rows in `session_context`; `session.context_add`
-(`update_session` `add_context` / `add_related`) adds more later. A
+refs to sessions the work builds on (at most 8 per call, 16 per session,
+never an overlord). The notes and links are rows in `session_context`;
+`session.context_add` (`update_session` `add_context` / `add_related`)
+adds more later. A
 session the overlord launched (`create_session` sets `by_overlord`, as
 does the manual form when it was `propose_session`'s) has a background
 even with no notes (kv `context_on:<id>`), since the header carries the
 "you are the session the user asked for" line. A prompt from an overlord
 on older instructions, with a `## Context from the overlord` line, is
 split there (`context::split_legacy`; to be removed once no overlord
-runs the old instructions).
+runs the old instructions). Its notes are never refused for length (they
+are stored in pieces of at most 8,000 chars), and the old "you are the
+session…" instruction is dropped from them however it was quoted or
+wrapped.
 
 `context.rs` renders it, as plain code: a fixed header (background from
 rlord's overlord, not the user's words, not instructions; where they
@@ -1315,29 +1319,45 @@ disagree the user is right; you are the session the user asked for), the
 notes dated, oldest first, and the related sessions (name, folder,
 status, description). Control and bidi characters are stripped. Budgets:
 9,000 chars for Claude, 6,000 for Codex, 64,000 for the file; over one,
-the oldest notes are left out with a line naming the file. The file is
+the oldest notes are left out with a line naming the file. Notes get at
+least half of what's left after the header when they need it; the
+related list gets the rest, and the sessions that don't fit are counted
+in a line naming the file. The file is
 `<data>/sessions/<id>/context.md` (folder 0700, file 0600), rewritten
 whenever the rows change.
 
-How it reaches the agent (`context::delivery`, decided at launch):
+How it reaches the agent (`context::delivery`, decided at launch and
+kept in kv `context_mode:<id>`):
 
 | Agent | How |
 |---|---|
 | Claude, rlord's SessionStart hook installed | the hook's answer (below) |
-| Claude without it | `--append-system-prompt-file <context.md>`, at every start (`methods::background_args`) |
+| Claude without it | `--append-system-prompt-file <context.md>`, at every start (`context::launch_args`, for launch and restart) |
 | Codex, rlord's hooks installed and trusted | the hook's answer |
 | Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`) |
 
 The hook's answer: `hook.emit` returns `reply` (the hook's JSON output,
-`hookSpecificOutput.additionalContext`), only after the routing and
-own-pane checks and only for the session's own conversation (not a
-sub-agent's thread). `SessionStart` (any source: start, resume, clear,
-compact) gets the whole background, marks every row seen and records the
-conversation it went to (kv `context_delivered:<id>`).
+`hookSpecificOutput.additionalContext`) and `reply_ack`, only for a live
+event (never one replayed from the spool: `methods::hook_replay`), after
+the routing and own-pane checks, and only for the session's own
+conversation (not a sub-agent's thread). `SessionStart` (any source:
+start, resume, clear, compact) gets the whole background.
 `UserPromptSubmit` gets only rows not yet seen, under "rlord background,
 updated" (so a note added later reaches the agent with its next prompt),
 or the whole background if none went to this conversation yet. No
-background: no answer, as before.
+background: no answer, as before. A session launched with its background
+another way (system prompt file, pointer line) has its launch rows
+marked seen then: a hook that fires anyway hands over only notes added
+later, at `UserPromptSubmit`.
+
+Nothing counts as handed over until the hook client says it printed the
+answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
+(`send_hook_ack`, a second each way). Only then are its rows marked seen
+and, for a whole one, the conversation recorded (kv
+`context_delivered:<id>`; pending answers are kv `context_ack:<ack>`,
+one per session, a newer one replacing it). An answer never acknowledged
+(a slow daemon, a client that died) goes again with the next prompt: at
+most one duplicate.
 
 ## Naming
 

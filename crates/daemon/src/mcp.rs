@@ -82,7 +82,7 @@ pub fn tools() -> Value {
         "prompt": s("The user's words, verbatim: their request as they put it, nothing of yours. It is the session's first prompt. Your notes go in `context`."),
         "context": s("Background from you, kept apart from the user's words: facts and pointers the session can't find itself (answers the user gave you, the right folder or files, a decision). Not new requirements. The session is shown it labelled as yours, not the user's. At most 8000 characters."),
         "related": {"type": "array", "items": {"type": "string"},
-                    "description": "Sessions this work builds on (id, id prefix or name; at most 8): listed in its background with their folder, status and description. Not the overlord."},
+                    "description": "Sessions this work builds on (id, id prefix or name; at most 8, and 16 per session in all): listed in its background with their folder, status and description. Not the overlord."},
     });
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
@@ -214,7 +214,7 @@ pub fn tools() -> Value {
                 "notes": s("Replace the free-form notes"),
                 "add_context": s("Add a note to the session's background (for its agent, labelled as yours, not the user's): a fact or pointer it needs. Reaches the agent with its next prompt. At most 8000 characters."),
                 "add_related": {"type": "array", "items": {"type": "string"},
-                                "description": "Add related sessions to its background (refs; at most 8)"},
+                                "description": "Add related sessions to its background (refs; at most 8 per call, 16 per session in all)"},
                 "add_tags": {"type": "array", "items": {"type": "string"}},
                 "remove_tags": {"type": "array", "items": {"type": "string"}},
                 "pinned": b("Pin to the top of the list"),
@@ -450,24 +450,11 @@ fn new_session_params(args: &Value) -> Value {
     if let Some(w) = args.get("workspace").and_then(Value::as_bool) {
         p.insert("workspace".into(), json!(w));
     }
-    let related = str_refs(args, "related");
+    let related = crate::methods::ref_list(args, "related");
     if !related.is_empty() {
         p.insert("related".into(), json!(related));
     }
     Value::Object(p)
-}
-
-/// A list of session refs (strings only; missing: none).
-fn str_refs(args: &Value, k: &str) -> Vec<String> {
-    args.get(k)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
@@ -632,7 +619,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             if let Some(v) = args.get("notes").and_then(Value::as_str) {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
             }
-            let related = str_refs(args, "add_related");
+            let related = crate::methods::ref_list(args, "add_related");
             if arg_str(args, "add_context").is_some() || !related.is_empty() {
                 d.rpc(
                     "session.context_add",

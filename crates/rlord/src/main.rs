@@ -2022,8 +2022,19 @@ fn hook_emit(agent: &str) -> Result<()> {
     // The daemon's answer for the agent (the session's background at
     // SessionStart / UserPromptSubmit): printed as the hook's output. Slow
     // or unreachable: nothing, as before.
+    // Acknowledged only once printed: the daemon then counts it handed
+    // over (unacknowledged, the next prompt gets it again).
     if let Some(r) = reply {
-        println!("{r}");
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{}", r.output)
+            .and_then(|_| out.flush())
+            .is_ok()
+        {
+            if let Some(ack) = &r.ack {
+                rlord_daemon::send_hook_ack(&paths::socket_path(), ack);
+            }
+        }
     }
     Ok(())
 }

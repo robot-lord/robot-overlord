@@ -258,7 +258,7 @@ impl Daemon {
             }
         }
         for params in drain_spool()? {
-            if let Err(e) = methods::hook_emit(&db, &params) {
+            if let Err(e) = methods::hook_replay(&db, &params) {
                 tracing::warn!(error = %e, "spooled hook event failed");
             }
         }
@@ -434,6 +434,7 @@ impl Daemon {
                 | "session.get"
                 | "session.log"
                 | "session.context"
+                | "hook.ack"
                 | "repo.list"
                 | "repo.find"
                 | "session.defaults"
@@ -509,6 +510,8 @@ impl Daemon {
             "session.notes" => methods::session_notes(&db, &params),
             "session.context" => methods::session_context(&db, &params),
             "session.context_add" => methods::session_context_add(&db, &params),
+            // The hook client printed an answer: what it carried is handed over.
+            "hook.ack" => methods::hook_ack(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => {
@@ -1006,10 +1009,21 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     send_hook_event_for_reply(socket_path, params).0
 }
 
+/// What the daemon answered a hook with, for the agent: the hook's output
+/// (e.g. the session's background at SessionStart), and the id to
+/// acknowledge it with once printed (`send_hook_ack`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookReply {
+    pub output: Value,
+    pub ack: Option<String>,
+}
+
 /// `send_hook_event`, and what the daemon answers the hook with, if
-/// anything (`reply`: the hook's output for the agent, e.g. the session's
-/// background at SessionStart). Only a `Delivered` event has one.
-pub fn send_hook_event_for_reply(socket_path: &Path, params: &Value) -> (HookSent, Option<Value>) {
+/// anything. Only a `Delivered` event has one.
+pub fn send_hook_event_for_reply(
+    socket_path: &Path,
+    params: &Value,
+) -> (HookSent, Option<HookReply>) {
     use std::io::{BufRead, BufReader as StdBufReader, ErrorKind, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc;
@@ -1021,7 +1035,7 @@ pub fn send_hook_event_for_reply(socket_path: &Path, params: &Value) -> (HookSen
     const SENDING: u8 = 1;
     const GAVE_UP: u8 = 2;
     let state = Arc::new(AtomicU8::new(CONNECTING));
-    let (tx, rx) = mpsc::channel::<(HookSent, Option<Value>)>();
+    let (tx, rx) = mpsc::channel::<(HookSent, Option<HookReply>)>();
     let path = socket_path.to_path_buf();
     let req = json!({"id": 1, "method": "hook.emit", "params": params});
     let sender_state = Arc::clone(&state);
@@ -1051,10 +1065,17 @@ pub fn send_hook_event_for_reply(socket_path: &Path, params: &Value) -> (HookSen
         let mut line = String::new();
         let _ = tx.send(match StdBufReader::new(&mut stream).read_line(&mut line) {
             Ok(n) if n > 0 => {
-                let reply = serde_json::from_str::<Value>(&line)
+                let result = serde_json::from_str::<Value>(&line)
                     .ok()
-                    .and_then(|v| v["result"].get("reply").cloned())
-                    .filter(|r| !r.is_null());
+                    .map(|v| v["result"].clone())
+                    .unwrap_or(Value::Null);
+                let reply = result
+                    .get("reply")
+                    .filter(|r| !r.is_null())
+                    .map(|r| HookReply {
+                        output: r.clone(),
+                        ack: result["reply_ack"].as_str().map(str::to_string),
+                    });
                 (HookSent::Delivered, reply)
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -1089,6 +1110,28 @@ pub fn send_hook_event_for_reply(socket_path: &Path, params: &Value) -> (HookSen
     // than that is waited, so its verdict is the one acted on.
     rx.recv_timeout(Duration::from_millis(3500))
         .unwrap_or((HookSent::Slow, None))
+}
+
+/// Tell the daemon a hook's answer was printed for the agent (`ack` from
+/// its `HookReply`), so what it carried counts as handed over. Best
+/// effort, a second at most each way: if it never arrives, the next
+/// prompt gets the same again.
+pub fn send_hook_ack(socket_path: &Path, ack: &str) -> bool {
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::time::Duration;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let req = json!({"id": 1, "method": "hook.ack", "params": {"ack": ack}});
+    let mut buf = serde_json::to_vec(&req).unwrap_or_default();
+    buf.push(b'\n');
+    if stream.write_all(&buf).is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    matches!(StdBufReader::new(&mut stream).read_line(&mut line), Ok(n) if n > 0)
 }
 
 // ---- hook spool: hook evidence must never be lost to a down daemon ----
@@ -1782,14 +1825,39 @@ mod tests {
             let (mut c, _) = listener.accept().unwrap();
             let mut line = String::new();
             std::io::BufReader::new(&c).read_line(&mut line).unwrap();
-            c.write_all(b"{\"id\":1,\"result\":{\"ok\":true,\"reply\":{\"x\":1}}}\n")
-                .unwrap();
+            c.write_all(
+                b"{\"id\":1,\"result\":{\"ok\":true,\"reply\":{\"x\":1},\"reply_ack\":\"a1\"}}\n",
+            )
+            .unwrap();
         });
         assert_eq!(
             send_hook_event_for_reply(&sock, &json!({"event": "SessionStart"})),
-            (HookSent::Delivered, Some(json!({"x": 1})))
+            (
+                HookSent::Delivered,
+                Some(HookReply {
+                    output: json!({"x": 1}),
+                    ack: Some("a1".into())
+                })
+            )
         );
         answer.join().unwrap();
+        // The acknowledgement names the answer.
+        let sock = dir.path().join("ack.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let answer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut c, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&c).read_line(&mut line).unwrap();
+            c.write_all(b"{\"id\":1,\"result\":{\"acked\":true}}\n")
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        });
+        assert!(send_hook_ack(&sock, "a1"));
+        let req = answer.join().unwrap();
+        assert_eq!(req["method"], "hook.ack");
+        assert_eq!(req["params"]["ack"], "a1");
+        assert!(!send_hook_ack(&dir.path().join("absent.sock"), "a1"));
         // Nobody there: no reply (the hook prints nothing).
         assert_eq!(
             send_hook_event_for_reply(&dir.path().join("absent.sock"), &json!({})),
@@ -1829,10 +1897,20 @@ mod tests {
             emit("SessionStart", json!({}))["reply"].is_null(),
             "no background"
         );
-        context::store(&db, "01bg", Some("use the staging DB"), &[], 5).unwrap();
+        context::store(&db, "01bg", &["use the staging DB".into()], &[], 5).unwrap();
         // From outside rlord's tmux (a forked copy): nothing.
         let r = emit("SessionStart", json!({"pane": null}));
         assert!(r["ignored"].is_string() && r["reply"].is_null());
+        // Replayed from the spool (its client is gone): no answer, nothing
+        // marked.
+        let replayed = methods::hook_replay(
+            &db,
+            &json!({"instance": "01bg", "agent": "claude", "event": "SessionStart",
+                    "payload": {"session_id": "u-1", "hook_event_name": "SessionStart"}}),
+        )
+        .unwrap();
+        assert!(replayed["reply"].is_null());
+        assert_eq!(db.context_unseen("01bg").unwrap().len(), 1);
         let r = emit("SessionStart", json!({}));
         let out = &r["reply"]["hookSpecificOutput"];
         assert_eq!(out["hookEventName"], "SessionStart");
@@ -1840,6 +1918,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("use the staging DB"));
+        // The client acknowledges it once printed (`hook.ack`).
+        let ack = r["reply_ack"].as_str().unwrap();
+        assert_eq!(
+            methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
+            json!({"acked": true})
+        );
         // Already given: the next prompt gets nothing more, and the status
         // still follows the hook.
         let r = emit("UserPromptSubmit", json!({}));
@@ -1848,7 +1932,7 @@ mod tests {
             db.resolve_ref("01bg").unwrap().status,
             rlord_core::types::Status::Working
         );
-        context::store(&db, "01bg", Some("PR is #12"), &[], 6).unwrap();
+        context::store(&db, "01bg", &["PR is #12".into()], &[], 6).unwrap();
         let r = emit("UserPromptSubmit", json!({}));
         assert!(r["reply"]["hookSpecificOutput"]["additionalContext"]
             .as_str()

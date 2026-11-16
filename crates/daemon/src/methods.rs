@@ -282,11 +282,11 @@ pub(crate) fn session_context_add_in(
     let (note, links) = context::check(
         db,
         params["context"].as_str(),
-        &str_list(params, "related"),
+        &ref_list(params, "related"),
         Some(&s.id),
     )?;
     let now = now_ms();
-    if context::store(db, &s.id, note.as_deref(), &links, now)? {
+    if context::store(db, &s.id, note.as_slice(), &links, now)? {
         context::refresh_file(db, base, &s)?;
         db.insert_event(
             &s.id,
@@ -415,6 +415,16 @@ pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A list of session refs (strings only, trimmed, blanks dropped; missing:
+/// none). The one parser for `related` / `add_related`, on every path.
+pub(crate) fn ref_list(params: &Value, key: &str) -> Vec<String> {
+    str_list(params, key)
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
 }
 
 pub(crate) fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
@@ -577,15 +587,24 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         }
         None => (None, None),
     };
-    let given = match (legacy, p_opt("context")) {
-        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
-        (a, b) => a.or(b),
-    };
-    let (note, links) = context::check(db, given.as_deref(), &str_list(params, "related"), None)?;
+    // Explicit `context` is checked (too long: refused, for the overlord
+    // to shorten); notes split from an old-style prompt are stored as
+    // they are, in pieces if long.
+    let (note, links) = context::check(
+        db,
+        p_opt("context").as_deref(),
+        &ref_list(params, "related"),
+        None,
+    )?;
+    let mut notes = legacy
+        .as_deref()
+        .map(context::legacy_notes)
+        .unwrap_or_default();
+    notes.extend(note);
     // Launched by the overlord (`create_session`, or its proposal the user
     // launched): its background says so even with no notes.
     let background =
-        params["by_overlord"].as_bool() == Some(true) || note.is_some() || !links.is_empty();
+        params["by_overlord"].as_bool() == Some(true) || !notes.is_empty() || !links.is_empty();
 
     // Where the session lives: an explicit repo, an explicit plain folder,
     // or the configured default repo.
@@ -652,10 +671,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let bg_file = context::file_path(&base, &id);
     let delivery = background.then(|| context::delivery(agent, context::hooks_work(agent)));
     let mut args = spec_args(agent, &spec);
-    if delivery == Some(context::Delivery::SystemPromptFile) {
-        args.push("--append-system-prompt-file".into());
-        args.push(bg_file.to_string_lossy().into_owned());
-    }
+    args.extend(context::launch_args(delivery, &bg_file));
     let first = match (&prompt, delivery) {
         (Some(p), Some(context::Delivery::Pointer)) => Some(context::with_pointer(p, &bg_file)),
         (p, _) => p.clone(),
@@ -698,9 +714,10 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         db.kv_set(&bind_since_key(&id), &now.to_string())?;
         db.kv_set(&bind_prompt_key(&id), first.as_deref().unwrap_or(""))?;
     }
-    if background {
+    if let Some(mode) = delivery {
         context::turn_on(db, &id)?;
-        context::store(db, &id, note.as_deref(), &links, now)?;
+        context::store(db, &id, &notes, &links, now)?;
+        context::set_mode(db, &id, mode, now)?;
         // (Before the agent starts: it may read it at once.)
         context::refresh_file(db, &base, &db.resolve_ref(&id)?)?;
     }
@@ -934,8 +951,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Its background as it was launched with (Claude's system prompt
+    // file: rewritten first if it has gone).
     let mut args = spec_args(agent, &spec);
-    args.extend(background_args(agent, &s.id));
+    let mode = context::mode(db, &s.id)?;
+    let bg_file = context::file_path(&paths::data_dir(), &s.id);
+    if mode == Some(context::Delivery::SystemPromptFile) && !bg_file.is_file() {
+        context::refresh_file(db, &paths::data_dir(), &s)?;
+    }
+    args.extend(context::launch_args(mode, &bg_file));
     let (mut argv, resumed) = agent.resume(
         s.agent_session.as_deref(),
         &s.agent_session_trust,
@@ -976,16 +1000,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     )?;
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
-}
-
-/// Claude's flags for a session's background at a (re)start, when rlord's
-/// hook can't hand it over (see `context::launch_args`).
-fn background_args(agent: Agent, id: &str) -> Vec<String> {
-    let base = paths::data_dir();
-    if agent != Agent::Claude || !context::file_path(&base, id).is_file() {
-        return Vec::new();
-    }
-    context::launch_args(agent, &base, id, context::hooks_work(agent))
 }
 
 /// The tmux session a session's agent (re)starts in: its own, or (it has
@@ -1147,9 +1161,22 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.list_events(&s.id, limit)?)?)
 }
 
-/// Ingest one agent hook event (from `rlord hook emit`, live or spooled).
+/// Ingest one live agent hook event (from `rlord hook emit`).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
     hook_emit_with(db, params, &|agent, id| agent.indexed(id))
+}
+
+/// `hook.ack`: the hook client printed the answer `ack` names.
+pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
+    let acked = context::ack(db, p_str(params, "ack")?, now_ms())?;
+    Ok(json!({"acked": acked}))
+}
+
+/// Ingest a hook event spooled while the daemon was down: as a live one,
+/// but its client is long gone, so it gets no answer (nothing is handed
+/// over, nothing marked).
+pub fn hook_replay(db: &Db, params: &Value) -> Result<Value> {
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false)
 }
 
 /// `hook_emit`, with how to ask an agent's own index whether a
@@ -1158,6 +1185,16 @@ pub(crate) fn hook_emit_with(
     db: &Db,
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
+) -> Result<Value> {
+    hook_emit_in(db, params, indexed, true)
+}
+
+/// `live`: its client waits for the answer (false: replayed).
+fn hook_emit_in(
+    db: &Db,
+    params: &Value,
+    indexed: &dyn Fn(Agent, &str) -> Indexed,
+    live: bool,
 ) -> Result<Value> {
     // `instance`: the hook's RLORD_SESSION_ID. A hook Codex's background
     // server ran has none (`by: "thread"`): see `codex_daemon::route`.
@@ -1277,16 +1314,19 @@ pub(crate) fn hook_emit_with(
         // The session's background, for its own conversation only (not a
         // sub-agent's thread; a forked or background copy was refused
         // above): the hook prints it for the agent.
-        let reply = if whose == Whose::Other {
+        // Marked handed over only when the client acknowledges it
+        // (`hook.ack`, `context::ack`).
+        let reply = if whose == Whose::Other || !live {
             None
         } else {
             let file = context::file_path(&paths::data_dir(), &s.id);
-            context::hook_reply(db, &s, agent, event, sid, &file, now)?
+            context::hook_reply(db, &s, agent, event, sid, &file)?
         };
         let answer = |v: Value| match &reply {
             Some(r) => {
                 let mut v = v;
-                v["reply"] = r.clone();
+                v["reply"] = r.output.clone();
+                v["reply_ack"] = json!(r.ack);
                 v
             }
             None => v,
@@ -1394,7 +1434,7 @@ pub(crate) fn hook_emit_with(
             db.insert_event(
                 &s.id,
                 now,
-                "context_delivered",
+                "context_sent",
                 &json!({"via": event}).to_string(),
             )?;
         }

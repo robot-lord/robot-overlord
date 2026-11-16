@@ -466,7 +466,7 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     }
     // The overlord's background and related sessions, checked now (not
     // when the user launches): the form shows them, read-only.
-    let related = crate::methods::str_list(params, "related");
+    let related = crate::methods::ref_list(params, "related");
     {
         let db = d.db();
         crate::context::check(

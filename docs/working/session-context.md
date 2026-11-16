@@ -168,6 +168,44 @@ by code (`context::frame_message`).
 - **Runtime dir** keeps `Daemon::bind`'s own 0700 (set every start; the
   socket is the trust boundary), outside `rlord_core::private`.
 
+### Review round 1 (PR #64)
+
+Fixed:
+
+1. Spool replay: `methods::hook_replay` ingests a spooled event with no
+   answer and marks nothing.
+2. Marked only on acknowledgement: `hook.emit` returns `reply_ack`;
+   `rlord hook emit` prints the reply, then sends `hook.ack` (best effort,
+   1s each way). `context::ack` marks rows seen and records the
+   conversation. Unacknowledged answers go again with the next prompt
+   (one pending answer per session, a newer one replaces it).
+3. Legacy notes are stored in pieces of at most 8,000 chars
+   (`context::legacy_notes`), never refused. Explicit `context` still is.
+4. At most 16 links per session (`LINKS_MAX`); `render` budgets the
+   related list, notes keep at least half of what's left after the
+   header when they need it; left-out related sessions are counted with
+   the file named.
+5. Delivery mode kept in kv `context_mode:<id>` at launch. Launched by
+   system prompt file or pointer: launch rows are marked seen, a hook
+   never sends the full render, later notes go at `UserPromptSubmit`.
+   Restarts take the flag from the stored mode (and rewrite a missing
+   file), not from a fresh hooks check.
+6. `split_legacy` drops the old instruction per paragraph, ignoring case,
+   line breaks and quote marks; text before it in the paragraph stays.
+7. `Db::context_exists` (`SELECT EXISTS`); `hook_reply` does one row
+   query (the `context_on` kv only when there are no rows).
+8. `context::launch_args(mode, file)` is the one helper for launch and
+   restart.
+9. `methods::ref_list` is the one parser for `related` / `add_related`
+   (MCP, `ui.propose_session`, `session.new`, `session.context_add`).
+
+Declined (coordinator): `--append-system-prompt-file` being print-only;
+`claude --help` 2.1.325 lists it for interactive sessions. V2 still not
+run.
+
+A session given background only after launch (no stored mode) gets it
+through hooks, or from the file; it gets no system prompt flag.
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the
