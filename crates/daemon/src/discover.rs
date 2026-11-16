@@ -290,19 +290,21 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
     record_bind(&d.db(), s, t)
 }
 
-/// `bind`, once, under the caller's DB lock: for a stopped session about to
-/// be started again (the overlord), whose thread may have turned up after
-/// rlord last looked. Nobody else waits in the folder it is asked for.
+/// `bind`, once, under the caller's DB lock: for a stopped overlord about
+/// to be started again, whose thread may have turned up after rlord last
+/// looked. Nobody else waits in the folder it is asked for. No rollout is
+/// read under the lock: the overlord is never forked (refused) and works
+/// in rlord's own folder, where no other session's fork runs; an archive
+/// summary's fork is never indexed (`--ephemeral`).
 pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
     let w = bind_inputs(db, s)?;
+    if w.fork.is_some() {
+        return Ok(false); // (a fork: left to `bind`, outside the lock)
+    }
     let candidates = untracked_threads(s, w.since, &w.tracked);
-    match pick_thread(
-        &candidates,
-        w.prompt.as_deref(),
-        false,
-        w.fork.as_deref(),
-        &rollout_fork,
-    ) {
+    match pick_thread(&candidates, w.prompt.as_deref(), false, None, &|_| {
+        Some(None)
+    }) {
         Some(t) => record_bind(db, s, t),
         None => Ok(false),
     }
@@ -350,28 +352,25 @@ fn untracked_threads(
         .collect()
 }
 
-/// The thread a rollout says it was forked from (`pick_thread` asks only
-/// about the threads it is still considering). A rollout's first line
-/// never changes: each is read once and remembered by thread id (a rollout
-/// not on disk yet is asked again).
-fn rollout_fork(t: &codex::Thread) -> Option<String> {
+/// What a thread's rollout says it was forked from (`codex::
+/// rollout_forked_from`; None: can't be told yet). A complete first line
+/// never changes: each answer is remembered by thread id once it is one;
+/// a rollout not readable yet is asked again.
+fn rollout_fork(t: &codex::Thread) -> Option<Option<String>> {
     static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
         std::sync::LazyLock::new(Default::default);
     if let Some(known) = SEEN.lock().ok().and_then(|s| s.get(&t.id).cloned()) {
-        return known;
+        return Some(known);
     }
-    let path = std::path::Path::new(&t.rollout_path);
-    let forked = codex::rollout_forked_from(path);
-    if path.exists() {
-        if let Ok(mut s) = SEEN.lock() {
-            // (Bounded: threads come and go over a long run.)
-            if s.len() >= 4096 {
-                s.clear();
-            }
-            s.insert(t.id.clone(), forked.clone());
+    let forked = codex::rollout_forked_from(std::path::Path::new(&t.rollout_path))?;
+    if let Ok(mut s) = SEEN.lock() {
+        // (Bounded: threads come and go over a long run.)
+        if s.len() >= 4096 {
+            s.clear();
         }
+        s.insert(t.id.clone(), forked.clone());
     }
-    forked
+    Some(forked)
 }
 
 fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
@@ -404,9 +403,10 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 /// - a user fork (`fork`: the thread it was forked from): the thread whose
 ///   rollout says it was forked from that one. Its first message is its
 ///   parent's, so the prompt can't tell it.
-/// - otherwise, of the threads that fit by the rules below, forked ones
-///   are never taken (a user fork of another session in the same folder,
-///   or an archive summary's `codex exec fork`):
+/// - otherwise, by the rules below; the one thread they narrow to is
+///   taken only if its rollout says it is no fork (not a user fork of
+///   another session in the same folder, nor an archive summary's `codex
+///   exec fork`):
 /// - launched with a prompt: the thread whose first message is that
 ///   prompt. One that has no first message yet may still become it: wait.
 /// - no prompt (a fresh conversation, or launched without one): the only
@@ -415,24 +415,30 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 ///   prompt (the only candidate, nobody else waiting).
 /// - two that fit equally: neither (the hooks will say).
 ///
-/// `forked_from` reads a thread's rollout: asked only of the threads still
-/// in the running.
+/// `forked_from` reads a thread's rollout (`rollout_fork`): every
+/// candidate's for a fork, else only the one left. A rollout that can't
+/// be read yet (None) means wait, never "not a fork".
 fn pick_thread<'a>(
     candidates: &'a [codex::Thread],
     prompt: Option<&str>,
     others_waiting: bool,
     fork: Option<&str>,
-    forked_from: &dyn Fn(&codex::Thread) -> Option<String>,
+    forked_from: &dyn Fn(&codex::Thread) -> Option<Option<String>>,
 ) -> Option<&'a codex::Thread> {
-    let one = |fit: Vec<&'a codex::Thread>| match fit.as_slice() {
-        [one] => Some(*one),
-        _ => None,
-    };
     if let Some(parent) = fork {
-        return one(candidates
-            .iter()
-            .filter(|t| forked_from(t).as_deref() == Some(parent))
-            .collect());
+        // Every candidate's rollout must say: one not readable yet may be
+        // the fork too (wait).
+        let mut found = Vec::new();
+        for t in candidates {
+            match forked_from(t)? {
+                Some(p) if p == parent => found.push(t),
+                _ => {}
+            }
+        }
+        return match found.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        };
     }
     let same = |a: &str, b: &str| {
         let (a, b) = (a.trim(), b.trim());
@@ -449,10 +455,12 @@ fn pick_thread<'a>(
         None if others_waiting => Vec::new(),
         None => candidates.iter().collect(),
     };
-    one(fit
-        .into_iter()
-        .filter(|t| forked_from(t).is_none())
-        .collect())
+    // Narrowed to one: taken only when its rollout says it is no fork (one
+    // not readable yet: wait).
+    match fit.as_slice() {
+        [one] => forked_from(one)?.is_none().then_some(*one),
+        _ => None,
+    }
 }
 
 /// Read a session's status from its transcript (incrementally).
@@ -591,13 +599,18 @@ mod tests {
     }
 
     /// What the test's rollouts say: `f…` threads were forked from
-    /// `parent`, `g…` from `other`; and which rollouts were read.
-    fn rollouts(read: &std::cell::RefCell<Vec<String>>, t: &codex::Thread) -> Option<String> {
+    /// `parent`, `g…` from `other`, `u…` can't be read yet; and which
+    /// rollouts were read.
+    fn rollouts(
+        read: &std::cell::RefCell<Vec<String>>,
+        t: &codex::Thread,
+    ) -> Option<Option<String>> {
         read.borrow_mut().push(t.id.clone());
         match t.id.chars().next() {
-            Some('f') => Some("parent".into()),
-            Some('g') => Some("other".into()),
-            _ => None,
+            Some('f') => Some(Some("parent".into())),
+            Some('g') => Some(Some("other".into())),
+            Some('u') => None,
+            _ => Some(None),
         }
     }
 
@@ -620,38 +633,46 @@ mod tests {
             Some("f1")
         );
         assert_eq!(pick(&c, None, false, Some("parent")).as_deref(), Some("f1"));
+        // A rollout not readable yet may be the fork too: wait.
+        let unread = [thread("f1", "x"), thread("u1", "x")];
+        assert_eq!(pick(&unread, None, false, Some("parent")), None);
         // Two forks of the same parent: neither (the hooks will say).
         c.push(thread("f2", "fix the login test"));
         assert_eq!(pick(&c, None, false, Some("parent")), None);
         assert_eq!(pick(&c, None, false, Some("absent")), None);
-        // An ordinary session never takes a forked thread, however its
-        // first message matches.
-        assert_eq!(
-            pick(&c, Some("fix the login test"), false, None).as_deref(),
-            Some("own")
-        );
+        // An ordinary session never takes a forked thread: the one it is
+        // narrowed to must say it is none.
         let only_forks = [thread("f1", "fix the login test")];
         assert_eq!(pick(&only_forks, None, false, None), None);
         assert_eq!(
             pick(&only_forks, Some("fix the login test"), false, None),
             None
         );
-        // An ordinary session reads the rollouts only of the threads its
-        // prompt fits.
-        let mixed = [thread("own", "fix it"), thread("x2", "speed it up")];
+        // Nor one whose rollout can't be read yet (wait, not "no fork").
+        let unread = [thread("u1", "fix it")];
+        assert_eq!(pick(&unread, Some("fix it"), false, None), None);
+        // Its own (and a fork with another first message): taken, reading
+        // only the rollout of the one left.
+        let mixed = [thread("own", "fix it"), thread("f2", "speed it up")];
         read.borrow_mut().clear();
         assert_eq!(
             pick(&mixed, Some("fix it"), false, None).as_deref(),
             Some("own")
         );
         assert_eq!(*read.borrow(), ["own"]);
+        // Two that fit: none, and nothing read.
         read.borrow_mut().clear();
+        assert_eq!(pick(&c, Some("fix the login test"), false, None), None);
         assert_eq!(pick(&mixed, None, true, None), None);
-        assert!(read.borrow().is_empty(), "nobody fits: nothing read");
+        assert!(
+            read.borrow().is_empty(),
+            "nothing narrowed to one: nothing read"
+        );
     }
 
     /// A rollout's fork flag is read once per thread: the file is not
-    /// read again on later passes. One not on disk yet is asked again.
+    /// read again on later passes. One not readable yet (missing, a first
+    /// line still being written) is asked again, not remembered.
     #[test]
     fn a_rollouts_fork_flag_is_read_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -665,11 +686,14 @@ mod tests {
                 json!({"type": "session_meta", "payload": {"forked_from_id": from}})
             )
         };
-        std::fs::write(&path, meta("t-parent")).unwrap();
-        assert_eq!(rollout_fork(&t).as_deref(), Some("t-parent"));
+        let line = meta("t-parent");
+        std::fs::write(&path, &line[..line.len() - 5]).unwrap();
+        assert_eq!(rollout_fork(&t), None, "half written");
+        std::fs::write(&path, &line).unwrap();
+        assert_eq!(rollout_fork(&t), Some(Some("t-parent".into())));
         // Changed on disk (it never is): the remembered answer stands.
         std::fs::write(&path, meta("t-other")).unwrap();
-        assert_eq!(rollout_fork(&t).as_deref(), Some("t-parent"));
+        assert_eq!(rollout_fork(&t), Some(Some("t-parent".into())));
     }
 
     /// A fork bound from the index whose rollout is on disk is no longer
@@ -715,7 +739,7 @@ mod tests {
     #[test]
     fn a_thread_is_bound_only_when_it_is_clearly_the_sessions() {
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool| {
-            pick_thread(c, prompt, others, None, &|_| None).map(|t| t.id.clone())
+            pick_thread(c, prompt, others, None, &|_| Some(None)).map(|t| t.id.clone())
         };
         let one = [thread("a", "fix the login test")];
         // Launched with that prompt: it's the one, even with a sibling waiting.

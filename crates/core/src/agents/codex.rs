@@ -563,41 +563,32 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
         .ok()
 }
 
-/// The thread a rollout's conversation was forked from (its `session_meta`
-/// line's `forked_from_id`), from its first line only: a fork's history
-/// copied after it may hold other threads' meta. None: not a fork, or it
-/// can't be read.
-pub fn rollout_forked_from(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut buf = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(64 * 1024)
-        .read_to_end(&mut buf)
+/// What a rollout's first line (its `session_meta`) says it was forked
+/// from: `Some(Some(thread))` a fork of that thread, `Some(None)` not a
+/// fork, `None` can't be told yet (no file, or no complete first line:
+/// it is still being written; ask again). Only the first line counts: a
+/// fork's history copied after it may hold other threads' meta. A first
+/// line is read whole (up to 4 MB: it carries the instructions).
+pub fn rollout_forked_from(path: &Path) -> Option<Option<String>> {
+    use std::io::{BufRead, Read};
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = Vec::new();
+    std::io::BufReader::new(f.take(4 << 20))
+        .read_until(b'\n', &mut line)
         .ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    let first = text.split('\n').next().unwrap_or("");
-    if let Ok(v) = serde_json::from_str::<Value>(first) {
-        if v["type"] != "session_meta" {
-            return None;
-        }
-        return v["payload"]["forked_from_id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-    }
-    // (A first line longer than what was read: the field comes early.)
-    if !first.contains("\"session_meta\"") {
+    if line.last() != Some(&b'\n') {
         return None;
     }
-    let key = "\"forked_from_id\":";
-    let at = first.find(key)? + key.len();
-    serde_json::Deserializer::from_str(&first[at..])
-        .into_iter::<Option<String>>()
-        .next()?
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
+    let v: Value = serde_json::from_slice(&line).ok()?;
+    if v["type"] != "session_meta" {
+        return Some(None);
+    }
+    Some(
+        v["payload"]["forked_from_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    )
 }
 
 // ---- reading rollout lines (see `transcript::Line`) ----
@@ -1643,32 +1634,45 @@ mod fork_tests {
             "fork.jsonl",
             &format!("{}\n{parent_meta}\n", meta(json!("t-1"))),
         );
-        assert_eq!(rollout_forked_from(&fork).as_deref(), Some("t-1"));
+        assert_eq!(rollout_forked_from(&fork), Some(Some("t-1".into())));
         // Not a fork: the parent's meta copied after the first line doesn't count.
         let plain = write(
             "plain.jsonl",
             &format!("{}\n{parent_meta}\n", meta(Value::Null)),
         );
-        assert_eq!(rollout_forked_from(&plain), None);
+        assert_eq!(rollout_forked_from(&plain), Some(None));
         let older = write(
             "older.jsonl",
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t-3\",\"cwd\":\"/a\"}}\n",
         );
-        assert_eq!(rollout_forked_from(&older), None);
-        // A first line longer than what is read: found from its start.
+        assert_eq!(rollout_forked_from(&older), Some(None));
+        // A long first line is read whole.
         let long = format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"t-4\",\"forked_from_id\":\"t-1\",\
              \"instructions\":\"{}\"}}}}\n",
             "y".repeat(100 * 1024)
         );
         assert_eq!(
-            rollout_forked_from(&write("long.jsonl", &long)).as_deref(),
-            Some("t-1")
+            rollout_forked_from(&write("long.jsonl", &long)),
+            Some(Some("t-1".into()))
         );
+        // Can't be told yet: no file, a first line still being written (no
+        // line end), one that doesn't parse. Asked again, never "not a fork".
         assert_eq!(rollout_forked_from(&dir.path().join("absent.jsonl")), None);
+        let partial = meta(json!("t-1"));
+        assert_eq!(
+            rollout_forked_from(&write("partial.jsonl", &partial[..partial.len() / 2])),
+            None
+        );
+        assert_eq!(rollout_forked_from(&write("unended.jsonl", &partial)), None);
         assert_eq!(
             rollout_forked_from(&write("junk.jsonl", "not json\n")),
             None
+        );
+        // Another first line than a meta one: not a fork.
+        assert_eq!(
+            rollout_forked_from(&write("other.jsonl", "{\"type\":\"event_msg\"}\n")),
+            Some(None)
         );
     }
 }

@@ -1448,19 +1448,23 @@ add`); reading and inserting under it, through `methods::start`, the tail
 
 Until then a restart forks again (kv `fork_pending`, `fork::pending`,
 written with the row before the pane starts, as is `bind_fork`), logged
-as `reforked` with its new branch point; the fork's note gets the new
-time (`fork::renote`), and a Codex fork drops the thread bound before
-and is bound anew by `bind_fork` (`fork::reforked`). The key goes once
-a hook or Codex's index names the fork's own transcript and it is on
-disk (`fork::conversation_seen`), or at a fresh start. Forks of one
-parent are made one at a time (a `fork:<parent>` lock in
-`locks::SessionLocks`, from the fork call to the row). An OpenCode fork
-call that fails (a time-out) may still have made the fork: a fork of
-the parent made since the call began that no session has
-(`opencode::user_fork_since`, not archived) is taken; the lock keeps it
-from being another fork's in the making. Its answer is read as JSON: an
-error answer whose error is `ForkEmpty` means "nothing to fork yet"
-(`opencode::fork_empty`).
+as `reforked` with its new branch point; once that pane is up the
+fork's note gets the new time (`fork::renote`), and a Codex fork drops
+the thread bound before and is bound anew by `bind_fork`
+(`fork::reforked`). The key goes once a hook or Codex's index names the
+fork's own transcript and it is on disk (`fork::conversation_seen`), or
+at a fresh start. Forks of one parent are made one at a time (a
+`fork:<parent>` lock in `locks::SessionLocks`, from the fork call to the
+row). An OpenCode fork is only ever the id OpenCode's answer gave: a
+call that fails or times out is reported (with a word that OpenCode may
+have made it anyway, in its own list), never guessed from the parent's
+forks, which may be the user's; so `undo` can only ever delete a session
+rlord made. The answer is read as JSON (`opencode::fork_response`, with
+the HTTP status when there is one): only an error answer whose error is
+`ForkEmpty` means "nothing to fork yet" (`opencode::fork_empty`).
+OpenCode's client, and the delete in `undo`, run through
+`process::run_agent` (not as one of rlord's sessions, output through
+rlord's folder), as the archive summaries' commands do.
 
 Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 2.2.7 (scratch setups, one short prompt each).
@@ -1477,8 +1481,10 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   (if inserted) with its background rows, events and kv keys
   (`Db::delete_session`), its background folder, the worktree and branch
   made for it, and OpenCode's server-made fork (`fork::undo`, best
-  effort). After the pane is up, everything stays with the fork and the
-  error is returned.
+  effort). Once the pane is up the fork is never undone: `methods::start`
+  can't fail after it (its last log line is best effort), and what
+  follows in `finish` (group, tags, description, reading the row back) is
+  logged, not returned, so the daemon's steps after a fork always run.
 - **Name.** Given, or `<parent>-fork`, `-fork-2`… chosen under the first
   lock (after every read that can fail) and reserved while the fork is
   made (kv `fork_name:<name>`, ten minutes at most), so two forks at once
@@ -1493,7 +1499,9 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   `tui.resume_cwd="current"` for that run (`codex::FORK_CWD`): no
   question, and the thread's `cwd` is the folder it was started in.
 - **What it copies**: agent, extra flags, a Remote Control the user
-  turned off, group, tags, description (or the one given), and the
+  turned off (and when the parent's was on, the fork's is set off: a
+  `--resume` of the copy must never reconnect under the parent's
+  Remote Control), group, tags, description (or the one given), and the
   parent's `session_context` rows with `at` and `source` (not which hook
   answer carried them), but not the parent's own fork note (a fork of a
   fork gets its own). Its model is the one asked for, else none: no
@@ -1529,9 +1537,14 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   prompt rule can't pick its thread. kv `bind_fork:<id>` holds the
   parent's thread: `discover::pick_thread` then takes only a thread whose
   rollout's first `session_meta` says `forked_from_id` is that one
-  (`codex::rollout_forked_from`), and any other waiting session skips
-  forked threads (rollouts are read only for the threads still in the
-  running). A Codex fork runs no `SessionStart` before its first
+  (`codex::rollout_forked_from`; every candidate must say, one not
+  readable yet means wait). Any other waiting session takes the one
+  thread its rules narrow to only if that rollout says it is no fork (one
+  not readable yet: wait, never "not a fork"); no other rollout is read.
+  An answer is remembered per thread once its first line is complete.
+  The overlord's `bind_now`, under the DB lock, reads none: the overlord
+  is never forked, and no fork runs in its folder. A Codex fork runs no
+  `SessionStart` before its first
   prompt, so it is usually bound from the index first and confirmed by
   its hook later.
 - **A user fork always runs in the pane**, whatever the parent's host:

@@ -136,10 +136,9 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     let base = paths::data_dir();
     let mut want = want(&d.db(), params)?;
     let _reserved = Reserved(d, want.auto_name.then(|| want.name.clone()));
-    // One fork of a parent at a time, from its fork call to its row: an
-    // OpenCode call that failed but made its fork finds it among the
-    // parent's forks no session has yet, which must not be another fork's
-    // in the making. (`locks` order: this, then the DB.)
+    // One fork of a parent at a time, from its fork call to its row (the
+    // agent's fork of one conversation is made once at a time; two forks'
+    // worktrees and names never race). (`locks` order: this, then the DB.)
     let _forking = d.sessions.lock(&format!("fork:{}", want.parent.id));
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(want.agent) {
@@ -155,22 +154,16 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     crate::usage::annotate(d, &mut rows, true);
     made.context_pct = rows[0]["usage"]["context_pct"].as_u64();
     if want.agent == Agent::OpenCode {
-        // (Each guard ends with its statement, before any early return:
-        // `Reserved` takes the lock when it is dropped.)
-        let tracked = {
-            let db = d.db();
-            db.agent_session_ids()
-        }?;
         made.opencode_id = Some(opencode_fork(
             &want.conversation,
-            std::path::Path::new(&want.parent.project_path),
-            &tracked,
+            &want.parent.project_path,
         )?);
     }
     if let Some(w) = &want.worktree {
         // The branch is named after it: a session that took the name
         // meanwhile (not a fork: those see the reservation) stops it here,
-        // before anything is made.
+        // before anything is made. (The guard ends with its block, before
+        // any early return: `Reserved` takes the DB lock when dropped.)
         let taken = {
             let db = d.db();
             db.name_taken(&want.name)
@@ -219,18 +212,13 @@ pub(crate) fn undo(id: &str, want: &Want, made: &Made, base: &std::path::Path) {
     if let Some(w) = &want.worktree {
         discard(w);
     }
+    // (Only an id OpenCode's own answer gave this fork: never a session
+    // rlord didn't make.)
     if let Some(oc) = &made.opencode_id {
-        let bin = install::resolved("opencode").unwrap_or_else(|| "opencode".into());
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(&opencode::delete_argv(oc)[1..])
-            .current_dir(&want.parent.project_path)
-            .env_remove("RLORD_SESSION_ID")
-            .stderr(std::process::Stdio::null());
-        let gone = rlord_core::process::run_to_file(
-            cmd,
-            &std::env::temp_dir(),
+        let gone = opencode_run(
+            &opencode::delete_argv(oc),
+            &want.parent.project_path,
             std::time::Duration::from_secs(opencode::CREATE_LIMIT_S),
-            None,
         );
         if !matches!(gone, Ok((st, _)) if st.success()) {
             tracing::warn!(opencode_session = %oc, "a fork that didn't start is left in OpenCode");
@@ -287,40 +275,50 @@ fn sub_folder(top: &str, folder: &str) -> std::path::PathBuf {
 
 /// OpenCode's fork of `conversation`, by its server when one answers, else
 /// by OpenCode's own client run in the parent's folder `dir` (which starts
-/// the server, as a launch does). A call that fails, a time-out above all,
-/// may still have made it: a fork of the parent made since the call began
-/// that no session has (`tracked`) is taken.
-fn opencode_fork(
-    conversation: &str,
-    dir: &std::path::Path,
-    tracked: &std::collections::HashSet<String>,
-) -> Result<String> {
-    let began = now_ms();
+/// the server, as a launch does). Only an id OpenCode answered with is
+/// this fork's: a call that failed or timed out is reported as such (the
+/// user forks again), never guessed from the parent's forks, which may be
+/// the user's own (and `undo` would delete it).
+fn opencode_fork(conversation: &str, dir: &str) -> Result<String> {
     let svc = rlord_core::agents::opencode_service::Service::read(&opencode::service_file());
     let r = match svc.filter(|s| s.answers()) {
         Some(svc) => svc.fork(conversation),
-        None => {
-            let bin = install::resolved("opencode")
-                .unwrap_or_else(|| std::path::PathBuf::from("opencode"));
-            opencode::fork_via_cli(&bin, conversation, dir)
-        }
+        None => opencode_run(
+            &opencode::fork_api_argv(conversation),
+            dir,
+            opencode::FORK_LIMIT,
+        )
+        .and_then(|(_, text)| opencode::fork_response(&text, None)),
     };
-    let e = match r {
-        Ok(id) => return Ok(id),
-        Err(e) if e.to_string() == opencode::NOTHING_TO_FORK => {
-            bail!("nothing to fork yet: {e}")
-        }
-        Err(e) => e,
-    };
-    let made = opencode::user_fork_since(&opencode::db_path(), conversation, began)
-        .filter(|id| !tracked.contains(id));
-    match made {
-        Some(id) => {
-            tracing::info!(fork = %id, error = %e, "OpenCode's fork call failed, but it made the fork");
-            Ok(id)
-        }
-        None => bail!("OpenCode didn't fork it: {e}"),
+    r.map_err(|e| match e.to_string().as_str() {
+        opencode::NOTHING_TO_FORK => anyhow::anyhow!("nothing to fork yet: {e}"),
+        _ => anyhow::anyhow!(
+            "{e} (if OpenCode made the fork anyway, it is in OpenCode's session list; \
+             rlord didn't take it)"
+        ),
+    })
+}
+
+/// Run OpenCode's own client (`argv`, `opencode …`, as rlord finds it)
+/// in folder `dir`, for rlord (`process::run_agent`: not one of its
+/// sessions, output through rlord's folder).
+fn opencode_run(
+    argv: &[String],
+    dir: &str,
+    limit: std::time::Duration,
+) -> Result<(std::process::ExitStatus, String)> {
+    let mut argv = argv.to_vec();
+    if let Some(bin) = install::resolved("opencode") {
+        argv[0] = bin.to_string_lossy().into_owned();
     }
+    rlord_core::process::run_agent(
+        &crate::summary::output_dir(),
+        "opencode",
+        &argv,
+        dir,
+        None,
+        limit,
+    )
 }
 
 /// Read the parent and check the fork can be made (what is refused:
@@ -486,16 +484,10 @@ pub(crate) fn rows(
     ));
     // Links already copied aren't added again.
     let copied_links: Vec<&ContextRow> = parent_rows.iter().filter(|r| r.kind == "link").collect();
-    let mut seen: Vec<String> = copied_links.iter().map(|c| c.body.clone()).collect();
-    add.retain(|r| {
-        if r.kind != "link" || !seen.contains(&r.body) {
-            if r.kind == "link" {
-                seen.push(r.body.clone());
-            }
-            return true;
-        }
-        false
-    });
+    let mut seen: std::collections::HashSet<String> =
+        copied_links.iter().map(|c| c.body.clone()).collect();
+    // (`insert` is false for a link already there: dropped.)
+    add.retain(|r| r.kind != "link" || seen.insert(r.body.clone()));
     let new_links = add.iter().filter(|r| r.kind == "link").count();
     let over = (copied_links.len() + new_links).saturating_sub(context::LINKS_MAX);
     let except = parent_rows
@@ -520,6 +512,15 @@ pub(crate) fn rows(
 /// the fork and at every resume), as the parent's own did.
 fn spec_of(want: &Want) -> Value {
     let mut spec = want.spec.clone();
+    // The parent's Remote Control was on: the fork's is off, explicitly.
+    // `--resume` of a copied conversation must never reconnect it under
+    // the parent's.
+    if spec["remote_control"]
+        .as_str()
+        .is_some_and(|n| !n.is_empty())
+    {
+        spec["remote_control_off"] = json!(true);
+    }
     if let Some(o) = spec.as_object_mut() {
         for k in ["remote_control", "remote_control_at", "codex_host"] {
             o.remove(k);
@@ -660,9 +661,21 @@ pub(crate) fn finish(
         },
     )?;
     *started = true;
-    after_start(db, want, &parent, id)?;
+    // The pane is up: the fork exists. What follows is best effort (logged),
+    // so the caller's own steps after a fork (the list, its keys, its tmux
+    // profile) always run.
+    if let Err(e) = after_start(db, want, &parent, id) {
+        tracing::warn!(session = %id, error = %e, "copying a fork's group, tags, description");
+    }
     tracing::info!(session = %id, parent = %parent.id, name = %name, agent = agent.name(), "forked session");
-    let mut out = serde_json::to_value(db.resolve_ref(id)?)?;
+    let mut out = match db.resolve_ref(id).map(serde_json::to_value) {
+        Ok(Ok(v)) => v,
+        _ => {
+            tracing::warn!(session = %id, "reading back a fork that started");
+            json!({"id": id, "name": name, "forked_from": parent.id,
+                   "forked_from_name": parent.name})
+        }
+    };
     out["warnings"] = json!(warnings(want, made));
     // (Said apart from `workspace_path`, which a fork in its parent's
     // worktree has too.)
@@ -993,6 +1006,25 @@ mod tests {
         assert!(spec.get("remote_control").is_none() && spec.get("codex_host").is_none());
         assert!(spec.get("remote_control_at").is_none());
         assert_eq!(spec["remote_control_off"], true);
+        // The parent's Remote Control on (its name in the spec): the
+        // fork's is off, so a Claude fork never reconnects under it.
+        w.spec["remote_control_off"] = Value::Null;
+        w.spec["remote_control"] = json!("rlord · api");
+        let spec = spec_of(&w);
+        assert!(spec.get("remote_control").is_none());
+        assert_eq!(spec["remote_control_off"], true);
+        let mut cl = w.clone();
+        cl.agent = Agent::Claude;
+        let args = spec_args(Agent::Claude, &spec_of(&cl));
+        assert!(!args.iter().any(|a| a == "--remote-control"));
+        assert!(
+            args.iter()
+                .any(|a| a.contains("\"disableRemoteControl\":true")),
+            "{args:?}"
+        );
+        // Never on: nothing said.
+        w.spec["remote_control"] = Value::Null;
+        assert!(spec_of(&w)["remote_control_off"].is_null());
         // No model asked for: none (the conversation keeps its own).
         w.model = None;
         assert!(spec_of(&w)["model"].is_null());

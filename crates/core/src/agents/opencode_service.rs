@@ -307,22 +307,9 @@ impl Service {
             Some(&serde_json::json!({})),
             super::opencode::FORK_LIMIT,
         )?;
-        if (200..300).contains(&status) {
-            // (A fork made: its id, whatever its data says.)
-            let v: Value = serde_json::from_str(text.trim())
-                .map_err(|_| anyhow::anyhow!("OpenCode's answer to the fork isn't JSON"))?;
-            return v["data"]["id"]
-                .as_str()
-                .filter(|id| is_session_id(id))
-                .map(str::to_string)
-                .context("OpenCode's answer to the fork has no session id");
-        }
-        let empty = serde_json::from_str::<Value>(text.trim())
-            .is_ok_and(|v| super::opencode::fork_empty(&v));
-        if empty {
-            bail!("{}", super::opencode::NOTHING_TO_FORK);
-        }
-        bail!("forking in OpenCode: {status} {}", clip_error(&text))
+        // (A 2xx answer: its id; an error: "nothing to fork" only by its
+        // error's name.)
+        super::opencode::fork_response(&text, Some((200..300).contains(&status)))
     }
 
     /// Text generated from session `id`'s context without adding to its
