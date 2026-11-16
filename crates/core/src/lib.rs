@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod code_dir;
 pub mod config;
 pub mod db;
 pub mod git;

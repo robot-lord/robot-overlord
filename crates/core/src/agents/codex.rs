@@ -432,6 +432,20 @@ pub fn rollout_folders(home: &Path) -> Option<std::collections::HashMap<PathBuf,
     )
 }
 
+/// The folders Codex threads ran in, from its thread index: distinct, at
+/// most `limit`. Empty when there is no index.
+pub fn thread_folders(home: &Path, limit: usize) -> Vec<String> {
+    let Some(c) = open_state(home) else {
+        return Vec::new();
+    };
+    let Ok(mut q) = c.prepare("SELECT DISTINCT cwd FROM threads LIMIT ?1") else {
+        return Vec::new();
+    };
+    q.query_map([limit as i64], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 /// The rollout file of a conversation: from the thread index, else by its
 /// name under `sessions/` (the file name ends in the id).
 pub fn rollout_of(home: &Path, id: &str) -> Option<PathBuf> {
@@ -1384,6 +1398,26 @@ mod tests {
         assert_eq!(rollout_of(dir.path(), "nope"), None);
         assert_eq!(rollouts_in(&dir.path().join("sessions")).len(), 1);
         assert_eq!(rollout_cwd(&p).as_deref(), Some("/src/app"));
+    }
+
+    #[test]
+    fn thread_folders_are_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(thread_folders(dir.path(), 10).is_empty());
+        let c = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
+        c.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, \
+               cwd TEXT NOT NULL);
+             INSERT INTO threads VALUES ('a', '/r/a.jsonl', '/src/app');
+             INSERT INTO threads VALUES ('b', '/r/b.jsonl', '/src/app');
+             INSERT INTO threads VALUES ('c', '/r/c.jsonl', '/src/web');",
+        )
+        .unwrap();
+        drop(c);
+        let mut f = thread_folders(dir.path(), 10);
+        f.sort();
+        assert_eq!(f, ["/src/app", "/src/web"]);
+        assert_eq!(thread_folders(dir.path(), 1).len(), 1);
     }
 
     #[test]

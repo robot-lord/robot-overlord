@@ -427,6 +427,40 @@ mod tests {
         assert!(found.skipped.is_empty());
     }
 
+    /// `repo_roots = ["~"]` with `code_dir` in `~/Documents`: the code
+    /// folder is granted (the daemon passes it in), so the scan enters it.
+    #[test]
+    fn a_named_code_folder_under_a_protected_one_is_scanned() {
+        use crate::privacy::Guard;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        init_repo(&root.join("Documents/code/alpha"));
+        init_repo(&root.join("src/beta"));
+        let code = root.join("Documents/code").to_string_lossy().into_owned();
+        let same = |_: &Path| Some(1);
+        let found = walk_with(&root, Guard::with(Some(&root), true, &[code]), &same);
+        assert_eq!(found.repos.len(), 2, "{found:?}");
+        assert!(found.skipped.is_empty(), "{found:?}");
+    }
+
+    /// A code folder on another device below a root: entered, not skipped.
+    #[test]
+    fn a_named_code_folder_on_another_device_is_scanned() {
+        use crate::privacy::Guard;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        init_repo(&root.join("ext/code/alpha"));
+        let ext = root.join("ext");
+        let dev = |p: &Path| Some(if p.starts_with(&ext) { 7 } else { 1 });
+        let code = ext.join("code").to_string_lossy().into_owned();
+        let found = walk_with(&root, Guard::with(None, false, &[code]), &dev);
+        assert_eq!(
+            found.repos,
+            vec![root.join("ext/code/alpha").to_string_lossy()]
+        );
+        assert!(found.skipped.is_empty(), "{found:?}");
+    }
+
     #[test]
     fn scan_never_follows_symlinks() {
         let dir = tempfile::tempdir().unwrap();

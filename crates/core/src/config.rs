@@ -698,8 +698,12 @@ impl Config {
     /// Load the user config; a missing file is the default config, a
     /// malformed one is an error (never silently ignored).
     pub fn load() -> Result<Self> {
-        let path = paths::config_path();
-        match std::fs::read_to_string(&path) {
+        Self::load_at(&paths::config_path())
+    }
+
+    /// `load` from the file at `path`.
+    pub fn load_at(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),

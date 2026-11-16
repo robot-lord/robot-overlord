@@ -207,9 +207,10 @@ impl Daemon {
 
     /// Git repos under `roots`, the folders the scan stayed out of, and
     /// whether the first scan of them is still running (`repo_scan.rs`:
-    /// never blocks for long). No roots: none. Folders sessions run in
-    /// count as granted (`privacy::Guard`); they are read under a short DB
-    /// lock, released before the scan.
+    /// never blocks for long). No roots: none. The folders the user named
+    /// (`code_dir`, each `repo_roots` entry) and those sessions run in
+    /// count as granted (`setup::granted_folders`); the session folders are
+    /// read under a short DB lock, released before the scan.
     fn scanned_repos(&self, roots: &[String], depth: u8) -> repo_scan::Found {
         if roots.is_empty() {
             return repo_scan::Found {
@@ -219,7 +220,8 @@ impl Daemon {
                 scanning: false,
             };
         }
-        let granted = self.db().session_folders().unwrap_or_default();
+        let sessions = self.db().session_folders().unwrap_or_default();
+        let granted = setup::granted_folders(&self.config(), sessions);
         let key = (roots.to_vec(), depth);
         self.repo_scan.get(&key, move |k| {
             rlord_core::git::scan_repos(&k.0, k.1, &granted)
@@ -782,6 +784,9 @@ impl Daemon {
             }
             "ui.show_list" => ui::show_list(self),
             "ui.keys" => ui::keys_open(self, params),
+            "setup.status" => setup::status(self),
+            "setup.suggest" => setup::suggest(self, params),
+            "setup.apply" => setup::apply(self, params),
             "keys.list" => ui::keys_list(self),
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),
