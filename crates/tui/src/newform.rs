@@ -286,6 +286,8 @@ pub(crate) struct NewForm {
     proposed: bool,
     context: String,
     related: Vec<String>,
+    /// The related sessions' names, to show (`related` holds their ids).
+    related_names: Vec<String>,
     picker: Option<(PickerKind, Vec<String>, ListState)>,
     finder: Option<Finder>,
     text_prompt: Option<(TextPrompt, String)>,
@@ -330,15 +332,18 @@ impl NewForm {
         }
         self.proposed = true;
         self.context = get("context").unwrap_or_default();
-        self.related = p["related"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let list = |k: &str| -> Vec<String> {
+            p[k].as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        self.related = list("related");
+        self.related_names = list("related_names");
         self.focus = self
             .fields()
             .iter()
@@ -358,7 +363,12 @@ impl NewForm {
         let first = context.lines().find(|l| !l.trim().is_empty());
         s.push_str(first.map(str::trim).unwrap_or("(none)"));
         if !self.related.is_empty() {
-            let related = rlord_daemon::context::clean(&self.related.join(", "));
+            let shown = if self.related_names.is_empty() {
+                &self.related
+            } else {
+                &self.related_names
+            };
+            let related = rlord_daemon::context::clean(&shown.join(", "));
             s.push_str(&format!(" · related: {}", related.replace('\n', " ")));
         }
         if s.chars().count() > width {
@@ -718,6 +728,7 @@ impl App {
             proposed: false,
             context: String::new(),
             related: Vec::new(),
+            related_names: Vec::new(),
             picker: None,
             finder: None,
             text_prompt: None,

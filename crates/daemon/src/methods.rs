@@ -608,7 +608,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     notes.extend(note);
     // Launched by the overlord (`create_session`, or its proposal the user
     // launched): its background says so even with no notes.
-    let background = by_overlord || !notes.is_empty() || !links.is_empty();
+    let background = context::needs_background(params);
 
     // Where the session lives: an explicit repo, an explicit plain folder,
     // or the configured default repo.
@@ -971,6 +971,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         model.as_deref(),
         &args,
     )?;
+    // A Pointer-mode session starting a new conversation: the pointer
+    // again, as its first prompt (its rows then count as handed over).
+    if let Some(p) = context::restart_prompt(mode, resumed, &bg_file) {
+        context::refresh_file(db, &paths::data_dir(), &s)?;
+        agent.add_first_prompt(&mut argv, &p);
+        if let Some(last) = db.context_rows(&s.id)?.last() {
+            db.context_mark_seen(&s.id, last.id, now_ms())?;
+        }
+    }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
     // session that starts anew under its id (the agent never had it) is

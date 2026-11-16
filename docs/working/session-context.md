@@ -299,6 +299,29 @@ Fixed:
 
 Declined (coordinator): moving `frame_message` to PR 4 (plan: PR 1).
 
+### Review round 5 (PR #64)
+
+Fixed:
+
+1. `clean` strips tag characters U+E0000–U+E007F and turns U+2028 /
+   U+2029 into line ends (test).
+2. `Related::of` shows `project_path` (the worktree), not `repo_path`.
+3. The worker paragraph is only for sessions the overlord launched with
+   background (kv `context_on`); late background gets the header without
+   it, in the file and in hook answers (`render_as`) (test).
+4. A Pointer-mode session restarted into a new conversation gets the
+   pointer again as its first prompt (`context::restart_prompt`,
+   `Agent::add_first_prompt`; rows marked seen) (tests).
+5. A replaced, unacknowledged answer stays acknowledgeable for its own
+   rows (up to 8 kept); acknowledging the newer one marks the union and
+   retires the older ones (test).
+6. `private::write` calls `sync_all` before the rename.
+7. `context::needs_background(params)` is the one test, used by
+   `session.new` and by the daemon deciding to ask `hooks_work`.
+8. `hook_reply` (the source-less wrapper) is `#[cfg(test)]`.
+9. `propose_session` stores the resolved ids for `related`, with
+   `related_names` for the form's preview.
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the

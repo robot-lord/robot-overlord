@@ -469,15 +469,22 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     let related = crate::methods::ref_list(params, "related");
     {
         let db = d.db();
-        crate::context::check(
+        let (_, ids) = crate::context::check(
             &db,
             prefill.get("context").and_then(Value::as_str),
             &related,
             None,
         )?;
-    }
-    if !related.is_empty() {
-        prefill.insert("related".into(), json!(related));
+        // The sessions as resolved now (ids), and their names to show.
+        if !ids.is_empty() {
+            let names: Vec<String> = ids
+                .iter()
+                .filter_map(|i| db.resolve_ref(i).ok())
+                .map(|s| crate::context::clean(&s.name))
+                .collect();
+            prefill.insert("related".into(), json!(ids));
+            prefill.insert("related_names".into(), json!(names));
+        }
     }
     // What the TUI shows of the overlord's text: no control characters.
     if let Some(c) = prefill.get("context").and_then(Value::as_str) {

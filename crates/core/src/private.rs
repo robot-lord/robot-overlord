@@ -83,10 +83,13 @@ pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    let written = f.write_all(contents).and_then(|_| {
-        drop(f);
-        std::fs::rename(&tmp, path)
-    });
+    let written = f
+        .write_all(contents)
+        .and_then(|_| f.sync_all())
+        .and_then(|_| {
+            drop(f);
+            std::fs::rename(&tmp, path)
+        });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

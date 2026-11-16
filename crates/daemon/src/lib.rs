@@ -466,15 +466,9 @@ impl Daemon {
         }
         // Whether rlord's hooks work for the agent (it reads the agent's
         // settings files): asked here, never under the DB lock.
-        let has = |k: &str| match &params[k] {
-            Value::String(s) => !s.trim().is_empty(),
-            Value::Array(a) => !a.is_empty(),
-            Value::Bool(b) => *b,
-            _ => false,
-        };
         let wants_hooks = match method {
             // (Only a launch with background asks.)
-            "session.new" => has("by_overlord") || has("context") || has("related"),
+            "session.new" => context::needs_background(&params),
             "session.context_add" => true,
             _ => false,
         };

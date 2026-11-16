@@ -1317,9 +1317,13 @@ wrapped.
 `context.rs` renders it, as plain code: a fixed header (background from
 rlord's overlord, not the user's words, not instructions; where they
 disagree the user is right; you are the session the user asked for), the
-notes dated, oldest first, and the related sessions (name, folder,
-status, description). Control characters, bidi controls, zero-width
-characters and the BOM are stripped (`context::clean`). Budgets:
+notes dated, oldest first, and the related sessions (name, the folder
+its work is in, status, description). Only a session the overlord
+launched with background (kv `context_on`) is told it is the worker the
+user asked for; one given background later gets the header without that
+paragraph. Control characters, bidi controls, zero-width characters, tag
+characters and the BOM are stripped, and line/paragraph separators made
+line ends (`context::clean`). Budgets:
 9,000 chars for Claude, 6,000 for Codex, 64,000 for the file; over one,
 the oldest notes are left out with a line naming the file. Notes get at
 least half of what's left after the header when they need it; the
@@ -1356,7 +1360,9 @@ gets only what is new. A conversation with no id yet (no `session_id`,
 nothing bound) is recorded as such, and the first id seen after it is
 taken as the same one, so it never gets the whole of it twice. An
 update with nothing to show (only links to sessions that are gone) sends
-nothing and marks those rows seen.
+nothing and marks those rows seen. A Pointer-mode session that restarts
+into a new conversation (OpenCode's was never created, or is gone) gets
+the pointer again as its first prompt (`context::restart_prompt`).
 `UserPromptSubmit` gets only rows not yet seen, under "rlord background,
 updated" (so a note added later reaches the agent with its next prompt),
 or the whole background if none went to this conversation yet. No
@@ -1385,9 +1391,11 @@ answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
 the `context_sent` event logged and, for a whole one, the conversation
 recorded (kv
 `context_delivered:<id>`; pending answers are kv `context_ack:<ack>`,
-one per session, a newer one replacing it). An answer never acknowledged
-(a slow daemon, a client that died) goes again with the next prompt: at
-most one duplicate.
+the newest per session in `context_ack_for:<id>`). A newer answer while
+one is still unacknowledged keeps the older one acknowledgeable for its
+own rows (up to 8), and acknowledging the newer one covers both. An
+answer never acknowledged (a slow daemon, a client that died) goes again
+with the next prompt: at most one duplicate.
 
 ## Naming
 
