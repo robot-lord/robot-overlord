@@ -1611,7 +1611,7 @@ fn print_search(v: &Value) {
 
 /// `rlord setup [PATH] [--keep-roots] [--json]`.
 fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<()> {
-    use rlord_core::config::{contract_tilde, expand_tilde};
+    use rlord_core::config::contract_tilde;
     use std::io::{IsTerminal, Write};
     let cwd = std::env::current_dir()?;
     // (A cheap look-up: the suggestion reads every agent's files, so it is
@@ -1726,12 +1726,7 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
     };
     let folder = absolute_folder(&folder, &cwd)?;
     let mut roots = roots_edit(&status["roots_default"], keep_roots);
-    let differs = !configured.is_empty()
-        && configured
-            .iter()
-            .map(|r| expand_tilde(r))
-            .collect::<Vec<_>>()
-            != [folder.clone()];
+    let differs = rlord_core::config::roots_beyond_code_dir(&configured, &folder);
     if !keep_roots && differs {
         let default_yes = roots == "follow";
         let roots_was = roots.clone();

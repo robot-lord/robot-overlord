@@ -571,6 +571,20 @@ pub fn absolute_dir(p: &str) -> Result<String> {
     Ok(t.to_string())
 }
 
+/// `repo_roots` name a folder besides the code folder (so there is a
+/// choice to make about them). Compared as `absolute_dir` keeps folders:
+/// `~` expanded, a trailing `/` trimmed.
+pub fn roots_beyond_code_dir(roots: &[String], code_dir: &str) -> bool {
+    let norm = |p: &str| {
+        absolute_dir(p).unwrap_or_else(|_| expand_tilde(p.trim()).trim_end_matches('/').to_string())
+    };
+    let code = norm(code_dir);
+    roots
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .any(|r| norm(r) != code)
+}
+
 /// The inverse of `expand_tilde`: a path under `$HOME` is written `~/...`.
 pub fn contract_tilde(p: &str) -> String {
     match std::env::var_os("HOME") {
@@ -1137,6 +1151,16 @@ mod tests {
         // `[]` reads as unset.
         let c = s("[session]\ncode_dir = \"/c\"\nrepo_roots = []\n");
         assert_eq!(c.scan_roots(), ["/c"]);
+    }
+
+    #[test]
+    fn roots_beyond_the_code_folder() {
+        let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!roots_beyond_code_dir(&v(&["/c/"]), "/c"));
+        assert!(!roots_beyond_code_dir(&v(&["/c", " "]), "/c/"));
+        assert!(!roots_beyond_code_dir(&[], "/c"));
+        assert!(roots_beyond_code_dir(&v(&["/c", "/d"]), "/c"));
+        assert!(roots_beyond_code_dir(&v(&["/d"]), ""));
     }
 
     #[test]

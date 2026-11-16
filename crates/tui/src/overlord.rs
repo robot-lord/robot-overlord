@@ -272,10 +272,13 @@ impl App {
             self.handle_ui_cmd(cmd);
             return; // the overlord asked for something; don't bury it
         }
+        // The startup sequence: the overlord's dialogs, then the code
+        // folder (setupform.rs). A dialog that opens here goes on to setup
+        // when it closes; otherwise setup is checked now.
+        self.startup_chain = true;
         self.check_overlord();
-        // Then the code folder, the first time (setupform.rs).
         if matches!(self.mode, Mode::Normal) {
-            self.check_setup();
+            self.setup_after_dialog();
         }
     }
 
@@ -349,7 +352,7 @@ impl App {
                     self.keys.label(Action::Overlord)
                 );
                 // First run: the code folder next.
-                self.check_setup();
+                self.setup_after_dialog();
             }
             KeyCode::Enter => {
                 let remote = s.remote == Some(true) && s.choice().remote;
@@ -374,7 +377,7 @@ impl App {
                         self.dirty = true;
                         // First run: the code folder next, then the
                         // overlord's overlay.
-                        if self.check_setup() {
+                        if self.setup_after_dialog() {
                             if let Mode::Setup(f) = &mut self.mode {
                                 f.then_overlord = true;
                             }
@@ -460,7 +463,7 @@ impl App {
         // Closed: the code folder next, the first time (as after the
         // overlord's own dialog).
         if matches!(self.mode, Mode::Normal) {
-            self.check_setup();
+            self.setup_after_dialog();
         }
     }
 
@@ -807,7 +810,7 @@ impl App {
         }
         // Closed: the code folder next, the first time.
         if matches!(self.mode, Mode::Normal) {
-            self.check_setup();
+            self.setup_after_dialog();
         }
     }
 

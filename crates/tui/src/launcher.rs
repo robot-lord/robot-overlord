@@ -245,7 +245,7 @@ impl App {
             }
             Cmd::Keys => self.open_keys(None),
             Cmd::Setup => match self.pending_setup.take() {
-                Some(cmd) => self.open_setup_from(&cmd),
+                Some(cmd) => self.open_parked(cmd, None),
                 None => {
                     self.open_setup(false);
                 }

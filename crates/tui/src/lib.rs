@@ -272,6 +272,10 @@ struct App {
     /// The first-run code-folder form was put off (Esc) this run: closing
     /// another dialog doesn't reopen it (`check_setup`).
     setup_put_off: bool,
+    /// The startup sequence (overlord dialog, model upgrade, Remote
+    /// Control offer, then the code folder) is still running: a dialog
+    /// closing goes on to setup (`setup_after_dialog`). Off mid-session.
+    startup_chain: bool,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -333,6 +337,7 @@ impl App {
             pending_setup: None,
             setup_rx: None,
             setup_put_off: false,
+            startup_chain: false,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rlord_core::git::{Scan, Skipped};
+use rlord_core::git::Scan;
 
 /// What a scan covers: (roots, depth).
 pub type Key = (Vec<String>, u8);
@@ -58,11 +58,8 @@ pub struct Scanner {
 /// A scan's answer.
 #[derive(Default)]
 pub struct Found {
-    pub repos: Vec<String>,
-    /// Folders the scan stayed out of (`git::scan_repos`), and how many
-    /// more than are listed.
-    pub skipped: Vec<Skipped>,
-    pub skipped_more: usize,
+    /// The last result for these roots (empty while there is none).
+    pub scan: Scan,
     /// No result for these roots yet, and a scan of them is running.
     pub scanning: bool,
 }
@@ -97,9 +94,7 @@ impl Scanner {
         }
         match st.found.get(key) {
             Some((_, scan)) => Found {
-                repos: scan.repos.clone(),
-                skipped: scan.skipped.clone(),
-                skipped_more: scan.skipped_more,
+                scan: scan.clone(),
                 scanning: false,
             },
             None => Found {
@@ -184,7 +179,7 @@ mod tests {
         for _ in 0..200 {
             let f = s.get(key, |_| panic!("rescanned while one was running"));
             if !f.scanning {
-                return f.repos;
+                return f.scan.repos;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -203,9 +198,9 @@ mod tests {
         let s = Scanner::with_timing(timing(5_000));
         let f = s.get(&key("a"), |_| vec!["/a/x".to_string()].into());
         assert!(!f.scanning);
-        assert_eq!(f.repos, vec!["/a/x".to_string()]);
+        assert_eq!(f.scan.repos, vec!["/a/x".to_string()]);
         let f = s.get(&key("a"), |_| panic!("rescanned a fresh result"));
-        assert_eq!(f.repos, vec!["/a/x".to_string()]);
+        assert_eq!(f.scan.repos, vec!["/a/x".to_string()]);
     }
 
     #[test]
@@ -213,7 +208,7 @@ mod tests {
         let s = Scanner::with_timing(timing(50));
         let (release, scan) = gated(&["/a/x"]);
         let f = s.get(&key("a"), scan);
-        assert!(f.scanning && f.repos.is_empty());
+        assert!(f.scanning && f.scan.repos.is_empty());
         // Past first_wait: no waiting, and no second scan of the same roots.
         let t = Instant::now();
         let f = s.get(&key("a"), |_| panic!("started a second scan"));
@@ -232,13 +227,14 @@ mod tests {
         let repos = if f.scanning {
             settled(&s, &key("b"))
         } else {
-            f.repos
+            f.scan.repos
         };
         assert_eq!(repos, vec!["/b/y".to_string()]);
     }
 
     #[test]
     fn skipped_folders_come_back() {
+        use rlord_core::git::Skipped;
         use rlord_core::privacy::Why;
         let s = Scanner::with_timing(timing(5_000));
         let skipped = vec![Skipped {
@@ -251,17 +247,17 @@ mod tests {
             skipped_more: 3,
         };
         let f = s.get(&key("h"), move |_| scan);
-        assert_eq!(f.repos, vec!["/h/a".to_string()]);
-        assert_eq!((f.skipped, f.skipped_more), (skipped, 3));
+        assert_eq!(f.scan.repos, vec!["/h/a".to_string()]);
+        assert_eq!((f.scan.skipped, f.scan.skipped_more), (skipped, 3));
     }
 
     #[test]
     fn panicking_scan_leaves_an_empty_result() {
         let s = Scanner::with_timing(timing(5_000));
         let f = s.get(&key("a"), |_| panic!("scan blew up"));
-        assert!(!f.scanning && f.repos.is_empty());
+        assert!(!f.scanning && f.scan.repos.is_empty());
         // Not rerun on the next look-up.
         let f = s.get(&key("a"), |_| panic!("reran a scan that panicked"));
-        assert!(!f.scanning && f.repos.is_empty());
+        assert!(!f.scanning && f.scan.repos.is_empty());
     }
 }

@@ -29,10 +29,34 @@ pub(crate) const KV: &str = "setup_code_dir";
 const CLAUDE_DIRS: usize = 300;
 const AGENT_ROWS: usize = 2000;
 
-/// The first-run form should open: no code folder set, and the user hasn't
-/// answered setup yet.
+/// Where setup stands, from the one kv row (read once, under one short
+/// lock) and the config.
+struct Answered {
+    /// The first-run form should open: no code folder set, and setup not
+    /// answered yet.
+    needed: bool,
+    /// A code folder was saved through setup before (`done:`).
+    done: bool,
+    /// The user said "don't ask again" (`skipped:`).
+    skipped: bool,
+}
+
+fn answered(d: &Daemon, cfg: &Config) -> Answered {
+    let row = d.db().kv_get(KV).ok().flatten();
+    answered_from(row.as_deref(), cfg)
+}
+
+fn answered_from(row: Option<&str>, cfg: &Config) -> Answered {
+    Answered {
+        needed: cfg.session.code_dir_path().is_none() && row.is_none(),
+        done: row.is_some_and(|a| a.starts_with("done")),
+        skipped: row.is_some_and(|a| a.starts_with("skipped")),
+    }
+}
+
+/// The first-run form should open (for callers already holding the DB).
 pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
-    cfg.session.code_dir_path().is_none() && db.kv_get(KV).ok().flatten().is_none()
+    answered_from(db.kv_get(KV).ok().flatten().as_deref(), cfg).needed
 }
 
 /// `setup.status` (cheap: config and one kv row): `needed`, the code
@@ -42,24 +66,15 @@ pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
 /// (`default_roots`). Every front end uses that as given.
 pub(crate) fn status(d: &Daemon) -> Result<Value> {
     let cfg = d.config();
-    let db = d.db();
-    let done = done(&db);
+    let a = answered(d, &cfg);
     Ok(json!({
-        "needed": needed(&db, &cfg),
+        "needed": a.needed,
         "code_dir": cfg.session.code_dir_path().unwrap_or_default(),
-        "skipped": db.kv_get(KV)?.is_some_and(|a| a.starts_with("skipped")),
-        "done": done,
+        "skipped": a.skipped,
+        "done": a.done,
         "repo_roots": cfg.session.repo_roots,
-        "roots_default": default_roots(&cfg, done),
+        "roots_default": default_roots(&cfg, a.done),
     }))
-}
-
-/// A code folder was saved through setup before (kv `done:`).
-fn done(db: &Db) -> bool {
-    db.kv_get(KV)
-        .ok()
-        .flatten()
-        .is_some_and(|a| a.starts_with("done"))
 }
 
 /// What saving rlord's own suggestion does with `repo_roots`: the old
@@ -137,11 +152,12 @@ fn collect(d: &Daemon, launch_dir: Option<&str>) -> Vec<Seen> {
 pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
     let seen = collect(d, params["launch_dir"].as_str());
     let cfg = d.config();
-    let (needed, done) = {
-        let db = d.db();
-        (needed(&db, &cfg), done(&db))
-    };
-    let s = code_dir::suggest(
+    let Answered { needed, done, .. } = answered(d, &cfg);
+    // A folder inside a repo counts as the repo, and a repo is never the
+    // suggestion: `.git` is looked for only where no macOS prompt guards.
+    let guard = Guard::new();
+    let is_repo = |p: &Path| guard.prompts(p).is_none() && p.join(".git").exists();
+    let s = code_dir::suggest_with(
         &seen,
         // (`$HOME` and above are never offered; rlord's data and temp dirs
         // hold no projects.)
@@ -150,8 +166,9 @@ pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
         )]),
         &with_resolved(rlord_core::import::excluded_dirs()),
         cfg.session.repo_scan_depth,
+        &is_repo,
     );
-    let mut v = suggestion_value(&s, &cfg, needed, &Guard::new(), &|p| p.is_dir());
+    let mut v = suggestion_value(&s, &cfg, needed, &guard, &|p| p.is_dir());
     v["done"] = json!(done);
     v["roots_default"] = json!(default_roots(&cfg, done));
     Ok(v)
@@ -172,12 +189,18 @@ fn suggestion_value(
             .filter(|p| Path::new(p).starts_with(dir))
             .count()
     };
-    // A single explicit root that isn't `~` outranks the vote.
+    // A single explicit root that isn't `~` outranks the vote, if it is
+    // there (a deleted one mustn't push out real candidates); one macOS
+    // guards can't be checked, and is kept and flagged.
     let roots = cfg.session.repo_roots.clone();
     let explicit = match roots.as_slice() {
         [r] if r.trim() != "~" && !r.trim().is_empty() => Some(expand_tilde(r.trim())),
         _ => None,
-    };
+    }
+    .filter(|r| {
+        let p = Path::new(r);
+        guard.prompts(p).is_some() || is_dir(p)
+    });
     let mut shown: Vec<(String, usize, &str)> = Vec::new();
     if let Some(r) = &explicit {
         shown.push((r.clone(), under(r), "repo_roots"));
@@ -463,6 +486,33 @@ mod tests {
             &exists,
         );
         assert!(v["suggestion"].is_null());
+    }
+
+    /// A deleted explicit root doesn't push out candidates.
+    #[test]
+    fn a_missing_explicit_root_is_ignored() {
+        let s = sugg("/h/ko", &["/h/work"], &["/h/ko/a", "/h/work/b"]);
+        let mut cfg = Config::default();
+        cfg.session.repo_roots = vec!["/h".into()];
+        let exists = |p: &Path| p != Path::new("/h");
+        let v = suggestion_value(&s, &cfg, false, &Guard::with(None, false), &exists);
+        assert_eq!(v["suggestion"]["path"], "/h/ko");
+        assert_eq!(v["suggestion"]["from"], "vote");
+        assert_eq!(v["alternatives"][0]["path"], "/h/work");
+    }
+
+    #[test]
+    fn the_kv_row_says_where_setup_stands() {
+        let cfg = Config::default();
+        let a = answered_from(None, &cfg);
+        assert!(a.needed && !a.done && !a.skipped);
+        let a = answered_from(Some("done:1"), &cfg);
+        assert!(!a.needed && a.done && !a.skipped);
+        let a = answered_from(Some("skipped:1"), &cfg);
+        assert!(!a.needed && !a.done && a.skipped);
+        let mut cfg = Config::default();
+        cfg.session.code_dir = "/c".into();
+        assert!(!answered_from(None, &cfg).needed);
     }
 
     #[test]

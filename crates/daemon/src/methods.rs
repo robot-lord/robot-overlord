@@ -49,7 +49,7 @@ pub(crate) fn repo_find(
         .iter()
         .filter_map(|r| r["path"].as_str().map(str::to_string))
         .collect();
-    for p in found.repos {
+    for p in found.scan.repos {
         if !known.contains(&p) {
             out.as_array_mut()
                 .unwrap()
@@ -60,28 +60,33 @@ pub(crate) fn repo_find(
     Ok(
         json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth,
               "scanning": found.scanning,
-              "skipped": found.skipped.iter().map(|k| json!({
+              "skipped": found.scan.skipped.iter().map(|k| json!({
                   "path": k.path, "why": k.why.id(), "text": k.why.text(),
               })).collect::<Vec<_>>(),
-              "skipped_more": found.skipped_more,
+              "skipped_more": found.scan.skipped_more,
               "code_dir": cfg.session.code_dir_path().unwrap_or_default()}),
     )
 }
 
 /// `[session]` as configured, plus what each agent offers: `agents` lists
 /// every agent rlord can run with its default model and picker choices
-/// (`models` empty: no catalog, the model is typed in). `code_dir` and
-/// `repo_roots` are expanded (`repo_roots`: what the finder scans);
+/// (`models` empty: no catalog, the model is typed in). `code_dir` is
+/// expanded; `repo_roots` is as configured, and `scan_roots` (expanded) is
+/// what the finder scans now, which is not a setting to pass back;
 /// `setup_needed`: no code folder yet and setup not answered.
 pub fn session_defaults(cfg: &Config, setup_needed: bool) -> Result<Value> {
     let mut v = serde_json::to_value(&cfg.session)?;
     v["code_dir"] = json!(cfg.session.code_dir_path().unwrap_or_default());
-    v["repo_roots"] = json!(cfg
+    v["scan_roots"] = json!(cfg
         .session
         .finder_roots(setup_needed)
         .iter()
         .map(|r| expand_tilde(r))
         .collect::<Vec<_>>());
+    if cfg.session.scan_roots().is_empty() && setup_needed {
+        v["scan_note"] =
+            json!("no code folder yet: the finder scans ~ until setup is done (confirm_setup)");
+    }
     v["setup_needed"] = json!(setup_needed);
     v["agents"] = install::status(false)
         .into_iter()

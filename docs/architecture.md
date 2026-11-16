@@ -1204,7 +1204,9 @@ can read without walking the disk (`daemon/src/setup.rs`, bounded): the
 newest Claude Code project dirs (a `cwd` whose slug matches, from the
 first of a few transcripts that has one), Codex's `threads.cwd`, OpenCode's top-level
 `session_v2.directory` (only that table: the DB holds credentials), rlord's
-repos and session folders, and the launch folder. Each project counts
+repos and session folders, and the launch folder. A folder inside a git
+repo counts as that repo (`.git` is looked for only where no macOS
+prompt guards), and a repo is never the suggestion. Each project counts
 once; the folder holding the most within `repo_scan_depth` wins (ties: the
 deeper), never `$HOME` or above (as given or resolved), nor a system or
 mount parent (`/Volumes`, `/mnt`, `/run/media/<user>`, `/var`, …:
@@ -1217,7 +1219,9 @@ difference from the new-session form: the confirm saves by plain code
 (`setup.apply`, through `Config::set_code_dir`, which keeps the file as
 written). The overlord only proposes (`confirm_setup` reopens the form);
 it isn't called again. First run opens the form after the overlord
-dialog; `:setup`, `rlord setup` and the overlord open it later. The form
+dialog (or the model-upgrade or Remote Control dialog), only during that
+startup sequence, never when a dialog closes mid-session; `:setup`,
+`rlord setup` and the overlord open it later. The form
 opens at once with the configured roots (`setup.status`, cheap) and fills
 in the suggestion from another thread; it asks before creating a folder
 that doesn't exist. A folder macOS guards is saved unchecked

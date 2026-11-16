@@ -235,13 +235,7 @@ impl SetupForm {
 
     /// The configured roots are explicit and aren't just the code folder.
     fn roots_differ(&self) -> bool {
-        !self.configured.is_empty()
-            && self
-                .configured
-                .iter()
-                .map(|r| expand_tilde(r))
-                .collect::<Vec<_>>()
-                != [expand_tilde(&self.code_dir)]
+        rlord_core::config::roots_beyond_code_dir(&self.configured, &self.code_dir)
     }
 
     /// Reopened by the overlord (`confirm_setup`): its proposal, the
@@ -454,13 +448,33 @@ impl App {
         // The overlord proposed one while something else was open: that
         // one, not rlord's own suggestion (even if the form was put off).
         if let Some(cmd) = self.pending_setup.take() {
-            self.open_setup_from(&cmd);
+            self.open_parked(cmd, Some(st));
             if let Mode::Setup(f) = &mut self.mode {
                 f.auto = needed;
             }
             return true;
         }
         needed && self.open_setup_with(&st, true)
+    }
+
+    /// A dialog of the startup sequence closed: the code folder next, but
+    /// only while that sequence runs (never mid-session: a dialog the
+    /// overlord opens later mustn't bring the form up).
+    pub(crate) fn setup_after_dialog(&mut self) -> bool {
+        if !std::mem::take(&mut self.startup_chain) {
+            return false;
+        }
+        self.check_setup()
+    }
+
+    /// Open a proposal the overlord parked while something else was open,
+    /// with what is configured now (`status`, or asked for here), not what
+    /// was configured when it was queued. The proposal's own fields stay.
+    pub(crate) fn open_parked(&mut self, mut cmd: Value, status: Option<Value>) {
+        if let Some(st) = status.or_else(|| self.call("setup.status", Value::Null)) {
+            cmd["status"] = st;
+        }
+        self.open_setup_from(&cmd);
     }
 
     /// Open the code-folder form now, showing "finding…" while rlord's
@@ -1250,6 +1264,38 @@ mod tests {
             panic!("form not open")
         };
         assert!(f.auto && f.then_overlord);
+    }
+
+    /// Mid-session (the startup sequence over), closing a dialog doesn't
+    /// look at setup at all.
+    #[test]
+    fn dialogs_mid_session_dont_open_setup() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        assert!(!app.startup_chain);
+        // (No daemon is asked: it returns before any call.)
+        assert!(!app.setup_after_dialog());
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// A parked proposal opens with what is configured now, keeping its
+    /// own fields.
+    #[test]
+    fn a_parked_proposal_opens_with_fresh_status() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let cmd = json!({"cmd": "setup", "prefill": {"code_dir": "/p", "note": "n"},
+                         "status": {"code_dir": "", "repo_roots": []}});
+        let fresh = json!({"code_dir": "/now", "repo_roots": ["/x"], "roots_default": "leave"});
+        app.open_parked(cmd, Some(fresh));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert_eq!(f.configured, ["/x"]);
+        assert_eq!(f.roots, Roots::Keep(vec!["/x".into()]));
+        assert_eq!((f.code_dir.as_str(), f.note.as_deref()), ("/p", Some("n")));
     }
 
     /// A proposal parked for `:setup` is dropped once a newer one opens.

@@ -83,7 +83,8 @@ you've sat idle a while (the user may also clear you). So:
 - `get_session_defaults` — what a new session gets if you don't say (agent,
   model and its choices, worktree, default repo), `code_dir` (where the
   user keeps repos; "" = not set), and under `agents` which coding agents
-  can run a session, each with its own models.
+  can run a session, each with its own models. `scan_roots` only says
+  what the finder scans now: never pass it back as `repo_roots`.
 - `confirm_setup` — open the code-folder form for the user to confirm. See
   "Where the user's code lives".
 - `create_session` — launch directly. `go: true` sends the user there;
