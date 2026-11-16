@@ -1127,6 +1127,18 @@ mod tests {
         }
     }
 
+    /// The user's words and the overlord's notes go to a session apart
+    /// (`prompt`, `context`): no longer one prompt with a heading between
+    /// them, and the "you are the session" line is rlord's (`context.rs`).
+    #[test]
+    fn instructions_keep_the_users_words_apart() {
+        assert!(!INSTRUCTIONS.contains("## Context from the overlord"));
+        assert!(!INSTRUCTIONS.contains("always ends with"));
+        for field in ["`prompt`", "`context`", "`related`", "`add_context`"] {
+            assert!(INSTRUCTIONS.contains(field), "overlord.md: {field}");
+        }
+    }
+
     /// Subagents may only use rlord tools that exist.
     #[test]
     fn subagent_tools_exist() {
