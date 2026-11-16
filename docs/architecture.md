@@ -95,7 +95,8 @@ sessions (
   pinned        INTEGER NOT NULL DEFAULT 0,
   sort_key      INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
-  archived_at   INTEGER             -- NULL = live
+  archived_at   INTEGER,            -- NULL = live
+  forked_from   TEXT                -- the session it was forked from (session.fork)
 );
 tags            (session_id, tag, PRIMARY KEY(session_id, tag));
 events (
@@ -232,8 +233,10 @@ lock is released:
 facts live in its module) is what the rest of rlord asks:
 
 - **Commands**: `launch` (a new conversation; returns the id and transcript
-  path when rlord can choose them), `resume`, and the same `launch` for a
-  fresh conversation in the pane.
+  path when rlord can choose them), `resume`, the same `launch` for a
+  fresh conversation in the pane, and `fork` (a user fork: the agent's
+  own command, `Fork::Native`; its server first, `Fork::Server`, then
+  `open_fork`; or none yet, `Fork::Seeded`). See "Forking a session".
 - **Identity**: `mints_id`. Claude takes a caller-chosen id (`--session-id`),
   so the transcript path is known at launch. Codex assigns its own: the id
   is bound from the first hook that carries it (`trust = hook`), or, while
@@ -678,7 +681,8 @@ boundary against local processes, which can reach the socket anyway.
 apart from the overlord's notes (`context`) and related sessions
 (`related`); `update_session` adds to them (`add_context`,
 `add_related`); `get_session` shows them as `background`. See "Session
-background".
+background". `fork_session` calls `session.fork` (see "Forking a
+session"); session rows carry `forked_from`.
 
 Tools (v1, the original design):
 - `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
@@ -704,7 +708,7 @@ A small skill/CLAUDE.md snippet documents the tools and conventions
 ### CLI
 
 Thin UDS client, ~1 round-trip per command: `rlord ls` (rich table,
-`--sort last-agent-msg --status waiting --tag foo`), `new`, `setup`, `attach`, `send`,
+`--sort last-agent-msg --status waiting --tag foo`), `new`, `fork`, `setup`, `attach`, `send`,
 `restart`, `archive`, `rename`, `tag`, `log <id>` (event history), `doctor`,
 `daemon`. Also the plumbing subcommands: `hook emit`, `mcp`,
 `claude install-hooks`, `codex install-notify`.
@@ -1422,6 +1426,77 @@ count isn't about, always get the whole background and start the count
 afresh. The answer is built last in `hook_emit` (after the event's own
 work, which can fail), so its bookkeeping never runs for an event that
 didn't go through; it names `context.md` only if the file is there.
+
+### Forking a session
+
+`session.fork` (`daemon/src/fork.rs`; the list's `f`, `rlord fork`, MCP
+`fork_session`) starts a new session that goes on from a copy of another
+session's whole conversation, on the same agent. The original is left as
+it is. Plain code, no AI: the `f` form forks directly (no overlord turn,
+no `confirm_*` tool: the options are few and each has a safe default).
+Like `import`, the slow and outside parts run without the DB lock (the
+hooks check, the parent's usage, OpenCode's fork call, `git worktree
+add`); reading and inserting under it, through `methods::start`, the tail
+`session.new` uses too.
+
+| | Claude Code | Codex | OpenCode |
+|---|---|---|---|
+| How | `claude --resume <parent> --fork-session --session-id <new>` | `codex fork <parent> --no-daemon` | `POST /api/session/<parent>/fork` (`{}`) on its server, else `opencode api …`; then `opencode -s <fork>` |
+| New id | minted by rlord (`claude::FORK_MINTS_ID`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
+| Conversation exists | from its first message (a restart before that forks again: kv `fork_pending`) | from its first prompt (the same) | at once |
+| New worktree | yes (`--resume` finds the parent from another worktree of the repo) | yes | no: the server gives a fork its parent's folder |
+
+Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
+2.2.7 (scratch rlord, one short prompt each).
+
+- **Folder.** The parent's (`project_path`, its worktree, repo, branch),
+  or with `workspace` a new worktree branched from the parent's `HEAD`
+  (`git::worktree_add_from`; uncommitted changes don't come along, and
+  the answer says so when there are some).
+- **What it copies**: agent, model (or the one asked for), extra flags,
+  group, tags, description (or the one given), and the parent's
+  `session_context` rows with `at`, `source` and `seen_at` (not which
+  hook answer carried them). Not notes (the user's own, per session),
+  pin, summary, usage, Remote Control, `codex_host`, role. It adds a note
+  (`context::fork_note`) and a link to the parent, both `source =
+  'fork'`, then the overlord's `context` and `related`. Past `LINKS_MAX`
+  the oldest copied links are dropped, never the link to the parent. A
+  fork always has background (`context_on`); its delivery is worked out
+  afresh, as for a launch. Nothing is added to the parent.
+- **Lineage**: `sessions.forked_from` (migration 0011); rows carry
+  `forked_from_name`; `session.get` lists `forks`. The list marks a fork
+  `⑂`; details and `rlord show` say both ways. The fork's first event is
+  `forked` (`from`, `from_conversation`, argv) instead of `launched`.
+- **Refused**: an overlord; no conversation yet (none bound, Claude's
+  transcript not written, OpenCode's `ForkEmptyError`); a `scavenged` id;
+  a parent whose folder is gone (archived ones fork while it's there); an
+  agent not installed; OpenCode into a new worktree.
+- **Warnings** (`warnings` in the answer, by plain code): a working
+  parent (the copy ends at its last finished step), a shared folder with
+  a live parent, a context window at or over 70%, uncommitted changes
+  left behind by a new worktree.
+- **Binding a Codex fork.** Its first message is its parent's, so the
+  prompt rule can't pick its thread. kv `bind_fork:<id>` holds the
+  parent's thread: `discover::pick_thread` then takes only a thread whose
+  rollout's first `session_meta` says `forked_from_id` is that one
+  (`codex::rollout_forked_from`), and any other waiting session skips
+  forked threads. A Codex fork runs no `SessionStart` before its first
+  prompt, so it is usually bound from the index first and confirmed by
+  its hook later.
+- **A user fork always runs in the pane**, whatever the parent's host:
+  its hooks carry its own `RLORD_SESSION_ID` and bind by pane
+  (`Route::Pane`, `SessionStart` of any `source`), and
+  `codex_gate::starts_fresh` stays as it is (a `fork` never binds a
+  daemon-mode session waiting by folder).
+
+**User fork and summary fork.** "User fork" is `session.fork`: a session
+with its own row, tmux session and `RLORD_SESSION_ID`. "Summary fork" is
+the archive summary's one-shot copy (`claude::summary_argv` with
+`--no-session-persistence`, `codex exec fork --ephemeral`, OpenCode's
+archived throwaway found by `opencode::fork_of`, archived only): it never
+becomes a session, and nothing in forking can pick it up (a user fork
+isn't archived, so `fork_of` never returns one; `descendants` goes by
+`parent_id`, which a fork doesn't have).
 
 ## Naming
 

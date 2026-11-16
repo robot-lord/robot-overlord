@@ -124,8 +124,8 @@ fn opencode_fork(conversation: &str) -> Result<String> {
     })
 }
 
-/// Read the parent and check the fork can be made (see "States of the
-/// parent" in docs/architecture.md).
+/// Read the parent and check the fork can be made (what is refused:
+/// "Forking a session" in docs/architecture.md).
 pub(crate) fn want(db: &Db, cfg: &Config, params: &Value) -> Result<Want> {
     let p_opt = |k: &str| {
         params[k]

@@ -475,6 +475,21 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 
 ## Owed / deferred
 
+- Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
+  `docs/architecture.md` "Forking a session"): a fork starts through
+  `methods::start` like a new session, so change that one path.
+  - PR 2 (pull): the wiring is computed in `spec_args`, which the fork
+    path uses too, so a fork gets its token and tools with no extra work;
+    its visible set includes the parent (a linked session).
+    `session_brief` should say `forked_from`. Codex's `-c
+    mcp_servers.rlord_session.*` needs the pane: a fork is always in the
+    pane. Then build the seeded fallback for agents with no native fork
+    on it (`docs/working-archive/session-fork.md`).
+  - PR 3 (prompts off argv): apply `FirstPrompt` in `methods::start`, so
+    a fork's prompt leaves argv with everyone's: Claude's stdin file with
+    `--resume … --fork-session` (extend V1 to that argv), Codex's pointer
+    to `prompt.md` as `codex fork`'s `[PROMPT]`, OpenCode's POST to the
+    fork's id. `bind_prompt` doesn't apply to forks (`bind_fork`).
 - Follow-up, not in this effort: the guard rail above.
 - The first prompt (with the pointer line for Codex untrusted / OpenCode)
   is still on argv, `launched_args`, the `launched` event and

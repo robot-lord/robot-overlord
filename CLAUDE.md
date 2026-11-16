@@ -134,7 +134,10 @@ A manual form (`N`) can exist alongside it for users who want no overlord.
 The code-folder form (`tui/src/setupform.rs`, `confirm_setup`) is the
 second, with one difference: what the overlord only has to confirm is
 saved by plain code when the user confirms (`setup.apply`), without another
-overlord turn.
+overlord turn. The fork form (`f`, `tui/src/forkform.rs`) has the same
+shape but no overlord turn and no `confirm_*` tool at all: it forks by
+plain code (`session.fork`), since its few options each have a safe
+default (the user's decision). Give it a `confirm_fork` if options grow.
 
 ## Review every PR before it merges
 

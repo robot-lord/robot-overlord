@@ -337,6 +337,43 @@ the code folder (without PATH it shows rlord's suggestion and asks).
 A new repo goes in the code folder: ask the overlord for work that needs
 one and it launches the session there, telling it where to create it.
 
+### Forking a session
+
+A fork is a new session that starts from a copy of another session's
+whole conversation and goes its own way: try another approach without
+losing the first, or branch off a side question. The original is left as
+it is. In the list, `f` opens a small form on the selected session: what
+the fork should do first (optional: left empty, it opens idle at its
+input), then its name (`<original>-fork`) and, for Claude Code and Codex
+sessions in a repo, where it works (the same folder, or a new worktree).
+`Enter` forks it, with no overlord turn. Or ask the overlord ("fork the
+auth session and try a token bucket instead"), or from the CLI: `rlord
+fork <session> [prompt…] [--name N] [--model M] [--worktree [--branch
+B]] [-a]`.
+
+- **Same agent, same model** (unless you name another), same group, tags
+  and description, and the original's background from the overlord. Not
+  its notes: they are yours, per session. The fork's background adds a
+  line saying what it was forked from and when.
+- **Same folder by default.** Both sessions then work on the same files;
+  rlord says so when the original is still running. A new worktree
+  (`--worktree`, or the form's choice) is branched from the original's
+  last commit: changes not committed there don't come along. OpenCode
+  forks always stay in the original's folder (its server gives a fork its
+  parent's folder).
+- **A working original** forks as far as its last finished step; a
+  nearly full context window is pointed out (a fork starts with all of
+  it: when the new work only needs to know about the original, a new
+  session with it as `related` is cheaper).
+- **How each agent forks**: Claude Code `claude --resume <id>
+  --fork-session`, Codex `codex fork <id>` (always in the pane, even when
+  the original runs on Codex's background server), OpenCode through its
+  server, then `opencode -s <fork>`. An archived session can be forked
+  while its folder is there.
+
+A fork shows `⑂` before its name; its details say what it was forked
+from, and the original's say its forks (`rlord show` too).
+
 ## Codex sessions
 
 A session runs on Claude Code, the Codex CLI or OpenCode (next section).
