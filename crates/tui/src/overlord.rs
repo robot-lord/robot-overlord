@@ -273,6 +273,10 @@ impl App {
             return; // the overlord asked for something; don't bury it
         }
         self.check_overlord();
+        // Then the code folder, the first time (setupform.rs).
+        if matches!(self.mode, Mode::Normal) {
+            self.check_setup();
+        }
     }
 
     pub(crate) fn check_overlord(&mut self) {
@@ -344,6 +348,8 @@ impl App {
                     "overlord not started — press {} any time",
                     self.keys.label(Action::Overlord)
                 );
+                // First run: the code folder next.
+                self.check_setup();
             }
             KeyCode::Enter => {
                 let remote = s.remote == Some(true) && s.choice().remote;
@@ -366,7 +372,15 @@ impl App {
                             );
                         }
                         self.dirty = true;
-                        self.show_overlord();
+                        // First run: the code folder next, then the
+                        // overlord's overlay.
+                        if self.check_setup() {
+                            if let Mode::Setup(f) = &mut self.mode {
+                                f.then_overlord = true;
+                            }
+                        } else {
+                            self.show_overlord();
+                        }
                     }
                     Err(e) => {
                         s.error = Some(format!("{e:#}"));
@@ -515,6 +529,17 @@ impl App {
             Some("keys") => {
                 self.open_keys(cmd["row"].as_str());
                 self.status_line = "the overlord opened the key screen".into();
+            }
+            // Never over something the user is typing into.
+            Some("setup") if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Setup(_)) => {
+                self.pending_setup = Some(cmd.clone());
+                self.status_line =
+                    "the overlord wants to open setup: finish here, then :setup".into();
+            }
+            Some("setup") => {
+                self.open_setup_from(&cmd);
+                self.status_line =
+                    "the overlord proposed a code folder — check it, then save".into();
             }
             Some("confirm_new_session") => {
                 self.open_new_form(newform::FormKind::Overlord);

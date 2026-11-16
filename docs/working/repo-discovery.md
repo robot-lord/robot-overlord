@@ -51,7 +51,7 @@ Progress: (updated per commit)
 - [x] finder and `find_repos` show skipped folders
 - [x] suggestion: `code_dir.rs`, sources, `setup.*` methods
 - [x] `rlord setup`
-- [ ] TUI setup form, first run, `:setup`
+- [x] TUI setup form, first run, `:setup`
 - [ ] overlord: `confirm_setup`, setup request, `overlord.md`
 - [ ] fresh-install steps
 - [ ] docs and reconcile

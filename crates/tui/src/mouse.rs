@@ -645,6 +645,14 @@ impl App {
             Mode::NewSession(form) => form.click(i).then_some(KeyCode::Enter),
             // A row: select it; again: change it, as → does.
             Mode::OverlordSetup(s) => s.click_row(i).then_some(KeyCode::Right),
+            // Again on Save: save; on another row: change it.
+            Mode::Setup(s) => s.click_row(i).then(|| {
+                if s.on_save() {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Right
+                }
+            }),
             _ => None,
         };
         match then {
