@@ -35,16 +35,6 @@ pub const RELATED_MAX: usize = 8;
 /// Related sessions one session links to, in all, at most.
 pub const LINKS_MAX: usize = 16;
 
-/// The line an old-style prompt (from an overlord still on the
-/// instructions from before PR 1 of session context) puts between the
-/// user's words and its own notes.
-const LEGACY_HEADING: &str = "## Context from the overlord";
-/// The sentence old instructions had the overlord end its notes with; the
-/// header says it now.
-const LEGACY_WORKER_LINE: &str = "You are the session the user asked for";
-/// How that instruction ended (lowercased, as matched).
-const LEGACY_WORKER_END: &str = "hand the whole task to one";
-
 /// kv key: this session has background from the overlord (it launched
 /// it), even with no notes or links.
 fn on_key(id: &str) -> String {
@@ -69,15 +59,15 @@ fn ack_key(ack: &str) -> String {
     format!("context_ack:{ack}")
 }
 
-/// kv key: full answers to one conversation not acknowledged yet
+/// kv key: answers to one conversation not acknowledged yet, in a row
 /// (`{conv, n}`).
 fn tries_key(id: &str) -> String {
-    format!("context_full_tries:{id}")
+    format!("context_unacked:{id}")
 }
 
-/// Unacknowledged full answers to one conversation before it counts as
-/// reached anyway.
-const FULL_TRIES: u64 = 2;
+/// Unacknowledged answers to one conversation in a row before what they
+/// carried counts as handed over anyway.
+const UNACKED_TRIES: u64 = 2;
 
 /// Unacknowledged older answers kept acknowledgeable per session, at most.
 const OLDER_MAX: usize = 8;
@@ -246,24 +236,25 @@ fn compose(
 ) -> String {
     let mut out = header;
     let available = budget.saturating_sub(out.chars().count());
-    let notes: Vec<&ContextRow> = rows.iter().filter(|r| r.kind == "note").collect();
+    // Each note's line, rendered once.
+    let lines: Vec<String> = rows
+        .iter()
+        .filter(|r| r.kind == "note")
+        .map(note_line)
+        .collect();
     // What the notes need in all: their lines plus the section's overhead,
     // the same figure `notes_section` reserves, so what is sized here fits
     // there.
     let overhead = notes_overhead(file);
-    let notes_need = if notes.is_empty() {
+    let notes_need = if lines.is_empty() {
         0
     } else {
-        overhead
-            + notes
-                .iter()
-                .map(|r| note_line(r).chars().count())
-                .sum::<usize>()
+        overhead + lines.iter().map(|l| l.chars().count()).sum::<usize>()
     };
     let rel_room = available.saturating_sub(notes_need.min(available / 2));
     let rel = related_section(related, rel_room, file);
     let room = available.saturating_sub(rel.chars().count());
-    out.push_str(&notes_section(&notes, room, file, overhead));
+    out.push_str(&notes_section(&lines, room, file, overhead));
     out.push_str(&rel);
     out
 }
@@ -292,13 +283,8 @@ fn notes_overhead(file: Option<&Path>) -> usize {
 /// characters, oldest left out with a line saying so (naming `file`,
 /// where they all are, when there is one). A newest note that alone is
 /// too long is clipped.
-fn notes_section(
-    notes: &[&ContextRow],
-    room: usize,
-    file: Option<&Path>,
-    overhead: usize,
-) -> String {
-    if notes.is_empty() {
+fn notes_section(lines: &[String], room: usize, file: Option<&Path>, overhead: usize) -> String {
+    if lines.is_empty() {
         return String::new();
     }
     let where_all = |what: &str| notes_notice(what, file);
@@ -306,8 +292,8 @@ fn notes_section(
     let room = room.saturating_sub(overhead);
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0;
-    for r in notes.iter().rev() {
-        let line = note_line(r);
+    for line in lines.iter().rev() {
+        let line = line.clone();
         let n = line.chars().count();
         if used + n <= room {
             used += n;
@@ -325,7 +311,7 @@ fn notes_section(
             break;
         }
     }
-    let left_out = notes.len() - kept.len();
+    let left_out = lines.len() - kept.len();
     let mut out = String::from(NOTES_HEAD);
     if left_out > 0 {
         out.push_str(&where_all(&format!("{left_out} older notes left out")));
@@ -426,151 +412,6 @@ pub fn launch_prompt(prompt: Option<&str>, mode: Option<Delivery>, file: &Path) 
         (None, Some(Delivery::Pointer)) => Some(pointer_only(file)),
         (p, _) => p.map(str::to_string),
     }
-}
-
-/// An old-style prompt split into the user's words and the overlord's
-/// notes, at a line that is exactly `## Context from the overlord`. The
-/// instruction old instructions ended the notes with is dropped (the
-/// header says it), however it was quoted or wrapped. No such line: the
-/// prompt as it is, no notes.
-pub fn split_legacy(prompt: &str) -> (String, Option<String>) {
-    let mut before = Vec::new();
-    let mut lines = prompt.lines();
-    for l in lines.by_ref() {
-        if l.trim_end() == LEGACY_HEADING {
-            let rest: Vec<&str> = lines.collect();
-            let notes = without_worker_line(&rest.join("\n"));
-            let words = before.join("\n").trim_end().to_string();
-            return (words, (!notes.is_empty()).then_some(notes));
-        }
-        before.push(l);
-    }
-    (prompt.to_string(), None)
-}
-
-/// A new session's first prompt, and the notes an old-style prompt carried
-/// (stored as notes: `legacy_notes`). Only the overlord's prompts are
-/// split (`by_overlord`); the user's own, from the manual form or the CLI,
-/// are taken as they are, whatever lines they hold.
-pub fn first_prompt(prompt: Option<String>, by_overlord: bool) -> (Option<String>, Vec<String>) {
-    match prompt {
-        Some(p) if by_overlord => {
-            let (words, notes) = split_legacy(&p);
-            let notes = notes.as_deref().map(legacy_notes).unwrap_or_default();
-            ((!words.trim().is_empty()).then_some(words), notes)
-        }
-        p => (p, Vec::new()),
-    }
-}
-
-/// Quote and emphasis marks ignored when looking for the old instruction.
-fn is_quote_mark(c: char) -> bool {
-    matches!(
-        c,
-        '"' | '\'' | '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}' | '>' | '*' | '_' | '`'
-    )
-}
-
-/// `notes` without the old "You are the session the user asked for…"
-/// instruction: matched per paragraph (blank-line separated), ignoring
-/// case, line breaks and quote marks. The paragraph is cut where it starts;
-/// anything before it in the paragraph stays.
-fn without_worker_line(notes: &str) -> String {
-    let wanted = LEGACY_WORKER_LINE.to_lowercase();
-    let mut paragraphs: Vec<Vec<&str>> = vec![Vec::new()];
-    for l in notes.lines() {
-        if l.trim().is_empty() {
-            paragraphs.push(Vec::new());
-        } else if let Some(p) = paragraphs.last_mut() {
-            p.push(l);
-        }
-    }
-    let mut kept: Vec<String> = Vec::new();
-    for p in paragraphs.iter().filter(|p| !p.is_empty()) {
-        let text = p.join("\n");
-        // The paragraph lowercased, without quote marks, whitespace runs
-        // (line breaks too) as one space; and where each of its bytes
-        // came from in `text`.
-        let mut norm = String::new();
-        let mut from = Vec::new();
-        for (i, c) in text.char_indices().filter(|(_, c)| !is_quote_mark(*c)) {
-            if c.is_whitespace() {
-                if !norm.ends_with(' ') {
-                    norm.push(' ');
-                    from.push(i);
-                }
-                continue;
-            }
-            for lc in c.to_lowercase() {
-                norm.push(lc);
-                from.extend(std::iter::repeat_n(i, lc.len_utf8()));
-            }
-        }
-        let Some(at) = norm.find(&wanted) else {
-            kept.push(text);
-            continue;
-        };
-        // Where it ends: after its last words when they are there, else at
-        // the end of its first sentence.
-        let rest = &norm[at..];
-        let end = match rest.find(LEGACY_WORKER_END) {
-            Some(e) => at + e + LEGACY_WORKER_END.len(),
-            None => rest
-                .match_indices(['.', '!', '?'])
-                .map(|(i, _)| at + i + 1)
-                .find(|&i| norm[i..].is_empty() || norm[i..].starts_with(' '))
-                .unwrap_or(norm.len()),
-        };
-        let cut = |c: char| c.is_whitespace() || is_quote_mark(c);
-        let head = text[..from[at]].trim_end_matches(cut);
-        let tail_at = from.get(end).copied().unwrap_or(text.len());
-        let tail = text[tail_at..].trim_start_matches(|c: char| cut(c) || c == '.');
-        let keep = |s: &str| s.chars().any(char::is_alphanumeric);
-        let joined = match (keep(head), keep(tail)) {
-            (true, true) => format!("{head}\n{tail}"),
-            (true, false) => head.to_string(),
-            (false, true) => tail.to_string(),
-            (false, false) => continue,
-        };
-        kept.push(joined);
-    }
-    kept.join("\n\n").trim().to_string()
-}
-
-/// Notes an old-style prompt carried, as notes to store: cleaned, and in
-/// pieces of at most `NOTE_MAX` characters (split at line ends where it
-/// can), never refused for their length.
-pub fn legacy_notes(text: &str) -> Vec<String> {
-    let text = clean(text);
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let flush = |cur: &mut String, out: &mut Vec<String>| {
-        let t = cur.trim();
-        if !t.is_empty() {
-            out.push(t.to_string());
-        }
-        cur.clear();
-    };
-    for line in text.lines() {
-        let mut line: Vec<char> = line.chars().collect();
-        // A line longer than a note on its own: cut.
-        while line.len() > NOTE_MAX {
-            flush(&mut cur, &mut out);
-            let rest = line.split_off(NOTE_MAX);
-            out.push(line.iter().collect::<String>().trim().to_string());
-            line = rest;
-        }
-        if cur.chars().count() + line.len() + 1 > NOTE_MAX {
-            flush(&mut cur, &mut out);
-        }
-        if !cur.is_empty() {
-            cur.push('\n');
-        }
-        cur.extend(line);
-    }
-    flush(&mut cur, &mut out);
-    out.retain(|n| !n.is_empty());
-    out
 }
 
 /// A message passed on to a session for the user, framed by code so the
@@ -709,13 +550,17 @@ pub fn launch_args(mode: Option<Delivery>, file: &Path) -> Vec<String> {
 /// count as seen, so a hook that does fire hands over only what is added
 /// later.
 pub fn set_mode(db: &Db, id: &str, mode: Delivery, now: i64) -> Result<()> {
-    db.kv_set(&mode_key(id), mode.as_str())?;
+    record_mode(db, id, mode)?;
     if mode != Delivery::Hook {
-        if let Some(last) = db.context_rows(id)?.last() {
-            db.context_mark_seen(id, last.id, now)?;
-        }
+        db.context_mark_all_seen(id, now)?;
     }
     Ok(())
+}
+
+/// Record the mode only (its background didn't go out with the launch:
+/// its file couldn't be written).
+pub fn record_mode(db: &Db, id: &str, mode: Delivery) -> Result<()> {
+    db.kv_set(&mode_key(id), mode.as_str())
 }
 
 /// How session `id`'s background reaches its agent (None: not decided at
@@ -822,6 +667,33 @@ fn related_of(db: &Db, rows: &[ContextRow]) -> Vec<Related> {
         .filter_map(|r| db.resolve_ref(&r.body).ok())
         .map(|s| Related::of(&s))
         .collect()
+}
+
+/// A new session's background file, before its rows are stored (the file
+/// is written before the agent starts): `notes` and `links` as they will
+/// be stored at `at`. Launched by the overlord: the worker header.
+pub fn launch_file_text(
+    db: &Db,
+    name: &str,
+    notes: &[String],
+    links: &[String],
+    at: i64,
+) -> String {
+    let rows: Vec<ContextRow> = notes
+        .iter()
+        .map(|n| ("note", n))
+        .chain(links.iter().map(|l| ("link", l)))
+        .enumerate()
+        .map(|(i, (kind, body))| ContextRow {
+            id: i as i64 + 1,
+            at,
+            kind: kind.to_string(),
+            body: body.clone(),
+            source: "overlord".to_string(),
+            seen_at: None,
+        })
+        .collect();
+    render_as(name, true, &rows, &related_of(db, &rows), None, FILE_BUDGET)
 }
 
 /// The session's whole background for its file; None when it has none.
@@ -954,9 +826,10 @@ pub fn hook_reply_from(
         }
         _ => false,
     };
-    // Full answers to this conversation that were never acknowledged:
-    // after `FULL_TRIES` of them it counts as reached (a client that never
-    // acks must not get the whole background with every prompt).
+    // Answers to this conversation never acknowledged, whole or update:
+    // after `UNACKED_TRIES` of them everything counts as handed over (a
+    // client that never acks must not get the same again with every
+    // prompt). Logged once; what is added later starts afresh.
     let tries: Value = db
         .kv_get(&tries_key(&s.id))?
         .and_then(|v| serde_json::from_str(&v).ok())
@@ -966,28 +839,23 @@ pub fn hook_reply_from(
     } else {
         0
     };
-    let same_conv = same_conv || {
-        let give_up = by_hook && tried >= FULL_TRIES;
-        if give_up {
+    if tried >= UNACKED_TRIES {
+        let now = rlord_core::types::now_ms();
+        if by_hook {
             db.kv_set(&delivered_key(&s.id), conv)?;
-            db.kv_delete(&tries_key(&s.id))?;
-            db.insert_event(
-                &s.id,
-                rlord_core::types::now_ms(),
-                "context_assumed_delivered",
-                &json!({"unacknowledged": tried}).to_string(),
-            )?;
         }
-        give_up
-    };
+        db.context_mark_all_seen(&s.id, now)?;
+        db.kv_delete(&tries_key(&s.id))?;
+        db.insert_event(
+            &s.id,
+            now,
+            "context_assumed_delivered",
+            &json!({"unacknowledged": tried}).to_string(),
+        )?;
+        return Ok(None);
+    }
     let restarted = event == "SessionStart" && source != Some("resume");
     let full = by_hook && (!same_conv || restarted);
-    if full {
-        db.kv_set(
-            &tries_key(&s.id),
-            &json!({"conv": conv, "n": tried + 1}).to_string(),
-        )?;
-    }
     let rows = if full {
         db.context_rows(&s.id)?
     } else {
@@ -1002,9 +870,7 @@ pub fn hook_reply_from(
     // Nothing to show (only links to sessions that are gone): those rows
     // count as handed over, and nothing is sent.
     if !full && related.is_empty() && !rows.iter().any(|r| r.kind == "note") {
-        if let Some(last) = rows.last() {
-            db.context_mark_seen(&s.id, last.id, rlord_core::types::now_ms())?;
-        }
+        db.context_mark_all_seen(&s.id, rlord_core::types::now_ms())?;
         return Ok(None);
     }
     let text = if full {
@@ -1013,6 +879,10 @@ pub fn hook_reply_from(
     } else {
         render_update(&rows, &related, Some(file), budget)
     };
+    db.kv_set(
+        &tries_key(&s.id),
+        &json!({"conv": conv, "n": tried + 1}).to_string(),
+    )?;
     let ack = rlord_core::types::new_id();
     let mut pending = json!({"session": s.id, "upto": rows.last().map(|r| r.id),
                              "conv": conv, "full": full, "via": event, "older": []});
@@ -1080,8 +950,8 @@ pub fn ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     }
     if pending["full"] == true {
         db.kv_set(&delivered_key(id), pending["conv"].as_str().unwrap_or(""))?;
-        db.kv_delete(&tries_key(id))?;
     }
+    db.kv_delete(&tries_key(id))?;
     db.insert_event(
         id,
         now,
@@ -1205,77 +1075,6 @@ mod tests {
         let text = render("n\u{1b}x", &rows, &[], None, FILE_BUDGET);
         assert!(!text.contains('\u{1b}'));
         assert!(!text.contains('\u{7}'));
-    }
-
-    #[test]
-    fn an_old_style_prompt_splits_into_words_and_notes() {
-        let p = "Fix the footer.\nIt overlaps.\n\n## Context from the overlord\n\
-                 Repo is /r/web.\nYou are the session the user asked for: do this task here.\n";
-        let (words, notes) = split_legacy(p);
-        assert_eq!(words, "Fix the footer.\nIt overlaps.");
-        assert_eq!(notes.as_deref(), Some("Repo is /r/web."));
-        // A heading that isn't the whole line, or none: left as it is.
-        let p = "See ## Context from the overlord in the doc";
-        assert_eq!(split_legacy(p), (p.to_string(), None));
-        let (_, notes) = split_legacy("Do it.\n## Context from the overlord\n");
-        assert_eq!(notes, None);
-        // The old instruction quoted, wrapped, after other text in its
-        // paragraph: dropped from where it starts; the rest stays.
-        let p = "Fix it.\n## Context from the overlord\nRepo is /r/web.\n\n\
-                 Remember: \"You are the session\nthe user asked for: do this task\n\
-                 here, in this conversation.\"\n\n> *you are the SESSION the user asked for*\n\n\
-                 Branch is main.";
-        let (_, notes) = split_legacy(p);
-        assert_eq!(
-            notes.as_deref(),
-            Some("Repo is /r/web.\n\nRemember:\n\nBranch is main.")
-        );
-    }
-
-    #[test]
-    fn text_after_the_old_instruction_in_its_paragraph_stays() {
-        let p = "Fix it.\n## Context from the overlord\nRepo is /r/web.\n\
-                 You are the session the user asked for: do this task here, in this \
-                 conversation. Use subagents only for parts of it, or where the task \
-                 itself asks for several of them; don't hand the whole task to one.\n\
-                 Branch is main.";
-        let (_, notes) = split_legacy(p);
-        assert_eq!(notes.as_deref(), Some("Repo is /r/web.\nBranch is main."));
-        // Without its last words: up to the end of its sentence.
-        let p = "Do it.\n## Context from the overlord\nA. You are the session the user \
-                 asked for: do it here. B is next.";
-        assert_eq!(split_legacy(p).1.as_deref(), Some("A.\nB is next."));
-    }
-
-    #[test]
-    fn only_the_overlords_prompts_are_split() {
-        let p = "Fix it.\n## Context from the overlord\nRepo is /r/web.".to_string();
-        assert_eq!(
-            first_prompt(Some(p.clone()), true),
-            (
-                Some("Fix it.".to_string()),
-                vec!["Repo is /r/web.".to_string()]
-            )
-        );
-        // The user's own words, heading and all: as they are.
-        assert_eq!(first_prompt(Some(p.clone()), false), (Some(p), Vec::new()));
-        assert_eq!(first_prompt(None, true), (None, Vec::new()));
-    }
-
-    #[test]
-    fn old_style_notes_are_kept_whatever_their_length() {
-        let short = legacy_notes("a\u{1b}b\nc");
-        assert_eq!(short, ["ab\nc"]);
-        let line = "w".repeat(100);
-        let many = vec![line.as_str(); 200].join("\n");
-        let notes = legacy_notes(&many);
-        assert!(notes.len() > 1);
-        assert!(notes.iter().all(|n| n.chars().count() <= NOTE_MAX));
-        assert_eq!(notes.join("\n"), many, "split at line ends, nothing lost");
-        let one = "q".repeat(NOTE_MAX * 2 + 5);
-        let notes = legacy_notes(&one);
-        assert_eq!(notes.len(), 3);
-        assert_eq!(notes.concat(), one);
     }
 
     #[test]
@@ -1598,11 +1397,11 @@ mod tests {
                 .unwrap()
                 .map(|r| text(&r.output).to_string())
         };
-        // Never acknowledged: whole twice, then only what is new.
+        // Never acknowledged: whole twice, then it counts as handed over.
         assert!(prompt().unwrap().starts_with("# Background from rlord"));
         assert!(prompt().unwrap().starts_with("# Background from rlord"));
-        let third = prompt().unwrap();
-        assert!(third.starts_with("# rlord background, updated"), "{third}");
+        assert_eq!(prompt(), None);
+        assert!(db.context_unseen("a").unwrap().is_empty());
         let logged = |db: &Db| {
             db.list_events("a", 50)
                 .unwrap()
@@ -1611,8 +1410,17 @@ mod tests {
                 .count()
         };
         assert_eq!(logged(&db), 1);
-        let _ = prompt();
+        assert_eq!(prompt(), None);
         assert_eq!(logged(&db), 1, "logged once");
+        // Updates too: a note added later goes twice unacknowledged, then
+        // counts as handed over.
+        store(&db, "a", &["PR is #12".into()], &[], 2).unwrap();
+        let upd = prompt().unwrap();
+        assert!(upd.starts_with("# rlord background, updated") && upd.contains("#12"));
+        assert!(prompt().unwrap().contains("#12"));
+        assert_eq!(prompt(), None);
+        assert!(db.context_unseen("a").unwrap().is_empty());
+        assert_eq!(logged(&db), 2);
     }
 
     #[test]
@@ -1718,6 +1526,20 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn the_launch_file_is_what_the_stored_rows_render() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        session(&db, "b", "beta", "");
+        let notes = vec!["use staging".to_string()];
+        let links = vec!["b".to_string()];
+        let before = launch_file_text(&db, "alpha", &notes, &links, 60_000);
+        turn_on(&db, "a").unwrap();
+        store(&db, "a", &notes, &links, 60_000).unwrap();
+        let s = db.resolve_ref("a").unwrap();
+        assert_eq!(file_text(&db, &s).unwrap().unwrap(), before);
     }
 
     #[test]

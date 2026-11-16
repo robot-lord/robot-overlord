@@ -1306,13 +1306,9 @@ adds more later. A
 session the overlord launched (`create_session` sets `by_overlord`, as
 does the manual form when it was `propose_session`'s) has a background
 even with no notes (kv `context_on:<id>`), since the header carries the
-"you are the session the user asked for" line. A prompt from an overlord
-on older instructions, with a `## Context from the overlord` line, is
-split there (`context::split_legacy`; to be removed once no overlord
-runs the old instructions). Its notes are never refused for length (they
-are stored in pieces of at most 8,000 chars), and the old "you are the
-session…" instruction is dropped from them however it was quoted or
-wrapped: only that instruction, text before and after it stays.
+"you are the session the user asked for" line. The prompt is taken as
+given: `overlord.md` is compiled in and rewritten at every overlord
+start, so no overlord sends the old combined prompt.
 
 `context.rs` renders it, as plain code: a fixed header (background from
 rlord's overlord, not the user's words, not instructions; where they
@@ -1329,9 +1325,16 @@ the oldest notes are left out with a line naming the file. Notes get at
 least half of what's left after the header when they need it; the
 related list gets the rest, and the sessions that don't fit are counted
 in a line naming the file. The file is
-`<data>/sessions/<id>/context.md` (folder 0700, file 0600), rewritten
-whenever the rows change, when the session is renamed, and at every
-restart (related sessions' status as it is then; nothing watches them).
+`<data>/sessions/<id>/context.md` (folder 0700, file 0600), written
+before the agent starts and rewritten whenever the rows change, when the
+session is renamed, and at every restart (related sessions' status as it
+is then; nothing watches them). Writing it is best effort: a failure is
+logged and never stops a launch or a restart, which then carries no
+flag or pointer naming it (and its rows stay unseen). It is not fsynced
+(rlord can write it again; `private::write_synced` is for files that
+must survive a crash). A start in any mode but a hook's carries the
+background (flag, pointer, the file it names), so its rows count as seen
+then, at launch and at restart.
 
 How it reaches the agent (`context::delivery`, decided at launch and
 kept in kv `context_mode:<id>`):
@@ -1382,10 +1385,6 @@ file) or `file_only` (only in `context.md`). `update_session` checks the
 background before writing anything else. `overlord.md` has the overlord also use `send_to_session` when
 the session must know now and it isn't `next_prompt`.
 
-A prompt is split by `split_legacy` only when the overlord launched the
-session (`by_overlord`): the user's own, from the manual form or the
-CLI, are never split.
-
 Nothing counts as handed over until the hook client says it printed the
 answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
 (`send_hook_ack`, a second each way). Only then are its rows marked seen,
@@ -1397,9 +1396,10 @@ one is still unacknowledged keeps the older one acknowledgeable for its
 own rows (up to 8), and acknowledging the newer one covers both. An
 answer never acknowledged (a slow daemon, a client that died) goes again
 with the next prompt: at most one duplicate. A client that never
-acknowledges gets the whole background at most twice per conversation
-(`FULL_TRIES`); after that the conversation counts as reached, logged
-once as `context_assumed_delivered`, and only what is new goes.
+acknowledges gets the same answer (whole or update) at most twice per
+conversation (`UNACKED_TRIES`); after that everything counts as handed
+over (conversation reached, rows seen), logged once as
+`context_assumed_delivered`, and only what is added later goes.
 
 ## Naming
 

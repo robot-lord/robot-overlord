@@ -66,8 +66,19 @@ pub fn append(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Replace `path`'s contents: written to a new 0600 file beside it, then
 /// renamed over it, so a reader sees the old or the new text, never a
-/// half-written one, and the file is never readable by others.
+/// half-written one, and the file is never readable by others. No fsync:
+/// for files rlord can write again (`write_synced` for the rest).
 pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_with(path, contents, false)
+}
+
+/// `write`, synced to disk before the rename, for a file that must
+/// survive a crash.
+pub fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_with(path, contents, true)
+}
+
+fn write_with(path: &Path, contents: &[u8], sync: bool) -> std::io::Result<()> {
     // A temp name of its own (another writer's is never touched): taken
     // with `create_new`, the next one tried if it exists.
     let (tmp, mut f) = loop {
@@ -85,7 +96,7 @@ pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     };
     let written = f
         .write_all(contents)
-        .and_then(|_| f.sync_all())
+        .and_then(|_| if sync { f.sync_all() } else { Ok(()) })
         .and_then(|_| {
             drop(f);
             std::fs::rename(&tmp, path)
@@ -146,7 +157,7 @@ mod tests {
         let p = t.path().join("context.md");
         write(&p, b"one").unwrap();
         assert_eq!(mode(&p), 0o600);
-        write(&p, b"two").unwrap();
+        write_synced(&p, b"two").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "two");
         assert_eq!(mode(&p), 0o600);
         // Nothing left beside it.

@@ -434,7 +434,6 @@ impl Daemon {
                 | "session.get"
                 | "session.log"
                 | "session.context"
-                | "hook.ack"
                 | "repo.list"
                 | "repo.find"
                 | "session.defaults"
@@ -474,21 +473,14 @@ impl Daemon {
         };
         if wants_hooks {
             let agent = match method {
-                "session.new" => params["agent"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|a| !a.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| Some(self.config().session.agent.clone())),
+                "session.new" => methods::agent_param(&self.config(), &params).ok(),
                 _ => self
                     .db()
                     .resolve_ref(params["ref"].as_str().unwrap_or(""))
                     .ok()
-                    .map(|s| s.agent),
+                    .and_then(|s| rlord_core::agents::Agent::parse(&s.agent)),
             };
-            let works = agent
-                .and_then(|a| rlord_core::agents::Agent::parse(&a))
-                .is_some_and(context::hooks_work);
+            let works = agent.is_some_and(context::hooks_work);
             params["hooks_work"] = json!(works);
         }
         // `status:limited`: not a stored status (`limits.rs`), so it is

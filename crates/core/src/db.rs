@@ -1325,6 +1325,15 @@ impl Db {
         Ok(())
     }
 
+    /// Mark every row of a session not yet pushed as pushed at `at`.
+    pub fn context_mark_all_seen(&self, session_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?2 WHERE session_id = ?1 AND seen_at IS NULL",
+            params![session_id, at],
+        )?;
+        Ok(())
+    }
+
     // ---- transcripts ----
 
     /// Agent conversation ids a session had before its current one (a
@@ -1796,6 +1805,11 @@ mod tests {
         assert_eq!(unseen.len(), 1);
         assert_eq!(unseen[0].body, "second");
         assert_eq!(db.context_rows("a").unwrap()[0].seen_at, Some(20));
+        // All the rest at once; what was seen keeps its time.
+        db.context_mark_all_seen("a", 30).unwrap();
+        assert!(db.context_unseen("a").unwrap().is_empty());
+        let rows = db.context_rows("a").unwrap();
+        assert_eq!((rows[0].seen_at, rows[2].seen_at), (Some(20), Some(30)));
         // Rows go with their session.
         db.conn
             .execute("DELETE FROM sessions WHERE id = 'a'", [])

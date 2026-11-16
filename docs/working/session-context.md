@@ -66,6 +66,10 @@ without rlord's SessionStart hook: `--append-system-prompt-file
 never overlords). Front ends `rlord mcp --session --token-file` and
 `rlord context <tool>`; wiring computed in `spec_args` at every start.
 
+**No legacy split.** The plan's `split_legacy` (old combined prompts)
+was dropped in review round 7: `overlord.md` is rewritten at every
+overlord start, and the user wants no compatibility code.
+
 **Prompt off argv (PR 3).** `FirstPrompt { Stdin, Server, Pointer, Typed
 }`: Claude from a 0600 file on stdin (if V1 passes), OpenCode POSTed to
 its server, Codex a fixed pointer line to `prompt.md` (user's decision),
@@ -128,7 +132,7 @@ by code (`context::frame_message`).
 - [x] Migration 0010, `Db::context_add` / `context_rows` /
   `context_unseen` / `context_mark_seen`. Rows cascade with their session
   (sessions are never deleted today, only archived).
-- [x] `context.rs`: render, files, `split_legacy`, `frame_message` (the
+- [x] `context.rs`: render, files, `split_legacy` (removed in round 7), `frame_message` (the
   last unused until PR 4), `check` / `store`, `hook_reply`, `delivery`.
 - [x] `session.new` takes `context`, `related`; RPC `session.context` /
   `session.context_add`; MCP `update_session` `add_context`,
@@ -357,11 +361,37 @@ Fixed:
 Declined (coordinator): `frame_message` (planned for PR 1); the
 test-only wrapper (already `#[cfg(test)]`).
 
+### Review round 7 (PR #64)
+
+1. The give-up path marks every row seen too, and the retry cap covers
+   every answer, whole or update (`UNACKED_TRIES` = 2 in a row per
+   conversation, kv `context_unacked:<id>`, reset by an ack) (test).
+2. A restart marks rows seen in every mode but Hook when the start
+   carries the background (as `set_mode`).
+3. The background file is best effort at launch and restart: written
+   before the agent starts (`context::launch_file_text`), a failure is
+   logged and the start carries no flag or pointer naming the missing
+   file; its rows then stay unseen (`context::record_mode`) (test that
+   the launch file matches the stored rows' render).
+4. `private::write` no longer fsyncs (context.md, the Codex gate are
+   regenerable); `private::write_synced` is the opt-in.
+5. `hook.ack` is mutating (`changed()` fires).
+6. `Db::context_mark_all_seen` (one `UPDATE … WHERE seen_at IS NULL`),
+   used by `set_mode`, the empty update, the give-up and restart.
+7. `methods::agent_param` is the one agent choice: `session_new`,
+   `new_params_on_codex_daemon`, the dispatcher's `hooks_work`.
+8. Legacy machinery removed (`split_legacy`, `without_worker_line`,
+   `legacy_notes`, `first_prompt` and their tests): `overlord.md` is
+   compiled in and rewritten at every overlord start, and the user wants
+   no compatibility code for old state. `by_overlord` stays: it decides
+   the background and the worker paragraph.
+9. `autostart::log_place` reports whether the log folder is rlord's own.
+10. `compose` renders note lines once and hands them to `notes_section`;
+    `update_session` adds background first (one `context::check`, in
+    `session.context_add`), so a refusal still writes nothing.
+
 ## Owed / deferred
 
-- `context::split_legacy` (old-style prompts with a `## Context from the
-  overlord` section) is for overlords still on old instructions. Remove it
-  a few releases after PR 1 ships.
 - Follow-up, not in this effort: the guard rail above.
 - The first prompt (with the pointer line for Codex untrusted / OpenCode)
   is still on argv, `launched_args`, the `launched` event and

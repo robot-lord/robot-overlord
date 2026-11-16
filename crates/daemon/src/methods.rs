@@ -407,7 +407,7 @@ pub(crate) fn new_on_codex_daemon(
 /// reads them (asked before it runs, to start the server first).
 pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
     let field = |k: &str| params[k].as_str().map(str::trim).filter(|v| !v.is_empty());
-    let Ok(agent) = Agent::named(field("agent").unwrap_or(&cfg.session.agent)) else {
+    let Ok(agent) = agent_param(cfg, params) else {
         return false;
     };
     new_on_codex_daemon(
@@ -416,6 +416,17 @@ pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
         field("role").unwrap_or(""),
         &str_list(params, "extra_args"),
     )
+}
+
+/// The agent `session.new`'s params ask for: `agent`, else the
+/// configured session agent. The one place that choice is made (the
+/// launch, the Codex daemon check, the daemon's hooks check).
+pub(crate) fn agent_param(cfg: &Config, params: &Value) -> Result<Agent> {
+    let named = params["agent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
+    Agent::named(named.unwrap_or(&cfg.session.agent))
 }
 
 /// A string-array param (missing / wrong type = empty).
@@ -570,7 +581,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(String::from)
     };
-    let agent = Agent::named(&p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone()))?;
+    let agent = agent_param(cfg, params)?;
     // Internal-only knobs (the overlord uses them; the MCP surface never
     // forwards them): adapter flags that must survive restarts, a role, and a
     // fixed tmux name.
@@ -593,23 +604,16 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         (!m.is_empty()).then(|| m.to_string())
     });
     // The user's words, and the overlord's notes and related sessions
-    // apart from them. (An overlord still on older instructions sends its
-    // notes inside the prompt, under a heading: split there.)
-    // (Only the overlord's prompts: the user's own, from the manual form or
-    // the CLI, are never split.)
-    let by_overlord = params["by_overlord"].as_bool() == Some(true);
-    let (prompt, legacy) = context::first_prompt(p_opt("prompt"), by_overlord);
-    // Explicit `context` is checked (too long: refused, for the overlord
-    // to shorten); notes split from an old-style prompt are stored as
-    // they are, in pieces if long.
+    // apart from them (checked: too long, refused for the overlord to
+    // shorten).
+    let prompt = p_opt("prompt");
     let (note, links) = context::check(
         db,
         p_opt("context").as_deref(),
         &ref_list(params, "related"),
         None,
     )?;
-    let mut notes = legacy;
-    notes.extend(note);
+    let notes: Vec<String> = note.into_iter().collect();
     // Launched by the overlord (`create_session`, or its proposal the user
     // launched): its background says so even with no notes.
     let background = context::needs_background(params);
@@ -679,10 +683,24 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let bg_file = context::file_path(&base, &id);
     // (`hooks_work`: asked by the daemon before taking the DB lock.)
     let delivery = background.then(|| context::delivery(agent, params["hooks_work"] == true));
+    // Its file first (the agent may read it at once). Best effort: a
+    // file that can't be written never stops the launch; the launch then
+    // carries no flag or pointer naming it.
+    let file_ok = delivery.is_some() && {
+        let text = context::launch_file_text(db, &name, &notes, &links, now_ms());
+        match context::write_file(&base, &id, &text) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "writing the background file");
+                false
+            }
+        }
+    };
+    let carried = delivery.filter(|d| file_ok || *d == context::Delivery::Hook);
     let mut args = spec_args(agent, &spec);
-    args.extend(context::launch_args(delivery, &bg_file));
+    args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
-    let first = context::launch_prompt(prompt.as_deref(), delivery, &bg_file);
+    let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
     let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
@@ -724,9 +742,12 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(mode) = delivery {
         context::turn_on(db, &id)?;
         context::store(db, &id, &notes, &links, now)?;
-        context::set_mode(db, &id, mode, now)?;
-        // (Before the agent starts: it may read it at once.)
-        context::refresh_file(db, &base, &db.resolve_ref(&id)?)?;
+        if carried == Some(mode) {
+            context::set_mode(db, &id, mode, now)?;
+        } else {
+            // (It didn't go out with the launch: its rows stay unseen.)
+            context::record_mode(db, &id, mode)?;
+        }
     }
 
     let cmd = pane_cmd(&id, program.as_deref(), daemon, argv);
@@ -960,11 +981,16 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .map(str::to_string);
     // Its background as it was launched with, its file rewritten first
     // (related sessions' status, a rename: as they are now).
+    // Best effort: a file that can't be written never stops the restart;
+    // without it the start carries no flag or pointer naming it.
     let mut args = spec_args(agent, &spec);
     let mode = context::mode(db, &s.id)?;
     let bg_file = context::file_path(&paths::data_dir(), &s.id);
-    context::refresh_file(db, &paths::data_dir(), &s)?;
-    args.extend(context::launch_args(mode, &bg_file));
+    if let Err(e) = context::refresh_file(db, &paths::data_dir(), &s) {
+        tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+    }
+    let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
+    args.extend(context::launch_args(carried, &bg_file));
     let (mut argv, resumed) = agent.resume(
         s.agent_session.as_deref(),
         &s.agent_session_trust,
@@ -975,9 +1001,8 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // A Pointer-mode session starting a new conversation: the pointer
     // again, as its first prompt (its rows count as handed over once the
     // pane is up, below).
-    let pointer = context::restart_prompt(mode, resumed, &bg_file);
-    if let Some(p) = &pointer {
-        agent.add_first_prompt(&mut argv, p);
+    if let Some(p) = context::restart_prompt(carried, resumed, &bg_file) {
+        agent.add_first_prompt(&mut argv, &p);
     }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
@@ -994,10 +1019,11 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
     let now = now_ms();
-    if pointer.is_some() {
-        if let Some(last) = db.context_rows(&s.id)?.last() {
-            db.context_mark_seen(&s.id, last.id, now)?;
-        }
+    // Any mode but a hook's carried it with this start (the flag, the
+    // pointer, the file the pointer named): what is there counts as
+    // handed over, as at launch (`set_mode`).
+    if carried.is_some_and(|m| m != context::Delivery::Hook) {
+        db.context_mark_all_seen(&s.id, now)?;
     }
     db.set_status(&s.id, Status::Starting, now)?;
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
