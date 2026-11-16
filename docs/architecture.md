@@ -674,7 +674,7 @@ A small skill/CLAUDE.md snippet documents the tools and conventions
 ### CLI
 
 Thin UDS client, ~1 round-trip per command: `rlord ls` (rich table,
-`--sort last-agent-msg --status waiting --tag foo`), `new`, `attach`, `send`,
+`--sort last-agent-msg --status waiting --tag foo`), `new`, `setup`, `attach`, `send`,
 `restart`, `archive`, `rename`, `tag`, `log <id>` (event history), `doctor`,
 `daemon`. Also the plumbing subcommands: `hook emit`, `mcp`,
 `claude install-hooks`, `codex install-notify`.
@@ -1103,7 +1103,18 @@ including when the active one hits a usage limit.
   last result, with `scanning: true`
   while roots never scanned have no result yet (waited on for a scan's
   first 2s). One scan per set of roots at a time, and a stuck one is not
-  retried (the same folder would block the retry).
+  retried (the same folder would block the retry). The scan also predicts
+  what would stall it and stays out (`git::scan_repos`,
+  `core/src/privacy.rs`): by name, before any `stat`, the folders macOS
+  guards with a privacy prompt (`$HOME/{Desktop,Documents,Downloads,Movies,
+  Music,Pictures,Library}`, `/Volumes/*`; no public API reports TCC status
+  without risking the prompt); on every platform, a folder on another
+  filesystem than its root (`st_dev`, like `find -xdev`); and no symlink is
+  followed. A folder counts as granted, and is entered, when it is (or
+  holds) a root, `code_dir`, a `repo_roots` entry, or a folder a live
+  session runs in (`setup::granted_folders`): macOS grants a protected
+  folder whole once allowed. Skipped folders come back in `repo.find`
+  (`skipped`, at most 50) and the finder and `find_repos` name them.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed
@@ -1171,6 +1182,32 @@ never silently ignored. Sections: `layout` (`side` = list left / preview
 right, `stack`), `list_width_pct`, `preview_refresh_ms`, `usage` (what the
 Usage column shows), `[keys]` (every TUI action), `[tmux]` (the three
 navigation bindings).
+
+### Setup: the code folder
+
+`[session] code_dir` is where the user keeps repos; `repo_roots` defaults
+to it (`SessionDefaults::scan_roots`). With neither set, the finder scans
+`~` until setup is answered, then nothing (`finder_roots`). Setup is
+answered when a kv row `setup_code_dir` exists (`done:` or `skipped:`): a
+skip never writes the config.
+
+The suggestion is plain code (`core/src/code_dir.rs`) over folders rlord
+can read without walking the disk (`daemon/src/setup.rs`, bounded): the
+newest Claude Code project dirs (a `cwd` from the newest transcript whose
+slug matches), Codex's `threads.cwd`, OpenCode's top-level
+`session_v2.directory` (only that table: the DB holds credentials), rlord's
+repos and session folders, and the launch folder. Each project counts
+once; the folder holding the most within `repo_scan_depth` wins (ties: the
+deeper), never `$HOME` or above. A single explicit root other than `~`
+outranks it. Only the folders shown are `stat`-ed, and only when no
+privacy prompt guards them.
+
+It follows describe, then confirm (`tui/src/setupform.rs`), with one
+difference from the new-session form: the confirm saves by plain code
+(`setup.apply`, through `Config::set_code_dir`, which keeps the file as
+written). The overlord only proposes (`confirm_setup` reopens the form);
+it isn't called again. First run opens the form after the overlord
+dialog; `:setup`, `rlord setup` and the overlord open it later.
 
 ## Session creation
 
