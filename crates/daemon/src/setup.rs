@@ -35,28 +35,60 @@ pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
     cfg.session.code_dir_path().is_none() && db.kv_get(KV).ok().flatten().is_none()
 }
 
-/// The folders the repo scan treats as allowed (`privacy::Guard`): the
-/// code folder and every `repo_roots` entry (the user named them, so they
-/// are scanned even where the scan normally stays out: a protected folder,
-/// another disk), plus `sessions`, the folders sessions run in. Expanded.
-pub(crate) fn granted_folders(cfg: &Config, sessions: Vec<String>) -> Vec<String> {
-    let roots = cfg
-        .session
-        .repo_roots
-        .iter()
-        .map(|r| r.trim())
-        .filter(|r| !r.is_empty())
-        .map(expand_tilde);
-    let mut out: Vec<String> = cfg
-        .session
-        .code_dir_path()
-        .into_iter()
-        .chain(roots)
-        .chain(sessions)
-        .collect();
+/// What the repo scan walks: the finder's `roots` (as written), plus the
+/// code folder as a root of its own when it lies under one of them. A
+/// named folder is always scanned (the scan's roots count as named,
+/// `privacy::Guard::name`), even inside a protected folder or below a
+/// mount the walk from the outer root skips.
+pub(crate) fn scan_roots(cfg: &Config, roots: &[String]) -> Vec<String> {
+    let mut out = roots.to_vec();
+    if let Some(code) = cfg.session.code_dir_path() {
+        let code = Path::new(code.trim_end_matches('/'));
+        let under = roots.iter().any(|r| {
+            let r = expand_tilde(r);
+            let r = Path::new(r.trim_end_matches('/'));
+            code != r && code.starts_with(r)
+        });
+        if under {
+            out.push(cfg.session.code_dir.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The folders the repo scan treats as granted (`privacy::Guard`): those
+/// sessions run in, `~` expanded, each also in its resolved form
+/// (`canon`: `/tmp` is `/private/tmp` on macOS, `/home` may be
+/// `/var/home`), since the walk sees resolved paths. Sorted, distinct.
+pub(crate) fn granted_folders(
+    sessions: Vec<String>,
+    canon: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in sessions {
+        let s = expand_tilde(s.trim());
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(c) = canon(&s).filter(|c| *c != s) {
+            out.push(c);
+        }
+        out.push(s);
+    }
     out.sort();
     out.dedup();
     out
+}
+
+/// `path` resolved (symlinks), unless resolving it could raise a macOS
+/// privacy prompt; None when it can't be.
+pub(crate) fn canonical(path: &str) -> Option<String> {
+    if Guard::new(&[]).prompts(Path::new(path)).is_some() {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// `setup.status`: `needed`, the code folder (expanded, "" when unset), and
@@ -69,6 +101,8 @@ pub(crate) fn status(d: &Daemon) -> Result<Value> {
         "needed": needed(&db, &cfg),
         "code_dir": cfg.session.code_dir_path().unwrap_or_default(),
         "skipped": answered.is_some_and(|a| a.starts_with("skipped")),
+        // As configured (`rlord setup <PATH>` picks what to do with them).
+        "repo_roots": cfg.session.repo_roots,
     }))
 }
 
@@ -192,7 +226,24 @@ fn suggestion_value(
 /// code-folder form on the user's screen with what the overlord would
 /// save. The user's confirm there saves it (`setup.apply`).
 pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
-    let sugg = suggest(d, &json!({}))?;
+    // The overlord named the folder: no need to read every agent's files
+    // for alternatives.
+    let named = params["code_dir"]
+        .as_str()
+        .is_some_and(|c| !c.trim().is_empty());
+    let sugg = if named {
+        let cfg = d.config();
+        let needed = needed(&d.db(), &cfg);
+        suggestion_value(
+            &Suggestion::default(),
+            &cfg,
+            needed,
+            &Guard::new(&[]),
+            &|p| p.is_dir(),
+        )
+    } else {
+        suggest(d, &json!({}))?
+    };
     let r = queue_confirm(d, params, sugg)?;
     crate::ui::show_list(d)?;
     Ok(r)
@@ -319,15 +370,35 @@ mod tests {
     }
 
     #[test]
-    fn named_folders_are_granted() {
+    fn session_folders_are_granted_in_both_forms() {
+        let canon = |p: &str| p.strip_prefix("/tmp").map(|r| format!("/private/tmp{r}"));
+        assert_eq!(
+            granted_folders(vec!["/tmp/a".into(), "/s/app".into(), " ".into()], &canon),
+            ["/private/tmp/a", "/s/app", "/tmp/a"]
+        );
+        assert!(granted_folders(vec![], &canon).is_empty());
+        // For real: a temp dir resolves (on macOS, /var is /private/var).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().into_owned();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(granted_folders(vec![p], &canonical).contains(&real.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn the_code_folder_under_a_root_is_a_root_too() {
         let mut cfg = Config::default();
         cfg.session.code_dir = "/h/Documents/code".into();
-        cfg.session.repo_roots = vec!["/h".into(), " ".into(), "/Volumes/X/src".into()];
         assert_eq!(
-            granted_folders(&cfg, vec!["/s/app".into(), "/h".into()]),
-            ["/Volumes/X/src", "/h", "/h/Documents/code", "/s/app"]
+            scan_roots(&cfg, &["/h".into()]),
+            ["/h", "/h/Documents/code"]
         );
-        assert!(granted_folders(&Config::default(), vec![]).is_empty());
+        // Not under a root, or the root itself: as is.
+        assert_eq!(scan_roots(&cfg, &["/elsewhere".into()]), ["/elsewhere"]);
+        assert_eq!(
+            scan_roots(&cfg, &["/h/Documents/code/".into()]),
+            ["/h/Documents/code/"]
+        );
+        assert_eq!(scan_roots(&Config::default(), &["/h".into()]), ["/h"]);
     }
 
     #[test]

@@ -205,13 +205,14 @@ impl Daemon {
         cfg.session.finder_roots(pending)
     }
 
-    /// Git repos under `roots`, the folders the scan stayed out of, and
-    /// whether the first scan of them is still running (`repo_scan.rs`:
-    /// never blocks for long). No roots: none. The folders the user named
-    /// (`code_dir`, each `repo_roots` entry) and those sessions run in
-    /// count as granted (`setup::granted_folders`); the session folders are
-    /// read under a short DB lock, released before the scan.
-    fn scanned_repos(&self, roots: &[String], depth: u8) -> repo_scan::Found {
+    /// Git repos under `roots` (the finder's), the folders the scan stayed
+    /// out of, and whether the first scan of them is still running
+    /// (`repo_scan.rs`: never blocks for long). No roots: none. The code
+    /// folder is scanned as a root of its own when it lies under one
+    /// (`setup::scan_roots`), and the folders sessions run in count as
+    /// granted (`setup::granted_folders`; read under a short DB lock,
+    /// released before the scan).
+    fn scanned_repos(&self, cfg: &Config, roots: &[String]) -> repo_scan::Found {
         if roots.is_empty() {
             return repo_scan::Found {
                 repos: Vec::new(),
@@ -221,11 +222,14 @@ impl Daemon {
             };
         }
         let sessions = self.db().session_folders().unwrap_or_default();
-        let granted = setup::granted_folders(&self.config(), sessions);
-        let key = (roots.to_vec(), depth);
-        self.repo_scan.get(&key, move |k| {
-            rlord_core::git::scan_repos(&k.0, k.1, &granted)
-        })
+        let granted = setup::granted_folders(sessions, &setup::canonical);
+        let key = (
+            setup::scan_roots(cfg, roots),
+            cfg.session.repo_scan_depth,
+            granted,
+        );
+        self.repo_scan
+            .get(&key, |k| rlord_core::git::scan_repos(&k.0, k.1, &k.2))
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -484,7 +488,7 @@ impl Daemon {
         let scanned = (method == "repo.find").then(|| {
             let cfg = self.config();
             let roots = self.finder_roots(&cfg);
-            let found = self.scanned_repos(&roots, cfg.session.repo_scan_depth);
+            let found = self.scanned_repos(&cfg, &roots);
             (found, roots, cfg)
         });
         let db = self.db.lock().expect("db mutex poisoned");

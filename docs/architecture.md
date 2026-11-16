@@ -1110,11 +1110,18 @@ including when the active one hits a usage limit.
   Music,Pictures,Library}`, `/Volumes/*`; no public API reports TCC status
   without risking the prompt); on every platform, a folder on another
   filesystem than its root (`st_dev`, like `find -xdev`); and no symlink is
-  followed. A folder counts as granted, and is entered, when it is (or
-  holds) a root, `code_dir`, a `repo_roots` entry, or a folder a live
-  session runs in (`setup::granted_folders`): macOS grants a protected
-  folder whole once allowed. Skipped folders come back in `repo.find`
-  (`skipped`, at most 50) and the finder and `find_repos` name them.
+  followed. A protected folder is entered when it holds a root or a
+  folder a live session runs in (macOS grants it whole once allowed).
+  Another filesystem is crossed only into a session folder or below one
+  (`Guard::allows`), never because something granted lies deeper. A code
+  folder under a root is scanned as a root of its own
+  (`setup::scan_roots`), so it is reached even below a mount or inside a
+  protected folder; a root nested in another is walked once. Session
+  folders are matched in both their stored and resolved forms
+  (`setup::granted_folders`), and the granted set is part of the scan
+  cache's key. A folder whose metadata can't be read is skipped silently.
+  Skipped folders come back in `repo.find` (`skipped`, at most 50) and the
+  finder and `find_repos` name them.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed
@@ -1207,7 +1214,10 @@ difference from the new-session form: the confirm saves by plain code
 (`setup.apply`, through `Config::set_code_dir`, which keeps the file as
 written). The overlord only proposes (`confirm_setup` reopens the form);
 it isn't called again. First run opens the form after the overlord
-dialog; `:setup`, `rlord setup` and the overlord open it later.
+dialog; `:setup`, `rlord setup` and the overlord open it later. The form
+opens at once and fills in the suggestion from another thread; it asks
+before creating a folder that doesn't exist. `confirm_setup` with a folder
+skips reading the agents' files.
 
 ## Session creation
 

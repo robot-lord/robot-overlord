@@ -18,8 +18,11 @@ use std::time::{Duration, Instant};
 
 use rlord_core::git::{Scan, Skipped};
 
-/// What a scan covers: (roots, depth).
-pub type Key = (Vec<String>, u8);
+/// What a scan covers: (roots, depth, granted folders sorted). The granted
+/// set changes the result (`privacy::Guard`), so a new session folder or
+/// code folder scans again; a result for the same roots under an older
+/// granted set is dropped when the new one lands.
+pub type Key = (Vec<String>, u8, Vec<String>);
 
 /// Timings, set by the daemon (`Scanner::default`) and by tests.
 #[derive(Clone, Copy)]
@@ -158,6 +161,7 @@ where
     let _slot = Slot(state.clone(), key.clone());
     let found = scan(&key);
     let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    st.found.retain(|k, _| (&k.0, k.1) != (&key.0, key.1));
     st.found.insert(key, (Instant::now(), found));
 }
 
@@ -167,7 +171,7 @@ mod tests {
     use std::sync::mpsc;
 
     fn key(r: &str) -> Key {
-        (vec![r.to_string()], 3)
+        (vec![r.to_string()], 3, Vec::new())
     }
 
     /// A scan that blocks until the returned sender sends or drops.
@@ -236,6 +240,21 @@ mod tests {
             f.repos
         };
         assert_eq!(repos, vec!["/b/y".to_string()]);
+    }
+
+    /// Another granted set is another scan; its result replaces the old
+    /// one for the same roots.
+    #[test]
+    fn a_new_granted_set_scans_again() {
+        let s = Scanner::with_timing(timing(5_000));
+        let k1 = key("a");
+        s.get(&k1, |_| vec!["/a/x".to_string()].into());
+        let mut k2 = key("a");
+        k2.2 = vec!["/a/mnt".into()];
+        let f = s.get(&k2, |k| vec![k.2[0].clone()].into());
+        assert_eq!(f.repos, ["/a/mnt"]);
+        let st = s.state.0.lock().unwrap();
+        assert!(!st.found.contains_key(&k1) && st.found.contains_key(&k2));
     }
 
     #[test]

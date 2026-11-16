@@ -73,6 +73,15 @@ pub(crate) struct SetupForm {
     pub(crate) then_overlord: bool,
     row: usize,
     error: Option<String>,
+    /// rlord's suggestion is still being worked out (off the UI thread;
+    /// `fill` lands it).
+    pub(crate) loading: bool,
+    /// The user moved or typed since it opened: a late suggestion keeps
+    /// their place.
+    touched: bool,
+    /// The folder the user was told doesn't exist; saving it again
+    /// creates it.
+    confirm_create: Option<String>,
 }
 
 /// What Save does.
@@ -82,6 +91,8 @@ pub(crate) enum SaveCall {
     Apply(Value),
     /// `overlord.setup_request` with these params.
     Request(Value),
+    /// The folder doesn't exist: ask before creating it.
+    AskCreate(String),
 }
 
 impl SetupForm {
@@ -149,6 +160,9 @@ impl SetupForm {
             then_overlord: false,
             row: 0,
             error: None,
+            loading: false,
+            touched: false,
+            confirm_create: None,
         };
         f.roots_row = f.roots_differ();
         // With a folder filled in, Enter saves it; with none, type one.
@@ -159,6 +173,32 @@ impl SetupForm {
         };
         f.row = f.rows().iter().position(|r| *r == start).unwrap_or(0);
         f
+    }
+
+    /// A form waiting on rlord's suggestion ("finding…").
+    pub(crate) fn loading(overlord: bool, auto: bool) -> SetupForm {
+        let mut f = SetupForm::from_suggest(&Value::Null, overlord, auto);
+        f.loading = true;
+        f
+    }
+
+    /// The suggestion arrived (Null: none could be made). What the user
+    /// already typed or picked stays.
+    pub(crate) fn fill(&mut self, sugg: &Value) {
+        let at = self.current();
+        let mut new = SetupForm::from_suggest(sugg, self.describe.is_some(), self.auto);
+        new.describe = self.describe.take();
+        new.then_overlord = self.then_overlord;
+        if self.code_dir_chosen {
+            new.code_dir = std::mem::take(&mut self.code_dir);
+            new.code_dir_chosen = true;
+            new.roots_row = new.roots_differ();
+        }
+        if self.touched {
+            new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
+            new.touched = true;
+        }
+        *self = new;
     }
 
     /// The configured roots are explicit and aren't just the code folder.
@@ -282,8 +322,12 @@ impl SetupForm {
         self.choices.iter().find(|c| c.path == self.code_dir)
     }
 
-    /// What Save does, or why it can't.
-    pub(crate) fn save_call(&self) -> std::result::Result<SaveCall, String> {
+    /// What Save does, or why it can't. `exists`: whether a folder is
+    /// there (None: can't tell without risking a macOS prompt).
+    pub(crate) fn save_call(
+        &self,
+        exists: &dyn Fn(&str) -> Option<bool>,
+    ) -> std::result::Result<SaveCall, String> {
         let dir = self.code_dir.trim();
         if self.describing() && !self.confirmed {
             let source = if dir.is_empty() {
@@ -307,7 +351,18 @@ impl SetupForm {
             })));
         }
         if dir.is_empty() {
-            return Err("type the folder you keep your repos in".into());
+            return Err(if self.loading {
+                "still finding a suggestion: type a folder, or wait a moment".into()
+            } else {
+                "type the folder you keep your repos in".into()
+            });
+        }
+        let path = expand_tilde(dir);
+        // A new folder is created only once the user said so (as the CLI
+        // asks).
+        let create = exists(&path) == Some(false);
+        if create && self.confirm_create.as_deref() != Some(path.as_str()) {
+            return Ok(SaveCall::AskCreate(path));
         }
         let roots = match &self.roots {
             Roots::Follow => json!("follow"),
@@ -315,9 +370,9 @@ impl SetupForm {
             Roots::Set(r) => json!(r),
         };
         Ok(SaveCall::Apply(json!({
-            "code_dir": expand_tilde(dir),
+            "code_dir": path,
             "roots": roots,
-            "create": true,
+            "create": create,
         })))
     }
 
@@ -340,30 +395,64 @@ impl App {
     /// First run: open the code-folder form when setup is needed. True
     /// when it opened.
     pub(crate) fn check_setup(&mut self) -> bool {
+        // (A cheap look-up; the suggestion is worked out only if needed,
+        // and off this thread.)
         let needed = self
             .call("setup.status", Value::Null)
             .is_some_and(|st| st["needed"] == true);
         needed && self.open_setup(true)
     }
 
-    /// Open the code-folder form, filled with rlord's suggestion. True when
-    /// it opened.
+    /// Open the code-folder form now, showing "finding…" while rlord's
+    /// suggestion is worked out on another thread (it reads the agents'
+    /// files). True when it opened.
     pub(crate) fn open_setup(&mut self, auto: bool) -> bool {
+        let Some(o) = self.call("overlord.get", Value::Null) else {
+            return false;
+        };
         let launch = std::env::current_dir()
             .ok()
             .and_then(|d| rlord_core::git::main_repo_root(&d.to_string_lossy()));
-        let Some(sugg) = self.call("setup.suggest", json!({"launch_dir": launch})) else {
-            return false;
-        };
-        let overlord = self
-            .call("overlord.get", Value::Null)
-            .is_some_and(|o| !o.is_null());
-        self.mode = Mode::Setup(Box::new(SetupForm::from_suggest(&sugg, overlord, auto)));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let v = client_call(
+                &paths::socket_path(),
+                "setup.suggest",
+                json!({"launch_dir": launch}),
+            )
+            .unwrap_or(Value::Null);
+            let _ = tx.send(v);
+        });
+        self.setup_rx = Some(rx);
+        self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto)));
         true
     }
 
+    /// The suggestion for an open form, if it has arrived (the event loop
+    /// asks on each pass). True when the screen changed.
+    pub(crate) fn poll_setup(&mut self) -> bool {
+        let Some(rx) = &self.setup_rx else {
+            return false;
+        };
+        let v = match rx.try_recv() {
+            Ok(v) => v,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => Value::Null,
+        };
+        self.setup_rx = None;
+        match &mut self.mode {
+            Mode::Setup(f) if f.loading => {
+                f.fill(&v);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The overlord's `confirm_setup`: the form, reopened with its proposal.
+    /// (It replaces any proposal parked for `:setup`.)
     pub(crate) fn open_setup_from(&mut self, cmd: &Value) {
+        self.pending_setup = None;
         let sugg = &cmd["suggest"];
         let mut f = SetupForm::from_suggest(sugg, true, false);
         f.prefill(&cmd["prefill"]);
@@ -383,6 +472,9 @@ impl App {
         let n = f.rows().len();
         if ctrl && k.code == KeyCode::Char('s') {
             return self.save_setup_form(f);
+        }
+        if !matches!(k.code, KeyCode::Esc | KeyCode::Enter) {
+            f.touched = true;
         }
         match k.code {
             KeyCode::Esc => {
@@ -446,7 +538,21 @@ impl App {
     }
 
     fn save_setup_form(&mut self, mut f: Box<SetupForm>) {
-        match f.save_call() {
+        let guard = rlord_core::privacy::Guard::new(&[]);
+        let exists = |p: &str| {
+            let p = std::path::Path::new(p);
+            guard.prompts(p).is_none().then(|| p.is_dir())
+        };
+        match f.save_call(&exists) {
+            Ok(SaveCall::AskCreate(path)) => {
+                f.error = Some(format!(
+                    "{} doesn't exist: enter again to create it",
+                    contract_tilde(&path)
+                ));
+                f.confirm_create = Some(path);
+                f.row = f.rows().iter().position(|r| *r == Row::Save).unwrap_or(0);
+                self.mode = Mode::Setup(f);
+            }
             Err(e) => {
                 f.error = Some(e);
                 f.row = f.rows().iter().position(|r| *r == Row::Folder).unwrap_or(0);
@@ -467,6 +573,8 @@ impl App {
                         })
                         .unwrap_or_default();
                     let dir = contract_tilde(r["code_dir"].as_str().unwrap_or(""));
+                    // Saved: a proposal parked for `:setup` is stale now.
+                    self.pending_setup = None;
                     self.status_line = if roots == [dir.clone()] {
                         format!("code folder: {dir} · the repo finder scans it")
                     } else {
@@ -496,6 +604,8 @@ impl App {
                 std::thread::spawn(move || {
                     let _ = client_call(&paths::socket_path(), "overlord.setup_request", p);
                 });
+                // Its answer reopens the form; nothing parked is current.
+                self.pending_setup = None;
                 self.status_line = "sent to the overlord".into();
                 self.show_overlord();
             }
@@ -708,6 +818,9 @@ impl App {
 /// saving will do.
 fn folder_hint(s: &SetupForm) -> String {
     let dir = s.code_dir.trim();
+    if dir.is_empty() && s.loading {
+        return "finding where your projects are…".into();
+    }
     if dir.is_empty() {
         return "rlord found no projects yet: type your repos' folder (created if missing)".into();
     }
@@ -764,7 +877,7 @@ mod tests {
         assert_eq!(f.current(), Row::Folder);
         assert_eq!(f.rows(), [Row::Folder, Row::Save]);
         assert!(folder_hint(&f).starts_with("rlord found no projects yet"));
-        assert!(f.save_call().is_err());
+        assert!(f.save_call(&|_| Some(true)).is_err());
     }
 
     #[test]
@@ -802,31 +915,112 @@ mod tests {
         assert_eq!(f.current(), Row::Save);
         // Confirmed: Save saves what is shown.
         assert_eq!(
-            f.save_call().unwrap(),
+            f.save_call(&|_| Some(true)).unwrap(),
             SaveCall::Apply(json!({"code_dir": "/elsewhere/ko",
-                                   "roots": ["/elsewhere/ko", "/p"], "create": true}))
+                                   "roots": ["/elsewhere/ko", "/p"], "create": false}))
         );
         f.description_changed();
         assert!(!f.confirmed && f.changed.is_empty());
-        assert!(matches!(f.save_call().unwrap(), SaveCall::Request(_)));
+        assert!(matches!(
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::Request(_)
+        ));
     }
 
     #[test]
     fn save_applies_or_asks_the_overlord() {
         let mut f = SetupForm::from_suggest(&sugg(Some("/elsewhere/ko"), &["~"]), true, true);
         assert_eq!(
-            f.save_call().unwrap(),
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::Apply(
+                json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": false})
+            )
+        );
+        // A folder that isn't there: asked first, created on the second save.
+        assert_eq!(
+            f.save_call(&|_| Some(false)).unwrap(),
+            SaveCall::AskCreate("/elsewhere/ko".into())
+        );
+        f.confirm_create = Some("/elsewhere/ko".into());
+        assert_eq!(
+            f.save_call(&|_| Some(false)).unwrap(),
             SaveCall::Apply(
                 json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": true})
             )
         );
+        // Another folder typed since: asked again.
+        f.code_dir = "/elsewhere/kode".into();
+        assert!(matches!(
+            f.save_call(&|_| Some(false)).unwrap(),
+            SaveCall::AskCreate(_)
+        ));
+        // Can't tell (macOS would ask): saved as given, not created.
+        assert_eq!(
+            f.save_call(&|_| None).unwrap(),
+            SaveCall::Apply(
+                json!({"code_dir": "/elsewhere/kode", "roots": "follow", "create": false})
+            )
+        );
+        f.code_dir = "/elsewhere/ko".into();
         f.describe = Some("mine are in ~/proj".into());
-        let SaveCall::Request(p) = f.save_call().unwrap() else {
+        let SaveCall::Request(p) = f.save_call(&|_| Some(true)).unwrap() else {
             panic!("not a request")
         };
         assert_eq!(p["code_dir_source"], "suggested by rlord");
         assert_eq!(p["roots"], "follow");
         assert_eq!(p["description"], "mine are in ~/proj");
+    }
+
+    /// The form opens at once; the suggestion lands later, keeping what
+    /// the user typed meanwhile.
+    #[test]
+    fn a_late_suggestion_fills_the_form() {
+        let mut f = SetupForm::loading(true, true);
+        assert!(f.loading && f.code_dir.is_empty());
+        assert_eq!(folder_hint(&f), "finding where your projects are…");
+        assert!(f
+            .save_call(&|_| Some(true))
+            .unwrap_err()
+            .contains("still finding"));
+        f.fill(&sugg(Some("/elsewhere/ko"), &[]));
+        assert!(!f.loading);
+        assert_eq!(
+            (f.code_dir.as_str(), f.current()),
+            ("/elsewhere/ko", Row::Save)
+        );
+        // Typed before it arrived: kept, and the focus stays.
+        let mut f = SetupForm::loading(true, true);
+        f.row = 1;
+        f.touched = true;
+        f.code_dir = "/mine".into();
+        f.code_dir_chosen = true;
+        f.describe = Some("d".into());
+        f.fill(&sugg(Some("/elsewhere/ko"), &[]));
+        assert_eq!(f.code_dir, "/mine");
+        assert_eq!(f.current(), Row::Folder);
+        assert_eq!(f.describe.as_deref(), Some("d"));
+        assert_eq!(f.choices.len(), 2);
+        // No answer: an empty form, no longer loading.
+        let mut f = SetupForm::loading(false, true);
+        f.fill(&Value::Null);
+        assert!(!f.loading);
+        assert!(folder_hint(&f).starts_with("rlord found no projects yet"));
+    }
+
+    /// A proposal parked for `:setup` is dropped once a newer one opens.
+    #[test]
+    fn a_newer_proposal_clears_the_parked_one() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.pending_setup = Some(json!({"cmd": "setup", "prefill": {"code_dir": "/old"}}));
+        app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/new"},
+                                    "suggest": sugg(None, &[])}));
+        assert!(app.pending_setup.is_none());
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert_eq!(f.code_dir, "/new");
     }
 
     #[test]

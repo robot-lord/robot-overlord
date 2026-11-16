@@ -432,13 +432,17 @@ pub fn rollout_folders(home: &Path) -> Option<std::collections::HashMap<PathBuf,
     )
 }
 
-/// The folders Codex threads ran in, from its thread index: distinct, at
-/// most `limit`. Empty when there is no index.
+/// The folders Codex threads ran in, from its thread index: distinct,
+/// newest first, at most `limit`. Empty when there is no index.
 pub fn thread_folders(home: &Path, limit: usize) -> Vec<String> {
     let Some(c) = open_state(home) else {
         return Vec::new();
     };
-    let Ok(mut q) = c.prepare("SELECT DISTINCT cwd FROM threads LIMIT ?1") else {
+    // (An index without `created_at_ms`: unordered.)
+    let Ok(mut q) = c
+        .prepare("SELECT cwd FROM threads GROUP BY cwd ORDER BY MAX(created_at_ms) DESC LIMIT ?1")
+        .or_else(|_| c.prepare("SELECT DISTINCT cwd FROM threads LIMIT ?1"))
+    else {
         return Vec::new();
     };
     q.query_map([limit as i64], |r| r.get::<_, String>(0))
@@ -1407,17 +1411,16 @@ mod tests {
         let c = rusqlite::Connection::open(dir.path().join("state_5.sqlite")).unwrap();
         c.execute_batch(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, \
-               cwd TEXT NOT NULL);
-             INSERT INTO threads VALUES ('a', '/r/a.jsonl', '/src/app');
-             INSERT INTO threads VALUES ('b', '/r/b.jsonl', '/src/app');
-             INSERT INTO threads VALUES ('c', '/r/c.jsonl', '/src/web');",
+               cwd TEXT NOT NULL, created_at_ms INTEGER);
+             INSERT INTO threads VALUES ('a', '/r/a.jsonl', '/src/app', 1);
+             INSERT INTO threads VALUES ('b', '/r/b.jsonl', '/src/app', 2);
+             INSERT INTO threads VALUES ('c', '/r/c.jsonl', '/src/web', 9);",
         )
         .unwrap();
         drop(c);
-        let mut f = thread_folders(dir.path(), 10);
-        f.sort();
-        assert_eq!(f, ["/src/app", "/src/web"]);
-        assert_eq!(thread_folders(dir.path(), 1).len(), 1);
+        assert_eq!(thread_folders(dir.path(), 10), ["/src/web", "/src/app"]);
+        // The limit keeps the newest.
+        assert_eq!(thread_folders(dir.path(), 1), ["/src/web"]);
     }
 
     #[test]

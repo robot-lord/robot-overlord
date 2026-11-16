@@ -154,13 +154,7 @@ fn finder_note(
             let shown: Vec<String> = paths
                 .iter()
                 .take(2)
-                .map(|p| {
-                    if home.is_empty() {
-                        p.to_string()
-                    } else {
-                        p.replacen(home, "~", 1)
-                    }
-                })
+                .map(|p| rlord_core::config::contract_tilde_in(p, home))
                 .collect();
             let hidden = paths.len().saturating_sub(2) + if i == last { more } else { 0 };
             let plus = if hidden > 0 {
@@ -1808,6 +1802,12 @@ mod tests {
             ("/h/Music".to_string(), p.clone()),
             ("/mnt/nas".to_string(), o.clone()),
         ];
+        // Only a path under home is shortened (not `/hx`).
+        let near = vec![("/hx/a".to_string(), p.clone())];
+        assert_eq!(
+            finder_note(&roots, &near, 0, "/h").unwrap(),
+            "skipped /hx/a (macOS asks permission) · add one to repo_roots to scan it"
+        );
         assert_eq!(
             finder_note(&roots, &skipped, 2, "/h").unwrap(),
             "skipped ~/Desktop, ~/Documents +1 (macOS asks permission); \

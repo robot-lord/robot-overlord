@@ -104,7 +104,8 @@ setup_form() {
   i=0
   while [ $i -lt 20 ]; do
     tmux -L e2e capture-pane -p >/tmp/screen.txt
-    grep -q 'Where do you keep your code\|rlord exited' /tmp/screen.txt && break
+    # (It opens at once, then fills in rlord's suggestion.)
+    grep -q 'no projects yet\|rlord exited' /tmp/screen.txt && break
     sleep 0.5
     i=$((i + 1))
   done

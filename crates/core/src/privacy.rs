@@ -57,8 +57,12 @@ pub struct Guard {
     volumes: bool,
     /// Compare paths ASCII-case-insensitively (macOS volumes usually are).
     fold_case: bool,
-    /// Folders that count as granted, as given.
+    /// Folders that count as granted (those sessions run in), as given:
+    /// for both rules.
     granted: Vec<PathBuf>,
+    /// Folders the user named (the scan's roots): for the privacy rule
+    /// only, so naming `~` doesn't open every mount below it.
+    named: Vec<PathBuf>,
 }
 
 impl Guard {
@@ -76,6 +80,7 @@ impl Guard {
             volumes: mac,
             fold_case: mac,
             granted: granted.iter().map(PathBuf::from).collect(),
+            named: Vec::new(),
         }
     }
 
@@ -87,12 +92,15 @@ impl Guard {
             volumes,
             fold_case: home.is_some() || volumes,
             granted: granted.iter().map(PathBuf::from).collect(),
+            named: Vec::new(),
         }
     }
 
-    /// Count `dirs` as granted too (the roots the user named).
-    pub fn grant(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
-        self.granted.extend(dirs);
+    /// Folders the user named (the scan's roots): a protected folder
+    /// holding one counts as granted (`granted`), but they don't open
+    /// another filesystem below them (`allows`).
+    pub fn name(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
+        self.named.extend(dirs);
     }
 
     /// By name only: `path` is, or is inside, a folder macOS guards with a
@@ -126,9 +134,23 @@ impl Guard {
         None
     }
 
-    /// Some granted folder is `dir` or inside it.
+    /// Some granted folder is `dir` or inside it. This is the privacy
+    /// rule: macOS grants a protected folder whole once anything in it is
+    /// allowed.
     pub fn granted(&self, dir: &Path) -> bool {
-        self.granted.iter().any(|g| self.is_within(g, dir))
+        self.granted
+            .iter()
+            .chain(&self.named)
+            .any(|g| self.is_within(g, dir))
+    }
+
+    /// `dir` is a granted folder or inside one. This is the
+    /// other-filesystem rule: a mount is crossed only into what was
+    /// granted, never because something granted lies deeper inside it.
+    /// Named folders don't count (a root of `~` must not open every mount
+    /// under it); a named folder below a mount is scanned as a root.
+    pub fn allows(&self, dir: &Path) -> bool {
+        self.granted.iter().any(|g| self.is_within(dir, g))
     }
 
     /// `inner` is `outer` or below it, component by component.
@@ -207,5 +229,13 @@ mod tests {
         );
         assert!(g.granted(Path::new("/Users/me/Documents/code")));
         assert!(!g.granted(Path::new("/Users/me/Documents/code/app/sub")));
+        // `allows` goes the other way: the folder itself or below it.
+        assert!(g.allows(Path::new("/Users/me/Documents/code/app/sub")));
+        assert!(!g.allows(Path::new("/Users/me/Documents/code")));
+        // A named folder: the privacy rule only.
+        let mut g = Guard::with(Some(home), true, &[]);
+        g.name([PathBuf::from("/Users/me/Desktop/x")]);
+        assert_eq!(g.prompts(Path::new("/Users/me/Desktop")), None);
+        assert!(!g.allows(Path::new("/Users/me/Desktop/x/y")));
     }
 }

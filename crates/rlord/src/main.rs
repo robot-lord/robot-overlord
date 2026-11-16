@@ -1613,9 +1613,10 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
     use rlord_core::config::{contract_tilde, expand_tilde};
     use std::io::{IsTerminal, Write};
     let cwd = std::env::current_dir()?;
-    let launch = rlord_core::git::main_repo_root(&cwd.to_string_lossy());
-    let sugg = call("setup.suggest", json!({"launch_dir": launch}))?;
-    let configured: Vec<String> = sugg["roots"]["configured"]
+    // (A cheap look-up: the suggestion reads every agent's files, so it is
+    // asked for only when there is no PATH.)
+    let status = call("setup.status", json!({}))?;
+    let configured: Vec<String> = status["repo_roots"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -1660,6 +1661,8 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         print_saved(&r);
         return Ok(());
     }
+    let launch = rlord_core::git::main_repo_root(&cwd.to_string_lossy());
+    let sugg = call("setup.suggest", json!({"launch_dir": launch}))?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&sugg)?);
         return Ok(());

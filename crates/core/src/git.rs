@@ -210,8 +210,12 @@ pub const MAX_SKIPPED: usize = 50;
 /// `~` once sat for an hour), and on every platform another filesystem
 /// than the root's (a network mount, a removable disk), like `find -xdev`.
 /// Symlinks are never followed. A root is scanned whatever it is (the user
-/// named it), and it and `granted` (folders sessions run in) count as
-/// allowed: a granted folder on another filesystem is entered.
+/// named it), on its own device; a root nested in another is walked once,
+/// as its own root. Roots and `granted` (the folders the user named and
+/// those sessions run in) count as granted: a protected folder holding one
+/// is entered, and another filesystem is crossed only into a granted
+/// folder or below one (`Guard::allows`). A folder whose metadata can't be
+/// read is skipped silently.
 ///
 /// Known limits: on macOS a root of `/` skips `/Users` and the other
 /// firmlinked folders (another device); a btrfs subvolume or ZFS dataset
@@ -222,15 +226,27 @@ pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
         .iter()
         .filter_map(|r| std::fs::canonicalize(crate::config::expand_tilde(r)).ok())
         .collect();
-    let mut guard = crate::privacy::Guard::new(granted);
-    guard.grant(canon.iter().cloned());
+    let guard = crate::privacy::Guard::new(granted);
+    scan_in(&canon, depth, guard, &device)
+}
+
+/// `scan_repos` over canonical roots, with a given guard and device
+/// look-up (tests).
+fn scan_in(
+    roots: &[PathBuf],
+    depth: u8,
+    mut guard: crate::privacy::Guard,
+    dev_of: &dyn Fn(&Path) -> Option<u64>,
+) -> Scan {
+    guard.name(roots.iter().cloned());
     let ctx = Walk {
         guard,
-        dev_of: &device,
+        dev_of,
+        roots: roots.to_vec(),
     };
     let mut out = Scan::default();
-    for root in &canon {
-        walk(root, depth, device(root), &ctx, &mut out);
+    for root in roots {
+        walk(root, depth, dev_of(root), &ctx, &mut out);
     }
     finish(out)
 }
@@ -258,6 +274,8 @@ fn device(p: &Path) -> Option<u64> {
 struct Walk<'a> {
     guard: crate::privacy::Guard,
     dev_of: &'a dyn Fn(&Path) -> Option<u64>,
+    /// Every root: one nested in another is walked as its own root only.
+    roots: Vec<PathBuf>,
 }
 
 /// `dev`: the device of the filesystem being walked (None: unknown, no
@@ -287,6 +305,9 @@ fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
             continue;
         }
         let path = entry.path();
+        if ctx.roots.contains(&path) {
+            continue;
+        }
         // By name, before anything touches it.
         if let Some(why) = ctx.guard.prompts(&path) {
             out.skipped.push(Skipped {
@@ -295,17 +316,20 @@ fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
             });
             continue;
         }
-        let child = (ctx.dev_of)(&path);
+        // Unreadable, or gone since it was listed: nothing to report.
+        let Some(child) = (ctx.dev_of)(&path) else {
+            continue;
+        };
         let mut next = dev;
-        if dev.is_some() && child != dev {
-            if !ctx.guard.granted(&path) {
+        if dev.is_some_and(|d| d != child) {
+            if !ctx.guard.allows(&path) {
                 out.skipped.push(Skipped {
                     path: path.to_string_lossy().into_owned(),
                     why: Why::OtherFilesystem,
                 });
                 continue;
             }
-            next = child;
+            next = Some(child);
         }
         walk(&path, depth - 1, next, ctx, out);
     }
@@ -335,7 +359,11 @@ mod tests {
         guard: crate::privacy::Guard,
         dev_of: &dyn Fn(&Path) -> Option<u64>,
     ) -> Scan {
-        let ctx = Walk { guard, dev_of };
+        let ctx = Walk {
+            guard,
+            dev_of,
+            roots: vec![root.to_path_buf()],
+        };
         let mut out = Scan::default();
         walk(root, 3, dev_of(root), &ctx, &mut out);
         finish(out)
@@ -392,7 +420,7 @@ mod tests {
         // Named as a root itself (granted), it is scanned.
         let docs = root.join("Documents");
         let mut g = Guard::with(Some(&root), false, &[]);
-        g.grant([docs.clone()]);
+        g.name([docs.clone()]);
         let found = walk_with(&docs, g, &same);
         assert_eq!(
             found.repos,
@@ -420,11 +448,32 @@ mod tests {
                 why: Why::OtherFilesystem
             }]
         );
-        // A session runs in it: entered, two levels deep too.
+        // A session runs deeper inside it: that doesn't open the mount.
         let granted = [mnt.join("b").to_string_lossy().into_owned()];
+        let found = walk_with(&root, Guard::with(None, false, &granted), &dev);
+        assert_eq!(found.repos, vec![root.join("local/a").to_string_lossy()]);
+        assert_eq!(found.skipped.len(), 1);
+        // The mount itself granted: entered, two levels deep too.
+        let granted = [mnt.to_string_lossy().into_owned()];
         let found = walk_with(&root, Guard::with(None, false, &granted), &dev);
         assert_eq!(found.repos.len(), 3, "{found:?}");
         assert!(found.skipped.is_empty());
+    }
+
+    /// Metadata that can't be read (or a folder gone since it was
+    /// listed): skipped without a report.
+    #[test]
+    fn unreadable_folders_are_skipped_silently() {
+        use crate::privacy::Guard;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        init_repo(&root.join("gone/a"));
+        init_repo(&root.join("here/b"));
+        let gone = root.join("gone");
+        let dev = |p: &Path| (!p.starts_with(&gone)).then_some(1);
+        let found = walk_with(&root, Guard::with(None, false, &[]), &dev);
+        assert_eq!(found.repos, vec![root.join("here/b").to_string_lossy()]);
+        assert!(found.skipped.is_empty(), "{found:?}");
     }
 
     /// `repo_roots = ["~"]` with `code_dir` in `~/Documents`: the code
@@ -436,29 +485,58 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         init_repo(&root.join("Documents/code/alpha"));
         init_repo(&root.join("src/beta"));
-        let code = root.join("Documents/code").to_string_lossy().into_owned();
+        let code = root.join("Documents/code");
         let same = |_: &Path| Some(1);
-        let found = walk_with(&root, Guard::with(Some(&root), true, &[code]), &same);
+        // (The daemon adds the code folder to the roots.)
+        let found = scan_in(
+            &[root.clone(), code],
+            3,
+            Guard::with(Some(&root), true, &[]),
+            &same,
+        );
         assert_eq!(found.repos.len(), 2, "{found:?}");
         assert!(found.skipped.is_empty(), "{found:?}");
     }
 
-    /// A code folder on another device below a root: entered, not skipped.
+    /// A code folder on another device below a root: the mount stays
+    /// skipped, and the code folder is scanned as its own root (the daemon
+    /// adds it to the roots), once.
     #[test]
     fn a_named_code_folder_on_another_device_is_scanned() {
-        use crate::privacy::Guard;
+        use crate::privacy::{Guard, Why};
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         init_repo(&root.join("ext/code/alpha"));
+        init_repo(&root.join("ext/other/beta"));
         let ext = root.join("ext");
+        let code = ext.join("code");
         let dev = |p: &Path| Some(if p.starts_with(&ext) { 7 } else { 1 });
-        let code = ext.join("code").to_string_lossy().into_owned();
-        let found = walk_with(&root, Guard::with(None, false, &[code]), &dev);
+        let found = scan_in(
+            &[root.clone(), code.clone()],
+            3,
+            Guard::with(None, false, &[]),
+            &dev,
+        );
         assert_eq!(
             found.repos,
             vec![root.join("ext/code/alpha").to_string_lossy()]
         );
-        assert!(found.skipped.is_empty(), "{found:?}");
+        assert_eq!(
+            found.skipped,
+            vec![Skipped {
+                path: ext.to_string_lossy().into_owned(),
+                why: Why::OtherFilesystem
+            }]
+        );
+        // A root nested in another (same device) is walked once.
+        let same = |_: &Path| Some(1);
+        let found = scan_in(
+            &[root.clone(), code.clone()],
+            3,
+            Guard::with(None, false, &[]),
+            &same,
+        );
+        assert_eq!(found.repos.len(), 2, "{found:?}");
     }
 
     #[test]

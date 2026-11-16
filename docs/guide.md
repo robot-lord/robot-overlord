@@ -89,7 +89,8 @@ rlord fills in a suggestion: the folder holding most of the projects it has
 seen (Claude Code's project list, Codex's and OpenCode's sessions, rlord's
 own sessions and repos, the folder you started `rlord` in), with what it
 rests on ("14 of 17 projects rlord has seen"). ←/→ shows the alternatives;
-type to change it (a folder that doesn't exist is created). `enter` saves
+type to change it (a folder that doesn't exist is created once you press
+`enter` again to confirm). `enter` saves
 it. With an overlord, an optional box lets you describe it in your own
 words instead ("work in ~/ko, personal in ~/proj"): the overlord reopens
 the form with its reading of that, and saving saves what it shows. `esc`
@@ -310,8 +311,10 @@ raise a privacy prompt (`~/Desktop`, `~/Documents`, `~/Downloads`,
 scanned folder. It never follows a symlink. A folder you named is always
 scanned, wherever it is: your code folder and each `repo_roots` entry
 (`repo_roots = ["~"]` with `code_dir = "~/Documents/code"` still scans
-`~/Documents/code`; a code folder on another disk is entered too), and so
-is a folder a session already runs in. `Tab`/`↑↓` move between fields (name, model,
+`~/Documents/code`; a code folder on another disk is scanned too). A
+protected folder that holds a session's folder is scanned (macOS has
+allowed it), and the scan crosses onto another disk only into a session's
+own folder, not the whole disk. `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;

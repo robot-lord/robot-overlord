@@ -266,6 +266,9 @@ struct App {
     /// The overlord asked to open the code-folder form while the user was
     /// busy in another one: `:setup` opens it then.
     pending_setup: Option<Value>,
+    /// The code-folder form's suggestion, being worked out on another
+    /// thread (`App::open_setup`).
+    setup_rx: Option<mpsc::Receiver<Value>>,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -325,6 +328,7 @@ impl App {
             conv_text: None,
             pending_select: None,
             pending_setup: None,
+            setup_rx: None,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),
@@ -771,6 +775,9 @@ impl App {
                 }
             }
             if pushed {
+                self.dirty = true;
+            }
+            if self.poll_setup() {
                 self.dirty = true;
             }
         }
