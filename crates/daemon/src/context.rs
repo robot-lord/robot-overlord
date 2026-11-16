@@ -520,11 +520,11 @@ pub fn hooks_work(agent: Agent) -> bool {
 /// start), or `file_only` (only written to context.md: the agent sees it
 /// if it reads the file again). `hooks_now`: rlord's hooks work for the
 /// agent now (`hooks_work`), which wins over how it was launched (`mode`).
-pub fn later_delivery(agent: Agent, mode: Option<Delivery>, hooks_now: bool) -> &'static str {
-    if hooks_now && agent != Agent::OpenCode {
-        return "next_prompt";
-    }
+pub fn later_delivery(mode: Option<Delivery>) -> &'static str {
+    // (Only the stored mode: a running agent has the hooks it loaded when
+    // it started, whatever is installed now.)
     match mode {
+        Some(Delivery::Hook) => "next_prompt",
         Some(Delivery::SystemPromptFile) => "next_start",
         _ => "file_only",
     }
@@ -581,7 +581,7 @@ pub fn needs_background(params: &Value) -> bool {
     params["by_overlord"].as_bool() == Some(true)
         || params["context"]
             .as_str()
-            .is_some_and(|c| !c.trim().is_empty())
+            .is_some_and(|c| !clean(c).trim().is_empty())
         || !crate::methods::ref_list(params, "related").is_empty()
 }
 
@@ -825,26 +825,31 @@ pub fn hook_reply_from(
         }
         _ => false,
     };
-    // Answers to this conversation never acknowledged, whole or update:
-    // after `UNACKED_TRIES` of them everything counts as handed over (a
-    // client that never acks must not get the same again with every
-    // prompt). Logged once; what is added later starts afresh.
+    // A start, clear or compact always gets the whole of it, and starts
+    // the count of unacknowledged answers afresh, as does a conversation
+    // the count isn't about.
+    let restarted = event == "SessionStart" && source != Some("resume");
     let tries: Value = db
         .kv_get(&tries_key(&s.id))?
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or(Value::Null);
-    let tried = if tries["conv"] == conv {
-        tries["n"].as_u64().unwrap_or(0)
-    } else {
+    let tried = if restarted || tries["conv"] != conv {
         0
+    } else {
+        tries["n"].as_u64().unwrap_or(0)
     };
+    // Answers to this conversation never acknowledged, whole or update:
+    // after `UNACKED_TRIES` of them what they carried counts as handed
+    // over (a client that never acks must not get the same again with
+    // every prompt), logged once. A note no answer carried yet still goes,
+    // in this answer.
+    let mut same_conv = same_conv;
     if tried >= UNACKED_TRIES {
         let now = rlord_core::types::now_ms();
         if by_hook {
             db.kv_set(&delivered_key(&s.id), conv)?;
+            same_conv = true;
         }
-        // What the answers carried counts as handed over; a note added
-        // since none carried it stays unseen, for the next answer.
         db.context_mark_sent_seen(&s.id, now)?;
         db.kv_delete(&full_key(&s.id))?;
         db.kv_delete(&tries_key(&s.id))?;
@@ -854,9 +859,8 @@ pub fn hook_reply_from(
             "context_assumed_delivered",
             &json!({"unacknowledged": tried}).to_string(),
         )?;
-        return Ok(None);
     }
-    let restarted = event == "SessionStart" && source != Some("resume");
+    let tried = if tried >= UNACKED_TRIES { 0 } else { tried };
     let full = by_hook && (!same_conv || restarted);
     let rows = if full {
         db.context_rows(&s.id)?
@@ -875,11 +879,13 @@ pub fn hook_reply_from(
         db.context_mark_all_seen(&s.id, rlord_core::types::now_ms())?;
         return Ok(None);
     }
+    // (The file is named only if it is there: its write may have failed.)
+    let file = Some(file).filter(|f| f.is_file());
     let text = if full {
         let worker = launched_with_it(db, &s.id)?;
-        render_as(&s.name, worker, &rows, &related, Some(file), budget)
+        render_as(&s.name, worker, &rows, &related, file, budget)
     } else {
-        render_update(&rows, &related, Some(file), budget)
+        render_update(&rows, &related, file, budget)
     };
     db.kv_set(
         &tries_key(&s.id),
@@ -889,8 +895,11 @@ pub fn hook_reply_from(
     // answer that carries them again takes them over); a whole one also
     // remembers the conversation it went to.
     let ack = new_ack(&s.id);
-    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    db.context_mark_sent(&s.id, &ids, &ack, rlord_core::types::now_ms())?;
+    if let Some(last) = rows.last() {
+        // (A whole answer carries every row up to its last; an update,
+        // every unseen one.)
+        db.context_mark_sent(&s.id, last.id, !full, &ack, rlord_core::types::now_ms())?;
+    }
     if full {
         db.kv_set(
             &full_key(&s.id),
@@ -912,7 +921,7 @@ pub fn ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     let Some((id, _)) = ack.split_once('.') else {
         return Ok(false);
     };
-    let rows = db.context_ack(ack, now)?;
+    let rows = db.context_ack(id, ack, now)?;
     let full: Value = db
         .kv_get(&full_key(id))?
         .and_then(|v| serde_json::from_str(&v).ok())
@@ -1442,15 +1451,40 @@ mod tests {
         store(&db, "a", &["two".into()], &[], 2).unwrap();
         assert!(prompt().unwrap().contains("two"));
         // Added after the last answer, before the give-up: no answer
-        // carried it.
+        // carried it. The give-up marks what the answers carried, and the
+        // new note goes in this very answer.
         store(&db, "a", &["three".into()], &[], 3).unwrap();
-        assert_eq!(prompt(), None, "gave up");
-        let unseen = db.context_unseen("a").unwrap();
-        assert_eq!(unseen.len(), 1);
-        assert_eq!(unseen[0].body, "three");
-        // It goes with the next answer.
         let next = prompt().unwrap();
+        assert!(next.starts_with("# rlord background, updated"), "{next}");
         assert!(next.contains("three") && !next.contains("one"), "{next}");
+        let unseen = db.context_unseen("a").unwrap();
+        assert_eq!(unseen.len(), 1, "until it is acknowledged");
+        assert_eq!(unseen[0].body, "three");
+    }
+
+    #[test]
+    fn a_reset_or_new_conversation_is_never_given_up_on() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        let s = db.resolve_ref("a").unwrap();
+        let f = Path::new("/f");
+        let hook = |event: &str, source: Option<&str>, sid: &str| {
+            hook_reply_from(&db, &s, Agent::Claude, event, source, Some(sid), f)
+                .unwrap()
+                .map(|r| text(&r.output).to_string())
+        };
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        // Two unacknowledged whole answers: the cap is reached.
+        assert!(hook("UserPromptSubmit", None, "c").is_some());
+        assert!(hook("UserPromptSubmit", None, "c").is_some());
+        // A start, a clear, a compact: the whole of it anyway.
+        for source in ["startup", "clear", "compact"] {
+            let t = hook("SessionStart", Some(source), "c").unwrap();
+            assert!(t.starts_with("# Background from rlord"), "{source}");
+        }
+        // Another conversation: the whole of it too.
+        let t = hook("UserPromptSubmit", None, "c2").unwrap();
+        assert!(t.starts_with("# Background from rlord"));
     }
 
     #[test]
@@ -1547,26 +1581,12 @@ mod tests {
     #[test]
     fn later_background_says_how_it_will_arrive() {
         use Delivery::*;
-        // Hooks working now: the next prompt, however it was launched.
-        for mode in [None, Some(Hook), Some(SystemPromptFile), Some(Pointer)] {
-            assert_eq!(later_delivery(Agent::Claude, mode, true), "next_prompt");
-            assert_eq!(later_delivery(Agent::Codex, mode, true), "next_prompt");
-        }
-        // Not now: by how it was launched.
-        assert_eq!(
-            later_delivery(Agent::Claude, Some(SystemPromptFile), false),
-            "next_start"
-        );
-        assert_eq!(
-            later_delivery(Agent::Claude, Some(Hook), false),
-            "file_only"
-        );
-        assert_eq!(
-            later_delivery(Agent::Codex, Some(Pointer), false),
-            "file_only"
-        );
-        assert_eq!(later_delivery(Agent::Codex, None, false), "file_only");
-        assert_eq!(later_delivery(Agent::OpenCode, None, true), "file_only");
+        // From the stored mode only: a running agent has the hooks it
+        // started with.
+        assert_eq!(later_delivery(Some(Hook)), "next_prompt");
+        assert_eq!(later_delivery(Some(SystemPromptFile)), "next_start");
+        assert_eq!(later_delivery(Some(Pointer)), "file_only");
+        assert_eq!(later_delivery(None), "file_only");
     }
 
     #[test]

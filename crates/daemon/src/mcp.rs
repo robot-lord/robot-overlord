@@ -620,7 +620,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                     &related,
                     id.as_str(),
                 )?;
-                Some(json!({"note": note, "links": links}))
+                Some((note, links))
             } else {
                 None
             };
@@ -634,8 +634,20 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
             }
             let mut delivery = None;
-            if let Some(c) = checked {
-                let r = d.rpc("session.context_add", json!({"ref": id, "checked": c}))?;
+            if let Some((note, links)) = checked {
+                // (In-process: the checked values never travel over RPC.)
+                let r = {
+                    let db = d.db();
+                    let s = db.resolve_ref(id.as_str().unwrap_or(""))?;
+                    crate::methods::context_store(
+                        &db,
+                        &s,
+                        note,
+                        &links,
+                        &rlord_core::paths::data_dir(),
+                    )?
+                };
+                d.changed();
                 delivery = Some(r["delivery"].clone());
             }
             let add = args.get("add_tags").cloned().unwrap_or(json!([]));

@@ -332,6 +332,8 @@ pub fn show_list(d: &Daemon) -> Result<Value> {
 pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
     let r = methods::p_str(params, "ref")?;
     let id = d.db().resolve_ref(r)?.id;
+    // (Asked before the locks: see `Daemon::restart_hooks`.)
+    let hooks = d.restart_hooks(&id);
     let s = {
         // (Its lock before the DB: a start or restart may follow.)
         let _session = d.sessions.lock(&id);
@@ -342,7 +344,7 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         } else if s.status == Status::Stopped
             || !s.tmux_session.as_deref().is_some_and(tmux::has_session)
         {
-            methods::session_restart(&db, &json!({"ref": s.id}))?;
+            methods::session_restart(&db, &json!({"ref": s.id, "hooks_work": hooks}))?;
         }
         db.resolve_ref(&s.id)?
     };

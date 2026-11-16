@@ -424,6 +424,31 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 10. `context_exists_or` split back: `Db::context_exists` plus the
     `context_on` kv in `has_background`.
 
+### Review round 9 (PR #64)
+
+1. The give-up never swallows a reset or a new conversation: SessionStart
+   `startup` / `clear` / `compact`, and a conversation the counter isn't
+   about, always get the whole background and reset the count. A note no
+   answer carried yet goes in the answer that gives up (tests).
+2. `later_delivery` goes by the stored mode only: Hook `next_prompt`,
+   SystemPromptFile `next_start`, else `file_only` (test).
+3. `Daemon::restart_hooks` computes `hooks_work` before the DB lock for
+   every restart path that can need it: the RPC, `ui.goto`, Remote
+   Control. Overlords (`overlord.rs`, `recall.rs`) have no background.
+4. A Pointer restart that sends `pointer_only` resets `bind_since` /
+   `bind_prompt` to that start and prompt (`note_first_prompt`, shared
+   with the launch) (test).
+5. The hook answer is built at the very end of `hook_emit`, after all
+   the event's fallible work.
+6. `checked` is no longer accepted over RPC: `update_session` stores the
+   checked values in-process (`methods::context_store`).
+7. Hook answers name `context.md` only if it exists.
+8. `needs_background` decides on the cleaned `context`.
+9. `Db::context_ack` filters by session (from the ack id) and
+   `Db::context_mark_sent` is one statement.
+10. A restart calls `agent.resume` once, then adds the flag or the
+    pointer to that command.
+
 ## Owed / deferred
 
 - Follow-up, not in this effort: the guard rail above.
@@ -434,3 +459,15 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
   session that added plain `rlord mcp`, like its notes. PR 2's scoped
   tools are the real surface for workers.
 - Reconcile at PR 4: Codex daemon-mode `turn/start`, an overlord token.
+- Edge cases left (review round 9):
+  - A running agent whose hooks were installed after it started gets
+    `file_only` reported for later background until its next start
+    (`later_delivery` goes by the stored mode only).
+  - An older answer's late ack marks nothing when a newer answer carried
+    the same rows again (the newer one's ack does): one duplicate at
+    most, as designed.
+  - A session given background only after launch has no stored mode:
+    reported `file_only`; it gets hook answers anyway if hooks fire, but
+    no system prompt flag at restart.
+  - `context.md` of sessions that link to one are refreshed on a rename,
+    not on the linked session's status changes (only at their restart).

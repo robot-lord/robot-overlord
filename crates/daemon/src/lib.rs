@@ -277,6 +277,25 @@ impl Daemon {
         Ok(())
     }
 
+    /// For a restart of session `r` (every path that restarts one calls it
+    /// before taking the DB lock and passes the answer as the restart's
+    /// `hooks_work`): whether rlord's hooks still work for its agent, when
+    /// its background goes by hook; None otherwise (nothing to check). It
+    /// reads the agent's settings files, so never under the lock.
+    /// (Overlords, restarted by `overlord.rs` and `recall.rs`, have no
+    /// background: nothing to ask.)
+    pub fn restart_hooks(&self, r: &str) -> Option<bool> {
+        let agent = {
+            let db = self.db();
+            let s = db.resolve_ref(r).ok()?;
+            if context::mode(&db, &s.id).ok().flatten() != Some(context::Delivery::Hook) {
+                return None;
+            }
+            rlord_core::agents::Agent::parse(&s.agent)?
+        };
+        Some(context::hooks_work(agent))
+    }
+
     /// Bind the socket (0700 dir, 0600 socket — the socket IS the auth boundary).
     pub fn bind(socket_path: &Path) -> Result<UnixListener> {
         let dir = socket_path.parent().context("socket path has no parent")?;
@@ -465,33 +484,19 @@ impl Daemon {
         }
         // Whether rlord's hooks work for the agent (it reads the agent's
         // settings files): asked here, never under the DB lock.
-        let wants_hooks = match method {
+        match method {
             // (Only a launch with background asks.)
-            "session.new" => context::needs_background(&params),
-            "session.context_add" => true,
-            // (A restart of a session whose background goes by hook: are
-            // they still there?)
-            "session.restart" => {
-                let db = self.db();
-                db.resolve_ref(params["ref"].as_str().unwrap_or(""))
-                    .ok()
-                    .is_some_and(|s| {
-                        context::mode(&db, &s.id).ok().flatten() == Some(context::Delivery::Hook)
-                    })
+            "session.new" if context::needs_background(&params) => {
+                let works =
+                    methods::agent_param(&self.config(), &params).is_ok_and(context::hooks_work);
+                params["hooks_work"] = json!(works);
             }
-            _ => false,
-        };
-        if wants_hooks {
-            let agent = match method {
-                "session.new" => methods::agent_param(&self.config(), &params).ok(),
-                _ => self
-                    .db()
-                    .resolve_ref(params["ref"].as_str().unwrap_or(""))
-                    .ok()
-                    .and_then(|s| rlord_core::agents::Agent::parse(&s.agent)),
-            };
-            let works = agent.is_some_and(context::hooks_work);
-            params["hooks_work"] = json!(works);
+            "session.restart" => {
+                if let Some(works) = self.restart_hooks(params["ref"].as_str().unwrap_or("")) {
+                    params["hooks_work"] = json!(works);
+                }
+            }
+            _ => {}
         }
         // `status:limited`: not a stored status (`limits.rs`), so it is
         // taken out of the query and matched on the annotated rows; any

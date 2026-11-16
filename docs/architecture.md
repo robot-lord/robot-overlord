@@ -1338,9 +1338,12 @@ then. A restart counts them seen only when it carried something fresh:
 the pointer sent again (a new conversation), or the system prompt file
 rewritten just now; never a resume without a pointer or a stale file. A
 restart into a new conversation of a session whose background went by
-hook checks the hooks again (before the DB lock): gone, it switches to
-the system prompt file (Claude) or the pointer (others) and stores that
-mode.
+hook checks the hooks again (`Daemon::restart_hooks`, before the DB
+lock, on every restart path: the RPC, `ui.goto`, Remote Control;
+overlords have no background): gone, it switches to the system prompt
+file (Claude) or the pointer (others) and stores that mode. A pointer
+sent again resets what binding goes by (`bind_since`, `bind_prompt`) to
+that start and that prompt.
 
 How it reaches the agent (`context::delivery`, decided at launch and
 kept in kv `context_mode:<id>`):
@@ -1385,10 +1388,13 @@ logged, and the hook event is still processed.
 
 Background added later (`session.context_add`) answers with `delivery`,
 which `update_session` passes on as `background_delivery`:
-`next_prompt` (rlord's hooks work for its agent now, however it was
-launched), else `next_start` (launched with Claude's system prompt
-file) or `file_only` (only in `context.md`). `update_session` checks the
-background before writing anything else. `overlord.md` has the overlord also use `send_to_session` when
+from the stored mode only, since a running agent has the hooks it loaded
+when it started: `next_prompt` (Hook), `next_start` (Claude's system
+prompt file) or `file_only` (only in `context.md`; also a session that
+had no background at launch). `update_session` checks the background
+before writing anything else, makes its other edits, then stores the
+checked note and links in-process (`methods::context_store`; never
+taken from a caller over RPC). `overlord.md` has the overlord also use `send_to_session` when
 the session must know now and it isn't `next_prompt`.
 
 Nothing counts as handed over until the hook client says it printed the
@@ -1405,8 +1411,12 @@ client that died) goes again with the next prompt: at most one
 duplicate. After `UNACKED_TRIES` (2) unacknowledged answers in a row to
 one conversation (kv `context_unacked:<id>`), the rows they carried
 count as seen and the conversation as reached, logged once as
-`context_assumed_delivered`; a note added since, which no answer
-carried, still goes with the next one.
+`context_assumed_delivered`; a note no answer carried yet still goes, in
+that same answer. A start, clear or compact, and a conversation the
+count isn't about, always get the whole background and start the count
+afresh. The answer is built last in `hook_emit` (after the event's own
+work, which can fail), so its bookkeeping never runs for an event that
+didn't go through; it names `context.md` only if the file is there.
 
 ## Naming
 

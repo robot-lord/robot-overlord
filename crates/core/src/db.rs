@@ -1298,26 +1298,26 @@ impl Db {
     pub fn context_mark_sent(
         &self,
         session_id: &str,
-        ids: &[i64],
+        upto: i64,
+        only_unseen: bool,
         ack: &str,
         at: i64,
     ) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "UPDATE session_context SET sent_ack = ?3, sent_at = ?4 \
-             WHERE session_id = ?1 AND id = ?2",
+        self.conn.execute(
+            "UPDATE session_context SET sent_ack = ?4, sent_at = ?5 \
+             WHERE session_id = ?1 AND id <= ?2 AND (?3 = 0 OR seen_at IS NULL)",
+            params![session_id, upto, only_unseen, ack, at],
         )?;
-        for id in ids {
-            stmt.execute(params![session_id, id, ack, at])?;
-        }
         Ok(())
     }
 
     /// The answer `ack` was acknowledged: the rows it was the latest to
     /// carry, not seen yet, are seen at `at`. Returns how many.
-    pub fn context_ack(&self, ack: &str, at: i64) -> Result<usize> {
+    pub fn context_ack(&self, session_id: &str, ack: &str, at: i64) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE session_context SET seen_at = ?2 WHERE sent_ack = ?1 AND seen_at IS NULL",
-            params![ack, at],
+            "UPDATE session_context SET seen_at = ?3 \
+             WHERE session_id = ?1 AND sent_ack = ?2 AND seen_at IS NULL",
+            params![session_id, ack, at],
         )?)
     }
 
