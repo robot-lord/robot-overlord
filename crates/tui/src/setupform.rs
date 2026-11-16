@@ -144,7 +144,10 @@ impl SetupForm {
         } else {
             (contract_tilde(current), true)
         };
-        let roots = if configured.is_empty() || configured == ["~"] {
+        // The old template's `["~"]` switches to the code folder, but only
+        // the first time: once a folder was saved, roots are the user's.
+        let done = sugg["done"] == true;
+        let roots = if configured.is_empty() || (configured == ["~"] && !done) {
             Roots::Follow
         } else {
             Roots::Keep(configured.clone())
@@ -168,7 +171,7 @@ impl SetupForm {
             loading: false,
             touched: false,
             confirm_create: None,
-            guard: rlord_core::privacy::Guard::new(&[]),
+            guard: rlord_core::privacy::Guard::new(),
             hint: String::new(),
         };
         f.roots_row = f.roots_differ();
@@ -189,8 +192,16 @@ impl SetupForm {
     }
 
     /// A form waiting on rlord's suggestion ("finding…").
-    pub(crate) fn loading(overlord: bool, auto: bool) -> SetupForm {
-        let mut f = SetupForm::from_suggest(&Value::Null, overlord, auto);
+    /// `status` (`setup.status`, cheap) gives the current code folder and
+    /// roots, so saving before the suggestion lands can't drop roots the
+    /// form hasn't seen.
+    pub(crate) fn loading(overlord: bool, auto: bool, status: &Value) -> SetupForm {
+        let known = json!({
+            "code_dir": status["code_dir"],
+            "roots": {"configured": status["repo_roots"]},
+            "done": status["done"],
+        });
+        let mut f = SetupForm::from_suggest(&known, overlord, auto);
         f.loading = true;
         f.refresh_hint();
         f
@@ -211,6 +222,7 @@ impl SetupForm {
         if self.touched {
             new.row = new.rows().iter().position(|r| *r == at).unwrap_or(0);
             new.touched = true;
+            new.roots = std::mem::replace(&mut self.roots, Roots::Follow);
         }
         new.refresh_hint();
         *self = new;
@@ -240,10 +252,13 @@ impl SetupForm {
                 .filter_map(Value::as_str)
                 .map(contract_tilde)
                 .collect();
-            if !r.is_empty() {
-                self.roots = Roots::Set(r);
-                self.roots_row = true;
-            }
+            // `[]`: only the code folder.
+            self.roots = if r.is_empty() {
+                Roots::Follow
+            } else {
+                Roots::Set(r)
+            };
+            self.roots_row = true;
         } else {
             self.roots_row = self.roots_differ();
         }
@@ -414,16 +429,34 @@ impl App {
     pub(crate) fn check_setup(&mut self) -> bool {
         // (A cheap look-up; the suggestion is worked out only if needed,
         // and off this thread.)
-        let needed = self
-            .call("setup.status", Value::Null)
-            .is_some_and(|st| st["needed"] == true);
-        needed && self.open_setup(true)
+        let Some(st) = self.call("setup.status", Value::Null) else {
+            return false;
+        };
+        let needed = st["needed"] == true;
+        // The overlord proposed one while something else was open: that
+        // one, not rlord's own suggestion.
+        if let Some(cmd) = self.pending_setup.take() {
+            self.open_setup_from(&cmd);
+            if let Mode::Setup(f) = &mut self.mode {
+                f.auto = needed;
+            }
+            return true;
+        }
+        needed && self.open_setup_with(&st, true)
     }
 
     /// Open the code-folder form now, showing "finding…" while rlord's
     /// suggestion is worked out on another thread (it reads the agents'
     /// files). True when it opened.
     pub(crate) fn open_setup(&mut self, auto: bool) -> bool {
+        match self.call("setup.status", Value::Null) {
+            Some(st) => self.open_setup_with(&st, auto),
+            None => false,
+        }
+    }
+
+    /// `open_setup`, with `setup.status` in hand.
+    fn open_setup_with(&mut self, status: &Value, auto: bool) -> bool {
         let Some(o) = self.call("overlord.get", Value::Null) else {
             return false;
         };
@@ -441,7 +474,7 @@ impl App {
             let _ = tx.send(v);
         });
         self.setup_rx = Some(rx);
-        self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto)));
+        self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto, status)));
         true
     }
 
@@ -1020,7 +1053,7 @@ mod tests {
     /// the user typed meanwhile.
     #[test]
     fn a_late_suggestion_fills_the_form() {
-        let mut f = SetupForm::loading(true, true);
+        let mut f = SetupForm::loading(true, true, &Value::Null);
         assert!(f.loading && f.code_dir.is_empty());
         assert_eq!(f.hint, "finding where your projects are…");
         assert!(f
@@ -1034,7 +1067,7 @@ mod tests {
             ("/elsewhere/ko", Row::Save)
         );
         // Typed before it arrived: kept, and the focus stays.
-        let mut f = SetupForm::loading(true, true);
+        let mut f = SetupForm::loading(true, true, &Value::Null);
         f.row = 1;
         f.touched = true;
         f.code_dir = "/mine".into();
@@ -1046,10 +1079,56 @@ mod tests {
         assert_eq!(f.describe.as_deref(), Some("d"));
         assert_eq!(f.choices.len(), 2);
         // No answer: an empty form, no longer loading.
-        let mut f = SetupForm::loading(false, true);
+        let mut f = SetupForm::loading(false, true, &Value::Null);
         f.fill(&Value::Null);
         assert!(!f.loading);
         assert!(f.hint.starts_with("rlord found no projects yet"));
+    }
+
+    /// Saved before the suggestion arrives: the configured roots (from
+    /// the cheap status) are kept, never replaced by "follow".
+    #[test]
+    fn an_early_save_keeps_configured_roots() {
+        let st = json!({"needed": true, "code_dir": "", "repo_roots": ["/x"], "done": false});
+        let mut f = SetupForm::loading(true, true, &st);
+        assert_eq!(f.roots, Roots::Keep(vec!["/x".into()]));
+        f.code_dir = "/c".into();
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(p["roots"], "leave");
+        // The current code folder is shown at once too.
+        let st = json!({"code_dir": "/c", "repo_roots": [], "done": true});
+        assert_eq!(SetupForm::loading(false, false, &st).code_dir, "/c");
+    }
+
+    /// `["~"]` follows the code folder only the first time.
+    #[test]
+    fn home_roots_are_kept_once_setup_was_done() {
+        let mut s = sugg(Some("/elsewhere/ko"), &["~"]);
+        assert_eq!(
+            SetupForm::from_suggest(&s, false, false).roots,
+            Roots::Follow
+        );
+        s["done"] = json!(true);
+        assert_eq!(
+            SetupForm::from_suggest(&s, false, false).roots,
+            Roots::Keep(vec!["~".into()])
+        );
+    }
+
+    /// The overlord's `repo_roots: []`: only the code folder.
+    #[test]
+    fn an_empty_roots_proposal_scans_only_the_code_folder() {
+        let mut f = SetupForm::from_suggest(&sugg(Some("/elsewhere/ko"), &["/x"]), true, false);
+        f.prefill(
+            &json!({"code_dir": "/elsewhere/ko", "repo_roots": [], "changed": ["repo_roots"]}),
+        );
+        assert!(f.roots_row && f.roots == Roots::Follow);
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(p["roots"], "follow");
     }
 
     /// The hint is worked out on edits, not on every frame.

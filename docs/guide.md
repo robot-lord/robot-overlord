@@ -314,10 +314,9 @@ raise a privacy prompt (`~/Desktop`, `~/Documents`, `~/Downloads`,
 scanned folder. It never follows a symlink. A folder you named is always
 scanned, wherever it is: your code folder and each `repo_roots` entry
 (`repo_roots = ["~"]` with `code_dir = "~/Documents/code"` still scans
-`~/Documents/code`; a code folder on another disk is scanned too). A
-protected folder that holds a session's folder is scanned (macOS has
-allowed it), and the scan crosses onto another disk only into a session's
-own folder, not the whole disk. `Tab`/`↑↓` move between fields (name, model,
+`~/Documents/code`; a code folder on another disk is scanned too), and
+nothing else in those places is. A repo you've run a session in always
+shows, as a repo you've used. `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;

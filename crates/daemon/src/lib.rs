@@ -205,12 +205,10 @@ impl Daemon {
         cfg.session.finder_roots(pending)
     }
 
-    /// Git repos under `roots` (the finder's, `finder_roots`), the folders
-    /// the scan stayed out of, and whether the first scan of them is still
-    /// running (`repo_scan.rs`: never blocks for long). No roots: none.
-    /// The folders sessions run in count as granted: read as stored under
-    /// a short DB lock; the scan's own thread resolves them
-    /// (`setup::granted_folders`), so nothing here touches the disk.
+    /// Git repos under `roots` (the finder's, `finder_roots`: every folder
+    /// the user named), the folders the scan stayed out of, and whether the
+    /// first scan of them is still running (`repo_scan.rs`: never blocks
+    /// for long). No roots: none. Nothing here touches the disk.
     fn scanned_repos(&self, cfg: &Config, roots: &[String]) -> repo_scan::Found {
         if roots.is_empty() {
             return repo_scan::Found {
@@ -220,12 +218,9 @@ impl Daemon {
                 scanning: false,
             };
         }
-        let sessions = self.db().session_folders().unwrap_or_default();
         let key = (roots.to_vec(), cfg.session.repo_scan_depth);
-        self.repo_scan.get(&key, sessions, |k, sessions| {
-            let granted = setup::granted_folders(sessions.to_vec(), &setup::canonical);
-            rlord_core::git::scan_repos(&k.0, k.1, &granted)
-        })
+        self.repo_scan
+            .get(&key, |k| rlord_core::git::scan_repos(&k.0, k.1))
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no

@@ -1110,17 +1110,15 @@ including when the active one hits a usage limit.
   Music,Pictures,Library}`, `/Volumes/*`; no public API reports TCC status
   without risking the prompt); on every platform, a folder on another
   filesystem than its root (`st_dev`, like `find -xdev`); and no symlink is
-  followed. A protected folder is entered when it holds a root or a
-  folder a live session runs in (macOS grants it whole once allowed).
-  Another filesystem is crossed only into a session folder or below one
-  (`Guard::allows`), never because something granted lies deeper. The code
-  folder is always a root of its own, so it is reached even below a mount
-  or inside a protected folder; a root nested in another, or named twice,
-  is walked once. Session
-  folders are matched in both their stored and resolved forms
-  (`setup::granted_folders`, resolved on the scan's thread). A result
-  made with other session folders is served and refreshed in the
-  background (still one scan per set of roots). A folder whose metadata can't be read is skipped silently.
+  followed. Only the roots themselves (the code folder and each
+  `repo_roots` entry, all named by the user) are entered wherever they
+  are: a root inside a protected folder or below a mount is walked as its
+  own root, and a root nested in another, or named twice, is walked once.
+  A folder where a session runs grants nothing: a macOS privacy grant
+  belongs to the app that made the access, so a session under a terminal
+  or an editor proves nothing about rlord's daemon (that session's repo
+  still shows, from the DB, as a known repo). A folder whose metadata
+  can't be read is skipped silently.
   Skipped folders come back in `repo.find` (`skipped`, at most 50) and the
   finder and `find_repos` name them.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
@@ -1218,8 +1216,10 @@ difference from the new-session form: the confirm saves by plain code
 written). The overlord only proposes (`confirm_setup` reopens the form);
 it isn't called again. First run opens the form after the overlord
 dialog; `:setup`, `rlord setup` and the overlord open it later. The form
-opens at once and fills in the suggestion from another thread; it asks
-before creating a folder that doesn't exist. `confirm_setup` with a folder
+opens at once with the configured roots (`setup.status`, cheap) and fills
+in the suggestion from another thread; it asks before creating a folder
+that doesn't exist. It offers to drop an old `repo_roots = ["~"]` only
+until a folder has been saved once. `confirm_setup` with a folder
 skips reading the agents' files.
 
 ## Session creation

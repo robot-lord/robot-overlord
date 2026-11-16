@@ -211,17 +211,17 @@ pub const MAX_SKIPPED: usize = 50;
 /// than the root's (a network mount, a removable disk), like `find -xdev`.
 /// Symlinks are never followed. A root is scanned whatever it is (the user
 /// named it: the code folder and each `repo_roots` entry), on its own
-/// device; a root nested in another, or named twice, is walked once. Roots and `granted` (the folders the user named and
-/// those sessions run in) count as granted: a protected folder holding one
-/// is entered, and another filesystem is crossed only into a granted
-/// folder or below one (`Guard::allows`). A folder whose metadata can't be
+/// device, including inside its own protected folder; a root nested in
+/// another, or named twice, is walked once. Nothing else is entered: not a
+/// protected folder met on the way, not another filesystem, whatever runs
+/// there (`privacy::Guard` says why). A folder whose metadata can't be
 /// read is skipped silently.
 ///
 /// Known limits: on macOS a root of `/` skips `/Users` and the other
 /// firmlinked folders (another device); a btrfs subvolume or ZFS dataset
 /// nested under a root is skipped and reported. Naming the folder in
 /// `repo_roots` scans it.
-pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
+pub fn scan_repos(roots: &[String], depth: u8) -> Scan {
     // (Two spellings of one folder, or a symlink to another root: walked
     // once.)
     let mut canon: Vec<PathBuf> = Vec::new();
@@ -232,8 +232,7 @@ pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
             }
         }
     }
-    let guard = crate::privacy::Guard::new(granted);
-    scan_in(&canon, depth, guard, &device)
+    scan_in(&canon, depth, crate::privacy::Guard::new(), &device)
 }
 
 /// `scan_repos` over canonical roots, with a given guard and device
@@ -241,10 +240,9 @@ pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
 fn scan_in(
     roots: &[PathBuf],
     depth: u8,
-    mut guard: crate::privacy::Guard,
+    guard: crate::privacy::Guard,
     dev_of: &dyn Fn(&Path) -> Option<u64>,
 ) -> Scan {
-    guard.name(roots.iter().cloned());
     let ctx = Walk {
         guard,
         dev_of,
@@ -252,7 +250,7 @@ fn scan_in(
     };
     let mut out = Scan::default();
     for root in roots {
-        walk(root, depth, dev_of(root), &ctx, &mut out);
+        walk(root, root, depth, dev_of(root), &ctx, &mut out);
     }
     finish(out)
 }
@@ -284,9 +282,9 @@ struct Walk<'a> {
     roots: Vec<PathBuf>,
 }
 
-/// `dev`: the device of the filesystem being walked (None: unknown, no
-/// check).
-fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
+/// `root`: the root this walk started from. `dev`: the device of the
+/// filesystem being walked (None: unknown, no check).
+fn walk(dir: &Path, root: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
     use crate::privacy::Why;
     if dir.join(".git").exists() {
         out.repos.push(dir.to_string_lossy().into_owned());
@@ -315,7 +313,7 @@ fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
             continue;
         }
         // By name, before anything touches it.
-        if let Some(why) = ctx.guard.prompts(&path) {
+        if let Some(why) = ctx.guard.prompts_within(&path, root) {
             out.skipped.push(Skipped {
                 path: path.to_string_lossy().into_owned(),
                 why,
@@ -326,18 +324,14 @@ fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
         let Some(child) = (ctx.dev_of)(&path) else {
             continue;
         };
-        let mut next = dev;
         if dev.is_some_and(|d| d != child) {
-            if !ctx.guard.allows(&path) {
-                out.skipped.push(Skipped {
-                    path: path.to_string_lossy().into_owned(),
-                    why: Why::OtherFilesystem,
-                });
-                continue;
-            }
-            next = Some(child);
+            out.skipped.push(Skipped {
+                path: path.to_string_lossy().into_owned(),
+                why: Why::OtherFilesystem,
+            });
+            continue;
         }
-        walk(&path, depth - 1, next, ctx, out);
+        walk(&path, root, depth - 1, dev, ctx, out);
     }
 }
 
@@ -371,7 +365,7 @@ mod tests {
             roots: vec![root.to_path_buf()],
         };
         let mut out = Scan::default();
-        walk(root, 3, dev_of(root), &ctx, &mut out);
+        walk(root, root, 3, dev_of(root), &ctx, &mut out);
         finish(out)
     }
 
@@ -391,7 +385,7 @@ mod tests {
         mk("ko/.hidden/skipped");
         mk("too/deep/for/depth/gamma");
         let roots = vec![dir.path().to_string_lossy().into_owned()];
-        let found = scan_repos(&roots, 3, &[]);
+        let found = scan_repos(&roots, 3);
         let canon = |p: &std::path::Path| {
             std::fs::canonicalize(p)
                 .unwrap()
@@ -414,7 +408,7 @@ mod tests {
             init_repo(&root.join(rel));
         }
         let same = |_: &Path| Some(1);
-        let found = walk_with(&root, Guard::with(Some(&root), false, &[]), &same);
+        let found = walk_with(&root, Guard::with(Some(&root), false), &same);
         assert_eq!(found.repos, vec![root.join("src/beta").to_string_lossy()]);
         assert_eq!(
             found.skipped,
@@ -423,11 +417,9 @@ mod tests {
                 why: Why::MacPrivacy
             }]
         );
-        // Named as a root itself (granted), it is scanned.
+        // Named as a root itself, it is scanned.
         let docs = root.join("Documents");
-        let mut g = Guard::with(Some(&root), false, &[]);
-        g.name([docs.clone()]);
-        let found = walk_with(&docs, g, &same);
+        let found = walk_with(&docs, Guard::with(Some(&root), false), &same);
         assert_eq!(
             found.repos,
             vec![root.join("Documents/code/alpha").to_string_lossy()]
@@ -436,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_stays_on_the_roots_filesystem_unless_granted() {
+    fn scan_stays_on_the_roots_filesystem() {
         use crate::privacy::{Guard, Why};
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -445,7 +437,7 @@ mod tests {
         init_repo(&root.join("mnt/deep/c"));
         let mnt = root.join("mnt");
         let dev = |p: &Path| Some(if p.starts_with(&mnt) { 2 } else { 1 });
-        let found = walk_with(&root, Guard::with(None, false, &[]), &dev);
+        let found = walk_with(&root, Guard::with(None, false), &dev);
         assert_eq!(found.repos, vec![root.join("local/a").to_string_lossy()]);
         assert_eq!(
             found.skipped,
@@ -454,16 +446,16 @@ mod tests {
                 why: Why::OtherFilesystem
             }]
         );
-        // A session runs deeper inside it: that doesn't open the mount.
-        let granted = [mnt.join("b").to_string_lossy().into_owned()];
-        let found = walk_with(&root, Guard::with(None, false, &granted), &dev);
-        assert_eq!(found.repos, vec![root.join("local/a").to_string_lossy()]);
-        assert_eq!(found.skipped.len(), 1);
-        // The mount itself granted: entered, two levels deep too.
-        let granted = [mnt.to_string_lossy().into_owned()];
-        let found = walk_with(&root, Guard::with(None, false, &granted), &dev);
+        // The mount named as a root: walked on its own device, two levels
+        // deep too.
+        let found = scan_in(
+            &[root.clone(), mnt.clone()],
+            3,
+            Guard::with(None, false),
+            &dev,
+        );
         assert_eq!(found.repos.len(), 3, "{found:?}");
-        assert!(found.skipped.is_empty());
+        assert!(found.skipped.is_empty(), "{found:?}");
     }
 
     /// Metadata that can't be read (or a folder gone since it was
@@ -477,13 +469,14 @@ mod tests {
         init_repo(&root.join("here/b"));
         let gone = root.join("gone");
         let dev = |p: &Path| (!p.starts_with(&gone)).then_some(1);
-        let found = walk_with(&root, Guard::with(None, false, &[]), &dev);
+        let found = walk_with(&root, Guard::with(None, false), &dev);
         assert_eq!(found.repos, vec![root.join("here/b").to_string_lossy()]);
         assert!(found.skipped.is_empty(), "{found:?}");
     }
 
     /// `repo_roots = ["~"]` with `code_dir` in `~/Documents`: the code
-    /// folder is granted (the daemon passes it in), so the scan enters it.
+    /// folder is a root, so it is scanned; the rest of `~/Documents` is
+    /// not (and is reported).
     #[test]
     fn a_named_code_folder_under_a_protected_one_is_scanned() {
         use crate::privacy::Guard;
@@ -494,19 +487,23 @@ mod tests {
         let code = root.join("Documents/code");
         let same = |_: &Path| Some(1);
         // (The daemon adds the code folder to the roots.)
+        init_repo(&root.join("Documents/other/gamma"));
         let found = scan_in(
             &[root.clone(), code],
             3,
-            Guard::with(Some(&root), true, &[]),
+            Guard::with(Some(&root), true),
             &same,
         );
-        assert_eq!(found.repos.len(), 2, "{found:?}");
-        assert!(found.skipped.is_empty(), "{found:?}");
+        let want: Vec<String> = ["Documents/code/alpha", "src/beta"]
+            .iter()
+            .map(|r| root.join(r).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found.repos, want);
+        assert_eq!(found.skipped.len(), 1, "{found:?}");
     }
 
     /// A code folder on another device below a root: the mount stays
-    /// skipped, and the code folder is scanned as its own root (the daemon
-    /// adds it to the roots), once.
+    /// skipped, and the code folder is scanned as its own root, once.
     #[test]
     fn a_named_code_folder_on_another_device_is_scanned() {
         use crate::privacy::{Guard, Why};
@@ -520,7 +517,7 @@ mod tests {
         let found = scan_in(
             &[root.clone(), code.clone()],
             3,
-            Guard::with(None, false, &[]),
+            Guard::with(None, false),
             &dev,
         );
         assert_eq!(
@@ -539,7 +536,7 @@ mod tests {
         let found = scan_in(
             &[root.clone(), code.clone()],
             3,
-            Guard::with(None, false, &[]),
+            Guard::with(None, false),
             &same,
         );
         assert_eq!(found.repos.len(), 2, "{found:?}");
@@ -552,7 +549,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         init_repo(&elsewhere.path().join("r"));
         std::os::unix::fs::symlink(elsewhere.path(), root.join("link")).unwrap();
-        let found = scan_repos(&[root.to_string_lossy().into_owned()], 3, &[]);
+        let found = scan_repos(&[root.to_string_lossy().into_owned()], 3);
         assert!(found.repos.is_empty(), "{found:?}");
     }
 

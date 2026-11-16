@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::code_dir::{self, Seen, Suggestion};
-use rlord_core::config::{contract_tilde, expand_tilde, Config, RootsEdit};
+use rlord_core::config::{absolute_dir, contract_tilde, expand_tilde, Config, RootsEdit};
 use rlord_core::db::Db;
 use rlord_core::privacy::Guard;
 use rlord_core::types::now_ms;
@@ -35,41 +35,6 @@ pub(crate) fn needed(db: &Db, cfg: &Config) -> bool {
     cfg.session.code_dir_path().is_none() && db.kv_get(KV).ok().flatten().is_none()
 }
 
-/// The folders the repo scan treats as granted (`privacy::Guard`): those
-/// sessions run in, `~` expanded, each also in its resolved form
-/// (`canon`: `/tmp` is `/private/tmp` on macOS, `/home` may be
-/// `/var/home`), since the walk sees resolved paths. Sorted, distinct.
-pub(crate) fn granted_folders(
-    sessions: Vec<String>,
-    canon: &dyn Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for s in sessions {
-        let s = expand_tilde(s.trim());
-        if s.is_empty() {
-            continue;
-        }
-        if let Some(c) = canon(&s).filter(|c| *c != s) {
-            out.push(c);
-        }
-        out.push(s);
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// `path` resolved (symlinks), unless resolving it could raise a macOS
-/// privacy prompt; None when it can't be.
-pub(crate) fn canonical(path: &str) -> Option<String> {
-    if Guard::new(&[]).prompts(Path::new(path)).is_some() {
-        return None;
-    }
-    std::fs::canonicalize(path)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
 /// `setup.status`: `needed`, the code folder (expanded, "" when unset), and
 /// whether the user skipped setup.
 pub(crate) fn status(d: &Daemon) -> Result<Value> {
@@ -79,10 +44,20 @@ pub(crate) fn status(d: &Daemon) -> Result<Value> {
     Ok(json!({
         "needed": needed(&db, &cfg),
         "code_dir": cfg.session.code_dir_path().unwrap_or_default(),
-        "skipped": answered.is_some_and(|a| a.starts_with("skipped")),
+        "skipped": answered.as_deref().is_some_and(|a| a.starts_with("skipped")),
+        // A code folder was saved through setup before.
+        "done": answered.is_some_and(|a| a.starts_with("done")),
         // As configured (`rlord setup <PATH>` picks what to do with them).
         "repo_roots": cfg.session.repo_roots,
     }))
+}
+
+/// A code folder was saved through setup before (kv `done:`).
+fn done(db: &Db) -> bool {
+    db.kv_get(KV)
+        .ok()
+        .flatten()
+        .is_some_and(|a| a.starts_with("done"))
 }
 
 /// Every folder rlord has seen work in. rlord's own rows under a short DB
@@ -131,9 +106,9 @@ pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
         &rlord_core::import::excluded_dirs(),
         cfg.session.repo_scan_depth,
     );
-    Ok(suggestion_value(&s, &cfg, needed, &Guard::new(&[]), &|p| {
-        p.is_dir()
-    }))
+    let mut v = suggestion_value(&s, &cfg, needed, &Guard::new(), &|p| p.is_dir());
+    v["done"] = json!(done(&d.db()));
+    Ok(v)
 }
 
 /// The `setup.suggest` answer for a suggestion. `is_dir` is asked only of
@@ -210,19 +185,16 @@ pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
     let named = params["code_dir"]
         .as_str()
         .is_some_and(|c| !c.trim().is_empty());
-    let sugg = if named {
+    let mut sugg = if named {
         let cfg = d.config();
         let needed = needed(&d.db(), &cfg);
-        suggestion_value(
-            &Suggestion::default(),
-            &cfg,
-            needed,
-            &Guard::new(&[]),
-            &|p| p.is_dir(),
-        )
+        suggestion_value(&Suggestion::default(), &cfg, needed, &Guard::new(), &|p| {
+            p.is_dir()
+        })
     } else {
         suggest(d, &json!({}))?
     };
+    sugg["done"] = json!(done(&d.db()));
     let r = queue_confirm(d, params, sugg)?;
     crate::ui::show_list(d)?;
     Ok(r)
@@ -232,29 +204,18 @@ pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
 /// form's UI command, with `sugg` (`setup.suggest`) for its choices.
 fn queue_confirm(d: &Daemon, params: &Value, sugg: Value) -> Result<Value> {
     let mut prefill = serde_json::Map::new();
-    let folder = |raw: &str| -> Result<String> {
-        let p = expand_tilde(raw.trim());
-        let p = p.trim_end_matches('/');
-        if p.is_empty() || !Path::new(p).is_absolute() {
-            bail!(
-                "{raw}: pass a full path (like ~/code or /Users/me/code), not a relative one or /"
-            );
-        }
-        Ok(p.to_string())
-    };
     if let Some(c) = params["code_dir"].as_str().filter(|c| !c.trim().is_empty()) {
-        prefill.insert("code_dir".into(), json!(folder(c)?));
+        prefill.insert("code_dir".into(), json!(absolute_dir(c)?));
     }
+    // Omitted: leave the configured roots. `[]`: only the code folder.
     if let Some(a) = params["repo_roots"].as_array() {
         let roots = a
             .iter()
             .filter_map(Value::as_str)
             .filter(|r| !r.trim().is_empty())
-            .map(folder)
+            .map(absolute_dir)
             .collect::<Result<Vec<_>>>()?;
-        if !roots.is_empty() {
-            prefill.insert("repo_roots".into(), json!(roots));
-        }
+        prefill.insert("repo_roots".into(), json!(roots));
     }
     for k in ["description", "note"] {
         if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
@@ -294,28 +255,31 @@ fn apply_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .context("code_dir: the folder to save (or skip: true)")?;
-    let dir = expand_tilde(raw);
-    let dir = dir.trim_end_matches('/').to_string();
-    if !Path::new(&dir).is_absolute() || dir.is_empty() {
-        bail!("{raw}: give a full path (like ~/code)");
-    }
+    let dir = absolute_dir(raw)?;
     let roots = match &params["roots"] {
         Value::Null => RootsEdit::Leave,
         Value::String(s) if s == "leave" => RootsEdit::Leave,
         Value::String(s) if s == "follow" => RootsEdit::Follow,
-        Value::Array(a) => RootsEdit::Set(
-            a.iter()
+        // `[]` is the same as follow: only the code folder.
+        Value::Array(a) => {
+            let list = a
+                .iter()
                 .filter_map(Value::as_str)
-                .map(|r| contract_tilde(&expand_tilde(r.trim())))
-                .filter(|r| !r.is_empty())
-                .collect(),
-        ),
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| absolute_dir(r).map(|r| contract_tilde(&r)))
+                .collect::<Result<Vec<_>>>()?;
+            if list.is_empty() {
+                RootsEdit::Follow
+            } else {
+                RootsEdit::Set(list)
+            }
+        }
         other => bail!("roots: \"leave\", \"follow\" or a list of folders, not {other}"),
     };
     // A folder macOS guards isn't touched (the user named it: it is saved
     // as given); any other must exist, or be created when asked.
     let mut created = false;
-    if Guard::new(&[]).prompts(Path::new(&dir)).is_none() && !Path::new(&dir).is_dir() {
+    if Guard::new().prompts(Path::new(&dir)).is_none() && !Path::new(&dir).is_dir() {
         if params["create"] != true {
             bail!("{} doesn't exist (create it?)", contract_tilde(&dir));
         }
@@ -346,21 +310,6 @@ mod tests {
 
     fn daemon() -> std::sync::Arc<Daemon> {
         Daemon::new(Db::open_in_memory().unwrap(), Config::default())
-    }
-
-    #[test]
-    fn session_folders_are_granted_in_both_forms() {
-        let canon = |p: &str| p.strip_prefix("/tmp").map(|r| format!("/private/tmp{r}"));
-        assert_eq!(
-            granted_folders(vec!["/tmp/a".into(), "/s/app".into(), " ".into()], &canon),
-            ["/private/tmp/a", "/s/app", "/tmp/a"]
-        );
-        assert!(granted_folders(vec![], &canon).is_empty());
-        // For real: a temp dir resolves (on macOS, /var is /private/var).
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().to_string_lossy().into_owned();
-        let real = std::fs::canonicalize(dir.path()).unwrap();
-        assert!(granted_folders(vec![p], &canonical).contains(&real.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -414,7 +363,7 @@ mod tests {
             &s,
             &Config::default(),
             true,
-            &Guard::with(None, false, &[]),
+            &Guard::with(None, false),
             &exists,
         );
         assert_eq!(v["suggestion"]["path"], "/h/ko");
@@ -434,7 +383,7 @@ mod tests {
         // A single explicit root outranks the vote.
         let mut cfg = Config::default();
         cfg.session.repo_roots = vec!["/h/work".into()];
-        let v = suggestion_value(&s, &cfg, false, &Guard::with(None, false, &[]), &exists);
+        let v = suggestion_value(&s, &cfg, false, &Guard::with(None, false), &exists);
         assert_eq!(v["suggestion"]["path"], "/h/work");
         assert_eq!(v["suggestion"]["from"], "repo_roots");
         assert_eq!(v["suggestion"]["projects"], 1);
@@ -442,7 +391,7 @@ mod tests {
         assert_eq!(v["roots"]["effective"], json!(["/h/work"]));
         // `["~"]` doesn't.
         cfg.session.repo_roots = vec!["~".into()];
-        let v = suggestion_value(&s, &cfg, false, &Guard::with(None, false, &[]), &exists);
+        let v = suggestion_value(&s, &cfg, false, &Guard::with(None, false), &exists);
         assert_eq!(v["suggestion"]["path"], "/h/ko");
         // No signal.
         let v = suggestion_value(
@@ -458,7 +407,7 @@ mod tests {
     #[test]
     fn a_guarded_candidate_is_flagged_not_stated() {
         let s = sugg("/h/Documents/code", &[], &["/h/Documents/code/a"]);
-        let guard = Guard::with(Some(Path::new("/h")), false, &[]);
+        let guard = Guard::with(Some(Path::new("/h")), false);
         let v = suggestion_value(&s, &Config::default(), true, &guard, &|p| {
             panic!("stat-ed {}", p.display())
         });
@@ -488,7 +437,18 @@ mod tests {
         let e = queue_confirm(&d, &json!({"code_dir": "ko"}), sugg.clone()).unwrap_err();
         assert!(e.to_string().contains("full path"), "{e}");
         assert!(queue_confirm(&d, &json!({"code_dir": "/"}), sugg.clone()).is_err());
-        assert!(queue_confirm(&d, &json!({"repo_roots": ["x"]}), sugg).is_err());
+        assert!(queue_confirm(&d, &json!({"repo_roots": ["x"]}), sugg.clone()).is_err());
+        // `[]` is passed on (only the code folder); omitted stays omitted.
+        let r = queue_confirm(
+            &d,
+            &json!({"code_dir": "/h/ko", "repo_roots": []}),
+            sugg.clone(),
+        )
+        .unwrap();
+        assert_eq!(r["shown"]["repo_roots"], json!([]));
+        let r = queue_confirm(&d, &json!({"code_dir": "/h/ko/"}), sugg).unwrap();
+        assert!(r["shown"].get("repo_roots").is_none());
+        assert_eq!(r["shown"]["code_dir"], "/h/ko");
     }
 
     #[test]
@@ -524,6 +484,16 @@ mod tests {
             (r["created"].as_bool(), r["repo_roots"].clone()),
             (Some(false), json!([code_s, "/a", "/b"]))
         );
+        // `[]`: only the code folder (the key goes).
+        let r = apply_at(&d, &json!({"code_dir": code_s, "roots": []}), &cfg).unwrap();
+        assert_eq!(r["repo_roots"], json!([code_s]));
+        assert!(!std::fs::read_to_string(&cfg)
+            .unwrap()
+            .contains("repo_roots"));
+        // A relative root is refused, and nothing is written.
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        assert!(apply_at(&d, &json!({"code_dir": code_s, "roots": ["rel"]}), &cfg).is_err());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
         // `/` and relative paths are refused.
         assert!(apply_at(&d, &json!({"code_dir": "/"}), &cfg).is_err());
         assert!(apply_at(&d, &json!({"code_dir": "code"}), &cfg).is_err());

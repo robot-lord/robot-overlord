@@ -175,7 +175,7 @@ pub fn tools() -> Value {
             json!({
                 "code_dir": s("The folder as you would save it (omit: rlord's suggestion)"),
                 "repo_roots": {"type": "array", "items": {"type": "string"},
-                               "description": "More folders for the repo finder to scan besides code_dir, which it always scans (omit: only the code folder)"},
+                               "description": "More folders for the repo finder to scan besides code_dir, which it always scans. Omit to leave the user's configured ones as they are; [] to scan only code_dir"},
                 "description": s("The user's description, verbatim, when answering a setup request"),
                 "changed": {"type": "array", "items": {"type": "string", "enum": ["code_dir", "repo_roots"]},
                             "description": "Hints you changed from what the user sent"},

@@ -558,6 +558,19 @@ pub fn expand_tilde(p: &str) -> String {
     p.to_string()
 }
 
+/// A folder the user gave, as rlord keeps it: `~` expanded and a trailing
+/// `/` trimmed. It must be absolute and not `/` itself. (A relative path
+/// is the caller's to resolve first, e.g. against the CLI's folder.)
+pub fn absolute_dir(p: &str) -> Result<String> {
+    let raw = p.trim();
+    let e = expand_tilde(raw);
+    let t = e.trim_end_matches('/');
+    if t.is_empty() || !std::path::Path::new(t).is_absolute() {
+        anyhow::bail!("{raw:?}: give a full path, like ~/code (not a relative path, nor /)");
+    }
+    Ok(t.to_string())
+}
+
 /// The inverse of `expand_tilde`: a path under `$HOME` is written `~/...`.
 pub fn contract_tilde(p: &str) -> String {
     match std::env::var_os("HOME") {
@@ -1124,6 +1137,20 @@ mod tests {
         // `[]` reads as unset.
         let c = s("[session]\ncode_dir = \"/c\"\nrepo_roots = []\n");
         assert_eq!(c.scan_roots(), ["/c"]);
+    }
+
+    #[test]
+    fn absolute_dirs() {
+        assert_eq!(absolute_dir(" /a/b/ ").unwrap(), "/a/b");
+        assert!(absolute_dir("/").is_err());
+        assert!(absolute_dir("//").is_err());
+        assert!(absolute_dir("").is_err());
+        assert!(absolute_dir("rel/x").is_err());
+        assert!(absolute_dir("~user/x").is_err());
+        // (`~` itself expands to $HOME, which is absolute when set.)
+        if std::env::var_os("HOME").is_some_and(|h| h.to_string_lossy().starts_with('/')) {
+            assert!(absolute_dir("~/x").unwrap().ends_with("/x"));
+        }
     }
 
     #[test]

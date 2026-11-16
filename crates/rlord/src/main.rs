@@ -1652,8 +1652,8 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         println!("saved to {}", r["config"].as_str().unwrap_or(""));
     };
     if let Some(p) = path {
-        let p = absolute_folder(&p, &cwd);
-        let roots = setup_roots_default(&configured, keep_roots);
+        let p = absolute_folder(&p, &cwd)?;
+        let roots = setup_roots_default(&configured, keep_roots, status["done"] == true);
         let r = call(
             "setup.apply",
             json!({"code_dir": p, "roots": roots, "create": true}),
@@ -1725,8 +1725,8 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         println!("aborted: no folder given");
         return Ok(());
     };
-    let folder = absolute_folder(&folder, &cwd);
-    let mut roots = setup_roots_default(&configured, keep_roots);
+    let folder = absolute_folder(&folder, &cwd)?;
+    let mut roots = setup_roots_default(&configured, keep_roots, status["done"] == true);
     let differs = !configured.is_empty()
         && configured
             .iter()
@@ -1747,7 +1747,7 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
             "leave"
         };
     }
-    let guarded = rlord_core::privacy::Guard::new(&[])
+    let guarded = rlord_core::privacy::Guard::new()
         .prompts(std::path::Path::new(&folder))
         .is_some();
     if !guarded && !std::path::Path::new(&folder).is_dir() {
@@ -1766,10 +1766,11 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
 }
 
 /// What `rlord setup` does with `repo_roots` unless asked: an old `["~"]`
-/// switches to the code folder; anything else is left (`--keep-roots`
-/// always leaves it).
-fn setup_roots_default(configured: &[String], keep_roots: bool) -> &'static str {
-    if !keep_roots && configured.len() == 1 && configured[0].trim() == "~" {
+/// switches to the code folder the first time (`done`: a folder was saved
+/// before, so the roots are the user's); anything else is left
+/// (`--keep-roots` always leaves it).
+fn setup_roots_default(configured: &[String], keep_roots: bool, done: bool) -> &'static str {
+    if !keep_roots && !done && configured.len() == 1 && configured[0].trim() == "~" {
         "follow"
     } else {
         "leave"
@@ -1795,14 +1796,16 @@ fn yes_no(answer: &str, default: bool) -> bool {
 }
 
 /// A folder as typed, made absolute: `~` expanded, a relative path taken
-/// from `cwd`.
-fn absolute_folder(p: &str, cwd: &std::path::Path) -> String {
-    let p = rlord_core::config::expand_tilde(p.trim());
-    if std::path::Path::new(&p).is_absolute() {
-        p
+/// from `cwd`, then checked as every folder rlord saves is
+/// (`config::absolute_dir`: not `/`, trailing `/` trimmed).
+fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
+    let e = rlord_core::config::expand_tilde(p.trim());
+    let abs = if std::path::Path::new(&e).is_absolute() {
+        e
     } else {
-        cwd.join(p).to_string_lossy().into_owned()
-    }
+        cwd.join(e).to_string_lossy().into_owned()
+    };
+    rlord_core::config::absolute_dir(&abs)
 }
 
 fn call(method: &str, params: Value) -> Result<Value> {
@@ -2381,17 +2384,19 @@ mod tests {
     #[test]
     fn setup_prompt_helpers() {
         let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(setup_roots_default(&v(&["~"]), false), "follow");
-        assert_eq!(setup_roots_default(&v(&["~"]), true), "leave");
-        assert_eq!(setup_roots_default(&v(&["~/ko"]), false), "leave");
-        assert_eq!(setup_roots_default(&[], false), "leave");
+        assert_eq!(setup_roots_default(&v(&["~"]), false, false), "follow");
+        assert_eq!(setup_roots_default(&v(&["~"]), false, true), "leave");
+        assert_eq!(setup_roots_default(&v(&["~"]), true, false), "leave");
+        assert_eq!(setup_roots_default(&v(&["~/ko"]), false, false), "leave");
+        assert_eq!(setup_roots_default(&[], false, false), "leave");
         assert_eq!(pick_folder("", Some("~/ko")).as_deref(), Some("~/ko"));
         assert_eq!(pick_folder("  ~/x ", Some("~/ko")).as_deref(), Some("~/x"));
         assert_eq!(pick_folder("", None), None);
         assert!(yes_no("", true) && !yes_no("", false));
         assert!(yes_no("Y", false) && !yes_no("no", true));
-        assert_eq!(absolute_folder("/a", Path::new("/c")), "/a");
-        assert_eq!(absolute_folder("b", Path::new("/c")), "/c/b");
+        assert_eq!(absolute_folder("/a/", Path::new("/c")).unwrap(), "/a");
+        assert_eq!(absolute_folder("b", Path::new("/c")).unwrap(), "/c/b");
+        assert!(absolute_folder("/", Path::new("/c")).is_err());
     }
 
     #[test]
