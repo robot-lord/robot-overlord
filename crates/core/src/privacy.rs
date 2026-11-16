@@ -57,8 +57,9 @@ pub const PROTECTED_HOME_DIRS: &[&str] = &[
 /// read inside a guarded folder (`prompts_within`).
 #[derive(Debug, Clone, Default)]
 pub struct Guard {
-    /// macOS only: the home whose protected folders are guarded.
-    home: Option<PathBuf>,
+    /// macOS only: the home whose protected folders are guarded, as given
+    /// and resolved (paths may come either way).
+    homes: Vec<PathBuf>,
     /// macOS only: guard `/Volumes/*`.
     volumes: bool,
     /// Compare paths ASCII-case-insensitively (macOS volumes usually are).
@@ -70,13 +71,22 @@ impl Guard {
     /// nothing is guarded by name.
     pub fn new() -> Guard {
         let mac = cfg!(target_os = "macos");
-        let home = mac
+        let mut homes = Vec::new();
+        if let Some(h) = mac
             .then(|| std::env::var_os("HOME"))
             .flatten()
             .filter(|h| !h.is_empty())
-            .map(|h| std::fs::canonicalize(&h).unwrap_or_else(|_| PathBuf::from(h)));
+        {
+            let h = PathBuf::from(h);
+            if let Ok(c) = std::fs::canonicalize(&h) {
+                if c != h {
+                    homes.push(c);
+                }
+            }
+            homes.push(h);
+        }
         Guard {
-            home,
+            homes,
             volumes: mac,
             fold_case: mac,
         }
@@ -85,10 +95,18 @@ impl Guard {
     /// A guard with the given home and `/Volumes` rule (tests; macOS-style
     /// case folding when either is on).
     pub fn with(home: Option<&Path>, volumes: bool) -> Guard {
-        Guard {
-            home: home.map(Path::to_path_buf),
+        Guard::with_homes(
+            &home.map(Path::to_path_buf).into_iter().collect::<Vec<_>>(),
             volumes,
-            fold_case: home.is_some() || volumes,
+        )
+    }
+
+    /// `with`, for a home known by more than one path (tests).
+    pub fn with_homes(homes: &[PathBuf], volumes: bool) -> Guard {
+        Guard {
+            homes: homes.to_vec(),
+            volumes,
+            fold_case: !homes.is_empty() || volumes,
         }
     }
 
@@ -108,7 +126,7 @@ impl Guard {
 
     /// The guarded folder `path` is in (or is), if any.
     fn guarded_ancestor(&self, path: &Path) -> Option<PathBuf> {
-        if let Some(home) = &self.home {
+        for home in &self.homes {
             for d in PROTECTED_HOME_DIRS {
                 let g = home.join(d);
                 if self.is_within(path, &g) {
@@ -191,6 +209,24 @@ mod tests {
         let g = Guard::with(None, false);
         assert_eq!(g.prompts(Path::new("/Users/me/Documents")), None);
         assert_eq!(g.prompts(Path::new("/Volumes/X")), None);
+    }
+
+    /// A home behind a symlink is guarded by either path.
+    #[test]
+    fn both_spellings_of_home_are_guarded() {
+        let g = Guard::with_homes(
+            &[PathBuf::from("/home/me"), PathBuf::from("/var/home/me")],
+            false,
+        );
+        assert_eq!(
+            g.prompts(Path::new("/home/me/Documents/a")),
+            Some(Why::MacPrivacy)
+        );
+        assert_eq!(
+            g.prompts(Path::new("/var/home/me/Desktop")),
+            Some(Why::MacPrivacy)
+        );
+        assert_eq!(g.prompts(Path::new("/var/home/me/src")), None);
     }
 
     #[test]

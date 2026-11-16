@@ -276,6 +276,9 @@ struct App {
     /// Control offer, then the code folder) is still running: a dialog
     /// closing goes on to setup (`setup_after_dialog`). Off mid-session.
     startup_chain: bool,
+    /// rlord's code-folder suggestion, once worked out this run: reused by
+    /// later opens (`load_suggestion`).
+    last_suggestion: Option<Value>,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -338,6 +341,7 @@ impl App {
             setup_rx: None,
             setup_put_off: false,
             startup_chain: false,
+            last_suggestion: None,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),

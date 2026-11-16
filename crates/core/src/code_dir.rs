@@ -122,10 +122,21 @@ fn never(d: &Path, homes: &[PathBuf]) -> bool {
         || d.parent() == Some(Path::new("/run/media"))
 }
 
+/// A folder that may be offered as the code folder at all: not `/`, not
+/// `$HOME` or above, not a system or mount parent (`NEVER`).
+pub fn suggestible(d: &Path, homes: &[PathBuf]) -> bool {
+    !never(d, homes)
+}
+
 /// The most common parent of the projects in `seen` (counting each project
 /// once, at most `max_depth` levels below the folder), and up to four
 /// alternatives. Ties go to the deeper folder (an ancestor that covers no
 /// more adds nothing), then the first by name.
+///
+/// Known limit: with no disk access, two subfolders of one repo (sessions
+/// run in `app/src` and `app/docs`) count as two projects, which can lift
+/// the repo itself into the vote; `suggest_except` lets the caller drop
+/// such a candidate.
 /// `homes`: `$HOME` as given and resolved (it may sit behind a symlink,
 /// and paths are recorded either way).
 pub fn suggest(
@@ -134,44 +145,28 @@ pub fn suggest(
     excluded: &[PathBuf],
     max_depth: u8,
 ) -> Suggestion {
-    suggest_with(seen, homes, excluded, max_depth, &|_| false)
+    suggest_except(seen, homes, excluded, max_depth, &|_| false)
 }
 
-/// `suggest`, knowing which folders are git repos (`is_repo`; the caller
-/// decides what it may look at). A folder inside a repo counts as that
-/// repo (two subfolders of one repo are one project), and a repo is never
-/// suggested as the code folder. `$HOME` and above never count as the
-/// enclosing repo (a dotfiles repo there would swallow everything).
-pub fn suggest_with(
+/// How many ranked candidates `suggest_except` asks `skip` about at most.
+const MAX_ASKED: usize = 20;
+
+/// `suggest`, leaving out candidates `skip` says no to (a git repo is no
+/// code folder). `skip` is asked only about candidates about to be shown,
+/// in rank order, and at most `MAX_ASKED` times; a skipped one doesn't hide
+/// its parent.
+pub fn suggest_except(
     seen: &[Seen],
     homes: &[PathBuf],
     excluded: &[PathBuf],
     max_depth: u8,
-    is_repo: &dyn Fn(&Path) -> bool,
+    skip: &dyn Fn(&Path) -> bool,
 ) -> Suggestion {
-    // (Each folder is asked about once.)
-    let cache = std::cell::RefCell::new(std::collections::HashMap::<PathBuf, bool>::new());
-    let repo = |d: &Path| -> bool {
-        if let Some(r) = cache.borrow().get(d) {
-            return *r;
-        }
-        let r = is_repo(d);
-        cache.borrow_mut().insert(d.to_path_buf(), r);
-        r
-    };
-    let enclosing = |p: PathBuf| -> PathBuf {
-        p.ancestors()
-            .take_while(|a| !never(a, homes))
-            .find(|a| repo(a))
-            .map(Path::to_path_buf)
-            .unwrap_or(p)
-    };
     let mut projects: BTreeMap<PathBuf, BTreeSet<&'static str>> = BTreeMap::new();
     for s in seen {
         let Some(p) = project_root(&s.path) else {
             continue;
         };
-        let p = enclosing(p);
         // `$HOME` itself, a folder directly in `/`, rlord's data and temp
         // dirs: never a project.
         if homes.contains(&p)
@@ -193,7 +188,7 @@ pub fn suggest_with(
     for p in projects.keys() {
         let depth = p.components().count();
         for d in p.ancestors().skip(1) {
-            if never(d, homes) || repo(d) {
+            if never(d, homes) {
                 continue;
             }
             if depth - d.components().count() <= max_depth as usize {
@@ -208,14 +203,19 @@ pub fn suggest_with(
             .then(a.cmp(b))
     });
     let mut picked: Vec<(PathBuf, usize)> = Vec::new();
+    let mut asked = 0;
     for (d, n) in ranked {
-        if picked.len() == 5 {
+        if picked.len() == 5 || asked == MAX_ASKED {
             break;
         }
         if picked
             .iter()
             .any(|(p, _)| p.starts_with(&d) || d.starts_with(p))
         {
+            continue;
+        }
+        asked += 1;
+        if skip(&d) {
             continue;
         }
         picked.push((d, n));
@@ -353,28 +353,20 @@ mod tests {
         );
         assert!(never(Path::new("/run/media/me"), homes));
         assert!(!never(Path::new("/srv/code"), homes));
-        // A folder inside a repo counts as the repo; a repo (here one
-        // nested in another) is never the suggestion.
-        let repos = ["/h/ko/app", "/h/ko/mono", "/h/ko/mono/vendor/lib"];
-        let is_repo = |d: &Path| repos.iter().any(|r| d == Path::new(r));
-        let s = suggest_with(
-            &seen(&[
-                "/h/ko/app/src",
-                "/h/ko/app/docs",
-                "/h/ko/mono/vendor/lib/x",
-                "/h/ko/b",
-            ]),
-            home,
+        // A repo among the candidates is left out, and its parent still
+        // shows (two subfolders of one repo lifted it into the vote).
+        let h = &[PathBuf::from("/h")];
+        let s = suggest_except(
+            &seen(&["/h/ko/app/src", "/h/ko/app/docs", "/h/ko/b"]),
+            h,
             &[],
             3,
-            &is_repo,
-        );
-        assert_eq!(
-            s.projects,
-            ["/h/ko/app", "/h/ko/b", "/h/ko/mono/vendor/lib"]
+            &|d| d == Path::new("/h/ko/app"),
         );
         assert_eq!(best(&s), Some("/h/ko"));
-        assert!(s.alternatives.iter().all(|c| !is_repo(Path::new(&c.path))));
+        assert!(s.alternatives.iter().all(|c| c.path != "/h/ko/app"));
+        assert!(suggestible(Path::new("/h/ko"), homes));
+        assert!(!suggestible(Path::new("/var/home"), homes));
         // (And `sources` parse for `basis`.)
         let mut src = sources_of(&serde_json::json!({"claude": 2, "rlord": 1}));
         src.sort();

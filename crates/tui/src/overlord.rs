@@ -265,6 +265,11 @@ impl App {
             self.saved_sel = Some(id.clone());
             self.pending_select = Some(id);
         }
+        // The startup sequence: the overlord's dialogs, then the code
+        // folder (setupform.rs). A dialog that opens here goes on to setup
+        // when it closes; otherwise setup is checked now. (Set before a
+        // pending command too: a dialog it opens still leads to setup.)
+        self.startup_chain = true;
         if let Some(cmd) = self
             .call("ui.pending", Value::Null)
             .filter(|c| !c.is_null())
@@ -272,10 +277,6 @@ impl App {
             self.handle_ui_cmd(cmd);
             return; // the overlord asked for something; don't bury it
         }
-        // The startup sequence: the overlord's dialogs, then the code
-        // folder (setupform.rs). A dialog that opens here goes on to setup
-        // when it closes; otherwise setup is checked now.
-        self.startup_chain = true;
         self.check_overlord();
         if matches!(self.mode, Mode::Normal) {
             self.setup_after_dialog();
@@ -539,7 +540,11 @@ impl App {
                 self.status_line = "the overlord opened the key screen".into();
             }
             // Never over something the user is typing into.
-            Some("setup") if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Setup(_)) => {
+            // (A setup form the user is working in counts as busy too.)
+            Some("setup")
+                if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Setup(_))
+                    || matches!(&self.mode, Mode::Setup(f) if f.is_touched()) =>
+            {
                 self.pending_setup = Some(cmd.clone());
                 self.status_line =
                     "the overlord wants to open setup: finish here, then :setup".into();

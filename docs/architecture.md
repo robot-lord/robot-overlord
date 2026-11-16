@@ -1204,14 +1204,17 @@ can read without walking the disk (`daemon/src/setup.rs`, bounded): the
 newest Claude Code project dirs (a `cwd` whose slug matches, from the
 first of a few transcripts that has one), Codex's `threads.cwd`, OpenCode's top-level
 `session_v2.directory` (only that table: the DB holds credentials), rlord's
-repos and session folders, and the launch folder. A folder inside a git
-repo counts as that repo (`.git` is looked for only where no macOS
-prompt guards), and a repo is never the suggestion. Each project counts
+repos and session folders, and the launch folder. The vote is string work
+only; then a candidate about to be shown that is a git repo is left out
+(`.git` is looked for only under `$HOME` and where no macOS prompt
+guards, so no stat reaches `/net` or `/mnt`). Two subfolders of one repo
+still count as two projects (a known limit). Each project counts
 once; the folder holding the most within `repo_scan_depth` wins (ties: the
 deeper), never `$HOME` or above (as given or resolved), nor a system or
 mount parent (`/Volumes`, `/mnt`, `/run/media/<user>`, `/var`, …:
-`code_dir::NEVER`). A single explicit root other than `~`
-outranks it. Only the folders shown are `stat`-ed, and only when no
+`code_dir::NEVER`). A single explicit root outranks it when it
+could be suggested itself (not `$HOME` in any spelling, a system parent
+or a repo). Only the folders shown are `stat`-ed, and only when no
 privacy prompt guards them.
 
 It follows describe, then confirm (`tui/src/setupform.rs`), with one

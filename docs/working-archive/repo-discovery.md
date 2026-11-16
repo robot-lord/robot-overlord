@@ -26,6 +26,10 @@ repo scan, "Setup: the code folder") and `docs/guide.md` ("The overlord",
   Harmless while nothing blocks for long.
 - **`privacy::Guard` relies on `$HOME`.** The macOS daemon runs from a
   user LaunchAgent, so `$HOME` is set.
+- **Subfolders of one repo count twice in the code-folder vote.** The
+  vote is plain string work; only the candidates about to be shown are
+  checked for being a repo (under `$HOME`). Sessions in `app/src` and
+  `app/docs` can still lift `app`'s parent's score.
 - **Other code that touches folders unprompted doesn't ask the guard
   yet**: `methods::repo_list`'s `is_dir` on known repos,
   `import::add_git_info`.

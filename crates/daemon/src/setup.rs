@@ -153,29 +153,53 @@ pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
     let seen = collect(d, params["launch_dir"].as_str());
     let cfg = d.config();
     let Answered { needed, done, .. } = answered(d, &cfg);
-    // A folder inside a repo counts as the repo, and a repo is never the
-    // suggestion: `.git` is looked for only where no macOS prompt guards.
     let guard = Guard::new();
-    let is_repo = |p: &Path| guard.prompts(p).is_none() && p.join(".git").exists();
-    let s = code_dir::suggest_with(
+    // (`$HOME` and above are never offered; rlord's data and temp dirs hold
+    // no projects.)
+    let homes = with_resolved(vec![PathBuf::from(
+        std::env::var_os("HOME").unwrap_or_default(),
+    )]);
+    let is_repo = |p: &Path| is_home_repo(p, &homes, &guard);
+    let s = code_dir::suggest_except(
         &seen,
-        // (`$HOME` and above are never offered; rlord's data and temp dirs
-        // hold no projects.)
-        &with_resolved(vec![PathBuf::from(
-            std::env::var_os("HOME").unwrap_or_default(),
-        )]),
+        &homes,
         &with_resolved(rlord_core::import::excluded_dirs()),
         cfg.session.repo_scan_depth,
         &is_repo,
     );
-    let mut v = suggestion_value(&s, &cfg, needed, &guard, &|p| p.is_dir());
+    let look = Look {
+        guard: &guard,
+        homes: &homes,
+        is_dir: &|p| p.is_dir(),
+        is_repo: &is_repo,
+    };
+    let mut v = suggestion_value_with(&s, &cfg, needed, &look);
     v["done"] = json!(done);
     v["roots_default"] = json!(default_roots(&cfg, done));
     Ok(v)
 }
 
-/// The `setup.suggest` answer for a suggestion. `is_dir` is asked only of
-/// the folders shown, and only of those no prompt guards.
+/// A git repo under `$HOME` (given or resolved) that no macOS prompt
+/// guards: no code folder. Nothing outside `$HOME` is looked at, so no
+/// stat reaches `/net`, `/mnt` and the like.
+fn is_home_repo(p: &Path, homes: &[PathBuf], guard: &Guard) -> bool {
+    homes.iter().any(|h| p.starts_with(h) && p != h)
+        && guard.prompts(p).is_none()
+        && p.join(".git").exists()
+}
+
+/// What `suggestion_value_with` may look at.
+struct Look<'a> {
+    guard: &'a Guard,
+    homes: &'a [PathBuf],
+    /// Asked only of the folders shown, and only of those no prompt guards.
+    is_dir: &'a dyn Fn(&Path) -> bool,
+    /// Asked of an explicit root before it is shown.
+    is_repo: &'a dyn Fn(&Path) -> bool,
+}
+
+/// `suggestion_value_with` with no homes and no repos (tests).
+#[cfg(test)]
 fn suggestion_value(
     s: &Suggestion,
     cfg: &Config,
@@ -183,6 +207,18 @@ fn suggestion_value(
     guard: &Guard,
     is_dir: &dyn Fn(&Path) -> bool,
 ) -> Value {
+    let look = Look {
+        guard,
+        homes: &[],
+        is_dir,
+        is_repo: &|_| false,
+    };
+    suggestion_value_with(s, cfg, needed, &look)
+}
+
+/// The `setup.suggest` answer for a suggestion.
+fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look) -> Value {
+    let (guard, is_dir) = (look.guard, look.is_dir);
     let under = |dir: &str| {
         s.projects
             .iter()
@@ -193,10 +229,14 @@ fn suggestion_value(
     // there (a deleted one mustn't push out real candidates); one macOS
     // guards can't be checked, and is kept and flagged.
     let roots = cfg.session.repo_roots.clone();
+    // (Normalized as saved folders are; never `$HOME` or above, in any
+    // spelling, nor a system or mount parent, nor a repo.)
     let explicit = match roots.as_slice() {
-        [r] if r.trim() != "~" && !r.trim().is_empty() => Some(expand_tilde(r.trim())),
+        [r] if r.trim() != "~" => absolute_dir(r).ok(),
         _ => None,
     }
+    .filter(|r| code_dir::suggestible(Path::new(r), look.homes))
+    .filter(|r| !(look.is_repo)(Path::new(r)))
     .filter(|r| {
         let p = Path::new(r);
         guard.prompts(p).is_some() || is_dir(p)
@@ -486,6 +526,35 @@ mod tests {
             &exists,
         );
         assert!(v["suggestion"].is_null());
+    }
+
+    /// An explicit root that is `$HOME` (any spelling), a system parent or
+    /// a repo doesn't go ahead of the vote.
+    #[test]
+    fn an_explicit_root_must_be_suggestible() {
+        let s = sugg("/h/ko", &[], &["/h/ko/a"]);
+        let homes = [PathBuf::from("/h"), PathBuf::from("/real/h")];
+        let guard = Guard::with(None, false);
+        let look = Look {
+            guard: &guard,
+            homes: &homes,
+            is_dir: &|_| true,
+            is_repo: &|p| p == Path::new("/h/ko/app"),
+        };
+        for r in ["/h/", "/real/h", "/h/ko/..", "/Volumes", "/h/ko/app"] {
+            let mut cfg = Config::default();
+            cfg.session.repo_roots = vec![r.into()];
+            let v = suggestion_value_with(&s, &cfg, false, &look);
+            assert_eq!(v["suggestion"]["from"], "vote", "{r}");
+        }
+        let mut cfg = Config::default();
+        cfg.session.repo_roots = vec!["/h/work/".into()];
+        let v = suggestion_value_with(&s, &cfg, false, &look);
+        assert_eq!(v["suggestion"]["path"], "/h/work");
+        // Only under `$HOME` is a repo looked for.
+        let g = Guard::with(None, false);
+        let homes = [PathBuf::from("/nonexistent-home")];
+        assert!(!is_home_repo(Path::new("/mnt/x"), &homes, &g));
     }
 
     /// A deleted explicit root doesn't push out candidates.

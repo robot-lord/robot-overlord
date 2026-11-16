@@ -415,6 +415,11 @@ impl SetupForm {
         })))
     }
 
+    /// The user has typed or moved in it.
+    pub(crate) fn is_touched(&self) -> bool {
+        self.touched
+    }
+
     /// A click on row `i`: select it. True when it already was.
     pub(crate) fn click_row(&mut self, i: usize) -> bool {
         if self.row == i {
@@ -499,7 +504,19 @@ impl App {
 
     /// Work out rlord's suggestion on another thread (it reads the agents'
     /// files); `poll_setup` fills the open form with it.
+    /// Only the first open in a run asks the daemon: the answer is kept for
+    /// the run and reused (reopening, an overlord round trip).
     fn load_suggestion(&mut self) {
+        if let Some(v) = self.last_suggestion.clone() {
+            if let Mode::Setup(f) = &mut self.mode {
+                f.fill(&v);
+            }
+            return;
+        }
+        // (Tests never reach a real daemon, nor the agents' files it reads.)
+        if cfg!(test) {
+            return;
+        }
         let launch = std::env::current_dir()
             .ok()
             .and_then(|d| rlord_core::git::main_repo_root(&d.to_string_lossy()));
@@ -528,6 +545,9 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => Value::Null,
         };
         self.setup_rx = None;
+        if !v.is_null() {
+            self.last_suggestion = Some(v.clone());
+        }
         match &mut self.mode {
             Mode::Setup(f) if f.loading => {
                 f.fill(&v);
@@ -1264,6 +1284,44 @@ mod tests {
             panic!("form not open")
         };
         assert!(f.auto && f.then_overlord);
+    }
+
+    /// The suggestion is asked for once a run: a reopened form (and an
+    /// overlord round trip) reuses it.
+    #[test]
+    fn the_suggestion_is_reused_within_a_run() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.last_suggestion = Some(sugg(Some("/elsewhere/ko"), &[]));
+        app.open_setup_from(&json!({"cmd": "setup", "prefill": {"note": "n"},
+                                    "status": {"code_dir": "", "repo_roots": []}}));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert!(!f.loading && app.setup_rx.is_none());
+        assert_eq!((f.code_dir.as_str(), f.choices.len()), ("/elsewhere/ko", 2));
+    }
+
+    /// A form the user is working in isn't replaced by a proposal: it is
+    /// parked for `:setup`.
+    #[test]
+    fn a_proposal_waits_while_the_user_works_in_the_form() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = SetupForm::from_suggest(&sugg(Some("/elsewhere/ko"), &[]), false, false);
+        f.touched = true;
+        f.code_dir = "/mine".into();
+        app.mode = Mode::Setup(Box::new(f));
+        app.handle_ui_cmd(json!({"cmd": "setup", "prefill": {"code_dir": "/p"},
+                                 "status": {"code_dir": "", "repo_roots": []}}));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form gone")
+        };
+        assert_eq!(f.code_dir, "/mine");
+        assert!(app.pending_setup.is_some());
+        assert!(app.status_line.contains(":setup"));
     }
 
     /// Mid-session (the startup sequence over), closing a dialog doesn't

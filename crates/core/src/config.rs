@@ -564,11 +564,27 @@ pub fn expand_tilde(p: &str) -> String {
 pub fn absolute_dir(p: &str) -> Result<String> {
     let raw = p.trim();
     let e = expand_tilde(raw);
-    let t = e.trim_end_matches('/');
-    if t.is_empty() || !std::path::Path::new(t).is_absolute() {
-        anyhow::bail!("{raw:?}: give a full path, like ~/code (not a relative path, nor /)");
+    let bad =
+        || anyhow::anyhow!("{raw:?}: give a full path, like ~/code (not a relative path, nor /)");
+    if !std::path::Path::new(&e).is_absolute() {
+        return Err(bad());
     }
-    Ok(t.to_string())
+    // Lexically: `.` dropped, `..` steps up (no disk access).
+    let mut out = std::path::PathBuf::from("/");
+    for c in std::path::Path::new(&e).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => {}
+        }
+    }
+    let t = out.to_string_lossy().into_owned();
+    if t == "/" {
+        return Err(bad());
+    }
+    Ok(t)
 }
 
 /// `repo_roots` name a folder besides the code folder (so there is a
@@ -1166,6 +1182,8 @@ mod tests {
     #[test]
     fn absolute_dirs() {
         assert_eq!(absolute_dir(" /a/b/ ").unwrap(), "/a/b");
+        assert_eq!(absolute_dir("/a/./b/../c").unwrap(), "/a/c");
+        assert!(absolute_dir("/a/..").is_err());
         assert!(absolute_dir("/").is_err());
         assert!(absolute_dir("//").is_err());
         assert!(absolute_dir("").is_err());

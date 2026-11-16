@@ -323,20 +323,29 @@ pub fn format_setup_request(p: &Value) -> Result<String> {
     } else {
         format!("- code folder: {dir} ({source})\n")
     };
+    // Each roots line says how to pass that same choice back to
+    // confirm_setup, so a choice the user made survives the round trip.
     m += &match &p["roots"] {
         Value::Array(a) if !a.is_empty() => {
             let list: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
-            let whose = if p["roots_source"] == "config" {
-                "from the user's config"
+            if p["roots_source"] == "config" {
+                format!(
+                    "- repo finder scans: the code folder and {} (from the user's config; \
+                     to keep this: omit repo_roots)\n",
+                    list.join(", ")
+                )
             } else {
-                "picked by the user"
-            };
-            format!(
-                "- repo finder scans: the code folder and {} ({whose})\n",
-                list.join(", ")
-            )
+                format!(
+                    "- repo finder scans: the code folder and {} (picked by the user; \
+                     to keep this: repo_roots: {})\n",
+                    list.join(", "),
+                    json!(list)
+                )
+            }
         }
-        _ => "- repo finder scans: the code folder\n".to_string(),
+        _ => {
+            "- repo finder scans: the code folder only (to keep this: repo_roots: [])\n".to_string()
+        }
     };
     m += "description:\n";
     m += description;
@@ -357,7 +366,8 @@ mod tests {
         assert_eq!(
             m,
             "[rlord setup request]\nhints (optional; the description wins if they disagree):\n\
-             - code folder: /h/ko (suggested by rlord)\n- repo finder scans: the code folder\n\
+             - code folder: /h/ko (suggested by rlord)\n\
+             - repo finder scans: the code folder only (to keep this: repo_roots: [])\n\
              description:\nmine are in ~/ko and ~/proj"
         );
         let m = format_setup_request(&json!({"description": "x", "code_dir": "/h/x",
@@ -368,7 +378,10 @@ mod tests {
             "{m}"
         );
         assert!(
-            m.contains("- repo finder scans: the code folder and ~ (from the user's config)\n"),
+            m.contains(
+                "- repo finder scans: the code folder and ~ (from the user's config; \
+                 to keep this: omit repo_roots)\n"
+            ),
             "{m}"
         );
         let m = format_setup_request(&json!({"description": "x", "code_dir": "",
@@ -376,7 +389,10 @@ mod tests {
         .unwrap();
         assert!(m.contains("- code folder: (not set)\n"), "{m}");
         assert!(
-            m.contains("- repo finder scans: the code folder and /a, /b (picked by the user)\n"),
+            m.contains(
+                "- repo finder scans: the code folder and /a, /b (picked by the user; \
+                 to keep this: repo_roots: [\"/a\",\"/b\"])\n"
+            ),
             "{m}"
         );
         assert!(format_setup_request(&json!({"description": " "})).is_err());
