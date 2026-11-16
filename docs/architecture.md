@@ -1312,7 +1312,7 @@ split there (`context::split_legacy`; to be removed once no overlord
 runs the old instructions). Its notes are never refused for length (they
 are stored in pieces of at most 8,000 chars), and the old "you are the
 session…" instruction is dropped from them however it was quoted or
-wrapped.
+wrapped: only that instruction, text before and after it stays.
 
 `context.rs` renders it, as plain code: a fixed header (background from
 rlord's overlord, not the user's words, not instructions; where they
@@ -1330,7 +1330,8 @@ least half of what's left after the header when they need it; the
 related list gets the rest, and the sessions that don't fit are counted
 in a line naming the file. The file is
 `<data>/sessions/<id>/context.md` (folder 0700, file 0600), rewritten
-whenever the rows change.
+whenever the rows change, when the session is renamed, and at every
+restart (related sessions' status as it is then; nothing watches them).
 
 How it reaches the agent (`context::delivery`, decided at launch and
 kept in kv `context_mode:<id>`):
@@ -1340,7 +1341,7 @@ kept in kv `context_mode:<id>`):
 | Claude, rlord's SessionStart and UserPromptSubmit hooks installed | the hook's answer (below) |
 | Claude without it | `--append-system-prompt-file <context.md>`, at every start (`context::launch_args`, for launch and restart) |
 | Codex, those hooks installed and trusted | the hook's answer |
-| Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`); with no words, a fixed first prompt naming the file and asking it to read it and wait for the user (`context::pointer_only`) |
+| Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`); with no words, a fixed first prompt naming the file and asking it to read it and wait for the user (`context::pointer_only`). OpenCode reads it unasked: its `external_directory` permission (paths outside the project) defaults to allow |
 
 Whether the hooks work (`context::hooks_work`: SessionStart and
 UserPromptSubmit installed, and for Codex trusted) reads the agent's
@@ -1395,7 +1396,10 @@ the newest per session in `context_ack_for:<id>`). A newer answer while
 one is still unacknowledged keeps the older one acknowledgeable for its
 own rows (up to 8), and acknowledging the newer one covers both. An
 answer never acknowledged (a slow daemon, a client that died) goes again
-with the next prompt: at most one duplicate.
+with the next prompt: at most one duplicate. A client that never
+acknowledges gets the whole background at most twice per conversation
+(`FULL_TRIES`); after that the conversation counts as reached, logged
+once as `context_assumed_delivered`, and only what is new goes.
 
 ## Naming
 

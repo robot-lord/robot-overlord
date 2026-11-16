@@ -322,6 +322,41 @@ Fixed:
 9. `propose_session` stores the resolved ids for `related`, with
    `related_names` for the form's preview.
 
+### Review round 6 (PR #64)
+
+1. OpenCode reading the pointer's file: OpenCode's permission docs
+   (opencode.ai/docs/permissions, checked 2026-11-16 against the
+   installed 2.2.7) say `external_directory` governs paths outside the
+   project, applies to `read`, and "The default policy allows
+   `external_directory`, so external paths are not prompted unless you
+   add a rule". The config schema gives it no other default. So the
+   pointer works unasked on a default setup; no live check needed, and
+   neither (a) inline background nor (b) a copy in the session folder.
+   A user's own `external_directory: ask/deny` rule would make OpenCode
+   ask or refuse: their choice, left alone (we never write their
+   config).
+2. `context.md` is rewritten at every restart and on a rename of the
+   session, as well as when its rows change.
+3. Lost acks: at most two unacknowledged full deliveries per
+   conversation (`FULL_TRIES`, kv `context_full_tries:<id>`); then it
+   counts as reached, logged once (`context_assumed_delivered`) (test).
+4. Pointer-mode restart marks rows seen only after the pane is
+   respawned or created.
+5. `private.rs` test no longer asserts the parent folder's mode (umask).
+6. `split_legacy` removes only the old instruction (to its last words,
+   else its sentence), keeping text before and after it in the paragraph
+   (test with no blank line).
+7. `set_mode` lost its `sent` flag: every mode but `Hook` sends at launch
+   (the pointer goes alone when there are no words); `launch_prompt`
+   returns just the prompt.
+8. `send_hook_ack` uses `client_call_within` (`client_call` with an
+   optional timeout).
+9. `overlord.md` keeps one line ("follow what its answer says about
+   delivery"); the values and advice are in the `add_context` schema.
+
+Declined (coordinator): `frame_message` (planned for PR 1); the
+test-only wrapper (already `#[cfg(test)]`).
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the

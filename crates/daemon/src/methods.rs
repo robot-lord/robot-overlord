@@ -162,8 +162,12 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
         "renamed",
         &json!({"from": old, "to": name.trim()}).to_string(),
     )?;
-    // Its tmux session follows the name.
+    // Its tmux session follows the name, and its background file (which
+    // names it).
     let s = db.resolve_ref(&s.id)?;
+    if let Err(e) = context::refresh_file(db, &paths::data_dir(), &s) {
+        tracing::warn!(error = %e, "rewriting the background file");
+    }
     if let Err(e) = sync_tmux_name(db, &s) {
         tracing::warn!(error = %e, "renaming tmux session");
     }
@@ -678,7 +682,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     let mut args = spec_args(agent, &spec);
     args.extend(context::launch_args(delivery, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
-    let (first, sent) = context::launch_prompt(prompt.as_deref(), delivery, &bg_file);
+    let first = context::launch_prompt(prompt.as_deref(), delivery, &bg_file);
     let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
@@ -720,8 +724,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(mode) = delivery {
         context::turn_on(db, &id)?;
         context::store(db, &id, &notes, &links, now)?;
-        // (`sent`: it went in with the launch, not by a hook.)
-        context::set_mode(db, &id, mode, sent, now)?;
+        context::set_mode(db, &id, mode, now)?;
         // (Before the agent starts: it may read it at once.)
         context::refresh_file(db, &base, &db.resolve_ref(&id)?)?;
     }
@@ -955,14 +958,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
-    // Its background as it was launched with (Claude's system prompt
-    // file: rewritten first if it has gone).
+    // Its background as it was launched with, its file rewritten first
+    // (related sessions' status, a rename: as they are now).
     let mut args = spec_args(agent, &spec);
     let mode = context::mode(db, &s.id)?;
     let bg_file = context::file_path(&paths::data_dir(), &s.id);
-    if mode == Some(context::Delivery::SystemPromptFile) && !bg_file.is_file() {
-        context::refresh_file(db, &paths::data_dir(), &s)?;
-    }
+    context::refresh_file(db, &paths::data_dir(), &s)?;
     args.extend(context::launch_args(mode, &bg_file));
     let (mut argv, resumed) = agent.resume(
         s.agent_session.as_deref(),
@@ -972,13 +973,11 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &args,
     )?;
     // A Pointer-mode session starting a new conversation: the pointer
-    // again, as its first prompt (its rows then count as handed over).
-    if let Some(p) = context::restart_prompt(mode, resumed, &bg_file) {
-        context::refresh_file(db, &paths::data_dir(), &s)?;
-        agent.add_first_prompt(&mut argv, &p);
-        if let Some(last) = db.context_rows(&s.id)?.last() {
-            db.context_mark_seen(&s.id, last.id, now_ms())?;
-        }
+    // again, as its first prompt (its rows count as handed over once the
+    // pane is up, below).
+    let pointer = context::restart_prompt(mode, resumed, &bg_file);
+    if let Some(p) = &pointer {
+        agent.add_first_prompt(&mut argv, p);
     }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
@@ -995,6 +994,11 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
     let now = now_ms();
+    if pointer.is_some() {
+        if let Some(last) = db.context_rows(&s.id)?.last() {
+            db.context_mark_seen(&s.id, last.id, now)?;
+        }
+    }
     db.set_status(&s.id, Status::Starting, now)?;
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
@@ -2168,10 +2172,10 @@ mod tests {
                 .clone()
         };
         assert_eq!(add("a", true), "next_prompt");
-        context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, true, 1).unwrap();
+        context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, 1).unwrap();
         assert_eq!(add("b", true), "next_prompt");
         assert_eq!(add("c", false), "next_start");
-        context::set_mode(&db, "01b", context::Delivery::Pointer, true, 1).unwrap();
+        context::set_mode(&db, "01b", context::Delivery::Pointer, 1).unwrap();
         assert_eq!(add("d", false), "file_only");
     }
 

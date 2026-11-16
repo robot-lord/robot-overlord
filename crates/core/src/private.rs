@@ -129,8 +129,6 @@ mod tests {
         let fresh = t.path().join("a/robot-overlord");
         dir(&fresh).unwrap();
         assert_eq!(mode(&fresh), 0o700);
-        // Its parent isn't rlord's: made as the system makes folders.
-        assert_ne!(mode(&t.path().join("a")), 0o700);
         // Made again: fine.
         dir(&fresh).unwrap();
 

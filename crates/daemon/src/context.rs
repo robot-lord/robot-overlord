@@ -42,6 +42,8 @@ const LEGACY_HEADING: &str = "## Context from the overlord";
 /// The sentence old instructions had the overlord end its notes with; the
 /// header says it now.
 const LEGACY_WORKER_LINE: &str = "You are the session the user asked for";
+/// How that instruction ended (lowercased, as matched).
+const LEGACY_WORKER_END: &str = "hand the whole task to one";
 
 /// kv key: this session has background from the overlord (it launched
 /// it), even with no notes or links.
@@ -66,6 +68,16 @@ fn mode_key(id: &str) -> String {
 fn ack_key(ack: &str) -> String {
     format!("context_ack:{ack}")
 }
+
+/// kv key: full answers to one conversation not acknowledged yet
+/// (`{conv, n}`).
+fn tries_key(id: &str) -> String {
+    format!("context_full_tries:{id}")
+}
+
+/// Unacknowledged full answers to one conversation before it counts as
+/// reached anyway.
+const FULL_TRIES: u64 = 2;
 
 /// Unacknowledged older answers kept acknowledgeable per session, at most.
 const OLDER_MAX: usize = 8;
@@ -406,19 +418,13 @@ pub fn restart_prompt(mode: Option<Delivery>, resumed: bool, file: &Path) -> Opt
 }
 
 /// A new session's first prompt as typed, given the user's words and how
-/// its background goes (None: it has none), and whether the background
-/// went out with the launch another way than a hook (the system prompt
-/// flag; the pointer line, after the words or alone).
-pub fn launch_prompt(
-    prompt: Option<&str>,
-    mode: Option<Delivery>,
-    file: &Path,
-) -> (Option<String>, bool) {
+/// its background goes (None: it has none). In Pointer mode the pointer
+/// always goes: after the words, or alone.
+pub fn launch_prompt(prompt: Option<&str>, mode: Option<Delivery>, file: &Path) -> Option<String> {
     match (prompt, mode) {
-        (Some(p), Some(Delivery::Pointer)) => (Some(with_pointer(p, file)), true),
-        (None, Some(Delivery::Pointer)) => (Some(pointer_only(file)), true),
-        (p, Some(Delivery::SystemPromptFile)) => (p.map(str::to_string), true),
-        (p, _) => (p.map(str::to_string), false),
+        (Some(p), Some(Delivery::Pointer)) => Some(with_pointer(p, file)),
+        (None, Some(Delivery::Pointer)) => Some(pointer_only(file)),
+        (p, _) => p.map(str::to_string),
     }
 }
 
@@ -481,27 +487,52 @@ fn without_worker_line(notes: &str) -> String {
     }
     let mut kept: Vec<String> = Vec::new();
     for p in paragraphs.iter().filter(|p| !p.is_empty()) {
-        let flat = p.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-        // The paragraph lowercased without quote marks, and where each of
-        // its characters came from in `flat`.
+        let text = p.join("\n");
+        // The paragraph lowercased, without quote marks, whitespace runs
+        // (line breaks too) as one space; and where each of its bytes
+        // came from in `text`.
         let mut norm = String::new();
         let mut from = Vec::new();
-        for (i, c) in flat.char_indices().filter(|(_, c)| !is_quote_mark(*c)) {
+        for (i, c) in text.char_indices().filter(|(_, c)| !is_quote_mark(*c)) {
+            if c.is_whitespace() {
+                if !norm.ends_with(' ') {
+                    norm.push(' ');
+                    from.push(i);
+                }
+                continue;
+            }
             for lc in c.to_lowercase() {
                 norm.push(lc);
                 from.extend(std::iter::repeat_n(i, lc.len_utf8()));
             }
         }
-        match norm.find(&wanted) {
-            None => kept.push(p.join("\n")),
-            Some(at) => {
-                let head = flat[..from[at]]
-                    .trim_end_matches(|c: char| c.is_whitespace() || is_quote_mark(c));
-                if head.chars().any(char::is_alphanumeric) {
-                    kept.push(head.to_string());
-                }
-            }
-        }
+        let Some(at) = norm.find(&wanted) else {
+            kept.push(text);
+            continue;
+        };
+        // Where it ends: after its last words when they are there, else at
+        // the end of its first sentence.
+        let rest = &norm[at..];
+        let end = match rest.find(LEGACY_WORKER_END) {
+            Some(e) => at + e + LEGACY_WORKER_END.len(),
+            None => rest
+                .match_indices(['.', '!', '?'])
+                .map(|(i, _)| at + i + 1)
+                .find(|&i| norm[i..].is_empty() || norm[i..].starts_with(' '))
+                .unwrap_or(norm.len()),
+        };
+        let cut = |c: char| c.is_whitespace() || is_quote_mark(c);
+        let head = text[..from[at]].trim_end_matches(cut);
+        let tail_at = from.get(end).copied().unwrap_or(text.len());
+        let tail = text[tail_at..].trim_start_matches(|c: char| cut(c) || c == '.');
+        let keep = |s: &str| s.chars().any(char::is_alphanumeric);
+        let joined = match (keep(head), keep(tail)) {
+            (true, true) => format!("{head}\n{tail}"),
+            (true, false) => head.to_string(),
+            (false, true) => tail.to_string(),
+            (false, false) => continue,
+        };
+        kept.push(joined);
     }
     kept.join("\n\n").trim().to_string()
 }
@@ -673,13 +704,13 @@ pub fn launch_args(mode: Option<Delivery>, file: &Path) -> Vec<String> {
 }
 
 /// Record how session `id`'s background reaches its agent, at launch.
-/// `sent`: it went in at launch another way than a hook (the system prompt
-/// flag, the pointer line after a prompt): its rows then count as seen, so
-/// a hook that does fire hands over only what is added later. (Not sent,
-/// e.g. no prompt to put the pointer after: they stay unseen.)
-pub fn set_mode(db: &Db, id: &str, mode: Delivery, sent: bool, now: i64) -> Result<()> {
+/// Any mode but `Hook` sends it with the launch (the system prompt flag;
+/// the pointer, after the words or alone: `launch_prompt`): its rows then
+/// count as seen, so a hook that does fire hands over only what is added
+/// later.
+pub fn set_mode(db: &Db, id: &str, mode: Delivery, now: i64) -> Result<()> {
     db.kv_set(&mode_key(id), mode.as_str())?;
-    if mode != Delivery::Hook && sent {
+    if mode != Delivery::Hook {
         if let Some(last) = db.context_rows(id)?.last() {
             db.context_mark_seen(id, last.id, now)?;
         }
@@ -923,8 +954,40 @@ pub fn hook_reply_from(
         }
         _ => false,
     };
+    // Full answers to this conversation that were never acknowledged:
+    // after `FULL_TRIES` of them it counts as reached (a client that never
+    // acks must not get the whole background with every prompt).
+    let tries: Value = db
+        .kv_get(&tries_key(&s.id))?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(Value::Null);
+    let tried = if tries["conv"] == conv {
+        tries["n"].as_u64().unwrap_or(0)
+    } else {
+        0
+    };
+    let same_conv = same_conv || {
+        let give_up = by_hook && tried >= FULL_TRIES;
+        if give_up {
+            db.kv_set(&delivered_key(&s.id), conv)?;
+            db.kv_delete(&tries_key(&s.id))?;
+            db.insert_event(
+                &s.id,
+                rlord_core::types::now_ms(),
+                "context_assumed_delivered",
+                &json!({"unacknowledged": tried}).to_string(),
+            )?;
+        }
+        give_up
+    };
     let restarted = event == "SessionStart" && source != Some("resume");
     let full = by_hook && (!same_conv || restarted);
+    if full {
+        db.kv_set(
+            &tries_key(&s.id),
+            &json!({"conv": conv, "n": tried + 1}).to_string(),
+        )?;
+    }
     let rows = if full {
         db.context_rows(&s.id)?
     } else {
@@ -1017,6 +1080,7 @@ pub fn ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     }
     if pending["full"] == true {
         db.kv_set(&delivered_key(id), pending["conv"].as_str().unwrap_or(""))?;
+        db.kv_delete(&tries_key(id))?;
     }
     db.insert_event(
         id,
@@ -1166,6 +1230,21 @@ mod tests {
             notes.as_deref(),
             Some("Repo is /r/web.\n\nRemember:\n\nBranch is main.")
         );
+    }
+
+    #[test]
+    fn text_after_the_old_instruction_in_its_paragraph_stays() {
+        let p = "Fix it.\n## Context from the overlord\nRepo is /r/web.\n\
+                 You are the session the user asked for: do this task here, in this \
+                 conversation. Use subagents only for parts of it, or where the task \
+                 itself asks for several of them; don't hand the whole task to one.\n\
+                 Branch is main.";
+        let (_, notes) = split_legacy(p);
+        assert_eq!(notes.as_deref(), Some("Repo is /r/web.\nBranch is main."));
+        // Without its last words: up to the end of its sentence.
+        let p = "Do it.\n## Context from the overlord\nA. You are the session the user \
+                 asked for: do it here. B is next.";
+        assert_eq!(split_legacy(p).1.as_deref(), Some("A.\nB is next."));
     }
 
     #[test]
@@ -1508,6 +1587,35 @@ mod tests {
     }
 
     #[test]
+    fn lost_acks_stop_the_whole_background_after_two() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        let s = db.resolve_ref("a").unwrap();
+        let f = Path::new("/f");
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        let prompt = || {
+            hook_reply(&db, &s, Agent::Claude, "UserPromptSubmit", Some("c"), f)
+                .unwrap()
+                .map(|r| text(&r.output).to_string())
+        };
+        // Never acknowledged: whole twice, then only what is new.
+        assert!(prompt().unwrap().starts_with("# Background from rlord"));
+        assert!(prompt().unwrap().starts_with("# Background from rlord"));
+        let third = prompt().unwrap();
+        assert!(third.starts_with("# rlord background, updated"), "{third}");
+        let logged = |db: &Db| {
+            db.list_events("a", 50)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "context_assumed_delivered")
+                .count()
+        };
+        assert_eq!(logged(&db), 1);
+        let _ = prompt();
+        assert_eq!(logged(&db), 1, "logged once");
+    }
+
+    #[test]
     fn a_replaced_answer_still_counts_once_acknowledged() {
         let db = Db::open_in_memory().unwrap();
         session(&db, "a", "alpha", "");
@@ -1613,14 +1721,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pointer_never_sent_leaves_the_notes_unseen() {
+    fn launched_another_way_its_rows_count_as_handed_over() {
         let db = Db::open_in_memory().unwrap();
         session(&db, "a", "alpha", "");
         store(&db, "a", &["use staging".into()], &[], 1).unwrap();
-        // Pointer mode with no prompt: nothing went out.
-        set_mode(&db, "a", Delivery::Pointer, false, 2).unwrap();
-        assert_eq!(db.context_unseen("a").unwrap().len(), 1);
-        set_mode(&db, "a", Delivery::Pointer, true, 3).unwrap();
+        set_mode(&db, "a", Delivery::Hook, 2).unwrap();
+        assert_eq!(
+            db.context_unseen("a").unwrap().len(),
+            1,
+            "a hook hands it over"
+        );
+        set_mode(&db, "a", Delivery::Pointer, 3).unwrap();
         assert!(db.context_unseen("a").unwrap().is_empty());
     }
 
@@ -1699,23 +1810,18 @@ mod tests {
     fn a_launch_without_words_still_hands_over_its_background() {
         use Delivery::*;
         let f = Path::new("/d/sessions/s/context.md");
-        let (p, sent) = launch_prompt(None, Some(Pointer), f);
-        let p = p.unwrap();
+        let p = launch_prompt(None, Some(Pointer), f).unwrap();
         assert!(p.starts_with("[rlord] Background for this session"));
         assert!(
             p.contains("/d/sessions/s/context.md") && p.contains("wait for the user's request")
         );
-        assert!(sent);
         assert_eq!(
             launch_prompt(Some("Fix it."), Some(Pointer), f),
-            (Some(with_pointer("Fix it.", f)), true)
+            Some(with_pointer("Fix it.", f))
         );
-        assert_eq!(launch_prompt(None, Some(SystemPromptFile), f), (None, true));
-        assert_eq!(
-            launch_prompt(Some("x"), Some(Hook), f),
-            (Some("x".into()), false)
-        );
-        assert_eq!(launch_prompt(None, None, f), (None, false));
+        assert_eq!(launch_prompt(None, Some(SystemPromptFile), f), None);
+        assert_eq!(launch_prompt(Some("x"), Some(Hook), f), Some("x".into()));
+        assert_eq!(launch_prompt(None, None, f), None);
     }
 
     #[test]
@@ -1760,7 +1866,7 @@ mod tests {
         let file = Path::new("/f");
         turn_on(&db, "a").unwrap();
         store(&db, "a", &["use staging".into()], &[], 1).unwrap();
-        set_mode(&db, "a", Delivery::SystemPromptFile, true, 2).unwrap();
+        set_mode(&db, "a", Delivery::SystemPromptFile, 2).unwrap();
         assert_eq!(mode(&db, "a").unwrap(), Some(Delivery::SystemPromptFile));
         // Its launch notes went in as the system prompt: a hook that fires
         // anyway doesn't send them again.

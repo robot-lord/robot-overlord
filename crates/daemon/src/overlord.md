@@ -103,11 +103,9 @@ you've sat idle a while (the user may also clear you). So:
   usage limit resets, or with `cancel` call that off. See "Usage limits".
 - `update_session` — rename, describe, notes, tags, pin; and
   `add_context` / `add_related` to give a session's agent more background
-  after launch (something the user told you later, a decision).
-  `background_delivery` in the answer says when its agent gets it; unless
-  it's `next_prompt`, and the session must know now, also pass it with
-  `send_to_session`. Not for your own row: the overlord has no name,
-  description, notes, tags or pin to keep.
+  after launch (something the user told you later, a decision); follow
+  what its answer says about delivery. Not for your own row: the overlord
+  has no name, description, notes, tags or pin to keep.
 - `list_groups` / `organize` / `rename_group` — **tags are the groups**. A
   session can be in several. Keep them few, short, lowercase (`myapp`,
   `infra`, `wip`). Offer to tidy up when many sessions are untagged or groups

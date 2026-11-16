@@ -914,6 +914,17 @@ pub fn build_id() -> u64 {
 
 /// Blocking one-shot client used by the CLI: connect, send one request, read one response.
 pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Value> {
+    client_call_within(socket_path, method, params, None)
+}
+
+/// `client_call`, giving up on a send or an answer after `timeout` (None:
+/// waits as long as it takes).
+pub fn client_call_within(
+    socket_path: &Path,
+    method: &str,
+    params: Value,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value> {
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path).with_context(|| {
         format!(
@@ -921,6 +932,8 @@ pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Va
             socket_path.display()
         )
     })?;
+    stream.set_write_timeout(timeout)?;
+    stream.set_read_timeout(timeout)?;
     let req = json!({"id": 1, "method": method, "params": params});
     let mut buf = serde_json::to_vec(&req)?;
     buf.push(b'\n');
@@ -1141,21 +1154,13 @@ pub fn send_hook_event_for_reply(
 /// effort, a second at most each way: if it never arrives, the next
 /// prompt gets the same again.
 pub fn send_hook_ack(socket_path: &Path, ack: &str) -> bool {
-    use std::io::{BufRead, BufReader as StdBufReader, Write};
-    use std::time::Duration;
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
-        return false;
-    };
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    let req = json!({"id": 1, "method": "hook.ack", "params": {"ack": ack}});
-    let mut buf = serde_json::to_vec(&req).unwrap_or_default();
-    buf.push(b'\n');
-    if stream.write_all(&buf).is_err() {
-        return false;
-    }
-    let mut line = String::new();
-    matches!(StdBufReader::new(&mut stream).read_line(&mut line), Ok(n) if n > 0)
+    client_call_within(
+        socket_path,
+        "hook.ack",
+        json!({"ack": ack}),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .is_ok()
 }
 
 // ---- hook spool: hook evidence must never be lost to a down daemon ----
