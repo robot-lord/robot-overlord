@@ -503,11 +503,9 @@ impl App {
     }
 
     pub(crate) fn draw_setup_form(&self, f: &mut Frame, s: &SetupForm) {
-        let area = newform::centered(f.area(), 84, 24);
-        f.render_widget(Clear, area);
         let accent = Style::default().fg(theme::accent());
         let muted = theme::muted();
-        let width = area.width.saturating_sub(8).max(10) as usize;
+        let width = f.area().width.min(84).saturating_sub(8).max(10) as usize;
         let mut lines: Vec<Line> = vec![Line::from("")];
         if let Some(n) = &s.note {
             lines.push(Line::from(vec![
@@ -691,6 +689,9 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
+        // As tall as what it shows.
+        let area = newform::centered(f.area(), 84, lines.len() as u16 + 3);
+        f.render_widget(Clear, area);
         self.modal_hits(f.area(), area, &lines);
         for (i, at) in starts.iter().enumerate() {
             self.hits

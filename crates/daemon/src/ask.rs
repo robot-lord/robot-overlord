@@ -312,10 +312,10 @@ pub fn format_setup_request(p: &Value) -> Result<String> {
         .filter(|t| !t.is_empty())
         .context("the description is empty")?;
     let dir = p["code_dir"].as_str().map(str::trim).unwrap_or("");
-    let source = match p["code_dir_source"].as_str() {
-        Some(s @ ("suggested by rlord" | "picked by the user")) => s,
-        _ => "not set",
-    };
+    let source = p["code_dir_source"]
+        .as_str()
+        .filter(|s| matches!(*s, "suggested by rlord" | "picked by the user"))
+        .unwrap_or("not set");
     let mut m = String::from("[rlord setup request]\n");
     m += "hints (optional; the description wins if they disagree):\n";
     m += &if dir.is_empty() || source == "not set" {

@@ -101,7 +101,7 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
         .filter(|d| d.file_type().is_ok_and(|t| t.is_dir()))
         .map(|d| (mtime(&d.path()), d.path()))
         .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by_key(|a| std::cmp::Reverse(a.0));
     dirs.truncate(limit);
     let mut out = Vec::new();
     for (_, dir) in dirs {
