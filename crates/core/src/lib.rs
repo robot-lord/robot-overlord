@@ -10,6 +10,7 @@ pub mod models;
 pub mod names;
 pub mod paths;
 pub mod privacy;
+pub mod private;
 pub mod process;
 pub mod themes;
 pub mod timefmt;

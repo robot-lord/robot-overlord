@@ -217,9 +217,12 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // rlord's data folder and its DB are the user's alone (SQLite gives
+        // the -wal and -shm files the DB file's mode).
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            crate::private::dir(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
+        crate::private::touch(path).with_context(|| format!("creating {}", path.display()))?;
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::init(conn)
     }
@@ -1641,6 +1644,24 @@ mod tests {
             assert_eq!(n, 1, "missing table {table}");
         }
         assert!(db.list_sessions(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_db_and_its_folder_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("robot-overlord");
+        let path = dir.join("state.db");
+        let db = Db::open(&path).unwrap();
+        db.kv_set("k", "v").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // SQLite makes these with the DB file's mode.
+        for side in ["-wal", "-shm"] {
+            let p = dir.join(format!("state.db{side}"));
+            assert_eq!(mode(&p), 0o600, "{side}");
+        }
     }
 
     #[test]

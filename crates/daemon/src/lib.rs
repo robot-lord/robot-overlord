@@ -1085,13 +1085,10 @@ fn spool_path() -> PathBuf {
 pub fn spool_hook_event(params: &Value) -> Result<()> {
     let path = spool_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        rlord_core::private::dir_under(&paths::data_dir(), dir)?;
     }
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut f = rlord_core::private::append(&path)?;
     writeln!(f, "{params}")?;
     Ok(())
 }

@@ -119,14 +119,17 @@ fn start_daemon(socket: &Path, old: Option<i32>) -> Result<()> {
 /// paths it writes into hooks and tmux bindings survive upgrades.
 fn spawn_detached() -> Result<Child> {
     let log = log_path();
+    // Its own folder on Linux (private, as rlord's folders are); a shared
+    // one on macOS (~/Library/Logs), where only the file is rlord's.
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
+        if dir.ends_with("robot-overlord") {
+            rlord_core::private::dir(dir)?;
+        } else {
+            std::fs::create_dir_all(dir)?;
+        }
     }
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .with_context(|| format!("opening {}", log.display()))?;
+    let out =
+        rlord_core::private::append(&log).with_context(|| format!("opening {}", log.display()))?;
     let mut cmd = Command::new(methods::rlord_bin());
     cmd.arg("daemon")
         .stdin(Stdio::null())
@@ -392,7 +395,7 @@ mod service {
 /// would otherwise both get "their" lock and share one state.db.
 pub fn acquire_instance_lock() -> Result<Option<File>> {
     let dir = paths::data_dir();
-    std::fs::create_dir_all(&dir)?;
+    rlord_core::private::dir(&dir)?;
     let path = dir.join("daemon.lock");
     let f = File::create(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: plain syscall on a valid fd we own.

@@ -507,7 +507,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} already exists", path.display());
             }
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+                rlord_core::private::dir(dir)?;
             }
             std::fs::write(&path, Config::default_toml())?;
             println!("wrote {}", path.display());
