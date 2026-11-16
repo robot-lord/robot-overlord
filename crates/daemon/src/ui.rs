@@ -331,7 +331,16 @@ pub fn show_list(d: &Daemon) -> Result<Value> {
 
 pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
     let r = methods::p_str(params, "ref")?;
-    let id = d.db().resolve_ref(r)?.id;
+    let found = d.db().resolve_ref(r)?;
+    let id = found.id.clone();
+    let needs_start = |s: &rlord_core::types::Session| {
+        s.status == Status::Stopped || !s.tmux_session.as_deref().is_some_and(tmux::has_session)
+    };
+    // (Asked before the locks, and only when it will be restarted: see
+    // `Daemon::restart_hooks`.)
+    let hooks = (!overlord::is_overlord_role(&found.role) && needs_start(&found))
+        .then(|| d.restart_hooks(&id))
+        .flatten();
     let s = {
         // (Its lock before the DB: a start or restart may follow.)
         let _session = d.sessions.lock(&id);
@@ -339,10 +348,8 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         let s = db.resolve_ref(&id)?;
         if overlord::is_overlord_role(&s.role) {
             overlord::ensure(&db, &d.config(), &json!({}))?;
-        } else if s.status == Status::Stopped
-            || !s.tmux_session.as_deref().is_some_and(tmux::has_session)
-        {
-            methods::session_restart(&db, &json!({"ref": s.id}))?;
+        } else if needs_start(&s) {
+            methods::session_restart(&db, &json!({"ref": s.id, "hooks_work": hooks}))?;
         }
         db.resolve_ref(&s.id)?
     };
@@ -437,7 +444,7 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
 pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     let mut prefill = Map::new();
     for k in [
-        "repo", "project", "name", "branch", "agent", "model", "prompt",
+        "repo", "project", "name", "branch", "agent", "model", "prompt", "context",
     ] {
         if let Some(v) = params
             .get(k)
@@ -463,6 +470,33 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     }
     if let Some(w) = params.get("workspace").and_then(Value::as_bool) {
         prefill.insert("workspace".into(), json!(w));
+    }
+    // The overlord's background and related sessions, checked now (not
+    // when the user launches): the form shows them, read-only.
+    let related = crate::methods::ref_list(params, "related");
+    {
+        let db = d.db();
+        let (_, ids) = crate::context::check(
+            &db,
+            prefill.get("context").and_then(Value::as_str),
+            &related,
+            None,
+        )?;
+        // The sessions as resolved now (ids), and their names to show.
+        if !ids.is_empty() {
+            let names: Vec<String> = ids
+                .iter()
+                .filter_map(|i| db.resolve_ref(i).ok())
+                .map(|s| crate::context::clean(&s.name))
+                .collect();
+            prefill.insert("related".into(), json!(ids));
+            prefill.insert("related_names".into(), json!(names));
+        }
+    }
+    // What the TUI shows of the overlord's text: no control characters.
+    if let Some(c) = prefill.get("context").and_then(Value::as_str) {
+        let c = crate::context::clean(c);
+        prefill.insert("context".into(), json!(c));
     }
     d.ui_cmd(json!({"cmd": "new_session", "prefill": prefill}));
     show_list(d)?;

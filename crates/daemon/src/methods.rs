@@ -8,7 +8,9 @@ use rlord_core::agents::{claude, codex, install, transcript, Agent, Effect, Inde
 use rlord_core::config::{expand_tilde, Config};
 use rlord_core::db::{Db, NewSession, SessionQuery};
 use rlord_core::types::{new_id, now_ms, Session, Status, Subagent};
-use rlord_core::{git, tmux};
+use rlord_core::{git, paths, tmux};
+
+use crate::context;
 
 /// Known repos for the picker: the configured default first (even if never
 /// used), then most-recently-used.
@@ -138,7 +140,7 @@ pub fn session_unarchive(db: &Db, params: &Value) -> Result<Value> {
 
 /// The overlord's row is fixed: always on top, never renamed, grouped,
 /// described, annotated or archived. Its meta-context is its instructions.
-fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
+pub(crate) fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
     if crate::overlord::is_overlord_role(&s.role) {
         bail!("the overlord can't be {what}");
     }
@@ -160,8 +162,18 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
         "renamed",
         &json!({"from": old, "to": name.trim()}).to_string(),
     )?;
-    // Its tmux session follows the name.
+    // Its tmux session follows the name, and its background file (which
+    // names it).
     let s = db.resolve_ref(&s.id)?;
+    // ... and the files of the sessions that list it as related.
+    let linkers = db.context_linkers(&s.id).unwrap_or_default();
+    for other in
+        std::iter::once(s.clone()).chain(linkers.iter().filter_map(|id| db.resolve_ref(id).ok()))
+    {
+        if let Err(e) = context::refresh_file(db, &paths::data_dir(), &other) {
+            tracing::warn!(session = %other.id, error = %e, "rewriting the background file");
+        }
+    }
     if let Err(e) = sync_tmux_name(db, &s) {
         tracing::warn!(error = %e, "renaming tmux session");
     }
@@ -261,6 +273,81 @@ pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 
+/// Add background for a session: a note (`context`) and links to related
+/// sessions (`related`), from the overlord. Its background file is
+/// rewritten; the agent gets the new part with its next prompt (hooks) or
+/// reads the file.
+pub fn session_context_add(db: &Db, params: &Value) -> Result<Value> {
+    session_context_add_in(db, params, &paths::data_dir())
+}
+
+/// `session_context_add`, with the session files under `base`.
+pub(crate) fn session_context_add_in(
+    db: &Db,
+    params: &Value,
+    base: &std::path::Path,
+) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    refuse_overlord(&s, "given background")?;
+    let (note, links) = context::check(
+        db,
+        params["context"].as_str(),
+        &ref_list(params, "related"),
+        Some(&s.id),
+    )?;
+    let hooks = params.get("hooks_work").and_then(Value::as_bool);
+    context_store(db, &s, note, &links, base, hooks)
+}
+
+/// Store background already through `context::check` (`update_session`
+/// checks before its other edits and stores after them, in-process: never
+/// taken from a caller over RPC), rewrite the file (best effort), and say
+/// how it reaches the agent.
+/// `hooks`: whether rlord's hooks work for its agent (asked outside the
+/// lock: `Daemon::first_background_hooks`), for a session getting its
+/// first background now, which then gets a mode: Hook, or the way an
+/// agent without them gets it.
+pub(crate) fn context_store(
+    db: &Db,
+    s: &Session,
+    note: Option<String>,
+    links: &[String],
+    base: &std::path::Path,
+    hooks: Option<bool>,
+) -> Result<Value> {
+    let s = s.clone();
+    refuse_overlord(&s, "given background")?;
+    let now = now_ms();
+    if context::mode(db, &s.id)?.is_none() {
+        let agent = Agent::named(&s.agent)?;
+        context::record_mode(db, &s.id, context::delivery(agent, hooks.unwrap_or(false)))?;
+    }
+    if context::store(db, &s.id, note.as_slice(), links, now)? {
+        // (Stored either way; the file is best effort.)
+        if let Err(e) = context::refresh_file(db, base, &s) {
+            tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+        }
+        db.insert_event(
+            &s.id,
+            now,
+            "context_added",
+            &json!({"note_chars": note.as_ref().map(|n| n.chars().count()),
+                    "related": links.len()})
+            .to_string(),
+        )?;
+    }
+    // How it reaches the agent, said honestly (see `context::later_delivery`).
+    let mut out = context::listing(db, &s.id)?;
+    out["delivery"] = json!(context::later_delivery(context::mode(db, &s.id)?));
+    Ok(out)
+}
+
+/// A session's background: the overlord's notes and related sessions.
+pub fn session_context(db: &Db, params: &Value) -> Result<Value> {
+    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    context::listing(db, &s.id)
+}
+
 pub fn session_pin(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     let pinned = params
@@ -347,7 +434,7 @@ pub(crate) fn new_on_codex_daemon(
 /// reads them (asked before it runs, to start the server first).
 pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
     let field = |k: &str| params[k].as_str().map(str::trim).filter(|v| !v.is_empty());
-    let Ok(agent) = Agent::named(field("agent").unwrap_or(&cfg.session.agent)) else {
+    let Ok(agent) = agent_param(cfg, params) else {
         return false;
     };
     new_on_codex_daemon(
@@ -356,6 +443,17 @@ pub(crate) fn new_params_on_codex_daemon(cfg: &Config, params: &Value) -> bool {
         field("role").unwrap_or(""),
         &str_list(params, "extra_args"),
     )
+}
+
+/// The agent `session.new`'s params ask for: `agent`, else the
+/// configured session agent. The one place that choice is made (the
+/// launch, the Codex daemon check, the daemon's hooks check).
+pub(crate) fn agent_param(cfg: &Config, params: &Value) -> Result<Agent> {
+    let named = params["agent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
+    Agent::named(named.unwrap_or(&cfg.session.agent))
 }
 
 /// A string-array param (missing / wrong type = empty).
@@ -370,6 +468,16 @@ pub(crate) fn str_list(params: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A list of session refs (strings only, trimmed, blanks dropped; missing:
+/// none). The one parser for `related` / `add_related`, on every path.
+pub(crate) fn ref_list(params: &Value, key: &str) -> Vec<String> {
+    str_list(params, key)
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
 }
 
 pub(crate) fn p_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
@@ -500,7 +608,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(String::from)
     };
-    let agent = Agent::named(&p_opt("agent").unwrap_or_else(|| cfg.session.agent.clone()))?;
+    let agent = agent_param(cfg, params)?;
     // Internal-only knobs (the overlord uses them; the MCP surface never
     // forwards them): adapter flags that must survive restarts, a role, and a
     // fixed tmux name.
@@ -522,7 +630,20 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         let m = cfg.session.model_for(agent).trim();
         (!m.is_empty()).then(|| m.to_string())
     });
+    // The user's words, and the overlord's notes and related sessions
+    // apart from them (checked: too long, refused for the overlord to
+    // shorten).
     let prompt = p_opt("prompt");
+    let (note, links) = context::check(
+        db,
+        p_opt("context").as_deref(),
+        &ref_list(params, "related"),
+        None,
+    )?;
+    let notes: Vec<String> = note.into_iter().collect();
+    // Launched by the overlord (`create_session`, or its proposal the user
+    // launched): its background says so even with no notes.
+    let background = context::needs_background(params);
 
     // Where the session lives: an explicit repo, an explicit plain folder,
     // or the configured default repo.
@@ -583,12 +704,31 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         spec["codex_host"] = json!(codex::HOST_DAEMON);
     }
     let daemon = codex::on_daemon(&spec);
-    let mut launch = agent.launch(
-        &project_path,
-        prompt.as_deref(),
-        model.as_deref(),
-        &spec_args(agent, &spec),
-    );
+    // How its background reaches the agent: its hook, Claude's system
+    // prompt file, or a fixed line after the user's words naming the file.
+    let base = paths::data_dir();
+    let bg_file = context::file_path(&base, &id);
+    // (`hooks_work`: asked by the daemon before taking the DB lock.)
+    let delivery = background.then(|| context::delivery(agent, params["hooks_work"] == true));
+    // Its file first (the agent may read it at once). Best effort: a
+    // file that can't be written never stops the launch; the launch then
+    // carries no flag or pointer naming it.
+    let file_ok = delivery.is_some() && {
+        let text = context::launch_file_text(db, &name, &notes, &links, now_ms());
+        match context::write_file(&base, &id, &text) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "writing the background file");
+                false
+            }
+        }
+    };
+    let carried = delivery.filter(|d| file_ok || *d == context::Delivery::Hook);
+    let mut args = spec_args(agent, &spec);
+    args.extend(context::launch_args(carried, &bg_file));
+    // With no words of the user's, the pointer line alone is the prompt.
+    let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
+    let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = match p_opt("tmux_name") {
@@ -619,11 +759,16 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         db.upsert_transcript_source(&id, &t.to_string_lossy())?;
     }
     hold_deferred(db, &id, &launch)?;
-    if !agent.mints_id() {
-        // Its conversation is bound once the agent reports it (or it turns
-        // up in the agent's own index): one started from now on.
-        db.kv_set(&bind_since_key(&id), &now.to_string())?;
-        db.kv_set(&bind_prompt_key(&id), prompt.as_deref().unwrap_or(""))?;
+    note_first_prompt(db, &id, agent, first.as_deref(), now)?;
+    if let Some(mode) = delivery {
+        context::turn_on(db, &id)?;
+        context::store(db, &id, &notes, &links, now)?;
+        if carried == Some(mode) {
+            context::set_mode(db, &id, mode, now)?;
+        } else {
+            // (It didn't go out with the launch: its rows stay unseen.)
+            context::record_mode(db, &id, mode)?;
+        }
     }
 
     let cmd = pane_cmd(&id, program.as_deref(), daemon, argv);
@@ -855,6 +1000,22 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Its background as it was launched with, its file rewritten first
+    // (related sessions' status, a rename: as they are now).
+    // Best effort: a file that can't be written never stops the restart;
+    // without it the start carries no flag or pointer naming it.
+    let base = paths::data_dir();
+    let bg_file = context::file_path(&base, &s.id);
+    let rewritten = match context::refresh_file(db, &base, &s) {
+        Ok(f) => f.is_some(),
+        Err(e) => {
+            tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+            false
+        }
+    };
+    // The command with the session's own flags; the background's flag or
+    // pointer is added to it below (both go last, where a launch puts
+    // them).
     let (mut argv, resumed) = agent.resume(
         s.agent_session.as_deref(),
         &s.agent_session_trust,
@@ -862,6 +1023,28 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         model.as_deref(),
         &spec_args(agent, &spec),
     )?;
+    let mut mode = context::mode(db, &s.id)?;
+    // A new conversation by hook, but the hooks no longer work
+    // (`hooks_work`: see `Daemon::restart_hooks`, asked before the lock):
+    // the way an agent without them gets it, from now on.
+    let hooks_gone = params.get("hooks_work").and_then(Value::as_bool) == Some(false);
+    // (Stored only once the pane is up, below: a failed restart leaves the
+    // mode as it was.)
+    let mut fell_back = None;
+    if mode == Some(context::Delivery::Hook) && hooks_gone && !resumed {
+        let fallback = context::delivery(agent, false);
+        fell_back = Some(fallback);
+        mode = Some(fallback);
+    }
+    let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
+    argv.extend(context::launch_args(carried, &bg_file));
+    // A Pointer-mode session starting a new conversation: the pointer
+    // again, as its first prompt; its conversation is then bound by that
+    // prompt, from now.
+    let pointer = context::restart_prompt(carried, resumed, &bg_file);
+    if let Some(p) = &pointer {
+        agent.add_first_prompt(&mut argv, p);
+    }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
     // session that starts anew under its id (the agent never had it) is
@@ -877,6 +1060,21 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
     let now = now_ms();
+    if let Some(fallback) = fell_back {
+        context::record_mode(db, &s.id, fallback)?;
+        tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
+    }
+    if let Some(p) = &pointer {
+        note_first_prompt(db, &s.id, agent, Some(p), now)?;
+    }
+    // Only what this start carried fresh counts as handed over: the
+    // pointer sent again, or the system prompt file rewritten just now.
+    // (A resume without a pointer, or a stale file, carries nothing new.)
+    let fresh =
+        pointer.is_some() || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
+    if fresh {
+        db.context_mark_all_seen(&s.id, now)?;
+    }
     db.set_status(&s.id, Status::Starting, now)?;
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
@@ -895,6 +1093,18 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     )?;
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
+}
+
+/// A start with first prompt `prompt` at `at`: for an agent that picks its
+/// own conversation id, the conversation is bound once the agent reports
+/// it (or it turns up in the agent's own index): one started from then
+/// on, with that first prompt as typed (the pointer line included).
+fn note_first_prompt(db: &Db, id: &str, agent: Agent, prompt: Option<&str>, at: i64) -> Result<()> {
+    if !agent.mints_id() {
+        db.kv_set(&bind_since_key(id), &at.to_string())?;
+        db.kv_set(&bind_prompt_key(id), prompt.unwrap_or(""))?;
+    }
+    Ok(())
 }
 
 /// The tmux session a session's agent (re)starts in: its own, or (it has
@@ -1056,9 +1266,22 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.list_events(&s.id, limit)?)?)
 }
 
-/// Ingest one agent hook event (from `rlord hook emit`, live or spooled).
+/// Ingest one live agent hook event (from `rlord hook emit`).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
     hook_emit_with(db, params, &|agent, id| agent.indexed(id))
+}
+
+/// `hook.ack`: the hook client printed the answer `ack` names.
+pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
+    let acked = context::ack(db, p_str(params, "ack")?, now_ms())?;
+    Ok(json!({"acked": acked}))
+}
+
+/// Ingest a hook event spooled while the daemon was down: as a live one,
+/// but its client is long gone, so it gets no answer (nothing is handed
+/// over, nothing marked).
+pub fn hook_replay(db: &Db, params: &Value) -> Result<Value> {
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false)
 }
 
 /// `hook_emit`, with how to ask an agent's own index whether a
@@ -1067,6 +1290,16 @@ pub(crate) fn hook_emit_with(
     db: &Db,
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
+) -> Result<Value> {
+    hook_emit_in(db, params, indexed, true)
+}
+
+/// `live`: its client waits for the answer (false: replayed).
+fn hook_emit_in(
+    db: &Db,
+    params: &Value,
+    indexed: &dyn Fn(Agent, &str) -> Indexed,
+    live: bool,
 ) -> Result<Value> {
     // `instance`: the hook's RLORD_SESSION_ID. A hook Codex's background
     // server ran has none (`by: "thread"`): see `codex_daemon::route`.
@@ -1183,6 +1416,38 @@ pub(crate) fn hook_emit_with(
             db.kv_delete(&bind_since_key(&s.id))?;
             db.kv_delete(&bind_prompt_key(&s.id))?;
         }
+        // The session's background, for its own conversation only (not a
+        // sub-agent's thread; a forked or background copy was refused
+        // above): the hook prints it for the agent.
+        // The session's background for its agent, built at the very end
+        // (`answer`, at each return below), after everything that can
+        // fail: its own bookkeeping never runs for an event that didn't go
+        // through. Best effort: a failure is logged, no answer. Marked
+        // handed over only when the client acknowledges it (`hook.ack`).
+        let answer = |v: Value| -> Value {
+            if whose == Whose::Other
+                || !live
+                || !matches!(event, "SessionStart" | "UserPromptSubmit")
+            {
+                return v;
+            }
+            let now_s = db.resolve_ref(&s.id).unwrap_or_else(|_| s.clone());
+            let file = context::file_path(&paths::data_dir(), &s.id);
+            let source = payload["source"].as_str();
+            match context::hook_reply_from(db, &now_s, agent, event, source, sid, &file) {
+                Ok(Some(r)) => {
+                    let mut v = v;
+                    v["reply"] = r.output;
+                    v["reply_ack"] = json!(r.ack);
+                    v
+                }
+                Ok(None) => v,
+                Err(e) => {
+                    tracing::warn!(session = %s.id, event, error = %e, "session background for a hook");
+                    v
+                }
+            }
+        };
         // A thread that was blocked as "another conversation" and is now
         // the session's own: it is the session's own agent that waits.
         if let (Whose::Adopt, Some(sid)) = (whose, sid) {
@@ -1229,7 +1494,7 @@ pub(crate) fn hook_emit_with(
             if blocked != was {
                 db.kv_set(&needs_you_key(&s.id), &json!(blocked).to_string())?;
             }
-            return Ok(json!({"ok": true, "unchanged": true}));
+            return Ok(answer(json!({"ok": true, "unchanged": true})));
         }
         // Kept only while the session needs someone.
         let waiting = status.unwrap_or(s.status) == Status::WaitingInput;
@@ -1282,6 +1547,7 @@ pub(crate) fn hook_emit_with(
             let detail = crate::own::with_source(json!({"hook": event}), source);
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
         }
+        return Ok(answer(json!({"ok": true})));
     } else {
         db.insert_event(
             &s.id,
@@ -1939,6 +2205,112 @@ mod tests {
     }
 
     #[test]
+    fn background_added_later_is_stored_and_written() {
+        let db = Db::open_in_memory().unwrap();
+        for (id, name) in [("01a", "web"), ("01b", "auth")] {
+            db.insert_session(&NewSession {
+                id,
+                name,
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/w",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        }
+        let t = tempfile::tempdir().unwrap();
+        let r = session_context_add_in(
+            &db,
+            &json!({"ref": "web", "context": "The user wants dark mode too.", "related": ["auth"],
+                    "hooks_work": false}),
+            t.path(),
+        )
+        .unwrap();
+        // Its first background: a mode is recorded from whether hooks
+        // work (not asked here: no): Claude's system prompt file.
+        assert_eq!(r["delivery"], "next_start");
+        assert_eq!(
+            context::mode(&db, "01a").unwrap(),
+            Some(context::Delivery::SystemPromptFile)
+        );
+        assert_eq!(r["notes"][0]["note"], "The user wants dark mode too.");
+        assert_eq!(r["related"][0]["name"], "auth");
+        let text = std::fs::read_to_string(context::file_path(t.path(), "01a")).unwrap();
+        assert!(text.contains("dark mode") && text.contains("- auth (/tmp/w"));
+        // Too long: refused, nothing stored.
+        let long = "x".repeat(context::NOTE_MAX + 1);
+        assert!(
+            session_context_add_in(&db, &json!({"ref": "web", "context": long}), t.path()).is_err()
+        );
+        assert_eq!(db.context_rows("01a").unwrap().len(), 2);
+        let mut listed = r.clone();
+        listed.as_object_mut().unwrap().remove("delivery");
+        assert_eq!(
+            session_context(&db, &json!({"ref": "web"})).unwrap(),
+            listed
+        );
+        // By the stored mode: what the running agent loaded at its start.
+        let add = |text: &str| {
+            session_context_add_in(&db, &json!({"ref": "auth", "context": text}), t.path()).unwrap()
+                ["delivery"]
+                .clone()
+        };
+        // First background with hooks working: Hook, the next prompt.
+        let first = session_context_add_in(
+            &db,
+            &json!({"ref": "auth", "context": "a", "hooks_work": true}),
+            t.path(),
+        )
+        .unwrap();
+        assert_eq!(first["delivery"], "next_prompt");
+        context::set_mode(&db, "01b", context::Delivery::Hook, 1).unwrap();
+        assert_eq!(add("b"), "next_prompt");
+        context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, 1).unwrap();
+        assert_eq!(add("c"), "next_start");
+        context::set_mode(&db, "01b", context::Delivery::Pointer, 1).unwrap();
+        assert_eq!(add("d"), "file_only");
+        // The file can't be written (its folder is a file): the note is
+        // stored all the same.
+        let blocked = t.path().join("not-a-folder");
+        std::fs::write(&blocked, b"").unwrap();
+        let r = session_context_add_in(
+            &db,
+            &json!({"ref": "auth", "context": "stored anyway"}),
+            &blocked,
+        )
+        .unwrap();
+        assert!(r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["note"] == "stored anyway"));
+    }
+
+    #[test]
+    fn a_first_prompt_resets_what_binding_goes_by() {
+        let db = Db::open_in_memory().unwrap();
+        // Codex picks its own ids: bound by the first prompt, from then.
+        note_first_prompt(&db, "s", Agent::Codex, Some("[rlord] Background …"), 42).unwrap();
+        assert_eq!(
+            db.kv_get(&bind_since_key("s")).unwrap().as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            db.kv_get(&bind_prompt_key("s")).unwrap().as_deref(),
+            Some("[rlord] Background …")
+        );
+        // Claude and OpenCode: rlord chose the id, nothing to note.
+        note_first_prompt(&db, "o", Agent::OpenCode, Some("x"), 1).unwrap();
+        assert_eq!(db.kv_get(&bind_since_key("o")).unwrap(), None);
+    }
+
+    #[test]
     fn overlord_row_is_fixed() {
         let db = Db::open_in_memory().unwrap();
         db.insert_session(&NewSession {
@@ -1971,6 +2343,14 @@ mod tests {
                 session_describe(&db, &with("description", json!("x"))),
             ),
             ("notes", session_notes(&db, &with("notes", json!("x")))),
+            (
+                "context",
+                session_context_add_in(
+                    &db,
+                    &with("context", json!("x")),
+                    std::path::Path::new("/nonexistent"),
+                ),
+            ),
             ("tag", session_tag(&db, &with("add", json!(["wip"])))),
             ("archive", session_archive(&db, &r)),
         ] {

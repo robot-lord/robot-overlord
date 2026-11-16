@@ -181,8 +181,7 @@ impl Report {
 
 /// Write the profile files.
 pub fn write(p: &Profile) -> Result<()> {
-    let dir = paths::data_dir();
-    std::fs::create_dir_all(&dir)?;
+    crate::private::dir(&paths::data_dir())?;
     std::fs::write(keys_path(), &p.keys)?;
     std::fs::write(session_path(), &p.session)?;
     std::fs::write(window_path(), &p.window)?;

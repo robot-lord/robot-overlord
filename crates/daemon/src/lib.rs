@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod autostart;
 pub mod codex_daemon;
+pub mod context;
 pub mod discover;
 pub mod import;
 pub mod limits;
@@ -257,7 +258,7 @@ impl Daemon {
             }
         }
         for params in drain_spool()? {
-            if let Err(e) = methods::hook_emit(&db, &params) {
+            if let Err(e) = methods::hook_replay(&db, &params) {
                 tracing::warn!(error = %e, "spooled hook event failed");
             }
         }
@@ -274,6 +275,41 @@ impl Daemon {
         self.bind_nav_keys();
         profile::sync_all(self, false);
         Ok(())
+    }
+
+    /// For a restart of session `r` (every path that restarts one calls it
+    /// before taking the DB lock and passes the answer as the restart's
+    /// `hooks_work`): whether rlord's hooks still work for its agent, when
+    /// its background goes by hook; None otherwise (nothing to check). It
+    /// reads the agent's settings files, so never under the lock.
+    /// (Overlords, restarted by `overlord.rs` and `recall.rs`, have no
+    /// background: nothing to ask.)
+    pub fn restart_hooks(&self, r: &str) -> Option<bool> {
+        let agent = {
+            let db = self.db();
+            let s = db.resolve_ref(r).ok()?;
+            if context::mode(&db, &s.id).ok().flatten() != Some(context::Delivery::Hook) {
+                return None;
+            }
+            rlord_core::agents::Agent::parse(&s.agent)?
+        };
+        Some(context::hooks_work(agent))
+    }
+
+    /// For background added to session `r` after launch: whether rlord's
+    /// hooks work for its agent, when it has no delivery mode yet (its
+    /// first background: `methods::context_store` records one); None
+    /// otherwise. Never under the DB lock (it reads settings files).
+    pub fn first_background_hooks(&self, r: &str) -> Option<bool> {
+        let agent = {
+            let db = self.db();
+            let s = db.resolve_ref(r).ok()?;
+            if context::mode(&db, &s.id).ok()?.is_some() {
+                return None;
+            }
+            rlord_core::agents::Agent::parse(&s.agent)?
+        };
+        Some(context::hooks_work(agent))
     }
 
     /// Bind the socket (0700 dir, 0600 socket — the socket IS the auth boundary).
@@ -432,6 +468,7 @@ impl Daemon {
             "session.list"
                 | "session.get"
                 | "session.log"
+                | "session.context"
                 | "repo.list"
                 | "repo.find"
                 | "session.defaults"
@@ -460,6 +497,28 @@ impl Daemon {
             if let Some(s) = s {
                 params["interrupt"] = codex_daemon::interrupt(&s).to_json();
             }
+        }
+        // Whether rlord's hooks work for the agent (it reads the agent's
+        // settings files): asked here, never under the DB lock.
+        match method {
+            // (Only a launch with background asks.)
+            "session.new" if context::needs_background(&params) => {
+                let works =
+                    methods::agent_param(&self.config(), &params).is_ok_and(context::hooks_work);
+                params["hooks_work"] = json!(works);
+            }
+            "session.restart" => {
+                if let Some(works) = self.restart_hooks(params["ref"].as_str().unwrap_or("")) {
+                    params["hooks_work"] = json!(works);
+                }
+            }
+            "session.context_add" => {
+                let r = params["ref"].as_str().unwrap_or("").to_string();
+                if let Some(works) = self.first_background_hooks(&r) {
+                    params["hooks_work"] = json!(works);
+                }
+            }
+            _ => {}
         }
         // `status:limited`: not a stored status (`limits.rs`), so it is
         // taken out of the query and matched on the annotated rows; any
@@ -505,6 +564,10 @@ impl Daemon {
             "session.pin" => methods::session_pin(&db, &params),
             "session.describe" => methods::session_describe(&db, &params),
             "session.notes" => methods::session_notes(&db, &params),
+            "session.context" => methods::session_context(&db, &params),
+            "session.context_add" => methods::session_context_add(&db, &params),
+            // The hook client printed an answer: what it carried is handed over.
+            "hook.ack" => methods::hook_ack(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => {
@@ -880,6 +943,17 @@ pub fn build_id() -> u64 {
 
 /// Blocking one-shot client used by the CLI: connect, send one request, read one response.
 pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Value> {
+    client_call_within(socket_path, method, params, None)
+}
+
+/// `client_call`, giving up on a send or an answer after `timeout` (None:
+/// waits as long as it takes).
+pub fn client_call_within(
+    socket_path: &Path,
+    method: &str,
+    params: Value,
+    timeout: Option<std::time::Duration>,
+) -> Result<Value> {
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path).with_context(|| {
         format!(
@@ -887,6 +961,8 @@ pub fn client_call(socket_path: &Path, method: &str, params: Value) -> Result<Va
             socket_path.display()
         )
     })?;
+    stream.set_write_timeout(timeout)?;
+    stream.set_read_timeout(timeout)?;
     let req = json!({"id": 1, "method": method, "params": params});
     let mut buf = serde_json::to_vec(&req)?;
     buf.push(b'\n');
@@ -990,6 +1066,15 @@ pub enum HookSent {
     Slow,
 }
 
+/// What the daemon answered a hook with, for the agent: the hook's output
+/// (e.g. the session's background at SessionStart), and the id to
+/// acknowledge it with once printed (`send_hook_ack`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookReply {
+    pub output: Value,
+    pub ack: Option<String>,
+}
+
 /// Send one hook event, never waiting long: a hook runs inside the agent's
 /// tool call, and a stalled daemon must not hold that up. A second to
 /// connect, a second to send, two for the answer.
@@ -998,7 +1083,13 @@ pub enum HookSent {
 /// short of an answer (no socket, refused, not connected in time, a send
 /// that didn't complete, the connection closed or reset) is `Unreachable`:
 /// the daemon did not take a whole event and answer, so it is kept.
-pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
+///
+/// Also what the daemon answered the hook with, for the agent, if
+/// anything. Only a `Delivered` event has one.
+pub fn send_hook_event_for_reply(
+    socket_path: &Path,
+    params: &Value,
+) -> (HookSent, Option<HookReply>) {
     use std::io::{BufRead, BufReader as StdBufReader, ErrorKind, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc;
@@ -1010,7 +1101,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     const SENDING: u8 = 1;
     const GAVE_UP: u8 = 2;
     let state = Arc::new(AtomicU8::new(CONNECTING));
-    let (tx, rx) = mpsc::channel::<HookSent>();
+    let (tx, rx) = mpsc::channel::<(HookSent, Option<HookReply>)>();
     let path = socket_path.to_path_buf();
     let req = json!({"id": 1, "method": "hook.emit", "params": params});
     let sender_state = Arc::clone(&state);
@@ -1018,7 +1109,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     std::thread::spawn(move || {
         let state = sender_state;
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
-            let _ = tx.send(HookSent::Unreachable);
+            let _ = tx.send((HookSent::Unreachable, None));
             return;
         };
         if state
@@ -1034,17 +1125,30 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
         // (A send that didn't complete left the daemon half a line: it
         // can't act on that.)
         if stream.write_all(&buf).is_err() {
-            let _ = tx.send(HookSent::Unreachable);
+            let _ = tx.send((HookSent::Unreachable, None));
             return;
         }
         let mut line = String::new();
         let _ = tx.send(match StdBufReader::new(&mut stream).read_line(&mut line) {
-            Ok(n) if n > 0 => HookSent::Delivered,
+            Ok(n) if n > 0 => {
+                let result = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .map(|v| v["result"].clone())
+                    .unwrap_or(Value::Null);
+                let reply = result
+                    .get("reply")
+                    .filter(|r| !r.is_null())
+                    .map(|r| HookReply {
+                        output: r.clone(),
+                        ack: result["reply_ack"].as_str().map(str::to_string),
+                    });
+                (HookSent::Delivered, reply)
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                HookSent::Slow
+                (HookSent::Slow, None)
             }
             // Closed or reset before an answer: the daemon went away.
-            _ => HookSent::Unreachable,
+            _ => (HookSent::Unreachable, None),
         });
     });
     // Connected within a second, or the event is kept (and the sender,
@@ -1054,7 +1158,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(sent) => return sent,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return HookSent::Unreachable,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return (HookSent::Unreachable, None),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if state.load(Ordering::SeqCst) == SENDING {
@@ -1065,13 +1169,27 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
                 .compare_exchange(CONNECTING, GAVE_UP, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            return HookSent::Unreachable;
+            return (HookSent::Unreachable, None);
         }
     }
     // Sending: the sender's own timeouts (1s + 2s) end it; a little more
     // than that is waited, so its verdict is the one acted on.
     rx.recv_timeout(Duration::from_millis(3500))
-        .unwrap_or(HookSent::Slow)
+        .unwrap_or((HookSent::Slow, None))
+}
+
+/// Tell the daemon a hook's answer was printed for the agent (`ack` from
+/// its `HookReply`), so what it carried counts as handed over. Best
+/// effort, a second at most each way: if it never arrives, the next
+/// prompt gets the same again.
+pub fn send_hook_ack(socket_path: &Path, ack: &str) -> bool {
+    client_call_within(
+        socket_path,
+        "hook.ack",
+        json!({"ack": ack}),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .is_ok()
 }
 
 // ---- hook spool: hook evidence must never be lost to a down daemon ----
@@ -1085,13 +1203,10 @@ fn spool_path() -> PathBuf {
 pub fn spool_hook_event(params: &Value) -> Result<()> {
     let path = spool_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        rlord_core::private::dir_under(&paths::data_dir(), dir)?;
     }
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut f = rlord_core::private::append(&path)?;
     writeln!(f, "{params}")?;
     Ok(())
 }
@@ -1176,6 +1291,65 @@ mod tests {
             .rpc("session.list", json!({"status": ["limited"]}))
             .unwrap();
         assert_eq!(rows, json!([]));
+    }
+
+    /// `update_session` checks the background it adds before writing
+    /// anything: a refused one leaves the rest of the session as it was.
+    #[test]
+    fn a_refused_background_changes_nothing_else() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        d.db()
+            .insert_session(&rlord_core::db::NewSession {
+                id: "s1",
+                name: "a",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/p",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1000,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        let long = "x".repeat(context::NOTE_MAX + 1);
+        for bad in [
+            json!({"session": "a", "name": "renamed", "description": "d", "add_context": long}),
+            json!({"session": "a", "name": "renamed", "add_related": ["nope"]}),
+        ] {
+            assert!(mcp::call(&d, "update_session", &bad).is_err());
+            let s = d.db().resolve_ref("s1").unwrap();
+            assert_eq!((s.name.as_str(), s.description.as_str()), ("a", ""));
+            assert!(d.db().context_rows("s1").unwrap().is_empty());
+        }
+        // The overlord's own row gets no background.
+        d.db()
+            .insert_session(&rlord_core::db::NewSession {
+                id: "o1",
+                name: "overlord",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/o",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1000,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "overlord",
+            })
+            .unwrap();
+        let e = mcp::call(
+            &d,
+            "update_session",
+            &json!({"session": "o1", "add_context": "x"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("the overlord can't be given background"), "{e}");
+        assert!(d.db().context_rows("o1").unwrap().is_empty());
     }
 
     #[test]
@@ -1716,8 +1890,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No daemon: unreachable (so the event is spooled).
         assert_eq!(
-            send_hook_event(&dir.path().join("absent.sock"), &json!({})),
-            HookSent::Unreachable
+            send_hook_event_for_reply(&dir.path().join("absent.sock"), &json!({})),
+            (HookSent::Unreachable, None)
         );
         // A daemon that takes the event and never answers: the hook gives
         // up after its read timeout, and doesn't spool a second copy.
@@ -1730,8 +1904,8 @@ mod tests {
         });
         let start = std::time::Instant::now();
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Slow
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Slow, None)
         );
         assert!(start.elapsed() < std::time::Duration::from_millis(3400));
         hold.join().unwrap();
@@ -1741,8 +1915,8 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let close = std::thread::spawn(move || drop(listener.accept()));
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Unreachable
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Unreachable, None)
         );
         close.join().unwrap();
         // And one that answers.
@@ -1756,10 +1930,141 @@ mod tests {
             c.write_all(b"{\"id\":1,\"result\":{}}\n").unwrap();
         });
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Delivered
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Delivered, None)
         );
         answer.join().unwrap();
+        // One that answers with something for the agent: handed back.
+        let sock = dir.path().join("reply.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let answer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut c, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&c).read_line(&mut line).unwrap();
+            c.write_all(
+                b"{\"id\":1,\"result\":{\"ok\":true,\"reply\":{\"x\":1},\"reply_ack\":\"a1\"}}\n",
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            send_hook_event_for_reply(&sock, &json!({"event": "SessionStart"})),
+            (
+                HookSent::Delivered,
+                Some(HookReply {
+                    output: json!({"x": 1}),
+                    ack: Some("a1".into())
+                })
+            )
+        );
+        answer.join().unwrap();
+        // The acknowledgement names the answer.
+        let sock = dir.path().join("ack.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let answer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut c, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&c).read_line(&mut line).unwrap();
+            c.write_all(b"{\"id\":1,\"result\":{\"acked\":true}}\n")
+                .unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        });
+        assert!(send_hook_ack(&sock, "a1"));
+        let req = answer.join().unwrap();
+        assert_eq!(req["method"], "hook.ack");
+        assert_eq!(req["params"]["ack"], "a1");
+        assert!(!send_hook_ack(&dir.path().join("absent.sock"), "a1"));
+        // Nobody there: no reply (the hook prints nothing).
+        assert_eq!(
+            send_hook_event_for_reply(&dir.path().join("absent.sock"), &json!({})),
+            (HookSent::Unreachable, None)
+        );
+    }
+
+    /// A session's own hook gets its background back; a hook from outside
+    /// its pane, or a session without background, gets nothing.
+    #[test]
+    fn a_sessions_own_hook_gets_its_background() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01bg",
+            name: "web-footer",
+            agent: "claude",
+            agent_session: Some("u-1"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01bg_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let emit = |event: &str, extra: Value| {
+            let mut params = json!({"instance": "01bg", "agent": "claude", "event": event,
+                                    "payload": {"session_id": "u-1", "hook_event_name": event}});
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            methods::hook_emit(&db, &params).unwrap()
+        };
+        assert!(
+            emit("SessionStart", json!({}))["reply"].is_null(),
+            "no background"
+        );
+        context::store(&db, "01bg", &["use the staging DB".into()], &[], 5).unwrap();
+        // From outside rlord's tmux (a forked copy): nothing.
+        let r = emit("SessionStart", json!({"pane": null}));
+        assert!(r["ignored"].is_string() && r["reply"].is_null());
+        // Replayed from the spool (its client is gone): no answer, nothing
+        // marked.
+        let replayed = methods::hook_replay(
+            &db,
+            &json!({"instance": "01bg", "agent": "claude", "event": "SessionStart",
+                    "payload": {"session_id": "u-1", "hook_event_name": "SessionStart"}}),
+        )
+        .unwrap();
+        assert!(replayed["reply"].is_null());
+        assert_eq!(db.context_unseen("01bg").unwrap().len(), 1);
+        let r = emit("SessionStart", json!({}));
+        let out = &r["reply"]["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "SessionStart");
+        assert!(out["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("use the staging DB"));
+        // The client acknowledges it once printed (`hook.ack`): logged
+        // then, once.
+        let sent = || {
+            db.list_events("01bg", 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "context_sent")
+                .count()
+        };
+        assert_eq!(sent(), 0);
+        let ack = r["reply_ack"].as_str().unwrap();
+        assert_eq!(
+            methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
+            json!({"acked": true})
+        );
+        assert_eq!(sent(), 1);
+        // Already given: the next prompt gets nothing more, and the status
+        // still follows the hook.
+        let r = emit("UserPromptSubmit", json!({}));
+        assert!(r["reply"].is_null());
+        assert_eq!(
+            db.resolve_ref("01bg").unwrap().status,
+            rlord_core::types::Status::Working
+        );
+        context::store(&db, "01bg", &["PR is #12".into()], &[], 6).unwrap();
+        let r = emit("UserPromptSubmit", json!({}));
+        assert!(r["reply"]["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("PR is #12"));
     }
 
     /// "Needs you" is a block mid-turn, cleared when the agent moves on;

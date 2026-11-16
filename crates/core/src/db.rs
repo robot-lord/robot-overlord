@@ -17,6 +17,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_summary.sql"),
     include_str!("../migrations/0008_usage.sql"),
     include_str!("../migrations/0009_rlord_msg.sql"),
+    include_str!("../migrations/0010_session_context.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -58,6 +59,20 @@ pub struct EventRow {
     pub ts: i64,
     pub kind: String,
     pub payload: serde_json::Value,
+}
+
+/// A `session_context` row: a note the overlord wrote for a session, or a
+/// link to a related session (`body` its id).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContextRow {
+    pub id: i64,
+    pub at: i64,
+    /// `note` or `link`.
+    pub kind: String,
+    pub body: String,
+    pub source: String,
+    /// When a hook pushed it to the agent (None: not yet).
+    pub seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -217,9 +232,12 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // rlord's data folder and its DB are the user's alone (SQLite gives
+        // the -wal and -shm files the DB file's mode).
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            crate::private::dir(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
+        crate::private::touch(path).with_context(|| format!("creating {}", path.display()))?;
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::init(conn)
     }
@@ -1217,6 +1235,160 @@ impl Db {
         Ok(v)
     }
 
+    // ---- session context (notes and links from the overlord) ----
+
+    /// Add a note (`kind` `note`) or a link (`link`, `body` the linked
+    /// session's id). A link that is already there isn't added again.
+    /// Returns whether a row was added.
+    pub fn context_add(
+        &self,
+        session_id: &str,
+        at: i64,
+        kind: &str,
+        body: &str,
+        source: &str,
+    ) -> Result<bool> {
+        // A link once only. A note the same as one not handed over yet, or
+        // as the latest note: not again.
+        let dup_sql = if kind == "link" {
+            "SELECT EXISTS (SELECT 1 FROM session_context \
+             WHERE session_id = ?1 AND kind = 'link' AND body = ?2)"
+        } else {
+            "SELECT EXISTS (SELECT 1 FROM session_context \
+             WHERE session_id = ?1 AND kind = 'note' AND body = ?2 \
+             AND (seen_at IS NULL OR id = (SELECT max(id) FROM session_context \
+                  WHERE session_id = ?1 AND kind = 'note')))"
+        };
+        let dup: bool = self
+            .conn
+            .query_row(dup_sql, params![session_id, body], |r| r.get(0))?;
+        if dup {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "INSERT INTO session_context (session_id, at, kind, body, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, at, kind, body, source],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether a session has any notes or links (without loading them).
+    pub fn context_exists(&self, session_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1)",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The sessions that link to `session_id` (its related sessions'
+    /// owners).
+    pub fn context_linkers(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM session_context WHERE kind = 'link' AND body = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record that the hook answer `ack` carried rows `ids` of a session
+    /// (at `at`): the latest answer that carried a row is the one whose
+    /// acknowledgement marks it seen.
+    pub fn context_mark_sent(
+        &self,
+        session_id: &str,
+        upto: i64,
+        only_unseen: bool,
+        ack: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET sent_ack = ?4, sent_at = ?5 \
+             WHERE session_id = ?1 AND id <= ?2 AND (?3 = 0 OR seen_at IS NULL)",
+            params![session_id, upto, only_unseen, ack, at],
+        )?;
+        Ok(())
+    }
+
+    /// The answer `ack` was acknowledged: the rows it was the latest to
+    /// carry, not seen yet, are seen at `at`. Returns how many.
+    pub fn context_ack(&self, session_id: &str, ack: &str, at: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE session_context SET seen_at = ?3 \
+             WHERE session_id = ?1 AND sent_ack = ?2 AND seen_at IS NULL",
+            params![session_id, ack, at],
+        )?)
+    }
+
+    /// Every row of a session some answer carried, not seen yet, is seen
+    /// at `at` (rows no answer carried stay unseen).
+    pub fn context_mark_sent_seen(&self, session_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?2 \
+             WHERE session_id = ?1 AND sent_ack IS NOT NULL AND seen_at IS NULL",
+            params![session_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// The ids of the sessions a session links to, oldest first.
+    pub fn context_links(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT body FROM session_context WHERE session_id = ?1 AND kind = 'link' ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// A session's notes and links, oldest first.
+    pub fn context_rows(&self, session_id: &str) -> Result<Vec<ContextRow>> {
+        self.context_where(session_id, "")
+    }
+
+    /// Those no hook has pushed to the agent yet, oldest first.
+    pub fn context_unseen(&self, session_id: &str) -> Result<Vec<ContextRow>> {
+        self.context_where(session_id, "AND seen_at IS NULL")
+    }
+
+    fn context_where(&self, session_id: &str, and: &str) -> Result<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, at, kind, body, source, seen_at FROM session_context \
+             WHERE session_id = ?1 {and} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(ContextRow {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                kind: r.get(2)?,
+                body: r.get(3)?,
+                source: r.get(4)?,
+                seen_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Mark a session's rows up to `upto` (a row id) as pushed at `at`.
+    #[cfg(test)]
+    pub fn context_mark_seen(&self, session_id: &str, upto: i64, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?3 \
+             WHERE session_id = ?1 AND id <= ?2 AND seen_at IS NULL",
+            params![session_id, upto, at],
+        )?;
+        Ok(())
+    }
+
+    /// Mark every row of a session not yet pushed as pushed at `at`.
+    pub fn context_mark_all_seen(&self, session_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?2 WHERE session_id = ?1 AND seen_at IS NULL",
+            params![session_id, at],
+        )?;
+        Ok(())
+    }
+
     // ---- transcripts ----
 
     /// Agent conversation ids a session had before its current one (a
@@ -1621,7 +1793,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         for table in [
             "sessions",
             "tags",
@@ -1644,12 +1816,92 @@ mod tests {
     }
 
     #[test]
+    fn context_rows_are_kept_marked_and_go_with_their_session() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["a", "b"] {
+            db.insert_session(&NewSession {
+                id,
+                name: id,
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        }
+        assert!(db
+            .context_add("a", 10, "note", "first", "overlord")
+            .unwrap());
+        assert!(db.context_add("a", 11, "link", "b", "overlord").unwrap());
+        // The same link once only.
+        assert!(!db.context_add("a", 12, "link", "b", "overlord").unwrap());
+        assert!(db
+            .context_add("a", 13, "note", "second", "overlord")
+            .unwrap());
+        let rows = db.context_rows("a").unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            ["first", "b", "second"]
+        );
+        assert!(db.context_rows("b").unwrap().is_empty());
+        assert!(db.context_exists("a").unwrap() && !db.context_exists("b").unwrap());
+        assert_eq!(db.context_linkers("b").unwrap(), ["a"]);
+        // The same note again while it is unseen, or as the latest: no.
+        assert!(!db
+            .context_add("a", 14, "note", "second", "overlord")
+            .unwrap());
+        assert!(!db
+            .context_add("a", 14, "note", "first", "overlord")
+            .unwrap());
+        assert_eq!(db.context_links("a").unwrap(), ["b"]);
+        db.context_mark_seen("a", rows[1].id, 20).unwrap();
+        let unseen = db.context_unseen("a").unwrap();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].body, "second");
+        assert_eq!(db.context_rows("a").unwrap()[0].seen_at, Some(20));
+        // All the rest at once; what was seen keeps its time.
+        db.context_mark_all_seen("a", 30).unwrap();
+        assert!(db.context_unseen("a").unwrap().is_empty());
+        let rows = db.context_rows("a").unwrap();
+        assert_eq!((rows[0].seen_at, rows[2].seen_at), (Some(20), Some(30)));
+        // Rows go with their session.
+        db.conn
+            .execute("DELETE FROM sessions WHERE id = 'a'", [])
+            .unwrap();
+        assert!(db.context_rows("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_db_and_its_folder_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("robot-overlord");
+        let path = dir.join("state.db");
+        let db = Db::open(&path).unwrap();
+        db.kv_set("k", "v").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // SQLite makes these with the DB file's mode.
+        for side in ["-wal", "-shm"] {
+            let p = dir.join(format!("state.db{side}"));
+            assert_eq!(mode(&p), 0o600, "{side}");
+        }
+    }
+
+    #[test]
     fn migrate_is_idempotent_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
     }
 
     #[test]

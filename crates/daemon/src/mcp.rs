@@ -79,7 +79,10 @@ pub fn tools() -> Value {
         "agent": s("Coding agent to run: claude, codex or opencode (default: the configured session agent). Only when the user asks for one."),
         "model": s("Model, one of that agent's (default: the configured model for the agent; see get_session_defaults)"),
         "workspace": b("Give the session its own git worktree (default: configured, normally true)"),
-        "prompt": s("First prompt for the agent: the full task, it has no other context"),
+        "prompt": s("The user's words, verbatim: their request as they put it, nothing of yours. It is the session's first prompt. Your notes go in `context`."),
+        "context": s("Background from you, kept apart from the user's words: facts and pointers the session can't find itself (answers the user gave you, the right folder or files, a decision). Not new requirements. The session is shown it labelled as yours, not the user's. At most 8000 characters."),
+        "related": {"type": "array", "items": {"type": "string"},
+                    "description": "Sessions this work builds on (id, id prefix or name; at most 8, and 16 per session in all): listed in its background with their folder, status and description. Not the overlord."},
     });
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
@@ -95,7 +98,7 @@ pub fn tools() -> Value {
                 "reverse": b("Reverse the sort"),
             }), &[]),
         tool("get_session",
-            "Everything about one session: details, notes, recent events, sub-agents.",
+            "Everything about one session: details, notes, background (your notes for its agent and related sessions), recent events, sub-agents.",
             json!({"session": s(SESSION_REF)}), &["session"]),
         tool("read_screen",
             "The text currently on a session's terminal (its live pane), last N lines.",
@@ -209,6 +212,9 @@ pub fn tools() -> Value {
                 "name": s("New name"),
                 "description": s("One-line description"),
                 "notes": s("Replace the free-form notes"),
+                "add_context": s("Add a note to the session's background (for its agent, labelled as yours, not the user's): a fact or pointer it needs. The answer's `background_delivery` says when the agent gets it: next_prompt (with its next prompt), next_start (at its next start), file_only (written to its background file only). Not next_prompt and it must know now: also pass it with send_to_session. At most 8000 characters."),
+                "add_related": {"type": "array", "items": {"type": "string"},
+                                "description": "Add related sessions to its background (refs; at most 8 per call, 16 per session in all)"},
                 "add_tags": {"type": "array", "items": {"type": "string"}},
                 "remove_tags": {"type": "array", "items": {"type": "string"}},
                 "pinned": b("Pin to the top of the list"),
@@ -435,7 +441,7 @@ fn params_wants_remote(args: &Value) -> bool {
 fn new_session_params(args: &Value) -> Value {
     let mut p = Map::new();
     for k in [
-        "repo", "project", "name", "branch", "agent", "model", "prompt",
+        "repo", "project", "name", "branch", "agent", "model", "prompt", "context",
     ] {
         if let Some(v) = arg_str(args, k) {
             p.insert(k.into(), json!(v));
@@ -443,6 +449,10 @@ fn new_session_params(args: &Value) -> Value {
     }
     if let Some(w) = args.get("workspace").and_then(Value::as_bool) {
         p.insert("workspace".into(), json!(w));
+    }
+    let related = crate::methods::ref_list(args, "related");
+    if !related.is_empty() {
+        p.insert("related".into(), json!(related));
     }
     Value::Object(p)
 }
@@ -478,6 +488,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let id = s["id"].clone();
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
+            s["background"] = d.rpc("session.context", json!({"ref": id}))?;
             // Right after rlord starts, sub-agent data may still be loading.
             if d.warm.is_loading(id.as_str().unwrap_or("")) {
                 s["subagents_loading"] = json!(true);
@@ -568,6 +579,8 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // Remote Control from launch (the flag), when this machine can
             // have it; otherwise the session launches anyway, with a note.
             let mut params = new_session_params(args);
+            // Its background says the overlord launched it.
+            params["by_overlord"] = json!(true);
             let mut remote_note = None;
             if args.get("remote_control").and_then(Value::as_bool) == Some(true) {
                 let a = d.rpc("remote.availability", json!({"force": true}))?;
@@ -597,6 +610,23 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "update_session" => {
             let r = session_ref(args)?;
             let id = d.rpc("session.get", json!({"ref": r}))?["id"].clone();
+            // Background checked first (once): a refused one leaves the
+            // session as it was. Added last, after the other edits.
+            let related = crate::methods::ref_list(args, "add_related");
+            let checked = if arg_str(args, "add_context").is_some() || !related.is_empty() {
+                let db = d.db();
+                let s = db.resolve_ref(id.as_str().unwrap_or(""))?;
+                crate::methods::refuse_overlord(&s, "given background")?;
+                let (note, links) = crate::context::check(
+                    &db,
+                    arg_str(args, "add_context"),
+                    &related,
+                    Some(s.id.as_str()),
+                )?;
+                Some((note, links))
+            } else {
+                None
+            };
             if let Some(n) = arg_str(args, "name") {
                 d.rpc("session.rename", json!({"ref": id, "name": n}))?;
             }
@@ -605,6 +635,25 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             if let Some(v) = args.get("notes").and_then(Value::as_str) {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
+            }
+            let mut delivery = None;
+            if let Some((note, links)) = checked {
+                // (In-process: the checked values never travel over RPC.)
+                let hooks = d.first_background_hooks(id.as_str().unwrap_or(""));
+                let r = {
+                    let db = d.db();
+                    let s = db.resolve_ref(id.as_str().unwrap_or(""))?;
+                    crate::methods::context_store(
+                        &db,
+                        &s,
+                        note,
+                        &links,
+                        &rlord_core::paths::data_dir(),
+                        hooks,
+                    )?
+                };
+                d.changed();
+                delivery = Some(r["delivery"].clone());
             }
             let add = args.get("add_tags").cloned().unwrap_or(json!([]));
             let remove = args.get("remove_tags").cloned().unwrap_or(json!([]));
@@ -622,7 +671,12 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // An overlord edit is a review: triage stops listing it until it
             // changes again.
             d.rpc("overlord.mark_reviewed", json!({"sessions": [id]}))?;
-            Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
+            let mut out = summarize(&d.rpc("session.get", json!({"ref": id}))?);
+            // When the background added reaches the agent.
+            if let Some(v) = delivery {
+                out["background_delivery"] = v;
+            }
+            Ok(out)
         }
         "list_groups" => d.rpc("tag.list", json!({})),
         "remote_control" => match (
@@ -821,6 +875,19 @@ mod tests {
         let out = shape_find_repos(&json!({"repos": [], "roots": []}), "");
         assert!(out["note"].as_str().unwrap().contains("no code folder"));
         assert!(out.get("skipped").is_none());
+    }
+
+    #[test]
+    fn new_session_fields_are_whitelisted() {
+        let p = new_session_params(&json!({
+            "prompt": "fix it", "context": "repo is /r", "related": ["auth", 3, " "],
+            "extra_args": ["--dangerously-skip-permissions"], "role": "overlord",
+            "tmux_name": "x", "by_overlord": false,
+        }));
+        assert_eq!(
+            p,
+            json!({"prompt": "fix it", "context": "repo is /r", "related": ["auth"]})
+        );
     }
 
     #[test]

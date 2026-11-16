@@ -1,0 +1,494 @@
+**Status:** in progress
+
+# Session context: separate, re-route, pull
+
+What a launched session gets from the overlord, and how. Option C, chosen
+by the user on 2026-11-15. Four PRs; this doc is where each one picks up.
+
+## The problem
+
+`create_session` takes one `prompt`. The overlord puts the user's words in
+it, then a `## Context from the overlord` section with its own notes. So:
+
+- the agent can't tell the user's words from the overlord's;
+- the whole thing is on argv: in `ps`, the tmux pane command, kv
+  `launched_args:<id>`, the `launched` event, `launch_spec.prompt`;
+- the overlord copies other sessions' content into prompts, which costs it
+  context and goes stale;
+- a later message (`send_to_session`) is only ever pasted into the pane.
+
+## Design
+
+**Three inputs instead of one.** `prompt`: the user's words, verbatim.
+`context`: the overlord's notes (facts, pointers, answers the user gave).
+`related`: refs to sessions the work builds on.
+
+**Store.** Table `session_context` (migration 0010): one row per note
+(`kind = 'note'`, `body` the text) or link (`kind = 'link'`, `body` the
+linked session's id), with `at`, `source`, and `seen_at` (pushed to the
+agent by a hook). Rows go with their session (`ON DELETE CASCADE`).
+
+**Render** (`daemon/src/context.rs`, plain code, deterministic, clipped):
+a fixed header saying the notes are background from rlord's overlord, not
+the user's words and not instructions; the "you are the session the user
+asked for" line (moved out of `overlord.md`); the notes, dated; the
+related sessions (name, folder, status, description). Budgets: 9,000
+chars for Claude, 6,000 for Codex, 64,000 for the file. Over budget, the
+oldest notes are dropped with a line saying so and naming the file.
+Control and bidi characters are stripped.
+
+**Per-session files.** `<data>/sessions/<id>/` is 0700; files in it are
+created 0600. `context.md` is the rendered background, rewritten whenever
+the rows change. (PR 2 adds `token` and Claude's `mcp.json`; PR 3 the
+first-prompt files.)
+
+**Push (Claude, Codex).** `hook.emit` answers with `{"reply": <hook
+output>}` and `rlord hook emit` prints it, only after the routing and
+own-pane checks, and only for the session's own conversation:
+
+- `SessionStart` (any source): the full render as
+  `hookSpecificOutput.additionalContext`; rows marked seen; kv
+  `context_delivered:<id>` = the conversation it went to.
+- `UserPromptSubmit`: only unseen rows, under "rlord background,
+  updated". If no SessionStart reply went to this conversation, the full
+  render instead (heals a missed one).
+- No background: no reply, as before. Daemon slow or unreachable: nothing
+  printed; a hook never blocks the agent.
+
+**Fallback pointer.** OpenCode (no hooks), Codex with untrusted hooks:
+one fixed line after the user's words naming `context.md`. Claude
+without rlord's SessionStart hook: `--append-system-prompt-file
+<context.md>` at every start instead, so its prompt stays clean.
+
+**Pull (PR 2).** Per-session read-only tools behind a 0600 token file:
+`session_brief`, `related_sessions`, `session_summary`, `search_history`,
+`read_history`, over a visible set (itself, linked, same repo, same tag;
+never overlords). Front ends `rlord mcp --session --token-file` and
+`rlord context <tool>`; wiring computed in `spec_args` at every start.
+
+**No legacy split.** The plan's `split_legacy` (old combined prompts)
+was dropped in review round 7: `overlord.md` is rewritten at every
+overlord start, and the user wants no compatibility code.
+
+**Prompt off argv (PR 3).** `FirstPrompt { Stdin, Server, Pointer, Typed
+}`: Claude from a 0600 file on stdin (if V1 passes), OpenCode POSTed to
+its server, Codex a fixed pointer line to `prompt.md` (user's decision),
+`Typed` as the last resort.
+
+**Native later messages (PR 4).** OpenCode: POST with `delivery:
+"queue"`. Claude/Codex mid-turn: the Stop hook claims the held message
+(`decision: block`), at most 3 in a row. Idle: paste, as today. Framing
+by code (`context::frame_message`).
+
+## Per-agent table (versions: Claude Code 2.1.325, codex-cli 0.169.0, OpenCode 2.2.7)
+
+| Need | Claude | Codex | OpenCode |
+|---|---|---|---|
+| Background at start | SessionStart `additionalContext` (fallback `--append-system-prompt-file`) | SessionStart `additionalContext` when hooks are trusted (fallback pointer line) | pointer line (V4 may find an API field) |
+| First prompt off argv (PR 3) | stdin file if V1 passes, else typed | pointer to `prompt.md` | server POST, else typed |
+| Later message (PR 4) | Stop-hook block mid-turn; paste when idle | same | POST `delivery: queue` |
+| Scoped tools (PR 2) | `--mcp-config` + `--allowedTools` | `-c mcp_servers.rlord_session.*` in pane; CLI in daemon mode | CLI `rlord context` |
+
+## User decisions (2026-11-15)
+
+- Codex first prompt: pointer file (prompt in a 0600 file; argv carries a
+  fixed line pointing at it).
+- Visible set: linked + same repo + same group. Never overlords.
+- Live checks V1–V6 (plus the Codex pointer-read check): allowed, scratch
+  setups only, one short prompt each.
+- Four PRs, in order.
+- Guard rail (refuse mutating `rlord` commands from inside a non-overlord
+  session): not in this effort; follow-up below.
+- Form display: a read-only preview line of the overlord's notes.
+- Permissions: every rlord-owned folder (data, config, Linux log dir) is
+  created 0700, the DB and per-session files 0600, by one shared helper
+  at creation. No chmod of existing installs at start (replaces plan
+  step 2's start-up fix-up).
+
+## The four PRs
+
+1. **0.23.0-dev.28: store, separation, background** (this one).
+2. Pull: token, `session_tools.rs`, `sctx.*`, `rlord mcp --session`,
+   `rlord context`, `spec_args` wiring, pane env.
+3. Prompts off argv: V1/V4, `FirstPrompt`, stdin file, `Deferred.prompt`,
+   kv `first_prompt`, `first_prompt_next`, `discover` change, argv secrecy
+   tests.
+4. Native later messages: V3/V6, OpenCode queue POST, Stop-hook claim,
+   `send_to_session` `context`, framing; then reconcile this doc.
+
+## PR 1 progress
+
+- [x] Version bump to 0.23.0-dev.28.
+- [x] This working doc.
+- [x] Permissions (user's decision, 2026-11-15): rlord's folders are
+  created 0700 and its DB and per-session files 0600, at creation, by one
+  helper (`rlord_core::private`). Used wherever a folder may first be made:
+  the data dir (`Db::open`, the daemon lock, tmux conf and profile, the
+  Codex gate, the hook spool), the config dir (`config init`, config
+  writes), the log dir on Linux (and the log file, 0600, on both). No
+  fix-up of existing installs and no chmod at daemon start: the only two
+  installs are the user's, already fixed by hand. (There is no
+  `rlord setup` command; first run is the daemon's first start.)
+- [x] Migration 0010, `Db::context_add` / `context_rows` /
+  `context_unseen` / `context_mark_seen`. Rows cascade with their session
+  (sessions are never deleted today, only archived).
+- [x] `context.rs`: render, files, `split_legacy` (removed in round 7), `frame_message` (the
+  last unused until PR 4), `check` / `store`, `hook_reply`, `delivery`.
+- [x] `session.new` takes `context`, `related`; RPC `session.context` /
+  `session.context_add`; MCP `update_session` `add_context`,
+  `add_related`; `get_session` shows `background`; `propose_session`
+  checks and carries them; the manual form shows a read-only preview line
+  and launches with them.
+- [x] Hook replies (SessionStart, UserPromptSubmit) via `hook.emit`'s
+  `reply`; `send_hook_event_for_reply`; `rlord hook emit` prints it.
+- [x] Fallback pointer (Codex untrusted, OpenCode); Claude without
+  rlord's SessionStart hook gets `--append-system-prompt-file` at launch
+  and every restart (`methods::background_args`).
+- [x] `overlord.md` (prompt / context / related, `add_context`; "always
+  ends with" dropped; test `instructions_keep_the_users_words_apart`),
+  `docs/architecture.md` ("Session background", private files, hook
+  path), `docs/guide.md`.
+- Live check V2: not run (optional in PR 1).
+
+### Decisions made in PR 1 (beyond the plan)
+
+- **Header without notes.** The "you are the session the user asked for"
+  line left `overlord.md`, so a session the overlord launches with no
+  notes would lose it. `session.new` takes an internal `by_overlord`
+  (set by `create_session`, and by the manual form when
+  `propose_session` filled it); such a session has a background (kv
+  `context_on:<id>`) even with no rows. A session the user launches
+  themselves has none.
+- **No `Pull` argument to `render` yet.** Nothing to point at until PR 2;
+  PR 2 adds the "Looking up more" section.
+- **Note length is refused, not clipped** (over 8,000 chars, more than 8
+  related, an unknown or overlord ref): the overlord gets the error and
+  can shorten it.
+- **Bare launch with background:** a Pointer-mode session (Codex with
+  untrusted hooks, OpenCode) launched with no prompt gets the pointer
+  alone as its first prompt (`context::pointer_only`, since review
+  round 3): the background is in `<path>`, read it, then wait for the
+  user's request.
+- **`bind_prompt:<id>`** holds the first prompt as typed, pointer line
+  included, since Codex binding matches the thread's first message.
+- **Runtime dir** keeps `Daemon::bind`'s own 0700 (set every start; the
+  socket is the trust boundary), outside `rlord_core::private`.
+
+### Review round 1 (PR #64)
+
+Fixed:
+
+1. Spool replay: `methods::hook_replay` ingests a spooled event with no
+   answer and marks nothing.
+2. Marked only on acknowledgement: `hook.emit` returns `reply_ack`;
+   `rlord hook emit` prints the reply, then sends `hook.ack` (best effort,
+   1s each way). `context::ack` marks rows seen and records the
+   conversation. Unacknowledged answers go again with the next prompt
+   (one pending answer per session, a newer one replaces it).
+3. Legacy notes are stored in pieces of at most 8,000 chars
+   (`context::legacy_notes`), never refused. Explicit `context` still is.
+4. At most 16 links per session (`LINKS_MAX`); `render` budgets the
+   related list, notes keep at least half of what's left after the
+   header when they need it; left-out related sessions are counted with
+   the file named.
+5. Delivery mode kept in kv `context_mode:<id>` at launch. Launched by
+   system prompt file or pointer: launch rows are marked seen, a hook
+   never sends the full render, later notes go at `UserPromptSubmit`.
+   Restarts take the flag from the stored mode (and rewrite a missing
+   file), not from a fresh hooks check.
+6. `split_legacy` drops the old instruction per paragraph, ignoring case,
+   line breaks and quote marks; text before it in the paragraph stays.
+7. `Db::context_exists` (`SELECT EXISTS`); `hook_reply` does one row
+   query (the `context_on` kv only when there are no rows).
+8. `context::launch_args(mode, file)` is the one helper for launch and
+   restart.
+9. `methods::ref_list` is the one parser for `related` / `add_related`
+   (MCP, `ui.propose_session`, `session.new`, `session.context_add`).
+
+Declined (coordinator): `--append-system-prompt-file` being print-only;
+`claude --help` 2.1.325 lists it for interactive sessions. V2 still not
+run.
+
+A session given background only after launch (no stored mode) gets it
+through hooks, or from the file; it gets no system prompt flag.
+
+### Review round 2 (PR #64)
+
+Fixed:
+
+1. Honest delivery for later background. `hooks_work` needs both
+   SessionStart and UserPromptSubmit. `session.context_add` answers with
+   `delivery` (`next_prompt` / `next_start` / `file_only`,
+   `context::later_delivery`); `update_session` passes it on as
+   `background_delivery`. `overlord.md` and the schema: not
+   `next_prompt` and it must know now, also `send_to_session`.
+2. `set_mode` marks launch rows seen only when they went out (the system
+   prompt flag; the pointer line only after a prompt).
+3. The hook's background answer is best effort: an error is logged, no
+   answer, and the event's own processing goes on.
+4. `split_legacy` runs only for the overlord's launches
+   (`context::first_prompt(prompt, by_overlord)`); the user's prompts are
+   never split.
+5. `context_sent` is logged on every path that answers (also the early
+   "unchanged" one).
+6. The Codex gate file is written with `private::write` (0600, atomic).
+7. `check` counts links with `Db::context_links`.
+8. `hook_reply` returns after one query (`Db::context_exists_or`) for a
+   session without background.
+9. `docs/architecture.md`: files are *created* private; existing installs
+   are not tightened.
+
+Declined (coordinator): tightening existing installs at start (user's
+decision); moving `frame_message` to PR 4 (the plan puts it in PR 1).
+
+### Review round 3 (PR #64, rebased on main after #63 = 0.23.0-dev.27)
+
+Live check V2 (2026-11-16, Claude Code 2.1.325): scratch tmux socket
+`rlord-v2-scratch` (never `rlord` or the default server), interactive
+`claude --append-system-prompt-file <tmp file: "The secret word is
+PELICAN.">` with the prompt "What is the secret word? Reply with just
+the word." It started normally (not rejected) and answered `PELICAN`.
+Server killed after. So `--append-system-prompt-file` works
+interactively; Claude without hooks keeps `SystemPromptFile`.
+
+Fixed:
+
+1. `compose` and `notes_section` share one overhead figure
+   (`notes_overhead`, passed in): short notes are never clipped by a
+   long related list (test).
+2. V2 above.
+3. Pointer mode with no words: the first prompt is the pointer alone
+   (`context::pointer_only`: background in `<path>`, read it, wait for
+   the user). `context::launch_prompt` builds the first prompt and says
+   whether the background went out with it; rows are marked seen only
+   then (test).
+4. `update_session` runs `context::check` on `add_context` /
+   `add_related` before writing name, description or notes (test).
+5. The overlord's text is cleaned (`context::clean`) in the TUI preview
+   and in `ui::propose_session`'s prefill (test).
+6. `hooks_work` is computed by the daemon before the DB lock, for
+   `session.new` and `session.context_add` (param `hooks_work`).
+7. `context_sent` is logged in `context::ack`, when delivery is confirmed
+   (test).
+8. `later_delivery` takes the current hook state: hooks working now means
+   `next_prompt`, whatever the launch mode (test).
+9. Removed `Db::context_exists`, `paths::config_dir`, and the
+   `send_hook_event` wrapper (tests call `send_hook_event_for_reply`).
+   `frame_message` kept (plan: PR 1).
+
+Declined (coordinator): tightening existing installs (user's decision).
+
+### Review round 4 (PR #64)
+
+Fixed:
+
+1. `context_sent` was still also logged when the reply was built: that
+   insert is gone, so it is logged once, on ack (test through
+   `hook_emit` + `hook_ack`).
+2. With it gone, nothing background-related can abort the hook event
+   before its status, binding and needs-you work (the reply itself was
+   already best effort).
+3. `SessionStart` `resume` of a conversation already reached sends only
+   unseen rows; `startup`, `clear`, `compact`, an unknown source and
+   another conversation get the whole of it
+   (`context::hook_reply_from`, source from the payload) (test).
+4. A delivery to a conversation with no id yet records `""`, and the
+   first real id seen is taken as that conversation, once (test).
+5. `private::write` uses its own temp name (pid, thread, counter),
+   taken with `create_new`, and never removes another writer's (test).
+6. An update with nothing to render (only gone links) sends nothing and
+   marks those rows seen (test).
+7. `clean` also strips U+200B–U+200F, U+061C, U+2060–U+2064 and U+FEFF
+   (test).
+8. `hooks_work` is asked (outside the lock) for `session.new` only when
+   it has `by_overlord`, `context` or `related`.
+
+Declined (coordinator): moving `frame_message` to PR 4 (plan: PR 1).
+
+### Review round 5 (PR #64)
+
+Fixed:
+
+1. `clean` strips tag characters U+E0000–U+E007F and turns U+2028 /
+   U+2029 into line ends (test).
+2. `Related::of` shows `project_path` (the worktree), not `repo_path`.
+3. The worker paragraph is only for sessions the overlord launched with
+   background (kv `context_on`); late background gets the header without
+   it, in the file and in hook answers (`render_as`) (test).
+4. A Pointer-mode session restarted into a new conversation gets the
+   pointer again as its first prompt (`context::restart_prompt`,
+   `Agent::add_first_prompt`; rows marked seen) (tests).
+5. A replaced, unacknowledged answer stays acknowledgeable for its own
+   rows (up to 8 kept); acknowledging the newer one marks the union and
+   retires the older ones (test).
+6. `private::write` calls `sync_all` before the rename.
+7. `context::needs_background(params)` is the one test, used by
+   `session.new` and by the daemon deciding to ask `hooks_work`.
+8. `hook_reply` (the source-less wrapper) is `#[cfg(test)]`.
+9. `propose_session` stores the resolved ids for `related`, with
+   `related_names` for the form's preview.
+
+### Review round 6 (PR #64)
+
+1. OpenCode reading the pointer's file: OpenCode's permission docs
+   (opencode.ai/docs/permissions, checked 2026-11-16 against the
+   installed 2.2.7) say `external_directory` governs paths outside the
+   project, applies to `read`, and "The default policy allows
+   `external_directory`, so external paths are not prompted unless you
+   add a rule". The config schema gives it no other default. So the
+   pointer works unasked on a default setup; no live check needed, and
+   neither (a) inline background nor (b) a copy in the session folder.
+   A user's own `external_directory: ask/deny` rule would make OpenCode
+   ask or refuse: their choice, left alone (we never write their
+   config).
+2. `context.md` is rewritten at every restart and on a rename of the
+   session, as well as when its rows change.
+3. Lost acks: at most two unacknowledged full deliveries per
+   conversation (`FULL_TRIES`, kv `context_full_tries:<id>`); then it
+   counts as reached, logged once (`context_assumed_delivered`) (test).
+4. Pointer-mode restart marks rows seen only after the pane is
+   respawned or created.
+5. `private.rs` test no longer asserts the parent folder's mode (umask).
+6. `split_legacy` removes only the old instruction (to its last words,
+   else its sentence), keeping text before and after it in the paragraph
+   (test with no blank line).
+7. `set_mode` lost its `sent` flag: every mode but `Hook` sends at launch
+   (the pointer goes alone when there are no words); `launch_prompt`
+   returns just the prompt.
+8. `send_hook_ack` uses `client_call_within` (`client_call` with an
+   optional timeout).
+9. `overlord.md` keeps one line ("follow what its answer says about
+   delivery"); the values and advice are in the `add_context` schema.
+
+Declined (coordinator): `frame_message` (planned for PR 1); the
+test-only wrapper (already `#[cfg(test)]`).
+
+### Review round 7 (PR #64)
+
+1. The give-up path marks every row seen too, and the retry cap covers
+   every answer, whole or update (`UNACKED_TRIES` = 2 in a row per
+   conversation, kv `context_unacked:<id>`, reset by an ack) (test).
+2. A restart marks rows seen in every mode but Hook when the start
+   carries the background (as `set_mode`).
+3. The background file is best effort at launch and restart: written
+   before the agent starts (`context::launch_file_text`), a failure is
+   logged and the start carries no flag or pointer naming the missing
+   file; its rows then stay unseen (`context::record_mode`) (test that
+   the launch file matches the stored rows' render).
+4. `private::write` no longer fsyncs (context.md, the Codex gate are
+   regenerable); `private::write_synced` is the opt-in.
+5. `hook.ack` is mutating (`changed()` fires).
+6. `Db::context_mark_all_seen` (one `UPDATE … WHERE seen_at IS NULL`),
+   used by `set_mode`, the empty update, the give-up and restart.
+7. `methods::agent_param` is the one agent choice: `session_new`,
+   `new_params_on_codex_daemon`, the dispatcher's `hooks_work`.
+8. Legacy machinery removed (`split_legacy`, `without_worker_line`,
+   `legacy_notes`, `first_prompt` and their tests): `overlord.md` is
+   compiled in and rewritten at every overlord start, and the user wants
+   no compatibility code for old state. `by_overlord` stays: it decides
+   the background and the worker paragraph.
+9. `autostart::log_place` reports whether the log folder is rlord's own.
+10. `compose` renders note lines once and hands them to `notes_section`;
+    `update_session` adds background first (one `context::check`, in
+    `session.context_add`), so a refusal still writes nothing.
+
+### Review round 8 (PR #64)
+
+A. Ack tracking redone as columns: `session_context.sent_ack` /
+   `sent_at` (migration 0010 edited in place, unreleased). An answer
+   stamps the rows it carries; `ack` marks seen the rows still stamped
+   with its id (`Db::context_ack`), plus the conversation (kv
+   `context_full_sent:<id>` for the latest whole answer). The ack id
+   names its session (`<session>.<id>`). Give-up marks seen only rows
+   some answer carried (`Db::context_mark_sent_seen`). Gone: the
+   `context_ack:*` / `context_ack_for:*` blobs and the `older` list.
+   Kept: the unacked counter. Tests: at most one duplicate, give-up,
+   replaced answer (its late ack marks nothing; the newer one marks
+   all), a note added after the give-up still goes.
+2. `session.context_add`: the file write after storing is best effort
+   (test: blocked folder, note stored).
+3. A restart marks rows seen only when it carried something fresh (a
+   pointer sent again, or the system prompt file rewritten this time).
+4. Restart into a new conversation re-checks `hooks_work` (the daemon,
+   before the lock, for sessions in Hook mode); gone: SystemPromptFile
+   for Claude, Pointer for the others, stored.
+5. `update_session` validates the background first, makes the other
+   edits, then adds it (passing the checked note and ids, not checked
+   again). A note the same as an unseen one or the latest one is not
+   added again (`Db::context_add`).
+6. A rename also rewrites `context.md` of the sessions that list it as
+   related (`Db::context_linkers`), best effort.
+8. Bare launches: corrected here and in the PR description (they get
+   `pointer_only`).
+9. `tmp_beside` is pid + counter.
+10. `context_exists_or` split back: `Db::context_exists` plus the
+    `context_on` kv in `has_background`.
+
+### Review round 9 (PR #64)
+
+1. The give-up never swallows a reset or a new conversation: SessionStart
+   `startup` / `clear` / `compact`, and a conversation the counter isn't
+   about, always get the whole background and reset the count. A note no
+   answer carried yet goes in the answer that gives up (tests).
+2. `later_delivery` goes by the stored mode only: Hook `next_prompt`,
+   SystemPromptFile `next_start`, else `file_only` (test).
+3. `Daemon::restart_hooks` computes `hooks_work` before the DB lock for
+   every restart path that can need it: the RPC, `ui.goto`, Remote
+   Control. Overlords (`overlord.rs`, `recall.rs`) have no background.
+4. A Pointer restart that sends `pointer_only` resets `bind_since` /
+   `bind_prompt` to that start and prompt (`note_first_prompt`, shared
+   with the launch) (test).
+5. The hook answer is built at the very end of `hook_emit`, after all
+   the event's fallible work.
+6. `checked` is no longer accepted over RPC: `update_session` stores the
+   checked values in-process (`methods::context_store`).
+7. Hook answers name `context.md` only if it exists.
+8. `needs_background` decides on the cleaned `context`.
+9. `Db::context_ack` filters by session (from the ack id) and
+   `Db::context_mark_sent` is one statement.
+10. A restart calls `agent.resume` once, then adds the flag or the
+    pointer to that command.
+
+### Review round 10 (PR #64)
+
+1. `update_session` refuses background for the overlord's own row
+   before checking or storing (`refuse_overlord`, also in
+   `context_store`); `hook_reply_from` returns None for overlord-role
+   sessions as a backstop (tests).
+2. A session's first background after launch records a mode
+   (`context_store`: Hook if hooks work, from
+   `Daemon::first_background_hooks` outside the lock, else the system
+   prompt file for Claude or the pointer); `later_delivery(None)` counts
+   as Hook, as `hook_reply_from` does. Clears the owed item about sessions
+   with no stored mode (tests).
+3. `hook_emit`'s answer returns at once for events other than
+   SessionStart / UserPromptSubmit.
+4. `ui.goto` asks `restart_hooks` only when it will restart the session.
+5. `architecture.md`: `hooks_work` goes to `session.new` and
+   `session.restart` (and to a first `session.context_add`).
+6. A restart's fallback mode (and a pointer's binding reset) is stored
+   only after the pane was respawned or created.
+7. `Db::context_mark_seen` and `private::write_synced` are
+   `#[cfg(test)]`.
+8. `RELATED_MAX` counts distinct resolved sessions, without the session
+   itself (test).
+
+## Owed / deferred
+
+- Follow-up, not in this effort: the guard rail above.
+- The first prompt (with the pointer line for Codex untrusted / OpenCode)
+  is still on argv, `launched_args`, the `launched` event and
+  `bind_prompt`: PR 3.
+- `get_session` (a read-only tool) shows any session's background to any
+  session that added plain `rlord mcp`, like its notes. PR 2's scoped
+  tools are the real surface for workers.
+- Reconcile at PR 4: Codex daemon-mode `turn/start`, an overlord token.
+- Edge cases left (review round 9):
+  - A running agent whose hooks were installed after it started gets
+    `file_only` reported for later background until its next start
+    (`later_delivery` goes by the stored mode only).
+  - An older answer's late ack marks nothing when a newer answer carried
+    the same rows again (the newer one's ack does): one duplicate at
+    most, as designed.
+  - `context.md` of sessions that link to one are refreshed on a rename,
+    not on the linked session's status changes (only at their restart).

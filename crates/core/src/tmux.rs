@@ -58,7 +58,7 @@ set -g detach-on-destroy on
 pub fn write_conf() -> Result<()> {
     let p = conf_path();
     if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
+        crate::private::dir(d)?;
     }
     let local = p.with_file_name("tmux.local.conf");
     let mut conf = CONF.to_string();

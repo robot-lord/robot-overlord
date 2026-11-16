@@ -293,8 +293,16 @@ viewing). `Enter` adds a new line in the
 request; `shift-enter` (or `ctrl-s`) sends it. The overlord names the session and launches it.
 It may ask a quick question or do a little groundwork first (its overlay
 opens so you see it); say "launch as is" in the request to skip that. The
-prompt it writes starts with your request word for word, plus any context
-it found. From
+session's first prompt is your request word for word. What the overlord
+found (file paths, your answers to its questions, related sessions) goes
+to the session separately, as **background**: labelled as the overlord's
+notes, not your words and not instructions. Claude Code and Codex get it
+from rlord's hooks when the session starts (Claude Code without rlord's
+hooks: as an added system prompt); Codex with untrusted hooks and
+OpenCode get one line after your words naming the file it is in
+(`~/.local/share/robot-overlord/sessions/<id>/context.md`). The overlord
+can add to it later and show it to you; a session it proposes (the
+manual form, filled in) shows a line previewing it. From
 anywhere: `rlord overlord ask "…"` (or pipe text in) sends the overlord any
 message.
 

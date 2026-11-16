@@ -242,6 +242,15 @@ impl Agent {
         }
     }
 
+    /// Add a first prompt to a start's command that has none: the last
+    /// argument, as `launch` puts it (OpenCode: `--prompt <text>`).
+    pub fn add_first_prompt(self, argv: &mut Vec<String>, prompt: &str) {
+        if self == Agent::OpenCode {
+            argv.push("--prompt".to_string());
+        }
+        argv.push(prompt.to_string());
+    }
+
     /// What must be confirmed after a start with `model` (see `Deferred`).
     pub fn deferred(self, model: Option<&str>) -> Option<Deferred> {
         let model = model.map(str::trim).filter(|m| !m.is_empty())?;
@@ -669,6 +678,21 @@ pub fn merge_hooks(file: &Path, hook_cmd: &str, events: &[(&str, Option<&str>)])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_prompt_added_to_a_start_is_where_a_launch_puts_it() {
+        let (mut argv, resumed) =
+            opencode::resume_argv("ses_x", Some(false), "/r", None, &["--x".into()]);
+        assert!(!resumed);
+        Agent::OpenCode.add_first_prompt(&mut argv, "read it");
+        assert_eq!(
+            argv,
+            opencode::launch_argv("ses_x", "/r", None, Some("read it"), &["--x".into()])
+        );
+        let mut argv = codex::launch_argv(None, None, &[]);
+        Agent::Codex.add_first_prompt(&mut argv, "read it");
+        assert_eq!(argv, codex::launch_argv(Some("read it"), None, &[]));
+    }
 
     #[test]
     fn moving_on_clears_only_needs_you() {

@@ -507,7 +507,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} already exists", path.display());
             }
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
+                rlord_core::private::dir(dir)?;
             }
             std::fs::write(&path, Config::default_toml())?;
             println!("wrote {}", path.display());
@@ -2015,10 +2015,26 @@ fn hook_emit(agent: &str) -> Result<()> {
         }
     };
     // Bounded: a stalled daemon never holds up the agent's tool call.
-    if rlord_daemon::send_hook_event(&paths::socket_path(), &params)
-        == rlord_daemon::HookSent::Unreachable
-    {
+    let (sent, reply) = rlord_daemon::send_hook_event_for_reply(&paths::socket_path(), &params);
+    if sent == rlord_daemon::HookSent::Unreachable {
         spool_hook_event(&params).ok();
+    }
+    // The daemon's answer for the agent (the session's background at
+    // SessionStart / UserPromptSubmit): printed as the hook's output. Slow
+    // or unreachable: nothing, as before.
+    // Acknowledged only once printed: the daemon then counts it handed
+    // over (unacknowledged, the next prompt gets it again).
+    if let Some(r) = reply {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{}", r.output)
+            .and_then(|_| out.flush())
+            .is_ok()
+        {
+            if let Some(ack) = &r.ack {
+                rlord_daemon::send_hook_ack(&paths::socket_path(), ack);
+            }
+        }
     }
     Ok(())
 }

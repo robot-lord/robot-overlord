@@ -815,7 +815,7 @@ impl Config {
 /// Write the config file's new text (already checked to load).
 fn write_config(path: &std::path::Path, out: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::private::dir(dir)?;
     }
     // A symlinked config (a dotfiles repo) is written where it points.
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());

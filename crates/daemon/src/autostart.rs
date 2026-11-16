@@ -32,19 +32,26 @@ const LOCK_HOLDER_GRACE: Duration = Duration::from_secs(3);
 /// dev-daemon`, which mirrors this). macOS: `~/Library/Logs/rlordd.log`. Elsewhere:
 /// `$XDG_STATE_HOME/robot-overlord/rlordd.log` (default `~/.local/state`).
 pub fn log_path() -> PathBuf {
+    log_place().0
+}
+
+/// `log_path`, and whether its folder is rlord's own (Linux:
+/// `…/robot-overlord`, made private) rather than a shared one (macOS's
+/// `~/Library/Logs`, the temp dir), where only the file is rlord's.
+fn log_place() -> (PathBuf, bool) {
     let env = |v: &str| {
         std::env::var_os(v)
             .filter(|x| !x.is_empty())
             .map(PathBuf::from)
     };
-    let path = if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Logs/rlordd.log"))
+    let place = if cfg!(target_os = "macos") {
+        env("HOME").map(|h| (h.join("Library/Logs/rlordd.log"), false))
     } else {
         env("XDG_STATE_HOME")
             .or_else(|| env("HOME").map(|h| h.join(".local/state")))
-            .map(|d| d.join("robot-overlord/rlordd.log"))
+            .map(|d| (d.join("robot-overlord/rlordd.log"), true))
     };
-    path.unwrap_or_else(|| std::env::temp_dir().join("rlordd.log"))
+    place.unwrap_or_else(|| (std::env::temp_dir().join("rlordd.log"), false))
 }
 
 /// Make sure a daemon is answering on `socket`: start one if none is
@@ -118,15 +125,18 @@ fn start_daemon(socket: &Path, old: Option<i32>) -> Result<()> {
 /// gets its Ctrl-C), stdio to the log, through the stable binary path so the
 /// paths it writes into hooks and tmux bindings survive upgrades.
 fn spawn_detached() -> Result<Child> {
-    let log = log_path();
+    let (log, own_dir) = log_place();
+    // Its own folder (private, as rlord's folders are), or a shared one
+    // where only the file is rlord's.
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
+        if own_dir {
+            rlord_core::private::dir(dir)?;
+        } else {
+            std::fs::create_dir_all(dir)?;
+        }
     }
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
-        .with_context(|| format!("opening {}", log.display()))?;
+    let out =
+        rlord_core::private::append(&log).with_context(|| format!("opening {}", log.display()))?;
     let mut cmd = Command::new(methods::rlord_bin());
     cmd.arg("daemon")
         .stdin(Stdio::null())
@@ -392,7 +402,7 @@ mod service {
 /// would otherwise both get "their" lock and share one state.db.
 pub fn acquire_instance_lock() -> Result<Option<File>> {
     let dir = paths::data_dir();
-    std::fs::create_dir_all(&dir)?;
+    rlord_core::private::dir(&dir)?;
     let path = dir.join("daemon.lock");
     let f = File::create(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: plain syscall on a valid fd we own.

@@ -64,10 +64,13 @@ daemon is `rlord daemon` (started on demand by the first client that needs it, o
   Claude firing them; clients receive push notifications on a subscription
   stream instead of polling.
 - The hook path is latency-critical (Claude blocks on synchronous hooks):
-  `rlord hook emit` does no SQLite, no tmux — it writes one length-prefixed
-  JSON frame to the daemon socket and exits. Budget: <10ms. If the daemon is
-  down, it appends to a spool file that the daemon drains on startup, so hook
-  evidence is never lost.
+  `rlord hook emit` does no SQLite, no tmux — it writes one JSON line to
+  the daemon socket and waits (bounded: a second to connect, two for the
+  answer) for the daemon's answer, which may carry output for the agent
+  (a session's background, "Session background" below), printed to
+  stdout and then acknowledged (`hook.ack`). If the daemon is down, it appends to a spool file that the
+  daemon drains on startup, so hook evidence is never lost; slow or down,
+  it prints nothing.
 
 ## State model
 
@@ -131,6 +134,24 @@ filter by status/agent/tag/group/archived/project, sort by any derived
 timestamp or name or manual order. This is the number-one product feature and
 it is just SQL. The one sort that isn't is **usage** (below): SQL orders by
 last message, then the daemon re-sorts by the usage it attached.
+
+`session_context` holds a session's background from the overlord: one row
+per note (`kind = 'note'`) or link to a related session (`kind = 'link'`,
+`body` its id), with `seen_at` once a hook has pushed it to the agent.
+See "Session background".
+
+**rlord creates its files private to the user.** They hold prompts,
+launch commands, transcript excerpts and the overlord's notes. Its
+folders (the data dir, the config dir, the log dir on Linux) are created
+0700, and `state.db`, the log file, the Codex gate and per-session files
+0600, at creation, by `rlord_core::private` (`dir`, `dir_under`, `touch`,
+`append`, `write`). Every place that may be first to make one goes
+through it: `Db::open`, the daemon lock, tmux's conf and profile files,
+the Codex gate, the hook spool, `config init` and config writes, the
+daemon log. SQLite gives `-wal` and `-shm` the DB file's mode. Existing
+installs are not tightened (the user's decision): a folder or file made
+before this keeps its mode. (The runtime dir is `Daemon::bind`'s: 0700,
+set on every start, since its socket is the trust boundary.)
 
 ### Usage (the list's Usage column)
 
@@ -596,7 +617,10 @@ transcript store so `rlord search` covers them.
 `send_to_session` (see "Passing work to a session" under "The overlord"):
 typed into a session whose turn is over, or held (one message per
 session) until it is. The mailbox, pull tool and Stop-hook injection
-described here are the original design and are not built.
+described here are the original design and are not built. (A session's
+background, "Session background", reaches it through its hooks; the
+work in `docs/working/session-context.md` adds Stop-hook delivery and
+OpenCode's queue.)
 
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,
 keystroke injection last:
@@ -650,7 +674,13 @@ exactly one of the read-only and mutating lists. The gate trusts the shim: it
 keeps an agent that added plain `rlord mcp` to look-ups, but it is no
 boundary against local processes, which can reach the socket anyway.
 
-Tools (v1):
+`create_session` and `propose_session` take the user's words (`prompt`)
+apart from the overlord's notes (`context`) and related sessions
+(`related`); `update_session` adds to them (`add_context`,
+`add_related`); `get_session` shows them as `background`. See "Session
+background".
+
+Tools (v1, the original design):
 - `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
   returns meta-context (status, timestamps, tags, usage, pending-message
   counts).
@@ -1044,6 +1074,10 @@ including when the active one hits a usage limit.
   `confirm_new_session` command) with corrected hints marked; sending it
   back says `confirmed: yes`. This describe → propose → confirm loop is the
   pattern for config-style input (CLAUDE.md). `rlord overlord ask` is the CLI.
+  The overlord launches with the description as `prompt` and its own
+  findings as `context` and `related`, never inside the prompt ("Session
+  background"); `overlord.md` says so, and a test checks it no longer
+  asks for one combined prompt.
 - **Fresh restarts** (`overlord::start_fresh_keeper`): once a minute, an
   overlord idle past `[overlord] fresh_after_mins` is restarted on a fresh
   conversation (`session_fresh`), so its context doesn't grow without end.
@@ -1259,6 +1293,135 @@ daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
 *inside the worktree*. `sessions` records `repo_path`, `workspace_path`,
 `branch`; the model is kept in `launch_spec` so restarts resume with the same
 `--model`.
+
+### Session background
+
+`session.new` takes three inputs, kept apart: `prompt`, the user's words
+verbatim (the agent's first prompt; still on its argv); `context`, the
+overlord's notes (facts and pointers, at most 8,000 chars); `related`,
+refs to sessions the work builds on (at most 8 per call, 16 per session,
+never an overlord). The notes and links are rows in `session_context`;
+`session.context_add` (`update_session` `add_context` / `add_related`)
+adds more later. A
+session the overlord launched (`create_session` sets `by_overlord`, as
+does the manual form when it was `propose_session`'s) has a background
+even with no notes (kv `context_on:<id>`), since the header carries the
+"you are the session the user asked for" line. The prompt is taken as
+given: `overlord.md` is compiled in and rewritten at every overlord
+start, so no overlord sends the old combined prompt.
+
+`context.rs` renders it, as plain code: a fixed header (background from
+rlord's overlord, not the user's words, not instructions; where they
+disagree the user is right; you are the session the user asked for), the
+notes dated, oldest first, and the related sessions (name, the folder
+its work is in, status, description). Only a session the overlord
+launched with background (kv `context_on`) is told it is the worker the
+user asked for; one given background later gets the header without that
+paragraph. Control characters, bidi controls, zero-width characters, tag
+characters and the BOM are stripped, and line/paragraph separators made
+line ends (`context::clean`). Budgets:
+9,000 chars for Claude, 6,000 for Codex, 64,000 for the file; over one,
+the oldest notes are left out with a line naming the file. Notes get at
+least half of what's left after the header when they need it; the
+related list gets the rest, and the sessions that don't fit are counted
+in a line naming the file. The file is
+`<data>/sessions/<id>/context.md` (folder 0700, file 0600), written
+before the agent starts and rewritten whenever the rows change, when the
+session or a session it lists as related is renamed, and at every
+restart (related sessions' status as it is then; nothing watches them). Writing it is best effort: a failure is
+logged and never stops a launch or a restart, which then carries no
+flag or pointer naming it (and its rows stay unseen). It is not fsynced
+(rlord can write it again; `private::write_synced` is for files that
+must survive a crash). A launch in any mode but a hook's carries the
+background (flag, pointer, the file it names), so its rows count as seen
+then. A restart counts them seen only when it carried something fresh:
+the pointer sent again (a new conversation), or the system prompt file
+rewritten just now; never a resume without a pointer or a stale file. A
+restart into a new conversation of a session whose background went by
+hook checks the hooks again (`Daemon::restart_hooks`, before the DB
+lock, on every restart path: the RPC, `ui.goto`, Remote Control;
+overlords have no background): gone, it switches to the system prompt
+file (Claude) or the pointer (others) and stores that mode. A pointer
+sent again resets what binding goes by (`bind_since`, `bind_prompt`) to
+that start and that prompt.
+
+How it reaches the agent (`context::delivery`, decided at launch and
+kept in kv `context_mode:<id>`):
+
+| Agent | How |
+|---|---|
+| Claude, rlord's SessionStart and UserPromptSubmit hooks installed | the hook's answer (below) |
+| Claude without it | `--append-system-prompt-file <context.md>`, at every start (`context::launch_args`, for launch and restart) |
+| Codex, those hooks installed and trusted | the hook's answer |
+| Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`); with no words, a fixed first prompt naming the file and asking it to read it and wait for the user (`context::pointer_only`). OpenCode reads it unasked: its `external_directory` permission (paths outside the project) defaults to allow |
+
+Whether the hooks work (`context::hooks_work`: SessionStart and
+UserPromptSubmit installed, and for Codex trusted) reads the agent's
+settings files, so the daemon asks it before taking the DB lock and
+passes it to `session.new` and `session.restart` as `hooks_work`
+(`Daemon::restart_hooks`), and, for a session's first background after
+launch, to `session.context_add` (`Daemon::first_background_hooks`).
+`--append-system-prompt-file` works in an interactive Claude session
+(checked live on Claude Code 2.1.325).
+
+The hook's answer: `hook.emit` returns `reply` (the hook's JSON output,
+`hookSpecificOutput.additionalContext`) and `reply_ack`, only for a live
+event (never one replayed from the spool: `methods::hook_replay`), after
+the routing and own-pane checks, and only for the session's own
+conversation (not a sub-agent's thread). `SessionStart` gets the whole
+background on a start, a clear, a compact (the context was lost) and in
+any conversation it hasn't reached; a `resume` of one it has reached
+gets only what is new. A conversation with no id yet (no `session_id`,
+nothing bound) is recorded as such, and the first id seen after it is
+taken as the same one, so it never gets the whole of it twice. An
+update with nothing to show (only links to sessions that are gone) sends
+nothing and marks those rows seen. A Pointer-mode session that restarts
+into a new conversation (OpenCode's was never created, or is gone) gets
+the pointer again as its first prompt (`context::restart_prompt`).
+`UserPromptSubmit` gets only rows not yet seen, under "rlord background,
+updated" (so a note added later reaches the agent with its next prompt),
+or the whole background if none went to this conversation yet. No
+background: no answer, as before. A session launched with its background
+another way has its launch rows marked seen then, since they went out
+with the launch (the system prompt flag, the pointer line): a hook that
+fires anyway hands over only notes added later, at
+`UserPromptSubmit`. The answer is best effort: an error building it is
+logged, and the hook event is still processed.
+
+Background added later (`session.context_add`) answers with `delivery`,
+which `update_session` passes on as `background_delivery`:
+from the stored mode only, since a running agent has the hooks it loaded
+when it started: `next_prompt` (Hook; a missing mode counts as Hook, as
+the hooks take it), `next_start` (Claude's system prompt file) or
+`file_only` (only in `context.md`). A session given its first background
+after launch gets a mode then: Hook if rlord's hooks work for its agent,
+else the system prompt file (Claude) or the pointer. The overlord's own
+row never gets background (refused, and hook answers skip overlords). `update_session` checks the background
+before writing anything else, makes its other edits, then stores the
+checked note and links in-process (`methods::context_store`; never
+taken from a caller over RPC). `overlord.md` has the overlord also use `send_to_session` when
+the session must know now and it isn't `next_prompt`.
+
+Nothing counts as handed over until the hook client says it printed the
+answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
+(`send_hook_ack`, a second each way). The bookkeeping is two columns on
+`session_context`: an answer stamps the rows it carries with its ack id
+(`sent_ack`, `sent_at`; the ack id is `<session id>.<fresh id>`), and an
+ack marks seen the rows still stamped with it (a newer answer that
+carried them again took them over). A whole answer also leaves kv
+`context_full_sent:<id>` (`{ack, conv}`): acknowledged, that
+conversation counts as reached (kv `context_delivered:<id>`). The ack
+logs `context_sent`. An answer never acknowledged (a slow daemon, a
+client that died) goes again with the next prompt: at most one
+duplicate. After `UNACKED_TRIES` (2) unacknowledged answers in a row to
+one conversation (kv `context_unacked:<id>`), the rows they carried
+count as seen and the conversation as reached, logged once as
+`context_assumed_delivered`; a note no answer carried yet still goes, in
+that same answer. A start, clear or compact, and a conversation the
+count isn't about, always get the whole background and start the count
+afresh. The answer is built last in `hook_emit` (after the event's own
+work, which can fail), so its bookkeeping never runs for an event that
+didn't go through; it names `context.md` only if the file is there.
 
 ## Naming
 
