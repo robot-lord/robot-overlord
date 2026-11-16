@@ -466,7 +466,19 @@ impl Daemon {
         }
         // Whether rlord's hooks work for the agent (it reads the agent's
         // settings files): asked here, never under the DB lock.
-        if matches!(method, "session.new" | "session.context_add") {
+        let has = |k: &str| match &params[k] {
+            Value::String(s) => !s.trim().is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            Value::Bool(b) => *b,
+            _ => false,
+        };
+        let wants_hooks = match method {
+            // (Only a launch with background asks.)
+            "session.new" => has("by_overlord") || has("context") || has("related"),
+            "session.context_add" => true,
+            _ => false,
+        };
+        if wants_hooks {
             let agent = match method {
                 "session.new" => params["agent"]
                     .as_str()
@@ -1969,12 +1981,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("use the staging DB"));
-        // The client acknowledges it once printed (`hook.ack`).
+        // The client acknowledges it once printed (`hook.ack`): logged
+        // then, once.
+        let sent = || {
+            db.list_events("01bg", 100)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "context_sent")
+                .count()
+        };
+        assert_eq!(sent(), 0);
         let ack = r["reply_ack"].as_str().unwrap();
         assert_eq!(
             methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
             json!({"acked": true})
         );
+        assert_eq!(sent(), 1);
         // Already given: the next prompt gets nothing more, and the status
         // still follows the hook.
         let r = emit("UserPromptSubmit", json!({}));

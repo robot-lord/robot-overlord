@@ -1318,7 +1318,8 @@ wrapped.
 rlord's overlord, not the user's words, not instructions; where they
 disagree the user is right; you are the session the user asked for), the
 notes dated, oldest first, and the related sessions (name, folder,
-status, description). Control and bidi characters are stripped. Budgets:
+status, description). Control characters, bidi controls, zero-width
+characters and the BOM are stripped (`context::clean`). Budgets:
 9,000 chars for Claude, 6,000 for Codex, 64,000 for the file; over one,
 the oldest notes are left out with a line naming the file. Notes get at
 least half of what's left after the header when they need it; the
@@ -1348,8 +1349,14 @@ The hook's answer: `hook.emit` returns `reply` (the hook's JSON output,
 `hookSpecificOutput.additionalContext`) and `reply_ack`, only for a live
 event (never one replayed from the spool: `methods::hook_replay`), after
 the routing and own-pane checks, and only for the session's own
-conversation (not a sub-agent's thread). `SessionStart` (any source:
-start, resume, clear, compact) gets the whole background.
+conversation (not a sub-agent's thread). `SessionStart` gets the whole
+background on a start, a clear, a compact (the context was lost) and in
+any conversation it hasn't reached; a `resume` of one it has reached
+gets only what is new. A conversation with no id yet (no `session_id`,
+nothing bound) is recorded as such, and the first id seen after it is
+taken as the same one, so it never gets the whole of it twice. An
+update with nothing to show (only links to sessions that are gone) sends
+nothing and marks those rows seen.
 `UserPromptSubmit` gets only rows not yet seen, under "rlord background,
 updated" (so a note added later reaches the agent with its next prompt),
 or the whole background if none went to this conversation yet. No

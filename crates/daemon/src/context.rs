@@ -119,8 +119,14 @@ pub fn clean(text: &str) -> String {
             '\n' => Some('\n'),
             '\t' => Some(' '),
             c if c.is_control() => None,
-            // Bidi embeddings, overrides and isolates.
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+            // Bidi embeddings, overrides, isolates and marks; zero-width
+            // characters, invisible operators and the BOM.
+            '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{061C}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{FEFF}' => None,
             c => Some(c),
         })
         .collect()
@@ -822,6 +828,23 @@ pub fn hook_reply(
     sid: Option<&str>,
     file: &Path,
 ) -> Result<Option<Reply>> {
+    hook_reply_from(db, s, agent, event, None, sid, file)
+}
+
+/// `hook_reply`, with the SessionStart's `source` (`startup`, `resume`,
+/// `clear`, `compact`; None: unknown, taken as a start). A `resume` of the
+/// conversation the background already reached keeps it: only what is new
+/// goes. A start, a clear and a compact (the context was lost) get the
+/// whole of it again, as does any other conversation.
+pub fn hook_reply_from(
+    db: &Db,
+    s: &Session,
+    agent: Agent,
+    event: &str,
+    source: Option<&str>,
+    sid: Option<&str>,
+    file: &Path,
+) -> Result<Option<Reply>> {
     if !matches!(event, "SessionStart" | "UserPromptSubmit") {
         return Ok(None);
     }
@@ -833,12 +856,24 @@ pub fn hook_reply(
         return Ok(None);
     }
     let by_hook = mode(db, &s.id)?.unwrap_or(Delivery::Hook) == Delivery::Hook;
-    let conv = sid.or(s.agent_session.as_deref()).unwrap_or("");
-    let full = by_hook
-        && (event == "SessionStart" || db.kv_get(&delivered_key(&s.id))?.as_deref() != Some(conv));
-    if !full && event == "SessionStart" {
+    // Launched with it another way: a start reads it from there.
+    if !by_hook && event == "SessionStart" {
         return Ok(None);
     }
+    let conv = sid.or(s.agent_session.as_deref()).unwrap_or("");
+    let delivered = db.kv_get(&delivered_key(&s.id))?;
+    let same_conv = match delivered.as_deref() {
+        Some(d) if d == conv => true,
+        // Went to a conversation with no id known yet: the first id seen
+        // is that one (once), not a new conversation.
+        Some("") => {
+            db.kv_set(&delivered_key(&s.id), conv)?;
+            true
+        }
+        _ => false,
+    };
+    let restarted = event == "SessionStart" && source != Some("resume");
+    let full = by_hook && (!same_conv || restarted);
     let rows = if full {
         db.context_rows(&s.id)?
     } else {
@@ -850,6 +885,14 @@ pub fn hook_reply(
         return Ok(None);
     }
     let related = related_of(db, &rows);
+    // Nothing to show (only links to sessions that are gone): those rows
+    // count as handed over, and nothing is sent.
+    if !full && related.is_empty() && !rows.iter().any(|r| r.kind == "note") {
+        if let Some(last) = rows.last() {
+            db.context_mark_seen(&s.id, last.id, rlord_core::types::now_ms())?;
+        }
+        return Ok(None);
+    }
     let text = if full {
         render(&s.name, &rows, &related, Some(file), budget)
     } else {
@@ -1004,6 +1047,10 @@ mod tests {
         assert_eq!(
             clean("a\u{1b}[31mred\u{1b}[0m\r\nb\tc\u{202E}d\u{7}"),
             "a[31mred[0m\nb cd"
+        );
+        assert_eq!(
+            clean("a\u{200B}b\u{200F}c\u{061C}d\u{2060}e\u{2064}f\u{FEFF}g\u{200D}h"),
+            "abcdefgh"
         );
         let rows = [row(1, 0, "note", "\u{1b}]0;title\u{7}hi")];
         let text = render("n\u{1b}x", &rows, &[], None, FILE_BUDGET);
@@ -1273,6 +1320,106 @@ mod tests {
         assert_eq!(reply("Stop", "conv-2"), None);
         let none = hook_reply(&db, &s, Agent::OpenCode, "SessionStart", None, file).unwrap();
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn a_resume_of_the_same_conversation_sends_only_what_is_new() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        let s = db.resolve_ref("a").unwrap();
+        let file = Path::new("/f");
+        let reply = |source: Option<&str>, sid: &str| {
+            let r = hook_reply_from(
+                &db,
+                &s,
+                Agent::Claude,
+                "SessionStart",
+                source,
+                Some(sid),
+                file,
+            )
+            .unwrap()?;
+            assert!(ack(&db, &r.ack, 1).unwrap());
+            Some(text(&r.output).to_string())
+        };
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        assert!(reply(Some("startup"), "c1")
+            .unwrap()
+            .starts_with("# Background from rlord"));
+        // Resumed, same conversation, nothing new: nothing.
+        assert_eq!(reply(Some("resume"), "c1"), None);
+        store(&db, "a", &["PR is #12".into()], &[], 2).unwrap();
+        let t = reply(Some("resume"), "c1").unwrap();
+        assert!(t.starts_with("# rlord background, updated") && !t.contains("staging"));
+        // A compact or a clear lost the context: the whole of it.
+        for source in ["compact", "clear"] {
+            assert!(
+                reply(Some(source), "c1").unwrap().contains("use staging"),
+                "{source}"
+            );
+        }
+        // Resumed into another conversation: the whole of it.
+        assert!(reply(Some("resume"), "c2").unwrap().contains("use staging"));
+    }
+
+    #[test]
+    fn a_conversation_without_an_id_yet_gets_it_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&NewSession {
+            id: "a",
+            name: "alpha",
+            agent: "codex",
+            agent_session: None,
+            project_path: "/r",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let s = db.resolve_ref("a").unwrap();
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        let f = Path::new("/f");
+        let r = hook_reply(&db, &s, Agent::Codex, "SessionStart", None, f)
+            .unwrap()
+            .unwrap();
+        assert!(ack(&db, &r.ack, 1).unwrap());
+        // The id turns up with the next prompt: the same conversation.
+        let r = hook_reply(&db, &s, Agent::Codex, "UserPromptSubmit", Some("t1"), f).unwrap();
+        assert_eq!(r, None);
+        // A different id after that is another conversation.
+        let r = hook_reply(&db, &s, Agent::Codex, "UserPromptSubmit", Some("t2"), f).unwrap();
+        assert!(text(&r.unwrap().output).contains("use staging"));
+    }
+
+    #[test]
+    fn an_update_with_nothing_to_show_sends_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        let s = db.resolve_ref("a").unwrap();
+        let f = Path::new("/f");
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        let r = hook_reply(&db, &s, Agent::Claude, "SessionStart", Some("conv-1"), f)
+            .unwrap()
+            .unwrap();
+        assert!(ack(&db, &r.ack, 1).unwrap());
+        // A link to a session that is gone: nothing to show.
+        db.context_add("a", 2, "link", "gone-id", "overlord")
+            .unwrap();
+        let r = hook_reply(
+            &db,
+            &s,
+            Agent::Claude,
+            "UserPromptSubmit",
+            Some("conv-1"),
+            f,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+        assert!(db.context_unseen("a").unwrap().is_empty(), "marked seen");
     }
 
     #[test]

@@ -272,6 +272,33 @@ Fixed:
 
 Declined (coordinator): tightening existing installs (user's decision).
 
+### Review round 4 (PR #64)
+
+Fixed:
+
+1. `context_sent` was still also logged when the reply was built: that
+   insert is gone, so it is logged once, on ack (test through
+   `hook_emit` + `hook_ack`).
+2. With it gone, nothing background-related can abort the hook event
+   before its status, binding and needs-you work (the reply itself was
+   already best effort).
+3. `SessionStart` `resume` of a conversation already reached sends only
+   unseen rows; `startup`, `clear`, `compact`, an unknown source and
+   another conversation get the whole of it
+   (`context::hook_reply_from`, source from the payload) (test).
+4. A delivery to a conversation with no id yet records `""`, and the
+   first real id seen is taken as that conversation, once (test).
+5. `private::write` uses its own temp name (pid, thread, counter),
+   taken with `create_new`, and never removes another writer's (test).
+6. An update with nothing to render (only gone links) sends nothing and
+   marks those rows seen (test).
+7. `clean` also strips U+200B–U+200F, U+061C, U+2060–U+2064 and U+FEFF
+   (test).
+8. `hooks_work` is asked (outside the lock) for `session.new` only when
+   it has `by_overlord`, `context` or `related`.
+
+Declined (coordinator): moving `frame_message` to PR 4 (plan: PR 1).
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the

@@ -1326,7 +1326,8 @@ fn hook_emit_in(
             None
         } else {
             let file = context::file_path(&paths::data_dir(), &s.id);
-            match context::hook_reply(db, &s, agent, event, sid, &file) {
+            let source = payload["source"].as_str();
+            match context::hook_reply_from(db, &s, agent, event, source, sid, &file) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(session = %s.id, event, error = %e, "session background for a hook");
@@ -1334,14 +1335,7 @@ fn hook_emit_in(
                 }
             }
         };
-        if reply.is_some() {
-            db.insert_event(
-                &s.id,
-                now,
-                "context_sent",
-                &json!({"via": event}).to_string(),
-            )?;
-        }
+        // (`context_sent` is logged when the client acknowledges it.)
         let answer = |v: Value| match &reply {
             Some(r) => {
                 let mut v = v;

@@ -68,23 +68,46 @@ pub fn append(path: &Path) -> std::io::Result<std::fs::File> {
 /// renamed over it, so a reader sees the old or the new text, never a
 /// half-written one, and the file is never readable by others.
 pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let tmp = tmp_beside(path);
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(FILE_MODE)
-        .open(&tmp)?;
-    f.write_all(contents)?;
-    drop(f);
-    std::fs::rename(&tmp, path)
+    // A temp name of its own (another writer's is never touched): taken
+    // with `create_new`, the next one tried if it exists.
+    let (tmp, mut f) = loop {
+        let tmp = tmp_beside(path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = f.write_all(contents).and_then(|_| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
+/// A temp file name beside `path`, unique to this process, thread and
+/// call.
 fn tmp_beside(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let thread: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
     path.with_file_name(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}-{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        std::process::id()
+        std::process::id(),
+        thread,
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
@@ -127,6 +150,13 @@ mod tests {
         assert_eq!(mode(&p), 0o600);
         // Nothing left beside it.
         assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1);
+        // Another writer's temp file beside it is left alone.
+        let other = t.path().join(".context.md.tmp-other");
+        std::fs::write(&other, b"theirs").unwrap();
+        write(&p, b"three").unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "theirs");
+        assert_ne!(tmp_beside(&p), tmp_beside(&p));
+        std::fs::remove_file(&other).unwrap();
 
         let db = t.path().join("state.db");
         touch(&db).unwrap();
