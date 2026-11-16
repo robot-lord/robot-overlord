@@ -268,14 +268,16 @@ pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
 /// rewritten; the agent gets the new part with its next prompt (hooks) or
 /// reads the file.
 pub fn session_context_add(db: &Db, params: &Value) -> Result<Value> {
-    session_context_add_in(db, params, &paths::data_dir())
+    session_context_add_in(db, params, &paths::data_dir(), &context::hooks_work)
 }
 
-/// `session_context_add`, with the session files under `base`.
+/// `session_context_add`, with the session files under `base`, and
+/// whether rlord's hooks work for an agent (`context::hooks_work`).
 pub(crate) fn session_context_add_in(
     db: &Db,
     params: &Value,
     base: &std::path::Path,
+    hooks: &dyn Fn(Agent) -> bool,
 ) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     refuse_overlord(&s, "given background")?;
@@ -297,7 +299,15 @@ pub(crate) fn session_context_add_in(
             .to_string(),
         )?;
     }
-    context::listing(db, &s.id)
+    // How it reaches the agent, said honestly (see `context::later_delivery`).
+    let mut out = context::listing(db, &s.id)?;
+    let agent = Agent::named(&s.agent)?;
+    out["delivery"] = json!(context::later_delivery(
+        agent,
+        context::mode(db, &s.id)?,
+        || hooks(agent)
+    ));
+    Ok(out)
 }
 
 /// A session's background: the overlord's notes and related sessions.
@@ -580,13 +590,10 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // The user's words, and the overlord's notes and related sessions
     // apart from them. (An overlord still on older instructions sends its
     // notes inside the prompt, under a heading: split there.)
-    let (prompt, legacy) = match p_opt("prompt") {
-        Some(p) => {
-            let (words, notes) = context::split_legacy(&p);
-            ((!words.trim().is_empty()).then_some(words), notes)
-        }
-        None => (None, None),
-    };
+    // (Only the overlord's prompts: the user's own, from the manual form or
+    // the CLI, are never split.)
+    let by_overlord = params["by_overlord"].as_bool() == Some(true);
+    let (prompt, legacy) = context::first_prompt(p_opt("prompt"), by_overlord);
     // Explicit `context` is checked (too long: refused, for the overlord
     // to shorten); notes split from an old-style prompt are stored as
     // they are, in pieces if long.
@@ -596,15 +603,11 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         &ref_list(params, "related"),
         None,
     )?;
-    let mut notes = legacy
-        .as_deref()
-        .map(context::legacy_notes)
-        .unwrap_or_default();
+    let mut notes = legacy;
     notes.extend(note);
     // Launched by the overlord (`create_session`, or its proposal the user
     // launched): its background says so even with no notes.
-    let background =
-        params["by_overlord"].as_bool() == Some(true) || !notes.is_empty() || !links.is_empty();
+    let background = by_overlord || !notes.is_empty() || !links.is_empty();
 
     // Where the session lives: an explicit repo, an explicit plain folder,
     // or the configured default repo.
@@ -717,7 +720,14 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(mode) = delivery {
         context::turn_on(db, &id)?;
         context::store(db, &id, &notes, &links, now)?;
-        context::set_mode(db, &id, mode, now)?;
+        // What went in at launch another way than a hook: the system
+        // prompt flag always, the pointer line only after a prompt.
+        let sent = match mode {
+            context::Delivery::Hook => false,
+            context::Delivery::SystemPromptFile => true,
+            context::Delivery::Pointer => prompt.is_some(),
+        };
+        context::set_mode(db, &id, mode, sent, now)?;
         // (Before the agent starts: it may read it at once.)
         context::refresh_file(db, &base, &db.resolve_ref(&id)?)?;
     }
@@ -1316,12 +1326,28 @@ fn hook_emit_in(
         // above): the hook prints it for the agent.
         // Marked handed over only when the client acknowledges it
         // (`hook.ack`, `context::ack`).
+        // Best effort: a failure here must not stop the event's own work
+        // (status, binding, needs-you) below.
         let reply = if whose == Whose::Other || !live {
             None
         } else {
             let file = context::file_path(&paths::data_dir(), &s.id);
-            context::hook_reply(db, &s, agent, event, sid, &file)?
+            match context::hook_reply(db, &s, agent, event, sid, &file) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(session = %s.id, event, error = %e, "session background for a hook");
+                    None
+                }
+            }
         };
+        if reply.is_some() {
+            db.insert_event(
+                &s.id,
+                now,
+                "context_sent",
+                &json!({"via": event}).to_string(),
+            )?;
+        }
         let answer = |v: Value| match &reply {
             Some(r) => {
                 let mut v = v;
@@ -1429,14 +1455,6 @@ fn hook_emit_in(
             };
             let detail = crate::own::with_source(json!({"hook": event}), source);
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
-        }
-        if reply.is_some() {
-            db.insert_event(
-                &s.id,
-                now,
-                "context_sent",
-                &json!({"via": event}).to_string(),
-            )?;
         }
         return Ok(answer(json!({"ok": true})));
     } else {
@@ -2116,23 +2134,55 @@ mod tests {
             .unwrap();
         }
         let t = tempfile::tempdir().unwrap();
+        let no_hooks = |_: Agent| false;
         let r = session_context_add_in(
             &db,
             &json!({"ref": "web", "context": "The user wants dark mode too.", "related": ["auth"]}),
             t.path(),
+            &no_hooks,
         )
         .unwrap();
+        // Said honestly: no hooks, no mode from launch: only the file.
+        assert_eq!(r["delivery"], "file_only");
         assert_eq!(r["notes"][0]["note"], "The user wants dark mode too.");
         assert_eq!(r["related"][0]["name"], "auth");
         let text = std::fs::read_to_string(context::file_path(t.path(), "01a")).unwrap();
         assert!(text.contains("dark mode") && text.contains("- auth (/tmp/w"));
         // Too long: refused, nothing stored.
         let long = "x".repeat(context::NOTE_MAX + 1);
-        assert!(
-            session_context_add_in(&db, &json!({"ref": "web", "context": long}), t.path()).is_err()
-        );
+        assert!(session_context_add_in(
+            &db,
+            &json!({"ref": "web", "context": long}),
+            t.path(),
+            &no_hooks
+        )
+        .is_err());
         assert_eq!(db.context_rows("01a").unwrap().len(), 2);
-        assert_eq!(session_context(&db, &json!({"ref": "web"})).unwrap(), r);
+        let mut listed = r.clone();
+        listed.as_object_mut().unwrap().remove("delivery");
+        assert_eq!(
+            session_context(&db, &json!({"ref": "web"})).unwrap(),
+            listed
+        );
+        // With hooks: the next prompt. Launched with a mode: that decides.
+        let hooks = |_: Agent| true;
+        let add = |text: &str, hooks: &dyn Fn(Agent) -> bool| {
+            session_context_add_in(
+                &db,
+                &json!({"ref": "auth", "context": text}),
+                t.path(),
+                hooks,
+            )
+            .unwrap()["delivery"]
+                .clone()
+        };
+        assert_eq!(add("a", &hooks), "next_prompt");
+        context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, true, 1).unwrap();
+        assert_eq!(add("b", &hooks), "next_start");
+        context::set_mode(&db, "01b", context::Delivery::Pointer, true, 1).unwrap();
+        assert_eq!(add("c", &hooks), "file_only");
+        context::set_mode(&db, "01b", context::Delivery::Hook, true, 1).unwrap();
+        assert_eq!(add("d", &no_hooks), "next_prompt");
     }
 
     #[test]
@@ -2174,6 +2224,7 @@ mod tests {
                     &db,
                     &with("context", json!("x")),
                     std::path::Path::new("/nonexistent"),
+                    &|_| false,
                 ),
             ),
             ("tag", session_tag(&db, &with("add", json!(["wip"])))),

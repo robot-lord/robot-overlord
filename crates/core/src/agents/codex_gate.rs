@@ -123,9 +123,7 @@ pub fn write_to(file: &Path, gate: &Gate) -> Result<()> {
     if let Some(dir) = file.parent() {
         crate::private::dir(dir)?;
     }
-    let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, gate.render())?;
-    std::fs::rename(&tmp, file)?;
+    crate::private::write(file, gate.render().as_bytes())?;
     Ok(())
 }
 

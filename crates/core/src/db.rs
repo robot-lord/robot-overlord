@@ -1276,6 +1276,25 @@ impl Db {
         )?)
     }
 
+    /// `context_exists`, or kv `key` is set: in one query.
+    pub fn context_exists_or(&self, session_id: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM kv WHERE key = ?2)",
+            params![session_id, key],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The ids of the sessions a session links to, oldest first.
+    pub fn context_links(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT body FROM session_context WHERE session_id = ?1 AND kind = 'link' ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// A session's notes and links, oldest first.
     pub fn context_rows(&self, session_id: &str) -> Result<Vec<ContextRow>> {
         self.context_where(session_id, "")
@@ -1776,6 +1795,10 @@ mod tests {
         );
         assert!(db.context_rows("b").unwrap().is_empty());
         assert!(db.context_exists("a").unwrap() && !db.context_exists("b").unwrap());
+        assert!(!db.context_exists_or("b", "flag:b").unwrap());
+        db.kv_set("flag:b", "1").unwrap();
+        assert!(db.context_exists_or("b", "flag:b").unwrap());
+        assert_eq!(db.context_links("a").unwrap(), ["b"]);
         db.context_mark_seen("a", rows[1].id, 20).unwrap();
         let unseen = db.context_unseen("a").unwrap();
         assert_eq!(unseen.len(), 1);

@@ -212,7 +212,7 @@ pub fn tools() -> Value {
                 "name": s("New name"),
                 "description": s("One-line description"),
                 "notes": s("Replace the free-form notes"),
-                "add_context": s("Add a note to the session's background (for its agent, labelled as yours, not the user's): a fact or pointer it needs. Reaches the agent with its next prompt. At most 8000 characters."),
+                "add_context": s("Add a note to the session's background (for its agent, labelled as yours, not the user's): a fact or pointer it needs. The answer's `background_delivery` says when the agent gets it: next_prompt (with its next prompt), next_start (at its next start), file_only (written to its background file only). Not next_prompt and it must know now: also pass it with send_to_session. At most 8000 characters."),
                 "add_related": {"type": "array", "items": {"type": "string"},
                                 "description": "Add related sessions to its background (refs; at most 8 per call, 16 per session in all)"},
                 "add_tags": {"type": "array", "items": {"type": "string"}},
@@ -620,11 +620,13 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
             }
             let related = crate::methods::ref_list(args, "add_related");
+            let mut delivery = None;
             if arg_str(args, "add_context").is_some() || !related.is_empty() {
-                d.rpc(
+                let r = d.rpc(
                     "session.context_add",
                     json!({"ref": id, "context": arg_str(args, "add_context"), "related": related}),
                 )?;
+                delivery = Some(r["delivery"].clone());
             }
             let add = args.get("add_tags").cloned().unwrap_or(json!([]));
             let remove = args.get("remove_tags").cloned().unwrap_or(json!([]));
@@ -642,7 +644,12 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // An overlord edit is a review: triage stops listing it until it
             // changes again.
             d.rpc("overlord.mark_reviewed", json!({"sessions": [id]}))?;
-            Ok(summarize(&d.rpc("session.get", json!({"ref": id}))?))
+            let mut out = summarize(&d.rpc("session.get", json!({"ref": id}))?);
+            // When the background added reaches the agent.
+            if let Some(v) = delivery {
+                out["background_delivery"] = v;
+            }
+            Ok(out)
         }
         "list_groups" => d.rpc("tag.list", json!({})),
         "remote_control" => match (

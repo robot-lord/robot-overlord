@@ -206,6 +206,35 @@ run.
 A session given background only after launch (no stored mode) gets it
 through hooks, or from the file; it gets no system prompt flag.
 
+### Review round 2 (PR #64)
+
+Fixed:
+
+1. Honest delivery for later background. `hooks_work` needs both
+   SessionStart and UserPromptSubmit. `session.context_add` answers with
+   `delivery` (`next_prompt` / `next_start` / `file_only`,
+   `context::later_delivery`); `update_session` passes it on as
+   `background_delivery`. `overlord.md` and the schema: not
+   `next_prompt` and it must know now, also `send_to_session`.
+2. `set_mode` marks launch rows seen only when they went out (the system
+   prompt flag; the pointer line only after a prompt).
+3. The hook's background answer is best effort: an error is logged, no
+   answer, and the event's own processing goes on.
+4. `split_legacy` runs only for the overlord's launches
+   (`context::first_prompt(prompt, by_overlord)`); the user's prompts are
+   never split.
+5. `context_sent` is logged on every path that answers (also the early
+   "unchanged" one).
+6. The Codex gate file is written with `private::write` (0600, atomic).
+7. `check` counts links with `Db::context_links`.
+8. `hook_reply` returns after one query (`Db::context_exists_or`) for a
+   session without background.
+9. `docs/architecture.md`: files are *created* private; existing installs
+   are not tightened.
+
+Declined (coordinator): tightening existing installs at start (user's
+decision); moving `frame_message` to PR 4 (the plan puts it in PR 1).
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the

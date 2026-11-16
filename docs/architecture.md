@@ -140,17 +140,18 @@ per note (`kind = 'note'`) or link to a related session (`kind = 'link'`,
 `body` its id), with `seen_at` once a hook has pushed it to the agent.
 See "Session background".
 
-**rlord's files are private to the user.** They hold prompts, launch
-commands, transcript excerpts and the overlord's notes. Its folders (the
-data dir, the config dir, the log dir on Linux) are created 0700, and
-`state.db`, the log file and per-session files 0600, at creation, by
-`rlord_core::private` (`dir`, `dir_under`, `touch`, `append`, `write`).
-Every place that may be first to make one goes through it: `Db::open`,
-the daemon lock, tmux's conf and profile files, the Codex gate, the hook
-spool, `config init` and config writes, the daemon log. SQLite gives
-`-wal` and `-shm` the DB file's mode. A folder that already exists is
-left as it is. (The runtime dir is `Daemon::bind`'s: 0700, set on every
-start, since its socket is the trust boundary.)
+**rlord creates its files private to the user.** They hold prompts,
+launch commands, transcript excerpts and the overlord's notes. Its
+folders (the data dir, the config dir, the log dir on Linux) are created
+0700, and `state.db`, the log file, the Codex gate and per-session files
+0600, at creation, by `rlord_core::private` (`dir`, `dir_under`, `touch`,
+`append`, `write`). Every place that may be first to make one goes
+through it: `Db::open`, the daemon lock, tmux's conf and profile files,
+the Codex gate, the hook spool, `config init` and config writes, the
+daemon log. SQLite gives `-wal` and `-shm` the DB file's mode. Existing
+installs are not tightened (the user's decision): a folder or file made
+before this keeps its mode. (The runtime dir is `Daemon::bind`'s: 0700,
+set on every start, since its socket is the trust boundary.)
 
 ### Usage (the list's Usage column)
 
@@ -1331,9 +1332,9 @@ kept in kv `context_mode:<id>`):
 
 | Agent | How |
 |---|---|
-| Claude, rlord's SessionStart hook installed | the hook's answer (below) |
+| Claude, rlord's SessionStart and UserPromptSubmit hooks installed | the hook's answer (below) |
 | Claude without it | `--append-system-prompt-file <context.md>`, at every start (`context::launch_args`, for launch and restart) |
-| Codex, rlord's hooks installed and trusted | the hook's answer |
+| Codex, those hooks installed and trusted | the hook's answer |
 | Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`) |
 
 The hook's answer: `hook.emit` returns `reply` (the hook's JSON output,
@@ -1346,9 +1347,22 @@ start, resume, clear, compact) gets the whole background.
 updated" (so a note added later reaches the agent with its next prompt),
 or the whole background if none went to this conversation yet. No
 background: no answer, as before. A session launched with its background
-another way (system prompt file, pointer line) has its launch rows
-marked seen then: a hook that fires anyway hands over only notes added
-later, at `UserPromptSubmit`.
+another way has its launch rows marked seen then, if they really went
+out (the system prompt flag; the pointer line, which needs a prompt to
+follow): a hook that fires anyway hands over only notes added later, at
+`UserPromptSubmit`. The answer is best effort: an error building it is
+logged, and the hook event is still processed.
+
+Background added later (`session.context_add`) answers with `delivery`,
+which `update_session` passes on as `background_delivery`:
+`next_prompt` (by hook), `next_start` (Claude's system prompt file), or
+`file_only` (only in `context.md`: OpenCode, the pointer line, no
+hooks). `overlord.md` has the overlord also use `send_to_session` when
+the session must know now and it isn't `next_prompt`.
+
+A prompt is split by `split_legacy` only when the overlord launched the
+session (`by_overlord`): the user's own, from the manual form or the
+CLI, are never split.
 
 Nothing counts as handed over until the hook client says it printed the
 answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`

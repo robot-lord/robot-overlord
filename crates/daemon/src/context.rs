@@ -338,6 +338,21 @@ pub fn split_legacy(prompt: &str) -> (String, Option<String>) {
     (prompt.to_string(), None)
 }
 
+/// A new session's first prompt, and the notes an old-style prompt carried
+/// (stored as notes: `legacy_notes`). Only the overlord's prompts are
+/// split (`by_overlord`); the user's own, from the manual form or the CLI,
+/// are taken as they are, whatever lines they hold.
+pub fn first_prompt(prompt: Option<String>, by_overlord: bool) -> (Option<String>, Vec<String>) {
+    match prompt {
+        Some(p) if by_overlord => {
+            let (words, notes) = split_legacy(&p);
+            let notes = notes.as_deref().map(legacy_notes).unwrap_or_default();
+            ((!words.trim().is_empty()).then_some(words), notes)
+        }
+        p => (p, Vec::new()),
+    }
+}
+
 /// Quote and emphasis marks ignored when looking for the old instruction.
 fn is_quote_mark(c: char) -> bool {
     matches!(
@@ -505,19 +520,42 @@ pub fn delivery(agent: Agent, hooks: bool) -> Delivery {
     }
 }
 
-/// Whether rlord's SessionStart hook runs for `agent` on this machine:
-/// installed (Claude), installed and trusted (Codex). Reads the agent's
-/// own config files.
+/// Whether rlord's hooks can hand `agent` its background on this machine:
+/// both SessionStart (at a start) and UserPromptSubmit (what is added
+/// later) installed, and for Codex trusted. Reads the agent's own config
+/// files.
 pub fn hooks_work(agent: Agent) -> bool {
     use rlord_core::agents::install;
-    let has_start =
-        || !install::hooks_missing(agent, &agent.hooks_file()).contains(&"SessionStart");
+    let both = || {
+        let missing = install::hooks_missing(agent, &agent.hooks_file());
+        !missing.contains(&"SessionStart") && !missing.contains(&"UserPromptSubmit")
+    };
     match agent {
-        Agent::Claude => has_start(),
+        Agent::Claude => both(),
         Agent::Codex => {
-            has_start() && install::codex_hooks_trusted(&agents::codex::home()) == Some(true)
+            both() && install::codex_hooks_trusted(&agents::codex::home()) == Some(true)
         }
         Agent::OpenCode => false,
+    }
+}
+
+/// What happens to background added after launch, said honestly to the
+/// overlord: `next_prompt` (a hook hands it over with the agent's next
+/// prompt), `next_start` (Claude's system prompt file, read at its next
+/// start), or `file_only` (only written to context.md: the agent sees it
+/// if it reads the file again). `mode`: as decided at launch (None: the
+/// session had no background then; `hooks` is asked instead).
+pub fn later_delivery(
+    agent: Agent,
+    mode: Option<Delivery>,
+    hooks: impl FnOnce() -> bool,
+) -> &'static str {
+    match mode {
+        Some(Delivery::Hook) => "next_prompt",
+        Some(Delivery::SystemPromptFile) => "next_start",
+        Some(Delivery::Pointer) => "file_only",
+        None if agent != Agent::OpenCode && hooks() => "next_prompt",
+        None => "file_only",
     }
 }
 
@@ -535,12 +573,13 @@ pub fn launch_args(mode: Option<Delivery>, file: &Path) -> Vec<String> {
 }
 
 /// Record how session `id`'s background reaches its agent, at launch.
-/// What it was launched with went in another way than a hook (the system
-/// prompt file, the pointer line): its rows count as seen, so a hook that
-/// does fire hands over only what is added later.
-pub fn set_mode(db: &Db, id: &str, mode: Delivery, now: i64) -> Result<()> {
+/// `sent`: it went in at launch another way than a hook (the system prompt
+/// flag, the pointer line after a prompt): its rows then count as seen, so
+/// a hook that does fire hands over only what is added later. (Not sent,
+/// e.g. no prompt to put the pointer after: they stay unseen.)
+pub fn set_mode(db: &Db, id: &str, mode: Delivery, sent: bool, now: i64) -> Result<()> {
     db.kv_set(&mode_key(id), mode.as_str())?;
-    if mode != Delivery::Hook {
+    if mode != Delivery::Hook && sent {
         if let Some(last) = db.context_rows(id)?.last() {
             db.context_mark_seen(id, last.id, now)?;
         }
@@ -599,12 +638,7 @@ pub fn check(
         }
     }
     let had: Vec<String> = match own {
-        Some(own) => db
-            .context_rows(own)?
-            .into_iter()
-            .filter(|r| r.kind == "link")
-            .map(|r| r.body)
-            .collect(),
+        Some(own) => db.context_links(own)?,
         None => Vec::new(),
     };
     let total = had.len() + ids.iter().filter(|i| !had.contains(i)).count();
@@ -633,9 +667,9 @@ pub fn turn_on(db: &Db, id: &str) -> Result<()> {
     db.kv_set(&on_key(id), "1")
 }
 
-/// Whether session `id` has any background to give.
+/// Whether session `id` has any background to give (one query).
 pub fn has_background(db: &Db, id: &str) -> Result<bool> {
-    Ok(db.kv_get(&on_key(id))?.is_some() || db.context_exists(id)?)
+    db.context_exists_or(id, &on_key(id))
 }
 
 /// The related sessions the links in `rows` name (gone ones skipped).
@@ -737,6 +771,10 @@ pub fn hook_reply(
     let Some(budget) = budget(agent) else {
         return Ok(None);
     };
+    // Most sessions have none: one query, then done.
+    if !has_background(db, &s.id)? {
+        return Ok(None);
+    }
     let by_hook = mode(db, &s.id)?.unwrap_or(Delivery::Hook) == Delivery::Hook;
     let conv = sid.or(s.agent_session.as_deref()).unwrap_or("");
     let full = by_hook
@@ -744,13 +782,14 @@ pub fn hook_reply(
     if !full && event == "SessionStart" {
         return Ok(None);
     }
-    // One query for the rows; the kv flag only when there are none.
     let rows = if full {
         db.context_rows(&s.id)?
     } else {
         db.context_unseen(&s.id)?
     };
-    if rows.is_empty() && (!full || db.kv_get(&on_key(&s.id))?.is_none()) {
+    // (Full with no rows: the header alone, for a session the overlord
+    // launched, which `has_background` says this is.)
+    if rows.is_empty() && !full {
         return Ok(None);
     }
     let related = related_of(db, &rows);
@@ -932,6 +971,21 @@ mod tests {
             notes.as_deref(),
             Some("Repo is /r/web.\n\nRemember:\n\nBranch is main.")
         );
+    }
+
+    #[test]
+    fn only_the_overlords_prompts_are_split() {
+        let p = "Fix it.\n## Context from the overlord\nRepo is /r/web.".to_string();
+        assert_eq!(
+            first_prompt(Some(p.clone()), true),
+            (
+                Some("Fix it.".to_string()),
+                vec!["Repo is /r/web.".to_string()]
+            )
+        );
+        // The user's own words, heading and all: as they are.
+        assert_eq!(first_prompt(Some(p.clone()), false), (Some(p), Vec::new()));
+        assert_eq!(first_prompt(None, true), (None, Vec::new()));
     }
 
     #[test]
@@ -1212,6 +1266,38 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_never_sent_leaves_the_notes_unseen() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        store(&db, "a", &["use staging".into()], &[], 1).unwrap();
+        // Pointer mode with no prompt: nothing went out.
+        set_mode(&db, "a", Delivery::Pointer, false, 2).unwrap();
+        assert_eq!(db.context_unseen("a").unwrap().len(), 1);
+        set_mode(&db, "a", Delivery::Pointer, true, 3).unwrap();
+        assert!(db.context_unseen("a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn later_background_says_how_it_will_arrive() {
+        let never = || panic!("not asked when the mode is known");
+        assert_eq!(
+            later_delivery(Agent::Claude, Some(Delivery::Hook), never),
+            "next_prompt"
+        );
+        assert_eq!(
+            later_delivery(Agent::Claude, Some(Delivery::SystemPromptFile), never),
+            "next_start"
+        );
+        assert_eq!(
+            later_delivery(Agent::Codex, Some(Delivery::Pointer), never),
+            "file_only"
+        );
+        assert_eq!(later_delivery(Agent::Claude, None, || true), "next_prompt");
+        assert_eq!(later_delivery(Agent::Codex, None, || false), "file_only");
+        assert_eq!(later_delivery(Agent::OpenCode, None, || true), "file_only");
+    }
+
+    #[test]
     fn launched_with_it_another_way_a_hook_hands_over_only_what_is_new() {
         let db = Db::open_in_memory().unwrap();
         session(&db, "a", "alpha", "");
@@ -1219,7 +1305,7 @@ mod tests {
         let file = Path::new("/f");
         turn_on(&db, "a").unwrap();
         store(&db, "a", &["use staging".into()], &[], 1).unwrap();
-        set_mode(&db, "a", Delivery::SystemPromptFile, 2).unwrap();
+        set_mode(&db, "a", Delivery::SystemPromptFile, true, 2).unwrap();
         assert_eq!(mode(&db, "a").unwrap(), Some(Delivery::SystemPromptFile));
         // Its launch notes went in as the system prompt: a hook that fires
         // anyway doesn't send them again.
