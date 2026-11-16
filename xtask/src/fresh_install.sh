@@ -99,11 +99,26 @@ tui() {
   tmux -L e2e send-keys Escape
 }
 step tui-first-run tui
+# Then the code-folder form (no projects seen yet); Esc puts it off.
+setup_form() {
+  i=0
+  while [ $i -lt 20 ]; do
+    tmux -L e2e capture-pane -p >/tmp/screen.txt
+    grep -q 'Where do you keep your code\|rlord exited' /tmp/screen.txt && break
+    sleep 0.5
+    i=$((i + 1))
+  done
+  cat /tmp/screen.txt
+  tmux -L e2e send-keys Escape
+}
+step tui-setup-form setup_form
 step agents-none-json rlord agents --json
 step agents-none rlord agents
 step overlord-status-none rlord overlord status
 mkdir -p "$HOME/proj"
 step new-none rlord new --project "$HOME/proj" --agent claude --name e2e-none
+step setup rlord setup "$HOME/proj"
+step setup-config rlord config show
 
 # Stand-ins for the three agents' CLIs, where a global install would put
 # them: they answer --version, log every call, and otherwise idle. No real

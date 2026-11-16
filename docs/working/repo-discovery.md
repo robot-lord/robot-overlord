@@ -53,7 +53,7 @@ Progress: (updated per commit)
 - [x] `rlord setup`
 - [x] TUI setup form, first run, `:setup`
 - [x] overlord: `confirm_setup`, setup request, `overlord.md`
-- [ ] fresh-install steps
+- [x] fresh-install steps
 - [ ] docs and reconcile
 
 ## Plan (agreed shape)
