@@ -88,20 +88,7 @@ impl Guard {
     /// nothing is guarded by name.
     pub fn new() -> Guard {
         let mac = cfg!(target_os = "macos");
-        let mut homes = Vec::new();
-        if let Some(h) = mac
-            .then(|| std::env::var_os("HOME"))
-            .flatten()
-            .filter(|h| !h.is_empty())
-        {
-            let h = PathBuf::from(h);
-            if let Ok(c) = std::fs::canonicalize(&h) {
-                if c != h {
-                    homes.push(c);
-                }
-            }
-            homes.push(h);
-        }
+        let homes = if mac { home_paths() } else { Vec::new() };
         Guard {
             homes,
             volumes: mac,
@@ -178,14 +165,7 @@ impl Guard {
 
     /// `inner` is `outer` or below it, component by component.
     pub fn is_within(&self, inner: &Path, outer: &Path) -> bool {
-        let mut i = inner.components();
-        for o in outer.components() {
-            match i.next() {
-                Some(c) if self.eq(c.as_os_str(), o.as_os_str()) => {}
-                _ => return false,
-            }
-        }
-        true
+        path_within(inner, outer, self.fold_case)
     }
 
     fn eq(&self, a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
@@ -195,6 +175,27 @@ impl Guard {
             a == b
         }
     }
+}
+
+/// This machine compares paths ignoring ASCII case (macOS).
+pub const FOLDS_CASE: bool = cfg!(target_os = "macos");
+
+/// `inner` is `outer` or below it, component by component (ASCII case
+/// folded when `fold`).
+pub fn path_within(inner: &Path, outer: &Path, fold: bool) -> bool {
+    let mut i = inner.components();
+    for o in outer.components() {
+        match i.next() {
+            Some(c) if c == o || (fold && c.as_os_str().eq_ignore_ascii_case(o.as_os_str())) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The same folder (ASCII case folded when `fold`).
+pub fn same_path(a: &Path, b: &Path, fold: bool) -> bool {
+    a.components().count() == b.components().count() && path_within(a, b, fold)
 }
 
 #[cfg(test)]

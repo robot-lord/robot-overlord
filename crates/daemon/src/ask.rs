@@ -351,6 +351,11 @@ pub fn format_setup_request(p: &Value) -> Result<String> {
                 )
             }
         }
+        _ if p["roots_source"] == "default" => {
+            "- repo finder scans: the code folder only (rlord's default; \
+             to keep this: repo_roots: [])\n"
+                .to_string()
+        }
         _ => {
             "- repo finder scans: the code folder only (to keep this: repo_roots: [])\n".to_string()
         }
@@ -403,6 +408,10 @@ mod tests {
             ),
             "{m}"
         );
+        let m = format_setup_request(&json!({"description": "x", "roots": "follow",
+            "roots_source": "default"}))
+        .unwrap();
+        assert!(m.contains("the code folder only (rlord's default; "), "{m}");
         assert!(format_setup_request(&json!({"description": " "})).is_err());
     }
 

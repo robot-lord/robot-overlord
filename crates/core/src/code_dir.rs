@@ -116,10 +116,17 @@ const NEVER: &[&str] = &[
 /// Folders never suggested: `/`, `$HOME` and its ancestors, `NEVER`, and
 /// each user's folder under `/run/media` (a parent of mounts too).
 fn never(d: &Path, homes: &[PathBuf]) -> bool {
+    never_with(d, homes, crate::privacy::FOLDS_CASE)
+}
+
+/// `never`, ignoring ASCII case when `fold` (as macOS does).
+fn never_with(d: &Path, homes: &[PathBuf], fold: bool) -> bool {
+    use crate::privacy::{path_within, same_path};
     d.parent().is_none()
-        || homes.iter().any(|h| h.starts_with(d))
-        || NEVER.iter().any(|n| d == Path::new(n))
-        || d.parent() == Some(Path::new("/run/media"))
+        || homes.iter().any(|h| path_within(h, d, fold))
+        || NEVER.iter().any(|n| same_path(d, Path::new(n), fold))
+        || d.parent()
+            .is_some_and(|p| same_path(p, Path::new("/run/media"), fold))
 }
 
 /// A folder that may be offered as the code folder at all: not `/`, not
@@ -366,6 +373,10 @@ mod tests {
         assert_eq!(best(&s), Some("/h/ko"));
         assert!(s.alternatives.iter().all(|c| c.path != "/h/ko/app"));
         assert!(suggestible(Path::new("/h/ko"), homes));
+        // Folding case (macOS): another spelling is the same folder.
+        assert!(never_with(Path::new("/Var/Home/ME"), homes, true));
+        assert!(never_with(Path::new("/volumes"), homes, true));
+        assert!(!never_with(Path::new("/volumes"), homes, false));
         assert!(!suggestible(Path::new("/var/home"), homes));
         // (And `sources` parse for `basis`.)
         let mut src = sources_of(&serde_json::json!({"claude": 2, "rlord": 1}));

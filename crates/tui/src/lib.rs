@@ -282,6 +282,11 @@ struct App {
     /// rlord's code-folder suggestion, once worked out this run: reused by
     /// later opens (`load_suggestion`).
     last_suggestion: Option<Value>,
+    /// A setup request on its way to the overlord, and the form it came
+    /// from (`poll_setup_send`).
+    setup_send: Option<setupform::SetupSend>,
+    /// That form, to reopen once nothing else is open (the send failed).
+    setup_retry: Option<Box<setupform::SetupForm>>,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -346,6 +351,8 @@ impl App {
             startup_chain: false,
             overlay_after_startup: false,
             last_suggestion: None,
+            setup_send: None,
+            setup_retry: None,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),
@@ -794,7 +801,7 @@ impl App {
             if pushed {
                 self.dirty = true;
             }
-            if self.poll_setup() {
+            if self.poll_setup() || self.poll_setup_send() {
                 self.dirty = true;
             }
             self.continue_startup();

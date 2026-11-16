@@ -323,7 +323,7 @@ shows, as a repo you've used. `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
-`rlord repos` lists known repos; `rlord setup [PATH] [--keep-roots]` sets
+`rlord repos` lists known repos; `rlord setup [PATH] [--keep-roots] [--allow-home]` sets
 the code folder (without PATH it shows rlord's suggestion and asks).
 
 A new repo goes in the code folder: ask the overlord for work that needs

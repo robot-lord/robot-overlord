@@ -540,7 +540,15 @@ impl App {
                     "the overlord wants to open setup: finish here, then :setup".into();
             }
             Some("setup") => {
+                // At startup it is the first-run form, and the end of the
+                // startup sequence (no second form after it).
+                let first = std::mem::take(&mut self.startup_chain);
                 self.open_setup_from(&cmd);
+                if first {
+                    if let Mode::Setup(f) = &mut self.mode {
+                        f.auto = cmd["status"]["needed"] == true;
+                    }
+                }
                 self.status_line =
                     "the overlord proposed a code folder — check it, then save".into();
             }

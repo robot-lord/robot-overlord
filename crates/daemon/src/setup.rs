@@ -398,7 +398,7 @@ fn apply_with(
     // a repo (where it can be checked); `$HOME` only when the user
     // confirmed it (`allow_home`: the finder then scans all of it).
     let p = Path::new(&dir);
-    if homes.iter().any(|h| h == p) {
+    if homes.iter().any(|h| guard.same(h, p)) {
         if params["allow_home"] != true {
             bail!(
                 "{} is your whole home folder: the repo finder would scan all of it. \

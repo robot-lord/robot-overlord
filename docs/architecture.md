@@ -1231,7 +1231,8 @@ that doesn't exist. A folder macOS guards is saved unchecked
 (`checked: false`): checking or creating it would raise the prompt.
 `setup.apply` refuses what the suggestion never offers (a system or
 mount parent, a git repo where it can check), and takes `$HOME` itself
-only with `allow_home` (the form and the CLI warn and ask twice). The
+only with `allow_home` (the form and the CLI warn and ask twice;
+`rlord setup --allow-home` without a terminal or with `--json`). The
 form looks at the disk from the UI thread only under `$HOME`; anything
 else is "not checked here" and left to `setup.apply`.
 What saving rlord's own suggestion does with `repo_roots` is the

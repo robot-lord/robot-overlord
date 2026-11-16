@@ -139,6 +139,10 @@ enum Command {
         /// `repo_roots = ["~"]` switches to scanning the code folder)
         #[arg(long)]
         keep_roots: bool,
+        /// Take your home folder itself as the code folder without asking
+        /// (the repo finder then scans all of it)
+        #[arg(long)]
+        allow_home: bool,
         /// Print the suggestion (no PATH) or what was saved, as JSON; never
         /// prompts
         #[arg(long)]
@@ -904,8 +908,9 @@ fn main() -> Result<()> {
         Command::Setup {
             path,
             keep_roots,
+            allow_home,
             json,
-        } => setup_cmd(path, keep_roots, json),
+        } => setup_cmd(path, keep_roots, allow_home, json),
         Command::Repos => {
             let r = call("repo.list", Value::Null)?;
             for repo in r.as_array().map(|v| v.as_slice()).unwrap_or_default() {
@@ -1609,8 +1614,13 @@ fn print_search(v: &Value) {
     println!("\nread around a hit: rlord history <session or transcript path> --around <line>");
 }
 
-/// `rlord setup [PATH] [--keep-roots] [--json]`.
-fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<()> {
+/// `rlord setup [PATH] [--keep-roots] [--allow-home] [--json]`.
+fn setup_cmd(
+    path: Option<String>,
+    keep_roots: bool,
+    allow_home_flag: bool,
+    json_out: bool,
+) -> Result<()> {
     use rlord_core::config::contract_tilde;
     use std::io::{IsTerminal, Write};
     let cwd = std::env::current_dir()?;
@@ -1671,12 +1681,16 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
         if !is_home(folder) {
             return Ok(false);
         }
+        if allow_home_flag {
+            return Ok(true);
+        }
         let warn = format!(
             "{} is your whole home folder: the repo finder scans all of it.",
             contract_tilde(folder)
         );
-        if !terminal {
-            anyhow::bail!("{warn} Run `rlord setup` at a terminal to confirm it.");
+        // (`--json` never prompts.)
+        if !terminal || json_out {
+            anyhow::bail!("{warn} Pass --allow-home to use it anyway.");
         }
         if !yes_no(&ask(&format!("{warn} Use it anyway? [y/N] "))?, false) {
             anyhow::bail!("aborted");
@@ -1787,7 +1801,9 @@ fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<(
 
 /// `folder` is `$HOME` (as given or resolved).
 fn is_home(folder: &str) -> bool {
-    rlord_core::privacy::home_paths().contains(&std::path::PathBuf::from(folder))
+    use rlord_core::privacy::{home_paths, same_path, FOLDS_CASE};
+    let p = std::path::Path::new(folder);
+    home_paths().iter().any(|h| same_path(h, p, FOLDS_CASE))
 }
 
 /// The question about `repo_roots`: everything the finder scans now (the

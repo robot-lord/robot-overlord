@@ -85,6 +85,10 @@ pub(crate) struct SetupForm {
     /// Reopened with an overlord proposal (`prefill`): a late suggestion
     /// doesn't replace it.
     proposal: bool,
+    /// The roots edit is rlord's default (`roots_default`), not a pick.
+    roots_from_default: bool,
+    /// The overlord's proposed roots, kept so ←/→ can come back to them.
+    proposed_roots: Option<Vec<String>>,
     /// The folder `$HOME` was confirmed for ("scans your whole home
     /// folder"): saving it again goes ahead.
     confirm_home: Option<String>,
@@ -100,6 +104,10 @@ pub(crate) struct SetupForm {
     /// edit, not per frame (it may look at the disk).
     hint: String,
 }
+
+/// A setup request on its way to the overlord: its result, and the form
+/// it came from (`App::poll_setup_send`).
+pub(crate) type SetupSend = (mpsc::Receiver<Result<(), String>>, Box<SetupForm>);
 
 /// What Save does.
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +162,7 @@ impl SetupForm {
         };
         // What saving rlord's suggestion does with the roots is the
         // daemon's call (`roots_default`), used as given.
+        let roots_from_default = !configured.is_empty() && sugg["roots_default"] == "follow";
         let roots = if configured.is_empty() || sugg["roots_default"] == "follow" {
             Roots::Follow
         } else {
@@ -179,6 +188,7 @@ impl SetupForm {
             touched: false,
             confirm_create: None,
             confirm_home: None,
+            roots_from_default,
             current: if current.is_empty() {
                 String::new()
             } else {
@@ -186,6 +196,7 @@ impl SetupForm {
             },
             homes: rlord_core::privacy::home_paths(),
             proposal: false,
+            proposed_roots: None,
             guard: rlord_core::privacy::Guard::new(),
             hint: String::new(),
         };
@@ -273,8 +284,10 @@ impl SetupForm {
             self.roots = if r.is_empty() {
                 Roots::Follow
             } else {
+                self.proposed_roots = Some(r.clone());
                 Roots::Set(r)
             };
+            self.roots_from_default = false;
             self.roots_row = true;
         } else {
             // No roots proposed: the configured ones stay, whatever the
@@ -366,12 +379,28 @@ impl SetupForm {
     }
 
     /// ← / → on the roots row: the code folder or the configured roots.
+    /// The roots row's choices, in order: the overlord's proposal (if
+    /// any), only the code folder, the configured roots (if any).
+    fn roots_options(&self) -> Vec<Roots> {
+        let mut v = Vec::new();
+        if let Some(p) = &self.proposed_roots {
+            v.push(Roots::Set(p.clone()));
+        }
+        v.push(Roots::Follow);
+        if !self.configured.is_empty() {
+            v.push(Roots::Keep(self.configured.clone()));
+        }
+        v
+    }
+
     fn toggle_roots(&mut self) {
-        self.roots = match &self.roots {
-            Roots::Follow if self.configured.is_empty() => Roots::Follow,
-            Roots::Follow => Roots::Keep(self.configured.clone()),
-            _ => Roots::Follow,
-        };
+        let o = self.roots_options();
+        let next = o
+            .iter()
+            .position(|r| *r == self.roots)
+            .map_or(0, |i| (i + 1) % o.len());
+        self.roots = o[next].clone();
+        self.roots_from_default = false;
     }
 
     /// The suggestion the folder field shows, if it is one.
@@ -399,6 +428,7 @@ impl SetupForm {
                 "suggested by rlord"
             };
             let (roots, roots_source) = match &self.roots {
+                Roots::Follow if self.roots_from_default => (json!("follow"), "default"),
                 Roots::Follow => (json!("follow"), "user"),
                 Roots::Keep(r) => (json!(r), "config"),
                 Roots::Set(r) => (json!(r), "user"),
@@ -449,14 +479,15 @@ impl SetupForm {
     /// `path` is `$HOME` (as given or resolved).
     fn is_home(&self, path: &str) -> bool {
         let p = std::path::Path::new(path.trim_end_matches('/'));
-        self.homes.iter().any(|h| h == p)
+        self.homes.iter().any(|h| self.guard.same(h, p))
     }
 
     /// Whether this (UI) thread may look at `path` on disk: only under
     /// `$HOME`, and only where no macOS prompt guards. Anything else is
     /// left to the daemon's check on save.
     fn may_stat(&self, path: &std::path::Path) -> bool {
-        self.homes.iter().any(|h| path.starts_with(h)) && self.guard.prompts(path).is_none()
+        self.homes.iter().any(|h| self.guard.is_within(path, h))
+            && self.guard.prompts(path).is_none()
     }
 
     /// The user has typed or moved in it.
@@ -623,6 +654,33 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// The setup request's delivery: said once it's done; on failure the
+    /// form comes back with the user's text, once nothing else is open.
+    /// True when the screen changed.
+    pub(crate) fn poll_setup_send(&mut self) -> bool {
+        if let Some((rx, _)) = &self.setup_send {
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => Err("the request was lost".into()),
+            };
+            let (_, mut f) = self.setup_send.take().expect("checked");
+            match r {
+                Ok(()) => self.status_line = "sent to the overlord".into(),
+                Err(e) => {
+                    self.status_line = format!("couldn't reach the overlord: {e}");
+                    f.error = Some(format!("not sent: {e}"));
+                    self.setup_retry = Some(f);
+                }
+            }
+        }
+        if self.setup_retry.is_some() && matches!(self.mode, Mode::Normal) {
+            self.mode = Mode::Setup(self.setup_retry.take().expect("checked"));
+            return true;
+        }
+        false
     }
 
     /// The overlord's `confirm_setup`: the form, reopened with its proposal.
@@ -830,12 +888,18 @@ impl App {
                     return;
                 }
                 // In the background: a stopped overlord can take a while.
+                // The form is kept until it's delivered (`poll_setup_send`).
+                let (tx, rx) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let _ = client_call(&paths::socket_path(), "overlord.setup_request", p);
+                    let r = client_call(&paths::socket_path(), "overlord.setup_request", p)
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(r);
                 });
+                self.setup_send = Some((rx, f));
                 // Its answer reopens the form; nothing parked is current.
                 self.pending_setup = None;
-                self.status_line = "sent to the overlord".into();
+                self.status_line = "sending to the overlord…".into();
                 self.show_overlord();
             }
         }
@@ -1023,7 +1087,11 @@ impl App {
             ("enter", "save", Cap::Context),
             ("tab", "move", Cap::Global),
             ("←/→", "other suggestions", Cap::Global),
-            ("esc", "ask me next start", Cap::Global),
+            if s.auto {
+                ("esc", "ask me next start", Cap::Global)
+            } else {
+                ("esc", "close", Cap::Global)
+            },
         ]));
         if s.auto {
             lines.push(keys_line(&[("ctrl-d", "don't ask again", Cap::Global)]));
@@ -1404,6 +1472,73 @@ mod tests {
         };
         assert!(!f.loading && app.setup_rx.is_none());
         assert_eq!((f.code_dir.as_str(), f.choices.len()), ("/elsewhere/ko", 2));
+    }
+
+    /// A setup request that couldn't be sent brings the form back with the
+    /// user's text, and says why.
+    #[test]
+    fn a_failed_request_reopens_the_form() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = SetupForm::from_suggest(&sugg(None, &[]), true, false);
+        f.describe = Some("mine are in ~/ko".into());
+        let (tx, srx) = mpsc::channel();
+        app.setup_send = Some((srx, Box::new(f)));
+        assert!(!app.poll_setup_send());
+        tx.send(Err("boom".to_string())).unwrap();
+        assert!(app.poll_setup_send());
+        assert!(app.status_line.contains("boom"));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not back")
+        };
+        assert_eq!(f.describe.as_deref(), Some("mine are in ~/ko"));
+        // Delivered: said so, nothing reopened.
+        app.mode = Mode::Normal;
+        let (tx, srx) = mpsc::channel();
+        let f = SetupForm::from_suggest(&sugg(None, &[]), true, false);
+        app.setup_send = Some((srx, Box::new(f)));
+        tx.send(Ok(())).unwrap();
+        assert!(!app.poll_setup_send());
+        assert_eq!(app.status_line, "sent to the overlord");
+    }
+
+    /// ←/→ on the roots row cycles the overlord's proposal, only the code
+    /// folder, and the configured roots; a default Follow is sent as such.
+    #[test]
+    fn roots_cycle_keeps_the_proposal() {
+        let mut f = SetupForm::from_suggest(&sugg(Some("/elsewhere/ko"), &["~"]), true, false);
+        assert!(f.roots_from_default);
+        f.describe = Some("x".into());
+        let SaveCall::Request(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not a request")
+        };
+        assert_eq!(p["roots_source"], "default");
+        f.prefill(&json!({"code_dir": "/elsewhere/ko", "repo_roots": ["/p"]}));
+        assert_eq!(f.roots, Roots::Set(vec!["/p".into()]));
+        f.toggle_roots();
+        assert_eq!(f.roots, Roots::Follow);
+        f.toggle_roots();
+        assert_eq!(f.roots, Roots::Keep(vec!["~".into()]));
+        f.toggle_roots();
+        assert_eq!(f.roots, Roots::Set(vec!["/p".into()]));
+    }
+
+    /// A setup command at startup is the first-run form, and ends the
+    /// startup sequence (no second form after it).
+    #[test]
+    fn a_setup_command_at_startup_is_the_first_run_form() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.startup_chain = true;
+        app.handle_ui_cmd(json!({"cmd": "setup", "prefill": {"code_dir": "/p"},
+                                 "status": {"needed": true, "code_dir": "", "repo_roots": []}}));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert!(f.auto);
+        assert!(!app.startup_chain);
     }
 
     /// A kept suggestion made for another config is dropped on open.
