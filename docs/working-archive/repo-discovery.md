@@ -39,6 +39,20 @@ repo scan, "Setup: the code folder") and `docs/guide.md` ("The overlord",
     head; reading the head first and stopping there would read less.
   - `Guard::guarded_ancestor` builds a `PathBuf` per protected folder for
     every entry the walk meets; it could compare components in place.
+- **From the final `/code-review` of #63, not fixed:**
+  - A mount inside `$HOME` (e.g. `~/nas`) can still be stat'ed by the form
+    or by `setup::is_home_repo`.
+  - `setup.apply` runs `create_dir_all` before the config write (a failed
+    write leaves the new folder).
+  - The "doesn't exist" text match (above) is still how the TUI spots a
+    missing folder.
+  - Config writes take no lock (two writers at once can lose one).
+  - `poll_setup() || poll_setup_send()` in the event loop short-circuits
+    the second on a pass where the first changed the screen.
+  - The may-stat rule exists three times (form, `suggestion_value_with`,
+    `is_home_repo`), and `is_home_repo` compares case-sensitively.
+  - Path equality and normalization are duplicated (`absolute_dir`,
+    `privacy::same_path`, `roots_beyond_code_dir`, `with_resolved`).
 - **Other code that touches folders unprompted doesn't ask the guard
   yet**: `methods::repo_list`'s `is_dir` on known repos,
   `import::add_git_info`.

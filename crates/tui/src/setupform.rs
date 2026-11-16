@@ -448,7 +448,7 @@ impl SetupForm {
                 "type the folder you keep your repos in".into()
             });
         }
-        let path = expand_tilde(dir);
+        let path = clean_dir(dir);
         // `$HOME` itself: the finder would scan all of it; asked first.
         let home = self.is_home(&path);
         if home && self.confirm_home.as_deref() != Some(path.as_str()) {
@@ -869,7 +869,7 @@ impl App {
                 Err(e) => {
                     // Not looked at here, and the daemon found it missing:
                     // ask, as for one seen missing here.
-                    let path = expand_tilde(f.code_dir.trim());
+                    let path = clean_dir(&f.code_dir);
                     if format!("{e:#}").contains("doesn't exist") {
                         f.error = Some(format!(
                             "{} doesn't exist: enter again to create it",
@@ -1129,6 +1129,14 @@ impl App {
     }
 }
 
+/// A typed folder as rlord keeps it (`absolute_dir`: `~` expanded, `.`
+/// and `..` resolved lexically), before any guard check or stat: so
+/// `~/src/../Documents/x` is seen as the guarded folder it is. A relative
+/// path stays as typed (and is refused).
+fn clean_dir(dir: &str) -> String {
+    rlord_core::config::absolute_dir(dir).unwrap_or_else(|_| expand_tilde(dir.trim()))
+}
+
 /// The line under the folder: what the suggestion rests on, or what
 /// saving will do.
 fn folder_hint(s: &SetupForm) -> String {
@@ -1149,7 +1157,7 @@ fn folder_hint(s: &SetupForm) -> String {
         }
         return h;
     }
-    let path = expand_tilde(dir);
+    let path = clean_dir(dir);
     let p = std::path::Path::new(&path);
     if !p.is_absolute() {
         return "a full path, like ~/code".into();
@@ -1564,6 +1572,31 @@ mod tests {
         };
         assert!(f.auto && f.then_overlord);
         assert!(app.setup_reply_flags.is_none());
+    }
+
+    /// A path with `..` is resolved before the guard and the home rule
+    /// see it.
+    #[test]
+    fn typed_paths_are_resolved_before_any_check() {
+        let mut f = SetupForm::from_suggest(&sugg(None, &[]), false, false);
+        f.homes = vec![std::path::PathBuf::from("/h")];
+        f.guard = rlord_core::privacy::Guard::with(Some(std::path::Path::new("/h")), false);
+        f.code_dir = "/h/src/../Documents/code".into();
+        f.refresh_hint();
+        assert!(f.hint.starts_with("macOS will ask"), "{}", f.hint);
+        // Saved as resolved, never stat-ed (guarded).
+        let SaveCall::Apply(p) = f
+            .save_call(&|p: &str| (!p.contains("..")).then_some(true))
+            .unwrap()
+        else {
+            panic!("not saved")
+        };
+        assert_eq!(p["code_dir"], "/h/Documents/code");
+        f.code_dir = "/h/x/..".into();
+        assert_eq!(
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::AskHome("/h".into())
+        );
     }
 
     /// A kept suggestion made for another config is dropped on open.

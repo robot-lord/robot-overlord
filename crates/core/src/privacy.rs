@@ -6,8 +6,10 @@
 //! TCC database needs Full Disk Access. So the guard goes by name: the
 //! home folders macOS protects and `/Volumes/*`. The other-filesystem rule
 //! (`st_dev`, like `find -xdev`) is applied by the walker (`git::scan_repos`).
-//! A folder the user named, or one a session already runs in, counts as
-//! granted: macOS grants the whole protected folder once it is allowed.
+//! Nothing counts as granted because a session ran in a folder (a macOS
+//! grant belongs to the app that made the access). Only the scan's roots,
+//! the folders the user named, are read inside a guarded folder
+//! (`Guard::prompts_within`).
 
 use std::path::{Component, Path, PathBuf};
 
