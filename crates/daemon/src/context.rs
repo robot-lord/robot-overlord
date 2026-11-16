@@ -518,15 +518,15 @@ pub fn hooks_work(agent: Agent) -> bool {
 /// overlord: `next_prompt` (a hook hands it over with the agent's next
 /// prompt), `next_start` (Claude's system prompt file, read at its next
 /// start), or `file_only` (only written to context.md: the agent sees it
-/// if it reads the file again). `hooks_now`: rlord's hooks work for the
-/// agent now (`hooks_work`), which wins over how it was launched (`mode`).
+/// if it reads the file again). From the stored mode only (a running
+/// agent has the hooks it loaded when it started); a missing one counts
+/// as Hook, as `hook_reply_from` takes it. (`methods::context_store`
+/// records one when background is first added after launch.)
 pub fn later_delivery(mode: Option<Delivery>) -> &'static str {
-    // (Only the stored mode: a running agent has the hooks it loaded when
-    // it started, whatever is installed now.)
-    match mode {
-        Some(Delivery::Hook) => "next_prompt",
-        Some(Delivery::SystemPromptFile) => "next_start",
-        _ => "file_only",
+    match mode.unwrap_or(Delivery::Hook) {
+        Delivery::Hook => "next_prompt",
+        Delivery::SystemPromptFile => "next_start",
+        Delivery::Pointer => "file_only",
     }
 }
 
@@ -608,7 +608,9 @@ pub fn check(
             );
         }
     }
-    if related.len() > RELATED_MAX {
+    // (A bound on what is resolved at all; the limit is on the distinct
+    // sessions, below.)
+    if related.len() > RELATED_MAX * 4 {
         bail!("at most {RELATED_MAX} related sessions");
     }
     let mut ids = Vec::new();
@@ -623,6 +625,9 @@ pub fn check(
         if !ids.contains(&s.id) {
             ids.push(s.id);
         }
+    }
+    if ids.len() > RELATED_MAX {
+        bail!("at most {RELATED_MAX} related sessions");
     }
     let had: Vec<String> = match own {
         Some(own) => db.context_links(own)?,
@@ -804,6 +809,10 @@ pub fn hook_reply_from(
     let Some(budget) = budget(agent) else {
         return Ok(None);
     };
+    // (Overlords never have background; a backstop.)
+    if crate::overlord::is_overlord_role(&s.role) {
+        return Ok(None);
+    }
     // Most sessions have none: one query, then done.
     if !has_background(db, &s.id)? {
         return Ok(None);
@@ -1208,7 +1217,8 @@ mod tests {
         assert!(check(&db, Some(&"n".repeat(NOTE_MAX + 1)), &[], None).is_err());
         assert!(check(&db, None, &["overlord".into()], None).is_err());
         assert!(check(&db, None, &["nope".into()], None).is_err());
-        let many: Vec<String> = (0..=RELATED_MAX).map(|_| "b".to_string()).collect();
+        // More than RELATED_MAX distinct sessions in one call: refused.
+        let many: Vec<String> = (0..=RELATED_MAX).map(|i| format!("r{i}")).collect();
         assert!(check(&db, None, &many, None).is_err());
     }
 
@@ -1463,6 +1473,39 @@ mod tests {
     }
 
     #[test]
+    fn an_overlord_gets_no_background_from_a_hook() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "o", "overlord", "overlord");
+        // (Rows written behind the checks' back: the backstop still holds.)
+        db.context_add("o", 1, "note", "x", "overlord").unwrap();
+        let s = db.resolve_ref("o").unwrap();
+        let r = hook_reply(
+            &db,
+            &s,
+            Agent::Claude,
+            "SessionStart",
+            Some("c"),
+            Path::new("/f"),
+        );
+        assert_eq!(r.unwrap(), None);
+    }
+
+    #[test]
+    fn related_counts_distinct_sessions() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        session(&db, "b", "beta", "");
+        // The same session many ways, and itself: one related session.
+        let refs: Vec<String> = ["b", "beta", "b", "beta", "a", "b", "beta", "b", "beta", "b"]
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        assert!(refs.len() > RELATED_MAX);
+        let (_, ids) = check(&db, None, &refs, Some("a")).unwrap();
+        assert_eq!(ids, ["b"]);
+    }
+
+    #[test]
     fn a_reset_or_new_conversation_is_never_given_up_on() {
         let db = Db::open_in_memory().unwrap();
         session(&db, "a", "alpha", "");
@@ -1586,7 +1629,11 @@ mod tests {
         assert_eq!(later_delivery(Some(Hook)), "next_prompt");
         assert_eq!(later_delivery(Some(SystemPromptFile)), "next_start");
         assert_eq!(later_delivery(Some(Pointer)), "file_only");
-        assert_eq!(later_delivery(None), "file_only");
+        assert_eq!(
+            later_delivery(None),
+            "next_prompt",
+            "as hook_reply_from takes it"
+        );
     }
 
     #[test]

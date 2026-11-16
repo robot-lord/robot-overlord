@@ -140,7 +140,7 @@ pub fn session_unarchive(db: &Db, params: &Value) -> Result<Value> {
 
 /// The overlord's row is fixed: always on top, never renamed, grouped,
 /// described, annotated or archived. Its meta-context is its instructions.
-fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
+pub(crate) fn refuse_overlord(s: &rlord_core::types::Session, what: &str) -> Result<()> {
     if crate::overlord::is_overlord_role(&s.role) {
         bail!("the overlord can't be {what}");
     }
@@ -295,22 +295,33 @@ pub(crate) fn session_context_add_in(
         &ref_list(params, "related"),
         Some(&s.id),
     )?;
-    context_store(db, &s, note, &links, base)
+    let hooks = params.get("hooks_work").and_then(Value::as_bool);
+    context_store(db, &s, note, &links, base, hooks)
 }
 
 /// Store background already through `context::check` (`update_session`
 /// checks before its other edits and stores after them, in-process: never
 /// taken from a caller over RPC), rewrite the file (best effort), and say
 /// how it reaches the agent.
+/// `hooks`: whether rlord's hooks work for its agent (asked outside the
+/// lock: `Daemon::first_background_hooks`), for a session getting its
+/// first background now, which then gets a mode: Hook, or the way an
+/// agent without them gets it.
 pub(crate) fn context_store(
     db: &Db,
     s: &Session,
     note: Option<String>,
     links: &[String],
     base: &std::path::Path,
+    hooks: Option<bool>,
 ) -> Result<Value> {
     let s = s.clone();
+    refuse_overlord(&s, "given background")?;
     let now = now_ms();
+    if context::mode(db, &s.id)?.is_none() {
+        let agent = Agent::named(&s.agent)?;
+        context::record_mode(db, &s.id, context::delivery(agent, hooks.unwrap_or(false)))?;
+    }
     if context::store(db, &s.id, note.as_slice(), links, now)? {
         // (Stored either way; the file is best effort.)
         if let Err(e) = context::refresh_file(db, base, &s) {
@@ -1017,10 +1028,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // (`hooks_work`: see `Daemon::restart_hooks`, asked before the lock):
     // the way an agent without them gets it, from now on.
     let hooks_gone = params.get("hooks_work").and_then(Value::as_bool) == Some(false);
+    // (Stored only once the pane is up, below: a failed restart leaves the
+    // mode as it was.)
+    let mut fell_back = None;
     if mode == Some(context::Delivery::Hook) && hooks_gone && !resumed {
         let fallback = context::delivery(agent, false);
-        context::record_mode(db, &s.id, fallback)?;
-        tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
+        fell_back = Some(fallback);
         mode = Some(fallback);
     }
     let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
@@ -1031,7 +1044,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let pointer = context::restart_prompt(carried, resumed, &bg_file);
     if let Some(p) = &pointer {
         agent.add_first_prompt(&mut argv, p);
-        note_first_prompt(db, &s.id, agent, Some(p), now_ms())?;
     }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
@@ -1048,6 +1060,13 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
     let now = now_ms();
+    if let Some(fallback) = fell_back {
+        context::record_mode(db, &s.id, fallback)?;
+        tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
+    }
+    if let Some(p) = &pointer {
+        note_first_prompt(db, &s.id, agent, Some(p), now)?;
+    }
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.
     // (A resume without a pointer, or a stale file, carries nothing new.)
@@ -1406,7 +1425,10 @@ fn hook_emit_in(
         // through. Best effort: a failure is logged, no answer. Marked
         // handed over only when the client acknowledges it (`hook.ack`).
         let answer = |v: Value| -> Value {
-            if whose == Whose::Other || !live {
+            if whose == Whose::Other
+                || !live
+                || !matches!(event, "SessionStart" | "UserPromptSubmit")
+            {
                 return v;
             }
             let now_s = db.resolve_ref(&s.id).unwrap_or_else(|_| s.clone());
@@ -2210,8 +2232,13 @@ mod tests {
             t.path(),
         )
         .unwrap();
-        // Said honestly: no hooks, no mode from launch: only the file.
-        assert_eq!(r["delivery"], "file_only");
+        // Its first background: a mode is recorded from whether hooks
+        // work (not asked here: no): Claude's system prompt file.
+        assert_eq!(r["delivery"], "next_start");
+        assert_eq!(
+            context::mode(&db, "01a").unwrap(),
+            Some(context::Delivery::SystemPromptFile)
+        );
         assert_eq!(r["notes"][0]["note"], "The user wants dark mode too.");
         assert_eq!(r["related"][0]["name"], "auth");
         let text = std::fs::read_to_string(context::file_path(t.path(), "01a")).unwrap();
@@ -2234,7 +2261,14 @@ mod tests {
                 ["delivery"]
                 .clone()
         };
-        assert_eq!(add("a"), "file_only");
+        // First background with hooks working: Hook, the next prompt.
+        let first = session_context_add_in(
+            &db,
+            &json!({"ref": "auth", "context": "a", "hooks_work": true}),
+            t.path(),
+        )
+        .unwrap();
+        assert_eq!(first["delivery"], "next_prompt");
         context::set_mode(&db, "01b", context::Delivery::Hook, 1).unwrap();
         assert_eq!(add("b"), "next_prompt");
         context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, 1).unwrap();

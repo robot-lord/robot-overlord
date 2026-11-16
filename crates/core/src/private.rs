@@ -74,6 +74,7 @@ pub fn write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// `write`, synced to disk before the rename, for a file that must
 /// survive a crash.
+#[cfg(test)]
 pub fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     write_with(path, contents, true)
 }

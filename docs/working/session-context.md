@@ -449,6 +449,30 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 10. A restart calls `agent.resume` once, then adds the flag or the
     pointer to that command.
 
+### Review round 10 (PR #64)
+
+1. `update_session` refuses background for the overlord's own row
+   before checking or storing (`refuse_overlord`, also in
+   `context_store`); `hook_reply_from` returns None for overlord-role
+   sessions as a backstop (tests).
+2. A session's first background after launch records a mode
+   (`context_store`: Hook if hooks work, from
+   `Daemon::first_background_hooks` outside the lock, else the system
+   prompt file for Claude or the pointer); `later_delivery(None)` counts
+   as Hook, as `hook_reply_from` does. Clears the owed item about sessions
+   with no stored mode (tests).
+3. `hook_emit`'s answer returns at once for events other than
+   SessionStart / UserPromptSubmit.
+4. `ui.goto` asks `restart_hooks` only when it will restart the session.
+5. `architecture.md`: `hooks_work` goes to `session.new` and
+   `session.restart` (and to a first `session.context_add`).
+6. A restart's fallback mode (and a pointer's binding reset) is stored
+   only after the pane was respawned or created.
+7. `Db::context_mark_seen` and `private::write_synced` are
+   `#[cfg(test)]`.
+8. `RELATED_MAX` counts distinct resolved sessions, without the session
+   itself (test).
+
 ## Owed / deferred
 
 - Follow-up, not in this effort: the guard rail above.
@@ -466,8 +490,5 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
   - An older answer's late ack marks nothing when a newer answer carried
     the same rows again (the newer one's ack does): one duplicate at
     most, as designed.
-  - A session given background only after launch has no stored mode:
-    reported `file_only`; it gets hook answers anyway if hooks fire, but
-    no system prompt flag at restart.
   - `context.md` of sessions that link to one are refreshed on a rename,
     not on the linked session's status changes (only at their restart).

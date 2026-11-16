@@ -1370,6 +1370,7 @@ impl Db {
     }
 
     /// Mark a session's rows up to `upto` (a row id) as pushed at `at`.
+    #[cfg(test)]
     pub fn context_mark_seen(&self, session_id: &str, upto: i64, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE session_context SET seen_at = ?3 \

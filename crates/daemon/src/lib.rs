@@ -296,6 +296,22 @@ impl Daemon {
         Some(context::hooks_work(agent))
     }
 
+    /// For background added to session `r` after launch: whether rlord's
+    /// hooks work for its agent, when it has no delivery mode yet (its
+    /// first background: `methods::context_store` records one); None
+    /// otherwise. Never under the DB lock (it reads settings files).
+    pub fn first_background_hooks(&self, r: &str) -> Option<bool> {
+        let agent = {
+            let db = self.db();
+            let s = db.resolve_ref(r).ok()?;
+            if context::mode(&db, &s.id).ok()?.is_some() {
+                return None;
+            }
+            rlord_core::agents::Agent::parse(&s.agent)?
+        };
+        Some(context::hooks_work(agent))
+    }
+
     /// Bind the socket (0700 dir, 0600 socket — the socket IS the auth boundary).
     pub fn bind(socket_path: &Path) -> Result<UnixListener> {
         let dir = socket_path.parent().context("socket path has no parent")?;
@@ -493,6 +509,12 @@ impl Daemon {
             }
             "session.restart" => {
                 if let Some(works) = self.restart_hooks(params["ref"].as_str().unwrap_or("")) {
+                    params["hooks_work"] = json!(works);
+                }
+            }
+            "session.context_add" => {
+                let r = params["ref"].as_str().unwrap_or("").to_string();
+                if let Some(works) = self.first_background_hooks(&r) {
                     params["hooks_work"] = json!(works);
                 }
             }
@@ -1302,6 +1324,32 @@ mod tests {
             assert_eq!((s.name.as_str(), s.description.as_str()), ("a", ""));
             assert!(d.db().context_rows("s1").unwrap().is_empty());
         }
+        // The overlord's own row gets no background.
+        d.db()
+            .insert_session(&rlord_core::db::NewSession {
+                id: "o1",
+                name: "overlord",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/o",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1000,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "overlord",
+            })
+            .unwrap();
+        let e = mcp::call(
+            &d,
+            "update_session",
+            &json!({"session": "o1", "add_context": "x"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("the overlord can't be given background"), "{e}");
+        assert!(d.db().context_rows("o1").unwrap().is_empty());
     }
 
     #[test]

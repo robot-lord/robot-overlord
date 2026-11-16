@@ -1358,7 +1358,9 @@ kept in kv `context_mode:<id>`):
 Whether the hooks work (`context::hooks_work`: SessionStart and
 UserPromptSubmit installed, and for Codex trusted) reads the agent's
 settings files, so the daemon asks it before taking the DB lock and
-passes it to `session.new` and `session.context_add` as `hooks_work`.
+passes it to `session.new` and `session.restart` as `hooks_work`
+(`Daemon::restart_hooks`), and, for a session's first background after
+launch, to `session.context_add` (`Daemon::first_background_hooks`).
 `--append-system-prompt-file` works in an interactive Claude session
 (checked live on Claude Code 2.1.325).
 
@@ -1389,9 +1391,12 @@ logged, and the hook event is still processed.
 Background added later (`session.context_add`) answers with `delivery`,
 which `update_session` passes on as `background_delivery`:
 from the stored mode only, since a running agent has the hooks it loaded
-when it started: `next_prompt` (Hook), `next_start` (Claude's system
-prompt file) or `file_only` (only in `context.md`; also a session that
-had no background at launch). `update_session` checks the background
+when it started: `next_prompt` (Hook; a missing mode counts as Hook, as
+the hooks take it), `next_start` (Claude's system prompt file) or
+`file_only` (only in `context.md`). A session given its first background
+after launch gets a mode then: Hook if rlord's hooks work for its agent,
+else the system prompt file (Claude) or the pointer. The overlord's own
+row never gets background (refused, and hook answers skip overlords). `update_session` checks the background
 before writing anything else, makes its other edits, then stores the
 checked note and links in-process (`methods::context_store`; never
 taken from a caller over RPC). `overlord.md` has the overlord also use `send_to_session` when

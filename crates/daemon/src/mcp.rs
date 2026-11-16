@@ -614,11 +614,14 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             // session as it was. Added last, after the other edits.
             let related = crate::methods::ref_list(args, "add_related");
             let checked = if arg_str(args, "add_context").is_some() || !related.is_empty() {
+                let db = d.db();
+                let s = db.resolve_ref(id.as_str().unwrap_or(""))?;
+                crate::methods::refuse_overlord(&s, "given background")?;
                 let (note, links) = crate::context::check(
-                    &d.db(),
+                    &db,
                     arg_str(args, "add_context"),
                     &related,
-                    id.as_str(),
+                    Some(s.id.as_str()),
                 )?;
                 Some((note, links))
             } else {
@@ -636,6 +639,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let mut delivery = None;
             if let Some((note, links)) = checked {
                 // (In-process: the checked values never travel over RPC.)
+                let hooks = d.first_background_hooks(id.as_str().unwrap_or(""));
                 let r = {
                     let db = d.db();
                     let s = db.resolve_ref(id.as_str().unwrap_or(""))?;
@@ -645,6 +649,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                         note,
                         &links,
                         &rlord_core::paths::data_dir(),
+                        hooks,
                     )?
                 };
                 d.changed();
