@@ -751,6 +751,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             tmux_name: &tmux_name,
             daemon,
             forked_from: None,
+            kv: Vec::new(),
             background: delivery.map(|mode| Background {
                 mode,
                 carried,
@@ -772,13 +773,12 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 /// A new session's background, as `start` stores it: how it reaches the
 /// agent (`mode`), how the launch carries it (`carried`: None when it
 /// doesn't, its file couldn't be written), the session whose rows are
-/// copied first with the row ids left out and whether their `seen_at`
-/// is kept (a fork's parent: `Made::parent_saw`), and the
-/// rows to add after them.
+/// copied first (unseen) with the row ids left out (a fork's parent),
+/// and the rows to add after them.
 pub(crate) struct Background<'a> {
     pub mode: context::Delivery,
     pub carried: Option<context::Delivery>,
-    pub copy_from: Option<(&'a str, &'a [i64], bool)>,
+    pub copy_from: Option<(&'a str, &'a [i64])>,
     pub rows: Vec<context::NewRow>,
 }
 
@@ -804,6 +804,9 @@ pub(crate) struct Start<'a> {
     pub daemon: bool,
     /// A fork's parent (its rlord id).
     pub forked_from: Option<&'a str>,
+    /// kv keys written with its row, before its pane starts (a fork's
+    /// `bind_fork`, `fork_pending`): a running session never lacks them.
+    pub kv: Vec<(String, String)>,
     pub background: Option<Background<'a>>,
     /// The event logged once the pane is up (`launched`, `forked`): its
     /// detail, to which the argv is added.
@@ -835,6 +838,9 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     if let Some(parent) = s.forked_from {
         db.set_forked_from(id, parent)?;
     }
+    for (k, v) in &s.kv {
+        db.kv_set(k, v)?;
+    }
     if let Some(r) = s.repo {
         db.touch_repo(r, now)?;
     }
@@ -845,8 +851,8 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     note_first_prompt(db, id, agent, s.first, now)?;
     if let Some(bg) = &s.background {
         context::turn_on(db, id)?;
-        if let Some((from, except, keep_seen)) = bg.copy_from {
-            db.context_copy(from, id, except, keep_seen)?;
+        if let Some((from, except)) = bg.copy_from {
+            db.context_copy(from, id, except)?;
         }
         context::store_rows(db, id, &bg.rows, now)?;
         if bg.carried == Some(bg.mode) {
@@ -862,9 +868,13 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
     tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
+    // The pane is up: from here nothing fails the start (a caller undoes a
+    // start that failed, and must never undo a running one).
     let (kind, mut detail) = s.event;
     detail["argv"] = json!(argv);
-    db.insert_event(id, now, kind, &detail.to_string())?;
+    if let Err(e) = db.insert_event(id, now, kind, &detail.to_string()) {
+        tracing::warn!(session = %id, error = %e, "logging a start");
+    }
     Ok(())
 }
 
@@ -1083,6 +1093,13 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // A fork whose conversation was never made (its agent never got that
+    // far) forks again rather than resume, from its parent's conversation
+    // as it is now: its note says so before its file is written.
+    let refork = crate::fork::pending(db, &s)?;
+    if refork.is_some() {
+        crate::fork::renote(db, &s, now_ms())?;
+    }
     // Its background as it was launched with, its file rewritten first
     // (related sessions' status, a rename: as they are now).
     // Best effort: a file that can't be written never stops the restart;
@@ -1098,9 +1115,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     };
     // The command with the session's own flags; the background's flag or
     // pointer is added to it below (both go last, where a launch puts
-    // them). A fork whose conversation was never made (its agent never
-    // got that far) forks again rather than resume.
-    let refork = crate::fork::pending(db, &s)?;
+    // them).
     let (mut argv, resumed) = match &refork {
         Some(parent) => (
             crate::fork::refork_argv(
@@ -1185,12 +1200,19 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     db.insert_event(
         &s.id,
         now,
-        if resumed { "resumed" } else { "restarted" },
+        match (resumed, &refork) {
+            (true, _) => "resumed",
+            // (Forked again: the `forked` event's branch point, now.)
+            (false, Some(_)) => "reforked",
+            (false, None) => "restarted",
+        },
         &match (resumed, agent.deferred(model.as_deref())) {
             // (Resumed: whatever model the conversation has by now.)
             (true, Some(d)) => json!({"argv": argv,
                 "model": format!("the session keeps its own (launched with {})", d.model)}),
-            _ if refork.is_some() => json!({"argv": argv, "fork": true}),
+            (_, _) if refork.is_some() => {
+                json!({"argv": argv, "from": s.forked_from, "from_conversation": refork})
+            }
             _ => json!({"argv": argv}),
         }
         .to_string(),

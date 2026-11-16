@@ -1441,19 +1441,26 @@ add`); reading and inserting under it, through `methods::start`, the tail
 
 | | Claude Code | Codex | OpenCode |
 |---|---|---|---|
-| How | `claude --resume <parent> --fork-session --session-id <new>` | `codex fork <parent> --no-daemon -c tui.resume_cwd="current"` | `POST /api/session/<parent>/fork` (`{}`) on its server, else `opencode api …` run in the parent's folder (60s each); then `opencode -s <fork>` |
+| How | `claude --resume <parent> --fork-session --session-id <new>` | `codex fork <parent> --no-alt-screen [--model m] -c tui.resume_cwd="current" --no-daemon [prompt]` (`codex::fork_argv`) | `POST /api/session/<parent>/fork` (`{}`) on its server, else `opencode api …` run in the parent's folder (60s each); then `opencode -s <fork>` |
 | New id | minted by rlord (`claude::FORK_MINTS_ID`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
 | Resumed at a restart once | its transcript is on disk (from its first message) | it is bound and its rollout is on disk | at once |
 | New worktree | yes (`--resume` finds the parent from another worktree of the repo, and from a subfolder of it) | yes (`tui.resume_cwd`: below) | no: the server gives a fork its parent's folder |
 
-Until then a restart forks again (kv `fork_pending`, `fork::pending`); a
-Codex fork forked again drops the thread bound before and is bound anew
-by `bind_fork` (`fork::reforked`). The key goes once a hook or Codex's
-index names the fork's own transcript and it is on disk
-(`fork::conversation_seen`), or at a fresh start. An OpenCode fork call
-that fails (a time-out) may still have made the fork: a fork of the
-parent made since the call began that no session has
-(`opencode::user_fork_since`, not archived) is taken.
+Until then a restart forks again (kv `fork_pending`, `fork::pending`,
+written with the row before the pane starts, as is `bind_fork`), logged
+as `reforked` with its new branch point; the fork's note gets the new
+time (`fork::renote`), and a Codex fork drops the thread bound before
+and is bound anew by `bind_fork` (`fork::reforked`). The key goes once
+a hook or Codex's index names the fork's own transcript and it is on
+disk (`fork::conversation_seen`), or at a fresh start. Forks of one
+parent are made one at a time (a `fork:<parent>` lock in
+`locks::SessionLocks`, from the fork call to the row). An OpenCode fork
+call that fails (a time-out) may still have made the fork: a fork of
+the parent made since the call began that no session has
+(`opencode::user_fork_since`, not archived) is taken; the lock keeps it
+from being another fork's in the making. Its answer is read as JSON: an
+error answer whose error is `ForkEmpty` means "nothing to fork yet"
+(`opencode::fork_empty`).
 
 Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 2.2.7 (scratch setups, one short prompt each).
@@ -1491,12 +1498,9 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   answer carried them), but not the parent's own fork note (a fork of a
   fork gets its own). Its model is the one asked for, else none: no
   `--model`, so the conversation goes on with the model it has (at the
-  fork and at every resume). Whether each row was handed over
-  (`seen_at`) is copied only when the parent's rows went into the
-  conversation the fork copies (`fork::parent_saw`): by hook, or by the
-  pointer line when its transcript has it; with Claude's system prompt
-  file (not part of the conversation) they are copied unseen, so the
-  fork is handed them. Not notes (the user's own, per session), pin,
+  fork and at every resume). The rows are copied unseen: the fork's own
+  delivery mode hands them over, as for a launch (whatever the parent's
+  conversation already had). Not notes (the user's own, per session), pin,
   summary, usage, Remote Control's name, `codex_host`, role. It adds a
   note (`context::fork_note`) and a link to the parent, both `source =
   'fork'`, then the overlord's `context` and `related`. Past `LINKS_MAX`

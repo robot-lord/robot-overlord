@@ -1459,27 +1459,36 @@ impl Db {
         Ok(())
     }
 
-    /// Copy session `from`'s notes and links to session `to` (a fork),
-    /// keeping when each was added and its source; not which hook answer
-    /// carried it. `keep_seen`: whether each was handed to the agent stays
-    /// as it is (the rows went into the conversation the fork copies);
-    /// otherwise all are copied unseen. `except`: row ids left out.
-    /// Returns how many were copied.
-    pub fn context_copy(
+    /// Rewrite a session's notes from `source` (a fork's own note, when it
+    /// is made again): new text and time, not handed to the agent yet.
+    /// Returns how many were rewritten.
+    pub fn context_renote(
         &self,
-        from: &str,
-        to: &str,
-        except: &[i64],
-        keep_seen: bool,
+        session_id: &str,
+        source: &str,
+        body: &str,
+        at: i64,
     ) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE session_context SET body = ?3, at = ?4, seen_at = NULL, sent_ack = NULL, \
+             sent_at = NULL WHERE session_id = ?1 AND kind = 'note' AND source = ?2",
+            params![session_id, source, body, at],
+        )?)
+    }
+
+    /// Copy session `from`'s notes and links to session `to` (a fork),
+    /// keeping when each was added and its source, unseen (the fork's own
+    /// delivery mode decides how they reach it); not which hook answer
+    /// carried them. `except`: row ids left out. Returns how many were
+    /// copied.
+    pub fn context_copy(&self, from: &str, to: &str, except: &[i64]) -> Result<usize> {
         let skip = serde_json::to_string(except)?;
         Ok(self.conn.execute(
-            "INSERT INTO session_context (session_id, at, kind, body, source, seen_at) \
-             SELECT ?2, at, kind, body, source, CASE WHEN ?4 THEN seen_at END \
-             FROM session_context \
+            "INSERT INTO session_context (session_id, at, kind, body, source) \
+             SELECT ?2, at, kind, body, source FROM session_context \
              WHERE session_id = ?1 AND id NOT IN (SELECT value FROM json_each(?3)) \
              ORDER BY id",
-            params![from, to, skip, keep_seen],
+            params![from, to, skip],
         )?)
     }
 
@@ -2054,8 +2063,8 @@ mod tests {
         db.context_mark_sent("p", rows[2].id, true, "p.ack", 21)
             .unwrap();
         let rows = db.context_rows("p").unwrap();
-        // Everything but the link, as it is.
-        assert_eq!(db.context_copy("p", "f", &[rows[1].id], true).unwrap(), 2);
+        // Everything but the link, unseen (the fork's mode hands them over).
+        assert_eq!(db.context_copy("p", "f", &[rows[1].id]).unwrap(), 2);
         let copied = db.context_rows("f").unwrap();
         assert_eq!(
             copied
@@ -2063,17 +2072,10 @@ mod tests {
                 .map(|r| (r.at, r.body.as_str(), r.source.as_str(), r.seen_at))
                 .collect::<Vec<_>>(),
             [
-                (10, "seen", "overlord", Some(20)),
+                (10, "seen", "overlord", None),
                 (12, "unseen", "overlord", None)
             ]
         );
-        // Rows that didn't go into the conversation: all unseen.
-        db.context_copy("p", "g", &[rows[1].id], false).unwrap();
-        assert!(db
-            .context_rows("g")
-            .unwrap()
-            .iter()
-            .all(|r| r.seen_at.is_none()));
         // Not which answer carried it (that was the parent's).
         assert_eq!(db.context_ack("f", "p.ack", 30).unwrap(), 0);
         // The parent's own rows are untouched.

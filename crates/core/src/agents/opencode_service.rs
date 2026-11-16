@@ -307,10 +307,22 @@ impl Service {
             Some(&serde_json::json!({})),
             super::opencode::FORK_LIMIT,
         )?;
-        if !(200..300).contains(&status) && !text.contains("ForkEmpty") {
-            bail!("forking in OpenCode: {status} {}", clip_error(&text));
+        if (200..300).contains(&status) {
+            // (A fork made: its id, whatever its data says.)
+            let v: Value = serde_json::from_str(text.trim())
+                .map_err(|_| anyhow::anyhow!("OpenCode's answer to the fork isn't JSON"))?;
+            return v["data"]["id"]
+                .as_str()
+                .filter(|id| is_session_id(id))
+                .map(str::to_string)
+                .context("OpenCode's answer to the fork has no session id");
         }
-        super::opencode::fork_response(&text)
+        let empty = serde_json::from_str::<Value>(text.trim())
+            .is_ok_and(|v| super::opencode::fork_empty(&v));
+        if empty {
+            bail!("{}", super::opencode::NOTHING_TO_FORK);
+        }
+        bail!("forking in OpenCode: {status} {}", clip_error(&text))
     }
 
     /// Text generated from session `id`'s context without adding to its
@@ -1074,10 +1086,23 @@ mod tests {
 
     #[test]
     fn a_fork_is_made_by_the_server() {
+        let answer = |head: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {head}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
         let (svc, asked) = serve(vec![
             ok(r#"{"data":{"id":"ses_2fork","directory":"/src/app"}}"#),
-            "HTTP/1.1 400 Bad Request\r\ncontent-length: 52\r\n\r\n{\"_tag\":\"Session.ForkEmptyError\",\"message\":\"empty\"}".into(),
-            "HTTP/1.1 500 Oops\r\ncontent-length: 21\r\n\r\n{\"message\":\"broken\"}".into(),
+            answer(
+                "400 Bad Request",
+                r#"{"_tag":"Session.ForkEmptyError","message":"empty"}"#,
+            ),
+            answer("500 Oops", r#"{"message":"broken"}"#),
+            // Made, whatever its data says.
+            ok(r#"{"data":{"id":"ses_3fork","title":"ForkEmptyError"}}"#),
+            // An error that only mentions it.
+            answer("400 Bad Request", r#"{"message":"not ForkEmpty"}"#),
         ]);
         assert_eq!(svc.fork("ses_1a").unwrap(), "ses_2fork");
         let req = asked.recv().unwrap();
@@ -1095,6 +1120,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("broken"));
+        assert_eq!(svc.fork("ses_1a").unwrap(), "ses_3fork");
+        assert_ne!(
+            svc.fork("ses_1a").unwrap_err().to_string(),
+            super::super::opencode::NOTHING_TO_FORK
+        );
         // An id that isn't one never reaches a URL.
         assert!(svc.fork("../x").is_err());
     }

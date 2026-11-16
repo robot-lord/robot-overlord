@@ -351,9 +351,27 @@ fn untracked_threads(
 }
 
 /// The thread a rollout says it was forked from (`pick_thread` asks only
-/// about the threads it is still considering).
+/// about the threads it is still considering). A rollout's first line
+/// never changes: each is read once and remembered by thread id (a rollout
+/// not on disk yet is asked again).
 fn rollout_fork(t: &codex::Thread) -> Option<String> {
-    codex::rollout_forked_from(std::path::Path::new(&t.rollout_path))
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
+        std::sync::LazyLock::new(Default::default);
+    if let Some(known) = SEEN.lock().ok().and_then(|s| s.get(&t.id).cloned()) {
+        return known;
+    }
+    let path = std::path::Path::new(&t.rollout_path);
+    let forked = codex::rollout_forked_from(path);
+    if path.exists() {
+        if let Ok(mut s) = SEEN.lock() {
+            // (Bounded: threads come and go over a long run.)
+            if s.len() >= 4096 {
+                s.clear();
+            }
+            s.insert(t.id.clone(), forked.clone());
+        }
+    }
+    forked
 }
 
 fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
@@ -630,6 +648,28 @@ mod tests {
         read.borrow_mut().clear();
         assert_eq!(pick(&mixed, None, true, None), None);
         assert!(read.borrow().is_empty(), "nobody fits: nothing read");
+    }
+
+    /// A rollout's fork flag is read once per thread: the file is not
+    /// read again on later passes. One not on disk yet is asked again.
+    #[test]
+    fn a_rollouts_fork_flag_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-once.jsonl");
+        let mut t = thread("t-once-only", "x");
+        t.rollout_path = path.to_string_lossy().into_owned();
+        assert_eq!(rollout_fork(&t), None, "not there yet");
+        let meta = |from: &str| {
+            format!(
+                "{}\n",
+                json!({"type": "session_meta", "payload": {"forked_from_id": from}})
+            )
+        };
+        std::fs::write(&path, meta("t-parent")).unwrap();
+        assert_eq!(rollout_fork(&t).as_deref(), Some("t-parent"));
+        // Changed on disk (it never is): the remembered answer stands.
+        std::fs::write(&path, meta("t-other")).unwrap();
+        assert_eq!(rollout_fork(&t).as_deref(), Some("t-parent"));
     }
 
     /// A fork bound from the index whose rollout is on disk is no longer

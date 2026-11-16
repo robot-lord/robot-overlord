@@ -53,11 +53,6 @@ pub(crate) struct Want {
     /// The name was chosen here (`<parent>-fork`…), not asked for: it is
     /// reserved while the fork is made (`reserve_key`).
     pub auto_name: bool,
-    /// How the parent's background reaches its agent, and where its
-    /// conversation is: whether its rows went into the conversation the
-    /// fork copies (`parent_saw`).
-    pub parent_mode: Option<context::Delivery>,
-    pub parent_transcript: Option<String>,
     pub description: Option<String>,
     /// Another model than the parent's.
     pub model: Option<String>,
@@ -99,9 +94,6 @@ pub(crate) struct Made {
     /// The parent's folder has changes not committed (a worktree fork
     /// doesn't carry them).
     pub uncommitted: bool,
-    /// The parent's background rows marked seen went into the
-    /// conversation the fork copies: their `seen_at` is copied too.
-    pub parent_saw: bool,
 }
 
 /// kv key: a default fork name being used by a fork in the making (the
@@ -144,6 +136,11 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     let base = paths::data_dir();
     let mut want = want(&d.db(), params)?;
     let _reserved = Reserved(d, want.auto_name.then(|| want.name.clone()));
+    // One fork of a parent at a time, from its fork call to its row: an
+    // OpenCode call that failed but made its fork finds it among the
+    // parent's forks no session has yet, which must not be another fork's
+    // in the making. (`locks` order: this, then the DB.)
+    let _forking = d.sessions.lock(&format!("fork:{}", want.parent.id));
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(want.agent) {
         bail!("{why}");
@@ -151,7 +148,6 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     want.worktree = plan_worktree(&want, &cfg)?;
     let mut made = Made {
         hooks: context::hooks_work(want.agent),
-        parent_saw: parent_saw(&want, &base),
         ..Default::default()
     };
     // (Read as `session.get` reads it.)
@@ -240,40 +236,6 @@ pub(crate) fn undo(id: &str, want: &Want, made: &Made, base: &std::path::Path) {
             tracing::warn!(opencode_session = %oc, "a fork that didn't start is left in OpenCode");
         }
     }
-}
-
-/// Whether the parent's rows marked seen went into the conversation the
-/// fork copies: by hook (also when no mode was recorded: hooks hand it
-/// over then), or by the pointer line, when that is in its transcript. A
-/// system prompt file isn't part of the conversation. Reads the
-/// transcript: outside the lock.
-fn parent_saw(want: &Want, base: &std::path::Path) -> bool {
-    match want.parent_mode {
-        None | Some(context::Delivery::Hook) => true,
-        Some(context::Delivery::SystemPromptFile) => false,
-        Some(context::Delivery::Pointer) => want.parent_transcript.as_deref().is_some_and(|t| {
-            let file = context::file_path(base, &want.parent.id);
-            transcript_names(std::path::Path::new(t), &file.to_string_lossy())
-        }),
-    }
-}
-
-/// Whether a conversation's text has `needle` in it (a transcript file
-/// read up to 64 MB, or an OpenCode conversation's rows).
-fn transcript_names(transcript: &std::path::Path, needle: &str) -> bool {
-    use std::io::{BufRead, Read};
-    if let Some((db, id)) = opencode::locate(transcript) {
-        return opencode::conversation(db, id)
-            .iter()
-            .any(|s| s.text.contains(needle));
-    }
-    let Ok(f) = std::fs::File::open(transcript) else {
-        return false;
-    };
-    std::io::BufReader::new(f.take(64 << 20))
-        .split(b'\n')
-        .map_while(std::result::Result::ok)
-        .any(|line| String::from_utf8_lossy(&line).contains(needle))
 }
 
 /// Remove a worktree this fork made (and its branch), best effort: the
@@ -431,8 +393,6 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
             );
         }
     }
-    let parent_mode = context::mode(db, &parent.id)?;
-    let parent_transcript = db.transcript_source(&parent.id)?;
     // All read and checked: the name is this fork's until it is done
     // (`Reserved`). Nothing after this can fail.
     if auto_name {
@@ -445,8 +405,6 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
         prompt: p_opt("prompt"),
         name,
         auto_name,
-        parent_mode,
-        parent_transcript,
         description: p_opt("description"),
         model: p_opt("model"),
         note,
@@ -687,10 +645,11 @@ pub(crate) fn finish(
             tmux_name: &tmux_name,
             daemon: false,
             forked_from: Some(&parent.id),
+            kv: fork_keys(want, id),
             background: Some(Background {
                 mode,
                 carried,
-                copy_from: Some((&parent.id, &except, made.parent_saw)),
+                copy_from: Some((&parent.id, &except)),
                 rows: add,
             }),
             event: (
@@ -724,18 +683,25 @@ pub(crate) fn after_start(db: &Db, want: &Want, parent: &Session, id: &str) -> R
     if !description.is_empty() {
         db.set_description(id, description)?;
     }
+    Ok(())
+}
+
+/// How fork `id`'s conversation is found and made again: written with its
+/// row, before its pane starts (`Start::kv`).
+pub(crate) fn fork_keys(want: &Want, id: &str) -> Vec<(String, String)> {
+    let mut kv = Vec::new();
     if !want.agent.mints_id() {
         // Its thread is the one forked from the parent's (`bind_fork`).
-        db.kv_set(&methods::bind_fork_key(id), &want.conversation)?;
+        kv.push((methods::bind_fork_key(id), want.conversation.clone()));
     }
     if want.agent != Agent::OpenCode {
         // (OpenCode's fork exists before its pane starts.)
-        db.kv_set(
-            &pending_key(id),
-            &json!({"parent_conversation": want.conversation}).to_string(),
-        )?;
+        kv.push((
+            pending_key(id),
+            json!({"parent_conversation": want.conversation}).to_string(),
+        ));
     }
-    Ok(())
+    kv
 }
 
 /// A restart of a fork whose conversation doesn't exist yet: the parent's
@@ -782,6 +748,35 @@ pub(crate) fn conversation_seen(db: &Db, id: &str, transcript: &str) -> Result<(
     if db.kv_get(&pending_key(id))?.is_some() && std::path::Path::new(transcript).exists() {
         db.kv_delete(&pending_key(id))?;
     }
+    Ok(())
+}
+
+/// A fork made again at a restart branches from its parent's conversation
+/// as it is now: its own note says so, with the new time (not handed over
+/// yet). Before the restart writes its background file.
+pub(crate) fn renote(db: &Db, s: &Session, at: i64) -> Result<()> {
+    let Some(pid) = s.forked_from.as_deref() else {
+        return Ok(());
+    };
+    let parent = db.resolve_ref(pid).ok();
+    let name = parent
+        .as_ref()
+        .map(|p| p.name.clone())
+        .or_else(|| s.forked_from_name.clone())
+        .unwrap_or_else(|| pid.to_string());
+    let shared = parent
+        .as_ref()
+        .is_some_and(|p| p.project_path == s.project_path);
+    let folder = match (&s.workspace_path, &s.branch) {
+        (Some(w), Some(b)) if !shared => ForkFolder::Worktree(w.clone(), b.clone()),
+        _ => ForkFolder::Shared,
+    };
+    db.context_renote(
+        &s.id,
+        "fork",
+        &context::fork_note(&name, pid, at, &folder),
+        at,
+    )?;
     Ok(())
 }
 
@@ -1082,7 +1077,7 @@ mod tests {
 
         // Copied as the fork starts.
         mk(&db, "f", "claude", Some("c-f"), here, "");
-        db.context_copy("p", "f", &except, true).unwrap();
+        db.context_copy("p", "f", &except).unwrap();
         context::store_rows(&db, "f", &add, 50).unwrap();
         let links = db.context_links("f").unwrap();
         assert_eq!(links.len(), context::LINKS_MAX);
@@ -1142,6 +1137,10 @@ mod tests {
         mk(&db, "f", "codex", None, here, "");
         let w = want(&db, &json!({"ref": "p"})).unwrap();
         after_start(&db, &w, &w.parent, "f").unwrap();
+        // (As `start` writes them, with the row.)
+        for (k, v) in fork_keys(&w, "f") {
+            db.kv_set(&k, &v).unwrap();
+        }
         let f = db.resolve_ref("f").unwrap();
         assert_eq!(f.group_path, "work/api");
         assert_eq!(f.tags, ["auth"]);
@@ -1171,6 +1170,9 @@ mod tests {
         mk(&db, "g", "opencode", Some("ses_2"), here, "");
         let w = want(&db, &json!({"ref": "q", "description": "Try a queue"})).unwrap();
         after_start(&db, &w, &w.parent, "g").unwrap();
+        for (k, v) in fork_keys(&w, "g") {
+            db.kv_set(&k, &v).unwrap();
+        }
         assert_eq!(db.resolve_ref("g").unwrap().description, "Try a queue");
         assert_eq!(db.kv_get(&pending_key("g")).unwrap(), None);
         assert_eq!(db.kv_get(&methods::bind_fork_key("g")).unwrap(), None);
@@ -1259,6 +1261,37 @@ mod tests {
             Some("c-new")
         );
         assert_eq!(db.kv_get(&methods::bind_fork_key("cl")).unwrap(), None);
+    }
+
+    /// A fork made again at a restart: its own note names the new branch
+    /// point and is handed over again; the rest of its background stays.
+    #[test]
+    fn a_refork_renews_its_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "codex", Some("t-p"), here, "");
+        mk(&db, "f", "codex", None, here, "");
+        db.set_forked_from("f", "p").unwrap();
+        let old = context::fork_note("n-p", "p", 0, &ForkFolder::Shared);
+        db.context_add("f", 0, "note", &old, "fork").unwrap();
+        db.context_add("f", 0, "note", "use the staging DB", "overlord")
+            .unwrap();
+        db.context_mark_all_seen("f", 5).unwrap();
+        let at = 1_800_000_000_000;
+        renote(&db, &db.resolve_ref("f").unwrap(), at).unwrap();
+        let rows = db.context_rows("f").unwrap();
+        assert_eq!(
+            rows[0].body,
+            context::fork_note("n-p", "p", at, &ForkFolder::Shared)
+        );
+        assert_eq!((rows[0].at, rows[0].seen_at), (at, None));
+        assert_eq!(
+            (rows[1].body.as_str(), rows[1].seen_at),
+            ("use the staging DB", Some(5))
+        );
+        // Not a fork: nothing to renew.
+        renote(&db, &db.resolve_ref("p").unwrap(), at).unwrap();
     }
 
     /// A fork that never started leaves nothing behind outside the
@@ -1440,50 +1473,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.kv_get(&pending_key("01fork")).unwrap(), None);
-    }
-
-    /// The parent's rows count as seen in the fork only when they went
-    /// into the conversation it copies.
-    #[test]
-    fn a_fork_keeps_seen_rows_only_when_the_conversation_has_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let here = dir.path().to_str().unwrap();
-        let base = dir.path().join("data");
-        let db = Db::open_in_memory().unwrap();
-        mk(&db, "p", "codex", Some("t-p"), here, "");
-        let transcript = dir.path().join("rollout-t-p.jsonl");
-        std::fs::write(
-            &transcript,
-            "{\"type\":\"session_meta\"}\n{\"text\":\"fix it\"}\n",
-        )
-        .unwrap();
-        db.upsert_transcript_source("p", transcript.to_str().unwrap())
-            .unwrap();
-        let mut w = want(&db, &json!({"ref": "p"})).unwrap();
-        let saw = |w: &Want, mode| {
-            let mut w = w.clone();
-            w.parent_mode = mode;
-            parent_saw(&w, &base)
-        };
-        use context::Delivery::*;
-        // By hook (or no mode: hooks hand it over then): in the conversation.
-        assert!(saw(&w, Some(Hook)) && saw(&w, None));
-        // A system prompt file isn't part of the conversation.
-        assert!(!saw(&w, Some(SystemPromptFile)));
-        // The pointer: only when the conversation has it.
-        assert!(!saw(&w, Some(Pointer)));
-        let pointer = context::pointer_only(&context::file_path(&base, "p"));
-        std::fs::write(
-            &transcript,
-            format!(
-                "{{\"type\":\"session_meta\"}}\n{}\n",
-                json!({"text": pointer})
-            ),
-        )
-        .unwrap();
-        assert!(saw(&w, Some(Pointer)));
-        w.parent_transcript = None;
-        assert!(!saw(&w, Some(Pointer)));
     }
 
     /// A default name is the fork's while it is made: a second fork at the

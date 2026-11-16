@@ -808,19 +808,34 @@ pub fn fork_path(id: &str) -> String {
 }
 
 /// The new session's id in what OpenCode answered a fork with (`{data:
-/// {id, …}}`). An answer naming `ForkEmpty` (`Session.ForkEmptyError`: no
-/// finished turn to copy) says so.
+/// {id, …}}`). An error answer whose error is `ForkEmpty`
+/// (`Session.ForkEmptyError`: no finished turn to copy) says so; a word
+/// in a session's data never does.
 pub fn fork_response(text: &str) -> anyhow::Result<String> {
-    if text.contains("ForkEmpty") {
-        anyhow::bail!("{NOTHING_TO_FORK}");
-    }
     let v: Value = serde_json::from_str(text.trim())
         .map_err(|_| anyhow::anyhow!("OpenCode's answer to the fork isn't JSON"))?;
-    v["data"]["id"]
-        .as_str()
-        .filter(|id| is_session_id(id))
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("OpenCode's answer to the fork has no session id"))
+    if let Some(id) = v["data"]["id"].as_str().filter(|id| is_session_id(id)) {
+        return Ok(id.to_string());
+    }
+    if fork_empty(&v) {
+        anyhow::bail!("{NOTHING_TO_FORK}");
+    }
+    anyhow::bail!("OpenCode's answer to the fork has no session id")
+}
+
+/// Whether an error answer is `ForkEmpty` (by its error's name or type,
+/// `_tag` as OpenCode 2.2.7 gives it, at the top or under `error`; with or
+/// without a `Session.` prefix or `Error` suffix).
+pub fn fork_empty(v: &Value) -> bool {
+    let is = |s: &str| {
+        let last = s.rsplit('.').next().unwrap_or(s);
+        matches!(last, "ForkEmpty" | "ForkEmptyError")
+    };
+    [v, &v["error"]].into_iter().any(|e| {
+        ["_tag", "name", "type"]
+            .iter()
+            .any(|k| e[*k].as_str().is_some_and(is))
+    })
 }
 
 /// Fork session `id` with OpenCode's own client (`opencode api POST
@@ -2540,6 +2555,20 @@ mod fork_tests {
             NOTHING_TO_FORK
         );
         assert!(fork_response("<html>").is_err());
+        // The word in a fork's own data is no error.
+        let titled = r#"{"data":{"id":"ses_9","title":"Debug ForkEmptyError handling"}}"#;
+        assert_eq!(fork_response(titled).unwrap(), "ses_9");
+        // Nor in an error's message: only its name or type says so.
+        let other = r#"{"_tag":"Session.NotFound","message":"not a ForkEmpty case"}"#;
+        assert_ne!(
+            fork_response(other).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
+        let nested = r#"{"error":{"name":"ForkEmptyError"}}"#;
+        assert_eq!(
+            fork_response(nested).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
         assert!(fork_response(r#"{"data":{"id":"../x"}}"#).is_err());
         assert!(fork_response(r#"{"data":{}}"#).is_err());
         assert_eq!(fork_path("ses_1"), "/api/session/ses_1/fork");
