@@ -17,6 +17,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0007_summary.sql"),
     include_str!("../migrations/0008_usage.sql"),
     include_str!("../migrations/0009_rlord_msg.sql"),
+    include_str!("../migrations/0010_session_context.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -58,6 +59,20 @@ pub struct EventRow {
     pub ts: i64,
     pub kind: String,
     pub payload: serde_json::Value,
+}
+
+/// A `session_context` row: a note the overlord wrote for a session, or a
+/// link to a related session (`body` its id).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContextRow {
+    pub id: i64,
+    pub at: i64,
+    /// `note` or `link`.
+    pub kind: String,
+    pub body: String,
+    pub source: String,
+    /// When a hook pushed it to the agent (None: not yet).
+    pub seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
@@ -1220,6 +1235,76 @@ impl Db {
         Ok(v)
     }
 
+    // ---- session context (notes and links from the overlord) ----
+
+    /// Add a note (`kind` `note`) or a link (`link`, `body` the linked
+    /// session's id). A link that is already there isn't added again.
+    /// Returns whether a row was added.
+    pub fn context_add(
+        &self,
+        session_id: &str,
+        at: i64,
+        kind: &str,
+        body: &str,
+        source: &str,
+    ) -> Result<bool> {
+        if kind == "link" {
+            let there: i64 = self.conn.query_row(
+                "SELECT count(*) FROM session_context \
+                 WHERE session_id = ?1 AND kind = 'link' AND body = ?2",
+                params![session_id, body],
+                |r| r.get(0),
+            )?;
+            if there > 0 {
+                return Ok(false);
+            }
+        }
+        self.conn.execute(
+            "INSERT INTO session_context (session_id, at, kind, body, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, at, kind, body, source],
+        )?;
+        Ok(true)
+    }
+
+    /// A session's notes and links, oldest first.
+    pub fn context_rows(&self, session_id: &str) -> Result<Vec<ContextRow>> {
+        self.context_where(session_id, "")
+    }
+
+    /// Those no hook has pushed to the agent yet, oldest first.
+    pub fn context_unseen(&self, session_id: &str) -> Result<Vec<ContextRow>> {
+        self.context_where(session_id, "AND seen_at IS NULL")
+    }
+
+    fn context_where(&self, session_id: &str, and: &str) -> Result<Vec<ContextRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, at, kind, body, source, seen_at FROM session_context \
+             WHERE session_id = ?1 {and} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(ContextRow {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                kind: r.get(2)?,
+                body: r.get(3)?,
+                source: r.get(4)?,
+                seen_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Mark a session's rows up to `upto` (a row id) as pushed at `at`.
+    pub fn context_mark_seen(&self, session_id: &str, upto: i64, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?3 \
+             WHERE session_id = ?1 AND id <= ?2 AND seen_at IS NULL",
+            params![session_id, upto, at],
+        )?;
+        Ok(())
+    }
+
     // ---- transcripts ----
 
     /// Agent conversation ids a session had before its current one (a
@@ -1624,7 +1709,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
         for table in [
             "sessions",
             "tags",
@@ -1644,6 +1729,53 @@ mod tests {
             assert_eq!(n, 1, "missing table {table}");
         }
         assert!(db.list_sessions(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_rows_are_kept_marked_and_go_with_their_session() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["a", "b"] {
+            db.insert_session(&NewSession {
+                id,
+                name: id,
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        }
+        assert!(db
+            .context_add("a", 10, "note", "first", "overlord")
+            .unwrap());
+        assert!(db.context_add("a", 11, "link", "b", "overlord").unwrap());
+        // The same link once only.
+        assert!(!db.context_add("a", 12, "link", "b", "overlord").unwrap());
+        assert!(db
+            .context_add("a", 13, "note", "second", "overlord")
+            .unwrap());
+        let rows = db.context_rows("a").unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+            ["first", "b", "second"]
+        );
+        assert!(db.context_rows("b").unwrap().is_empty());
+        db.context_mark_seen("a", rows[1].id, 20).unwrap();
+        let unseen = db.context_unseen("a").unwrap();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].body, "second");
+        assert_eq!(db.context_rows("a").unwrap()[0].seen_at, Some(20));
+        // Rows go with their session.
+        db.conn
+            .execute("DELETE FROM sessions WHERE id = 'a'", [])
+            .unwrap();
+        assert!(db.context_rows("a").unwrap().is_empty());
     }
 
     #[test]
@@ -1670,7 +1802,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 9);
+        assert_eq!(db.schema_version().unwrap(), 10);
     }
 
     #[test]

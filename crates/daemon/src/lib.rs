@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod autostart;
 pub mod codex_daemon;
+pub mod context;
 pub mod discover;
 pub mod import;
 pub mod limits;
