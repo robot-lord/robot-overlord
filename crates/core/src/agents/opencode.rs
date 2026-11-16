@@ -795,6 +795,9 @@ fn run_bounded(bin: &Path, args: &[&str], limit: Duration) -> Option<String> {
 
 // ---- user forks ----
 
+/// How long a fork call may take: the server copies the whole conversation.
+pub const FORK_LIMIT: Duration = Duration::from_secs(60);
+
 /// What a fork of a session with no finished turn is refused with.
 pub const NOTHING_TO_FORK: &str = "it has no conversation yet";
 
@@ -822,22 +825,18 @@ pub fn fork_response(text: &str) -> anyhow::Result<String> {
 
 /// Fork session `id` with OpenCode's own client (`opencode api POST
 /// /api/session/<id>/fork -d {}`), which knows how to reach the server and
-/// starts it when none runs, as a launch's create step does. Bounded by
-/// `CREATE_LIMIT_S`. The new session's id.
-pub fn fork_via_cli(bin: &Path, id: &str) -> anyhow::Result<String> {
+/// starts it when none runs, as a launch's create step does, from the
+/// parent's folder `dir`. Bounded by `FORK_LIMIT`. The new session's id.
+pub fn fork_via_cli(bin: &Path, id: &str, dir: &Path) -> anyhow::Result<String> {
     if !is_session_id(id) {
         anyhow::bail!("not an OpenCode session id");
     }
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["api", "POST", &fork_path(id), "-d", "{}"])
+        .current_dir(dir)
         .env_remove("RLORD_SESSION_ID")
         .stderr(std::process::Stdio::null());
-    let (_, text) = crate::process::run_to_file(
-        cmd,
-        &std::env::temp_dir(),
-        Duration::from_secs(CREATE_LIMIT_S),
-        None,
-    )?;
+    let (_, text) = crate::process::run_to_file(cmd, &std::env::temp_dir(), FORK_LIMIT, None)?;
     fork_response(&text).map_err(|e| {
         let said: String = text.trim().chars().take(200).collect();
         if said.is_empty() || e.to_string() == NOTHING_TO_FORK {
@@ -1631,6 +1630,20 @@ pub fn fork_of(db: &Path, id: &str, since_ms: i64) -> Option<String> {
         .query_row(
             "SELECT id FROM session_v2 WHERE fork_session_id = ?1 AND time_created >= ?2 \
              AND time_archived IS NOT NULL ORDER BY time_created DESC LIMIT 1",
+            rusqlite::params![id, since_ms],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+/// The newest fork of `id` not archived, created at or after `since_ms`:
+/// a user fork whose call ran out of time though the server made it.
+/// (Archived ones are the summary's: `fork_of`.)
+pub fn user_fork_since(db: &Path, id: &str, since_ms: i64) -> Option<String> {
+    open(db)?
+        .query_row(
+            "SELECT id FROM session_v2 WHERE fork_session_id = ?1 AND time_created >= ?2 \
+             AND time_archived IS NULL ORDER BY time_created DESC LIMIT 1",
             rusqlite::params![id, since_ms],
             |r| r.get(0),
         )
@@ -2530,5 +2543,27 @@ mod fork_tests {
         assert!(fork_response(r#"{"data":{"id":"../x"}}"#).is_err());
         assert!(fork_response(r#"{"data":{}}"#).is_err());
         assert_eq!(fork_path("ses_1"), "/api/session/ses_1/fork");
+    }
+
+    /// A fork call that ran out of time though the server made the fork:
+    /// found by its parent, since the call started, not archived.
+    #[test]
+    fn a_late_fork_is_found_by_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::tests::store(dir.path());
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "INSERT INTO session_v2 (id, project_id, fork_session_id, directory, time_created, time_updated, time_archived) \
+               VALUES ('ses_summary', 'p', 'ses_parent', '/a', 500, 500, 500), \
+                      ('ses_old', 'p', 'ses_parent', '/a', 100, 100, NULL), \
+                      ('ses_mine', 'p', 'ses_parent', '/a', 400, 400, NULL);",
+        )
+        .unwrap();
+        assert_eq!(
+            user_fork_since(&db, "ses_parent", 300).as_deref(),
+            Some("ses_mine")
+        );
+        assert_eq!(user_fork_since(&db, "ses_parent", 450), None);
+        assert_eq!(user_fork_since(&db, "ses_other", 0), None);
     }
 }

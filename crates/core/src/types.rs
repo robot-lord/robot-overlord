@@ -106,6 +106,16 @@ pub struct Session {
     pub forked_from: Option<String>,
     #[serde(default)]
     pub forked_from_name: Option<String>,
+    /// The sessions forked from it (live or archived), oldest first.
+    #[serde(default)]
+    pub forks: Vec<ForkRef>,
+}
+
+/// A session forked from another (`Session::forks`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRef {
+    pub id: String,
+    pub name: String,
 }
 
 impl Session {

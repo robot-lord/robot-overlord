@@ -50,6 +50,14 @@ pub(crate) struct Want {
     pub spec: Value,
     pub prompt: Option<String>,
     pub name: String,
+    /// The name was chosen here (`<parent>-fork`…), not asked for: it is
+    /// reserved while the fork is made (`reserve_key`).
+    pub auto_name: bool,
+    /// How the parent's background reaches its agent, and where its
+    /// conversation is: whether its rows went into the conversation the
+    /// fork copies (`parent_saw`).
+    pub parent_mode: Option<context::Delivery>,
+    pub parent_transcript: Option<String>,
     pub description: Option<String>,
     /// Another model than the parent's.
     pub model: Option<String>,
@@ -89,6 +97,41 @@ pub(crate) struct Made {
     /// The parent's folder has changes not committed (a worktree fork
     /// doesn't carry them).
     pub uncommitted: bool,
+    /// The parent's background rows marked seen went into the
+    /// conversation the fork copies: their `seen_at` is copied too.
+    pub parent_saw: bool,
+}
+
+/// kv key: a default fork name being used by a fork in the making (the
+/// time it was taken, ms), so two forks at once don't pick the same one
+/// (and a worktree fork's branch, named after it, stays its own).
+fn reserve_key(name: &str) -> String {
+    format!("fork_name:{name}")
+}
+
+/// How long a reservation holds, should a fork never release it.
+const RESERVED_MS: i64 = 10 * 60_000;
+
+/// A session has the name, or a fork in the making reserved it.
+fn name_unavailable(db: &Db, name: &str, now: i64) -> bool {
+    db.name_taken(name).unwrap_or(false)
+        || db
+            .kv_get(&reserve_key(name))
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())
+            .is_some_and(|at| now - at < RESERVED_MS)
+}
+
+/// Releases a reserved name when the fork is done, whichever way.
+struct Reserved<'a>(&'a Daemon, Option<String>);
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = &self.1 {
+            let _ = self.0.db().kv_delete(&reserve_key(n));
+        }
+    }
 }
 
 /// `session.fork` params: `ref` (the parent), `prompt`, `name`,
@@ -96,7 +139,9 @@ pub(crate) struct Made {
 /// worktree) and `branch`.
 pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     let cfg = d.config();
+    let base = paths::data_dir();
     let mut want = want(&d.db(), params)?;
+    let _reserved = Reserved(d, want.auto_name.then(|| want.name.clone()));
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(want.agent) {
         bail!("{why}");
@@ -104,6 +149,7 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     want.worktree = plan_worktree(&want, &cfg)?;
     let mut made = Made {
         hooks: context::hooks_work(want.agent),
+        parent_saw: parent_saw(&want, &base),
         ..Default::default()
     };
     // (Read as `session.get` reads it.)
@@ -111,9 +157,29 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     crate::usage::annotate(d, &mut rows, true);
     made.context_pct = rows[0]["usage"]["context_pct"].as_u64();
     if want.agent == Agent::OpenCode {
-        made.opencode_id = Some(opencode_fork(&want.conversation)?);
+        // (Each guard ends with its statement, before any early return:
+        // `Reserved` takes the lock when it is dropped.)
+        let tracked = {
+            let db = d.db();
+            db.agent_session_ids()
+        }?;
+        made.opencode_id = Some(opencode_fork(
+            &want.conversation,
+            std::path::Path::new(&want.parent.project_path),
+            &tracked,
+        )?);
     }
     if let Some(w) = &want.worktree {
+        // The branch is named after it: a session that took the name
+        // meanwhile (not a fork: those see the reservation) stops it here,
+        // before anything is made.
+        let taken = {
+            let db = d.db();
+            db.name_taken(&want.name)
+        }?;
+        if want.auto_name && taken {
+            bail!("{} was taken meanwhile: fork again", want.name);
+        }
         made.uncommitted = git::has_changes(&want.parent.project_path) == Some(true);
         let start = git::head_commit(&want.parent.project_path)?;
         git::ensure_excluded(&w.repo, &cfg.session.workspace_dir)?;
@@ -127,11 +193,48 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
             );
         }
     }
-    let r = finish(&d.db(), &want, &made, &paths::data_dir());
-    if let (Err(_), Some(w)) = (&r, &want.worktree) {
+    let mut started = false;
+    let r = finish(&d.db(), &want, &made, &base, &mut started);
+    // Failed before its pane started: nothing works in the worktree yet.
+    // (After that it is the fork's: kept, and the error returned.)
+    if let (Err(_), Some(w), false) = (&r, &want.worktree, started) {
         discard(w);
     }
     r
+}
+
+/// Whether the parent's rows marked seen went into the conversation the
+/// fork copies: by hook (also when no mode was recorded: hooks hand it
+/// over then), or by the pointer line, when that is in its transcript. A
+/// system prompt file isn't part of the conversation. Reads the
+/// transcript: outside the lock.
+fn parent_saw(want: &Want, base: &std::path::Path) -> bool {
+    match want.parent_mode {
+        None | Some(context::Delivery::Hook) => true,
+        Some(context::Delivery::SystemPromptFile) => false,
+        Some(context::Delivery::Pointer) => want.parent_transcript.as_deref().is_some_and(|t| {
+            let file = context::file_path(base, &want.parent.id);
+            transcript_names(std::path::Path::new(t), &file.to_string_lossy())
+        }),
+    }
+}
+
+/// Whether a conversation's text has `needle` in it (a transcript file
+/// read up to 64 MB, or an OpenCode conversation's rows).
+fn transcript_names(transcript: &std::path::Path, needle: &str) -> bool {
+    use std::io::{BufRead, Read};
+    if let Some((db, id)) = opencode::locate(transcript) {
+        return opencode::conversation(db, id)
+            .iter()
+            .any(|s| s.text.contains(needle));
+    }
+    let Ok(f) = std::fs::File::open(transcript) else {
+        return false;
+    };
+    std::io::BufReader::new(f.take(64 << 20))
+        .split(b'\n')
+        .map_while(std::result::Result::ok)
+        .any(|line| String::from_utf8_lossy(&line).contains(needle))
 }
 
 /// Remove a worktree this fork made (and its branch), best effort: the
@@ -178,21 +281,41 @@ fn sub_folder(top: &str, folder: &str) -> std::path::PathBuf {
 }
 
 /// OpenCode's fork of `conversation`, by its server when one answers, else
-/// by OpenCode's own client (which starts the server, as a launch does).
-fn opencode_fork(conversation: &str) -> Result<String> {
+/// by OpenCode's own client run in the parent's folder `dir` (which starts
+/// the server, as a launch does). A call that fails, a time-out above all,
+/// may still have made it: a fork of the parent made since the call began
+/// that no session has (`tracked`) is taken.
+fn opencode_fork(
+    conversation: &str,
+    dir: &std::path::Path,
+    tracked: &std::collections::HashSet<String>,
+) -> Result<String> {
+    let began = now_ms();
     let svc = rlord_core::agents::opencode_service::Service::read(&opencode::service_file());
     let r = match svc.filter(|s| s.answers()) {
         Some(svc) => svc.fork(conversation),
         None => {
             let bin = install::resolved("opencode")
                 .unwrap_or_else(|| std::path::PathBuf::from("opencode"));
-            opencode::fork_via_cli(&bin, conversation)
+            opencode::fork_via_cli(&bin, conversation, dir)
         }
     };
-    r.map_err(|e| match e.to_string().as_str() {
-        opencode::NOTHING_TO_FORK => anyhow::anyhow!("nothing to fork yet: {}", e),
-        _ => anyhow::anyhow!("OpenCode didn't fork it: {e}"),
-    })
+    let e = match r {
+        Ok(id) => return Ok(id),
+        Err(e) if e.to_string() == opencode::NOTHING_TO_FORK => {
+            bail!("nothing to fork yet: {e}")
+        }
+        Err(e) => e,
+    };
+    let made = opencode::user_fork_since(&opencode::db_path(), conversation, began)
+        .filter(|id| !tracked.contains(id));
+    match made {
+        Some(id) => {
+            tracing::info!(fork = %id, error = %e, "OpenCode's fork call failed, but it made the fork");
+            Ok(id)
+        }
+        None => bail!("OpenCode didn't fork it: {e}"),
+    }
 }
 
 /// Read the parent and check the fork can be made (what is refused:
@@ -246,10 +369,9 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
         None,
     )?;
     related.retain(|r| *r != parent.id);
-    let name = match p_opt("name") {
-        Some(n) => n,
-        None => default_name(db, &parent.name),
-    };
+    let asked = p_opt("name");
+    let auto_name = asked.is_none();
+    let name = asked.unwrap_or_else(|| default_name(db, &parent.name));
     let wants_worktree = params["workspace"] == true;
     if wants_worktree {
         if !agent.forks_elsewhere() {
@@ -266,13 +388,19 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
             );
         }
     }
+    // Checked: the name is this fork's until it is done (`Reserved`).
+    if auto_name {
+        db.kv_set(&reserve_key(&name), &now_ms().to_string())?;
+    }
     Ok(Want {
         agent,
         conversation,
         spec,
         prompt: p_opt("prompt"),
-
         name,
+        auto_name,
+        parent_mode: context::mode(db, &parent.id)?,
+        parent_transcript: db.transcript_source(&parent.id)?,
         description: p_opt("description"),
         model: p_opt("model"),
         note,
@@ -284,9 +412,11 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
     })
 }
 
-/// `<parent>-fork`, `-fork-2`, …: the first name no session has.
+/// `<parent>-fork`, `-fork-2`, …: the first name no session has and no
+/// fork in the making reserved.
 fn default_name(db: &Db, parent: &str) -> String {
-    names::fork_name(parent, |n| db.name_taken(n).unwrap_or(false))
+    let now = now_ms();
+    names::fork_name(parent, |n| name_unavailable(db, n, now))
 }
 
 /// What to say about the fork, by plain code: a live parent shares its
@@ -428,11 +558,25 @@ pub(crate) fn launch(
 }
 
 /// Insert and start the fork, under the lock.
-pub(crate) fn finish(db: &Db, want: &Want, made: &Made, base: &std::path::Path) -> Result<Value> {
-    // Checked again: the parent may have gone while the lock was off. (The
-    // name stays as chosen: a worktree's branch was named after it.)
+/// `started`: set once its pane is up (an error after that leaves the
+/// fork, and its worktree, in place).
+pub(crate) fn finish(
+    db: &Db,
+    want: &Want,
+    made: &Made,
+    base: &std::path::Path,
+    started: &mut bool,
+) -> Result<Value> {
+    // Checked again: the parent may have gone while the lock was off, or
+    // a session (not a fork: those see the reservation) taken the name it
+    // chose. A worktree fork's branch was named after it: that stops it
+    // (its worktree is removed); any other picks the next name.
     let parent = db.resolve_ref(&want.parent.id)?;
-    let name = want.name.clone();
+    let name = match (want.auto_name && db.name_taken(&want.name)?, &want.worktree) {
+        (false, _) => want.name.clone(),
+        (true, Some(_)) => bail!("{} was taken meanwhile: fork again", want.name),
+        (true, None) => default_name(db, &parent.name),
+    };
     let agent = want.agent;
     let id = rlord_core::types::new_id();
     let now = now_ms();
@@ -500,7 +644,7 @@ pub(crate) fn finish(db: &Db, want: &Want, made: &Made, base: &std::path::Path) 
             background: Some(Background {
                 mode,
                 carried,
-                copy_from: Some((&parent.id, &except)),
+                copy_from: Some((&parent.id, &except, made.parent_saw)),
                 rows: add,
             }),
             event: (
@@ -510,6 +654,7 @@ pub(crate) fn finish(db: &Db, want: &Want, made: &Made, base: &std::path::Path) 
             ),
         },
     )?;
+    *started = true;
     after_start(db, want, &parent, &id)?;
     tracing::info!(session = %id, parent = %parent.id, name = %name, agent = agent.name(), "forked session");
     let mut out = serde_json::to_value(db.resolve_ref(&id)?)?;
@@ -560,7 +705,14 @@ pub(crate) fn pending(db: &Db, s: &Session) -> Result<Option<String>> {
             (Some(_), Some(t)) => std::path::Path::new(&t).exists(),
             (Some(sid), None) => claude::transcript_path(&s.project_path, sid).exists(),
         },
-        Some(Agent::Codex) => s.agent_session.is_some(),
+        // Bound is not enough: its rollout must be on disk, or `codex
+        // resume` finds no conversation.
+        Some(Agent::Codex) => {
+            s.agent_session.is_some()
+                && db
+                    .transcript_source(&s.id)?
+                    .is_some_and(|t| std::path::Path::new(&t).exists())
+        }
         _ => true,
     };
     if exists {
@@ -574,6 +726,17 @@ pub(crate) fn pending(db: &Db, s: &Session) -> Result<Option<String>> {
         db.kv_delete(&pending_key(&s.id))?;
     }
     Ok(parent)
+}
+
+/// The fork's own conversation was seen at `transcript` (a hook's
+/// `transcript_path`, a thread bound from Codex's index): once that is on
+/// disk a restart resumes it, so `fork_pending` goes. (Nothing for a
+/// session that isn't a fork.)
+pub(crate) fn conversation_seen(db: &Db, id: &str, transcript: &str) -> Result<()> {
+    if db.kv_get(&pending_key(id))?.is_some() && std::path::Path::new(transcript).exists() {
+        db.kv_delete(&pending_key(id))?;
+    }
+    Ok(())
 }
 
 /// The command that forks again for a restart of a fork that never
@@ -834,7 +997,7 @@ mod tests {
 
         // Copied as the fork starts.
         mk(&db, "f", "claude", Some("c-f"), here, "");
-        db.context_copy("p", "f", &except).unwrap();
+        db.context_copy("p", "f", &except, true).unwrap();
         context::store_rows(&db, "f", &add, 50).unwrap();
         let links = db.context_links("f").unwrap();
         assert_eq!(links.len(), context::LINKS_MAX);
@@ -906,8 +1069,16 @@ mod tests {
             Some("t-p")
         );
         assert_eq!(pending(&db, &f).unwrap().as_deref(), Some("t-p"));
+        // Bound, but no rollout on disk yet: `codex resume` would find
+        // nothing, so it is forked again.
         db.set_agent_session("f", "t-f", "hook").unwrap();
+        let rollout = dir.path().join("rollout-t-f.jsonl");
+        db.upsert_transcript_source("f", rollout.to_str().unwrap())
+            .unwrap();
         let f = db.resolve_ref("f").unwrap();
+        assert_eq!(pending(&db, &f).unwrap().as_deref(), Some("t-p"));
+        // Its rollout written: resumed from now on.
+        std::fs::write(&rollout, "{}\n").unwrap();
         assert_eq!(pending(&db, &f).unwrap(), None);
         assert_eq!(db.kv_get(&pending_key("f")).unwrap(), None, "cleared");
         // OpenCode's fork exists before its pane: nothing pending; a
@@ -1066,6 +1237,11 @@ mod tests {
         )
         .unwrap();
         context::record_mode(&db, "01fork", context::Delivery::Hook).unwrap();
+        db.kv_set(
+            &pending_key("01fork"),
+            r#"{"parent_conversation":"t-parent"}"#,
+        )
+        .unwrap();
         let r = methods::hook_emit_with(
             &db,
             &json!({"instance": "01fork", "agent": "codex", "event": "SessionStart",
@@ -1082,5 +1258,94 @@ mod tests {
         assert!(reply.contains("Forked from session"), "{r}");
         // Bound: nothing left to find it by.
         assert_eq!(db.kv_get(&methods::bind_fork_key("01fork")).unwrap(), None);
+        // Its rollout isn't on disk yet: still a fork to make again.
+        assert!(db.kv_get(&pending_key("01fork")).unwrap().is_some());
+        // Once a hook names a rollout that is there, no longer.
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-x-t-fork.jsonl");
+        std::fs::write(&rollout, "{}\n").unwrap();
+        methods::hook_emit_with(
+            &db,
+            &json!({"instance": "01fork", "agent": "codex", "event": "UserPromptSubmit",
+                    "payload": {"session_id": "t-fork", "hook_event_name": "UserPromptSubmit",
+                                "transcript_path": rollout.to_str().unwrap()}}),
+            &|_, _| rlord_core::agents::Indexed::User,
+        )
+        .unwrap();
+        assert_eq!(db.kv_get(&pending_key("01fork")).unwrap(), None);
+    }
+
+    /// The parent's rows count as seen in the fork only when they went
+    /// into the conversation it copies.
+    #[test]
+    fn a_fork_keeps_seen_rows_only_when_the_conversation_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let base = dir.path().join("data");
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "codex", Some("t-p"), here, "");
+        let transcript = dir.path().join("rollout-t-p.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"session_meta\"}\n{\"text\":\"fix it\"}\n",
+        )
+        .unwrap();
+        db.upsert_transcript_source("p", transcript.to_str().unwrap())
+            .unwrap();
+        let mut w = want(&db, &json!({"ref": "p"})).unwrap();
+        let saw = |w: &Want, mode| {
+            let mut w = w.clone();
+            w.parent_mode = mode;
+            parent_saw(&w, &base)
+        };
+        use context::Delivery::*;
+        // By hook (or no mode: hooks hand it over then): in the conversation.
+        assert!(saw(&w, Some(Hook)) && saw(&w, None));
+        // A system prompt file isn't part of the conversation.
+        assert!(!saw(&w, Some(SystemPromptFile)));
+        // The pointer: only when the conversation has it.
+        assert!(!saw(&w, Some(Pointer)));
+        let pointer = context::pointer_only(&context::file_path(&base, "p"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\"}}\n{}\n",
+                json!({"text": pointer})
+            ),
+        )
+        .unwrap();
+        assert!(saw(&w, Some(Pointer)));
+        w.parent_transcript = None;
+        assert!(!saw(&w, Some(Pointer)));
+    }
+
+    /// A default name is the fork's while it is made: a second fork at the
+    /// same time takes the next one. A stale reservation doesn't count.
+    #[test]
+    fn a_default_name_is_reserved_while_the_fork_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "codex", Some("t-p"), here, "");
+        let first = want(&db, &json!({"ref": "p"})).unwrap();
+        assert!(first.auto_name);
+        let second = want(&db, &json!({"ref": "p"})).unwrap();
+        assert_eq!(
+            (first.name.as_str(), second.name.as_str()),
+            ("n-p-fork", "n-p-fork-2")
+        );
+        // Asked for by name: not reserved, not changed.
+        let named = want(&db, &json!({"ref": "p", "name": "n-p-fork"})).unwrap();
+        assert!(!named.auto_name);
+        assert_eq!(named.name, "n-p-fork");
+        // Released (`Reserved`), or older than it may hold: free again.
+        db.kv_delete(&reserve_key("n-p-fork")).unwrap();
+        db.kv_set(
+            &reserve_key("n-p-fork-2"),
+            &(now_ms() - RESERVED_MS - 1).to_string(),
+        )
+        .unwrap();
+        assert!(!name_unavailable(&db, "n-p-fork-2", now_ms()));
+        assert_eq!(want(&db, &json!({"ref": "p"})).unwrap().name, "n-p-fork");
     }
 }

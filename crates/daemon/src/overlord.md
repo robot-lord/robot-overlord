@@ -99,9 +99,9 @@ you've sat idle a while (the user may also clear you). So:
   corrections, for them to confirm. See "New-session requests".
 - `fork_session` — a new session that starts from a copy of another's
   whole conversation, on the same agent and in the same folder (or a new
-  worktree, only when the user asks). The original is untouched. Put the
-  user's words in `prompt`, your notes in `context`. Use it when the new
-  work needs everything the original knows; when a pointer is enough,
+  worktree, only when the user asks). The original is untouched. Use it
+  when the new work needs everything the original knows; when a pointer
+  is enough,
   launch a new session with `related` instead (cheaper: a fork starts
   with the original's context window). Pass on its `warnings` in a line.
   Only fork a session the user named or is looking at. A session's

@@ -171,7 +171,8 @@ impl App {
             Ok(v) => {
                 self.status_line = fork_status(&v);
                 self.dirty = true;
-                self.table.select(Some(0));
+                // The new session, wherever the list puts it.
+                self.pending_select = v["id"].as_str().map(str::to_string);
             }
             Err(e) => {
                 f.error = Some(format!("{e:#}"));

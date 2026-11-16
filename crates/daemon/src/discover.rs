@@ -364,6 +364,8 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
     // rlord's own attribution ("minted"), until a hook confirms it.
     db.set_agent_session(&s.id, &t.id, "minted")?;
     db.upsert_transcript_source(&s.id, &t.rollout_path)?;
+    // A fork whose rollout is written: resumed at a restart, not forked again.
+    crate::fork::conversation_seen(db, &s.id, &t.rollout_path)?;
     // Bound: what the search for its thread needed is done with.
     methods::clear_bind_keys(db, &s.id)?;
     db.insert_event(
@@ -628,6 +630,46 @@ mod tests {
         read.borrow_mut().clear();
         assert_eq!(pick(&mixed, None, true, None), None);
         assert!(read.borrow().is_empty(), "nobody fits: nothing read");
+    }
+
+    /// A fork bound from the index whose rollout is on disk is no longer
+    /// one to make again at a restart; one whose rollout isn't, still is.
+    #[test]
+    fn binding_a_fork_with_its_rollout_ends_its_pending_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        for id in ["a", "b"] {
+            db.insert_session(&rlord_core::db::NewSession {
+                id,
+                name: id,
+                agent: "codex",
+                agent_session: None,
+                project_path: "/src/app",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.kv_set(&crate::fork::pending_key(id), "{}").unwrap();
+        }
+        let on_disk = dir.path().join("rollout-ta.jsonl");
+        std::fs::write(&on_disk, "{}\n").unwrap();
+        let mut t = thread("ta", "x");
+        t.rollout_path = on_disk.to_string_lossy().into_owned();
+        assert!(record_bind(&db, &db.resolve_ref("a").unwrap(), &t).unwrap());
+        assert_eq!(db.kv_get(&crate::fork::pending_key("a")).unwrap(), None);
+        let mut t = thread("tb", "x");
+        t.rollout_path = dir
+            .path()
+            .join("absent.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        assert!(record_bind(&db, &db.resolve_ref("b").unwrap(), &t).unwrap());
+        assert!(db.kv_get(&crate::fork::pending_key("b")).unwrap().is_some());
     }
 
     #[test]

@@ -305,7 +305,7 @@ impl Service {
             "POST",
             &super::opencode::fork_path(id),
             Some(&serde_json::json!({})),
-            Duration::from_secs(10),
+            super::opencode::FORK_LIMIT,
         )?;
         if !(200..300).contains(&status) && !text.contains("ForkEmpty") {
             bail!("forking in OpenCode: {status} {}", clip_error(&text));

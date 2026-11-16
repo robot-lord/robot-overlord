@@ -350,6 +350,7 @@ impl Db {
         let rows = stmt.query_map([arg], row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
+        self.attach_forks(&mut sessions)?;
         self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
     }
@@ -564,6 +565,7 @@ impl Db {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
+        self.attach_forks(&mut sessions)?;
         self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
     }
@@ -590,6 +592,40 @@ impl Db {
             if let Some((running, total)) = counts.get(&s.id) {
                 s.agents_running = *running;
                 s.agents_total = *total;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each session's forks (one query over the forks there are: the
+    /// index on `forked_from`).
+    fn attach_forks(&self, sessions: &mut [Session]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT forked_from, id, name FROM sessions WHERE forked_from IS NOT NULL \
+             ORDER BY created_at, id",
+        )?;
+        let mut by_parent: std::collections::HashMap<String, Vec<crate::types::ForkRef>> =
+            Default::default();
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (parent, id, name) = row?;
+            by_parent
+                .entry(parent)
+                .or_default()
+                .push(crate::types::ForkRef { id, name });
+        }
+        for s in sessions {
+            if let Some(f) = by_parent.remove(&s.id) {
+                s.forks = f;
             }
         }
         Ok(())
@@ -634,16 +670,6 @@ impl Db {
             params![id, parent],
         )?;
         Ok(())
-    }
-
-    /// The sessions forked from session `id` (live or archived), oldest
-    /// first: (id, name).
-    pub fn forks_of(&self, id: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name FROM sessions WHERE forked_from = ?1 ORDER BY created_at, id",
-        )?;
-        let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Whether any session (live or archived) is called `name`.
@@ -1411,18 +1437,26 @@ impl Db {
     }
 
     /// Copy session `from`'s notes and links to session `to` (a fork),
-    /// keeping when each was added, its source and whether it was handed
-    /// to the agent (the fork's conversation is a copy of the one it went
-    /// to); not which hook answer carried it. `except`: row ids left out.
+    /// keeping when each was added and its source; not which hook answer
+    /// carried it. `keep_seen`: whether each was handed to the agent stays
+    /// as it is (the rows went into the conversation the fork copies);
+    /// otherwise all are copied unseen. `except`: row ids left out.
     /// Returns how many were copied.
-    pub fn context_copy(&self, from: &str, to: &str, except: &[i64]) -> Result<usize> {
+    pub fn context_copy(
+        &self,
+        from: &str,
+        to: &str,
+        except: &[i64],
+        keep_seen: bool,
+    ) -> Result<usize> {
         let skip = serde_json::to_string(except)?;
         Ok(self.conn.execute(
             "INSERT INTO session_context (session_id, at, kind, body, source, seen_at) \
-             SELECT ?2, at, kind, body, source, seen_at FROM session_context \
+             SELECT ?2, at, kind, body, source, CASE WHEN ?4 THEN seen_at END \
+             FROM session_context \
              WHERE session_id = ?1 AND id NOT IN (SELECT value FROM json_each(?3)) \
              ORDER BY id",
-            params![from, to, skip],
+            params![from, to, skip, keep_seen],
         )?)
     }
 
@@ -1585,6 +1619,7 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_rlord_msg_at: r.get(25)?,
         forked_from: r.get(26)?,
         forked_from_name: r.get(27)?,
+        forks: Vec::new(),
     })
 }
 
@@ -1952,10 +1987,21 @@ mod tests {
         assert_eq!(f.forked_from_name.as_deref(), Some("n-p"));
         let p = db.resolve_ref("p").unwrap();
         assert_eq!((p.forked_from, p.forked_from_name), (None, None));
-        assert_eq!(
-            db.forks_of("p").unwrap(),
-            [("f".into(), "n-f".into()), ("g".into(), "n-g".into())]
-        );
+        let fork = |id: &str| crate::types::ForkRef {
+            id: id.into(),
+            name: format!("n-{id}"),
+        };
+        assert_eq!(p.forks, [fork("f"), fork("g")]);
+        // In the list too.
+        let listed = db.sessions(&SessionQuery::default()).unwrap();
+        let p_row = listed.iter().find(|s| s.id == "p").unwrap();
+        assert_eq!(p_row.forks, [fork("f"), fork("g")]);
+        assert!(listed
+            .iter()
+            .find(|s| s.id == "x")
+            .unwrap()
+            .forks
+            .is_empty());
         // Listed with its parent's name too.
         let listed = db
             .sessions(&SessionQuery::default())
@@ -1976,7 +2022,7 @@ mod tests {
             .unwrap();
         let rows = db.context_rows("p").unwrap();
         // Everything but the link, as it is.
-        assert_eq!(db.context_copy("p", "f", &[rows[1].id]).unwrap(), 2);
+        assert_eq!(db.context_copy("p", "f", &[rows[1].id], true).unwrap(), 2);
         let copied = db.context_rows("f").unwrap();
         assert_eq!(
             copied
@@ -1988,6 +2034,13 @@ mod tests {
                 (12, "unseen", "overlord", None)
             ]
         );
+        // Rows that didn't go into the conversation: all unseen.
+        db.context_copy("p", "g", &[rows[1].id], false).unwrap();
+        assert!(db
+            .context_rows("g")
+            .unwrap()
+            .iter()
+            .all(|r| r.seen_at.is_none()));
         // Not which answer carried it (that was the parent's).
         assert_eq!(db.context_ack("f", "p.ack", 30).unwrap(), 0);
         // The parent's own rows are untouched.

@@ -1722,7 +1722,7 @@ mod tests {
         app.open_menu(30, 8, false);
         assert_eq!(
             labels(&app),
-            ["unarchive", "rename", "tags", "describe", "notes"]
+            ["unarchive", "rename", "tags", "describe", "notes", "fork"]
         );
         // A group: open, rename, favourite.
         app.mode = Mode::Normal;

@@ -772,12 +772,13 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
 /// A new session's background, as `start` stores it: how it reaches the
 /// agent (`mode`), how the launch carries it (`carried`: None when it
 /// doesn't, its file couldn't be written), the session whose rows are
-/// copied first with the row ids left out (a fork's parent), and the
+/// copied first with the row ids left out and whether their `seen_at`
+/// is kept (a fork's parent: `Made::parent_saw`), and the
 /// rows to add after them.
 pub(crate) struct Background<'a> {
     pub mode: context::Delivery,
     pub carried: Option<context::Delivery>,
-    pub copy_from: Option<(&'a str, &'a [i64])>,
+    pub copy_from: Option<(&'a str, &'a [i64], bool)>,
     pub rows: Vec<context::NewRow>,
 }
 
@@ -844,8 +845,8 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     note_first_prompt(db, id, agent, s.first, now)?;
     if let Some(bg) = &s.background {
         context::turn_on(db, id)?;
-        if let Some((from, except)) = bg.copy_from {
-            db.context_copy(from, id, except)?;
+        if let Some((from, except, keep_seen)) = bg.copy_from {
+            db.context_copy(from, id, except, keep_seen)?;
         }
         context::store_rows(db, id, &bg.rows, now)?;
         if bg.carried == Some(bg.mode) {
@@ -1065,15 +1066,7 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
 
 pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    let mut v = serde_json::to_value(&s)?;
-    // The sessions forked from it (`session.fork`).
-    let forks: Vec<Value> = db
-        .forks_of(&s.id)?
-        .into_iter()
-        .map(|(id, name)| json!({"id": id, "name": name}))
-        .collect();
-    v["forks"] = json!(forks);
-    Ok(v)
+    Ok(serde_json::to_value(s)?)
 }
 
 pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
@@ -1272,6 +1265,8 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
             db.kv_delete(&bind_fork_key(&s.id))?;
         }
     }
+    // Nor is there a fork to make again at its next restart.
+    db.kv_delete(&crate::fork::pending_key(&s.id))?;
     db.set_status(&s.id, Status::Starting, now)?;
     db.insert_event(
         &s.id,
@@ -1571,6 +1566,9 @@ fn hook_emit_in(
         if whose != Whose::Other {
             if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
                 db.upsert_transcript_source(&s.id, tp)?;
+                // A fork whose own conversation is written: no longer one
+                // to make again at a restart.
+                crate::fork::conversation_seen(db, &s.id, tp)?;
             }
         }
         // Who this event is about, when it blocks or unblocks: a sub-agent

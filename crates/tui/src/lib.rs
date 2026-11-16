@@ -234,9 +234,6 @@ struct App {
     preview_rich: Option<Text<'static>>,
     /// Sub-agents of the selected session (refreshed with the preview).
     agents: Vec<Value>,
-    /// The names of the sessions forked from the selected one, archived
-    /// ones too (from `session.get`, when the selection changes).
-    forks: Vec<String>,
     status_line: String,
     dirty: bool,
     last_preview: Instant,
@@ -340,7 +337,6 @@ impl App {
             preview_text: String::new(),
             preview_rich: None,
             agents: Vec::new(),
-            forks: Vec::new(),
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
@@ -643,8 +639,7 @@ impl App {
         self.last_preview = Instant::now();
         self.preview_due = None;
         // Another session: its preview starts at the end again.
-        let moved = self.preview_for != self.selected_id();
-        if moved {
+        if self.preview_for != self.selected_id() {
             self.preview_scroll = 0;
             self.convs_stale = true;
         }
@@ -658,21 +653,8 @@ impl App {
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
-            self.forks.clear();
             return;
         };
-        // Its forks, whatever the list shows (filtered, live or archived):
-        // the daemon's answer, once per selection.
-        if moved {
-            self.forks = client_call(
-                &paths::socket_path(),
-                "session.get",
-                json!({"ref": s["id"].as_str().unwrap_or("")}),
-            )
-            .ok()
-            .map(|v| fork_names(&v))
-            .unwrap_or_default();
-        }
         // The overlord's conversations, while its row is selected: loaded
         // when it gets selected or something changed, not on every tick.
         if is_overlord_role(&s) {
@@ -2077,10 +2059,13 @@ impl App {
                 ),
             ]));
         }
-        if !self.forks.is_empty() && self.preview_for == self.selected_id() {
+        // (Its row carries them all, live or archived, whatever the list
+        // shows.)
+        let forks = fork_names(s);
+        if !forks.is_empty() {
             lines.push(Line::from(vec![
                 key("forks"),
-                Span::styled(self.forks.join(", "), theme::muted()),
+                Span::styled(forks.join(", "), theme::muted()),
             ]));
         }
         // On Codex's shared background server: the turn outlives the pane.
@@ -2613,7 +2598,7 @@ fn updated_at(s: &Value) -> Option<i64> {
 
 /// The details pane's usage line: all three, whatever the column shows
 /// (`12 turns · 1.2M tokens · 42% of 200k context`).
-/// The names in `session.get`'s `forks`.
+/// The names of a session row's `forks` (`Session::forks`).
 fn fork_names(v: &Value) -> Vec<String> {
     v["forks"]
         .as_array()
@@ -3304,13 +3289,18 @@ fn context_legend(
     let archived = !s["archived_at"].is_null();
     // Archived: a record. Unarchive first; its notes can still be kept up.
     if archived {
-        return vec![
+        let mut v = vec![
             (Action::Unarchive, "unarchive"),
             (Action::Rename, "rename"),
             (Action::Tags, "tags"),
             (Action::Describe, "describe"),
             (Action::Notes, "notes"),
         ];
+        // (Forked while its folder is there: the daemon says if it isn't.)
+        if !s["agent_session"].is_null() && !overlord {
+            v.push((Action::Fork, "fork"));
+        }
+        return v;
     }
     // Resuming (Enter on a stopped row) and restarting both need a
     // conversation the agent can resume.
@@ -3379,6 +3369,16 @@ mod tests {
         v.iter().map(|(_, l)| l.to_string()).collect()
     }
 
+    /// The details' forks line comes from the row (archived forks too),
+    /// not from what the list shows.
+    #[test]
+    fn fork_names_come_from_the_row() {
+        let row = json!({"forks": [{"id": "01a", "name": "api-fork"},
+                                   {"id": "01b", "name": "api-fork-2"}]});
+        assert_eq!(fork_names(&row), ["api-fork", "api-fork-2"]);
+        assert!(fork_names(&json!({})).is_empty());
+    }
+
     #[test]
     fn context_legend_lists_only_what_applies() {
         let running = json!({"status": "working", "agent": "claude", "agent_session": "x",
@@ -3395,7 +3395,7 @@ mod tests {
         assert_eq!(
             labels(&context_legend(false, None, Some(&archived))),
             // A record: unarchive first, no resume.
-            ["unarchive", "rename", "tags", "describe", "notes"]
+            ["unarchive", "rename", "tags", "describe", "notes", "fork"]
         );
         let overlord = json!({"status": "idle", "agent": "claude", "agent_session": "x",
                               "archived_at": null, "pinned": false, "role": "overlord"});
