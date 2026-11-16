@@ -280,6 +280,12 @@ pub(crate) struct NewForm {
     confirmed: bool,
     changed: Vec<String>,
     note: Option<String>,
+    /// Proposed by the overlord (`propose_session`): its background for
+    /// the session (`context`, `related`), carried through to the launch
+    /// and shown read-only; the launch says the overlord proposed it.
+    proposed: bool,
+    context: String,
+    related: Vec<String>,
     picker: Option<(PickerKind, Vec<String>, ListState)>,
     finder: Option<Finder>,
     text_prompt: Option<(TextPrompt, String)>,
@@ -322,11 +328,41 @@ impl NewForm {
         if let Some(pr) = get("prompt") {
             self.prompt = pr;
         }
+        self.proposed = true;
+        self.context = get("context").unwrap_or_default();
+        self.related = p["related"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         self.focus = self
             .fields()
             .iter()
             .position(|f| *f == Field::Launch)
             .unwrap_or(0);
+    }
+
+    /// One read-only line previewing the overlord's background for the
+    /// session (None: it gave none).
+    pub(crate) fn background_preview(&self, width: usize) -> Option<String> {
+        if self.context.trim().is_empty() && self.related.is_empty() {
+            return None;
+        }
+        let mut s = String::from("overlord's notes: ");
+        let first = self.context.lines().find(|l| !l.trim().is_empty());
+        s.push_str(first.map(str::trim).unwrap_or("(none)"));
+        if !self.related.is_empty() {
+            s.push_str(&format!(" · related: {}", self.related.join(", ")));
+        }
+        if s.chars().count() > width {
+            s = s.chars().take(width.saturating_sub(1)).collect();
+            s.push('…');
+        }
+        Some(s)
     }
 
     /// The overlord's correction of an overlord-form request: the user's
@@ -676,6 +712,9 @@ impl App {
             confirmed: false,
             changed: Vec::new(),
             note: None,
+            proposed: false,
+            context: String::new(),
+            related: Vec::new(),
             picker: None,
             finder: None,
             text_prompt: None,
@@ -1185,6 +1224,10 @@ impl App {
         let mut params = json!({
             "name": if f.name.trim().is_empty() { None } else { Some(f.name.trim()) },
             "prompt": if f.prompt.trim().is_empty() { None } else { Some(f.prompt.trim()) },
+            // The overlord's background, when it proposed this session.
+            "context": if f.context.trim().is_empty() { None } else { Some(f.context.trim()) },
+            "related": f.related,
+            "by_overlord": f.proposed,
             "agent": f.agent,
             "model": f.model,
             "workspace": f.workspace,
@@ -1430,6 +1473,9 @@ impl App {
             if *field == Field::Prompt {
                 lines.push(Line::raw(""));
             }
+        }
+        if let Some(p) = form.background_preview(inner.width as usize) {
+            lines.push(Line::from(Span::styled(p, theme::faint())));
         }
         lines.extend(form.agent_blocker_lines(""));
         if let Some(e) = &form.error {
@@ -1896,6 +1942,34 @@ mod tests {
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
         assert_eq!(f.resolved, ["repo"]);
         assert_eq!(f.model, "", "reset to the agent default");
+    }
+
+    #[test]
+    fn a_proposed_session_shows_the_overlords_notes_read_only() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.open_new_form(FormKind::Manual);
+        let mut f = match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        };
+        assert_eq!(f.background_preview(80), None);
+        f.prefill(&json!({
+            "repo": "/r/web", "prompt": "fix the footer",
+            "context": "\nThe footer is in web/footer.tsx.\nSecond line.",
+            "related": ["auth-fix"],
+        }));
+        assert!(f.proposed);
+        let out = render(&app, &f);
+        assert!(
+            out.contains("overlord's notes: The footer is in web/footer.tsx. · related: auth-fix"),
+            "{out}"
+        );
+        assert!(!out.contains("Second line."));
+        let p = f.background_preview(20).unwrap();
+        assert_eq!(p.chars().count(), 20);
+        assert!(p.ends_with('…'));
     }
 
     #[test]

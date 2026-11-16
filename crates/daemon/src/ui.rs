@@ -437,7 +437,7 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
 pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     let mut prefill = Map::new();
     for k in [
-        "repo", "project", "name", "branch", "agent", "model", "prompt",
+        "repo", "project", "name", "branch", "agent", "model", "prompt", "context",
     ] {
         if let Some(v) = params
             .get(k)
@@ -463,6 +463,21 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     }
     if let Some(w) = params.get("workspace").and_then(Value::as_bool) {
         prefill.insert("workspace".into(), json!(w));
+    }
+    // The overlord's background and related sessions, checked now (not
+    // when the user launches): the form shows them, read-only.
+    let related = crate::methods::str_list(params, "related");
+    {
+        let db = d.db();
+        crate::context::check(
+            &db,
+            prefill.get("context").and_then(Value::as_str),
+            &related,
+            None,
+        )?;
+    }
+    if !related.is_empty() {
+        prefill.insert("related".into(), json!(related));
     }
     d.ui_cmd(json!({"cmd": "new_session", "prefill": prefill}));
     show_list(d)?;
