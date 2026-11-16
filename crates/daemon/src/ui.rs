@@ -479,6 +479,11 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     if !related.is_empty() {
         prefill.insert("related".into(), json!(related));
     }
+    // What the TUI shows of the overlord's text: no control characters.
+    if let Some(c) = prefill.get("context").and_then(Value::as_str) {
+        let c = crate::context::clean(c);
+        prefill.insert("context".into(), json!(c));
+    }
     d.ui_cmd(json!({"cmd": "new_session", "prefill": prefill}));
     show_list(d)?;
     Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))

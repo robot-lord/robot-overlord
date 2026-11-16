@@ -610,6 +610,17 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "update_session" => {
             let r = session_ref(args)?;
             let id = d.rpc("session.get", json!({"ref": r}))?["id"].clone();
+            // Background is checked before anything is written, so a
+            // refused one leaves the session as it was.
+            let related = crate::methods::ref_list(args, "add_related");
+            if arg_str(args, "add_context").is_some() || !related.is_empty() {
+                crate::context::check(
+                    &d.db(),
+                    arg_str(args, "add_context"),
+                    &related,
+                    id.as_str(),
+                )?;
+            }
             if let Some(n) = arg_str(args, "name") {
                 d.rpc("session.rename", json!({"ref": id, "name": n}))?;
             }
@@ -619,7 +630,6 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             if let Some(v) = args.get("notes").and_then(Value::as_str) {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
             }
-            let related = crate::methods::ref_list(args, "add_related");
             let mut delivery = None;
             if arg_str(args, "add_context").is_some() || !related.is_empty() {
                 let r = d.rpc(

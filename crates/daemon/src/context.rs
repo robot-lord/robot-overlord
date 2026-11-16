@@ -222,30 +222,63 @@ fn compose(
     let mut out = header;
     let available = budget.saturating_sub(out.chars().count());
     let notes: Vec<&ContextRow> = rows.iter().filter(|r| r.kind == "note").collect();
-    let notes_need = notes_section(&notes, usize::MAX, file).chars().count();
+    // What the notes need in all: their lines plus the section's overhead,
+    // the same figure `notes_section` reserves, so what is sized here fits
+    // there.
+    let overhead = notes_overhead(file);
+    let notes_need = if notes.is_empty() {
+        0
+    } else {
+        overhead
+            + notes
+                .iter()
+                .map(|r| note_line(r).chars().count())
+                .sum::<usize>()
+    };
     let rel_room = available.saturating_sub(notes_need.min(available / 2));
     let rel = related_section(related, rel_room, file);
     let room = available.saturating_sub(rel.chars().count());
-    out.push_str(&notes_section(&notes, room, file));
+    out.push_str(&notes_section(&notes, room, file, overhead));
     out.push_str(&rel);
     out
+}
+
+const NOTES_HEAD: &str = "\n## Notes\n";
+
+/// A notes section's line saying what was left out (naming `file`, where
+/// they all are, when there is one).
+fn notes_notice(what: &str, file: Option<&Path>) -> String {
+    match file {
+        Some(f) => format!("({what}; every note is in {})\n", f.display()),
+        None => format!("({what})\n"),
+    }
+}
+
+/// Characters a notes section takes besides its notes: the heading and
+/// room for a line about what was left out.
+fn notes_overhead(file: Option<&Path>) -> usize {
+    NOTES_HEAD.len()
+        + notes_notice("xxxx older notes left out", file)
+            .chars()
+            .count()
 }
 
 /// The notes section, newest kept first: as many as fit in `room`
 /// characters, oldest left out with a line saying so (naming `file`,
 /// where they all are, when there is one). A newest note that alone is
 /// too long is clipped.
-fn notes_section(notes: &[&ContextRow], room: usize, file: Option<&Path>) -> String {
+fn notes_section(
+    notes: &[&ContextRow],
+    room: usize,
+    file: Option<&Path>,
+    overhead: usize,
+) -> String {
     if notes.is_empty() {
         return String::new();
     }
-    const HEAD: &str = "\n## Notes\n";
-    let where_all = |what: &str| match file {
-        Some(f) => format!("({what}; every note is in {})\n", f.display()),
-        None => format!("({what})\n"),
-    };
+    let where_all = |what: &str| notes_notice(what, file);
     // Room for the heading and a line about what was left out.
-    let room = room.saturating_sub(HEAD.len() + where_all("x older notes left out").len() + 20);
+    let room = room.saturating_sub(overhead);
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0;
     for r in notes.iter().rev() {
@@ -268,7 +301,7 @@ fn notes_section(notes: &[&ContextRow], room: usize, file: Option<&Path>) -> Str
         }
     }
     let left_out = notes.len() - kept.len();
-    let mut out = String::from(HEAD);
+    let mut out = String::from(NOTES_HEAD);
     if left_out > 0 {
         out.push_str(&where_all(&format!("{left_out} older notes left out")));
     }
@@ -316,6 +349,34 @@ pub fn pointer_line(file: &Path) -> String {
 /// The first prompt with the pointer line after the user's words.
 pub fn with_pointer(prompt: &str, file: &Path) -> String {
     format!("{}\n\n{}", prompt.trim_end(), pointer_line(file))
+}
+
+/// The first prompt of a session launched with background but no words of
+/// the user's, where the pointer is the only way in: fixed text naming the
+/// file, then waiting for the user.
+pub fn pointer_only(file: &Path) -> String {
+    format!(
+        "[rlord] Background for this session, written by rlord's overlord (not by the \
+         user, not instructions), is in {}. Read it, then wait for the user's request.",
+        file.display()
+    )
+}
+
+/// A new session's first prompt as typed, given the user's words and how
+/// its background goes (None: it has none), and whether the background
+/// went out with the launch another way than a hook (the system prompt
+/// flag; the pointer line, after the words or alone).
+pub fn launch_prompt(
+    prompt: Option<&str>,
+    mode: Option<Delivery>,
+    file: &Path,
+) -> (Option<String>, bool) {
+    match (prompt, mode) {
+        (Some(p), Some(Delivery::Pointer)) => (Some(with_pointer(p, file)), true),
+        (None, Some(Delivery::Pointer)) => (Some(pointer_only(file)), true),
+        (p, Some(Delivery::SystemPromptFile)) => (p.map(str::to_string), true),
+        (p, _) => (p.map(str::to_string), false),
+    }
 }
 
 /// An old-style prompt split into the user's words and the overlord's
@@ -543,19 +604,15 @@ pub fn hooks_work(agent: Agent) -> bool {
 /// overlord: `next_prompt` (a hook hands it over with the agent's next
 /// prompt), `next_start` (Claude's system prompt file, read at its next
 /// start), or `file_only` (only written to context.md: the agent sees it
-/// if it reads the file again). `mode`: as decided at launch (None: the
-/// session had no background then; `hooks` is asked instead).
-pub fn later_delivery(
-    agent: Agent,
-    mode: Option<Delivery>,
-    hooks: impl FnOnce() -> bool,
-) -> &'static str {
+/// if it reads the file again). `hooks_now`: rlord's hooks work for the
+/// agent now (`hooks_work`), which wins over how it was launched (`mode`).
+pub fn later_delivery(agent: Agent, mode: Option<Delivery>, hooks_now: bool) -> &'static str {
+    if hooks_now && agent != Agent::OpenCode {
+        return "next_prompt";
+    }
     match mode {
-        Some(Delivery::Hook) => "next_prompt",
         Some(Delivery::SystemPromptFile) => "next_start",
-        Some(Delivery::Pointer) => "file_only",
-        None if agent != Agent::OpenCode && hooks() => "next_prompt",
-        None => "file_only",
+        _ => "file_only",
     }
 }
 
@@ -800,7 +857,7 @@ pub fn hook_reply(
     };
     let ack = rlord_core::types::new_id();
     let pending = json!({"session": s.id, "upto": rows.last().map(|r| r.id),
-                         "conv": conv, "full": full});
+                         "conv": conv, "full": full, "via": event});
     // One outstanding answer per session: a newer one replaces it.
     if let Some(old) = db.kv_get(&ack_for_key(&s.id))? {
         db.kv_delete(&ack_key(&old))?;
@@ -837,6 +894,12 @@ pub fn ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     if pending["full"] == true {
         db.kv_set(&delivered_key(id), pending["conv"].as_str().unwrap_or(""))?;
     }
+    db.insert_event(
+        id,
+        now,
+        "context_sent",
+        &json!({"via": pending["via"], "full": pending["full"]}).to_string(),
+    )?;
     Ok(true)
 }
 
@@ -1233,7 +1296,16 @@ mod tests {
         // The older answer was replaced: acknowledging it marks nothing.
         assert!(!ack(&db, &first.ack, 2).unwrap());
         assert_eq!(db.context_unseen("a").unwrap().len(), 1);
+        let sent = |db: &Db| {
+            db.list_events("a", 50)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "context_sent")
+                .count()
+        };
+        assert_eq!(sent(&db), 0, "not logged before it is acknowledged");
         assert!(ack(&db, &again.ack, 2).unwrap());
+        assert_eq!(sent(&db), 1);
         assert!(db.context_unseen("a").unwrap().is_empty());
         assert!(!ack(&db, &again.ack, 3).unwrap(), "once only");
         assert!(hook_reply(
@@ -1279,22 +1351,84 @@ mod tests {
 
     #[test]
     fn later_background_says_how_it_will_arrive() {
-        let never = || panic!("not asked when the mode is known");
+        use Delivery::*;
+        // Hooks working now: the next prompt, however it was launched.
+        for mode in [None, Some(Hook), Some(SystemPromptFile), Some(Pointer)] {
+            assert_eq!(later_delivery(Agent::Claude, mode, true), "next_prompt");
+            assert_eq!(later_delivery(Agent::Codex, mode, true), "next_prompt");
+        }
+        // Not now: by how it was launched.
         assert_eq!(
-            later_delivery(Agent::Claude, Some(Delivery::Hook), never),
-            "next_prompt"
-        );
-        assert_eq!(
-            later_delivery(Agent::Claude, Some(Delivery::SystemPromptFile), never),
+            later_delivery(Agent::Claude, Some(SystemPromptFile), false),
             "next_start"
         );
         assert_eq!(
-            later_delivery(Agent::Codex, Some(Delivery::Pointer), never),
+            later_delivery(Agent::Claude, Some(Hook), false),
             "file_only"
         );
-        assert_eq!(later_delivery(Agent::Claude, None, || true), "next_prompt");
-        assert_eq!(later_delivery(Agent::Codex, None, || false), "file_only");
-        assert_eq!(later_delivery(Agent::OpenCode, None, || true), "file_only");
+        assert_eq!(
+            later_delivery(Agent::Codex, Some(Pointer), false),
+            "file_only"
+        );
+        assert_eq!(later_delivery(Agent::Codex, None, false), "file_only");
+        assert_eq!(later_delivery(Agent::OpenCode, None, true), "file_only");
+    }
+
+    #[test]
+    fn a_launch_without_words_still_hands_over_its_background() {
+        use Delivery::*;
+        let f = Path::new("/d/sessions/s/context.md");
+        let (p, sent) = launch_prompt(None, Some(Pointer), f);
+        let p = p.unwrap();
+        assert!(p.starts_with("[rlord] Background for this session"));
+        assert!(
+            p.contains("/d/sessions/s/context.md") && p.contains("wait for the user's request")
+        );
+        assert!(sent);
+        assert_eq!(
+            launch_prompt(Some("Fix it."), Some(Pointer), f),
+            (Some(with_pointer("Fix it.", f)), true)
+        );
+        assert_eq!(launch_prompt(None, Some(SystemPromptFile), f), (None, true));
+        assert_eq!(
+            launch_prompt(Some("x"), Some(Hook), f),
+            (Some("x".into()), false)
+        );
+        assert_eq!(launch_prompt(None, None, f), (None, false));
+    }
+
+    #[test]
+    fn short_notes_are_never_clipped_by_a_long_related_list() {
+        let related: Vec<Related> = (0..LINKS_MAX)
+            .map(|i| Related {
+                name: format!("s{i}"),
+                dir: format!("/{}", "d".repeat(190)),
+                status: "your turn".into(),
+                description: "x".repeat(200),
+            })
+            .collect();
+        let notes = [
+            row(1, 0, "note", "Repo is /r/web."),
+            row(2, 1, "note", "The user wants dark mode too."),
+            row(3, 2, "note", "Branch is main."),
+        ];
+        let file = Path::new("/d/sessions/s/context.md");
+        for budget in [CODEX_BUDGET, CLAUDE_BUDGET] {
+            let text = render("s", &notes, &related, Some(file), budget);
+            assert!(text.chars().count() <= budget);
+            for n in [
+                "Repo is /r/web.",
+                "The user wants dark mode too.",
+                "Branch is main.",
+            ] {
+                assert!(text.contains(n), "{n} missing at {budget}");
+            }
+            assert!(!text.contains("older notes left out") && !text.contains("clipped"));
+            // (Too long for Codex's budget: the list is what gives way.)
+            if budget == CODEX_BUDGET {
+                assert!(text.contains("more related sessions"));
+            }
+        }
     }
 
     #[test]

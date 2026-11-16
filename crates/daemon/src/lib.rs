@@ -464,6 +464,27 @@ impl Daemon {
                 params["interrupt"] = codex_daemon::interrupt(&s).to_json();
             }
         }
+        // Whether rlord's hooks work for the agent (it reads the agent's
+        // settings files): asked here, never under the DB lock.
+        if matches!(method, "session.new" | "session.context_add") {
+            let agent = match method {
+                "session.new" => params["agent"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| Some(self.config().session.agent.clone())),
+                _ => self
+                    .db()
+                    .resolve_ref(params["ref"].as_str().unwrap_or(""))
+                    .ok()
+                    .map(|s| s.agent),
+            };
+            let works = agent
+                .and_then(|a| rlord_core::agents::Agent::parse(&a))
+                .is_some_and(context::hooks_work);
+            params["hooks_work"] = json!(works);
+        }
         // `status:limited`: not a stored status (`limits.rs`), so it is
         // taken out of the query and matched on the annotated rows; any
         // other statuses asked for alongside it still count (either one).
@@ -997,18 +1018,6 @@ pub enum HookSent {
     Slow,
 }
 
-/// Send one hook event, never waiting long: a hook runs inside the agent's
-/// tool call, and a stalled daemon must not hold that up. A second to
-/// connect, a second to send, two for the answer.
-///
-/// Only a timeout while waiting for the answer is `Slow`. Anything else
-/// short of an answer (no socket, refused, not connected in time, a send
-/// that didn't complete, the connection closed or reset) is `Unreachable`:
-/// the daemon did not take a whole event and answer, so it is kept.
-pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
-    send_hook_event_for_reply(socket_path, params).0
-}
-
 /// What the daemon answered a hook with, for the agent: the hook's output
 /// (e.g. the session's background at SessionStart), and the id to
 /// acknowledge it with once printed (`send_hook_ack`).
@@ -1018,7 +1027,16 @@ pub struct HookReply {
     pub ack: Option<String>,
 }
 
-/// `send_hook_event`, and what the daemon answers the hook with, if
+/// Send one hook event, never waiting long: a hook runs inside the agent's
+/// tool call, and a stalled daemon must not hold that up. A second to
+/// connect, a second to send, two for the answer.
+///
+/// Only a timeout while waiting for the answer is `Slow`. Anything else
+/// short of an answer (no socket, refused, not connected in time, a send
+/// that didn't complete, the connection closed or reset) is `Unreachable`:
+/// the daemon did not take a whole event and answer, so it is kept.
+///
+/// Also what the daemon answered the hook with, for the agent, if
 /// anything. Only a `Delivered` event has one.
 pub fn send_hook_event_for_reply(
     socket_path: &Path,
@@ -1233,6 +1251,39 @@ mod tests {
             .rpc("session.list", json!({"status": ["limited"]}))
             .unwrap();
         assert_eq!(rows, json!([]));
+    }
+
+    /// `update_session` checks the background it adds before writing
+    /// anything: a refused one leaves the rest of the session as it was.
+    #[test]
+    fn a_refused_background_changes_nothing_else() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        d.db()
+            .insert_session(&rlord_core::db::NewSession {
+                id: "s1",
+                name: "a",
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp/p",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1000,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        let long = "x".repeat(context::NOTE_MAX + 1);
+        for bad in [
+            json!({"session": "a", "name": "renamed", "description": "d", "add_context": long}),
+            json!({"session": "a", "name": "renamed", "add_related": ["nope"]}),
+        ] {
+            assert!(mcp::call(&d, "update_session", &bad).is_err());
+            let s = d.db().resolve_ref("s1").unwrap();
+            assert_eq!((s.name.as_str(), s.description.as_str()), ("a", ""));
+            assert!(d.db().context_rows("s1").unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -1773,8 +1824,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No daemon: unreachable (so the event is spooled).
         assert_eq!(
-            send_hook_event(&dir.path().join("absent.sock"), &json!({})),
-            HookSent::Unreachable
+            send_hook_event_for_reply(&dir.path().join("absent.sock"), &json!({})),
+            (HookSent::Unreachable, None)
         );
         // A daemon that takes the event and never answers: the hook gives
         // up after its read timeout, and doesn't spool a second copy.
@@ -1787,8 +1838,8 @@ mod tests {
         });
         let start = std::time::Instant::now();
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Slow
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Slow, None)
         );
         assert!(start.elapsed() < std::time::Duration::from_millis(3400));
         hold.join().unwrap();
@@ -1798,8 +1849,8 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let close = std::thread::spawn(move || drop(listener.accept()));
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Unreachable
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Unreachable, None)
         );
         close.join().unwrap();
         // And one that answers.
@@ -1813,8 +1864,8 @@ mod tests {
             c.write_all(b"{\"id\":1,\"result\":{}}\n").unwrap();
         });
         assert_eq!(
-            send_hook_event(&sock, &json!({"event": "Stop"})),
-            HookSent::Delivered
+            send_hook_event_for_reply(&sock, &json!({"event": "Stop"})),
+            (HookSent::Delivered, None)
         );
         answer.join().unwrap();
         // One that answers with something for the agent: handed back.

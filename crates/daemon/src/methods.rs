@@ -268,16 +268,17 @@ pub fn session_notes(db: &Db, params: &Value) -> Result<Value> {
 /// rewritten; the agent gets the new part with its next prompt (hooks) or
 /// reads the file.
 pub fn session_context_add(db: &Db, params: &Value) -> Result<Value> {
-    session_context_add_in(db, params, &paths::data_dir(), &context::hooks_work)
+    session_context_add_in(db, params, &paths::data_dir())
 }
 
-/// `session_context_add`, with the session files under `base`, and
-/// whether rlord's hooks work for an agent (`context::hooks_work`).
+/// `session_context_add`, with the session files under `base`.
+/// `params.hooks_work`: whether rlord's hooks work for the session's agent
+/// now (`context::hooks_work`, asked by the daemon before taking the DB
+/// lock: it reads the agent's settings files).
 pub(crate) fn session_context_add_in(
     db: &Db,
     params: &Value,
     base: &std::path::Path,
-    hooks: &dyn Fn(Agent) -> bool,
 ) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     refuse_overlord(&s, "given background")?;
@@ -305,7 +306,7 @@ pub(crate) fn session_context_add_in(
     out["delivery"] = json!(context::later_delivery(
         agent,
         context::mode(db, &s.id)?,
-        || hooks(agent)
+        params["hooks_work"] == true
     ));
     Ok(out)
 }
@@ -672,13 +673,12 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // prompt file, or a fixed line after the user's words naming the file.
     let base = paths::data_dir();
     let bg_file = context::file_path(&base, &id);
-    let delivery = background.then(|| context::delivery(agent, context::hooks_work(agent)));
+    // (`hooks_work`: asked by the daemon before taking the DB lock.)
+    let delivery = background.then(|| context::delivery(agent, params["hooks_work"] == true));
     let mut args = spec_args(agent, &spec);
     args.extend(context::launch_args(delivery, &bg_file));
-    let first = match (&prompt, delivery) {
-        (Some(p), Some(context::Delivery::Pointer)) => Some(context::with_pointer(p, &bg_file)),
-        (p, _) => p.clone(),
-    };
+    // With no words of the user's, the pointer line alone is the prompt.
+    let (first, sent) = context::launch_prompt(prompt.as_deref(), delivery, &bg_file);
     let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
@@ -720,13 +720,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     if let Some(mode) = delivery {
         context::turn_on(db, &id)?;
         context::store(db, &id, &notes, &links, now)?;
-        // What went in at launch another way than a hook: the system
-        // prompt flag always, the pointer line only after a prompt.
-        let sent = match mode {
-            context::Delivery::Hook => false,
-            context::Delivery::SystemPromptFile => true,
-            context::Delivery::Pointer => prompt.is_some(),
-        };
+        // (`sent`: it went in with the launch, not by a hook.)
         context::set_mode(db, &id, mode, sent, now)?;
         // (Before the agent starts: it may read it at once.)
         context::refresh_file(db, &base, &db.resolve_ref(&id)?)?;
@@ -2134,12 +2128,11 @@ mod tests {
             .unwrap();
         }
         let t = tempfile::tempdir().unwrap();
-        let no_hooks = |_: Agent| false;
         let r = session_context_add_in(
             &db,
-            &json!({"ref": "web", "context": "The user wants dark mode too.", "related": ["auth"]}),
+            &json!({"ref": "web", "context": "The user wants dark mode too.", "related": ["auth"],
+                    "hooks_work": false}),
             t.path(),
-            &no_hooks,
         )
         .unwrap();
         // Said honestly: no hooks, no mode from launch: only the file.
@@ -2150,13 +2143,9 @@ mod tests {
         assert!(text.contains("dark mode") && text.contains("- auth (/tmp/w"));
         // Too long: refused, nothing stored.
         let long = "x".repeat(context::NOTE_MAX + 1);
-        assert!(session_context_add_in(
-            &db,
-            &json!({"ref": "web", "context": long}),
-            t.path(),
-            &no_hooks
-        )
-        .is_err());
+        assert!(
+            session_context_add_in(&db, &json!({"ref": "web", "context": long}), t.path()).is_err()
+        );
         assert_eq!(db.context_rows("01a").unwrap().len(), 2);
         let mut listed = r.clone();
         listed.as_object_mut().unwrap().remove("delivery");
@@ -2164,25 +2153,23 @@ mod tests {
             session_context(&db, &json!({"ref": "web"})).unwrap(),
             listed
         );
-        // With hooks: the next prompt. Launched with a mode: that decides.
-        let hooks = |_: Agent| true;
-        let add = |text: &str, hooks: &dyn Fn(Agent) -> bool| {
+        // Hooks working now: the next prompt, however it was launched.
+        // Not: by how it was launched.
+        let add = |text: &str, hooks: bool| {
             session_context_add_in(
                 &db,
-                &json!({"ref": "auth", "context": text}),
+                &json!({"ref": "auth", "context": text, "hooks_work": hooks}),
                 t.path(),
-                hooks,
             )
             .unwrap()["delivery"]
                 .clone()
         };
-        assert_eq!(add("a", &hooks), "next_prompt");
+        assert_eq!(add("a", true), "next_prompt");
         context::set_mode(&db, "01b", context::Delivery::SystemPromptFile, true, 1).unwrap();
-        assert_eq!(add("b", &hooks), "next_start");
+        assert_eq!(add("b", true), "next_prompt");
+        assert_eq!(add("c", false), "next_start");
         context::set_mode(&db, "01b", context::Delivery::Pointer, true, 1).unwrap();
-        assert_eq!(add("c", &hooks), "file_only");
-        context::set_mode(&db, "01b", context::Delivery::Hook, true, 1).unwrap();
-        assert_eq!(add("d", &no_hooks), "next_prompt");
+        assert_eq!(add("d", false), "file_only");
     }
 
     #[test]
@@ -2224,7 +2211,6 @@ mod tests {
                     &db,
                     &with("context", json!("x")),
                     std::path::Path::new("/nonexistent"),
-                    &|_| false,
                 ),
             ),
             ("tag", session_tag(&db, &with("add", json!(["wip"])))),

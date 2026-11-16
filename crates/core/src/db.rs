@@ -1267,16 +1267,8 @@ impl Db {
         Ok(true)
     }
 
-    /// Whether a session has any notes or links (without loading them).
-    pub fn context_exists(&self, session_id: &str) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1)",
-            params![session_id],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// `context_exists`, or kv `key` is set: in one query.
+    /// Whether a session has any notes or links, or kv `key` is set: in
+    /// one query, without loading them.
     pub fn context_exists_or(&self, session_id: &str, key: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1) \
@@ -1794,7 +1786,7 @@ mod tests {
             ["first", "b", "second"]
         );
         assert!(db.context_rows("b").unwrap().is_empty());
-        assert!(db.context_exists("a").unwrap() && !db.context_exists("b").unwrap());
+        assert!(db.context_exists_or("a", "none").unwrap());
         assert!(!db.context_exists_or("b", "flag:b").unwrap());
         db.kv_set("flag:b", "1").unwrap();
         assert!(db.context_exists_or("b", "flag:b").unwrap());

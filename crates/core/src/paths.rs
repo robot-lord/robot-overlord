@@ -35,15 +35,11 @@ pub fn db_path() -> PathBuf {
     data_dir().join("state.db")
 }
 
-/// User config folder: `$XDG_CONFIG_HOME/robot-overlord` or `~/.config/...`.
-pub fn config_dir() -> PathBuf {
+/// User config: `$XDG_CONFIG_HOME/robot-overlord/config.toml` or `~/.config/...`.
+pub fn config_path() -> PathBuf {
     env_dir("XDG_CONFIG_HOME")
         .or_else(|| env_dir("HOME").map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("robot-overlord")
-}
-
-/// User config: `<config_dir>/config.toml`.
-pub fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
+        .join("config.toml")
 }

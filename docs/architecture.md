@@ -1335,7 +1335,14 @@ kept in kv `context_mode:<id>`):
 | Claude, rlord's SessionStart and UserPromptSubmit hooks installed | the hook's answer (below) |
 | Claude without it | `--append-system-prompt-file <context.md>`, at every start (`context::launch_args`, for launch and restart) |
 | Codex, those hooks installed and trusted | the hook's answer |
-| Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`) |
+| Codex otherwise, OpenCode | one fixed line after the user's words naming the file (`context::pointer_line`); with no words, a fixed first prompt naming the file and asking it to read it and wait for the user (`context::pointer_only`) |
+
+Whether the hooks work (`context::hooks_work`: SessionStart and
+UserPromptSubmit installed, and for Codex trusted) reads the agent's
+settings files, so the daemon asks it before taking the DB lock and
+passes it to `session.new` and `session.context_add` as `hooks_work`.
+`--append-system-prompt-file` works in an interactive Claude session
+(checked live on Claude Code 2.1.325).
 
 The hook's answer: `hook.emit` returns `reply` (the hook's JSON output,
 `hookSpecificOutput.additionalContext`) and `reply_ack`, only for a live
@@ -1347,17 +1354,18 @@ start, resume, clear, compact) gets the whole background.
 updated" (so a note added later reaches the agent with its next prompt),
 or the whole background if none went to this conversation yet. No
 background: no answer, as before. A session launched with its background
-another way has its launch rows marked seen then, if they really went
-out (the system prompt flag; the pointer line, which needs a prompt to
-follow): a hook that fires anyway hands over only notes added later, at
+another way has its launch rows marked seen then, since they went out
+with the launch (the system prompt flag, the pointer line): a hook that
+fires anyway hands over only notes added later, at
 `UserPromptSubmit`. The answer is best effort: an error building it is
 logged, and the hook event is still processed.
 
 Background added later (`session.context_add`) answers with `delivery`,
 which `update_session` passes on as `background_delivery`:
-`next_prompt` (by hook), `next_start` (Claude's system prompt file), or
-`file_only` (only in `context.md`: OpenCode, the pointer line, no
-hooks). `overlord.md` has the overlord also use `send_to_session` when
+`next_prompt` (rlord's hooks work for its agent now, however it was
+launched), else `next_start` (launched with Claude's system prompt
+file) or `file_only` (only in `context.md`). `update_session` checks the
+background before writing anything else. `overlord.md` has the overlord also use `send_to_session` when
 the session must know now and it isn't `next_prompt`.
 
 A prompt is split by `split_legacy` only when the overlord launched the
@@ -1366,8 +1374,9 @@ CLI, are never split.
 
 Nothing counts as handed over until the hook client says it printed the
 answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
-(`send_hook_ack`, a second each way). Only then are its rows marked seen
-and, for a whole one, the conversation recorded (kv
+(`send_hook_ack`, a second each way). Only then are its rows marked seen,
+the `context_sent` event logged and, for a whole one, the conversation
+recorded (kv
 `context_delivered:<id>`; pending answers are kv `context_ack:<ack>`,
 one per session, a newer one replacing it). An answer never acknowledged
 (a slow daemon, a client that died) goes again with the next prompt: at

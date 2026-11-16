@@ -235,6 +235,43 @@ Fixed:
 Declined (coordinator): tightening existing installs at start (user's
 decision); moving `frame_message` to PR 4 (the plan puts it in PR 1).
 
+### Review round 3 (PR #64, rebased on main after #63 = 0.23.0-dev.27)
+
+Live check V2 (2026-11-16, Claude Code 2.1.325): scratch tmux socket
+`rlord-v2-scratch` (never `rlord` or the default server), interactive
+`claude --append-system-prompt-file <tmp file: "The secret word is
+PELICAN.">` with the prompt "What is the secret word? Reply with just
+the word." It started normally (not rejected) and answered `PELICAN`.
+Server killed after. So `--append-system-prompt-file` works
+interactively; Claude without hooks keeps `SystemPromptFile`.
+
+Fixed:
+
+1. `compose` and `notes_section` share one overhead figure
+   (`notes_overhead`, passed in): short notes are never clipped by a
+   long related list (test).
+2. V2 above.
+3. Pointer mode with no words: the first prompt is the pointer alone
+   (`context::pointer_only`: background in `<path>`, read it, wait for
+   the user). `context::launch_prompt` builds the first prompt and says
+   whether the background went out with it; rows are marked seen only
+   then (test).
+4. `update_session` runs `context::check` on `add_context` /
+   `add_related` before writing name, description or notes (test).
+5. The overlord's text is cleaned (`context::clean`) in the TUI preview
+   and in `ui::propose_session`'s prefill (test).
+6. `hooks_work` is computed by the daemon before the DB lock, for
+   `session.new` and `session.context_add` (param `hooks_work`).
+7. `context_sent` is logged in `context::ack`, when delivery is confirmed
+   (test).
+8. `later_delivery` takes the current hook state: hooks working now means
+   `next_prompt`, whatever the launch mode (test).
+9. Removed `Db::context_exists`, `paths::config_dir`, and the
+   `send_hook_event` wrapper (tests call `send_hook_event_for_reply`).
+   `frame_message` kept (plan: PR 1).
+
+Declined (coordinator): tightening existing installs (user's decision).
+
 ## Owed / deferred
 
 - `context::split_legacy` (old-style prompts with a `## Context from the

@@ -353,10 +353,13 @@ impl NewForm {
             return None;
         }
         let mut s = String::from("overlord's notes: ");
-        let first = self.context.lines().find(|l| !l.trim().is_empty());
+        // (Shown, so cleaned: no escape sequences reach the terminal.)
+        let context = rlord_daemon::context::clean(&self.context);
+        let first = context.lines().find(|l| !l.trim().is_empty());
         s.push_str(first.map(str::trim).unwrap_or("(none)"));
         if !self.related.is_empty() {
-            s.push_str(&format!(" · related: {}", self.related.join(", ")));
+            let related = rlord_daemon::context::clean(&self.related.join(", "));
+            s.push_str(&format!(" · related: {}", related.replace('\n', " ")));
         }
         if s.chars().count() > width {
             s = s.chars().take(width.saturating_sub(1)).collect();
@@ -1967,6 +1970,10 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("Second line."));
+        // Shown cleaned: no escape sequence reaches the terminal.
+        f.context = "\u{1b}]0;title\u{7}hi \u{1b}[31mred".into();
+        let p = f.background_preview(80).unwrap();
+        assert!(!p.contains('\u{1b}') && !p.contains('\u{7}'), "{p:?}");
         let p = f.background_preview(20).unwrap();
         assert_eq!(p.chars().count(), 20);
         assert!(p.ends_with('…'));
