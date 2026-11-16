@@ -134,9 +134,6 @@ pub enum Fork {
     /// The agent's server makes the fork first (the daemon calls it,
     /// outside the DB lock), then `Agent::open_fork` opens it.
     Server,
-    /// No native fork: a new conversation seeded from the parent's
-    /// history. Designed, not built: no agent returns it yet.
-    Seeded,
 }
 
 /// What a launch asked for that the agent's own command line can't carry,
@@ -290,19 +287,23 @@ impl Agent {
 
     /// Open a fork the agent's server already made (`Fork::Server`): the
     /// conversation `id` exists, with its parent's model unless `model`
-    /// asks for another (set once it is open: `Deferred`).
+    /// asks for another (set once it is open: `Deferred`). None for an
+    /// agent whose forks aren't made by a server.
     pub fn open_fork(
         self,
         id: &str,
         prompt: Option<&str>,
         model: Option<&str>,
         extra: &[String],
-    ) -> Launch {
-        Launch {
-            argv: opencode::open_argv(id, prompt, extra),
-            session_id: Some(id.to_string()),
-            transcript: Some(opencode::transcript_path(id)),
-            deferred: self.deferred(model),
+    ) -> Option<Launch> {
+        match self {
+            Agent::OpenCode => Some(Launch {
+                argv: opencode::open_argv(id, prompt, extra),
+                session_id: Some(id.to_string()),
+                transcript: Some(opencode::transcript_path(id)),
+                deferred: self.deferred(model),
+            }),
+            Agent::Claude | Agent::Codex => None,
         }
     }
 

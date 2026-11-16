@@ -631,7 +631,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             Ok(out)
         }
         "fork_session" => {
-            let mut params = json!({"ref": session_ref(args)?, "by_overlord": true});
+            let mut params = json!({"ref": session_ref(args)?});
             for k in [
                 "prompt",
                 "context",

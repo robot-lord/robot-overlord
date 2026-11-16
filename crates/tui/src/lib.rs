@@ -234,6 +234,9 @@ struct App {
     preview_rich: Option<Text<'static>>,
     /// Sub-agents of the selected session (refreshed with the preview).
     agents: Vec<Value>,
+    /// The names of the sessions forked from the selected one, archived
+    /// ones too (from `session.get`, when the selection changes).
+    forks: Vec<String>,
     status_line: String,
     dirty: bool,
     last_preview: Instant,
@@ -337,6 +340,7 @@ impl App {
             preview_text: String::new(),
             preview_rich: None,
             agents: Vec::new(),
+            forks: Vec::new(),
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
@@ -639,7 +643,8 @@ impl App {
         self.last_preview = Instant::now();
         self.preview_due = None;
         // Another session: its preview starts at the end again.
-        if self.preview_for != self.selected_id() {
+        let moved = self.preview_for != self.selected_id();
+        if moved {
             self.preview_scroll = 0;
             self.convs_stale = true;
         }
@@ -653,8 +658,21 @@ impl App {
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
+            self.forks.clear();
             return;
         };
+        // Its forks, whatever the list shows (filtered, live or archived):
+        // the daemon's answer, once per selection.
+        if moved {
+            self.forks = client_call(
+                &paths::socket_path(),
+                "session.get",
+                json!({"ref": s["id"].as_str().unwrap_or("")}),
+            )
+            .ok()
+            .map(|v| fork_names(&v))
+            .unwrap_or_default();
+        }
         // The overlord's conversations, while its row is selected: loaded
         // when it gets selected or something changed, not on every tick.
         if is_overlord_role(&s) {
@@ -2059,16 +2077,10 @@ impl App {
                 ),
             ]));
         }
-        let forks: Vec<&str> = self
-            .all
-            .iter()
-            .filter(|o| o["forked_from"].is_string() && o["forked_from"] == s["id"])
-            .filter_map(|o| o["name"].as_str())
-            .collect();
-        if !forks.is_empty() {
+        if !self.forks.is_empty() && self.preview_for == self.selected_id() {
             lines.push(Line::from(vec![
                 key("forks"),
-                Span::styled(forks.join(", "), theme::muted()),
+                Span::styled(self.forks.join(", "), theme::muted()),
             ]));
         }
         // On Codex's shared background server: the turn outlives the pane.
@@ -2601,6 +2613,16 @@ fn updated_at(s: &Value) -> Option<i64> {
 
 /// The details pane's usage line: all three, whatever the column shows
 /// (`12 turns · 1.2M tokens · 42% of 200k context`).
+/// The names in `session.get`'s `forks`.
+fn fork_names(v: &Value) -> Vec<String> {
+    v["forks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn usage_details(u: &Value) -> String {
     use rlord_core::usage::compact;
     let Some(u) = Usage::from_json(u) else {

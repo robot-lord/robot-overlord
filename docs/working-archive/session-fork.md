@@ -8,9 +8,9 @@ Forking shipped in 0.23.0-dev.29; how it works is in
 ## Owed
 
 - **Seeded fallback for agents with no native fork** (Gemini, any later
-  adapter). `Agent::fork` returns `Fork::Seeded` for it, and
-  `daemon::fork::launch` refuses that ("forking isn't supported for
-  <agent> yet"). Design: an ordinary new conversation (`agent.launch`)
+  adapter). Give `agents::Fork` a variant for it (a `Seeded` arm was
+  removed in review round 1 until an agent needs it), and have
+  `daemon::fork::launch` handle it. Design: an ordinary new conversation (`agent.launch`)
   with everything else a fork gets (lineage, copies, the fork note, the
   link to the parent), plus, by plain code, the parent's history: once
   session-context PR 2 lands, a note telling it to read its linked parent
@@ -38,8 +38,9 @@ Forking shipped in 0.23.0-dev.29; how it works is in
 
 ## Accepted edge cases
 
-- A fork whose start fails after the outside work (OpenCode's fork call,
-  `git worktree add`) leaves that OpenCode session or worktree behind.
+- An OpenCode fork whose start fails after the fork call leaves that
+  OpenCode session behind (a worktree fork's worktree and branch are
+  removed).
 - An unhooked Codex user fork of a session started while that session's
   archive summary runs: the summary's `--ephemeral` thread isn't in the
   index, so it can't be picked.
@@ -62,6 +63,18 @@ server killed after.
   --no-daemon` showed "Thread forked from …" with the history; no
   `SessionStart` until its first prompt; bound from the thread index by
   `bind_fork` within a second, confirmed by its hook at the first prompt.
+- F2b (review round 1, Claude Code 2.1.326, print mode in a temp repo,
+  which skips the folder-trust question): a parent in `repo/sub`, forked
+  from `repo/.worktrees/fk/sub`, quoted the parent's message; the fork's
+  transcript went under the subfolder of the new worktree.
+- F6 (review round 1, codex-cli 0.169.0, temp repo, scratch tmux socket,
+  that folder trusted for the run only with `-c projects=…`): `codex fork`
+  from a new worktree first asked "Working directory · fork", the
+  parent's folder highlighted. Picking the current folder, and on a
+  second run `-c tui.resume_cwd="current"` with no question, indexed the
+  thread with the worktree as `cwd` (`source = cli`, rollout
+  `forked_from_id` = the parent). So Codex worktree forks pass that
+  override.
 - F4 (OpenCode 2.2.7, its own server on another port): the fork call
   answered `{data: {id}}`; the row had `fork_session_id` = parent,
   `parent_id` NULL, not archived, the parent's messages copied; `opencode

@@ -128,12 +128,29 @@ pub fn head_commit(dir: &str) -> Result<String> {
     git(&["-C", dir, "rev-parse", "--verify", "HEAD"])
 }
 
-/// Whether the checkout at `dir` has changes not committed (tracked files
-/// only; None when git can't say).
+/// Whether the checkout at `dir` has anything not committed: changed
+/// files, and untracked ones not ignored (a new worktree has neither).
+/// None when git can't say.
 pub fn has_changes(dir: &str) -> Option<bool> {
-    git(&["-C", dir, "status", "--porcelain", "--untracked-files=no"])
-        .ok()
-        .map(|out| !out.is_empty())
+    git(&[
+        "-C",
+        dir,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    ])
+    .ok()
+    .map(|out| !out.is_empty())
+}
+
+/// Undo `worktree_add_from`: remove the worktree at `dir` (with whatever is
+/// in it) and its branch `branch`. For a worktree rlord just made and
+/// nothing ran in yet.
+pub fn worktree_discard(repo: &str, branch: &str, dir: &Path) -> Result<()> {
+    let dir_s = dir.to_string_lossy();
+    git(&["-C", repo, "worktree", "remove", "--force", &dir_s])?;
+    git(&["-C", repo, "branch", "-D", branch])?;
+    Ok(())
 }
 
 /// Whether `repo` has a local branch named `branch`.
@@ -457,6 +474,12 @@ mod tests {
             has_changes(&dir.path().join("none").to_string_lossy()),
             None
         );
+        // A file not added yet counts too (it doesn't come along either).
+        std::fs::write(wt.join("new.txt"), "x").unwrap();
+        assert_eq!(has_changes(w), Some(true));
+        // Undone: the worktree and its branch are gone.
+        worktree_discard(r, "x-fork", &wt).unwrap();
+        assert!(!wt.exists() && !branch_exists(r, "x-fork"));
     }
 
     #[test]

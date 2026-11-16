@@ -278,7 +278,13 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
     let w = bind_inputs(&d.db(), s)?;
     // (Codex's index and the rollouts are read without the DB lock.)
     let candidates = untracked_threads(s, w.since, &w.tracked);
-    let Some(t) = pick_thread(&candidates, w.prompt.as_deref(), others, w.fork.as_deref()) else {
+    let Some(t) = pick_thread(
+        &candidates,
+        w.prompt.as_deref(),
+        others,
+        w.fork.as_deref(),
+        &rollout_fork,
+    ) else {
         return Ok(false);
     };
     record_bind(&d.db(), s, t)
@@ -290,7 +296,13 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
 pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
     let w = bind_inputs(db, s)?;
     let candidates = untracked_threads(s, w.since, &w.tracked);
-    match pick_thread(&candidates, w.prompt.as_deref(), false, w.fork.as_deref()) {
+    match pick_thread(
+        &candidates,
+        w.prompt.as_deref(),
+        false,
+        w.fork.as_deref(),
+        &rollout_fork,
+    ) {
         Some(t) => record_bind(db, s, t),
         None => Ok(false),
     }
@@ -327,26 +339,21 @@ fn bind_inputs(db: &Db, s: &Session) -> Result<Wanted> {
     })
 }
 
-/// A thread that may be a session's, and the thread its rollout says it
-/// was forked from.
-struct Candidate {
-    thread: codex::Thread,
-    forked_from: Option<String>,
-}
-
 fn untracked_threads(
     s: &Session,
     since: i64,
     tracked: &std::collections::HashSet<String>,
-) -> Vec<Candidate> {
+) -> Vec<codex::Thread> {
     codex::threads_started_in(&codex::home(), &s.project_path, since, s.codex_daemon)
         .into_iter()
         .filter(|t| !tracked.contains(&t.id))
-        .map(|thread| Candidate {
-            forked_from: codex::rollout_forked_from(std::path::Path::new(&thread.rollout_path)),
-            thread,
-        })
         .collect()
+}
+
+/// The thread a rollout says it was forked from (`pick_thread` asks only
+/// about the threads it is still considering).
+fn rollout_fork(t: &codex::Thread) -> Option<String> {
+    codex::rollout_forked_from(std::path::Path::new(&t.rollout_path))
 }
 
 fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
@@ -377,9 +384,9 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 /// - a user fork (`fork`: the thread it was forked from): the thread whose
 ///   rollout says it was forked from that one. Its first message is its
 ///   parent's, so the prompt can't tell it.
-/// - otherwise forked threads are never candidates (a user fork of
-///   another session in the same folder, or an archive summary's `codex
-///   exec fork`), and:
+/// - otherwise, of the threads that fit by the rules below, forked ones
+///   are never taken (a user fork of another session in the same folder,
+///   or an archive summary's `codex exec fork`):
 /// - launched with a prompt: the thread whose first message is that
 ///   prompt. One that has no first message yet may still become it: wait.
 /// - no prompt (a fresh conversation, or launched without one): the only
@@ -387,27 +394,26 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 /// - an older Codex whose index keeps no first message: as with no
 ///   prompt (the only candidate, nobody else waiting).
 /// - two that fit equally: neither (the hooks will say).
+///
+/// `forked_from` reads a thread's rollout: asked only of the threads still
+/// in the running.
 fn pick_thread<'a>(
-    candidates: &'a [Candidate],
+    candidates: &'a [codex::Thread],
     prompt: Option<&str>,
     others_waiting: bool,
     fork: Option<&str>,
+    forked_from: &dyn Fn(&codex::Thread) -> Option<String>,
 ) -> Option<&'a codex::Thread> {
+    let one = |fit: Vec<&'a codex::Thread>| match fit.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    };
     if let Some(parent) = fork {
-        let fit: Vec<&Candidate> = candidates
+        return one(candidates
             .iter()
-            .filter(|c| c.forked_from.as_deref() == Some(parent))
-            .collect();
-        return match fit.as_slice() {
-            [one] => Some(&one.thread),
-            _ => None,
-        };
+            .filter(|t| forked_from(t).as_deref() == Some(parent))
+            .collect());
     }
-    let candidates: Vec<&codex::Thread> = candidates
-        .iter()
-        .filter(|c| c.forked_from.is_none())
-        .map(|c| &c.thread)
-        .collect();
     let same = |a: &str, b: &str| {
         let (a, b) = (a.trim(), b.trim());
         // (Codex may keep only the start of a long first message.)
@@ -417,16 +423,16 @@ fn pick_thread<'a>(
     let messages = candidates.iter().any(|t| t.first_user_message.is_some());
     let fit: Vec<&codex::Thread> = match prompt.filter(|_| messages) {
         Some(p) => candidates
-            .into_iter()
+            .iter()
             .filter(|t| same(t.first_user_message.as_deref().unwrap_or(""), p))
             .collect(),
         None if others_waiting => Vec::new(),
-        None => candidates,
+        None => candidates.iter().collect(),
     };
-    match fit.as_slice() {
-        [one] => Some(*one),
-        _ => None,
-    }
+    one(fit
+        .into_iter()
+        .filter(|t| forked_from(t).is_none())
+        .collect())
 }
 
 /// Read a session's status from its transcript (incrementally).
@@ -564,32 +570,29 @@ mod tests {
         }
     }
 
-    fn plain(threads: &[codex::Thread]) -> Vec<Candidate> {
-        threads
-            .iter()
-            .map(|t| Candidate {
-                thread: t.clone(),
-                forked_from: None,
-            })
-            .collect()
-    }
-
-    fn forked(id: &str, from: &str) -> Candidate {
-        Candidate {
-            // (A fork's first message is its parent's.)
-            thread: thread(id, "fix the login test"),
-            forked_from: Some(from.into()),
+    /// What the test's rollouts say: `f…` threads were forked from
+    /// `parent`, `g…` from `other`; and which rollouts were read.
+    fn rollouts(read: &std::cell::RefCell<Vec<String>>, t: &codex::Thread) -> Option<String> {
+        read.borrow_mut().push(t.id.clone());
+        match t.id.chars().next() {
+            Some('f') => Some("parent".into()),
+            Some('g') => Some("other".into()),
+            _ => None,
         }
     }
 
     #[test]
     fn a_fork_binds_only_the_thread_forked_from_its_parent() {
-        let pick = |c: &[Candidate], prompt: Option<&str>, others: bool, fork: Option<&str>| {
-            pick_thread(c, prompt, others, fork).map(|t| t.id.clone())
+        let read = std::cell::RefCell::new(Vec::new());
+        let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>| {
+            pick_thread(c, prompt, others, fork, &|t| rollouts(&read, t)).map(|t| t.id.clone())
         };
-        let mut c = plain(&[thread("own", "fix the login test")]);
-        c.push(forked("f1", "parent"));
-        c.push(forked("g1", "other"));
+        // (A fork's first message is its parent's.)
+        let mut c = vec![
+            thread("own", "fix the login test"),
+            thread("f1", "fix the login test"),
+            thread("g1", "fix the login test"),
+        ];
         // The fork: only its parent's fork, whatever its prompt, even
         // with a sibling waiting.
         assert_eq!(
@@ -598,7 +601,7 @@ mod tests {
         );
         assert_eq!(pick(&c, None, false, Some("parent")).as_deref(), Some("f1"));
         // Two forks of the same parent: neither (the hooks will say).
-        c.push(forked("f2", "parent"));
+        c.push(thread("f2", "fix the login test"));
         assert_eq!(pick(&c, None, false, Some("parent")), None);
         assert_eq!(pick(&c, None, false, Some("absent")), None);
         // An ordinary session never takes a forked thread, however its
@@ -607,18 +610,30 @@ mod tests {
             pick(&c, Some("fix the login test"), false, None).as_deref(),
             Some("own")
         );
-        let only_forks = [forked("f1", "parent")];
+        let only_forks = [thread("f1", "fix the login test")];
         assert_eq!(pick(&only_forks, None, false, None), None);
         assert_eq!(
             pick(&only_forks, Some("fix the login test"), false, None),
             None
         );
+        // An ordinary session reads the rollouts only of the threads its
+        // prompt fits.
+        let mixed = [thread("own", "fix it"), thread("x2", "speed it up")];
+        read.borrow_mut().clear();
+        assert_eq!(
+            pick(&mixed, Some("fix it"), false, None).as_deref(),
+            Some("own")
+        );
+        assert_eq!(*read.borrow(), ["own"]);
+        read.borrow_mut().clear();
+        assert_eq!(pick(&mixed, None, true, None), None);
+        assert!(read.borrow().is_empty(), "nobody fits: nothing read");
     }
 
     #[test]
     fn a_thread_is_bound_only_when_it_is_clearly_the_sessions() {
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool| {
-            pick_thread(&plain(c), prompt, others, None).map(|t| t.id.clone())
+            pick_thread(c, prompt, others, None, &|_| None).map(|t| t.id.clone())
         };
         let one = [thread("a", "fix the login test")];
         // Launched with that prompt: it's the one, even with a sibling waiting.

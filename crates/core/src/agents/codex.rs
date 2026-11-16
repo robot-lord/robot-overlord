@@ -116,21 +116,32 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
+/// What a fork run in another folder than its parent's last one works in
+/// (`tui.resume_cwd`, this run only): the folder it is started in. Without
+/// it Codex asks first ("Working directory · fork", the parent's folder
+/// highlighted), which would hold the pane, and with the parent's folder
+/// the thread is indexed there and never bound (codex-cli 0.169.0).
+pub const FORK_CWD: &str = "tui.resume_cwd=\"current\"";
+
 /// A user fork of thread `parent` (a new thread that starts from a copy of
 /// it; the parent is untouched): `codex fork <parent> --no-alt-screen
-/// [--model m] <extra…> [prompt]`. Codex assigns the new thread's id; its
-/// rollout names the parent (`rollout_forked_from`). (Not the archive
-/// summary's `codex exec fork`: `summary_argv`.)
+/// [--model m] -c tui.resume_cwd="current" <extra…> [prompt]`. Codex
+/// assigns the new thread's id; its rollout names the parent
+/// (`rollout_forked_from`), and its folder is the one it was started in
+/// (`FORK_CWD`). (Not the archive summary's `codex exec fork`:
+/// `summary_argv`.)
 pub fn fork_argv(
     parent: &str,
     first_prompt: Option<&str>,
     model: Option<&str>,
     extra: &[String],
 ) -> Vec<String> {
+    let mut own = vec!["-c".to_string(), FORK_CWD.to_string()];
+    own.extend(extra.iter().cloned());
     let mut argv = with_model(
         vec!["codex".to_string(), "fork".to_string(), parent.to_string()],
         model,
-        extra,
+        &own,
     );
     argv.extend(first_prompt.map(str::to_string));
     argv
@@ -1596,13 +1607,16 @@ mod fork_tests {
                 "--no-alt-screen",
                 "--model",
                 "gpt-x",
+                "-c",
+                "tui.resume_cwd=\"current\"",
                 "--no-daemon",
                 "try a queue"
             ]
         );
+        // Always in the folder it is started in, with no question first.
         assert_eq!(
             fork_argv("t-1", None, None, &[]),
-            ["codex", "fork", "t-1", "--no-alt-screen"]
+            ["codex", "fork", "t-1", "--no-alt-screen", "-c", FORK_CWD]
         );
         // Not the summary's `codex exec fork`.
         assert!(!fork_argv("t-1", None, None, &[]).contains(&"exec".to_string()));

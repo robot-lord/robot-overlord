@@ -49,8 +49,6 @@ pub(crate) struct Want {
     /// The parent's launch spec.
     pub spec: Value,
     pub prompt: Option<String>,
-    /// Asked for by name (else the default, `names::fork_name`).
-    pub named: bool,
     pub name: String,
     pub description: Option<String>,
     /// Another model than the parent's.
@@ -58,8 +56,25 @@ pub(crate) struct Want {
     /// The overlord's note and related sessions (checked).
     pub note: Option<String>,
     pub related: Vec<String>,
-    /// A new worktree: (repo, branch, folder).
-    pub worktree: Option<(String, String, std::path::PathBuf)>,
+    /// A new worktree was asked for (`workspace`), with this branch (else
+    /// one from the name).
+    pub wants_worktree: bool,
+    pub branch: Option<String>,
+    /// Where it goes: worked out outside the lock (`plan_worktree`).
+    pub worktree: Option<Worktree>,
+}
+
+/// A worktree fork's new worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Worktree {
+    pub repo: String,
+    pub branch: String,
+    /// The new worktree.
+    pub dir: std::path::PathBuf,
+    /// Where the fork works: the parent's subfolder of its checkout, in
+    /// the new worktree (the worktree itself when the parent works at its
+    /// top).
+    pub project: std::path::PathBuf,
 }
 
 /// What was done outside the lock.
@@ -77,15 +92,16 @@ pub(crate) struct Made {
 }
 
 /// `session.fork` params: `ref` (the parent), `prompt`, `name`,
-/// `description`, `model`, `context`, `related`, `by_overlord`,
-/// `workspace` (a new worktree) and `branch`.
+/// `description`, `model`, `context`, `related`, `workspace` (a new
+/// worktree) and `branch`.
 pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     let cfg = d.config();
-    let want = want(&d.db(), &cfg, params)?;
+    let mut want = want(&d.db(), params)?;
     // Not installed: say how to get it, rather than fail in the pane.
     if let Some(why) = install::missing(want.agent) {
         bail!("{why}");
     }
+    want.worktree = plan_worktree(&want, &cfg)?;
     let mut made = Made {
         hooks: context::hooks_work(want.agent),
         ..Default::default()
@@ -97,13 +113,68 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     if want.agent == Agent::OpenCode {
         made.opencode_id = Some(opencode_fork(&want.conversation)?);
     }
-    if let Some((repo, branch, dir)) = &want.worktree {
+    if let Some(w) = &want.worktree {
         made.uncommitted = git::has_changes(&want.parent.project_path) == Some(true);
         let start = git::head_commit(&want.parent.project_path)?;
-        git::ensure_excluded(repo, &cfg.session.workspace_dir)?;
-        git::worktree_add_from(repo, branch, dir, &start)?;
+        git::ensure_excluded(&w.repo, &cfg.session.workspace_dir)?;
+        git::worktree_add_from(&w.repo, &w.branch, &w.dir, &start)?;
+        // (A subfolder that isn't committed isn't in the new worktree.)
+        if !w.project.is_dir() {
+            discard(w);
+            bail!(
+                "{} isn't in the new worktree (it isn't committed): fork it in the same folder",
+                w.project.display()
+            );
+        }
     }
-    finish(&d.db(), &want, &made, &paths::data_dir())
+    let r = finish(&d.db(), &want, &made, &paths::data_dir());
+    if let (Err(_), Some(w)) = (&r, &want.worktree) {
+        discard(w);
+    }
+    r
+}
+
+/// Remove a worktree this fork made (and its branch), best effort: the
+/// fork didn't start.
+fn discard(w: &Worktree) {
+    if let Err(e) = git::worktree_discard(&w.repo, &w.branch, &w.dir) {
+        tracing::warn!(dir = %w.dir.display(), error = %e, "removing a fork's worktree");
+    }
+}
+
+/// Where a worktree fork goes, when one was asked for. Outside the lock:
+/// it asks git where the parent's checkout starts, so the fork works in
+/// the same subfolder of the new worktree.
+pub(crate) fn plan_worktree(want: &Want, cfg: &Config) -> Result<Option<Worktree>> {
+    if !want.wants_worktree {
+        return Ok(None);
+    }
+    let p = &want.parent;
+    let not_repo = || anyhow::anyhow!("{} isn't in a git repo: fork it in the same folder", p.name);
+    let repo = p.repo_path.clone().ok_or_else(not_repo)?;
+    let top = git::repo_root(&p.project_path).ok_or_else(not_repo)?;
+    let branch = want
+        .branch
+        .clone()
+        .unwrap_or_else(|| git::sanitize_branch(&want.name));
+    let dir = git::workspace_path(&repo, &cfg.session.workspace_dir, &branch);
+    let project = dir.join(sub_folder(&top, &p.project_path));
+    Ok(Some(Worktree {
+        repo,
+        branch,
+        dir,
+        project,
+    }))
+}
+
+/// `folder` relative to `top` (the checkout it is in); empty when it is
+/// `top` itself or not under it.
+fn sub_folder(top: &str, folder: &str) -> std::path::PathBuf {
+    let real = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| p.into());
+    real(folder)
+        .strip_prefix(real(top))
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 /// OpenCode's fork of `conversation`, by its server when one answers, else
@@ -126,7 +197,7 @@ fn opencode_fork(conversation: &str) -> Result<String> {
 
 /// Read the parent and check the fork can be made (what is refused:
 /// "Forking a session" in docs/architecture.md).
-pub(crate) fn want(db: &Db, cfg: &Config, params: &Value) -> Result<Want> {
+pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
     let p_opt = |k: &str| {
         params[k]
             .as_str()
@@ -175,12 +246,12 @@ pub(crate) fn want(db: &Db, cfg: &Config, params: &Value) -> Result<Want> {
         None,
     )?;
     related.retain(|r| *r != parent.id);
-    let named = p_opt("name");
-    let name = match &named {
-        Some(n) => n.clone(),
+    let name = match p_opt("name") {
+        Some(n) => n,
         None => default_name(db, &parent.name),
     };
-    let worktree = if params["workspace"] == true {
+    let wants_worktree = params["workspace"] == true;
+    if wants_worktree {
         if !agent.forks_elsewhere() {
             bail!(
                 "{} can't fork into a new worktree: its fork stays in its parent's folder. \
@@ -188,34 +259,27 @@ pub(crate) fn want(db: &Db, cfg: &Config, params: &Value) -> Result<Want> {
                 agent.label()
             );
         }
-        let repo = parent
-            .repo_path
-            .clone()
-            .filter(|_| git::repo_root(&parent.project_path).is_some())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} isn't in a git repo: fork it in the same folder",
-                    parent.name
-                )
-            })?;
-        let branch = p_opt("branch").unwrap_or_else(|| git::sanitize_branch(&name));
-        let dir = git::workspace_path(&repo, &cfg.session.workspace_dir, &branch);
-        Some((repo, branch, dir))
-    } else {
-        None
-    };
+        if parent.repo_path.is_none() {
+            bail!(
+                "{} isn't in a git repo: fork it in the same folder",
+                parent.name
+            );
+        }
+    }
     Ok(Want {
         agent,
         conversation,
         spec,
         prompt: p_opt("prompt"),
-        named: named.is_some(),
+
         name,
         description: p_opt("description"),
         model: p_opt("model"),
         note,
         related,
-        worktree,
+        wants_worktree,
+        branch: p_opt("branch"),
+        worktree: None,
         parent,
     })
 }
@@ -257,9 +321,10 @@ pub(crate) fn warnings(want: &Want, made: &Made) -> Vec<String> {
     out
 }
 
-/// The fork's background: the parent's rows to leave out (its oldest links
-/// past `LINKS_MAX`, never the link to the parent), and the rows to add
-/// after the copied ones (the fork's note and its link to the parent,
+/// The fork's background: the parent's rows to leave out (its own fork
+/// note, when it is a fork itself: the fork gets its own; and its oldest
+/// links past `LINKS_MAX`, never one named in `related`), and the rows to
+/// add after the copied ones (the fork's note and its link to the parent,
 /// then the overlord's note and related sessions).
 pub(crate) fn rows(
     want: &Want,
@@ -299,7 +364,18 @@ pub(crate) fn rows(
     });
     let new_links = add.iter().filter(|r| r.kind == "link").count();
     let over = (copied_links.len() + new_links).saturating_sub(context::LINKS_MAX);
-    let except = copied_links.iter().take(over).map(|r| r.id).collect();
+    let except = parent_rows
+        .iter()
+        .filter(|r| r.kind == "note" && r.source == "fork")
+        .chain(
+            copied_links
+                .iter()
+                .copied()
+                .filter(|r| !want.related.contains(&r.body))
+                .take(over),
+        )
+        .map(|r| r.id)
+        .collect();
     (except, add)
 }
 
@@ -344,34 +420,31 @@ pub(crate) fn launch(
                 .opencode_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("the fork wasn't made"))?;
-            Ok(want.agent.open_fork(id, first, want.model.as_deref(), args))
+            want.agent
+                .open_fork(id, first, want.model.as_deref(), args)
+                .ok_or_else(|| anyhow::anyhow!("{} has no server fork", want.agent.label()))
         }
-        Fork::Seeded => bail!("forking isn't supported for {} yet", want.agent.label()),
     }
 }
 
 /// Insert and start the fork, under the lock.
 pub(crate) fn finish(db: &Db, want: &Want, made: &Made, base: &std::path::Path) -> Result<Value> {
-    // Checked again: the parent may have gone, or the name been taken,
-    // while the lock was off.
+    // Checked again: the parent may have gone while the lock was off. (The
+    // name stays as chosen: a worktree's branch was named after it.)
     let parent = db.resolve_ref(&want.parent.id)?;
-    let name = if !want.named && db.name_taken(&want.name)? {
-        default_name(db, &parent.name)
-    } else {
-        want.name.clone()
-    };
+    let name = want.name.clone();
     let agent = want.agent;
     let id = rlord_core::types::new_id();
     let now = now_ms();
     let (project, folder, repo, workspace, branch) = match &want.worktree {
-        Some((repo, branch, dir)) => {
-            let dir = dir.to_string_lossy().into_owned();
+        Some(w) => {
+            let dir = w.dir.to_string_lossy().into_owned();
             (
-                dir.clone(),
-                ForkFolder::Worktree(dir.clone(), branch.clone()),
-                Some(repo.clone()),
+                w.project.to_string_lossy().into_owned(),
+                ForkFolder::Worktree(dir.clone(), w.branch.clone()),
+                Some(w.repo.clone()),
                 Some(dir),
-                Some(branch.clone()),
+                Some(w.branch.clone()),
             )
         }
         None => (
@@ -441,6 +514,9 @@ pub(crate) fn finish(db: &Db, want: &Want, made: &Made, base: &std::path::Path) 
     tracing::info!(session = %id, parent = %parent.id, name = %name, agent = agent.name(), "forked session");
     let mut out = serde_json::to_value(db.resolve_ref(&id)?)?;
     out["warnings"] = json!(warnings(want, made));
+    // (Said apart from `workspace_path`, which a fork in its parent's
+    // worktree has too.)
+    out["new_worktree"] = json!(want.worktree.is_some());
     Ok(out)
 }
 
@@ -549,10 +625,65 @@ mod tests {
         .unwrap();
     }
 
+    /// A worktree fork works in the parent's subfolder of the new
+    /// worktree (and at its top when the parent does).
+    #[test]
+    fn a_worktree_fork_keeps_the_parents_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join("app/web")).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let r = repo.to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        for (id, folder) in [("sub", repo.join("app/web")), ("top", repo.clone())] {
+            db.insert_session(&NewSession {
+                id,
+                name: id,
+                agent: "codex",
+                agent_session: Some("t-1"),
+                project_path: folder.to_str().unwrap(),
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: Some(r),
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        }
+        let cfg = Config::default();
+        let plan = |id: &str| {
+            let w = want(&db, &json!({"ref": id, "workspace": true})).unwrap();
+            plan_worktree(&w, &cfg).unwrap().unwrap()
+        };
+        let w = plan("sub");
+        assert_eq!(w.branch, "sub-fork");
+        assert_eq!(
+            w.dir,
+            git::workspace_path(r, &cfg.session.workspace_dir, "sub-fork")
+        );
+        assert_eq!(w.project, w.dir.join("app/web"));
+        let w = plan("top");
+        assert_eq!(w.project, w.dir);
+        // Not asked for: none.
+        let w = want(&db, &json!({"ref": "top"})).unwrap();
+        assert_eq!(plan_worktree(&w, &cfg).unwrap(), None);
+    }
+
     fn err(db: &Db, params: Value) -> String {
-        want(db, &Config::default(), &params)
-            .unwrap_err()
-            .to_string()
+        want(db, &params).unwrap_err().to_string()
     }
 
     #[test]
@@ -572,7 +703,7 @@ mod tests {
             .unwrap();
         assert!(err(&db, json!({"ref": "b"})).contains("nothing to fork yet"));
         std::fs::write(&absent, "{}\n").unwrap();
-        assert!(want(&db, &Config::default(), &json!({"ref": "b"})).is_ok());
+        assert!(want(&db, &json!({"ref": "b"})).is_ok());
         // A guessed id.
         mk(&db, "s", "codex", Some("t-s"), here, "");
         db.set_agent_session("s", "t-s", "scavenged").unwrap();
@@ -602,26 +733,20 @@ mod tests {
         let here = dir.path().to_str().unwrap();
         let db = Db::open_in_memory().unwrap();
         mk(&db, "p", "codex", Some("t-p"), here, "");
-        let w = want(&db, &Config::default(), &json!({"ref": "p"})).unwrap();
-        assert_eq!((w.name.as_str(), w.named), ("n-p-fork", false));
+        let w = want(&db, &json!({"ref": "p"})).unwrap();
+        assert_eq!(w.name, "n-p-fork");
         mk(&db, "f", "codex", None, here, "");
         db.rename("f", "n-p-fork").unwrap();
-        let w = want(&db, &Config::default(), &json!({"ref": "p"})).unwrap();
+        let w = want(&db, &json!({"ref": "p"})).unwrap();
         assert_eq!(w.name, "n-p-fork-2");
         let w = want(
             &db,
-            &Config::default(),
             &json!({"ref": "p", "name": " mine ", "prompt": " try a queue ", "model": "m-2"}),
         )
         .unwrap();
         assert_eq!(
-            (
-                w.name.as_str(),
-                w.named,
-                w.prompt.as_deref(),
-                w.model.as_deref()
-            ),
-            ("mine", true, Some("try a queue"), Some("m-2"))
+            (w.name.as_str(), w.prompt.as_deref(), w.model.as_deref()),
+            ("mine", Some("try a queue"), Some("m-2"))
         );
         // Its launch spec: the parent's, less what is per session.
         let spec = spec_of(&w);
@@ -630,7 +755,7 @@ mod tests {
         assert!(spec.get("remote_control").is_none() && spec.get("codex_host").is_none());
 
         // Warnings, by plain code.
-        let mut w = want(&db, &Config::default(), &json!({"ref": "p"})).unwrap();
+        let mut w = want(&db, &json!({"ref": "p"})).unwrap();
         w.parent.status = Status::Working;
         let made = Made {
             context_pct: Some(82),
@@ -666,14 +791,17 @@ mod tests {
         }
         db.context_add("p", 40, "note", "use the staging DB", "overlord")
             .unwrap();
+        // The parent is a fork itself: its own fork note isn't the fork's.
+        db.context_add("p", 41, "note", "Forked from session \"g\"", "fork")
+            .unwrap();
         mk(&db, "x", "claude", None, here, "");
+        // r00, the oldest link, is asked for again: it is never cut.
         let w = want(
             &db,
-            &Config::default(),
-            &json!({"ref": "p", "context": "the user wants a queue", "related": ["x", "r05", "p"]}),
+            &json!({"ref": "p", "context": "the user wants a queue", "related": ["x", "r00", "p"]}),
         )
         .unwrap();
-        assert_eq!(w.related, ["x", "r05"], "not the parent itself");
+        assert_eq!(w.related, ["x", "r00"], "not the parent itself");
         let parent_rows = db.context_rows("p").unwrap();
         let (except, add) = rows(&w, &parent_rows, &ForkFolder::Shared, 1_800_000_000_000);
         // Its note and its link to the parent first, then the overlord's
@@ -693,9 +821,16 @@ mod tests {
             .starts_with("Forked from session \"n-p\" (p) at "));
         assert!(add[0].body.contains("same folder"), "{}", add[0].body);
         assert_eq!((add[1].body.as_str(), add[3].body.as_str()), ("p", "x"));
-        // 16 copied + 2 new: the two oldest copied links are left out.
-        let first_two: Vec<i64> = parent_rows.iter().take(2).map(|r| r.id).collect();
-        assert_eq!(except, first_two);
+        // The parent's fork note, then (16 copied + 2 new links) the two
+        // oldest copied links not asked for: r01 and r02, not r00.
+        let id_of = |body: &str| {
+            parent_rows
+                .iter()
+                .find(|r| r.body.starts_with(body))
+                .unwrap()
+                .id
+        };
+        assert_eq!(except, [id_of("Forked from"), id_of("r01"), id_of("r02")]);
 
         // Copied as the fork starts.
         mk(&db, "f", "claude", Some("c-f"), here, "");
@@ -703,7 +838,8 @@ mod tests {
         context::store_rows(&db, "f", &add, 50).unwrap();
         let links = db.context_links("f").unwrap();
         assert_eq!(links.len(), context::LINKS_MAX);
-        assert!(links.contains(&"p".to_string()) && !links.contains(&"r00".to_string()));
+        assert!(links.contains(&"p".to_string()) && links.contains(&"r00".to_string()));
+        assert!(!links.contains(&"r01".to_string()) && !links.contains(&"r02".to_string()));
         let notes: Vec<String> = db
             .context_rows("f")
             .unwrap()
@@ -716,7 +852,13 @@ mod tests {
         assert_eq!(db.context_rows("p").unwrap(), parent_rows);
 
         // The file the fork starts with names the parent.
-        let text = context::launch_file_text_rows(&db, "n-p-fork", &parent_rows[2..], &add, 50);
+        let copied: Vec<_> = parent_rows
+            .iter()
+            .filter(|r| !except.contains(&r.id))
+            .cloned()
+            .collect();
+        let text = context::launch_file_text_rows(&db, "n-p-fork", &copied, &add, 50);
+        assert!(!text.contains("\"g\""), "{text}");
         assert!(text.contains("Forked from session"), "{text}");
         assert!(text.contains("use the staging DB"), "{text}");
         assert!(text.contains("- n-p ("), "{text}");
@@ -750,7 +892,7 @@ mod tests {
             db.set_notes(id, "the user's own notes").unwrap();
         }
         mk(&db, "f", "codex", None, here, "");
-        let w = want(&db, &Config::default(), &json!({"ref": "p"})).unwrap();
+        let w = want(&db, &json!({"ref": "p"})).unwrap();
         after_start(&db, &w, &w.parent, "f").unwrap();
         let f = db.resolve_ref("f").unwrap();
         assert_eq!(f.group_path, "work/api");
@@ -771,12 +913,7 @@ mod tests {
         // OpenCode's fork exists before its pane: nothing pending; a
         // description given wins.
         mk(&db, "g", "opencode", Some("ses_2"), here, "");
-        let w = want(
-            &db,
-            &Config::default(),
-            &json!({"ref": "q", "description": "Try a queue"}),
-        )
-        .unwrap();
+        let w = want(&db, &json!({"ref": "q", "description": "Try a queue"})).unwrap();
         after_start(&db, &w, &w.parent, "g").unwrap();
         assert_eq!(db.resolve_ref("g").unwrap().description, "Try a queue");
         assert_eq!(db.kv_get(&pending_key("g")).unwrap(), None);
@@ -800,7 +937,7 @@ mod tests {
                 .unwrap();
         }
         let args = |w: &Want| spec_args(w.agent, &spec_of(w));
-        let w = want(&db, &Config::default(), &json!({"ref": "cl"})).unwrap();
+        let w = want(&db, &json!({"ref": "cl"})).unwrap();
         let l = launch(&w, &Made::default(), here, Some("go"), &args(&w)).unwrap();
         assert_eq!(
             &l.argv[..4],
@@ -817,19 +954,14 @@ mod tests {
         assert!(l.argv.windows(2).any(|a| a == ["--model", "m-1"]));
         assert!(!l.argv.iter().any(|a| a == "--remote-control"));
 
-        let w = want(&db, &Config::default(), &json!({"ref": "cx"})).unwrap();
+        let w = want(&db, &json!({"ref": "cx"})).unwrap();
         let l = launch(&w, &Made::default(), here, None, &args(&w)).unwrap();
         assert_eq!(&l.argv[..3], ["codex", "fork", "t-1"]);
         // Always in the pane, whatever the parent's host.
         assert!(l.argv.contains(&"--no-daemon".to_string()), "{:?}", l.argv);
         assert_eq!(l.session_id, None);
 
-        let w = want(
-            &db,
-            &Config::default(),
-            &json!({"ref": "oc", "model": "a/b"}),
-        )
-        .unwrap();
+        let w = want(&db, &json!({"ref": "oc", "model": "a/b"})).unwrap();
         assert!(launch(&w, &Made::default(), here, None, &[]).is_err());
         let made = Made {
             opencode_id: Some("ses_2fork".into()),
@@ -884,7 +1016,14 @@ mod tests {
                 &[]
             )
             .unwrap(),
-            ["codex", "fork", "t-p", "--no-alt-screen"]
+            [
+                "codex",
+                "fork",
+                "t-p",
+                "--no-alt-screen",
+                "-c",
+                codex::FORK_CWD
+            ]
         );
     }
 

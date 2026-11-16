@@ -2519,11 +2519,13 @@ fn fork_lines(r: &Value) -> String {
         s("name"),
         s("id")
     );
-    if let Some(ws) = r["workspace_path"]
-        .as_str()
-        .filter(|ws| Some(*ws) != r["repo_path"].as_str())
-    {
-        out.push_str(&format!(" in {ws} [{}]", s("branch")));
+    // Only a worktree this fork made (one in its parent's is no news).
+    if r["new_worktree"] == true {
+        out.push_str(&format!(
+            " in a new worktree {} [{}]",
+            s("project_path"),
+            s("branch")
+        ));
     }
     out.push('\n');
     for w in r["warnings"].as_array().into_iter().flatten() {
@@ -2603,11 +2605,18 @@ mod tests {
             fork_lines(&r),
             "forked api → api-fork (01f)\n  note: it shares its folder with api (working)\n"
         );
+        // In its parent's worktree: nothing to say about it.
         let r = json!({"id": "01f", "name": "x", "forked_from_name": "api", "repo_path": "/r",
-                       "workspace_path": "/r/.worktrees/x", "branch": "x", "warnings": []});
+                       "workspace_path": "/r/.worktrees/api", "branch": "api",
+                       "new_worktree": false, "warnings": []});
+        assert_eq!(fork_lines(&r), "forked api → x (01f)\n");
+        // A worktree of its own, in the parent's subfolder of it.
+        let r = json!({"id": "01f", "name": "x", "forked_from_name": "api", "repo_path": "/r",
+                       "workspace_path": "/r/.worktrees/x", "project_path": "/r/.worktrees/x/web",
+                       "branch": "x", "new_worktree": true, "warnings": []});
         assert_eq!(
             fork_lines(&r),
-            "forked api → x (01f) in /r/.worktrees/x [x]\n"
+            "forked api → x (01f) in a new worktree /r/.worktrees/x/web [x]\n"
         );
         let s = json!({"forked_from": "01p", "forked_from_name": "api",
                        "forks": [{"id": "01g", "name": "x-fork"}]});

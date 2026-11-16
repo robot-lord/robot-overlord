@@ -112,9 +112,9 @@ pub fn resume_argv(
 pub const FORK_MINTS_ID: bool = true;
 
 /// Whether a user fork can start in another worktree of the parent's repo:
-/// `--resume <parent>` from there still finds the parent's conversation,
-/// and the fork's transcript goes under the new folder (live check F2,
-/// Claude Code 2.1.326). There, a new worktree of a repo Claude already
+/// `--resume <parent>` from there (its top, or the parent's subfolder of
+/// it) still finds the parent's conversation, and the fork's transcript
+/// goes under the new folder (live checks F2, F2b, Claude Code 2.1.326). There, a new worktree of a repo Claude already
 /// trusted started without its folder-trust question.
 pub const FORK_ELSEWHERE: bool = true;
 

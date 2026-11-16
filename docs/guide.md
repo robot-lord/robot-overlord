@@ -344,7 +344,8 @@ whole conversation and goes its own way: try another approach without
 losing the first, or branch off a side question. The original is left as
 it is. In the list, `f` opens a small form on the selected session: what
 the fork should do first (optional: left empty, it opens idle at its
-input), then its name (`<original>-fork`) and, for Claude Code and Codex
+input), then its name (left empty: `<original>-fork`, or the next one no
+session has) and, for Claude Code and Codex
 sessions in a repo, where it works (the same folder, or a new worktree).
 `Enter` forks it, with no overlord turn. Or ask the overlord ("fork the
 auth session and try a token bucket instead"), or from the CLI: `rlord
@@ -358,9 +359,10 @@ B]] [-a]`.
 - **Same folder by default.** Both sessions then work on the same files;
   rlord says so when the original is still running. A new worktree
   (`--worktree`, or the form's choice) is branched from the original's
-  last commit: changes not committed there don't come along. OpenCode
-  forks always stay in the original's folder (its server gives a fork its
-  parent's folder).
+  last commit, and the fork works in the same subfolder of it as the
+  original: changes not committed there (new files too) don't come
+  along. OpenCode forks always stay in the original's folder (its server
+  gives a fork its parent's folder).
 - **A working original** forks as far as its last finished step; a
   nearly full context window is pointed out (a fork starts with all of
   it: when the new work only needs to know about the original, a new
