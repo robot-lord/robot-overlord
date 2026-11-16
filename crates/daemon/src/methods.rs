@@ -32,9 +32,16 @@ pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
 }
 
 /// Everything the repo finder can offer: known repos (MRU, default first)
-/// followed by repos discovered under `repo_roots`, deduplicated.
+/// followed by repos discovered under `roots` (the finder's, see
+/// `Daemon::finder_roots`), deduplicated.
 /// `scanning`: the disk scan is still running, so `scanned` may be short.
-pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>, scanning: bool) -> Result<Value> {
+pub fn repo_find(
+    db: &Db,
+    cfg: &Config,
+    roots: &[String],
+    scanned: Vec<String>,
+    scanning: bool,
+) -> Result<Value> {
     let mut out = repo_list(db, cfg)?;
     let known: std::collections::HashSet<String> = out
         .as_array()
@@ -49,23 +56,29 @@ pub fn repo_find(db: &Db, cfg: &Config, scanned: Vec<String>, scanning: bool) ->
                 .push(json!({"path": p, "default": false, "last_used_at": null}));
         }
     }
-    let roots: Vec<String> = cfg
-        .session
-        .repo_roots
-        .iter()
-        .map(|r| expand_tilde(r))
-        .collect();
+    let roots: Vec<String> = roots.iter().map(|r| expand_tilde(r)).collect();
     Ok(
         json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth,
-              "scanning": scanning}),
+              "scanning": scanning,
+              "code_dir": cfg.session.code_dir_path().unwrap_or_default()}),
     )
 }
 
 /// `[session]` as configured, plus what each agent offers: `agents` lists
 /// every agent rlord can run with its default model and picker choices
-/// (`models` empty: no catalog, the model is typed in).
-pub fn session_defaults(cfg: &Config) -> Result<Value> {
+/// (`models` empty: no catalog, the model is typed in). `code_dir` and
+/// `repo_roots` are expanded (`repo_roots`: what the finder scans);
+/// `setup_needed`: no code folder yet and setup not answered.
+pub fn session_defaults(cfg: &Config, setup_needed: bool) -> Result<Value> {
     let mut v = serde_json::to_value(&cfg.session)?;
+    v["code_dir"] = json!(cfg.session.code_dir_path().unwrap_or_default());
+    v["repo_roots"] = json!(cfg
+        .session
+        .finder_roots(setup_needed)
+        .iter()
+        .map(|r| expand_tilde(r))
+        .collect::<Vec<_>>());
+    v["setup_needed"] = json!(setup_needed);
     v["agents"] = install::status(false)
         .into_iter()
         .map(|st| {

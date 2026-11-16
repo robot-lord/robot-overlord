@@ -17,6 +17,7 @@ mod repo_scan;
 pub mod rpc;
 pub mod search;
 pub mod send;
+pub mod setup;
 pub mod summary;
 pub mod triage;
 pub mod ui;
@@ -197,10 +198,20 @@ impl Daemon {
         }
     }
 
-    /// Git repos under the configured roots, and whether the first scan of
-    /// them is still running (`repo_scan.rs`: never blocks for long).
-    fn scanned_repos(&self, cfg: &Config) -> (Vec<String>, bool) {
-        let key = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
+    /// The folders the repo finder scans (as written, `~` unexpanded): the
+    /// configured roots, or `~` while setup is pending (`finder_roots`).
+    pub(crate) fn finder_roots(&self, cfg: &Config) -> Vec<String> {
+        let pending = setup::needed(&self.db(), cfg);
+        cfg.session.finder_roots(pending)
+    }
+
+    /// Git repos under `roots`, and whether the first scan of them is still
+    /// running (`repo_scan.rs`: never blocks for long). No roots: none.
+    fn scanned_repos(&self, roots: &[String], depth: u8) -> (Vec<String>, bool) {
+        if roots.is_empty() {
+            return (Vec::new(), false);
+        }
+        let key = (roots.to_vec(), depth);
         let f = self
             .repo_scan
             .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
@@ -462,7 +473,9 @@ impl Daemon {
         // scanned.)
         let scanned = (method == "repo.find").then(|| {
             let cfg = self.config();
-            (self.scanned_repos(&cfg), cfg)
+            let roots = self.finder_roots(&cfg);
+            let found = self.scanned_repos(&roots, cfg.session.repo_scan_depth);
+            (found, roots, cfg)
         });
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
@@ -470,10 +483,14 @@ impl Daemon {
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
-                let ((repos, scanning), cfg) = scanned.expect("scanned for repo.find");
-                methods::repo_find(&db, &cfg, repos, scanning)
+                let ((repos, scanning), roots, cfg) = scanned.expect("scanned for repo.find");
+                methods::repo_find(&db, &cfg, &roots, repos, scanning)
             }
-            "session.defaults" => methods::session_defaults(&self.config()),
+            "session.defaults" => {
+                let cfg = self.config();
+                let needed = setup::needed(&db, &cfg);
+                methods::session_defaults(&cfg, needed)
+            }
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),
             "session.stop" => methods::session_stop(&db, &params),

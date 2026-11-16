@@ -158,7 +158,7 @@ pub fn tools() -> Value {
             "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there.",
             json!({"query": s("Words that must appear in the path")}), &[]),
         tool("get_session_defaults",
-            "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
+            "The defaults new sessions get (agent, model, model choices, workspace, default repo), `code_dir` (the folder the user keeps repos in and where new ones go; \"\" = not set yet, see confirm_setup), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
         tool("list_agents",
             "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it (`too_old`: installed, but a version rlord can't run), whether rlord's hooks are installed (and, for Codex, trusted; null for OpenCode, which needs none), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
@@ -369,6 +369,39 @@ fn summarize_candidate(c: &Value) -> Value {
     row
 }
 
+/// What `find_repos` hands the overlord from a `repo.find` result: the
+/// repos matching `query` (at most 40), whether the scan is still running,
+/// and a note when the finder scans nothing.
+fn shape_find_repos(r: &Value, query: &str) -> Value {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let repos: Vec<Value> = r["repos"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|x| {
+                    let p = x["path"].as_str().unwrap_or("").to_lowercase();
+                    words.iter().all(|w| p.contains(w.as_str()))
+                })
+                .take(40)
+                .map(|x| {
+                    json!({"path": x["path"], "default": x["default"],
+                           "last_used": x["last_used_at"].as_i64().map(|t| rel_age(Some(t)))})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = json!({"repos": repos});
+    if r["scanning"].as_bool() == Some(true) {
+        out["scanning"] = true.into();
+    }
+    if r["roots"].as_array().is_some_and(|a| a.is_empty()) {
+        out["note"] = json!(
+            "no code folder set: only repos already used are listed (confirm_setup sets one)"
+        );
+    }
+    out
+}
+
 fn params_wants_remote(args: &Value) -> bool {
     args.get("remote_control").and_then(Value::as_bool) == Some(true)
 }
@@ -464,32 +497,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         }
         "find_repos" => {
             let r = d.rpc("repo.find", json!({}))?;
-            let words: Vec<String> = arg_str(args, "query")
-                .unwrap_or("")
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            let repos: Vec<Value> = r["repos"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter(|x| {
-                            let p = x["path"].as_str().unwrap_or("").to_lowercase();
-                            words.iter().all(|w| p.contains(w.as_str()))
-                        })
-                        .take(40)
-                        .map(|x| {
-                            json!({"path": x["path"], "default": x["default"],
-                                   "last_used": x["last_used_at"].as_i64().map(|t| rel_age(Some(t)))})
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut out = json!({"repos": repos});
-            if r["scanning"].as_bool() == Some(true) {
-                out["scanning"] = true.into();
-            }
-            Ok(out)
+            Ok(shape_find_repos(&r, arg_str(args, "query").unwrap_or("")))
         }
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)

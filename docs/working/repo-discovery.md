@@ -46,7 +46,7 @@ One PR for items 2, 3 and 4. The user's calls on the plan's open questions:
 
 Progress: (updated per commit)
 
-- [ ] config: `code_dir`, `scan_roots`, `set_code_dir`
+- [x] config: `code_dir`, `scan_roots`, `set_code_dir`
 - [ ] predictor: `privacy.rs`, `git::scan_repos`, `skipped`
 - [ ] finder and `find_repos` show skipped folders
 - [ ] suggestion: `code_dir.rs`, sources, `setup.*` methods

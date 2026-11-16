@@ -420,7 +420,11 @@ pub struct SessionDefaults {
     pub workspace_dir: String,
     /// Repo preselected in the new-session form. Empty = the current directory.
     pub default_repo: String,
-    /// Directories scanned (to `repo_scan_depth`) by the repo finder.
+    /// Where the user's repos live and new ones are created. Empty = not
+    /// set (`rlord setup` sets it).
+    pub code_dir: String,
+    /// Directories the repo finder scans (to `repo_scan_depth`). Empty =
+    /// the code folder (see `scan_roots`).
     pub repo_roots: Vec<String>,
     pub repo_scan_depth: u8,
     /// Claude Code's renderer for rlord's sessions (`--settings
@@ -446,7 +450,8 @@ impl Default for SessionDefaults {
             workspace: true,
             workspace_dir: ".worktrees".into(),
             default_repo: String::new(),
-            repo_roots: vec!["~".into()],
+            code_dir: String::new(),
+            repo_roots: Vec::new(),
             repo_scan_depth: 3,
             claude_tui: "default".into(),
             codex_daemon: false,
@@ -484,6 +489,56 @@ impl SessionDefaults {
         }
         Some(expand_tilde(r))
     }
+
+    /// `code_dir` with `~` expanded; None when unset.
+    pub fn code_dir_path(&self) -> Option<String> {
+        let d = self.code_dir.trim();
+        if d.is_empty() {
+            return None;
+        }
+        Some(expand_tilde(d))
+    }
+
+    /// The folders the repo finder scans, as written: `repo_roots` when it
+    /// lists any, else the code folder when one is set, else none.
+    pub fn scan_roots(&self) -> Vec<String> {
+        let roots: Vec<String> = self
+            .repo_roots
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+        match self.code_dir.trim() {
+            "" => Vec::new(),
+            d => vec![d.to_string()],
+        }
+    }
+
+    /// `scan_roots`, except that with neither a code folder nor roots set
+    /// the finder keeps scanning `~` until setup is done or skipped
+    /// (`setup_pending`); after that it scans nothing.
+    pub fn finder_roots(&self, setup_pending: bool) -> Vec<String> {
+        let roots = self.scan_roots();
+        if roots.is_empty() && setup_pending {
+            return vec!["~".into()];
+        }
+        roots
+    }
+}
+
+/// What `Config::set_code_dir` does with `[session] repo_roots`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootsEdit {
+    /// Leave the key as it is.
+    Leave,
+    /// Remove it: the finder scans the code folder.
+    Follow,
+    /// Write these roots.
+    Set(Vec<String>),
 }
 
 pub fn expand_tilde(p: &str) -> String {
@@ -498,6 +553,29 @@ pub fn expand_tilde(p: &str) -> String {
         return format!("{home}/{rest}");
     }
     p.to_string()
+}
+
+/// The inverse of `expand_tilde`: a path under `$HOME` is written `~/...`.
+pub fn contract_tilde(p: &str) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => contract_tilde_in(p, &home.to_string_lossy()),
+        None => p.to_string(),
+    }
+}
+
+/// `contract_tilde` against a given home.
+pub fn contract_tilde_in(p: &str, home: &str) -> String {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return p.to_string();
+    }
+    if p == home {
+        return "~".into();
+    }
+    match p.strip_prefix(home).and_then(|r| r.strip_prefix('/')) {
+        Some(rest) => format!("~/{rest}"),
+        None => p.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +733,29 @@ impl Config {
         write_config(&path, &set_overlord_in(&text, agent, model, effort)?)
     }
 
+    /// Save the code folder (`[session] code_dir`, as given: write it with
+    /// `~`) and do what `roots` says with `repo_roots`, keeping the rest of
+    /// the file as written. The result must load with exactly that, or
+    /// nothing is written. Returns the file's path.
+    pub fn set_code_dir(code_dir: &str, roots: RootsEdit) -> Result<std::path::PathBuf> {
+        Self::set_code_dir_at(&paths::config_path(), code_dir, roots)
+    }
+
+    /// `set_code_dir` on the config file at `path`.
+    pub fn set_code_dir_at(
+        path: &std::path::Path,
+        code_dir: &str,
+        roots: RootsEdit,
+    ) -> Result<std::path::PathBuf> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        write_config(path, &set_code_dir_in(&text, code_dir, &roots)?)?;
+        Ok(path.to_path_buf())
+    }
+
     /// Commented template written by `rlord config init`; equals the defaults.
     pub fn default_toml() -> String {
         DEFAULT_TOML.to_string()
@@ -700,6 +801,49 @@ fn set_overlord_in(text: &str, agent: &str, model: &str, effort: &str) -> Result
     ) != (agent, model, effort)
     {
         anyhow::bail!("the overlord's settings didn't take in config.toml");
+    }
+    Ok(out)
+}
+
+/// `text` with the code folder set and `repo_roots` edited (see
+/// `Config::set_code_dir`).
+fn set_code_dir_in(text: &str, code_dir: &str, roots: &RootsEdit) -> Result<String> {
+    let before = toml::from_str::<Config>(text).context("config.toml doesn't load")?;
+    let out = set_in(text, "session", "code_dir", code_dir)?;
+    let mut doc: toml_edit::DocumentMut = out.parse().context("parsing the edited config")?;
+    let table = doc["session"]
+        .as_table_mut()
+        .context("[session] isn't a table")?;
+    match roots {
+        RootsEdit::Leave => {}
+        RootsEdit::Follow => {
+            table.remove("repo_roots");
+        }
+        RootsEdit::Set(list) => {
+            let mut arr = toml_edit::Array::new();
+            for r in list {
+                arr.push(r.as_str());
+            }
+            match table.get_mut("repo_roots").and_then(|i| i.as_value_mut()) {
+                // Keep the line's own comment.
+                Some(v) => {
+                    let decor = v.decor().clone();
+                    *v = toml_edit::Value::Array(arr);
+                    *v.decor_mut() = decor;
+                }
+                None => table["repo_roots"] = toml_edit::value(arr),
+            }
+        }
+    }
+    let out = doc.to_string();
+    let c = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+    let want_roots = match roots {
+        RootsEdit::Leave => before.session.repo_roots.clone(),
+        RootsEdit::Follow => Vec::new(),
+        RootsEdit::Set(list) => list.clone(),
+    };
+    if c.session.code_dir != code_dir || c.session.repo_roots != want_roots {
+        anyhow::bail!("the code folder didn't take in config.toml");
     }
     Ok(out)
 }
@@ -765,8 +909,12 @@ opencode_model = ""             # OpenCode's model, as provider/model; "" =
 workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
-repo_roots = ["~"]              # where the repo finder looks for git repos...
-repo_scan_depth = 3             # ...and how deep (hidden/heavy dirs and macOS ~/Documents etc. skipped)
+code_dir = ""                   # where your repos live and new ones go, e.g.
+                                # "~/code" (`rlord setup` suggests one)
+# repo_roots = ["~/code"]       # where the repo finder looks; default: code_dir
+repo_scan_depth = 3             # ...and how deep (hidden and heavy dirs skipped;
+                                # also other disks, and on macOS the folders that
+                                # raise a privacy prompt)
 claude_tui = "default"          # Claude's renderer here: "default" (inline: tmux
                                 # scrollback and copy-mode search work),
                                 # "fullscreen", or "" for Claude's own setting
@@ -934,6 +1082,74 @@ mod tests {
         assert_eq!(c.overlord.fresh_after_mins, 60);
         assert_eq!(c.tmux.overlord, "M-o");
         assert_eq!(c.keys.overlord, "M-o");
+        assert_eq!(c.session.code_dir, "");
+        assert!(c.session.scan_roots().is_empty());
+    }
+
+    #[test]
+    fn scan_roots_follow_the_code_folder() {
+        let s = |t: &str| toml::from_str::<Config>(t).unwrap().session;
+        // Unset: nothing, unless setup is still pending (then `~`).
+        assert!(s("").scan_roots().is_empty());
+        assert_eq!(s("").finder_roots(true), ["~"]);
+        assert!(s("").finder_roots(false).is_empty());
+        assert_eq!(s("").code_dir_path(), None);
+        // The code folder only.
+        let c = s("[session]\ncode_dir = \"~/ko\"\n");
+        assert_eq!(c.scan_roots(), ["~/ko"]);
+        assert_eq!(c.finder_roots(true), ["~/ko"]);
+        // Explicit roots win; the old template's `["~"]` still loads.
+        let c = s("[session]\ncode_dir = \"~/ko\"\nrepo_roots = [\"~\"]\n");
+        assert_eq!(c.scan_roots(), ["~"]);
+        // `[]` reads as unset.
+        let c = s("[session]\ncode_dir = \"/c\"\nrepo_roots = []\n");
+        assert_eq!(c.scan_roots(), ["/c"]);
+    }
+
+    #[test]
+    fn tilde_contraction() {
+        assert_eq!(contract_tilde_in("/h", "/h"), "~");
+        assert_eq!(contract_tilde_in("/h/ko", "/h/"), "~/ko");
+        assert_eq!(contract_tilde_in("/hx/ko", "/h"), "/hx/ko");
+        assert_eq!(contract_tilde_in("/abs", ""), "/abs");
+    }
+
+    #[test]
+    fn code_dir_is_saved_and_repo_roots_edited() {
+        let t = "# mine\n[session]\nagent = \"codex\"   # me\nrepo_roots = [\"~\"]   # all\n";
+        // Follow: the key goes; the rest stays as written.
+        let out = set_code_dir_in(t, "~/ko", &RootsEdit::Follow).unwrap();
+        assert!(out.starts_with("# mine\n") && out.contains("# me"), "{out}");
+        assert!(!out.contains("repo_roots"), "{out}");
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.session.code_dir, "~/ko");
+        assert_eq!(c.session.scan_roots(), ["~/ko"]);
+        // Leave: an explicit `["~"]` stays.
+        let out = set_code_dir_in(t, "~/ko", &RootsEdit::Leave).unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.session.scan_roots(), ["~"]);
+        // Set: an array, keeping the line's comment.
+        let set = RootsEdit::Set(vec!["~/ko".into(), "~/proj".into()]);
+        let out = set_code_dir_in(t, "~/ko", &set).unwrap();
+        assert!(out.contains("# all"), "{out}");
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.session.scan_roots(), ["~/ko", "~/proj"]);
+        // An empty file gains the section.
+        let out = set_code_dir_in("", "/c", &RootsEdit::Follow).unwrap();
+        assert_eq!(toml::from_str::<Config>(&out).unwrap().session.code_dir, "/c");
+        // The template too (its `repo_roots` is commented out).
+        let out = set_code_dir_in(&Config::default_toml(), "~/code", &RootsEdit::Follow).unwrap();
+        let c: Config = toml::from_str(&out).unwrap();
+        assert_eq!(c.session.scan_roots(), ["~/code"]);
+        // A file that doesn't load: nothing.
+        assert!(set_code_dir_in("[session]\nrepo_scan_depth = \"x\"\n", "/c", &RootsEdit::Leave).is_err());
+        // On disk, at a given path.
+        let dir = std::env::temp_dir().join(format!("rlord-codedir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        Config::set_code_dir_at(&p, "/c", RootsEdit::Follow).unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains("code_dir = \"/c\""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
