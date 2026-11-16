@@ -32,6 +32,8 @@ pub struct Keys {
     pub new: String,
     /// New session via the manual form (no overlord).
     pub new_manual: String,
+    /// Fork the selected session (a small form).
+    pub fork: String,
     pub restart: String,
     pub stop: String,
     pub archive: String,
@@ -77,6 +79,7 @@ impl Default for Keys {
             attach: "enter".into(),
             new: "n".into(),
             new_manual: "N".into(),
+            fork: "f".into(),
             restart: "r".into(),
             stop: "S".into(),
             archive: "x".into(),
@@ -1004,6 +1007,7 @@ bottom = "G"
 attach = "enter"
 new = "n"               # new session: describe it, the overlord launches it
 new_manual = "N"        # new session: the manual form
+fork = "f"              # fork the selected session: a copy of its conversation
 restart = "r"
 stop = "S"              # Shift-S: stops the agent, keeps the session listed
 archive = "x"

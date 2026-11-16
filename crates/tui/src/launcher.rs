@@ -57,6 +57,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         "new session: the form",
         Cmd::Act(Action::NewManual),
     ),
+    (
+        "fork",
+        "fork the selected session: a copy of its conversation",
+        Cmd::Act(Action::Fork),
+    ),
     ("overlord", "open the overlord", Cmd::Act(Action::Overlord)),
     (
         "overlord claude",
@@ -356,6 +361,7 @@ impl App {
             row(k(Action::Filter), "search"),
             row(k(Action::New), "new session (ask the overlord)"),
             row(k(Action::NewManual), "new session (form)"),
+            row(k(Action::Fork), "fork (a copy of its conversation)"),
             row(k(Action::SwitchTab), "sessions ⇄ groups"),
             row(
                 format!("{}/{}", k(Action::SessionsTab), k(Action::GroupsTab)),

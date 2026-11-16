@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+mod forkform;
 mod groups;
 mod keyscreen;
 mod launcher;
@@ -183,6 +184,8 @@ enum Mode {
     /// The code-folder form (first run, `:setup`, the overlord's
     /// `confirm_setup`).
     Setup(Box<setupform::SetupForm>),
+    /// The fork form (`f`).
+    Fork(Box<forkform::ForkForm>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
@@ -839,6 +842,7 @@ impl App {
             }
             Mode::OverlordSetup(s) => self.handle_setup(k, s),
             Mode::Setup(f) => self.handle_setup_form(k, f),
+            Mode::Fork(f) => self.handle_fork_form(k, f),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
             Mode::Help => {}
@@ -1041,6 +1045,7 @@ impl App {
             }
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
+            Action::Fork => self.open_fork_form(),
             // Esc peels one layer (`esc_target`).
             Action::Cancel => match self.esc_target() {
                 groups::EscTarget::Conversation => self.show_conversation(0),
@@ -1460,6 +1465,7 @@ impl App {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
             Mode::Setup(s) => self.draw_setup_form(f, s),
+            Mode::Fork(s) => self.draw_fork_form(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
@@ -1590,6 +1596,10 @@ impl App {
                     // Which agent runs it (its marker), then its name.
                     Cell::from(Line::from({
                         let mut spans = theme::agent_marker(s["agent"].as_str().unwrap_or(""));
+                        // A fork of another session.
+                        if s["forked_from"].is_string() {
+                            spans.push(Span::styled("⑂ ", theme::faint()));
+                        }
                         spans.push(Span::raw(get("name")));
                         // The other agents' overlords that are up (the
                         // row itself is the active one).
@@ -2033,6 +2043,34 @@ impl App {
                 Span::styled(usage_details(&s["usage"]), theme::muted()),
             ]),
         ];
+        // Lineage: what it was forked from, and its forks in the list.
+        if s["forked_from"].is_string() {
+            lines.push(Line::from(vec![
+                key("forked"),
+                Span::styled(
+                    format!(
+                        "from {} · {} ago",
+                        s["forked_from_name"]
+                            .as_str()
+                            .unwrap_or("a session that's gone"),
+                        rel_age(s["created_at"].as_i64())
+                    ),
+                    theme::muted(),
+                ),
+            ]));
+        }
+        let forks: Vec<&str> = self
+            .all
+            .iter()
+            .filter(|o| o["forked_from"].is_string() && o["forked_from"] == s["id"])
+            .filter_map(|o| o["name"].as_str())
+            .collect();
+        if !forks.is_empty() {
+            lines.push(Line::from(vec![
+                key("forks"),
+                Span::styled(forks.join(", "), theme::muted()),
+            ]));
+        }
         // On Codex's shared background server: the turn outlives the pane.
         if s["codex_daemon"] == true {
             lines.push(Line::from(vec![
@@ -2316,6 +2354,7 @@ impl App {
                 Some("overlord — see dialog".to_string())
             }
             Mode::Setup(_) => Some("code folder — see form".to_string()),
+            Mode::Fork(_) => Some("fork — see form".to_string()),
             Mode::Help => Some("help: any key closes".to_string()),
             Mode::Command(l) => Some(format!(
                 "command: {}▏   (enter: run · tab: complete · ↑↓: choose · esc: close)",
@@ -2948,6 +2987,7 @@ enum Action {
     Attach,
     New,
     NewManual,
+    Fork,
     Restart,
     Stop,
     Archive,
@@ -3092,6 +3132,7 @@ impl KeyMap {
             (Action::Attach, &k.attach),
             (Action::New, &k.new),
             (Action::NewManual, &k.new_manual),
+            (Action::Fork, &k.fork),
             (Action::Restart, &k.restart),
             (Action::Stop, &k.stop),
             (Action::Archive, &k.archive),
@@ -3133,6 +3174,7 @@ impl KeyMap {
                 || (*a == Action::Help && k.help == "?")
                 || (*a == Action::Command && k.command == ":")
                 || (*a == Action::Usage && k.usage == "U")
+                || (*a == Action::Fork && k.fork == "f")
         };
         // Only the defaults give way; a step key the user set is theirs.
         bindings.retain(|(a, b)| !default_step(a) || !taken(b, *a, &snapshot));
@@ -3287,6 +3329,10 @@ fn context_legend(
     v.push((Action::Tags, "tags"));
     v.push((Action::Describe, "describe"));
     v.push((Action::Notes, "notes"));
+    // (A conversation to copy.)
+    if resumable {
+        v.push((Action::Fork, "fork"));
+    }
     v
 }
 
@@ -3319,7 +3365,7 @@ mod tests {
             labels(&context_legend(false, None, Some(&running))),
             [
                 "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes"
+                "notes", "fork"
             ]
         );
         let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
