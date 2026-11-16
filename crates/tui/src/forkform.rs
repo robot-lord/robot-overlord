@@ -28,8 +28,11 @@ pub(crate) struct ForkForm {
     /// What the fork should do first (the user's words; empty: it opens
     /// idle).
     pub prompt: String,
-    /// Its name (empty: the default, `<parent>-fork`).
+    /// Its name (empty: `default_name`).
     pub name: String,
+    /// What the daemon names it when `name` is empty (`names::fork_name`,
+    /// against the names in the list).
+    pub default_name: String,
     /// In a new worktree rather than the parent's folder.
     pub worktree: bool,
     /// A new worktree is possible: the agent can fork elsewhere (Claude
@@ -41,7 +44,7 @@ pub(crate) struct ForkForm {
 
 impl ForkForm {
     /// The form for forking session `s` (a list row).
-    pub(crate) fn for_session(s: &Value) -> ForkForm {
+    pub(crate) fn for_session(s: &Value, taken: &[&str]) -> ForkForm {
         let agent = s["agent"].as_str().unwrap_or("").to_string();
         let can_worktree = rlord_core::agents::Agent::parse(&agent)
             .is_some_and(|a| a.forks_elsewhere())
@@ -53,6 +56,9 @@ impl ForkForm {
             folder: contract_tilde(s["project_path"].as_str().unwrap_or("")),
             prompt: String::new(),
             name: String::new(),
+            default_name: rlord_core::names::fork_name(s["name"].as_str().unwrap_or(""), |n| {
+                taken.contains(&n)
+            }),
             worktree: false,
             can_worktree,
             row: 0,
@@ -75,8 +81,8 @@ impl ForkForm {
     }
 
     /// The name it gets when the field is left empty.
-    pub(crate) fn default_name(&self) -> String {
-        format!("{}-fork", self.parent_name)
+    pub(crate) fn default_name(&self) -> &str {
+        &self.default_name
     }
 
     /// `session.fork`'s params, as the form stands.
@@ -150,7 +156,8 @@ impl App {
             self.status_line = "the overlord can't be forked".into();
             return;
         }
-        self.mode = Mode::Fork(Box::new(ForkForm::for_session(s)));
+        let taken: Vec<&str> = self.all.iter().filter_map(|o| o["name"].as_str()).collect();
+        self.mode = Mode::Fork(Box::new(ForkForm::for_session(s, &taken)));
     }
 
     pub(crate) fn handle_fork_form(&mut self, k: KeyEvent, mut f: Box<ForkForm>) {
@@ -184,13 +191,10 @@ impl App {
             Line::from(vec![
                 Span::styled("  A new session with a copy of ", text),
                 Span::styled(s.parent_name.clone(), text.bold()),
-                Span::styled("'s whole conversation.", text),
+                Span::styled("'s whole conversation; the original stays as it is.", text),
             ]),
             Line::from(Span::styled(
-                format!(
-                    "  {} · {} · the original is left as it is",
-                    s.agent, s.folder
-                ),
+                format!("  {} · {}", s.agent, s.folder),
                 theme::muted(),
             )),
             Line::from(""),
@@ -261,7 +265,7 @@ impl App {
                     &s.prompt,
                     "(optional) what the fork should do; empty: it opens idle",
                 )),
-                Row::Name => spans.extend(field(focused, &s.name, &s.default_name())),
+                Row::Name => spans.extend(field(focused, &s.name, s.default_name())),
                 Row::Folder => {
                     let v = if s.worktree {
                         "a new worktree (from its last commit)"
@@ -338,7 +342,7 @@ mod tests {
 
     #[test]
     fn the_form_forks_with_what_was_typed() {
-        let mut f = ForkForm::for_session(&row("codex", Some("/src/api")));
+        let mut f = ForkForm::for_session(&row("codex", Some("/src/api")), &[]);
         assert_eq!(f.rows(), [Row::Prompt, Row::Name, Row::Folder, Row::Fork]);
         // Left as it is: the parent only (opens idle, default name, same
         // folder).
@@ -368,10 +372,12 @@ mod tests {
 
     #[test]
     fn opencode_and_plain_folders_have_no_worktree_row() {
-        let f = ForkForm::for_session(&row("opencode", Some("/src/api")));
+        let f = ForkForm::for_session(&row("opencode", Some("/src/api")), &[]);
         assert_eq!(f.rows(), [Row::Prompt, Row::Name, Row::Fork]);
-        let mut f = ForkForm::for_session(&row("claude", None));
+        let mut f = ForkForm::for_session(&row("claude", None), &["api-fork"]);
         assert_eq!(f.rows(), [Row::Prompt, Row::Name, Row::Fork]);
+        // The name it will get: the first one free in the list.
+        assert_eq!(f.default_name(), "api-fork-2");
         // Even if set, it isn't asked for.
         f.worktree = true;
         assert!(f.params().get("workspace").is_none());
@@ -393,7 +399,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
         let app = App::new(rx, Config::default(), keys);
-        let f = ForkForm::for_session(&row("claude", Some("/src/api")));
+        let f = ForkForm::for_session(&row("claude", Some("/src/api")), &[]);
         let mut term = ratatui::Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|fr| app.draw_fork_form(fr, &f)).unwrap();
         let buf = term.backend().buffer();

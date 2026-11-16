@@ -10,7 +10,7 @@ demo=${RLORD_DEMO_DIR:?}
 data=${XDG_DATA_HOME:?}/opencode
 db=$data/opencode.db
 args=("$@")
-sid='' prompt='' sub='' fork=0 archived=0 body=''
+sid='' prompt='' sub='' fork=0 archived=0 body='' path=''
 for ((i = 0; i < ${#args[@]}; i++)); do
   case ${args[$i]} in
     --version | -v) echo "opencode v2.2.7"; exit 0 ;;
@@ -26,7 +26,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --fork) fork=1 ;;
     --archived) archived=1 ;;
     -*) ;;
-    *) case $sub in delete) sid=${args[$i]} ;; api) ;; *) prompt=${args[$i]} ;; esac ;;
+    *) case $sub in delete) sid=${args[$i]} ;; api) path=${args[$i]} ;; *) prompt=${args[$i]} ;; esac ;;
   esac
 done
 
@@ -65,6 +65,30 @@ create() { # ID [FORK-OF]
 
 case $sub in
   api)
+    # `api POST /api/session/<id>/fork -d {}`: a user fork (rlord's
+    # `session.fork` without a server): a copy of the session's messages
+    # under a new id, answered as the server does.
+    if [[ $path == /api/session/*/fork ]]; then
+      parent=${path#/api/session/}; parent=${parent%/fork}
+      python3 - "$db" "$parent" <<'PY'
+import json, sqlite3, sys, time, uuid
+db, parent = sys.argv[1:]
+c = sqlite3.connect(db)
+row = c.execute("select directory, model from session_v2 where id = ?", (parent,)).fetchone()
+if row is None or c.execute("select 1 from session_message where session_id = ?", (parent,)).fetchone() is None:
+    print(json.dumps({"_tag": "Session.ForkEmptyError", "message": "nothing to fork"}))
+    sys.exit(0)
+new = "ses_" + uuid.uuid4().hex[:26]
+now = int(time.time() * 1000)
+c.execute("insert into session_v2 (id, directory, title, model, time_created, time_updated, fork_session_id, time_idle) values (?, ?, '', ?, ?, ?, ?, ?)",
+          (new, row[0], row[1], now, now, parent, now))
+for (mid, kind, seq, data) in c.execute("select id, type, seq, data from session_message where session_id = ? order by seq", (parent,)).fetchall():
+    c.execute("insert into session_message values (?, ?, ?, ?, ?, ?, ?)", (new[4:] + mid, new, kind, seq, now, now, data))
+c.commit()
+print(json.dumps({"data": {"id": new, "directory": row[0], "forkSessionID": parent}}))
+PY
+      exit 0
+    fi
     # `api POST /api/session -d {id, location, model}`: what a launch runs
     # first, so the session exists (with its model) before its screen.
     python3 - "$db" "$body" <<'PY'
