@@ -50,7 +50,7 @@ Progress: (updated per commit)
 - [x] predictor: `privacy.rs`, `git::scan_repos`, `skipped`
 - [x] finder and `find_repos` show skipped folders
 - [x] suggestion: `code_dir.rs`, sources, `setup.*` methods
-- [ ] `rlord setup`
+- [x] `rlord setup`
 - [ ] TUI setup form, first run, `:setup`
 - [ ] overlord: `confirm_setup`, setup request, `overlord.md`
 - [ ] fresh-install steps

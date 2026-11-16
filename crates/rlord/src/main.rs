@@ -128,6 +128,21 @@ enum Command {
     },
     /// List git repos rlord has used, most recent first
     Repos,
+    /// Set your code folder: where your repos live and new ones go (the
+    /// repo finder scans it). Without PATH, rlord suggests one from the
+    /// projects it has seen and asks.
+    Setup {
+        /// The folder (created if missing); no prompts
+        path: Option<String>,
+        /// Leave `[session] repo_roots` as it is (by default an old
+        /// `repo_roots = ["~"]` switches to scanning the code folder)
+        #[arg(long)]
+        keep_roots: bool,
+        /// Print the suggestion (no PATH) or what was saved, as JSON; never
+        /// prompts
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach the terminal to a session (ref = id, id prefix, or name)
     Attach {
         r#ref: String,
@@ -885,6 +900,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Setup {
+            path,
+            keep_roots,
+            json,
+        } => setup_cmd(path, keep_roots, json),
         Command::Repos => {
             let r = call("repo.list", Value::Null)?;
             for repo in r.as_array().map(|v| v.as_slice()).unwrap_or_default() {
@@ -1588,6 +1608,200 @@ fn print_search(v: &Value) {
     println!("\nread around a hit: rlord history <session or transcript path> --around <line>");
 }
 
+/// `rlord setup [PATH] [--keep-roots] [--json]`.
+fn setup_cmd(path: Option<String>, keep_roots: bool, json_out: bool) -> Result<()> {
+    use rlord_core::config::{contract_tilde, expand_tilde};
+    use std::io::{IsTerminal, Write};
+    let cwd = std::env::current_dir()?;
+    let launch = rlord_core::git::main_repo_root(&cwd.to_string_lossy());
+    let sugg = call("setup.suggest", json!({"launch_dir": launch}))?;
+    let configured: Vec<String> = sugg["roots"]["configured"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let print_saved = |r: &Value| {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(r).unwrap_or_default());
+            return;
+        }
+        let roots: Vec<String> = r["repo_roots"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(contract_tilde)
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!(
+            "code folder: {}{} · the repo finder scans {}",
+            contract_tilde(r["code_dir"].as_str().unwrap_or("")),
+            if r["created"] == true {
+                " (created)"
+            } else {
+                ""
+            },
+            roots.join(", ")
+        );
+        println!("saved to {}", r["config"].as_str().unwrap_or(""));
+    };
+    if let Some(p) = path {
+        let p = absolute_folder(&p, &cwd);
+        let roots = setup_roots_default(&configured, keep_roots);
+        let r = call(
+            "setup.apply",
+            json!({"code_dir": p, "roots": roots, "create": true}),
+        )?;
+        print_saved(&r);
+        return Ok(());
+    }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&sugg)?);
+        return Ok(());
+    }
+    let label = |c: &Value| {
+        let sources: Vec<(String, usize)> = sugg["sources"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0) as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut l = format!(
+            "{}: {}",
+            contract_tilde(c["path"].as_str().unwrap_or("")),
+            rlord_core::code_dir::basis(
+                c["projects"].as_u64().unwrap_or(0) as usize,
+                c["of"].as_u64().unwrap_or(0) as usize,
+                &sources
+            )
+        );
+        if c["from"] == "repo_roots" {
+            l.push_str(" (your repo_roots)");
+        }
+        if c["prompts"] == true {
+            l.push_str(" (macOS will ask permission for it once)");
+        }
+        l
+    };
+    let current = sugg["code_dir"].as_str().unwrap_or("");
+    if !current.is_empty() {
+        println!("code folder now: {}", contract_tilde(current));
+    }
+    let best = sugg["suggestion"]
+        .as_object()
+        .map(|_| contract_tilde(sugg["suggestion"]["path"].as_str().unwrap_or("")));
+    match &best {
+        Some(_) => println!("suggested: {}", label(&sugg["suggestion"])),
+        None => println!("rlord found no projects yet to suggest a code folder from"),
+    }
+    for a in sugg["alternatives"].as_array().into_iter().flatten() {
+        println!("       or: {}", label(a));
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("pass the folder: rlord setup <path>");
+    }
+    let ask = |q: &str| -> Result<String> {
+        print!("{q}");
+        std::io::stdout().flush()?;
+        let mut a = String::new();
+        std::io::stdin().read_line(&mut a)?;
+        Ok(a.trim().to_string())
+    };
+    let prompt = match &best {
+        Some(b) => format!("Code folder [{b}]: "),
+        None => "Code folder: ".to_string(),
+    };
+    let Some(folder) = pick_folder(&ask(&prompt)?, best.as_deref()) else {
+        println!("aborted: no folder given");
+        return Ok(());
+    };
+    let folder = absolute_folder(&folder, &cwd);
+    let mut roots = setup_roots_default(&configured, keep_roots);
+    let differs = !configured.is_empty()
+        && configured
+            .iter()
+            .map(|r| expand_tilde(r))
+            .collect::<Vec<_>>()
+            != [folder.clone()];
+    if !keep_roots && differs {
+        let default_yes = roots == "follow";
+        let q = format!(
+            "The repo finder scans {} now. Scan {} instead? [{}] ",
+            configured.join(", "),
+            contract_tilde(&folder),
+            if default_yes { "Y/n" } else { "y/N" }
+        );
+        roots = if yes_no(&ask(&q)?, default_yes) {
+            "follow"
+        } else {
+            "leave"
+        };
+    }
+    let guarded = rlord_core::privacy::Guard::new(&[])
+        .prompts(std::path::Path::new(&folder))
+        .is_some();
+    if !guarded && !std::path::Path::new(&folder).is_dir() {
+        let q = format!("Create {}? [Y/n] ", contract_tilde(&folder));
+        if !yes_no(&ask(&q)?, true) {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+    let r = call(
+        "setup.apply",
+        json!({"code_dir": folder, "roots": roots, "create": true}),
+    )?;
+    print_saved(&r);
+    Ok(())
+}
+
+/// What `rlord setup` does with `repo_roots` unless asked: an old `["~"]`
+/// switches to the code folder; anything else is left (`--keep-roots`
+/// always leaves it).
+fn setup_roots_default(configured: &[String], keep_roots: bool) -> &'static str {
+    if !keep_roots && configured.len() == 1 && configured[0].trim() == "~" {
+        "follow"
+    } else {
+        "leave"
+    }
+}
+
+/// The folder typed at the prompt: empty takes the suggestion (None when
+/// there is none).
+fn pick_folder(answer: &str, suggestion: Option<&str>) -> Option<String> {
+    match answer.trim() {
+        "" => suggestion.map(str::to_string),
+        a => Some(a.to_string()),
+    }
+}
+
+/// A yes/no answer; empty or anything else takes the default.
+fn yes_no(answer: &str, default: bool) -> bool {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    }
+}
+
+/// A folder as typed, made absolute: `~` expanded, a relative path taken
+/// from `cwd`.
+fn absolute_folder(p: &str, cwd: &std::path::Path) -> String {
+    let p = rlord_core::config::expand_tilde(p.trim());
+    if std::path::Path::new(&p).is_absolute() {
+        p
+    } else {
+        cwd.join(p).to_string_lossy().into_owned()
+    }
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -2160,6 +2374,22 @@ fn installed_by(exe: &std::path::Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn setup_prompt_helpers() {
+        let v = |r: &[&str]| r.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(setup_roots_default(&v(&["~"]), false), "follow");
+        assert_eq!(setup_roots_default(&v(&["~"]), true), "leave");
+        assert_eq!(setup_roots_default(&v(&["~/ko"]), false), "leave");
+        assert_eq!(setup_roots_default(&[], false), "leave");
+        assert_eq!(pick_folder("", Some("~/ko")).as_deref(), Some("~/ko"));
+        assert_eq!(pick_folder("  ~/x ", Some("~/ko")).as_deref(), Some("~/x"));
+        assert_eq!(pick_folder("", None), None);
+        assert!(yes_no("", true) && !yes_no("", false));
+        assert!(yes_no("Y", false) && !yes_no("no", true));
+        assert_eq!(absolute_folder("/a", Path::new("/c")), "/a");
+        assert_eq!(absolute_folder("b", Path::new("/c")), "/c/b");
+    }
 
     #[test]
     fn knows_package_managed_installs() {
