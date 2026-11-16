@@ -674,7 +674,7 @@ A small skill/CLAUDE.md snippet documents the tools and conventions
 ### CLI
 
 Thin UDS client, ~1 round-trip per command: `rlord ls` (rich table,
-`--sort last-agent-msg --status waiting --tag foo`), `new`, `attach`, `send`,
+`--sort last-agent-msg --status waiting --tag foo`), `new`, `setup`, `attach`, `send`,
 `restart`, `archive`, `rename`, `tag`, `log <id>` (event history), `doctor`,
 `daemon`. Also the plumbing subcommands: `hook emit`, `mcp`,
 `claude install-hooks`, `codex install-notify`.
@@ -1103,7 +1103,24 @@ including when the active one hits a usage limit.
   last result, with `scanning: true`
   while roots never scanned have no result yet (waited on for a scan's
   first 2s). One scan per set of roots at a time, and a stuck one is not
-  retried (the same folder would block the retry).
+  retried (the same folder would block the retry). The scan also predicts
+  what would stall it and stays out (`git::scan_repos`,
+  `core/src/privacy.rs`): by name, before any `stat`, the folders macOS
+  guards with a privacy prompt (`$HOME/{Desktop,Documents,Downloads,Movies,
+  Music,Pictures,Library}`, `/Volumes/*`; no public API reports TCC status
+  without risking the prompt); on every platform, a folder on another
+  filesystem than its root (`st_dev`, like `find -xdev`); and no symlink is
+  followed. Only the roots themselves (the code folder and each
+  `repo_roots` entry, all named by the user) are entered wherever they
+  are: a root inside a protected folder or below a mount is walked as its
+  own root, and a root nested in another, or named twice, is walked once.
+  A folder where a session runs grants nothing: a macOS privacy grant
+  belongs to the app that made the access, so a session under a terminal
+  or an editor proves nothing about rlord's daemon (that session's repo
+  still shows, from the DB, as a known repo). A folder whose metadata
+  can't be read is skipped silently.
+  Skipped folders come back in `repo.find` (`skipped`, at most 50) and the
+  finder and `find_repos` name them.
 - **UI control** (`daemon/src/ui.rs`): terminal navigation is done by the
   daemon with tmux. It switches the user's client (the most recently
   active one). TUI state is pushed
@@ -1171,6 +1188,59 @@ never silently ignored. Sections: `layout` (`side` = list left / preview
 right, `stack`), `list_width_pct`, `preview_refresh_ms`, `usage` (what the
 Usage column shows), `[keys]` (every TUI action), `[tmux]` (the three
 navigation bindings).
+
+### Setup: the code folder
+
+`[session] code_dir` is where the user keeps repos. The finder always
+scans it, plus each `repo_roots` entry, a folder named twice once
+(`SessionDefaults::scan_roots`). With neither set, the finder scans
+`~` until setup is answered, then nothing (`finder_roots`). Setup is
+answered when a kv row `setup_code_dir` exists (`done:` or `skipped:`): a
+skip ("don't ask again" on the form) never writes the config; Esc on the
+form records nothing, so it opens again next start.
+
+The suggestion is plain code (`core/src/code_dir.rs`) over folders rlord
+can read without walking the disk (`daemon/src/setup.rs`, bounded): the
+newest Claude Code project dirs (a `cwd` whose slug matches, from the
+first of a few transcripts that has one), Codex's `threads.cwd`, OpenCode's top-level
+`session_v2.directory` (only that table: the DB holds credentials), rlord's
+repos and session folders, and the launch folder. The vote is string work
+only; then a candidate about to be shown that is a git repo is left out
+(`.git` is looked for only under `$HOME` and where no macOS prompt
+guards, so no stat reaches `/net` or `/mnt`). Two subfolders of one repo
+still count as two projects (a known limit). Each project counts
+once; the folder holding the most within `repo_scan_depth` wins (ties: the
+deeper), never `$HOME` or above (as given or resolved), nor a system or
+mount parent (`/Volumes`, `/mnt`, `/run/media/<user>`, `/var`, …:
+`code_dir::NEVER`). A single explicit root outranks it when it
+could be suggested itself (not `$HOME` in any spelling, a system parent
+or a repo). Only the folders shown are `stat`-ed, and only when no
+privacy prompt guards them.
+
+It follows describe, then confirm (`tui/src/setupform.rs`), with one
+difference from the new-session form: the confirm saves by plain code
+(`setup.apply`, through `Config::set_code_dir`, which keeps the file as
+written). The overlord only proposes (`confirm_setup` reopens the form);
+it isn't called again. First run opens the form after the overlord
+dialog (or the model-upgrade or Remote Control dialog), only during that
+startup sequence, never when a dialog closes mid-session; `:setup`,
+`rlord setup` and the overlord open it later. The form
+opens at once with the configured roots (`setup.status`, cheap) and fills
+in the suggestion from another thread; it asks before creating a folder
+that doesn't exist. A folder macOS guards is saved unchecked
+(`checked: false`): checking or creating it would raise the prompt.
+`setup.apply` refuses what the suggestion never offers (a system or
+mount parent, a git repo where it can check), and takes `$HOME` itself
+only with `allow_home` (the form and the CLI warn and ask twice;
+`rlord setup --allow-home` without a terminal or with `--json`). The
+form looks at the disk from the UI thread only under `$HOME`; anything
+else is "not checked here" and left to `setup.apply`.
+What saving rlord's own suggestion does with `repo_roots` is the
+daemon's call (`setup::default_roots`, returned as `roots_default` and
+used as given by the TUI and the CLI): an old `["~"]` is dropped only
+until a folder has been saved once. An overlord proposal without
+`repo_roots` always leaves them. `confirm_setup` never reads the agents'
+files; the form loads the suggestion itself.
 
 ## Session creation
 

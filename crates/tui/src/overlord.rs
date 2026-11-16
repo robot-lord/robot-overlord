@@ -265,6 +265,11 @@ impl App {
             self.saved_sel = Some(id.clone());
             self.pending_select = Some(id);
         }
+        // The startup sequence: the overlord's dialogs, then the code
+        // folder (setupform.rs). A dialog that opens here goes on to setup
+        // when it closes; otherwise setup is checked now. (Set before a
+        // pending command too: a dialog it opens still leads to setup.)
+        self.startup_chain = true;
         if let Some(cmd) = self
             .call("ui.pending", Value::Null)
             .filter(|c| !c.is_null())
@@ -273,6 +278,8 @@ impl App {
             return; // the overlord asked for something; don't bury it
         }
         self.check_overlord();
+        // (The code folder follows once nothing is open: the event loop's
+        // `continue_startup`.)
     }
 
     pub(crate) fn check_overlord(&mut self) {
@@ -366,7 +373,13 @@ impl App {
                             );
                         }
                         self.dirty = true;
-                        self.show_overlord();
+                        // First run: the code folder next (if it opens),
+                        // then the overlord's overlay.
+                        if self.startup_chain {
+                            self.overlay_after_startup = true;
+                        } else {
+                            self.show_overlord();
+                        }
                     }
                     Err(e) => {
                         s.error = Some(format!("{e:#}"));
@@ -515,6 +528,29 @@ impl App {
             Some("keys") => {
                 self.open_keys(cmd["row"].as_str());
                 self.status_line = "the overlord opened the key screen".into();
+            }
+            // Never over something the user is typing into.
+            // (A setup form the user is working in counts as busy too.)
+            Some("setup")
+                if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Setup(_))
+                    || matches!(&self.mode, Mode::Setup(f) if f.is_touched()) =>
+            {
+                self.pending_setup = Some(cmd.clone());
+                self.status_line =
+                    "the overlord wants to open setup: finish here, then :setup".into();
+            }
+            Some("setup") => {
+                // At startup it is the first-run form, and the end of the
+                // startup sequence (no second form after it).
+                let first = std::mem::take(&mut self.startup_chain);
+                self.open_setup_from(&cmd);
+                if first {
+                    if let Mode::Setup(f) = &mut self.mode {
+                        f.auto = cmd["status"]["needed"] == true;
+                    }
+                }
+                self.status_line =
+                    "the overlord proposed a code folder — check it, then save".into();
             }
             Some("confirm_new_session") => {
                 self.open_new_form(newform::FormKind::Overlord);

@@ -128,6 +128,26 @@ enum Command {
     },
     /// List git repos rlord has used, most recent first
     Repos,
+    /// Set your code folder: where your repos live and new ones go (the
+    /// repo finder scans it). Without PATH, rlord suggests one from the
+    /// projects it has seen and asks.
+    Setup {
+        /// The folder (created if missing, except one macOS guards, which
+        /// is saved unchecked); no prompts
+        path: Option<String>,
+        /// Leave `[session] repo_roots` as it is (by default an old
+        /// `repo_roots = ["~"]` switches to scanning the code folder)
+        #[arg(long)]
+        keep_roots: bool,
+        /// Take your home folder itself as the code folder without asking
+        /// (the repo finder then scans all of it)
+        #[arg(long)]
+        allow_home: bool,
+        /// Print the suggestion (no PATH) or what was saved, as JSON; never
+        /// prompts
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach the terminal to a session (ref = id, id prefix, or name)
     Attach {
         r#ref: String,
@@ -885,6 +905,12 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Setup {
+            path,
+            keep_roots,
+            allow_home,
+            json,
+        } => setup_cmd(path, keep_roots, allow_home, json),
         Command::Repos => {
             let r = call("repo.list", Value::Null)?;
             for repo in r.as_array().map(|v| v.as_slice()).unwrap_or_default() {
@@ -1588,6 +1614,264 @@ fn print_search(v: &Value) {
     println!("\nread around a hit: rlord history <session or transcript path> --around <line>");
 }
 
+/// `rlord setup [PATH] [--keep-roots] [--allow-home] [--json]`.
+fn setup_cmd(
+    path: Option<String>,
+    keep_roots: bool,
+    allow_home_flag: bool,
+    json_out: bool,
+) -> Result<()> {
+    use rlord_core::config::contract_tilde;
+    use std::io::{IsTerminal, Write};
+    let cwd = std::env::current_dir()?;
+    // (A cheap look-up: the suggestion reads every agent's files, so it is
+    // asked for only when there is no PATH.)
+    let status = call("setup.status", json!({}))?;
+    let configured: Vec<String> = status["repo_roots"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let print_saved = |r: &Value| {
+        if json_out {
+            println!("{}", serde_json::to_string_pretty(r).unwrap_or_default());
+            return;
+        }
+        let roots: Vec<String> = r["repo_roots"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(contract_tilde)
+                    .collect()
+            })
+            .unwrap_or_default();
+        println!(
+            "code folder: {}{} · the repo finder scans {}",
+            contract_tilde(r["code_dir"].as_str().unwrap_or("")),
+            if r["created"] == true {
+                " (created)"
+            } else {
+                ""
+            },
+            roots.join(", ")
+        );
+        if r["checked"] == false {
+            println!(
+                "not checked: macOS guards this folder; create it yourself if it doesn't exist"
+            );
+        }
+        println!("saved to {}", r["config"].as_str().unwrap_or(""));
+    };
+    let ask = |q: &str| -> Result<String> {
+        print!("{q}");
+        std::io::stdout().flush()?;
+        let mut a = String::new();
+        std::io::stdin().read_line(&mut a)?;
+        Ok(a.trim().to_string())
+    };
+    let terminal = std::io::stdin().is_terminal();
+    // `$HOME` itself: the finder would scan all of it. Said, and confirmed
+    // at a terminal; refused otherwise.
+    let home_ok = |folder: &str| -> Result<bool> {
+        if !is_home(folder) {
+            return Ok(false);
+        }
+        if allow_home_flag {
+            return Ok(true);
+        }
+        let warn = format!(
+            "{} is your whole home folder: the repo finder scans all of it.",
+            contract_tilde(folder)
+        );
+        // (`--json` never prompts.)
+        if !terminal || json_out {
+            anyhow::bail!("{warn} Pass --allow-home to use it anyway.");
+        }
+        if !yes_no(&ask(&format!("{warn} Use it anyway? [y/N] "))?, false) {
+            anyhow::bail!("aborted");
+        }
+        Ok(true)
+    };
+    if let Some(p) = path {
+        let p = absolute_folder(&p, &cwd)?;
+        let allow_home = home_ok(&p)?;
+        let roots = roots_edit(&status["roots_default"], keep_roots);
+        let r = call(
+            "setup.apply",
+            json!({"code_dir": p, "roots": roots, "create": true, "allow_home": allow_home}),
+        )?;
+        print_saved(&r);
+        return Ok(());
+    }
+    // (Nothing to ask without a terminal: say so before reading every
+    // agent's files for a suggestion.)
+    if !json_out && !terminal {
+        anyhow::bail!("pass the folder: rlord setup <path> (or --json for rlord's suggestion)");
+    }
+    let launch = rlord_core::git::main_repo_root(&cwd.to_string_lossy());
+    let sugg = call("setup.suggest", json!({"launch_dir": launch}))?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&sugg)?);
+        return Ok(());
+    }
+    let label = |c: &Value| {
+        let sources = rlord_core::code_dir::sources_of(&sugg["sources"]);
+        let mut l = format!(
+            "{}: {}",
+            contract_tilde(c["path"].as_str().unwrap_or("")),
+            rlord_core::code_dir::basis(
+                c["projects"].as_u64().unwrap_or(0) as usize,
+                c["of"].as_u64().unwrap_or(0) as usize,
+                &sources
+            )
+        );
+        if c["from"] == "repo_roots" {
+            l.push_str(" (your repo_roots)");
+        }
+        if c["prompts"] == true {
+            l.push_str(" (macOS will ask permission for it once)");
+        } else if c["checked"] == false {
+            l.push_str(" (not checked)");
+        }
+        l
+    };
+    let current = sugg["code_dir"].as_str().unwrap_or("");
+    if !current.is_empty() {
+        println!("code folder now: {}", contract_tilde(current));
+    }
+    let best = sugg["suggestion"]
+        .as_object()
+        .map(|_| contract_tilde(sugg["suggestion"]["path"].as_str().unwrap_or("")));
+    match &best {
+        Some(_) => println!("suggested: {}", label(&sugg["suggestion"])),
+        None => println!("rlord found no projects yet to suggest a code folder from"),
+    }
+    for a in sugg["alternatives"].as_array().into_iter().flatten() {
+        println!("       or: {}", label(a));
+    }
+    let prompt = match &best {
+        Some(b) => format!("Code folder [{b}]: "),
+        None => "Code folder: ".to_string(),
+    };
+    let Some(folder) = pick_folder(&ask(&prompt)?, best.as_deref()) else {
+        println!("aborted: no folder given");
+        return Ok(());
+    };
+    let folder = absolute_folder(&folder, &cwd)?;
+    let allow_home = home_ok(&folder)?;
+    let mut roots = roots_edit(&status["roots_default"], keep_roots);
+    let differs = rlord_core::config::roots_beyond_code_dir(&configured, &folder);
+    if !keep_roots && differs {
+        let default_yes = roots == "follow";
+        let roots_was = roots.clone();
+        let q = roots_question(
+            status["code_dir"].as_str().unwrap_or(""),
+            &configured,
+            &folder,
+            default_yes,
+        );
+        roots = if yes_no(&ask(&q)?, default_yes) {
+            json!("follow")
+        } else if default_yes {
+            json!("leave")
+        } else {
+            roots_was
+        };
+    }
+    let guarded = rlord_core::privacy::Guard::new()
+        .prompts(std::path::Path::new(&folder))
+        .is_some();
+    if !guarded && !std::path::Path::new(&folder).is_dir() {
+        let q = format!("Create {}? [Y/n] ", contract_tilde(&folder));
+        if !yes_no(&ask(&q)?, true) {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+    let r = call(
+        "setup.apply",
+        json!({"code_dir": folder, "roots": roots, "create": true, "allow_home": allow_home}),
+    )?;
+    print_saved(&r);
+    Ok(())
+}
+
+/// `folder` is `$HOME` (as given or resolved).
+fn is_home(folder: &str) -> bool {
+    rlord_core::privacy::is_home(std::path::Path::new(folder))
+}
+
+/// The question about `repo_roots`: everything the finder scans now (the
+/// code folder and `repo_roots`), and exactly what "y" changes.
+fn roots_question(
+    code_dir: &str,
+    configured: &[String],
+    folder: &str,
+    default_yes: bool,
+) -> String {
+    use rlord_core::config::contract_tilde;
+    let now: Vec<String> = std::iter::once(code_dir)
+        .filter(|c| !c.is_empty())
+        .map(contract_tilde)
+        .chain(configured.iter().cloned())
+        .collect();
+    format!(
+        "The repo finder scans {} now. y: remove repo_roots ({}) from the config, so it \
+         scans only {}. [{}] ",
+        now.join(", "),
+        configured.join(", "),
+        contract_tilde(folder),
+        if default_yes { "Y/n" } else { "y/N" }
+    )
+}
+
+/// What `rlord setup` does with `repo_roots`: the daemon's
+/// `roots_default` (`setup.status`) as given, or leave them with
+/// `--keep-roots`.
+fn roots_edit(default: &Value, keep_roots: bool) -> Value {
+    if keep_roots || default.is_null() {
+        json!("leave")
+    } else {
+        default.clone()
+    }
+}
+
+/// The folder typed at the prompt: empty takes the suggestion (None when
+/// there is none).
+fn pick_folder(answer: &str, suggestion: Option<&str>) -> Option<String> {
+    match answer.trim() {
+        "" => suggestion.map(str::to_string),
+        a => Some(a.to_string()),
+    }
+}
+
+/// A yes/no answer; empty or anything else takes the default.
+fn yes_no(answer: &str, default: bool) -> bool {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    }
+}
+
+/// A folder as typed, made absolute: `~` expanded, a relative path taken
+/// from `cwd`, then checked as every folder rlord saves is
+/// (`config::absolute_dir`: not `/`, trailing `/` trimmed).
+fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
+    let e = rlord_core::config::expand_tilde(p.trim());
+    let abs = if std::path::Path::new(&e).is_absolute() {
+        e
+    } else {
+        cwd.join(e).to_string_lossy().into_owned()
+    };
+    rlord_core::config::absolute_dir(&abs)
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -2160,6 +2444,27 @@ fn installed_by(exe: &std::path::Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn setup_prompt_helpers() {
+        assert_eq!(
+            roots_question("/nope/ko", &["~".into()], "/nope/code", true),
+            "The repo finder scans /nope/ko, ~ now. y: remove repo_roots (~) from the config, \
+             so it scans only /nope/code. [Y/n] "
+        );
+        assert_eq!(roots_edit(&json!("follow"), false), "follow");
+        assert_eq!(roots_edit(&json!("follow"), true), "leave");
+        assert_eq!(roots_edit(&json!("leave"), false), "leave");
+        assert_eq!(roots_edit(&Value::Null, false), "leave");
+        assert_eq!(pick_folder("", Some("~/ko")).as_deref(), Some("~/ko"));
+        assert_eq!(pick_folder("  ~/x ", Some("~/ko")).as_deref(), Some("~/x"));
+        assert_eq!(pick_folder("", None), None);
+        assert!(yes_no("", true) && !yes_no("", false));
+        assert!(yes_no("Y", false) && !yes_no("no", true));
+        assert_eq!(absolute_folder("/a/", Path::new("/c")).unwrap(), "/a");
+        assert_eq!(absolute_folder("b", Path::new("/c")).unwrap(), "/c/b");
+        assert!(absolute_folder("/", Path::new("/c")).is_err());
+    }
 
     #[test]
     fn knows_package_managed_installs() {

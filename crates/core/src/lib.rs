@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod code_dir;
 pub mod config;
 pub mod db;
 pub mod git;
@@ -8,6 +9,7 @@ pub mod keys;
 pub mod models;
 pub mod names;
 pub mod paths;
+pub mod privacy;
 pub mod process;
 pub mod themes;
 pub mod timefmt;

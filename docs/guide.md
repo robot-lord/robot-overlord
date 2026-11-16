@@ -83,6 +83,25 @@ to switch and restart, and the conversation resumes.
 `rlord overlord status|model <m>|restart|open` does the same from the CLI
 (`rlord overlord switch <agent>`: see "An overlord per agent").
 
+Next, the first start asks **where you keep your code**: your code folder
+(`[session] code_dir`). The repo finder scans it, and new repos go there.
+rlord fills in a suggestion: the folder holding most of the projects it has
+seen (Claude Code's project list, Codex's and OpenCode's sessions, rlord's
+own sessions and repos, the folder you started `rlord` in), with what it
+rests on ("14 of 17 projects rlord has seen"). ←/→ shows the alternatives;
+type to change it (a folder that doesn't exist is created once you press
+`enter` again to confirm; one macOS guards, like `~/Documents/x`, is saved
+without checking, so create it yourself; your home folder itself is
+taken only after a second `enter`, since the finder then scans all of
+it; a system folder or a repo is refused). `enter` saves
+it. With an overlord, an optional box lets you describe it in your own
+words instead ("work in ~/ko, personal in ~/proj"): the overlord reopens
+the form with its reading of that, and saving saves what it shows. `esc`
+puts it off until the next start; `ctrl-d` there stops asking (with no code
+folder, the finder then lists only repos you've used, unless `repo_roots`
+is set). `:setup` opens it any time, `rlord setup [PATH]` does the same
+from a terminal, and you can just tell the overlord "my code is in ~/ko".
+
 ### Which agent runs the overlord
 
 Each agent gets the same thing in its own terms: rlord's tools without a
@@ -283,16 +302,32 @@ message.
 else the repo around the current directory). `shift-enter`, `ctrl-s` or `Enter` on
 Launch launches; `Enter` on the repo line opens the repo list — default first (★), then
 every repo you've used, most recent first — plus "find another repo…" (a
-filter-as-you-type finder over every git repo under `repo_roots`, default
-`["~"]` to depth 3, MRU first; a typed path that is a repo is offered too.
-On macOS the scan skips `~/Desktop`, `~/Documents`, `~/Downloads`,
-`~/Movies`, `~/Music` and `~/Pictures`, where reading waits on a privacy
-prompt; add one to `repo_roots` to scan it)
-and "no repo — plain folder…". `Tab`/`↑↓` move between fields (name, model,
+filter-as-you-type finder, MRU first; a typed path that is a repo is offered
+too) and "no repo — plain folder…".
+
+The finder scans your code folder (`code_dir`) to `repo_scan_depth` (3),
+plus any folders in `repo_roots` (`repo_roots = ["~/work"]`). Until you
+set a code folder, or say "don't ask again" on the form, it scans `~`;
+after that with none set (and no `repo_roots`), it lists only repos you've
+used. It stays out of folders where
+reading could stall, and says which it skipped: on macOS the folders that
+raise a privacy prompt (`~/Desktop`, `~/Documents`, `~/Downloads`,
+`~/Movies`, `~/Music`, `~/Pictures`, `~/Library`, anything under
+`/Volumes`), and on every system another disk or network mount below a
+scanned folder. It never follows a symlink. A folder you named is always
+scanned, wherever it is: your code folder and each `repo_roots` entry
+(`repo_roots = ["~"]` with `code_dir = "~/Documents/code"` still scans
+`~/Documents/code`; a code folder on another disk is scanned too), and
+nothing else in those places is. A repo you've run a session in always
+shows, as a repo you've used. `Tab`/`↑↓` move between fields (name, model,
 workspace toggle, branch — auto-derived from the name until you edit it —
 first prompt). From the CLI: `rlord new [--repo R | --project DIR]
 [--no-workspace] [--branch B] [--model M] [--name N] [prompt…]`;
-`rlord repos` lists known repos.
+`rlord repos` lists known repos; `rlord setup [PATH] [--keep-roots] [--allow-home]` sets
+the code folder (without PATH it shows rlord's suggestion and asks).
+
+A new repo goes in the code folder: ask the overlord for work that needs
+one and it launches the session there, telling it where to create it.
 
 ## Codex sessions
 
@@ -728,7 +763,7 @@ Option send Alt, e.g. kitty `macos_option_as_alt both`.) Option-D and
 Option-O are bindings in rlord's own tmux server (`rlord tmux bind|unbind`).
 
 The footer shows only the everyday keys. `?` opens a cheat sheet of every
-key; `:` opens a command launcher for the rest (`:keys`, `:sort created`,
+key; `:` opens a command launcher for the rest (`:keys`, `:setup`, `:sort created`,
 `:archived`, `:log`, `:usage tokens`, …).
 In the launcher, menus and form pickers, `ctrl-n`/`ctrl-p` and
 `ctrl-j`/`ctrl-k` move up and down as the arrows do (as in fzf); plain

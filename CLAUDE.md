@@ -131,6 +131,10 @@ fields with defaults, a `confirm_*` MCP tool that reopens the form, and
 `overlord.md` rules for when to use it. Reference implementation: `n` in the
 list (`tui/src/newform.rs`, `confirm_new_session`, `ask::format_request`).
 A manual form (`N`) can exist alongside it for users who want no overlord.
+The code-folder form (`tui/src/setupform.rs`, `confirm_setup`) is the
+second, with one difference: what the overlord only has to confirm is
+saved by plain code when the user confirms (`setup.apply`), without another
+overlord turn.
 
 ## Review every PR before it merges
 

@@ -122,6 +122,9 @@ rlord install-hooks          # once: lets rlord see what your agents are doing
 rlord                        # open the list
 ```
 
+On first start rlord asks where you keep your code, with a folder it
+suggests from the projects it has seen; `rlord setup` changes it later.
+
 Then:
 
 | | |

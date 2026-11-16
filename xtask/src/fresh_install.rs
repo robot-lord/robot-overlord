@@ -100,10 +100,13 @@ impl Way {
             [
                 "ping",
                 "tui-first-run",
+                "tui-setup-form",
                 "agents-none-json",
                 "agents-none",
                 "overlord-status-none",
                 "new-none",
+                "setup",
+                "setup-config",
                 "standins",
                 "agents-standins-json",
                 "install-hooks",
@@ -226,6 +229,18 @@ fn judge(step: &Step, way: Way, ver: &Version) -> Option<String> {
         "tui-first-run" => need(
             has("Start your overlord") && has("rlord agents"),
             "the first run should open the overlord setup, saying no agent is installed",
+        ),
+        "tui-setup-form" => need(
+            has("Where do you keep your code") && has("rlord found no projects yet"),
+            "after the overlord dialog, the code-folder form should open, with no projects seen",
+        ),
+        "setup" => need(
+            ok && has("code folder: ~/proj"),
+            "`rlord setup <path>` should save the code folder",
+        ),
+        "setup-config" => need(
+            ok && has("code_dir = \"~/proj\""),
+            "the config should hold the code folder after `rlord setup`",
         ),
         "agents-none-json" => agents_check(&step.out, |a| {
             (a["installed"] == false && a["install"]["command"].as_str().is_some())
@@ -691,6 +706,19 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            judge(
+                &step(
+                    "setup",
+                    0,
+                    "code folder: ~/proj · the repo finder scans ~/proj"
+                ),
+                Way::Deb,
+                &v
+            ),
+            None
+        );
+        assert!(judge(&step("setup-config", 0, "code_dir = \"\""), Way::Deb, &v).is_some());
         // Unlisted steps just need to succeed.
         assert_eq!(judge(&step("stop-codex", 0, ""), Way::Deb, &v), None);
         assert!(judge(&step("reset", 1, "old daemon did not exit"), Way::Deb, &v).is_some());

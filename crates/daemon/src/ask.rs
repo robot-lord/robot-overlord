@@ -10,6 +10,10 @@
 //! defaults (repo, agent, model, worktree, tags), formatted as a
 //! `[rlord new-session request]` message. The overlord's instructions say
 //! what that header means: launch exactly one session for this request.
+//!
+//! `overlord.setup_request` is the code-folder form's description, sent as
+//! a `[rlord setup request]`: the overlord answers with `confirm_setup`,
+//! and the user's confirm on the form saves it (no second round).
 
 use std::time::{Duration, Instant};
 
@@ -293,9 +297,123 @@ pub fn format_request(p: &Value) -> Result<String> {
     Ok(m)
 }
 
+/// `{description, code_dir, code_dir_source, roots, roots_source}` from
+/// the code-folder form (`tui/src/setupform.rs`).
+pub fn setup_request(d: &Daemon, params: &Value) -> Result<Value> {
+    send(d, &format_setup_request(params)?)
+}
+
+/// The `[rlord setup request]` message: the form's hints, whose they
+/// were, and the description verbatim.
+pub fn format_setup_request(p: &Value) -> Result<String> {
+    let description = p["description"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .context("the description is empty")?;
+    let dir = p["code_dir"].as_str().map(str::trim).unwrap_or("");
+    let source = p["code_dir_source"]
+        .as_str()
+        .filter(|s| {
+            matches!(
+                *s,
+                "suggested by rlord"
+                    | "picked by the user"
+                    | "current setting"
+                    | "proposed by the overlord"
+            )
+        })
+        .unwrap_or("not set");
+    let mut m = String::from("[rlord setup request]\n");
+    m += "hints (optional; the description wins if they disagree):\n";
+    m += &if dir.is_empty() || source == "not set" {
+        "- code folder: (not set)\n".to_string()
+    } else {
+        format!("- code folder: {dir} ({source})\n")
+    };
+    // Each roots line says how to pass that same choice back to
+    // confirm_setup, so a choice the user made survives the round trip.
+    m += &match &p["roots"] {
+        Value::Array(a) if !a.is_empty() => {
+            let list: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            if p["roots_source"] == "config" {
+                format!(
+                    "- repo finder scans: the code folder and {} (from the user's config; \
+                     to keep this: omit repo_roots)\n",
+                    list.join(", ")
+                )
+            } else {
+                format!(
+                    "- repo finder scans: the code folder and {} (picked by the user; \
+                     to keep this: repo_roots: {})\n",
+                    list.join(", "),
+                    json!(list)
+                )
+            }
+        }
+        _ if p["roots_source"] == "default" => {
+            "- repo finder scans: the code folder only (rlord's default; \
+             to keep this: repo_roots: [])\n"
+                .to_string()
+        }
+        _ => {
+            "- repo finder scans: the code folder only (to keep this: repo_roots: [])\n".to_string()
+        }
+    };
+    m += "description:\n";
+    m += description;
+    Ok(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_request_message() {
+        let m = format_setup_request(&json!({
+            "description": " mine are in ~/ko and ~/proj ", "code_dir": "/h/ko",
+            "code_dir_source": "suggested by rlord", "roots": "follow",
+        }))
+        .unwrap();
+        assert_eq!(
+            m,
+            "[rlord setup request]\nhints (optional; the description wins if they disagree):\n\
+             - code folder: /h/ko (suggested by rlord)\n\
+             - repo finder scans: the code folder only (to keep this: repo_roots: [])\n\
+             description:\nmine are in ~/ko and ~/proj"
+        );
+        let m = format_setup_request(&json!({"description": "x", "code_dir": "/h/x",
+            "code_dir_source": "picked by the user", "roots": ["~"], "roots_source": "config"}))
+        .unwrap();
+        assert!(
+            m.contains("- code folder: /h/x (picked by the user)\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains(
+                "- repo finder scans: the code folder and ~ (from the user's config; \
+                 to keep this: omit repo_roots)\n"
+            ),
+            "{m}"
+        );
+        let m = format_setup_request(&json!({"description": "x", "code_dir": "",
+            "roots": ["/a", "/b"], "roots_source": "user"}))
+        .unwrap();
+        assert!(m.contains("- code folder: (not set)\n"), "{m}");
+        assert!(
+            m.contains(
+                "- repo finder scans: the code folder and /a, /b (picked by the user; \
+                 to keep this: repo_roots: [\"/a\",\"/b\"])\n"
+            ),
+            "{m}"
+        );
+        let m = format_setup_request(&json!({"description": "x", "roots": "follow",
+            "roots_source": "default"}))
+        .unwrap();
+        assert!(m.contains("the code folder only (rlord's default; "), "{m}");
+        assert!(format_setup_request(&json!({"description": " "})).is_err());
+    }
 
     #[test]
     fn request_message_keeps_the_description_verbatim() {

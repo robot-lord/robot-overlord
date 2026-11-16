@@ -155,10 +155,10 @@ pub fn tools() -> Value {
                 "show": b("Take the user to the list (default true)"),
             }), &[]),
         tool("find_repos",
-            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there.",
+            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there. `skipped`: folders the scan stayed out of (a macOS privacy prompt, another disk): a repo in one is found by its path, not by scanning.",
             json!({"query": s("Words that must appear in the path")}), &[]),
         tool("get_session_defaults",
-            "The defaults new sessions get (agent, model, model choices, workspace, default repo), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
+            "The defaults new sessions get (agent, model, model choices, workspace, default repo), `code_dir` (the folder the user keeps repos in and where new ones go; \"\" = not set yet, see confirm_setup), `repo_roots` as the user configured them, `scan_roots` (what the repo finder scans right now: a readout, never pass it to confirm_setup as repo_roots), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
         tool("list_agents",
             "The coding agents rlord knows (Claude Code, Codex, OpenCode): whether each is installed (and its version), whether rlord can run sessions on it (`too_old`: installed, but a version rlord can't run), whether rlord's hooks are installed (and, for Codex, trusted; null for OpenCode, which needs none), what's left to do, and for one that's missing the install command to suggest for this machine. Plain look-ups, no AI. rlord never installs an agent: the user runs the command.",
@@ -169,6 +169,17 @@ pub fn tools() -> Value {
                 "query": s("Words to find in your earlier conversations (all must appear in one message); omit for a digest of the previous one"),
                 "conversation": s("A conversation id from a recall search: digest that one instead of the previous"),
                 "limit": {"type": "integer", "description": "Conversations to return for a query (default 6)"},
+            }), &[]),
+        tool("confirm_setup",
+            "Open the code-folder form on the user's screen (hides your overlay) for them to confirm: the folder they keep repos in (`code_dir`: the repo finder scans it and new repos go there). Pass what you would save; with nothing passed the form shows rlord's own suggestion, worked out from the projects it has seen. Nothing is saved until they confirm there, and rlord saves it then: you don't act again.",
+            json!({
+                "code_dir": s("The folder as you would save it; answering a setup request, the one the description names (it wins over the hints). Omit: rlord's suggestion"),
+                "repo_roots": {"type": "array", "items": {"type": "string"},
+                               "description": "More folders for the repo finder to scan besides code_dir, which it always scans. Omit to leave the user's configured ones as they are; [] to scan only code_dir. Answering a setup request: pass the roots choice exactly as the request's roots line says, unless the description asks for something else. Never pass get_session_defaults' scan_roots here"},
+                "description": s("The user's description, verbatim, when answering a setup request"),
+                "changed": {"type": "array", "items": {"type": "string", "enum": ["code_dir", "repo_roots"]},
+                            "description": "Hints you changed from what the user sent"},
+                "note": s("One line for the top of the form, e.g. \"Scanning both ~/ko and ~/proj, new repos in ~/ko\""),
             }), &[]),
         tool("propose_session",
             "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
@@ -369,6 +380,53 @@ fn summarize_candidate(c: &Value) -> Value {
     row
 }
 
+/// What `find_repos` hands the overlord from a `repo.find` result: the
+/// repos matching `query` (at most 40), whether the scan is still running,
+/// the folders it stayed out of (at most 10, `skipped_more` counts the
+/// rest), and a note when the finder scans nothing.
+fn shape_find_repos(r: &Value, query: &str) -> Value {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let repos: Vec<Value> = r["repos"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|x| {
+                    let p = x["path"].as_str().unwrap_or("").to_lowercase();
+                    words.iter().all(|w| p.contains(w.as_str()))
+                })
+                .take(40)
+                .map(|x| {
+                    json!({"path": x["path"], "default": x["default"],
+                           "last_used": x["last_used_at"].as_i64().map(|t| rel_age(Some(t)))})
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = json!({"repos": repos});
+    if r["scanning"].as_bool() == Some(true) {
+        out["scanning"] = true.into();
+    }
+    let skipped = r["skipped"].as_array().cloned().unwrap_or_default();
+    if !skipped.is_empty() {
+        out["skipped"] = skipped
+            .iter()
+            .take(10)
+            .map(|k| json!({"path": k["path"], "why": k["text"]}))
+            .collect();
+        let more =
+            skipped.len().saturating_sub(10) as u64 + r["skipped_more"].as_u64().unwrap_or(0);
+        if more > 0 {
+            out["skipped_more"] = more.into();
+        }
+    }
+    if r["roots"].as_array().is_some_and(|a| a.is_empty()) {
+        out["note"] = json!(
+            "no code folder set: only repos already used are listed (confirm_setup sets one)"
+        );
+    }
+    out
+}
+
 fn params_wants_remote(args: &Value) -> bool {
     args.get("remote_control").and_then(Value::as_bool) == Some(true)
 }
@@ -464,32 +522,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         }
         "find_repos" => {
             let r = d.rpc("repo.find", json!({}))?;
-            let words: Vec<String> = arg_str(args, "query")
-                .unwrap_or("")
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
-            let repos: Vec<Value> = r["repos"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter(|x| {
-                            let p = x["path"].as_str().unwrap_or("").to_lowercase();
-                            words.iter().all(|w| p.contains(w.as_str()))
-                        })
-                        .take(40)
-                        .map(|x| {
-                            json!({"path": x["path"], "default": x["default"],
-                                   "last_used": x["last_used_at"].as_i64().map(|t| rel_age(Some(t)))})
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut out = json!({"repos": repos});
-            if r["scanning"].as_bool() == Some(true) {
-                out["scanning"] = true.into();
-            }
-            Ok(out)
+            Ok(shape_find_repos(&r, arg_str(args, "query").unwrap_or("")))
         }
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)
@@ -502,6 +535,15 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         ),
         "list_agents" => d.rpc("agents.list", json!({})),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),
+        "confirm_setup" => {
+            let mut p = Map::new();
+            for k in ["code_dir", "repo_roots", "description", "changed", "note"] {
+                if let Some(v) = args.get(k) {
+                    p.insert(k.into(), v.clone());
+                }
+            }
+            d.rpc("ui.confirm_setup", Value::Object(p))
+        }
         "confirm_new_session" => {
             let mut p = Map::new();
             for k in [
@@ -744,6 +786,7 @@ mod tests {
         "list_agents",
         "propose_session",
         "confirm_new_session",
+        "confirm_setup",
         "create_session",
         "update_session",
         "remote_control",
@@ -758,6 +801,27 @@ mod tests {
         "resume_after_limit",
         "session_action",
     ];
+
+    #[test]
+    fn find_repos_reports_skipped_folders_and_no_roots() {
+        let skipped: Vec<Value> = (0..12)
+            .map(|i| json!({"path": format!("/x/{i}"), "why": "privacy", "text": "macOS asks permission"}))
+            .collect();
+        let r = json!({
+            "repos": [{"path": "/h/ko/a", "default": false, "last_used_at": null},
+                      {"path": "/h/b", "default": false, "last_used_at": null}],
+            "roots": ["/h"], "skipped": skipped, "skipped_more": 3,
+        });
+        let out = shape_find_repos(&r, "ko");
+        assert_eq!(out["repos"].as_array().unwrap().len(), 1);
+        assert_eq!(out["skipped"].as_array().unwrap().len(), 10);
+        assert_eq!(out["skipped"][0]["why"], "macOS asks permission");
+        assert_eq!(out["skipped_more"], 5);
+        assert!(out.get("note").is_none());
+        let out = shape_find_repos(&json!({"repos": [], "roots": []}), "");
+        assert!(out["note"].as_str().unwrap().contains("no code folder"));
+        assert!(out.get("skipped").is_none());
+    }
 
     #[test]
     fn read_only_tools_are_an_explicit_allow_list() {

@@ -1483,6 +1483,24 @@ pub fn directory(db: &Path, id: &str) -> Option<String> {
         .ok()
 }
 
+/// The folders top-level OpenCode sessions ran in (not sub-agents'):
+/// distinct, most recently updated first, at most `limit`. Reads only `session_v2` (the database also
+/// holds credentials).
+pub fn directories(db: &Path, limit: usize) -> Vec<String> {
+    let Some(c) = open(db) else {
+        return Vec::new();
+    };
+    let Ok(mut q) = c.prepare(
+        "SELECT directory FROM session_v2 WHERE parent_id IS NULL \
+         GROUP BY directory ORDER BY MAX(time_updated) DESC LIMIT ?1",
+    ) else {
+        return Vec::new();
+    };
+    q.query_map([limit as i64], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 /// The session `id` is a child of (a sub-agent's session names its
 /// parent): `Some(Some(parent))`, or `Some(None)` for a session that has
 /// none. `None` when it can't be told (the database couldn't be read, or
@@ -2075,6 +2093,25 @@ pub(crate) mod tests {
         ] {
             assert_eq!(locate(Path::new(other)), None, "{other}");
         }
+    }
+
+    #[test]
+    fn directories_leave_out_child_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "INSERT INTO session_v2 (id, project_id, parent_id, directory, time_created, time_updated) \
+               VALUES ('ses_b', 'p', NULL, '/src/app', 1, 1), \
+                      ('ses_c', 'p', 'ses_b', '/src/child', 1, 1), \
+                      ('ses_d', 'p', NULL, '/src/web', 1, 9999999999999);",
+        )
+        .unwrap();
+        drop(c);
+        assert_eq!(directories(&db, 10), ["/src/web", "/src/app"]);
+        // The limit keeps the newest.
+        assert_eq!(directories(&db, 1), ["/src/web"]);
+        assert!(directories(&dir.path().join("absent.db"), 10).is_empty());
     }
 
     #[test]

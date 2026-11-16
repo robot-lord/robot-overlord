@@ -23,6 +23,7 @@ mod newform;
 mod overlay;
 mod overlord;
 mod record;
+mod setupform;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -179,6 +180,9 @@ enum Mode {
     RenameGroup(String),
     NewSession(Box<NewForm>),
     OverlordSetup(Box<overlord::Setup>),
+    /// The code-folder form (first run, `:setup`, the overlord's
+    /// `confirm_setup`).
+    Setup(Box<setupform::SetupForm>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
@@ -259,6 +263,33 @@ struct App {
     conv_text: Option<(String, String)>,
     /// Session to select once the next refresh lands (set by the overlord).
     pending_select: Option<String>,
+    /// The overlord asked to open the code-folder form while the user was
+    /// busy in another one: `:setup` opens it then.
+    pending_setup: Option<Value>,
+    /// The code-folder form's suggestion, being worked out on another
+    /// thread (`App::open_setup`).
+    setup_rx: Option<mpsc::Receiver<Value>>,
+    /// The first-run code-folder form was put off (Esc) this run: closing
+    /// another dialog doesn't reopen it (`check_setup`).
+    setup_put_off: bool,
+    /// The startup sequence (overlord dialog, model upgrade, Remote
+    /// Control offer, then the code folder) is still running: a dialog
+    /// closing leads to setup once nothing is open (`continue_startup`).
+    startup_chain: bool,
+    /// The overlord was just created in the startup sequence: its overlay
+    /// opens once the code folder is settled.
+    overlay_after_startup: bool,
+    /// rlord's code-folder suggestion, once worked out this run: reused by
+    /// later opens (`load_suggestion`).
+    last_suggestion: Option<Value>,
+    /// A setup request on its way to the overlord, and the form it came
+    /// from (`poll_setup_send`).
+    setup_send: Option<setupform::SetupSend>,
+    /// That form, to reopen once nothing else is open (the send failed).
+    setup_retry: Option<Box<setupform::SetupForm>>,
+    /// The sent form's (first run, overlay after), for the overlord's
+    /// answer (`open_setup_from`).
+    setup_reply_flags: Option<(bool, bool)>,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -317,6 +348,15 @@ impl App {
             conv_sel: 0,
             conv_text: None,
             pending_select: None,
+            pending_setup: None,
+            setup_rx: None,
+            setup_put_off: false,
+            startup_chain: false,
+            overlay_after_startup: false,
+            last_suggestion: None,
+            setup_send: None,
+            setup_retry: None,
+            setup_reply_flags: None,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),
@@ -765,6 +805,10 @@ impl App {
             if pushed {
                 self.dirty = true;
             }
+            if self.poll_setup() || self.poll_setup_send() {
+                self.dirty = true;
+            }
+            self.continue_startup();
         }
     }
 
@@ -794,6 +838,7 @@ impl App {
                 }
             }
             Mode::OverlordSetup(s) => self.handle_setup(k, s),
+            Mode::Setup(f) => self.handle_setup_form(k, f),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
             Mode::Help => {}
@@ -1414,6 +1459,7 @@ impl App {
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
+            Mode::Setup(s) => self.draw_setup_form(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
@@ -2269,6 +2315,7 @@ impl App {
             Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
+            Mode::Setup(_) => Some("code folder — see form".to_string()),
             Mode::Help => Some("help: any key closes".to_string()),
             Mode::Command(l) => Some(format!(
                 "command: {}▏   (enter: run · tab: complete · ↑↓: choose · esc: close)",

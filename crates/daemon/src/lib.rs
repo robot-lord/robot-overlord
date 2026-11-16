@@ -17,6 +17,7 @@ mod repo_scan;
 pub mod rpc;
 pub mod search;
 pub mod send;
+pub mod setup;
 pub mod summary;
 pub mod triage;
 pub mod ui;
@@ -197,14 +198,24 @@ impl Daemon {
         }
     }
 
-    /// Git repos under the configured roots, and whether the first scan of
-    /// them is still running (`repo_scan.rs`: never blocks for long).
-    fn scanned_repos(&self, cfg: &Config) -> (Vec<String>, bool) {
-        let key = (cfg.session.repo_roots.clone(), cfg.session.repo_scan_depth);
-        let f = self
-            .repo_scan
-            .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
-        (f.repos, f.scanning)
+    /// The folders the repo finder scans (as written, `~` unexpanded): the
+    /// configured roots, or `~` while setup is pending (`finder_roots`).
+    pub(crate) fn finder_roots(&self, cfg: &Config) -> Vec<String> {
+        let pending = setup::needed(&self.db(), cfg);
+        cfg.session.finder_roots(pending)
+    }
+
+    /// Git repos under `roots` (the finder's, `finder_roots`: every folder
+    /// the user named), the folders the scan stayed out of, and whether the
+    /// first scan of them is still running (`repo_scan.rs`: never blocks
+    /// for long). No roots: none. Nothing here touches the disk.
+    fn scanned_repos(&self, cfg: &Config, roots: &[String]) -> repo_scan::Found {
+        if roots.is_empty() {
+            return repo_scan::Found::default();
+        }
+        let key = (roots.to_vec(), cfg.session.repo_scan_depth);
+        self.repo_scan
+            .get(&key, |k| rlord_core::git::scan_repos(&k.0, k.1))
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -462,7 +473,9 @@ impl Daemon {
         // scanned.)
         let scanned = (method == "repo.find").then(|| {
             let cfg = self.config();
-            (self.scanned_repos(&cfg), cfg)
+            let roots = self.finder_roots(&cfg);
+            let found = self.scanned_repos(&cfg, &roots);
+            (found, roots, cfg)
         });
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
@@ -470,10 +483,14 @@ impl Daemon {
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
-                let ((repos, scanning), cfg) = scanned.expect("scanned for repo.find");
-                methods::repo_find(&db, &cfg, repos, scanning)
+                let (found, roots, cfg) = scanned.expect("scanned for repo.find");
+                methods::repo_find(&db, &cfg, &roots, found)
             }
-            "session.defaults" => methods::session_defaults(&self.config()),
+            "session.defaults" => {
+                let cfg = self.config();
+                let needed = setup::needed(&db, &cfg);
+                methods::session_defaults(&cfg, needed)
+            }
             "session.get" => methods::session_get(&db, &params),
             "session.restart" => methods::session_restart(&db, &params),
             "session.stop" => methods::session_stop(&db, &params),
@@ -757,6 +774,11 @@ impl Daemon {
             }
             "ui.show_list" => ui::show_list(self),
             "ui.keys" => ui::keys_open(self, params),
+            "setup.status" => setup::status(self),
+            "setup.suggest" => setup::suggest(self, params),
+            "setup.apply" => setup::apply(self, params),
+            "ui.confirm_setup" => setup::confirm(self, params),
+            "overlord.setup_request" => ask::setup_request(self, params),
             "keys.list" => ui::keys_list(self),
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),

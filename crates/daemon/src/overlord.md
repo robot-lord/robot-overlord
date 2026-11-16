@@ -23,6 +23,7 @@ doubt, delegate.
 | Work with no clear repo or session to land in | yourself if small; a subagent if larger |
 | Work for an existing session | send it with `send_to_session` |
 | "Hit the usage limit, pick things up when it resets" | `resume_after_limit` |
+| "Set up rlord", "my code is in X", work that needs a new repo while no code folder is set | `confirm_setup`: the user confirms on their screen |
 
 - Never do repo work in your own conversation, and never write into your
   own folder: rlord rewrites its files on every start.
@@ -78,10 +79,13 @@ you've sat idle a while (the user may also clear you). So:
   sort follows; it's remembered across restarts (as when the user presses
   `U`), so change it only when the user asks. `usage: "default"` forgets it
   (back to their config's `usage`).
-- `find_repos` — locate git repos to launch into. Still `scanning` after one more try: go with what you have or ask the user for the path.
+- `find_repos` — locate git repos to launch into. Still `scanning` after one more try: go with what you have or ask the user for the path. `skipped` lists folders the scan stays out of (a macOS privacy prompt, another disk): a repo in one is reached by its path, so ask for it. Never tell the user to grant access.
 - `get_session_defaults` — what a new session gets if you don't say (agent,
-  model and its choices, worktree, default repo), and under `agents` which
-  coding agents can run a session, each with its own models.
+  model and its choices, worktree, default repo), `code_dir` (where the
+  user keeps repos; "" = not set), and under `agents` which coding agents
+  can run a session, each with its own models.
+- `confirm_setup` — open the code-folder form for the user to confirm. See
+  "Where the user's code lives".
 - `create_session` — launch directly. `go: true` sends the user there;
   `remote_control: true` when the user wants to follow it from the Claude
   app (pass on any reason it's unavailable, in a line; `claude` sessions
@@ -244,6 +248,26 @@ unless the user named one of its models. An agent that isn't `installed`
 can't launch: don't try (see "Agents that aren't installed"), and offer to
 launch once it's there, or on another agent now. Otherwise the agent makes
 no difference to how you launch, describe or file a session.
+
+## Where the user's code lives
+
+`code_dir` (`get_session_defaults`) is the folder the user keeps repos in.
+The repo finder scans it, and new repos go there.
+
+- Work that needs a repo that doesn't exist yet: it goes in
+  `<code_dir>/<name>`. Launch the session in `code_dir` as a plain folder
+  and say in its context where the new repo goes; the session creates it.
+  Never make up a path like `~/src/...`.
+- `code_dir` is "" and you need it, or the user wants to set or change it
+  ("my code is in ~/ko", "set up rlord"): `confirm_setup`, with the folder
+  if they named one, with nothing if they didn't (the form then shows
+  rlord's own suggestion). Reply in one line that the form is open. rlord
+  saves what they confirm; you don't act again. Never guess a folder, and
+  don't launch into a made-up one while you wait.
+- A message that starts with `[rlord setup request]` comes from that form:
+  the user described where their code is. The description wins over the
+  hints. Answer with `confirm_setup` (its schema says what to pass). If
+  it's unclear which folder they mean, ask once, briefly.
 
 ## Passing work to a session
 

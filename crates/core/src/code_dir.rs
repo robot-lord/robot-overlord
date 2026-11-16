@@ -1,0 +1,419 @@
+//! Suggest the user's code folder (`[session] code_dir`) from the folders
+//! rlord has seen projects in: the most common parent. Plain string work,
+//! no disk access (the caller checks the few folders it will show).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+
+/// A folder some agent or rlord has seen work in, and who saw it:
+/// `claude`, `codex`, `opencode`, `rlord` or `launch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub path: String,
+    pub source: &'static str,
+}
+
+/// A possible code folder, and how many of the projects it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub path: String,
+    pub projects: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Suggestion {
+    /// None: no signal.
+    pub best: Option<Candidate>,
+    /// At most 4, best first; none is an ancestor or descendant of another
+    /// suggested folder.
+    pub alternatives: Vec<Candidate>,
+    /// Distinct projects counted.
+    pub total: usize,
+    /// Distinct projects each source saw.
+    pub by_source: BTreeMap<&'static str, usize>,
+    /// The distinct projects counted, sorted.
+    pub projects: Vec<String>,
+}
+
+/// The label a source is shown with.
+pub fn source_label(source: &str) -> &str {
+    match source {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "rlord" => "rlord",
+        "launch" => "this folder",
+        s => s,
+    }
+}
+
+/// `sources` as `setup.suggest` returns them (`{"claude": 9, ...}`), for
+/// `basis`.
+pub fn sources_of(v: &serde_json::Value) -> Vec<(String, usize)> {
+    v.as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0) as usize))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a suggestion rests on, in words: "14 of 17 projects rlord has
+/// seen (Claude Code 9, Codex 3, rlord 6)". `sources`: (source, count) in
+/// any order; sources with none are left out.
+pub fn basis(projects: usize, of: usize, sources: &[(String, usize)]) -> String {
+    let mut parts: Vec<String> = sources
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(s, n)| format!("{} {n}", source_label(s)))
+        .collect();
+    parts.sort();
+    let noun = if of == 1 { "project" } else { "projects" };
+    let mut out = format!("{projects} of {of} {noun} rlord has seen");
+    if !parts.is_empty() {
+        out.push_str(&format!(" ({})", parts.join(", ")));
+    }
+    out
+}
+
+/// The project a seen folder belongs to: cut at the first hidden component
+/// (`/a/ko/app/.worktrees/x` is `/a/ko/app`). None for a relative path.
+fn project_root(p: &str) -> Option<PathBuf> {
+    let p = Path::new(p.trim());
+    if !p.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(n) if n.to_string_lossy().starts_with('.') => break,
+            Component::CurDir | Component::ParentDir => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// System and mount parents: never a code folder (a scan of a mount
+/// parent like `/Volumes` would skip every child, each another disk).
+const NEVER: &[&str] = &[
+    "/Users",
+    "/home",
+    "/Volumes",
+    "/private",
+    "/mnt",
+    "/media",
+    "/run",
+    "/run/media",
+    "/var",
+    "/tmp",
+    "/opt",
+    "/usr",
+    "/System",
+];
+
+/// Folders never suggested: `/`, `$HOME` and its ancestors, `NEVER`, and
+/// each user's folder under `/run/media` and `/media` (parents of mounts
+/// too).
+fn never(d: &Path, homes: &[PathBuf]) -> bool {
+    never_with(d, homes, crate::privacy::FOLDS_CASE)
+}
+
+/// `never`, ignoring ASCII case when `fold` (as macOS does).
+fn never_with(d: &Path, homes: &[PathBuf], fold: bool) -> bool {
+    use crate::privacy::{path_within, same_path};
+    d.parent().is_none()
+        || homes.iter().any(|h| path_within(h, d, fold))
+        || NEVER.iter().any(|n| same_path(d, Path::new(n), fold))
+        || d.parent().is_some_and(|p| {
+            same_path(p, Path::new("/run/media"), fold) || same_path(p, Path::new("/media"), fold)
+        })
+}
+
+/// A folder that may be offered as the code folder at all: not `/`, not
+/// `$HOME` or above, not a system or mount parent (`NEVER`).
+pub fn suggestible(d: &Path, homes: &[PathBuf]) -> bool {
+    !never(d, homes)
+}
+
+/// The most common parent of the projects in `seen` (counting each project
+/// once, at most `max_depth` levels below the folder), and up to four
+/// alternatives. Ties go to the deeper folder (an ancestor that covers no
+/// more adds nothing), then the first by name.
+///
+/// Known limit: with no disk access, two subfolders of one repo (sessions
+/// run in `app/src` and `app/docs`) count as two projects, which can lift
+/// the repo itself into the vote; `suggest_except` lets the caller drop
+/// such a candidate.
+/// `homes`: `$HOME` as given and resolved (it may sit behind a symlink,
+/// and paths are recorded either way).
+pub fn suggest(
+    seen: &[Seen],
+    homes: &[PathBuf],
+    excluded: &[PathBuf],
+    max_depth: u8,
+) -> Suggestion {
+    suggest_except(seen, homes, excluded, max_depth, &|_| false)
+}
+
+/// How many ranked candidates `suggest_except` asks `skip` about at most.
+const MAX_ASKED: usize = 20;
+
+/// `suggest`, leaving out candidates `skip` says no to (a git repo is no
+/// code folder). `skip` is asked only about candidates about to be shown,
+/// in rank order, and at most `MAX_ASKED` times; a skipped one doesn't hide
+/// its parent.
+pub fn suggest_except(
+    seen: &[Seen],
+    homes: &[PathBuf],
+    excluded: &[PathBuf],
+    max_depth: u8,
+    skip: &dyn Fn(&Path) -> bool,
+) -> Suggestion {
+    let mut projects: BTreeMap<PathBuf, BTreeSet<&'static str>> = BTreeMap::new();
+    for s in seen {
+        let Some(p) = project_root(&s.path) else {
+            continue;
+        };
+        // `$HOME` itself, a folder directly in `/`, rlord's data and temp
+        // dirs: never a project.
+        if homes.contains(&p)
+            || p.parent().is_none_or(|d| d.parent().is_none())
+            || excluded.iter().any(|e| p.starts_with(e))
+        {
+            continue;
+        }
+        projects.entry(p).or_default().insert(s.source);
+    }
+    let mut by_source: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for sources in projects.values() {
+        for s in sources {
+            *by_source.entry(s).or_default() += 1;
+        }
+    }
+    // Every proper ancestor of a project, scored.
+    let mut score: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for p in projects.keys() {
+        let depth = p.components().count();
+        for d in p.ancestors().skip(1) {
+            if never(d, homes) {
+                continue;
+            }
+            if depth - d.components().count() <= max_depth as usize {
+                *score.entry(d.to_path_buf()).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(PathBuf, usize)> = score.into_iter().collect();
+    ranked.sort_by(|(a, sa), (b, sb)| {
+        sb.cmp(sa)
+            .then(b.components().count().cmp(&a.components().count()))
+            .then(a.cmp(b))
+    });
+    let mut picked: Vec<(PathBuf, usize)> = Vec::new();
+    let mut asked = 0;
+    for (d, n) in ranked {
+        if picked.len() == 5 || asked == MAX_ASKED {
+            break;
+        }
+        if picked
+            .iter()
+            .any(|(p, _)| p.starts_with(&d) || d.starts_with(p))
+        {
+            continue;
+        }
+        asked += 1;
+        if skip(&d) {
+            continue;
+        }
+        picked.push((d, n));
+    }
+    let mut picked = picked.into_iter().map(|(d, n)| Candidate {
+        path: d.to_string_lossy().into_owned(),
+        projects: n,
+    });
+    Suggestion {
+        best: picked.next(),
+        alternatives: picked.collect(),
+        total: projects.len(),
+        by_source,
+        projects: projects
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(paths: &[&str]) -> Vec<Seen> {
+        paths
+            .iter()
+            .map(|p| Seen {
+                path: p.to_string(),
+                source: "claude",
+            })
+            .collect()
+    }
+
+    fn best(s: &Suggestion) -> Option<&str> {
+        s.best.as_ref().map(|c| c.path.as_str())
+    }
+
+    #[test]
+    fn the_most_common_parent_wins() {
+        let home = &[PathBuf::from("/h")];
+        let s = suggest(
+            &seen(&[
+                "/h/ko/a",
+                "/h/ko/b",
+                "/h/ko/org/c",
+                "/h/ko/org/d",
+                "/h/work/e",
+            ]),
+            home,
+            &[],
+            3,
+        );
+        assert_eq!(
+            s.best,
+            Some(Candidate {
+                path: "/h/ko".into(),
+                projects: 4
+            })
+        );
+        assert_eq!(
+            s.alternatives,
+            vec![Candidate {
+                path: "/h/work".into(),
+                projects: 1
+            }]
+        );
+        assert_eq!(s.total, 5);
+        assert_eq!(s.by_source["claude"], 5);
+        assert_eq!(
+            basis(4, 5, &[("claude".into(), 5), ("codex".into(), 0)]),
+            "4 of 5 projects rlord has seen (Claude Code 5)"
+        );
+    }
+
+    #[test]
+    fn worktrees_and_duplicates_count_once() {
+        let home = &[PathBuf::from("/h")];
+        let mut v = seen(&[
+            "/h/ko/app/.worktrees/x",
+            "/h/ko/app/.claude/worktrees/y",
+            "/h/ko/app",
+        ]);
+        v.push(Seen {
+            path: "/h/ko/app".into(),
+            source: "codex",
+        });
+        let s = suggest(&v, home, &[], 3);
+        assert_eq!(s.total, 1);
+        assert_eq!(best(&s), Some("/h/ko"));
+        assert_eq!((s.by_source["claude"], s.by_source["codex"]), (1, 1));
+    }
+
+    #[test]
+    fn home_and_its_direct_projects_are_never_suggested() {
+        let home = &[PathBuf::from("/h")];
+        // A project directly in $HOME adds nothing; $HOME itself is no project.
+        let s = suggest(&seen(&["/h/dotfiles", "/h", "/h/.config"]), home, &[], 3);
+        assert_eq!(s.best, None);
+        // Nor a folder directly in `/`; relative paths are dropped.
+        let s = suggest(&seen(&["/srv", "rel/x"]), home, &[], 3);
+        assert_eq!(s, Suggestion::default());
+        assert_eq!(suggest(&[], home, &[], 3).best, None);
+        // `$HOME` behind a symlink: neither spelling is suggested.
+        let homes = &[PathBuf::from("/home/me"), PathBuf::from("/var/home/me")];
+        let s = suggest(&seen(&["/var/home/me/a", "/home/me/b"]), homes, &[], 3);
+        assert_eq!(s.best, None);
+        // System and mount parents are never offered; what's under them is.
+        let s = suggest(
+            &seen(&[
+                "/Volumes/Ext/a",
+                "/Volumes/Ssd/b",
+                "/run/media/me/usb/c",
+                "/opt/x/d",
+            ]),
+            homes,
+            &[],
+            3,
+        );
+        let mut all: Vec<&str> = s
+            .best
+            .iter()
+            .chain(&s.alternatives)
+            .map(|c| c.path.as_str())
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "/Volumes/Ext",
+                "/Volumes/Ssd",
+                "/opt/x",
+                "/run/media/me/usb"
+            ]
+        );
+        assert!(never(Path::new("/run/media/me"), homes));
+        assert!(never(Path::new("/media/me"), homes));
+        assert!(!never(Path::new("/media/me/usb"), homes));
+        assert!(!never(Path::new("/srv/code"), homes));
+        // A repo among the candidates is left out, and its parent still
+        // shows (two subfolders of one repo lifted it into the vote).
+        let h = &[PathBuf::from("/h")];
+        let s = suggest_except(
+            &seen(&["/h/ko/app/src", "/h/ko/app/docs", "/h/ko/b"]),
+            h,
+            &[],
+            3,
+            &|d| d == Path::new("/h/ko/app"),
+        );
+        assert_eq!(best(&s), Some("/h/ko"));
+        assert!(s.alternatives.iter().all(|c| c.path != "/h/ko/app"));
+        assert!(suggestible(Path::new("/h/ko"), homes));
+        // Folding case (macOS): another spelling is the same folder.
+        assert!(never_with(Path::new("/Var/Home/ME"), homes, true));
+        assert!(never_with(Path::new("/volumes"), homes, true));
+        assert!(!never_with(Path::new("/volumes"), homes, false));
+        assert!(!suggestible(Path::new("/var/home"), homes));
+        // (And `sources` parse for `basis`.)
+        let mut src = sources_of(&serde_json::json!({"claude": 2, "rlord": 1}));
+        src.sort();
+        assert_eq!(src, [("claude".to_string(), 2), ("rlord".to_string(), 1)]);
+    }
+
+    #[test]
+    fn excluded_folders_are_dropped() {
+        let home = &[PathBuf::from("/h")];
+        let s = suggest(
+            &seen(&[
+                "/tmp/x/a",
+                "/h/.local/share/robot-overlord/overlord",
+                "/h/src/a",
+            ]),
+            home,
+            &[PathBuf::from("/tmp")],
+            3,
+        );
+        assert_eq!(best(&s), Some("/h/src"));
+        assert_eq!(s.total, 1);
+    }
+
+    #[test]
+    fn ties_go_to_the_deeper_folder() {
+        let home = &[PathBuf::from("/h")];
+        let s = suggest(&seen(&["/h/ko/org/a", "/h/ko/org/b"]), home, &[], 3);
+        assert_eq!(best(&s), Some("/h/ko/org"));
+        // Alternatives are neither ancestors nor descendants of the best.
+        assert!(s.alternatives.is_empty());
+        // Too deep below a folder: not counted for it.
+        let s = suggest(&seen(&["/h/a/b/c/d/e"]), home, &[], 1);
+        assert_eq!(best(&s), Some("/h/a/b/c/d"));
+    }
+}

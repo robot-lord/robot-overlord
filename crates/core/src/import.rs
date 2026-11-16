@@ -80,6 +80,62 @@ pub fn scan_claude(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candi
     scan_claude_in(&projects, opts, tracked, &procs, &excluded_dirs())
 }
 
+/// The folders Claude Code conversations ran in, for the code-folder
+/// suggestion: the newest `limit` project dirs (by mtime) under
+/// `~/.claude/projects`, each read through the head and tail of at most a
+/// few of its transcripts (no stat of every file).
+pub fn claude_project_folders(limit: usize) -> Vec<String> {
+    claude_project_folders_in(&claude::config_dir().join("projects"), limit)
+}
+
+/// How many of one project dir's transcripts `claude_project_folders`
+/// reads at most looking for its folder.
+const TRANSCRIPTS_PER_DIR: usize = 3;
+
+/// `claude_project_folders` over an explicit projects dir (tests). The
+/// slug is lossy, so a dir's folder is a `cwd` from its transcript whose
+/// slug matches the dir's name; a dir with none is skipped.
+pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
+    let Ok(dirs) = std::fs::read_dir(projects) else {
+        return Vec::new();
+    };
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut dirs: Vec<(Option<SystemTime>, PathBuf)> = dirs
+        .flatten()
+        .filter(|d| d.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|d| (mtime(&d.path()), d.path()))
+        .collect();
+    dirs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    dirs.truncate(limit);
+    let mut out = Vec::new();
+    for (_, dir) in dirs {
+        let slug = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // Any of a folder's transcripts names it: the first few that
+        // yield one, by name only (no stat of every file).
+        let found = files
+            .flatten()
+            .map(|f| f.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .take(TRANSCRIPTS_PER_DIR)
+            .find_map(|t| {
+                let (head, tail) = transcript::read_head_tail(&t);
+                head.iter()
+                    .chain(tail.iter())
+                    .filter_map(|v| v["cwd"].as_str())
+                    .find(|c| claude::project_slug(c) == slug)
+                    .map(str::to_string)
+            });
+        out.extend(found);
+    }
+    out
+}
+
 /// `scan_claude` over an explicit projects dir, process list and excluded
 /// folders (tests).
 pub fn scan_claude_in(
@@ -360,7 +416,7 @@ pub fn add_git_info(c: &mut Candidate) {
 }
 
 /// rlord's data dir (the overlord's folder) and the temp dirs.
-fn excluded_dirs() -> Vec<PathBuf> {
+pub fn excluded_dirs() -> Vec<PathBuf> {
     vec![
         crate::paths::data_dir(),
         std::env::temp_dir(),
@@ -432,6 +488,28 @@ mod tests {
                    "timestamp": "2026-11-09T00:00:00.000Z"}),
             json!({"type": "pr-link", "prUrl": "https://example.test/pr/7"}),
         ]
+    }
+
+    #[test]
+    fn claude_project_folders_come_from_matching_cwds() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        write(
+            &projects,
+            "/src/app",
+            ID_A,
+            &convo("/src/app", "hi", "2026-11-01T10:01:00.000Z"),
+        );
+        // A transcript whose cwd doesn't match its folder's slug: skipped.
+        let dir_b = projects.join(claude::project_slug("/src/web"));
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(
+            dir_b.join(format!("{ID_B}.jsonl")),
+            json!({"type": "user", "cwd": "/elsewhere"}).to_string() + "\n",
+        )
+        .unwrap();
+        assert_eq!(claude_project_folders_in(&projects, 300), ["/src/app"]);
+        assert!(claude_project_folders_in(&dir.path().join("none"), 300).is_empty());
     }
 
     #[test]

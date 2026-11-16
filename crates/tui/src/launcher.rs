@@ -20,6 +20,8 @@ pub(crate) struct Launcher {
 enum Cmd {
     Act(Action),
     Keys,
+    /// The code-folder form.
+    Setup,
     Sort(SortMode),
     /// None: back to config `usage` (forget the pick).
     Usage(Option<UsageMetric>),
@@ -40,6 +42,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         Cmd::Keys,
     ),
     ("help", "cheat sheet: every key", Cmd::Act(Action::Help)),
+    (
+        "setup",
+        "your code folder: where repos live and new ones go",
+        Cmd::Setup,
+    ),
     (
         "new",
         "new session: describe it to the overlord",
@@ -237,6 +244,12 @@ impl App {
                 self.do_action(a, terminal)?;
             }
             Cmd::Keys => self.open_keys(None),
+            Cmd::Setup => match self.pending_setup.take() {
+                Some(cmd) => self.open_parked(cmd, None),
+                None => {
+                    self.open_setup(false);
+                }
+            },
             Cmd::Sort(s) => {
                 // As a header click: a new sort starts in its natural direction.
                 if self.sort != s {
