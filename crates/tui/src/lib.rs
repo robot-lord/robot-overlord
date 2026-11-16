@@ -274,8 +274,11 @@ struct App {
     setup_put_off: bool,
     /// The startup sequence (overlord dialog, model upgrade, Remote
     /// Control offer, then the code folder) is still running: a dialog
-    /// closing goes on to setup (`setup_after_dialog`). Off mid-session.
+    /// closing leads to setup once nothing is open (`continue_startup`).
     startup_chain: bool,
+    /// The overlord was just created in the startup sequence: its overlay
+    /// opens once the code folder is settled.
+    overlay_after_startup: bool,
     /// rlord's code-folder suggestion, once worked out this run: reused by
     /// later opens (`load_suggestion`).
     last_suggestion: Option<Value>,
@@ -341,6 +344,7 @@ impl App {
             setup_rx: None,
             setup_put_off: false,
             startup_chain: false,
+            overlay_after_startup: false,
             last_suggestion: None,
             saved_sel: None,
             reported_view: Value::Null,
@@ -793,6 +797,7 @@ impl App {
             if self.poll_setup() {
                 self.dirty = true;
             }
+            self.continue_startup();
         }
     }
 

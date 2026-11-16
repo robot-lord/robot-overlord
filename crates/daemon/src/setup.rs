@@ -156,9 +156,7 @@ pub(crate) fn suggest(d: &Daemon, params: &Value) -> Result<Value> {
     let guard = Guard::new();
     // (`$HOME` and above are never offered; rlord's data and temp dirs hold
     // no projects.)
-    let homes = with_resolved(vec![PathBuf::from(
-        std::env::var_os("HOME").unwrap_or_default(),
-    )]);
+    let homes = rlord_core::privacy::home_paths();
     let is_repo = |p: &Path| is_home_repo(p, &homes, &guard);
     let s = code_dir::suggest_except(
         &seen,
@@ -260,7 +258,8 @@ fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look
         .into_iter()
         .filter_map(|(path, projects, from)| {
             let prompts = guard.prompts(Path::new(&path)).is_some();
-            if !prompts && !is_dir(Path::new(&path)) {
+            // (The explicit root was checked above: stat once.)
+            if !prompts && from != "repo_roots" && !is_dir(Path::new(&path)) {
                 return None;
             }
             Some(json!({"path": path, "projects": projects, "of": s.total,
@@ -344,11 +343,23 @@ pub(crate) fn apply(d: &Daemon, params: &Value) -> Result<Value> {
 /// folder was checked (false: macOS guards it, so it wasn't touched) and
 /// created, and the config file.
 fn apply_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
-    apply_with(d, params, path, &Guard::new())
+    apply_with(
+        d,
+        params,
+        path,
+        &Guard::new(),
+        &rlord_core::privacy::home_paths(),
+    )
 }
 
-/// `apply_at` with a given guard (tests).
-fn apply_with(d: &Daemon, params: &Value, path: &Path, guard: &Guard) -> Result<Value> {
+/// `apply_at` with a given guard and homes (tests).
+fn apply_with(
+    d: &Daemon,
+    params: &Value,
+    path: &Path,
+    guard: &Guard,
+    homes: &[PathBuf],
+) -> Result<Value> {
     if params["skip"] == true {
         d.db().kv_set(KV, &format!("skipped:{}", now_ms()))?;
         return Ok(json!({"skipped": true}));
@@ -383,6 +394,27 @@ fn apply_with(d: &Daemon, params: &Value, path: &Path, guard: &Guard) -> Result<
     // (that would raise the prompt): it is saved as given, unchecked. Any
     // other must exist, or be created when asked.
     let checked = guard.prompts(Path::new(&dir)).is_none();
+    // The same rules as the suggestion: not a system or mount parent, not
+    // a repo (where it can be checked); `$HOME` only when the user
+    // confirmed it (`allow_home`: the finder then scans all of it).
+    let p = Path::new(&dir);
+    if homes.iter().any(|h| h == p) {
+        if params["allow_home"] != true {
+            bail!(
+                "{} is your whole home folder: the repo finder would scan all of it. \
+                 Pick the folder your repos are in, or confirm home (allow_home)",
+                contract_tilde(&dir)
+            );
+        }
+    } else if !code_dir::suggestible(p, homes) {
+        bail!("{dir} is a system or mount folder, not a code folder: pick the folder your repos are in");
+    }
+    if checked && p.join(".git").exists() {
+        bail!(
+            "{} is a git repo: the code folder is the one that holds your repos (its parent?)",
+            contract_tilde(&dir)
+        );
+    }
     let mut created = false;
     if checked && !Path::new(&dir).is_dir() {
         if params["create"] != true {
@@ -661,6 +693,30 @@ mod tests {
     }
 
     /// A folder macOS guards is saved as given: not checked, not created.
+    /// setup.apply refuses what the suggestion never offers: a system or
+    /// mount parent, a repo; `$HOME` only when confirmed.
+    #[test]
+    fn apply_refuses_what_is_no_code_folder() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cfg = root.join("config.toml");
+        let g = Guard::with(None, false);
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("app/.git")).unwrap();
+        let homes = [home.clone()];
+        let apply = |p: Value| apply_with(&d, &p, &cfg, &g, &homes);
+        let e = apply(json!({"code_dir": "/Volumes"})).unwrap_err();
+        assert!(e.to_string().contains("system or mount"), "{e}");
+        let e = apply(json!({"code_dir": home.join("app").to_string_lossy()})).unwrap_err();
+        assert!(e.to_string().contains("is a git repo"), "{e}");
+        let e = apply(json!({"code_dir": home.to_string_lossy()})).unwrap_err();
+        assert!(e.to_string().contains("whole home folder"), "{e}");
+        assert!(!cfg.exists(), "nothing written");
+        let r = apply(json!({"code_dir": home.to_string_lossy(), "allow_home": true})).unwrap();
+        assert_eq!(r["code_dir"], home.to_string_lossy().as_ref());
+    }
+
     #[test]
     fn a_guarded_folder_is_saved_unchecked() {
         let d = daemon();
@@ -674,6 +730,7 @@ mod tests {
             &json!({"code_dir": code.to_string_lossy(), "create": true}),
             &cfg,
             &guard,
+            &[],
         )
         .unwrap();
         assert_eq!(

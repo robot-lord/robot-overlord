@@ -85,6 +85,15 @@ pub(crate) struct SetupForm {
     /// Reopened with an overlord proposal (`prefill`): a late suggestion
     /// doesn't replace it.
     proposal: bool,
+    /// The folder `$HOME` was confirmed for ("scans your whole home
+    /// folder"): saving it again goes ahead.
+    confirm_home: Option<String>,
+    /// The code folder as configured now (with `~`; "" when unset): shown
+    /// as the current setting, not as the user's pick.
+    current: String,
+    /// `$HOME` as given and resolved: only folders under it are looked at
+    /// from this (UI) thread.
+    homes: Vec<std::path::PathBuf>,
     /// Which folders macOS would ask about (built once).
     guard: rlord_core::privacy::Guard,
     /// The line under the folder (`folder_hint`), worked out once per
@@ -101,6 +110,8 @@ pub(crate) enum SaveCall {
     Request(Value),
     /// The folder doesn't exist: ask before creating it.
     AskCreate(String),
+    /// The folder is `$HOME`: say the finder scans all of it, ask again.
+    AskHome(String),
 }
 
 impl SetupForm {
@@ -132,13 +143,14 @@ impl SetupForm {
             })
             .unwrap_or_default();
         let current = sugg["code_dir"].as_str().unwrap_or("");
+        // (`code_dir_chosen` is only the user's own change in this form.)
         let (code_dir, chosen) = if current.is_empty() {
             (
                 choices.first().map(|c| c.path.clone()).unwrap_or_default(),
                 false,
             )
         } else {
-            (contract_tilde(current), true)
+            (contract_tilde(current), false)
         };
         // What saving rlord's suggestion does with the roots is the
         // daemon's call (`roots_default`), used as given.
@@ -166,6 +178,13 @@ impl SetupForm {
             loading: false,
             touched: false,
             confirm_create: None,
+            confirm_home: None,
+            current: if current.is_empty() {
+                String::new()
+            } else {
+                contract_tilde(current)
+            },
+            homes: rlord_core::privacy::home_paths(),
             proposal: false,
             guard: rlord_core::privacy::Guard::new(),
             hint: String::new(),
@@ -243,7 +262,6 @@ impl SetupForm {
     pub(crate) fn prefill(&mut self, p: &Value) {
         if let Some(d) = p["code_dir"].as_str().filter(|d| !d.is_empty()) {
             self.code_dir = contract_tilde(d);
-            self.code_dir_chosen = true;
         }
         if let Some(r) = p["repo_roots"].as_array() {
             let r: Vec<String> = r
@@ -373,6 +391,10 @@ impl SetupForm {
                 "not set"
             } else if self.code_dir_chosen {
                 "picked by the user"
+            } else if dir == self.current {
+                "current setting"
+            } else if self.proposal {
+                "proposed by the overlord"
             } else {
                 "suggested by rlord"
             };
@@ -397,12 +419,20 @@ impl SetupForm {
             });
         }
         let path = expand_tilde(dir);
+        // `$HOME` itself: the finder would scan all of it; asked first.
+        let home = self.is_home(&path);
+        if home && self.confirm_home.as_deref() != Some(path.as_str()) {
+            return Ok(SaveCall::AskHome(path));
+        }
         // A new folder is created only once the user said so (as the CLI
-        // asks).
-        let create = exists(&path) == Some(false);
-        if create && self.confirm_create.as_deref() != Some(path.as_str()) {
+        // asks). One not looked at here (`exists` None) is checked by the
+        // daemon; if it isn't there, the user is asked then.
+        let confirmed = self.confirm_create.as_deref() == Some(path.as_str());
+        let missing = exists(&path) == Some(false);
+        if missing && !confirmed {
             return Ok(SaveCall::AskCreate(path));
         }
+        let create = missing || confirmed;
         let roots = match &self.roots {
             Roots::Follow => json!("follow"),
             Roots::Keep(_) => json!("leave"),
@@ -412,7 +442,21 @@ impl SetupForm {
             "code_dir": path,
             "roots": roots,
             "create": create,
+            "allow_home": home,
         })))
+    }
+
+    /// `path` is `$HOME` (as given or resolved).
+    fn is_home(&self, path: &str) -> bool {
+        let p = std::path::Path::new(path.trim_end_matches('/'));
+        self.homes.iter().any(|h| h == p)
+    }
+
+    /// Whether this (UI) thread may look at `path` on disk: only under
+    /// `$HOME`, and only where no macOS prompt guards. Anything else is
+    /// left to the daemon's check on save.
+    fn may_stat(&self, path: &std::path::Path) -> bool {
+        self.homes.iter().any(|h| path.starts_with(h)) && self.guard.prompts(path).is_none()
     }
 
     /// The user has typed or moved in it.
@@ -446,9 +490,14 @@ impl App {
         }
         // (A cheap look-up; the suggestion is worked out only if needed,
         // and off this thread.)
-        let Some(st) = self.call("setup.status", Value::Null) else {
-            return false;
-        };
+        match self.call("setup.status", Value::Null) {
+            Some(st) => self.check_setup_from(st),
+            None => false,
+        }
+    }
+
+    /// `check_setup` with `setup.status` in hand.
+    fn check_setup_from(&mut self, st: Value) -> bool {
         let needed = st["needed"] == true;
         // The overlord proposed one while something else was open: that
         // one, not rlord's own suggestion (even if the form was put off).
@@ -462,14 +511,21 @@ impl App {
         needed && self.open_setup_with(&st, true)
     }
 
-    /// A dialog of the startup sequence closed: the code folder next, but
-    /// only while that sequence runs (never mid-session: a dialog the
-    /// overlord opens later mustn't bring the form up).
-    pub(crate) fn setup_after_dialog(&mut self) -> bool {
-        if !std::mem::take(&mut self.startup_chain) {
-            return false;
+    /// The startup sequence (the overlord's dialogs, a pending command)
+    /// is over once nothing is open: then the code folder, once. Never
+    /// mid-session. Called on each pass of the event loop.
+    pub(crate) fn continue_startup(&mut self) {
+        if !self.startup_chain || !matches!(self.mode, Mode::Normal) {
+            return;
         }
-        self.check_setup()
+        self.startup_chain = false;
+        let opened = self.check_setup();
+        if std::mem::take(&mut self.overlay_after_startup) {
+            match &mut self.mode {
+                Mode::Setup(f) if opened => f.then_overlord = true,
+                _ => self.show_overlord(),
+            }
+        }
     }
 
     /// Open a proposal the overlord parked while something else was open,
@@ -497,9 +553,21 @@ impl App {
         let Some(o) = self.call("overlord.get", Value::Null) else {
             return false;
         };
+        self.drop_stale_suggestion(status);
         self.mode = Mode::Setup(Box::new(SetupForm::loading(!o.is_null(), auto, status)));
         self.load_suggestion();
         true
+    }
+
+    /// The kept suggestion was made for another config (the code folder or
+    /// `repo_roots` changed since): drop it, so the next open asks again.
+    fn drop_stale_suggestion(&mut self, status: &Value) {
+        let stale = self.last_suggestion.as_ref().is_some_and(|v| {
+            v["code_dir"] != status["code_dir"] || v["roots"]["configured"] != status["repo_roots"]
+        });
+        if stale {
+            self.last_suggestion = None;
+        }
     }
 
     /// Work out rlord's suggestion on another thread (it reads the agents'
@@ -569,6 +637,7 @@ impl App {
         };
         // What is configured now came with the command (cheap); rlord's own
         // suggestion, for ←/→, loads in the background.
+        self.drop_stale_suggestion(&cmd["status"]);
         let mut f = SetupForm::loading(true, auto, &cmd["status"]);
         f.then_overlord = then_overlord;
         f.prefill(&cmd["prefill"]);
@@ -670,12 +739,22 @@ impl App {
     }
 
     fn save_setup_form(&mut self, mut f: Box<SetupForm>) {
-        let guard = f.guard.clone();
         let exists = |p: &str| {
             let p = std::path::Path::new(p);
-            guard.prompts(p).is_none().then(|| p.is_dir())
+            f.may_stat(p).then(|| p.is_dir())
         };
-        match f.save_call(&exists) {
+        let call = f.save_call(&exists);
+        match call {
+            Ok(SaveCall::AskHome(path)) => {
+                f.error = Some(format!(
+                    "{} is your whole home folder: the repo finder scans all of it. \
+                     Enter again to use it anyway",
+                    contract_tilde(&path)
+                ));
+                f.confirm_home = Some(path);
+                f.row = f.rows().iter().position(|r| *r == Row::Save).unwrap_or(0);
+                self.mode = Mode::Setup(f);
+            }
             Ok(SaveCall::AskCreate(path)) => {
                 f.error = Some(format!(
                     "{} doesn't exist: enter again to create it",
@@ -705,8 +784,10 @@ impl App {
                         })
                         .unwrap_or_default();
                     let dir = contract_tilde(r["code_dir"].as_str().unwrap_or(""));
-                    // Saved: a proposal parked for `:setup` is stale now.
+                    // Saved: a proposal parked for `:setup`, and the kept
+                    // suggestion, are stale now.
                     self.pending_setup = None;
+                    self.last_suggestion = None;
                     self.status_line = if roots == [dir.clone()] {
                         format!("code folder: {dir} · the repo finder scans it")
                     } else {
@@ -723,7 +804,18 @@ impl App {
                     self.close_setup(&f);
                 }
                 Err(e) => {
-                    f.error = Some(format!("{e:#}"));
+                    // Not looked at here, and the daemon found it missing:
+                    // ask, as for one seen missing here.
+                    let path = expand_tilde(f.code_dir.trim());
+                    if format!("{e:#}").contains("doesn't exist") {
+                        f.error = Some(format!(
+                            "{} doesn't exist: enter again to create it",
+                            contract_tilde(&path)
+                        ));
+                        f.confirm_create = Some(path);
+                    } else {
+                        f.error = Some(format!("{e:#}"));
+                    }
                     self.mode = Mode::Setup(f);
                 }
             },
@@ -982,13 +1074,24 @@ fn folder_hint(s: &SetupForm) -> String {
         return h;
     }
     let path = expand_tilde(dir);
-    if !std::path::Path::new(&path).is_absolute() {
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
         return "a full path, like ~/code".into();
     }
-    if s.guard.prompts(std::path::Path::new(&path)).is_some() {
+    if s.is_home(&path) {
+        return "your whole home folder: the repo finder scans all of it".into();
+    }
+    if s.guard.prompts(p).is_some() {
         return "macOS will ask permission for this folder once".into();
     }
-    if !std::path::Path::new(&path).is_dir() {
+    if dir == s.current {
+        return "your current code folder".into();
+    }
+    // (Only under `$HOME` is the disk looked at from here.)
+    if !s.may_stat(p) {
+        return "not checked here: rlord checks it when you save".into();
+    }
+    if !p.is_dir() {
         return "will be created".into();
     }
     String::new()
@@ -1063,7 +1166,7 @@ mod tests {
         assert_eq!(
             f.save_call(&|_| Some(true)).unwrap(),
             SaveCall::Apply(json!({"code_dir": "/elsewhere/ko",
-                                   "roots": ["/elsewhere/ko", "/p"], "create": false}))
+                                   "roots": ["/elsewhere/ko", "/p"], "create": false, "allow_home": false}))
         );
         f.description_changed();
         assert!(!f.confirmed && f.changed.is_empty());
@@ -1079,7 +1182,7 @@ mod tests {
         assert_eq!(
             f.save_call(&|_| Some(true)).unwrap(),
             SaveCall::Apply(
-                json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": false})
+                json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": false, "allow_home": false})
             )
         );
         // A folder that isn't there: asked first, created on the second save.
@@ -1091,7 +1194,7 @@ mod tests {
         assert_eq!(
             f.save_call(&|_| Some(false)).unwrap(),
             SaveCall::Apply(
-                json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": true})
+                json!({"code_dir": "/elsewhere/ko", "roots": "follow", "create": true, "allow_home": false})
             )
         );
         // Another folder typed since: asked again.
@@ -1104,7 +1207,7 @@ mod tests {
         assert_eq!(
             f.save_call(&|_| None).unwrap(),
             SaveCall::Apply(
-                json!({"code_dir": "/elsewhere/kode", "roots": "follow", "create": false})
+                json!({"code_dir": "/elsewhere/kode", "roots": "follow", "create": false, "allow_home": false})
             )
         );
         f.code_dir = "/elsewhere/ko".into();
@@ -1303,6 +1406,67 @@ mod tests {
         assert_eq!((f.code_dir.as_str(), f.choices.len()), ("/elsewhere/ko", 2));
     }
 
+    /// A kept suggestion made for another config is dropped on open.
+    #[test]
+    fn a_stale_suggestion_is_dropped() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.last_suggestion = Some(sugg(Some("/elsewhere/ko"), &[]));
+        app.drop_stale_suggestion(&json!({"code_dir": "", "repo_roots": []}));
+        assert!(app.last_suggestion.is_some());
+        app.drop_stale_suggestion(&json!({"code_dir": "/now", "repo_roots": []}));
+        assert!(app.last_suggestion.is_none());
+    }
+
+    /// Outside `$HOME` the form doesn't look at the disk: "not checked
+    /// here", and Save leaves the check to the daemon. `$HOME` itself is
+    /// asked about twice.
+    #[test]
+    fn only_home_folders_are_looked_at_here() {
+        let mut f = SetupForm::from_suggest(&sugg(None, &[]), false, false);
+        f.homes = vec![std::path::PathBuf::from("/h")];
+        f.code_dir = "/srv/code".into();
+        f.refresh_hint();
+        assert!(f.hint.starts_with("not checked here"), "{}", f.hint);
+        assert!(!f.may_stat(std::path::Path::new("/srv/code")));
+        // Save: unknown (None), so no create unless the daemon says so.
+        let SaveCall::Apply(p) = f.save_call(&|_| None).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(
+            (p["create"].as_bool(), p["allow_home"].as_bool()),
+            (Some(false), Some(false))
+        );
+        // Home: a warning, then confirmed.
+        f.code_dir = "/h".into();
+        f.refresh_hint();
+        assert!(f.hint.contains("whole home folder"), "{}", f.hint);
+        assert_eq!(
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::AskHome("/h".into())
+        );
+        f.confirm_home = Some("/h".into());
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not saved")
+        };
+        assert_eq!(p["allow_home"], true);
+    }
+
+    /// A configured folder is the current setting, not the user's pick.
+    #[test]
+    fn the_configured_folder_is_the_current_setting() {
+        let mut s = sugg(None, &[]);
+        s["code_dir"] = json!("/c");
+        let mut f = SetupForm::from_suggest(&s, true, false);
+        assert!(!f.code_dir_chosen);
+        f.describe = Some("x".into());
+        let SaveCall::Request(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("not a request")
+        };
+        assert_eq!(p["code_dir_source"], "current setting");
+    }
+
     /// A form the user is working in isn't replaced by a proposal: it is
     /// parked for `:setup`.
     #[test]
@@ -1324,16 +1488,36 @@ mod tests {
         assert!(app.status_line.contains(":setup"));
     }
 
-    /// Mid-session (the startup sequence over), closing a dialog doesn't
-    /// look at setup at all.
+    /// Startup: a pending command's screen first; the code folder once
+    /// nothing is open; nothing mid-session.
     #[test]
-    fn dialogs_mid_session_dont_open_setup() {
+    fn setup_follows_the_startup_sequence_only() {
         let (_tx, rx) = mpsc::channel();
         let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
         let mut app = App::new(rx, Config::default(), keys);
+        app.startup_chain = true;
+        // A pending command's screen is open: wait.
+        app.mode = Mode::Help;
+        app.continue_startup();
+        assert!(app.startup_chain);
+        // Its form, when it was a parked proposal, opens as the first-run
+        // form when setup is needed.
+        app.mode = Mode::Normal;
+        app.pending_setup = Some(json!({"cmd": "setup", "prefill": {"code_dir": "/p"}}));
+        let st = json!({"needed": true, "code_dir": "", "repo_roots": []});
+        assert!(app.check_setup_from(st));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert!(f.auto);
+        // Closed, the sequence ends (put off: no daemon call is made).
+        app.mode = Mode::Normal;
+        app.setup_put_off = true;
+        app.continue_startup();
         assert!(!app.startup_chain);
-        // (No daemon is asked: it returns before any call.)
-        assert!(!app.setup_after_dialog());
+        // Mid-session: nothing.
+        app.setup_put_off = false;
+        app.continue_startup();
         assert!(matches!(app.mode, Mode::Normal));
     }
 

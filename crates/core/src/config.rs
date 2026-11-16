@@ -874,15 +874,7 @@ fn set_code_dir_in(text: &str, code_dir: &str, roots: &RootsEdit) -> Result<Stri
             for r in list {
                 arr.push(r.as_str());
             }
-            match table.get_mut("repo_roots").and_then(|i| i.as_value_mut()) {
-                // Keep the line's own comment.
-                Some(v) => {
-                    let decor = v.decor().clone();
-                    *v = toml_edit::Value::Array(arr);
-                    *v.decor_mut() = decor;
-                }
-                None => table["repo_roots"] = toml_edit::value(arr),
-            }
+            set_value_in(table, "repo_roots", toml_edit::Value::Array(arr));
         }
     }
     let out = doc.to_string();
@@ -913,18 +905,23 @@ fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String>
     let table = doc[section]
         .as_table_mut()
         .with_context(|| format!("[{section}] isn't a table"))?;
-    match table.get_mut(field).and_then(|i| i.as_value_mut()) {
-        // Keep the line's own comment.
-        Some(v) => {
-            let decor = v.decor().clone();
-            *v = toml_edit::Value::from(value);
-            *v.decor_mut() = decor;
-        }
-        None => table[field] = toml_edit::value(value),
-    }
+    set_value_in(table, field, toml_edit::Value::from(value));
     let out = doc.to_string();
     toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
     Ok(out)
+}
+
+/// `table[field] = value`, keeping the line's own comment when the key is
+/// there.
+fn set_value_in(table: &mut toml_edit::Table, field: &str, value: toml_edit::Value) {
+    match table.get_mut(field).and_then(|i| i.as_value_mut()) {
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = value;
+            *v.decor_mut() = decor;
+        }
+        None => table[field] = toml_edit::Item::Value(value),
+    }
 }
 
 const DEFAULT_TOML: &str = r##"# Robot Overlord configuration. Every key is optional.

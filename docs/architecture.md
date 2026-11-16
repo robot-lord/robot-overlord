@@ -1229,6 +1229,11 @@ opens at once with the configured roots (`setup.status`, cheap) and fills
 in the suggestion from another thread; it asks before creating a folder
 that doesn't exist. A folder macOS guards is saved unchecked
 (`checked: false`): checking or creating it would raise the prompt.
+`setup.apply` refuses what the suggestion never offers (a system or
+mount parent, a git repo where it can check), and takes `$HOME` itself
+only with `allow_home` (the form and the CLI warn and ask twice). The
+form looks at the disk from the UI thread only under `$HOME`; anything
+else is "not checked here" and left to `setup.apply`.
 What saving rlord's own suggestion does with `repo_roots` is the
 daemon's call (`setup::default_roots`, returned as `roots_default` and
 used as given by the TUI and the CLI): an old `["~"]` is dropped only

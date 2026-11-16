@@ -1236,18 +1236,24 @@ impl App {
 
         if let Some(finder) = &form.finder {
             let home = std::env::var("HOME").unwrap_or_default();
-            let note = finder_note(&finder.roots, &finder.skipped, finder.skipped_more, &home);
+            let mut note = finder_note(&finder.roots, &finder.skipped, finder.skipped_more, &home);
+            let rows = finder.rows();
+            // Nothing scanned and nothing matches: the "no code folder"
+            // note is the whole story (no "scanned …" line).
+            let nothing_scanned = finder.roots.is_empty() && rows.is_empty() && !finder.scanning;
+            let no_roots_hint = nothing_scanned.then(|| note.take()).flatten();
             let q_rows = if note.is_some() { 3 } else { 2 };
             let [q_area, list_area] =
                 RLayout::vertical([Constraint::Length(q_rows), Constraint::Min(3)]).areas(inner);
-            let rows = finder.rows();
             let roots = finder
                 .roots
                 .iter()
                 .map(|r| r.replacen(&home, "~", 1))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let hint = if finder.scanning {
+            let hint = if let Some(h) = no_roots_hint {
+                h
+            } else if finder.scanning {
                 format!(
                     "still scanning {roots}, so only repos you've used show (reopen to refresh) · or type a repo path · esc back"
                 )

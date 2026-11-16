@@ -278,9 +278,8 @@ impl App {
             return; // the overlord asked for something; don't bury it
         }
         self.check_overlord();
-        if matches!(self.mode, Mode::Normal) {
-            self.setup_after_dialog();
-        }
+        // (The code folder follows once nothing is open: the event loop's
+        // `continue_startup`.)
     }
 
     pub(crate) fn check_overlord(&mut self) {
@@ -352,8 +351,6 @@ impl App {
                     "overlord not started — press {} any time",
                     self.keys.label(Action::Overlord)
                 );
-                // First run: the code folder next.
-                self.setup_after_dialog();
             }
             KeyCode::Enter => {
                 let remote = s.remote == Some(true) && s.choice().remote;
@@ -376,12 +373,10 @@ impl App {
                             );
                         }
                         self.dirty = true;
-                        // First run: the code folder next, then the
-                        // overlord's overlay.
-                        if self.setup_after_dialog() {
-                            if let Mode::Setup(f) = &mut self.mode {
-                                f.then_overlord = true;
-                            }
+                        // First run: the code folder next (if it opens),
+                        // then the overlord's overlay.
+                        if self.startup_chain {
+                            self.overlay_after_startup = true;
                         } else {
                             self.show_overlord();
                         }
@@ -460,11 +455,6 @@ impl App {
                 }
             }
             _ => self.mode = Mode::OverlordUpgrade(u),
-        }
-        // Closed: the code folder next, the first time (as after the
-        // overlord's own dialog).
-        if matches!(self.mode, Mode::Normal) {
-            self.setup_after_dialog();
         }
     }
 
@@ -812,10 +802,6 @@ impl App {
                 }
             },
             _ => self.mode = Mode::RemoteOffer(o),
-        }
-        // Closed: the code folder next, the first time.
-        if matches!(self.mode, Mode::Normal) {
-            self.setup_after_dialog();
         }
     }
 

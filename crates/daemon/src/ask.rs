@@ -314,7 +314,15 @@ pub fn format_setup_request(p: &Value) -> Result<String> {
     let dir = p["code_dir"].as_str().map(str::trim).unwrap_or("");
     let source = p["code_dir_source"]
         .as_str()
-        .filter(|s| matches!(*s, "suggested by rlord" | "picked by the user"))
+        .filter(|s| {
+            matches!(
+                *s,
+                "suggested by rlord"
+                    | "picked by the user"
+                    | "current setting"
+                    | "proposed by the overlord"
+            )
+        })
         .unwrap_or("not set");
     let mut m = String::from("[rlord setup request]\n");
     m += "hints (optional; the description wins if they disagree):\n";

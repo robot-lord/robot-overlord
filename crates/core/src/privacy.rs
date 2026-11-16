@@ -47,6 +47,23 @@ pub const PROTECTED_HOME_DIRS: &[&str] = &[
     "Library",
 ];
 
+/// `$HOME` as given and resolved (it may sit behind a symlink, and paths
+/// are recorded either way). Empty when unset.
+pub fn home_paths() -> Vec<PathBuf> {
+    let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    let h = PathBuf::from(h);
+    let mut v = Vec::new();
+    if let Ok(c) = std::fs::canonicalize(&h) {
+        if c != h {
+            v.push(c);
+        }
+    }
+    v.push(h);
+    v
+}
+
 /// Says which folders would raise a prompt. No disk access after it is
 /// built: it is asked before anything touches the folder.
 ///
