@@ -728,64 +728,143 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
-    let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
-    let program = pane_program(agent, &mut launch.argv);
-    let argv = &launch.argv;
+    let launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
     };
     let launch_spec = spec.to_string();
-    let now = now_ms();
-
-    db.insert_session(&NewSession {
-        id: &id,
-        name: &name,
-        agent: agent.name(),
-        agent_session: launch.session_id.as_deref(),
-        project_path: &project_path,
-        tmux_session: Some(&tmux_name),
-        launch_spec: &launch_spec,
-        created_at: now,
-        repo_path: repo.as_deref(),
-        workspace_path: workspace_path.as_deref(),
-        branch: branch.as_deref(),
-        role: &role,
-    })?;
-    if let Some(r) = &repo {
-        db.touch_repo(r, now)?;
-    }
-    if let Some(t) = &launch.transcript {
-        db.upsert_transcript_source(&id, &t.to_string_lossy())?;
-    }
-    hold_deferred(db, &id, &launch)?;
-    note_first_prompt(db, &id, agent, first.as_deref(), now)?;
-    if let Some(mode) = delivery {
-        context::turn_on(db, &id)?;
-        context::store(db, &id, &notes, &links, now)?;
-        if carried == Some(mode) {
-            context::set_mode(db, &id, mode, now)?;
-        } else {
-            // (It didn't go out with the launch: its rows stay unseen.)
-            context::record_mode(db, &id, mode)?;
-        }
-    }
-
-    let cmd = pane_cmd(&id, program.as_deref(), daemon, argv);
-    note_launch(db, &id, argv)?;
-    // (Its folder is in the gate before its first hook can run.)
-    crate::codex_daemon::sync_gate(db);
-    tmux::new_session(&tmux_name, &project_path, &cmd)?;
-    db.insert_event(
-        &id,
-        now,
-        "launched",
-        &json!({"argv": argv, "workspace": workspace_path, "branch": branch}).to_string(),
+    start(
+        db,
+        Start {
+            id: &id,
+            name: &name,
+            agent,
+            launch_spec: &launch_spec,
+            launch,
+            first: first.as_deref(),
+            project_path: &project_path,
+            repo: repo.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+            branch: branch.as_deref(),
+            role: &role,
+            tmux_name: &tmux_name,
+            daemon,
+            forked_from: None,
+            background: delivery.map(|mode| Background {
+                mode,
+                carried,
+                copy_from: None,
+                rows: context::rows_from(&notes, &links, "overlord"),
+            }),
+            event: (
+                "launched",
+                json!({"workspace": workspace_path, "branch": branch}),
+            ),
+        },
     )?;
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
+}
+
+/// A new session's background, as `start` stores it: how it reaches the
+/// agent (`mode`), how the launch carries it (`carried`: None when it
+/// doesn't, its file couldn't be written), the session whose rows are
+/// copied first with the row ids left out (a fork's parent), and the
+/// rows to add after them.
+pub(crate) struct Background<'a> {
+    pub mode: context::Delivery,
+    pub carried: Option<context::Delivery>,
+    pub copy_from: Option<(&'a str, &'a [i64])>,
+    pub rows: Vec<context::NewRow>,
+}
+
+/// What a new session and a fork have decided before the pane starts.
+pub(crate) struct Start<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub agent: Agent,
+    /// The launch spec as stored.
+    pub launch_spec: &'a str,
+    /// The agent's command, and what is known of its conversation.
+    pub launch: rlord_core::agents::Launch,
+    /// The first prompt as typed (an agent that picks its own id is bound
+    /// by it).
+    pub first: Option<&'a str>,
+    pub project_path: &'a str,
+    pub repo: Option<&'a str>,
+    pub workspace_path: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub role: &'a str,
+    pub tmux_name: &'a str,
+    /// On Codex's shared background server.
+    pub daemon: bool,
+    /// A fork's parent (its rlord id).
+    pub forked_from: Option<&'a str>,
+    pub background: Option<Background<'a>>,
+    /// The event logged once the pane is up (`launched`, `forked`): its
+    /// detail, to which the argv is added.
+    pub event: (&'static str, Value),
+}
+
+/// What a new session and a fork share once everything is decided: the
+/// row, its background, its pane, the log.
+pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
+    let Start { id, agent, .. } = s;
+    let mut launch = s.launch;
+    let program = pane_program(agent, &mut launch.argv);
+    let argv = &launch.argv;
+    let now = now_ms();
+    db.insert_session(&NewSession {
+        id,
+        name: s.name,
+        agent: agent.name(),
+        agent_session: launch.session_id.as_deref(),
+        project_path: s.project_path,
+        tmux_session: Some(s.tmux_name),
+        launch_spec: s.launch_spec,
+        created_at: now,
+        repo_path: s.repo,
+        workspace_path: s.workspace_path,
+        branch: s.branch,
+        role: s.role,
+    })?;
+    if let Some(parent) = s.forked_from {
+        db.set_forked_from(id, parent)?;
+    }
+    if let Some(r) = s.repo {
+        db.touch_repo(r, now)?;
+    }
+    if let Some(t) = &launch.transcript {
+        db.upsert_transcript_source(id, &t.to_string_lossy())?;
+    }
+    hold_deferred(db, id, &launch)?;
+    note_first_prompt(db, id, agent, s.first, now)?;
+    if let Some(bg) = &s.background {
+        context::turn_on(db, id)?;
+        if let Some((from, except)) = bg.copy_from {
+            db.context_copy(from, id, except)?;
+        }
+        context::store_rows(db, id, &bg.rows, now)?;
+        if bg.carried == Some(bg.mode) {
+            context::set_mode(db, id, bg.mode, now)?;
+        } else {
+            // (It didn't go out with the launch: its rows stay unseen.)
+            context::record_mode(db, id, bg.mode)?;
+        }
+    }
+
+    let cmd = pane_cmd(id, program.as_deref(), s.daemon, argv);
+    note_launch(db, id, argv)?;
+    // (Its folder is in the gate before its first hook can run.)
+    crate::codex_daemon::sync_gate(db);
+    tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
+    let (kind, mut detail) = s.event;
+    detail["argv"] = json!(argv);
+    db.insert_event(id, now, kind, &detail.to_string())?;
+    Ok(())
 }
 
 /// Add an importable conversation (see `import::import`, which finds it and

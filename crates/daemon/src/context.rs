@@ -643,12 +643,38 @@ pub fn check(
 /// Store checked notes and links for session `id`. Returns whether
 /// anything was added.
 pub fn store(db: &Db, id: &str, notes: &[String], links: &[String], now: i64) -> Result<bool> {
+    store_rows(db, id, &rows_from(notes, links, "overlord"), now)
+}
+
+/// A row to add: its kind (`note`, `link`), body and source (`overlord`,
+/// or `fork` for what a fork's own code wrote).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRow {
+    pub kind: &'static str,
+    pub body: String,
+    pub source: &'static str,
+}
+
+/// Notes, then links, as rows from `source`.
+pub fn rows_from(notes: &[String], links: &[String], source: &'static str) -> Vec<NewRow> {
+    let row = |kind, body: &String| NewRow {
+        kind,
+        body: body.clone(),
+        source,
+    };
+    notes
+        .iter()
+        .map(|n| row("note", n))
+        .chain(links.iter().map(|l| row("link", l)))
+        .collect()
+}
+
+/// Store rows (already checked) for session `id`, in order. Returns
+/// whether anything was added.
+pub fn store_rows(db: &Db, id: &str, rows: &[NewRow], now: i64) -> Result<bool> {
     let mut added = false;
-    for n in notes {
-        added |= db.context_add(id, now, "note", n, "overlord")?;
-    }
-    for l in links {
-        added |= db.context_add(id, now, "link", l, "overlord")?;
+    for r in rows {
+        added |= db.context_add(id, now, r.kind, &r.body, r.source)?;
     }
     Ok(added)
 }
@@ -683,18 +709,33 @@ pub fn launch_file_text(
     links: &[String],
     at: i64,
 ) -> String {
-    let rows: Vec<ContextRow> = notes
+    launch_file_text_rows(db, name, &[], &rows_from(notes, links, "overlord"), at)
+}
+
+/// `launch_file_text` for rows copied from another session (`copied`, as
+/// they are stored there) followed by new ones.
+pub fn launch_file_text_rows(
+    db: &Db,
+    name: &str,
+    copied: &[ContextRow],
+    rows: &[NewRow],
+    at: i64,
+) -> String {
+    let rows: Vec<ContextRow> = copied
         .iter()
-        .map(|n| ("note", n))
-        .chain(links.iter().map(|l| ("link", l)))
-        .enumerate()
-        .map(|(i, (kind, body))| ContextRow {
-            id: i as i64 + 1,
+        .cloned()
+        .chain(rows.iter().map(|r| ContextRow {
+            id: 0,
             at,
-            kind: kind.to_string(),
-            body: body.clone(),
-            source: "overlord".to_string(),
+            kind: r.kind.to_string(),
+            body: r.body.clone(),
+            source: r.source.to_string(),
             seen_at: None,
+        }))
+        .enumerate()
+        .map(|(i, r)| ContextRow {
+            id: i as i64 + 1,
+            ..r
         })
         .collect();
     render_as(name, true, &rows, &related_of(db, &rows), None, FILE_BUDGET)

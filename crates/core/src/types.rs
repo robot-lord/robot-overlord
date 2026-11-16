@@ -100,6 +100,12 @@ pub struct Session {
     /// spec's `codex_host`), not in its pane: see `agents::codex::on_daemon`.
     #[serde(default)]
     pub codex_daemon: bool,
+    /// The session it was forked from (`session.fork`): its rlord id, and
+    /// its name as it is now (None when that session is gone).
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    #[serde(default)]
+    pub forked_from_name: Option<String>,
 }
 
 impl Session {

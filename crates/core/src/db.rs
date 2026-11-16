@@ -18,6 +18,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_usage.sql"),
     include_str!("../migrations/0009_rlord_msg.sql"),
     include_str!("../migrations/0010_session_context.sql"),
+    include_str!("../migrations/0011_forked_from.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -27,7 +28,8 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      project_path, tmux_session, status, group_path, pinned, created_at, archived_at, \
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
      repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at, \
-     last_rlord_msg_at";
+     last_rlord_msg_at, forked_from, \
+     (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from)";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -623,6 +625,34 @@ impl Db {
             params![id, name],
         )?;
         Ok(())
+    }
+
+    /// Record that session `id` was forked from session `parent`.
+    pub fn set_forked_from(&self, id: &str, parent: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET forked_from = ?2 WHERE id = ?1",
+            params![id, parent],
+        )?;
+        Ok(())
+    }
+
+    /// The sessions forked from session `id` (live or archived), oldest
+    /// first: (id, name).
+    pub fn forks_of(&self, id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name FROM sessions WHERE forked_from = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Whether any session (live or archived) is called `name`.
+    pub fn name_taken(&self, name: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
@@ -1380,6 +1410,22 @@ impl Db {
         Ok(())
     }
 
+    /// Copy session `from`'s notes and links to session `to` (a fork),
+    /// keeping when each was added, its source and whether it was handed
+    /// to the agent (the fork's conversation is a copy of the one it went
+    /// to); not which hook answer carried it. `except`: row ids left out.
+    /// Returns how many were copied.
+    pub fn context_copy(&self, from: &str, to: &str, except: &[i64]) -> Result<usize> {
+        let skip = serde_json::to_string(except)?;
+        Ok(self.conn.execute(
+            "INSERT INTO session_context (session_id, at, kind, body, source, seen_at) \
+             SELECT ?2, at, kind, body, source, seen_at FROM session_context \
+             WHERE session_id = ?1 AND id NOT IN (SELECT value FROM json_each(?3)) \
+             ORDER BY id",
+            params![from, to, skip],
+        )?)
+    }
+
     /// Mark every row of a session not yet pushed as pushed at `at`.
     pub fn context_mark_all_seen(&self, session_id: &str, at: i64) -> Result<()> {
         self.conn.execute(
@@ -1537,6 +1583,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         summary: r.get(23)?,
         summary_at: r.get(24)?,
         last_rlord_msg_at: r.get(25)?,
+        forked_from: r.get(26)?,
+        forked_from_name: r.get(27)?,
     })
 }
 
@@ -1793,7 +1841,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
         for table in [
             "sessions",
             "tags",
@@ -1878,6 +1926,75 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_knows_its_parent_and_takes_a_copy_of_its_background() {
+        let db = Db::open_in_memory().unwrap();
+        for (id, at) in [("p", 1), ("f", 2), ("g", 3), ("x", 4)] {
+            db.insert_session(&NewSession {
+                id,
+                name: &format!("n-{id}"),
+                agent: "claude",
+                agent_session: None,
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: at,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+        }
+        db.set_forked_from("f", "p").unwrap();
+        db.set_forked_from("g", "p").unwrap();
+        let f = db.resolve_ref("f").unwrap();
+        assert_eq!(f.forked_from.as_deref(), Some("p"));
+        assert_eq!(f.forked_from_name.as_deref(), Some("n-p"));
+        let p = db.resolve_ref("p").unwrap();
+        assert_eq!((p.forked_from, p.forked_from_name), (None, None));
+        assert_eq!(
+            db.forks_of("p").unwrap(),
+            [("f".into(), "n-f".into()), ("g".into(), "n-g".into())]
+        );
+        // Listed with its parent's name too.
+        let listed = db
+            .sessions(&SessionQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "g")
+            .unwrap();
+        assert_eq!(listed.forked_from_name.as_deref(), Some("n-p"));
+        assert!(db.name_taken("n-f").unwrap() && !db.name_taken("n-q").unwrap());
+
+        db.context_add("p", 10, "note", "seen", "overlord").unwrap();
+        db.context_add("p", 11, "link", "x", "overlord").unwrap();
+        db.context_add("p", 12, "note", "unseen", "overlord")
+            .unwrap();
+        let rows = db.context_rows("p").unwrap();
+        db.context_mark_seen("p", rows[0].id, 20).unwrap();
+        db.context_mark_sent("p", rows[2].id, true, "p.ack", 21)
+            .unwrap();
+        let rows = db.context_rows("p").unwrap();
+        // Everything but the link, as it is.
+        assert_eq!(db.context_copy("p", "f", &[rows[1].id]).unwrap(), 2);
+        let copied = db.context_rows("f").unwrap();
+        assert_eq!(
+            copied
+                .iter()
+                .map(|r| (r.at, r.body.as_str(), r.source.as_str(), r.seen_at))
+                .collect::<Vec<_>>(),
+            [
+                (10, "seen", "overlord", Some(20)),
+                (12, "unseen", "overlord", None)
+            ]
+        );
+        // Not which answer carried it (that was the parent's).
+        assert_eq!(db.context_ack("f", "p.ack", 30).unwrap(), 0);
+        // The parent's own rows are untouched.
+        assert_eq!(db.context_rows("p").unwrap(), rows);
+    }
+
+    #[test]
     fn a_new_db_and_its_folder_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
@@ -1901,7 +2018,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 10);
+        assert_eq!(db.schema_version().unwrap(), 11);
     }
 
     #[test]

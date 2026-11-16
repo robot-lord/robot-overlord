@@ -275,8 +275,27 @@ pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
         .unwrap_or_else(|| format!("{base}-{}", random_u64() % 1_000_000))
 }
 
+/// A fork's default name: `<parent>-fork`, then `-fork-2`, `-fork-3`, …
+/// (the first `taken` says no to). A fork of `x-fork` is `x-fork-fork`.
+pub fn fork_name(parent: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = format!("{}-fork", parent.trim());
+    std::iter::once(base.clone())
+        .chain((2..10_000).map(|i| format!("{base}-{i}")))
+        .find(|n| !taken(n))
+        .unwrap_or_else(|| format!("{base}-{}", random_u64() % 1_000_000))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_fork_is_named_after_its_parent() {
+        let none = |_: &str| false;
+        assert_eq!(fork_name("api", none), "api-fork");
+        assert_eq!(fork_name("api-fork", none), "api-fork-fork");
+        let taken = |n: &str| n == "api-fork" || n == "api-fork-2";
+        assert_eq!(fork_name("api", taken), "api-fork-3");
+    }
 
     #[test]
     fn tmux_names_follow_the_session_name() {
