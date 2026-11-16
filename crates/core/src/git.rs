@@ -170,63 +170,102 @@ const SKIP_DIRS: &[&str] = &[
     "build",
 ];
 
+/// A folder the repo scan stayed out of, and why.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Skipped {
+    pub path: String,
+    pub why: crate::privacy::Why,
+}
+
+/// What a repo scan found, and the folders it stayed out of (at most
+/// `MAX_SKIPPED`; `skipped_more` counts the rest).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scan {
+    pub repos: Vec<String>,
+    pub skipped: Vec<Skipped>,
+    pub skipped_more: usize,
+}
+
+impl From<Vec<String>> for Scan {
+    fn from(repos: Vec<String>) -> Scan {
+        Scan {
+            repos,
+            ..Scan::default()
+        }
+    }
+}
+
+/// How many skipped folders a scan lists.
+pub const MAX_SKIPPED: usize = 50;
+
 /// Git repositories under `roots`, up to `depth` levels down. A repo is a
 /// directory containing `.git`. We keep descending below a repo: a dotfiles
 /// repo in `$HOME` must not hide everything under it, and vendored/nested
 /// repos are real repos too (worktrees live under hidden dirs and are
 /// skipped). Sorted, deduplicated.
 ///
-/// On macOS the scan never walks into the home folders the system guards
-/// with a privacy prompt (`PROTECTED_HOME_DIRS`): reading one blocks until
-/// the user answers a dialog, so a scan of `~` sat for an hour and stalled
-/// every MCP call behind it. A root that is (or is inside) one of them is
-/// still scanned, since the user named it.
-pub fn find_repos(roots: &[String], depth: u8) -> Vec<String> {
-    let home = guarded_home();
-    let mut found = Vec::new();
-    for root in roots {
-        let root = crate::config::expand_tilde(root);
-        let Ok(root) = std::fs::canonicalize(&root) else {
-            continue;
-        };
-        walk(&root, depth, home.as_deref(), &mut found);
+/// The scan stays out of folders where a read could block (and reports
+/// them in `skipped`): on macOS the ones the system guards with a privacy
+/// prompt (`privacy::Guard`: reading one waits on a dialog, so a scan of
+/// `~` once sat for an hour), and on every platform another filesystem
+/// than the root's (a network mount, a removable disk), like `find -xdev`.
+/// Symlinks are never followed. A root is scanned whatever it is (the user
+/// named it), and it and `granted` (folders sessions run in) count as
+/// allowed: a granted folder on another filesystem is entered.
+///
+/// Known limits: on macOS a root of `/` skips `/Users` and the other
+/// firmlinked folders (another device); a btrfs subvolume or ZFS dataset
+/// nested under a root is skipped and reported. Naming the folder in
+/// `repo_roots` scans it.
+pub fn scan_repos(roots: &[String], depth: u8, granted: &[String]) -> Scan {
+    let canon: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(crate::config::expand_tilde(r)).ok())
+        .collect();
+    let mut guard = crate::privacy::Guard::new(granted);
+    guard.grant(canon.iter().cloned());
+    let ctx = Walk {
+        guard,
+        dev_of: &device,
+    };
+    let mut out = Scan::default();
+    for root in &canon {
+        walk(root, depth, device(root), &ctx, &mut out);
     }
-    found.sort();
-    found.dedup();
-    found
+    finish(out)
 }
 
-/// Folders directly under `$HOME` that macOS guards with a privacy
-/// (TCC) prompt. `Library` is in `SKIP_DIRS` already.
-const PROTECTED_HOME_DIRS: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Movies",
-    "Music",
-    "Pictures",
-];
-
-/// The home folder whose `PROTECTED_HOME_DIRS` the scan stays out of: on
-/// macOS only.
-fn guarded_home() -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return None;
+/// Sort and dedupe, and cap the skipped list.
+fn finish(mut out: Scan) -> Scan {
+    out.repos.sort();
+    out.repos.dedup();
+    out.skipped.sort();
+    out.skipped.dedup();
+    if out.skipped.len() > MAX_SKIPPED {
+        out.skipped_more = out.skipped.len() - MAX_SKIPPED;
+        out.skipped.truncate(MAX_SKIPPED);
     }
-    std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok())
+    out
 }
 
-/// Path equality as macOS sees it (only used there, via `guarded_home`):
-/// volumes are usually case-insensitive, so a root spelled `/users/me` is
-/// still `$HOME`.
-fn same_path(a: &Path, b: &Path) -> bool {
-    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+/// The device a folder is on (not following a symlink).
+fn device(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).ok().map(|m| m.dev())
 }
 
-/// `home`: skip its `PROTECTED_HOME_DIRS` children (`guarded_home`).
-fn walk(dir: &Path, depth: u8, home: Option<&Path>, out: &mut Vec<String>) {
+/// What a walk checks each folder against.
+struct Walk<'a> {
+    guard: crate::privacy::Guard,
+    dev_of: &'a dyn Fn(&Path) -> Option<u64>,
+}
+
+/// `dev`: the device of the filesystem being walked (None: unknown, no
+/// check).
+fn walk(dir: &Path, depth: u8, dev: Option<u64>, ctx: &Walk, out: &mut Scan) {
+    use crate::privacy::Why;
     if dir.join(".git").exists() {
-        out.push(dir.to_string_lossy().into_owned());
+        out.repos.push(dir.to_string_lossy().into_owned());
     }
     if depth == 0 {
         return;
@@ -234,23 +273,41 @@ fn walk(dir: &Path, depth: u8, home: Option<&Path>, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let in_home = home.is_some_and(|h| same_path(h, dir));
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
             continue;
         }
-        if in_home && PROTECTED_HOME_DIRS.contains(&name.as_ref()) {
-            continue;
-        }
         // Don't follow symlinks: loops and duplicates aren't worth it.
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        if ft.is_dir() {
-            walk(&entry.path(), depth - 1, home, out);
+        if !ft.is_dir() {
+            continue;
         }
+        let path = entry.path();
+        // By name, before anything touches it.
+        if let Some(why) = ctx.guard.prompts(&path) {
+            out.skipped.push(Skipped {
+                path: path.to_string_lossy().into_owned(),
+                why,
+            });
+            continue;
+        }
+        let child = (ctx.dev_of)(&path);
+        let mut next = dev;
+        if dev.is_some() && child != dev {
+            if !ctx.guard.granted(&path) {
+                out.skipped.push(Skipped {
+                    path: path.to_string_lossy().into_owned(),
+                    why: Why::OtherFilesystem,
+                });
+                continue;
+            }
+            next = child;
+        }
+        walk(&path, depth - 1, next, ctx, out);
     }
 }
 
@@ -267,13 +324,29 @@ mod tests {
         assert_eq!(workspace_dirname("feature/x-y"), "feature-x-y");
     }
 
+    fn init_repo(p: &Path) {
+        std::fs::create_dir_all(p).unwrap();
+        git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
+    }
+
+    /// A walk with this guard and devices, as `scan_repos` runs it.
+    fn walk_with(
+        root: &Path,
+        guard: crate::privacy::Guard,
+        dev_of: &dyn Fn(&Path) -> Option<u64>,
+    ) -> Scan {
+        let ctx = Walk { guard, dev_of };
+        let mut out = Scan::default();
+        walk(root, 3, dev_of(root), &ctx, &mut out);
+        finish(out)
+    }
+
     #[test]
-    fn find_repos_scans_roots() {
+    fn scan_repos_scans_roots() {
         let dir = tempfile::tempdir().unwrap();
         let mk = |rel: &str| {
             let p = dir.path().join(rel);
-            std::fs::create_dir_all(&p).unwrap();
-            git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
+            init_repo(&p);
             p
         };
         // The scan root is itself a repo (a dotfiles home) — must not stop there.
@@ -284,38 +357,103 @@ mod tests {
         mk("ko/.hidden/skipped");
         mk("too/deep/for/depth/gamma");
         let roots = vec![dir.path().to_string_lossy().into_owned()];
-        let found = find_repos(&roots, 3);
+        let found = scan_repos(&roots, 3, &[]);
         let canon = |p: &std::path::Path| {
             std::fs::canonicalize(p)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         };
-        assert!(found.contains(&canon(&a)));
-        assert!(found.contains(&canon(&b)));
-        assert!(found.contains(&canon(dir.path())));
-        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found.repos.contains(&canon(&a)));
+        assert!(found.repos.contains(&canon(&b)));
+        assert!(found.repos.contains(&canon(dir.path())));
+        assert_eq!(found.repos.len(), 3, "{found:?}");
+        assert!(found.skipped.is_empty(), "{found:?}");
     }
 
     #[test]
-    fn find_repos_skips_protected_dirs_unless_named() {
+    fn scan_skips_protected_dirs_unless_named() {
+        use crate::privacy::{Guard, Why};
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         for rel in ["Documents/code/alpha", "src/beta"] {
-            let p = root.join(rel);
-            std::fs::create_dir_all(&p).unwrap();
-            git(&["-C", p.to_str().unwrap(), "init", "-q"]).unwrap();
+            init_repo(&root.join(rel));
         }
-        let mut found = Vec::new();
-        walk(&root, 3, Some(&root), &mut found);
-        assert_eq!(found, vec![root.join("src/beta").to_string_lossy()]);
-        // Named as a root itself, it is scanned.
-        let mut found = Vec::new();
-        walk(&root.join("Documents"), 3, Some(&root), &mut found);
+        let same = |_: &Path| Some(1);
+        let found = walk_with(&root, Guard::with(Some(&root), false, &[]), &same);
+        assert_eq!(found.repos, vec![root.join("src/beta").to_string_lossy()]);
         assert_eq!(
-            found,
+            found.skipped,
+            vec![Skipped {
+                path: root.join("Documents").to_string_lossy().into_owned(),
+                why: Why::MacPrivacy
+            }]
+        );
+        // Named as a root itself (granted), it is scanned.
+        let docs = root.join("Documents");
+        let mut g = Guard::with(Some(&root), false, &[]);
+        g.grant([docs.clone()]);
+        let found = walk_with(&docs, g, &same);
+        assert_eq!(
+            found.repos,
             vec![root.join("Documents/code/alpha").to_string_lossy()]
         );
+        assert!(found.skipped.is_empty());
+    }
+
+    #[test]
+    fn scan_stays_on_the_roots_filesystem_unless_granted() {
+        use crate::privacy::{Guard, Why};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        init_repo(&root.join("local/a"));
+        init_repo(&root.join("mnt/b"));
+        init_repo(&root.join("mnt/deep/c"));
+        let mnt = root.join("mnt");
+        let dev = |p: &Path| Some(if p.starts_with(&mnt) { 2 } else { 1 });
+        let found = walk_with(&root, Guard::with(None, false, &[]), &dev);
+        assert_eq!(found.repos, vec![root.join("local/a").to_string_lossy()]);
+        assert_eq!(
+            found.skipped,
+            vec![Skipped {
+                path: mnt.to_string_lossy().into_owned(),
+                why: Why::OtherFilesystem
+            }]
+        );
+        // A session runs in it: entered, two levels deep too.
+        let granted = [mnt.join("b").to_string_lossy().into_owned()];
+        let found = walk_with(&root, Guard::with(None, false, &granted), &dev);
+        assert_eq!(found.repos.len(), 3, "{found:?}");
+        assert!(found.skipped.is_empty());
+    }
+
+    #[test]
+    fn scan_never_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        init_repo(&elsewhere.path().join("r"));
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("link")).unwrap();
+        let found = scan_repos(&[root.to_string_lossy().into_owned()], 3, &[]);
+        assert!(found.repos.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn skipped_is_capped_and_counted() {
+        use crate::privacy::Why;
+        let skipped = (0..60)
+            .map(|i| Skipped {
+                path: format!("/x/{i:02}"),
+                why: Why::OtherFilesystem,
+            })
+            .collect();
+        let out = finish(Scan {
+            skipped,
+            ..Scan::default()
+        });
+        assert_eq!(out.skipped.len(), MAX_SKIPPED);
+        assert_eq!(out.skipped_more, 10);
+        assert_eq!(out.skipped[0].path, "/x/00");
     }
 
     #[test]

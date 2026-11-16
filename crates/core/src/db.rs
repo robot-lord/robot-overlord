@@ -1047,6 +1047,18 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The folders live (non-archived) sessions run in: each one's
+    /// `project_path` and `repo_path`. Distinct, unordered.
+    pub fn session_folders(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project_path FROM sessions WHERE archived_at IS NULL AND project_path != '' \
+             UNION SELECT repo_path FROM sessions WHERE archived_at IS NULL \
+             AND repo_path IS NOT NULL AND repo_path != ''",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     // ---- subagents ----
 
     /// Insert or update a sub-agent; only provided (Some / non-empty) fields

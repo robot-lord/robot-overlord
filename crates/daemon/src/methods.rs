@@ -34,13 +34,13 @@ pub fn repo_list(db: &Db, cfg: &Config) -> Result<Value> {
 /// Everything the repo finder can offer: known repos (MRU, default first)
 /// followed by repos discovered under `roots` (the finder's, see
 /// `Daemon::finder_roots`), deduplicated.
-/// `scanning`: the disk scan is still running, so `scanned` may be short.
-pub fn repo_find(
+/// `scanning`: the disk scan is still running, so the list may be short.
+/// `skipped`: folders the scan stayed out of (`git::scan_repos`).
+pub(crate) fn repo_find(
     db: &Db,
     cfg: &Config,
     roots: &[String],
-    scanned: Vec<String>,
-    scanning: bool,
+    found: crate::repo_scan::Found,
 ) -> Result<Value> {
     let mut out = repo_list(db, cfg)?;
     let known: std::collections::HashSet<String> = out
@@ -49,7 +49,7 @@ pub fn repo_find(
         .iter()
         .filter_map(|r| r["path"].as_str().map(str::to_string))
         .collect();
-    for p in scanned {
+    for p in found.repos {
         if !known.contains(&p) {
             out.as_array_mut()
                 .unwrap()
@@ -59,7 +59,11 @@ pub fn repo_find(
     let roots: Vec<String> = roots.iter().map(|r| expand_tilde(r)).collect();
     Ok(
         json!({"repos": out, "roots": roots, "depth": cfg.session.repo_scan_depth,
-              "scanning": scanning,
+              "scanning": found.scanning,
+              "skipped": found.skipped.iter().map(|k| json!({
+                  "path": k.path, "why": k.why.id(), "text": k.why.text(),
+              })).collect::<Vec<_>>(),
+              "skipped_more": found.skipped_more,
               "code_dir": cfg.session.code_dir_path().unwrap_or_default()}),
     )
 }

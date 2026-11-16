@@ -205,17 +205,25 @@ impl Daemon {
         cfg.session.finder_roots(pending)
     }
 
-    /// Git repos under `roots`, and whether the first scan of them is still
-    /// running (`repo_scan.rs`: never blocks for long). No roots: none.
-    fn scanned_repos(&self, roots: &[String], depth: u8) -> (Vec<String>, bool) {
+    /// Git repos under `roots`, the folders the scan stayed out of, and
+    /// whether the first scan of them is still running (`repo_scan.rs`:
+    /// never blocks for long). No roots: none. Folders sessions run in
+    /// count as granted (`privacy::Guard`); they are read under a short DB
+    /// lock, released before the scan.
+    fn scanned_repos(&self, roots: &[String], depth: u8) -> repo_scan::Found {
         if roots.is_empty() {
-            return (Vec::new(), false);
+            return repo_scan::Found {
+                repos: Vec::new(),
+                skipped: Vec::new(),
+                skipped_more: 0,
+                scanning: false,
+            };
         }
+        let granted = self.db().session_folders().unwrap_or_default();
         let key = (roots.to_vec(), depth);
-        let f = self
-            .repo_scan
-            .get(&key, |k| rlord_core::git::find_repos(&k.0, k.1));
-        (f.repos, f.scanning)
+        self.repo_scan.get(&key, move |k| {
+            rlord_core::git::scan_repos(&k.0, k.1, &granted)
+        })
     }
 
     /// Install the navigation bindings on the tmux server. Best-effort: no
@@ -483,8 +491,8 @@ impl Daemon {
             "session.new" => methods::session_new(&db, &self.config(), &params),
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
-                let ((repos, scanning), roots, cfg) = scanned.expect("scanned for repo.find");
-                methods::repo_find(&db, &cfg, &roots, repos, scanning)
+                let (found, roots, cfg) = scanned.expect("scanned for repo.find");
+                methods::repo_find(&db, &cfg, &roots, found)
             }
             "session.defaults" => {
                 let cfg = self.config();
