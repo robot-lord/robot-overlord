@@ -125,14 +125,48 @@ by code (`context::frame_message`).
   fix-up of existing installs and no chmod at daemon start: the only two
   installs are the user's, already fixed by hand. (There is no
   `rlord setup` command; first run is the daemon's first start.)
-- [ ] Migration 0010, `Db::context_*`.
-- [ ] `context.rs`: render, files, `split_legacy`, `frame_message`.
-- [ ] `session.new` takes `context`, `related`; `update_session`
-  `add_context`, `add_related`; `get_session` shows them; form preview.
-- [ ] Hook replies (SessionStart, UserPromptSubmit), printed by
-  `rlord hook emit`.
-- [ ] Fallback pointer; Claude's `--append-system-prompt-file`.
-- [ ] `overlord.md`, `docs/architecture.md`, `docs/guide.md`.
+- [x] Migration 0010, `Db::context_add` / `context_rows` /
+  `context_unseen` / `context_mark_seen`. Rows cascade with their session
+  (sessions are never deleted today, only archived).
+- [x] `context.rs`: render, files, `split_legacy`, `frame_message` (the
+  last unused until PR 4), `check` / `store`, `hook_reply`, `delivery`.
+- [x] `session.new` takes `context`, `related`; RPC `session.context` /
+  `session.context_add`; MCP `update_session` `add_context`,
+  `add_related`; `get_session` shows `background`; `propose_session`
+  checks and carries them; the manual form shows a read-only preview line
+  and launches with them.
+- [x] Hook replies (SessionStart, UserPromptSubmit) via `hook.emit`'s
+  `reply`; `send_hook_event_for_reply`; `rlord hook emit` prints it.
+- [x] Fallback pointer (Codex untrusted, OpenCode); Claude without
+  rlord's SessionStart hook gets `--append-system-prompt-file` at launch
+  and every restart (`methods::background_args`).
+- [x] `overlord.md` (prompt / context / related, `add_context`; "always
+  ends with" dropped; test `instructions_keep_the_users_words_apart`),
+  `docs/architecture.md` ("Session background", private files, hook
+  path), `docs/guide.md`.
+- Live check V2: not run (optional in PR 1).
+
+### Decisions made in PR 1 (beyond the plan)
+
+- **Header without notes.** The "you are the session the user asked for"
+  line left `overlord.md`, so a session the overlord launches with no
+  notes would lose it. `session.new` takes an internal `by_overlord`
+  (set by `create_session`, and by the manual form when
+  `propose_session` filled it); such a session has a background (kv
+  `context_on:<id>`) even with no rows. A session the user launches
+  themselves has none.
+- **No `Pull` argument to `render` yet.** Nothing to point at until PR 2;
+  PR 2 adds the "Looking up more" section.
+- **Note length is refused, not clipped** (over 8,000 chars, more than 8
+  related, an unknown or overlord ref): the overlord gets the error and
+  can shorten it.
+- **Bare launch with background:** a Codex (untrusted) or OpenCode
+  session launched with no prompt gets no pointer line (it would start a
+  turn). Its background is only in the file until PR 2 lets it pull.
+- **`bind_prompt:<id>`** holds the first prompt as typed, pointer line
+  included, since Codex binding matches the thread's first message.
+- **Runtime dir** keeps `Daemon::bind`'s own 0700 (set every start; the
+  socket is the trust boundary), outside `rlord_core::private`.
 
 ## Owed / deferred
 
@@ -140,4 +174,10 @@ by code (`context::frame_message`).
   overlord` section) is for overlords still on old instructions. Remove it
   a few releases after PR 1 ships.
 - Follow-up, not in this effort: the guard rail above.
+- The first prompt (with the pointer line for Codex untrusted / OpenCode)
+  is still on argv, `launched_args`, the `launched` event and
+  `bind_prompt`: PR 3.
+- `get_session` (a read-only tool) shows any session's background to any
+  session that added plain `rlord mcp`, like its notes. PR 2's scoped
+  tools are the real surface for workers.
 - Reconcile at PR 4: Codex daemon-mode `turn/start`, an overlord token.
