@@ -205,6 +205,21 @@ pub fn tools() -> Value {
         tool("create_session",
             "Create and launch a new agent session immediately.",
             create_props, &[]),
+        tool("fork_session",
+            "Start a new session that goes on from a copy of another session's whole conversation, on the same agent, in the same folder (or a new worktree). The original is left as it is. For trying another approach or branching off. Not for work that only needs to know about a session: launch a new one with `related` for that. The answer is the new session, with `forked_from` and `warnings` (shared folder, a working original, a nearly full context window) to pass on.",
+            json!({
+                "session": s(SESSION_REF),
+                "prompt": s("The user's words for what the fork should do first, verbatim (optional: without it the fork opens idle at its input)"),
+                "context": s("Your own notes for the fork, as for create_session (optional). The fork already gets the original's background and a note saying what it was forked from."),
+                "related": {"type": "array", "items": {"type": "string"},
+                            "description": "More related sessions for its background, as for create_session (the original is linked already)"},
+                "name": s("Its name (default: <original>-fork, then -fork-2, …)"),
+                "description": s("Its one-line description (default: the original's)"),
+                "model": s("Another model than the original's, one of that agent's (default: the original's)"),
+                "worktree": b("Work in a new git worktree branched from the original's last commit instead of its folder (default false). Claude Code and Codex only; uncommitted changes don't come along. Only when the user asks, or the two must not touch the same files."),
+                "branch": s("The new worktree's branch (default: derived from the name)"),
+                "go": b("Switch the user's terminal to the fork (default false)"),
+            }), &["session"]),
         tool("update_session",
             "Edit a session's meta-context. Only the fields given change.",
             json!({
@@ -342,6 +357,14 @@ fn summarize(s: &Value) -> Value {
         // Remote Control: on / connecting / failed / … (absent when off).
         "remote": s["remote"]["state"], "remote_url": s["remote"]["url"],
     });
+    // A fork: what it was forked from.
+    if let Some(from) = s["forked_from"].as_str() {
+        row["forked_from"] = json!({"id": from, "name": s["forked_from_name"]});
+    }
+    // The sessions forked from it (get_session).
+    if s["forks"].as_array().is_some_and(|f| !f.is_empty()) {
+        row["forks"] = s["forks"].clone();
+    }
     // Stopped on a usage limit: that, rather than the status under it.
     if !s["limit"].is_null() {
         row["status"] = json!("limited");
@@ -607,6 +630,36 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(out)
         }
+        "fork_session" => {
+            let mut params = json!({"ref": session_ref(args)?, "by_overlord": true});
+            for k in [
+                "prompt",
+                "context",
+                "related",
+                "name",
+                "description",
+                "model",
+                "branch",
+            ] {
+                if let Some(v) = args.get(k) {
+                    params[k] = v.clone();
+                }
+            }
+            if args.get("worktree").and_then(Value::as_bool) == Some(true) {
+                params["workspace"] = json!(true);
+            }
+            let s = d.rpc("session.fork", params)?;
+            let mut out = summarize(&s);
+            out["warnings"] = s["warnings"].clone();
+            if args.get("go").and_then(Value::as_bool) == Some(true) {
+                // The fork exists either way; a failed switch is a note.
+                match d.rpc("ui.goto", json!({"ref": s["id"]})) {
+                    Ok(_) => out["user_switched_to_it"] = json!(true),
+                    Err(e) => out["switch_failed"] = json!(format!("{e:#}")),
+                }
+            }
+            Ok(out)
+        }
         "update_session" => {
             let r = session_ref(args)?;
             let id = d.rpc("session.get", json!({"ref": r}))?["id"].clone();
@@ -842,6 +895,7 @@ mod tests {
         "confirm_new_session",
         "confirm_setup",
         "create_session",
+        "fork_session",
         "update_session",
         "remote_control",
         "set_group_order",
