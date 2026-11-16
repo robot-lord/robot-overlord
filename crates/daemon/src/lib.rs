@@ -3,6 +3,7 @@ pub mod autostart;
 pub mod codex_daemon;
 pub mod context;
 pub mod discover;
+pub mod fork;
 pub mod import;
 pub mod limits;
 pub mod locks;
@@ -434,6 +435,7 @@ impl Daemon {
         if matches!(
             method,
             "session.new"
+                | "session.fork"
                 | "session.restart"
                 // (Enter on a stopped session resumes it.)
                 | "ui.goto"
@@ -791,6 +793,20 @@ impl Daemon {
                 Ok(json!({"styled": true}))
             }
             "session.import_scan" => import::scan(self, params),
+            // (Its own locking: OpenCode's fork call, the hooks check and
+            // `git worktree add` run without the DB lock.)
+            "session.fork" => {
+                let r = fork::fork(self, params);
+                if let Ok(v) = &r {
+                    self.changed();
+                    self.bind_nav_keys();
+                    // A new tmux session starts on rlord's defaults.
+                    if let Some(id) = v["id"].as_str() {
+                        profile::sync_ref(self, id);
+                    }
+                }
+                r
+            }
             "session.import" => {
                 let r = import::import(self, params);
                 if let Ok(v) = &r {

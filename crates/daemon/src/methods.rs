@@ -984,7 +984,7 @@ pub(crate) fn import_candidate(
 /// A tmux name for a session called `name` (see `names::tmux_name_for`),
 /// not taken by another session or live tmux session; `own` is the
 /// session's current one (free for itself).
-fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
+pub(crate) fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
     // own check still catches.
     // The overlords' fixed names are reserved, even before they exist.
@@ -1094,14 +1094,28 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     };
     // The command with the session's own flags; the background's flag or
     // pointer is added to it below (both go last, where a launch puts
-    // them).
-    let (mut argv, resumed) = agent.resume(
-        s.agent_session.as_deref(),
-        &s.agent_session_trust,
-        &s.project_path,
-        model.as_deref(),
-        &spec_args(agent, &spec),
-    )?;
+    // them). A fork whose conversation was never made (its agent never
+    // got that far) forks again rather than resume.
+    let refork = crate::fork::pending(db, &s)?;
+    let (mut argv, resumed) = match &refork {
+        Some(parent) => (
+            crate::fork::refork_argv(
+                agent,
+                &s,
+                parent,
+                model.as_deref(),
+                &spec_args(agent, &spec),
+            )?,
+            false,
+        ),
+        None => agent.resume(
+            s.agent_session.as_deref(),
+            &s.agent_session_trust,
+            &s.project_path,
+            model.as_deref(),
+            &spec_args(agent, &spec),
+        )?,
+    };
     let mut mode = context::mode(db, &s.id)?;
     // A new conversation by hook, but the hooks no longer work
     // (`hooks_work`: see `Daemon::restart_hooks`, asked before the lock):
@@ -1145,6 +1159,9 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     }
     if let Some(p) = &pointer {
         note_first_prompt(db, &s.id, agent, Some(p), now)?;
+    } else if refork.is_some() {
+        // (Its thread, forked from the parent's, is one started from now.)
+        note_first_prompt(db, &s.id, agent, None, now)?;
     }
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.
@@ -1166,6 +1183,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             // (Resumed: whatever model the conversation has by now.)
             (true, Some(d)) => json!({"argv": argv,
                 "model": format!("the session keeps its own (launched with {})", d.model)}),
+            _ if refork.is_some() => json!({"argv": argv, "fork": true}),
             _ => json!({"argv": argv}),
         }
         .to_string(),

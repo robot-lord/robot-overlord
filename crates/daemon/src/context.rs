@@ -646,6 +646,37 @@ pub fn store(db: &Db, id: &str, notes: &[String], links: &[String], now: i64) ->
     store_rows(db, id, &rows_from(notes, links, "overlord"), now)
 }
 
+/// Where a fork works, for its note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkFolder {
+    /// Its parent's folder.
+    Shared,
+    /// A worktree of its own (path, branch), branched from the parent's
+    /// last commit.
+    Worktree(String, String),
+}
+
+/// The note a fork gets (plain code, `source = 'fork'`): what it was
+/// forked from and when, that the two go on separately, and where it
+/// works.
+pub fn fork_note(parent_name: &str, parent_id: &str, at: i64, folder: &ForkFolder) -> String {
+    let ts = rlord_core::timefmt::fmt_ts(at);
+    let when = format!("{} UTC", ts.get(..16).unwrap_or(&ts));
+    let mut out = format!(
+        "Forked from session \"{}\" ({parent_id}) at {when}. The conversation up to then \
+         is a copy of that session's; from here the two go on separately.",
+        one_line(parent_name, 80)
+    );
+    match folder {
+        ForkFolder::Shared => out.push_str(" It works in the same folder as that session."),
+        ForkFolder::Worktree(path, branch) => out.push_str(&format!(
+            " It works in its own worktree, {path} (branch {branch}), branched from that \
+             session's last commit; changes not committed there were not carried over."
+        )),
+    }
+    out
+}
+
 /// A row to add: its kind (`note`, `link`), body and source (`overlord`,
 /// or `fork` for what a fork's own code wrote).
 #[derive(Debug, Clone, PartialEq, Eq)]

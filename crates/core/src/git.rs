@@ -105,6 +105,37 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create the worktree on a new branch `branch` started at commit `start`
+/// (a fork's: its parent's last commit). Refuses an existing branch or
+/// folder.
+pub fn worktree_add_from(repo: &str, branch: &str, dir: &Path, start: &str) -> Result<()> {
+    if dir.exists() {
+        bail!("workspace directory already exists: {}", dir.display());
+    }
+    if branch_exists(repo, branch) {
+        bail!("branch {branch} already exists");
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let dir_s = dir.to_string_lossy();
+    git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s, start])?;
+    Ok(())
+}
+
+/// The commit checked out in the folder `dir` (its HEAD).
+pub fn head_commit(dir: &str) -> Result<String> {
+    git(&["-C", dir, "rev-parse", "--verify", "HEAD"])
+}
+
+/// Whether the checkout at `dir` has changes not committed (tracked files
+/// only; None when git can't say).
+pub fn has_changes(dir: &str) -> Option<bool> {
+    git(&["-C", dir, "status", "--porcelain", "--untracked-files=no"])
+        .ok()
+        .map(|out| !out.is_empty())
+}
+
 /// Whether `repo` has a local branch named `branch`.
 pub fn branch_exists(repo: &str, branch: &str) -> bool {
     git(&[
@@ -381,6 +412,51 @@ mod tests {
         let mut out = Scan::default();
         walk(root, root, 3, dev_of(root), &ctx, &mut out);
         finish(out, false)
+    }
+
+    #[test]
+    fn a_fork_worktree_starts_at_the_parents_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let r = repo.to_str().unwrap();
+        let commit = |msg: &str| {
+            git(&[
+                "-C",
+                r,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                msg,
+            ])
+            .unwrap()
+        };
+        commit("one");
+        let first = head_commit(r).unwrap();
+        commit("two");
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git(&["-C", r, "add", "f.txt"]).unwrap();
+        assert_eq!(has_changes(r), Some(true));
+        let wt = repo.join(".worktrees").join("x-fork");
+        worktree_add_from(r, "x-fork", &wt, &first).unwrap();
+        let w = wt.to_str().unwrap();
+        assert_eq!(head_commit(w).unwrap(), first);
+        // Nothing uncommitted was carried over.
+        assert_eq!(has_changes(w), Some(false));
+        assert!(!wt.join("f.txt").exists());
+        // The branch and the folder are taken now.
+        let e = worktree_add_from(r, "x-fork", &repo.join("other"), &first).unwrap_err();
+        assert!(e.to_string().contains("already exists"), "{e}");
+        assert!(worktree_add_from(r, "y-fork", &wt, &first).is_err());
+        assert_eq!(
+            has_changes(&dir.path().join("none").to_string_lossy()),
+            None
+        );
     }
 
     #[test]
