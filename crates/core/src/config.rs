@@ -1136,19 +1136,29 @@ mod tests {
         assert_eq!(c.session.scan_roots(), ["~/ko", "~/proj"]);
         // An empty file gains the section.
         let out = set_code_dir_in("", "/c", &RootsEdit::Follow).unwrap();
-        assert_eq!(toml::from_str::<Config>(&out).unwrap().session.code_dir, "/c");
+        assert_eq!(
+            toml::from_str::<Config>(&out).unwrap().session.code_dir,
+            "/c"
+        );
         // The template too (its `repo_roots` is commented out).
         let out = set_code_dir_in(&Config::default_toml(), "~/code", &RootsEdit::Follow).unwrap();
         let c: Config = toml::from_str(&out).unwrap();
         assert_eq!(c.session.scan_roots(), ["~/code"]);
         // A file that doesn't load: nothing.
-        assert!(set_code_dir_in("[session]\nrepo_scan_depth = \"x\"\n", "/c", &RootsEdit::Leave).is_err());
+        assert!(set_code_dir_in(
+            "[session]\nrepo_scan_depth = \"x\"\n",
+            "/c",
+            &RootsEdit::Leave
+        )
+        .is_err());
         // On disk, at a given path.
         let dir = std::env::temp_dir().join(format!("rlord-codedir-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("config.toml");
         Config::set_code_dir_at(&p, "/c", RootsEdit::Follow).unwrap();
-        assert!(std::fs::read_to_string(&p).unwrap().contains("code_dir = \"/c\""));
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("code_dir = \"/c\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

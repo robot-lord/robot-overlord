@@ -111,7 +111,70 @@ struct Finder {
     roots: Vec<String>,
     /// The disk scan was still running: the list may be short.
     scanning: bool,
+    /// Folders the scan stayed out of: (path, why as text), and how many
+    /// more than are listed.
+    skipped: Vec<(String, String)>,
+    skipped_more: usize,
     state: ListState,
+}
+
+/// The finder's third line: no code folder (nothing scanned), or the
+/// folders the scan stayed out of, grouped by reason, two paths each.
+fn finder_note(
+    roots: &[String],
+    skipped: &[(String, String)],
+    more: usize,
+    home: &str,
+) -> Option<String> {
+    if roots.is_empty() {
+        return Some(
+            "no code folder set, so only repos you've used show · :setup sets one · or type a repo path"
+                .into(),
+        );
+    }
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut reasons: Vec<&str> = Vec::new();
+    for (_, why) in skipped {
+        if !reasons.contains(&why.as_str()) {
+            reasons.push(why);
+        }
+    }
+    let last = reasons.len() - 1;
+    let groups: Vec<String> = reasons
+        .iter()
+        .enumerate()
+        .map(|(i, why)| {
+            let paths: Vec<&str> = skipped
+                .iter()
+                .filter(|(_, w)| w == why)
+                .map(|(p, _)| p.as_str())
+                .collect();
+            let shown: Vec<String> = paths
+                .iter()
+                .take(2)
+                .map(|p| {
+                    if home.is_empty() {
+                        p.to_string()
+                    } else {
+                        p.replacen(home, "~", 1)
+                    }
+                })
+                .collect();
+            let hidden = paths.len().saturating_sub(2) + if i == last { more } else { 0 };
+            let plus = if hidden > 0 {
+                format!(" +{hidden}")
+            } else {
+                String::new()
+            };
+            format!("{}{plus} ({why})", shown.join(", "))
+        })
+        .collect();
+    Some(format!(
+        "skipped {} · add one to repo_roots to scan it",
+        groups.join("; ")
+    ))
 }
 
 impl Finder {
@@ -1025,6 +1088,18 @@ impl App {
                 })
                 .unwrap_or_default(),
             scanning: v["scanning"].as_bool().unwrap_or(false),
+            skipped: v["skipped"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|k| {
+                            let s = |f: &str| k[f].as_str().unwrap_or("").to_string();
+                            (s("path"), s("text"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            skipped_more: v["skipped_more"].as_u64().unwrap_or(0) as usize,
             state: ListState::default().with_selected(Some(0)),
         });
     }
@@ -1163,8 +1238,10 @@ impl App {
 
         if let Some(finder) = &form.finder {
             let home = std::env::var("HOME").unwrap_or_default();
+            let note = finder_note(&finder.roots, &finder.skipped, finder.skipped_more, &home);
+            let q_rows = if note.is_some() { 3 } else { 2 };
             let [q_area, list_area] =
-                RLayout::vertical([Constraint::Length(2), Constraint::Min(3)]).areas(inner);
+                RLayout::vertical([Constraint::Length(q_rows), Constraint::Min(3)]).areas(inner);
             let rows = finder.rows();
             let roots = finder
                 .roots
@@ -1177,20 +1254,24 @@ impl App {
                     "still scanning {roots}, so only repos you've used show (reopen to refresh) · or type a repo path · esc back"
                 )
             } else if rows.is_empty() {
-                format!("no repos match — scanned {roots} (config: [session] repo_roots) · or type a repo path")
+                format!("no repos match — scanned {roots} (config: [session] code_dir, repo_roots) · or type a repo path")
             } else {
                 format!("{} repos · ↑↓/tab move · enter pick · esc back", rows.len())
             };
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(Span::styled(
-                        format!("find repo: {}▏", finder.query),
-                        Style::default().fg(theme::yellow()),
-                    )),
-                    Line::from(Span::styled(hint, Style::default().fg(theme::muted_c()))),
-                ]),
-                q_area,
-            );
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!("find repo: {}▏", finder.query),
+                    Style::default().fg(theme::yellow()),
+                )),
+                Line::from(Span::styled(hint, Style::default().fg(theme::muted_c()))),
+            ];
+            if let Some(note) = note {
+                lines.push(Line::from(Span::styled(
+                    note,
+                    Style::default().fg(theme::muted_c()),
+                )));
+            }
+            f.render_widget(Paragraph::new(lines), q_area);
             let list = List::new(rows.iter().map(|(_, label)| ListItem::new(label.as_str())))
                 .highlight_style(theme::selected())
                 .highlight_symbol(theme::SELECT_BAR);
@@ -1711,6 +1792,28 @@ pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finder_note_says_what_was_skipped() {
+        let roots = vec!["/h".to_string()];
+        assert_eq!(finder_note(&roots, &[], 0, "/h"), None);
+        assert!(finder_note(&[], &[], 0, "/h")
+            .unwrap()
+            .starts_with("no code folder set"));
+        let p = "macOS asks permission".to_string();
+        let o = "another disk or network mount".to_string();
+        let skipped = vec![
+            ("/h/Desktop".to_string(), p.clone()),
+            ("/h/Documents".to_string(), p.clone()),
+            ("/h/Music".to_string(), p.clone()),
+            ("/mnt/nas".to_string(), o.clone()),
+        ];
+        assert_eq!(
+            finder_note(&roots, &skipped, 2, "/h").unwrap(),
+            "skipped ~/Desktop, ~/Documents +1 (macOS asks permission); \
+             /mnt/nas +2 (another disk or network mount) · add one to repo_roots to scan it"
+        );
+    }
 
     fn render(app: &App, form: &NewForm) -> String {
         use ratatui::backend::TestBackend;

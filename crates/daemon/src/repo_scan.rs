@@ -171,12 +171,7 @@ mod tests {
     }
 
     /// A scan that blocks until the returned sender sends or drops.
-    fn gated(
-        repos: &[&str],
-    ) -> (
-        mpsc::Sender<()>,
-        impl FnOnce(&Key) -> Scan + Send + 'static,
-    ) {
+    fn gated(repos: &[&str]) -> (mpsc::Sender<()>, impl FnOnce(&Key) -> Scan + Send + 'static) {
         let (tx, rx) = mpsc::channel::<()>();
         let repos: Vec<String> = repos.iter().map(|r| r.to_string()).collect();
         (tx, move |_: &Key| {

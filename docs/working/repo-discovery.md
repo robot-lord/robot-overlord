@@ -48,7 +48,7 @@ Progress: (updated per commit)
 
 - [x] config: `code_dir`, `scan_roots`, `set_code_dir`
 - [x] predictor: `privacy.rs`, `git::scan_repos`, `skipped`
-- [ ] finder and `find_repos` show skipped folders
+- [x] finder and `find_repos` show skipped folders
 - [ ] suggestion: `code_dir.rs`, sources, `setup.*` methods
 - [ ] `rlord setup`
 - [ ] TUI setup form, first run, `:setup`

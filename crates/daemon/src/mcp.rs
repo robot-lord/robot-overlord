@@ -155,7 +155,7 @@ pub fn tools() -> Value {
                 "show": b("Take the user to the list (default true)"),
             }), &[]),
         tool("find_repos",
-            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there.",
+            "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there. `skipped`: folders the scan stayed out of (a macOS privacy prompt, another disk): a repo in one is found by its path, not by scanning.",
             json!({"query": s("Words that must appear in the path")}), &[]),
         tool("get_session_defaults",
             "The defaults new sessions get (agent, model, model choices, workspace, default repo), `code_dir` (the folder the user keeps repos in and where new ones go; \"\" = not set yet, see confirm_setup), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
@@ -371,7 +371,8 @@ fn summarize_candidate(c: &Value) -> Value {
 
 /// What `find_repos` hands the overlord from a `repo.find` result: the
 /// repos matching `query` (at most 40), whether the scan is still running,
-/// and a note when the finder scans nothing.
+/// the folders it stayed out of (at most 10, `skipped_more` counts the
+/// rest), and a note when the finder scans nothing.
 fn shape_find_repos(r: &Value, query: &str) -> Value {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let repos: Vec<Value> = r["repos"]
@@ -393,6 +394,19 @@ fn shape_find_repos(r: &Value, query: &str) -> Value {
     let mut out = json!({"repos": repos});
     if r["scanning"].as_bool() == Some(true) {
         out["scanning"] = true.into();
+    }
+    let skipped = r["skipped"].as_array().cloned().unwrap_or_default();
+    if !skipped.is_empty() {
+        out["skipped"] = skipped
+            .iter()
+            .take(10)
+            .map(|k| json!({"path": k["path"], "why": k["text"]}))
+            .collect();
+        let more =
+            skipped.len().saturating_sub(10) as u64 + r["skipped_more"].as_u64().unwrap_or(0);
+        if more > 0 {
+            out["skipped_more"] = more.into();
+        }
     }
     if r["roots"].as_array().is_some_and(|a| a.is_empty()) {
         out["note"] = json!(
@@ -766,6 +780,27 @@ mod tests {
         "resume_after_limit",
         "session_action",
     ];
+
+    #[test]
+    fn find_repos_reports_skipped_folders_and_no_roots() {
+        let skipped: Vec<Value> = (0..12)
+            .map(|i| json!({"path": format!("/x/{i}"), "why": "privacy", "text": "macOS asks permission"}))
+            .collect();
+        let r = json!({
+            "repos": [{"path": "/h/ko/a", "default": false, "last_used_at": null},
+                      {"path": "/h/b", "default": false, "last_used_at": null}],
+            "roots": ["/h"], "skipped": skipped, "skipped_more": 3,
+        });
+        let out = shape_find_repos(&r, "ko");
+        assert_eq!(out["repos"].as_array().unwrap().len(), 1);
+        assert_eq!(out["skipped"].as_array().unwrap().len(), 10);
+        assert_eq!(out["skipped"][0]["why"], "macOS asks permission");
+        assert_eq!(out["skipped_more"], 5);
+        assert!(out.get("note").is_none());
+        let out = shape_find_repos(&json!({"repos": [], "roots": []}), "");
+        assert!(out["note"].as_str().unwrap().contains("no code folder"));
+        assert!(out.get("skipped").is_none());
+    }
 
     #[test]
     fn read_only_tools_are_an_explicit_allow_list() {

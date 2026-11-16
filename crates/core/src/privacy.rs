@@ -115,7 +115,8 @@ impl Guard {
         if self.volumes {
             let mut c = path.components();
             if c.next() == Some(Component::RootDir)
-                && c.next().is_some_and(|v| self.eq(v.as_os_str(), "Volumes".as_ref()))
+                && c.next()
+                    .is_some_and(|v| self.eq(v.as_os_str(), "Volumes".as_ref()))
             {
                 if let Some(vol) = c.next() {
                     return Some(Path::new("/Volumes").join(vol));
@@ -188,7 +189,10 @@ mod tests {
         let g = Guard::with(
             Some(home),
             true,
-            &["/Users/me/Documents/code/app".into(), "/Volumes/Ext/r".into()],
+            &[
+                "/Users/me/Documents/code/app".into(),
+                "/Volumes/Ext/r".into(),
+            ],
         );
         assert_eq!(g.prompts(Path::new("/Users/me/Documents")), None);
         assert_eq!(g.prompts(Path::new("/Users/me/Documents/other")), None);
@@ -197,7 +201,10 @@ mod tests {
             Some(Why::MacPrivacy)
         );
         assert_eq!(g.prompts(Path::new("/Volumes/Ext/x")), None);
-        assert_eq!(g.prompts(Path::new("/Volumes/Other")), Some(Why::MacPrivacy));
+        assert_eq!(
+            g.prompts(Path::new("/Volumes/Other")),
+            Some(Why::MacPrivacy)
+        );
         assert!(g.granted(Path::new("/Users/me/Documents/code")));
         assert!(!g.granted(Path::new("/Users/me/Documents/code/app/sub")));
     }
