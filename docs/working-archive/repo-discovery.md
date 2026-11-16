@@ -30,6 +30,15 @@ repo scan, "Setup: the code folder") and `docs/guide.md` ("The overlord",
   vote is plain string work; only the candidates about to be shown are
   checked for being a repo (under `$HOME`). Sessions in `app/src` and
   `app/docs` can still lift `app`'s parent's score.
+- **From the last `/code-review` of #63, not fixed:**
+  - The TUI recognises a missing folder by matching `setup.apply`'s
+    "doesn't exist" error text; it should be a structured `missing` field.
+  - A second `setup.suggest` can start while one is still running (two
+    forms opened quickly in one run before the first answer lands).
+  - `claude_project_folders` reads each transcript's tail as well as its
+    head; reading the head first and stopping there would read less.
+  - `Guard::guarded_ancestor` builds a `PathBuf` per protected folder for
+    every entry the walk meets; it could compare components in place.
 - **Other code that touches folders unprompted doesn't ask the guard
   yet**: `methods::repo_list`'s `is_dir` on known repos,
   `import::add_git_info`.

@@ -1735,6 +1735,8 @@ fn setup_cmd(
         }
         if c["prompts"] == true {
             l.push_str(" (macOS will ask permission for it once)");
+        } else if c["checked"] == false {
+            l.push_str(" (not checked)");
         }
         l
     };
@@ -1801,9 +1803,7 @@ fn setup_cmd(
 
 /// `folder` is `$HOME` (as given or resolved).
 fn is_home(folder: &str) -> bool {
-    use rlord_core::privacy::{home_paths, same_path, FOLDS_CASE};
-    let p = std::path::Path::new(folder);
-    home_paths().iter().any(|h| same_path(h, p, FOLDS_CASE))
+    rlord_core::privacy::is_home(std::path::Path::new(folder))
 }
 
 /// The question about `repo_roots`: everything the finder scans now (the

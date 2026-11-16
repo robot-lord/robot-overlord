@@ -205,9 +205,11 @@ fn suggestion_value(
     guard: &Guard,
     is_dir: &dyn Fn(&Path) -> bool,
 ) -> Value {
+    // (The tests' folders are under `/h`.)
+    let homes = [PathBuf::from("/h")];
     let look = Look {
         guard,
-        homes: &[],
+        homes: &homes,
         is_dir,
         is_repo: &|_| false,
     };
@@ -217,6 +219,10 @@ fn suggestion_value(
 /// The `setup.suggest` answer for a suggestion.
 fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look) -> Value {
     let (guard, is_dir) = (look.guard, look.is_dir);
+    // Only folders under `$HOME` that no prompt guards are looked at (as
+    // for the repo check); any other is shown as not checked.
+    let checkable =
+        |p: &Path| look.homes.iter().any(|h| guard.is_within(p, h)) && guard.prompts(p).is_none();
     let under = |dir: &str| {
         s.projects
             .iter()
@@ -237,7 +243,7 @@ fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look
     .filter(|r| !(look.is_repo)(Path::new(r)))
     .filter(|r| {
         let p = Path::new(r);
-        guard.prompts(p).is_some() || is_dir(p)
+        !checkable(p) || is_dir(p)
     });
     let mut shown: Vec<(String, usize, &str)> = Vec::new();
     if let Some(r) = &explicit {
@@ -257,13 +263,15 @@ fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look
     let shown: Vec<Value> = shown
         .into_iter()
         .filter_map(|(path, projects, from)| {
-            let prompts = guard.prompts(Path::new(&path)).is_some();
+            let p = Path::new(&path);
+            let prompts = guard.prompts(p).is_some();
+            let checked = checkable(p);
             // (The explicit root was checked above: stat once.)
-            if !prompts && from != "repo_roots" && !is_dir(Path::new(&path)) {
+            if checked && from != "repo_roots" && !is_dir(p) {
                 return None;
             }
             Some(json!({"path": path, "projects": projects, "of": s.total,
-                        "from": from, "prompts": prompts}))
+                        "from": from, "prompts": prompts, "checked": checked}))
         })
         .take(5)
         .collect();
@@ -398,7 +406,8 @@ fn apply_with(
     // a repo (where it can be checked); `$HOME` only when the user
     // confirmed it (`allow_home`: the finder then scans all of it).
     let p = Path::new(&dir);
-    if homes.iter().any(|h| guard.same(h, p)) {
+    let home = rlord_core::privacy::is_home_in(p, homes, guard.folds_case());
+    if home {
         if params["allow_home"] != true {
             bail!(
                 "{} is your whole home folder: the repo finder would scan all of it. \
@@ -409,7 +418,8 @@ fn apply_with(
     } else if !code_dir::suggestible(p, homes) {
         bail!("{dir} is a system or mount folder, not a code folder: pick the folder your repos are in");
     }
-    if checked && p.join(".git").exists() {
+    // (A dotfiles repo at `$HOME` doesn't block a confirmed home.)
+    if checked && !home && p.join(".git").exists() {
         bail!(
             "{} is a git repo: the code folder is the one that holds your repos (its parent?)",
             contract_tilde(&dir)
@@ -614,6 +624,42 @@ mod tests {
         let mut cfg = Config::default();
         cfg.session.code_dir = "/c".into();
         assert!(!answered_from(None, &cfg).needed);
+    }
+
+    /// Candidates outside `$HOME` aren't looked at: shown, not checked.
+    #[test]
+    fn candidates_outside_home_are_not_stated() {
+        let s = sugg("/srv/code", &[], &["/srv/code/a"]);
+        let v = suggestion_value(
+            &s,
+            &Config::default(),
+            true,
+            &Guard::with(None, false),
+            &|p| panic!("stat-ed {}", p.display()),
+        );
+        assert_eq!(v["suggestion"]["path"], "/srv/code");
+        assert_eq!(v["suggestion"]["checked"], false);
+    }
+
+    /// A confirmed home with a dotfiles repo in it is taken.
+    #[test]
+    fn a_dotfiles_repo_doesnt_block_a_confirmed_home() {
+        let d = daemon();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let cfg = root.join("config.toml");
+        let homes = [home.clone()];
+        let r = apply_with(
+            &d,
+            &json!({"code_dir": home.to_string_lossy(), "allow_home": true}),
+            &cfg,
+            &Guard::with(None, false),
+            &homes,
+        )
+        .unwrap();
+        assert_eq!(r["code_dir"], home.to_string_lossy().as_ref());
     }
 
     #[test]

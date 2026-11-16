@@ -266,9 +266,7 @@ The repo finder scans it, and new repos go there.
   don't launch into a made-up one while you wait.
 - A message that starts with `[rlord setup request]` comes from that form:
   the user described where their code is. The description wins over the
-  hints. Call `confirm_setup` with the folder, the finder's folders as
-  the request states the user's choice (changed only if the description
-  asks), their description verbatim, `changed` and a one-line `note`. If
+  hints. Answer with `confirm_setup` (its schema says what to pass). If
   it's unclear which folder they mean, ask once, briefly.
 
 ## Passing work to a session

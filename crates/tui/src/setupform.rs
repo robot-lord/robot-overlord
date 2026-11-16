@@ -478,8 +478,11 @@ impl SetupForm {
 
     /// `path` is `$HOME` (as given or resolved).
     fn is_home(&self, path: &str) -> bool {
-        let p = std::path::Path::new(path.trim_end_matches('/'));
-        self.homes.iter().any(|h| self.guard.same(h, p))
+        rlord_core::privacy::is_home_in(
+            std::path::Path::new(path),
+            &self.homes,
+            self.guard.folds_case(),
+        )
     }
 
     /// Whether this (UI) thread may look at `path` on disk: only under
@@ -670,6 +673,7 @@ impl App {
             match r {
                 Ok(()) => self.status_line = "sent to the overlord".into(),
                 Err(e) => {
+                    self.setup_reply_flags = None;
                     self.status_line = format!("couldn't reach the overlord: {e}");
                     f.error = Some(format!("not sent: {e}"));
                     self.setup_retry = Some(f);
@@ -691,7 +695,8 @@ impl App {
         // then the overlay, as before).
         let (auto, then_overlord) = match &self.mode {
             Mode::Setup(f) => (f.auto, f.then_overlord),
-            _ => (false, false),
+            // (The form that asked the overlord was sent away: its own.)
+            _ => self.setup_reply_flags.take().unwrap_or((false, false)),
         };
         // What is configured now came with the command (cheap); rlord's own
         // suggestion, for ←/→, loads in the background.
@@ -896,6 +901,9 @@ impl App {
                         .map_err(|e| format!("{e:#}"));
                     let _ = tx.send(r);
                 });
+                // The overlord's answer reopens it as this form was (first
+                // run, overlay after).
+                self.setup_reply_flags = Some((f.auto, f.then_overlord));
                 self.setup_send = Some((rx, f));
                 // Its answer reopens the form; nothing parked is current.
                 self.pending_setup = None;
@@ -1539,6 +1547,23 @@ mod tests {
         };
         assert!(f.auto);
         assert!(!app.startup_chain);
+    }
+
+    /// The overlord's answer to a first-run form's request opens as the
+    /// first-run form.
+    #[test]
+    fn the_answer_to_a_first_run_request_is_first_run() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.setup_reply_flags = Some((true, true));
+        app.open_setup_from(&json!({"cmd": "setup", "prefill": {"code_dir": "/p"},
+                                    "status": {"code_dir": "", "repo_roots": []}}));
+        let Mode::Setup(f) = &app.mode else {
+            panic!("form not open")
+        };
+        assert!(f.auto && f.then_overlord);
+        assert!(app.setup_reply_flags.is_none());
     }
 
     /// A kept suggestion made for another config is dropped on open.

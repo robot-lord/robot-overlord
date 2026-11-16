@@ -114,7 +114,8 @@ const NEVER: &[&str] = &[
 ];
 
 /// Folders never suggested: `/`, `$HOME` and its ancestors, `NEVER`, and
-/// each user's folder under `/run/media` (a parent of mounts too).
+/// each user's folder under `/run/media` and `/media` (parents of mounts
+/// too).
 fn never(d: &Path, homes: &[PathBuf]) -> bool {
     never_with(d, homes, crate::privacy::FOLDS_CASE)
 }
@@ -125,8 +126,9 @@ fn never_with(d: &Path, homes: &[PathBuf], fold: bool) -> bool {
     d.parent().is_none()
         || homes.iter().any(|h| path_within(h, d, fold))
         || NEVER.iter().any(|n| same_path(d, Path::new(n), fold))
-        || d.parent()
-            .is_some_and(|p| same_path(p, Path::new("/run/media"), fold))
+        || d.parent().is_some_and(|p| {
+            same_path(p, Path::new("/run/media"), fold) || same_path(p, Path::new("/media"), fold)
+        })
 }
 
 /// A folder that may be offered as the code folder at all: not `/`, not
@@ -359,6 +361,8 @@ mod tests {
             ]
         );
         assert!(never(Path::new("/run/media/me"), homes));
+        assert!(never(Path::new("/media/me"), homes));
+        assert!(!never(Path::new("/media/me/usb"), homes));
         assert!(!never(Path::new("/srv/code"), homes));
         // A repo among the candidates is left out, and its parent still
         // shows (two subfolders of one repo lifted it into the vote).

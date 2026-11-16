@@ -287,6 +287,9 @@ struct App {
     setup_send: Option<setupform::SetupSend>,
     /// That form, to reopen once nothing else is open (the send failed).
     setup_retry: Option<Box<setupform::SetupForm>>,
+    /// The sent form's (first run, overlay after), for the overlord's
+    /// answer (`open_setup_from`).
+    setup_reply_flags: Option<(bool, bool)>,
     /// The selection as last saved with the daemon (kept across restarts).
     saved_sel: Option<String>,
     /// Last view reported to the daemon (so the overlord sees what we show).
@@ -353,6 +356,7 @@ impl App {
             last_suggestion: None,
             setup_send: None,
             setup_retry: None,
+            setup_reply_flags: None,
             saved_sel: None,
             reported_view: Value::Null,
             hits: Default::default(),

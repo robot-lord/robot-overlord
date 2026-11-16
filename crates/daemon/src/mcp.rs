@@ -173,7 +173,7 @@ pub fn tools() -> Value {
         tool("confirm_setup",
             "Open the code-folder form on the user's screen (hides your overlay) for them to confirm: the folder they keep repos in (`code_dir`: the repo finder scans it and new repos go there). Pass what you would save; with nothing passed the form shows rlord's own suggestion, worked out from the projects it has seen. Nothing is saved until they confirm there, and rlord saves it then: you don't act again.",
             json!({
-                "code_dir": s("The folder as you would save it (omit: rlord's suggestion)"),
+                "code_dir": s("The folder as you would save it; answering a setup request, the one the description names (it wins over the hints). Omit: rlord's suggestion"),
                 "repo_roots": {"type": "array", "items": {"type": "string"},
                                "description": "More folders for the repo finder to scan besides code_dir, which it always scans. Omit to leave the user's configured ones as they are; [] to scan only code_dir. Answering a setup request: pass the roots choice exactly as the request's roots line says, unless the description asks for something else. Never pass get_session_defaults' scan_roots here"},
                 "description": s("The user's description, verbatim, when answering a setup request"),

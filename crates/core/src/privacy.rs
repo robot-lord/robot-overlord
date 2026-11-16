@@ -177,6 +177,23 @@ impl Guard {
     }
 }
 
+/// `path` is `$HOME` (as given or resolved; trailing `/` ignored, ASCII
+/// case folded on macOS).
+pub fn is_home(path: &Path) -> bool {
+    is_home_in(path, &home_paths(), FOLDS_CASE)
+}
+
+/// `is_home` against given homes and case rule (tests, and callers that
+/// hold them already).
+pub fn is_home_in(path: &Path, homes: &[PathBuf], fold: bool) -> bool {
+    let trimmed = path.to_string_lossy();
+    let p = Path::new(match trimmed.trim_end_matches('/') {
+        "" => "/",
+        t => t,
+    });
+    homes.iter().any(|h| same_path(h, p, fold))
+}
+
 /// This machine compares paths ignoring ASCII case (macOS).
 pub const FOLDS_CASE: bool = cfg!(target_os = "macos");
 
@@ -245,6 +262,15 @@ mod tests {
             Some(Why::MacPrivacy)
         );
         assert_eq!(g.prompts(Path::new("/var/home/me/src")), None);
+    }
+
+    #[test]
+    fn home_is_matched_by_one_rule() {
+        let homes = [PathBuf::from("/Users/me")];
+        assert!(is_home_in(Path::new("/Users/me/"), &homes, false));
+        assert!(is_home_in(Path::new("/users/ME"), &homes, true));
+        assert!(!is_home_in(Path::new("/users/ME"), &homes, false));
+        assert!(!is_home_in(Path::new("/Users/me/x"), &homes, true));
     }
 
     #[test]
