@@ -1065,7 +1065,15 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
 
 pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
-    Ok(serde_json::to_value(s)?)
+    let mut v = serde_json::to_value(&s)?;
+    // The sessions forked from it (`session.fork`).
+    let forks: Vec<Value> = db
+        .forks_of(&s.id)?
+        .into_iter()
+        .map(|(id, name)| json!({"id": id, "name": name}))
+        .collect();
+    v["forks"] = json!(forks);
+    Ok(v)
 }
 
 pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {

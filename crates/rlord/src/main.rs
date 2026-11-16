@@ -126,6 +126,33 @@ enum Command {
         #[arg(long, short = 'a')]
         attach: bool,
     },
+    /// Fork a session: a new session that goes on from a copy of its whole
+    /// conversation, on the same agent, in the same folder (or a new
+    /// worktree). The original is left as it is
+    Fork {
+        /// The session to fork (id, id prefix, name or name prefix)
+        r#ref: String,
+        /// What the fork should do first (optional: it opens idle)
+        prompt: Vec<String>,
+        /// Display name (default: <original>-fork)
+        #[arg(long)]
+        name: Option<String>,
+        /// Another model than the original's (default: the original's)
+        #[arg(long)]
+        model: Option<String>,
+        /// Work in a new worktree branched from the original's last commit
+        /// (Claude Code and Codex; uncommitted changes don't come along)
+        #[arg(long)]
+        worktree: bool,
+        /// The new worktree's branch (default: derived from the name)
+        #[arg(long, requires = "worktree")]
+        branch: Option<String>,
+        /// Attach immediately after it starts
+        #[arg(long, short = 'a')]
+        attach: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// List git repos rlord has used, most recent first
     Repos,
     /// Set your code folder: where your repos live and new ones go (the
@@ -905,6 +932,32 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Fork {
+            r#ref,
+            prompt,
+            name,
+            model,
+            worktree,
+            branch,
+            attach,
+            json,
+        } => {
+            let prompt = (!prompt.is_empty()).then(|| prompt.join(" "));
+            let r = call(
+                "session.fork",
+                json!({"ref": r#ref, "prompt": prompt, "name": name, "model": model,
+                       "workspace": worktree, "branch": branch}),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", fork_lines(&r));
+            }
+            if attach {
+                attach_tmux(r["tmux_session"].as_str().context("no tmux session")?)?;
+            }
+            Ok(())
+        }
         Command::Setup {
             path,
             keep_roots,
@@ -1176,6 +1229,7 @@ fn main() -> Result<()> {
             println!("  state      {}", t("last_state_change_at"));
             println!("  tags       {}   group {}", tags_of(&s), g("group_path"));
             println!("  desc       {}", g("description"));
+            print!("{}", lineage_lines(&s));
             let notes = s["notes"].as_str().unwrap_or("");
             if !notes.is_empty() {
                 println!("  notes");
@@ -2456,10 +2510,113 @@ fn installed_by(exe: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+/// What `rlord fork` prints: the fork, then each warning on its own line.
+fn fork_lines(r: &Value) -> String {
+    let s = |k: &str| r[k].as_str().unwrap_or("?");
+    let mut out = format!(
+        "forked {} → {} ({})",
+        r["forked_from_name"].as_str().unwrap_or("?"),
+        s("name"),
+        s("id")
+    );
+    if let Some(ws) = r["workspace_path"]
+        .as_str()
+        .filter(|ws| Some(*ws) != r["repo_path"].as_str())
+    {
+        out.push_str(&format!(" in {ws} [{}]", s("branch")));
+    }
+    out.push('\n');
+    for w in r["warnings"].as_array().into_iter().flatten() {
+        if let Some(w) = w.as_str() {
+            out.push_str(&format!("  note: {w}\n"));
+        }
+    }
+    out
+}
+
+/// `rlord show`'s lineage: what a session was forked from, and its forks.
+fn lineage_lines(s: &Value) -> String {
+    let mut out = String::new();
+    if let Some(from) = s["forked_from"].as_str() {
+        let name = s["forked_from_name"].as_str().unwrap_or("(gone)");
+        let when = s["created_at"]
+            .as_i64()
+            .map(|v| format!(" · {}", fmt_ts(v)))
+            .unwrap_or_default();
+        out.push_str(&format!("  forked from {name} ({from}){when}\n"));
+    }
+    let forks: Vec<&str> = s["forks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    if !forks.is_empty() {
+        out.push_str(&format!("  forks      {}\n", forks.join(", ")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn fork_parses_and_prints() {
+        let cli = Cli::try_parse_from([
+            "rlord",
+            "fork",
+            "api",
+            "try",
+            "a",
+            "queue",
+            "--name",
+            "q",
+            "--worktree",
+            "-a",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Fork {
+                r#ref,
+                prompt,
+                name,
+                worktree,
+                attach,
+                branch,
+                ..
+            }) => {
+                assert_eq!(r#ref, "api");
+                assert_eq!(prompt.join(" "), "try a queue");
+                assert_eq!(name.as_deref(), Some("q"));
+                assert!(worktree && attach && branch.is_none());
+            }
+            _ => panic!("not a fork"),
+        }
+        // A branch only goes with a new worktree.
+        assert!(Cli::try_parse_from(["rlord", "fork", "api", "--branch", "b"]).is_err());
+        let r = json!({"id": "01f", "name": "api-fork", "forked_from_name": "api",
+                       "repo_path": "/r", "workspace_path": "/r", "branch": "main",
+                       "warnings": ["it shares its folder with api (working)"]});
+        assert_eq!(
+            fork_lines(&r),
+            "forked api → api-fork (01f)\n  note: it shares its folder with api (working)\n"
+        );
+        let r = json!({"id": "01f", "name": "x", "forked_from_name": "api", "repo_path": "/r",
+                       "workspace_path": "/r/.worktrees/x", "branch": "x", "warnings": []});
+        assert_eq!(
+            fork_lines(&r),
+            "forked api → x (01f) in /r/.worktrees/x [x]\n"
+        );
+        let s = json!({"forked_from": "01p", "forked_from_name": "api",
+                       "forks": [{"id": "01g", "name": "x-fork"}]});
+        assert_eq!(
+            lineage_lines(&s),
+            "  forked from api (01p)\n  forks      x-fork\n"
+        );
+        assert_eq!(lineage_lines(&json!({"forks": []})), "");
+    }
 
     #[test]
     fn setup_prompt_helpers() {
