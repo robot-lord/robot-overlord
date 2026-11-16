@@ -433,6 +433,7 @@ impl Daemon {
             "session.list"
                 | "session.get"
                 | "session.log"
+                | "session.context"
                 | "repo.list"
                 | "repo.find"
                 | "session.defaults"
@@ -506,6 +507,8 @@ impl Daemon {
             "session.pin" => methods::session_pin(&db, &params),
             "session.describe" => methods::session_describe(&db, &params),
             "session.notes" => methods::session_notes(&db, &params),
+            "session.context" => methods::session_context(&db, &params),
+            "session.context_add" => methods::session_context_add(&db, &params),
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => {
@@ -1000,6 +1003,13 @@ pub enum HookSent {
 /// that didn't complete, the connection closed or reset) is `Unreachable`:
 /// the daemon did not take a whole event and answer, so it is kept.
 pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
+    send_hook_event_for_reply(socket_path, params).0
+}
+
+/// `send_hook_event`, and what the daemon answers the hook with, if
+/// anything (`reply`: the hook's output for the agent, e.g. the session's
+/// background at SessionStart). Only a `Delivered` event has one.
+pub fn send_hook_event_for_reply(socket_path: &Path, params: &Value) -> (HookSent, Option<Value>) {
     use std::io::{BufRead, BufReader as StdBufReader, ErrorKind, Write};
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc;
@@ -1011,7 +1021,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     const SENDING: u8 = 1;
     const GAVE_UP: u8 = 2;
     let state = Arc::new(AtomicU8::new(CONNECTING));
-    let (tx, rx) = mpsc::channel::<HookSent>();
+    let (tx, rx) = mpsc::channel::<(HookSent, Option<Value>)>();
     let path = socket_path.to_path_buf();
     let req = json!({"id": 1, "method": "hook.emit", "params": params});
     let sender_state = Arc::clone(&state);
@@ -1019,7 +1029,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     std::thread::spawn(move || {
         let state = sender_state;
         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
-            let _ = tx.send(HookSent::Unreachable);
+            let _ = tx.send((HookSent::Unreachable, None));
             return;
         };
         if state
@@ -1035,17 +1045,23 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
         // (A send that didn't complete left the daemon half a line: it
         // can't act on that.)
         if stream.write_all(&buf).is_err() {
-            let _ = tx.send(HookSent::Unreachable);
+            let _ = tx.send((HookSent::Unreachable, None));
             return;
         }
         let mut line = String::new();
         let _ = tx.send(match StdBufReader::new(&mut stream).read_line(&mut line) {
-            Ok(n) if n > 0 => HookSent::Delivered,
+            Ok(n) if n > 0 => {
+                let reply = serde_json::from_str::<Value>(&line)
+                    .ok()
+                    .and_then(|v| v["result"].get("reply").cloned())
+                    .filter(|r| !r.is_null());
+                (HookSent::Delivered, reply)
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                HookSent::Slow
+                (HookSent::Slow, None)
             }
             // Closed or reset before an answer: the daemon went away.
-            _ => HookSent::Unreachable,
+            _ => (HookSent::Unreachable, None),
         });
     });
     // Connected within a second, or the event is kept (and the sender,
@@ -1055,7 +1071,7 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(sent) => return sent,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return HookSent::Unreachable,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return (HookSent::Unreachable, None),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if state.load(Ordering::SeqCst) == SENDING {
@@ -1066,13 +1082,13 @@ pub fn send_hook_event(socket_path: &Path, params: &Value) -> HookSent {
                 .compare_exchange(CONNECTING, GAVE_UP, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            return HookSent::Unreachable;
+            return (HookSent::Unreachable, None);
         }
     }
     // Sending: the sender's own timeouts (1s + 2s) end it; a little more
     // than that is waited, so its verdict is the one acted on.
     rx.recv_timeout(Duration::from_millis(3500))
-        .unwrap_or(HookSent::Slow)
+        .unwrap_or((HookSent::Slow, None))
 }
 
 // ---- hook spool: hook evidence must never be lost to a down daemon ----
@@ -1758,6 +1774,86 @@ mod tests {
             HookSent::Delivered
         );
         answer.join().unwrap();
+        // One that answers with something for the agent: handed back.
+        let sock = dir.path().join("reply.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let answer = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut c, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&c).read_line(&mut line).unwrap();
+            c.write_all(b"{\"id\":1,\"result\":{\"ok\":true,\"reply\":{\"x\":1}}}\n")
+                .unwrap();
+        });
+        assert_eq!(
+            send_hook_event_for_reply(&sock, &json!({"event": "SessionStart"})),
+            (HookSent::Delivered, Some(json!({"x": 1})))
+        );
+        answer.join().unwrap();
+        // Nobody there: no reply (the hook prints nothing).
+        assert_eq!(
+            send_hook_event_for_reply(&dir.path().join("absent.sock"), &json!({})),
+            (HookSent::Unreachable, None)
+        );
+    }
+
+    /// A session's own hook gets its background back; a hook from outside
+    /// its pane, or a session without background, gets nothing.
+    #[test]
+    fn a_sessions_own_hook_gets_its_background() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01bg",
+            name: "web-footer",
+            agent: "claude",
+            agent_session: Some("u-1"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01bg_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let emit = |event: &str, extra: Value| {
+            let mut params = json!({"instance": "01bg", "agent": "claude", "event": event,
+                                    "payload": {"session_id": "u-1", "hook_event_name": event}});
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            methods::hook_emit(&db, &params).unwrap()
+        };
+        assert!(
+            emit("SessionStart", json!({}))["reply"].is_null(),
+            "no background"
+        );
+        context::store(&db, "01bg", Some("use the staging DB"), &[], 5).unwrap();
+        // From outside rlord's tmux (a forked copy): nothing.
+        let r = emit("SessionStart", json!({"pane": null}));
+        assert!(r["ignored"].is_string() && r["reply"].is_null());
+        let r = emit("SessionStart", json!({}));
+        let out = &r["reply"]["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "SessionStart");
+        assert!(out["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("use the staging DB"));
+        // Already given: the next prompt gets nothing more, and the status
+        // still follows the hook.
+        let r = emit("UserPromptSubmit", json!({}));
+        assert!(r["reply"].is_null());
+        assert_eq!(
+            db.resolve_ref("01bg").unwrap().status,
+            rlord_core::types::Status::Working
+        );
+        context::store(&db, "01bg", Some("PR is #12"), &[], 6).unwrap();
+        let r = emit("UserPromptSubmit", json!({}));
+        assert!(r["reply"]["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("PR is #12"));
     }
 
     /// "Needs you" is a block mid-turn, cleared when the agent moves on;

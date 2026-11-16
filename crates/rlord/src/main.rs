@@ -2015,10 +2015,15 @@ fn hook_emit(agent: &str) -> Result<()> {
         }
     };
     // Bounded: a stalled daemon never holds up the agent's tool call.
-    if rlord_daemon::send_hook_event(&paths::socket_path(), &params)
-        == rlord_daemon::HookSent::Unreachable
-    {
+    let (sent, reply) = rlord_daemon::send_hook_event_for_reply(&paths::socket_path(), &params);
+    if sent == rlord_daemon::HookSent::Unreachable {
         spool_hook_event(&params).ok();
+    }
+    // The daemon's answer for the agent (the session's background at
+    // SessionStart / UserPromptSubmit): printed as the hook's output. Slow
+    // or unreachable: nothing, as before.
+    if let Some(r) = reply {
+        println!("{r}");
     }
     Ok(())
 }
