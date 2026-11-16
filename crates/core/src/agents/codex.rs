@@ -116,6 +116,26 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
+/// A user fork of thread `parent` (a new thread that starts from a copy of
+/// it; the parent is untouched): `codex fork <parent> --no-alt-screen
+/// [--model m] <extra…> [prompt]`. Codex assigns the new thread's id; its
+/// rollout names the parent (`rollout_forked_from`). (Not the archive
+/// summary's `codex exec fork`: `summary_argv`.)
+pub fn fork_argv(
+    parent: &str,
+    first_prompt: Option<&str>,
+    model: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut argv = with_model(
+        vec!["codex".to_string(), "fork".to_string(), parent.to_string()],
+        model,
+        extra,
+    );
+    argv.extend(first_prompt.map(str::to_string));
+    argv
+}
+
 /// A TOML basic string (for a `-c key=value` override's value).
 pub fn toml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -530,6 +550,43 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
         .into_iter::<String>()
         .next()?
         .ok()
+}
+
+/// The thread a rollout's conversation was forked from (its `session_meta`
+/// line's `forked_from_id`), from its first line only: a fork's history
+/// copied after it may hold other threads' meta. None: not a fork, or it
+/// can't be read.
+pub fn rollout_forked_from(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let first = text.split('\n').next().unwrap_or("");
+    if let Ok(v) = serde_json::from_str::<Value>(first) {
+        if v["type"] != "session_meta" {
+            return None;
+        }
+        return v["payload"]["forked_from_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+    // (A first line longer than what was read: the field comes early.)
+    if !first.contains("\"session_meta\"") {
+        return None;
+    }
+    let key = "\"forked_from_id\":";
+    let at = first.find(key)? + key.len();
+    serde_json::Deserializer::from_str(&first[at..])
+        .into_iter::<Option<String>>()
+        .next()?
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
 }
 
 // ---- reading rollout lines (see `transcript::Line`) ----
@@ -1519,5 +1576,85 @@ mod tests {
             assert!(!argv.iter().any(|x| x.contains("dangerously")));
         }
         assert!(!b.contains(&"--model".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_user_fork_runs_codex_fork_with_the_sessions_flags() {
+        let extra = host_args(false);
+        assert_eq!(
+            fork_argv("t-1", Some("try a queue"), Some("gpt-x"), &extra),
+            [
+                "codex",
+                "fork",
+                "t-1",
+                "--no-alt-screen",
+                "--model",
+                "gpt-x",
+                "--no-daemon",
+                "try a queue"
+            ]
+        );
+        assert_eq!(
+            fork_argv("t-1", None, None, &[]),
+            ["codex", "fork", "t-1", "--no-alt-screen"]
+        );
+        // Not the summary's `codex exec fork`.
+        assert!(!fork_argv("t-1", None, None, &[]).contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn a_rollout_says_which_thread_it_was_forked_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let meta = |forked: Value| {
+            json!({"timestamp": "2026-11-16T10:00:00Z", "type": "session_meta",
+                   "payload": {"id": "t-2", "forked_from_id": forked, "cwd": "/src/app",
+                               "instructions": "x".repeat(200)}})
+            .to_string()
+        };
+        let parent_meta = json!({"type": "session_meta",
+            "payload": {"id": "t-1", "forked_from_id": "t-0", "cwd": "/src/app"}})
+        .to_string();
+        let fork = write(
+            "fork.jsonl",
+            &format!("{}\n{parent_meta}\n", meta(json!("t-1"))),
+        );
+        assert_eq!(rollout_forked_from(&fork).as_deref(), Some("t-1"));
+        // Not a fork: the parent's meta copied after the first line doesn't count.
+        let plain = write(
+            "plain.jsonl",
+            &format!("{}\n{parent_meta}\n", meta(Value::Null)),
+        );
+        assert_eq!(rollout_forked_from(&plain), None);
+        let older = write(
+            "older.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t-3\",\"cwd\":\"/a\"}}\n",
+        );
+        assert_eq!(rollout_forked_from(&older), None);
+        // A first line longer than what is read: found from its start.
+        let long = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"t-4\",\"forked_from_id\":\"t-1\",\
+             \"instructions\":\"{}\"}}}}\n",
+            "y".repeat(100 * 1024)
+        );
+        assert_eq!(
+            rollout_forked_from(&write("long.jsonl", &long)).as_deref(),
+            Some("t-1")
+        );
+        assert_eq!(rollout_forked_from(&dir.path().join("absent.jsonl")), None);
+        assert_eq!(
+            rollout_forked_from(&write("junk.jsonl", "not json\n")),
+            None
+        );
     }
 }

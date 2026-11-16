@@ -292,6 +292,27 @@ impl Service {
         .map(|_| ())
     }
 
+    /// Fork session `id` (`POST /api/session/{id}/fork`, body `{}`: its
+    /// whole conversation): the new session's id. The fork gets the
+    /// parent's folder and model, is not archived, and its row names the
+    /// parent (`fork_session_id`). A parent with no finished turn is
+    /// refused (`opencode::NOTHING_TO_FORK`).
+    pub fn fork(&self, id: &str) -> Result<String> {
+        if !is_session_id(id) {
+            bail!("not an OpenCode session id");
+        }
+        let (status, text) = self.request(
+            "POST",
+            &super::opencode::fork_path(id),
+            Some(&serde_json::json!({})),
+            Duration::from_secs(10),
+        )?;
+        if !(200..300).contains(&status) && !text.contains("ForkEmpty") {
+            bail!("forking in OpenCode: {status} {}", clip_error(&text));
+        }
+        super::opencode::fork_response(&text)
+    }
+
     /// Text generated from session `id`'s context without adding to its
     /// history (`POST /api/session/{id}/generate`): the session's own
     /// model answers, and only its token totals change.
@@ -1049,6 +1070,33 @@ mod tests {
             }
         };
         assert!(!gone.answers());
+    }
+
+    #[test]
+    fn a_fork_is_made_by_the_server() {
+        let (svc, asked) = serve(vec![
+            ok(r#"{"data":{"id":"ses_2fork","directory":"/src/app"}}"#),
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: 52\r\n\r\n{\"_tag\":\"Session.ForkEmptyError\",\"message\":\"empty\"}".into(),
+            "HTTP/1.1 500 Oops\r\ncontent-length: 21\r\n\r\n{\"message\":\"broken\"}".into(),
+        ]);
+        assert_eq!(svc.fork("ses_1a").unwrap(), "ses_2fork");
+        let req = asked.recv().unwrap();
+        assert!(
+            req.starts_with("POST /api/session/ses_1a/fork HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.ends_with("{}"), "{req}");
+        assert_eq!(
+            svc.fork("ses_1a").unwrap_err().to_string(),
+            super::super::opencode::NOTHING_TO_FORK
+        );
+        assert!(svc
+            .fork("ses_1a")
+            .unwrap_err()
+            .to_string()
+            .contains("broken"));
+        // An id that isn't one never reaches a URL.
+        assert!(svc.fork("../x").is_err());
     }
 
     #[test]

@@ -103,6 +103,42 @@ pub fn resume_argv(
     Ok(argv)
 }
 
+/// Whether a user fork's new conversation id can be chosen by rlord:
+/// `--resume <parent> --fork-session --session-id <new>` starts the fork
+/// on `<new>` (live check F1, Claude Code 2.1.325; see `fork_argv`).
+/// False: the fork's id is bound from its first hook instead.
+pub const FORK_MINTS_ID: bool = true;
+
+/// Whether a user fork can start in another worktree of the parent's repo:
+/// `--resume <parent>` there still finds the parent's conversation (live
+/// check F2, Claude Code 2.1.325).
+pub const FORK_ELSEWHERE: bool = true;
+
+/// A user fork of conversation `parent` (a new session that starts from a
+/// copy of it; the parent is untouched): `claude --resume <parent>
+/// --fork-session [--session-id <new>] [--model m] <extra…> [prompt]`.
+/// (Not the archive summary's fork: `summary_argv`.)
+pub fn fork_argv(
+    parent: &str,
+    new_id: Option<&str>,
+    first_prompt: Option<&str>,
+    model: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = ["claude", "--resume", parent, "--fork-session"]
+        .map(String::from)
+        .to_vec();
+    if let Some(id) = new_id {
+        argv.extend(["--session-id".to_string(), id.to_string()]);
+    }
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        argv.extend(["--model".to_string(), m.to_string()]);
+    }
+    argv.extend(extra.iter().cloned());
+    argv.extend(first_prompt.map(str::to_string));
+    argv
+}
+
 /// Map a Claude hook event to (event kind for our log, what it does to the
 /// status).
 ///
@@ -739,5 +775,47 @@ mod tests {
         assert!(a.background);
         assert_eq!(a.output_tokens, 260);
         assert_eq!(a.finished_at.unwrap() - a.started_at.unwrap(), 4000);
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    #[test]
+    fn a_user_fork_resumes_the_parent_into_a_new_id() {
+        let extra = vec!["--settings".to_string(), "{}".to_string()];
+        assert_eq!(
+            fork_argv(
+                "p-1",
+                Some("n-2"),
+                Some("try it with a queue"),
+                Some(" opus "),
+                &extra
+            ),
+            [
+                "claude",
+                "--resume",
+                "p-1",
+                "--fork-session",
+                "--session-id",
+                "n-2",
+                "--model",
+                "opus",
+                "--settings",
+                "{}",
+                "try it with a queue"
+            ]
+        );
+        // No id of rlord's choosing, no model, no prompt: opens idle.
+        assert_eq!(
+            fork_argv("p-1", None, None, Some(""), &[]),
+            ["claude", "--resume", "p-1", "--fork-session"]
+        );
+        // Never the summary's one-shot flags.
+        let a = fork_argv("p-1", Some("n"), Some("x"), None, &[]);
+        assert!(!a
+            .iter()
+            .any(|x| x == "-p" || x == "--no-session-persistence"));
     }
 }

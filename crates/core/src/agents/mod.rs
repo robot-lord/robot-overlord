@@ -124,6 +124,21 @@ pub struct Launch {
     pub deferred: Option<Deferred>,
 }
 
+/// How a user fork of a conversation starts (a new session that goes on
+/// from a copy of it; see `Agent::fork`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fork {
+    /// The agent's own command forks it. `Launch::session_id` is None when
+    /// the agent assigns the new id (bound later, as for a launch).
+    Native(Launch),
+    /// The agent's server makes the fork first (the daemon calls it,
+    /// outside the DB lock), then `Agent::open_fork` opens it.
+    Server,
+    /// No native fork: a new conversation seeded from the parent's
+    /// history. Designed, not built: no agent returns it yet.
+    Seeded,
+}
+
 /// What a launch asked for that the agent's own command line can't carry,
 /// to be confirmed once its conversation exists by whatever follows that
 /// agent. OpenCode's TUI has no model flag: the launch creates the session
@@ -239,6 +254,67 @@ impl Agent {
                     deferred: self.deferred(model),
                 }
             }
+        }
+    }
+
+    /// A user fork of conversation `parent`, started in `project` (the
+    /// folder the fork's conversation runs in). `model`: only when the
+    /// fork should change it (a fork keeps its parent's otherwise).
+    pub fn fork(
+        self,
+        parent: &str,
+        project: &str,
+        prompt: Option<&str>,
+        model: Option<&str>,
+        extra: &[String],
+    ) -> Fork {
+        match self {
+            Agent::Claude => {
+                let id = claude::FORK_MINTS_ID.then(claude::mint_session_id);
+                Fork::Native(Launch {
+                    argv: claude::fork_argv(parent, id.as_deref(), prompt, model, extra),
+                    transcript: id.as_deref().map(|i| claude::transcript_path(project, i)),
+                    session_id: id,
+                    deferred: None,
+                })
+            }
+            Agent::Codex => Fork::Native(Launch {
+                argv: codex::fork_argv(parent, prompt, model, extra),
+                session_id: None,
+                transcript: None,
+                deferred: None,
+            }),
+            Agent::OpenCode => Fork::Server,
+        }
+    }
+
+    /// Open a fork the agent's server already made (`Fork::Server`): the
+    /// conversation `id` exists, with its parent's model unless `model`
+    /// asks for another (set once it is open: `Deferred`).
+    pub fn open_fork(
+        self,
+        id: &str,
+        prompt: Option<&str>,
+        model: Option<&str>,
+        extra: &[String],
+    ) -> Launch {
+        Launch {
+            argv: opencode::open_argv(id, prompt, extra),
+            session_id: Some(id.to_string()),
+            transcript: Some(opencode::transcript_path(id)),
+            deferred: self.deferred(model),
+        }
+    }
+
+    /// Whether a user fork can start in another folder than its parent's
+    /// (a new worktree). OpenCode's server gives a fork its parent's
+    /// folder; Claude finds the parent's transcript from another worktree
+    /// of the same repo (live check F2).
+    pub fn forks_elsewhere(self) -> bool {
+        match self {
+            Agent::Claude => claude::FORK_ELSEWHERE,
+            Agent::Codex => true,
+            Agent::OpenCode => false,
         }
     }
 
