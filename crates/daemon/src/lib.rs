@@ -787,6 +787,8 @@ impl Daemon {
             "setup.status" => setup::status(self),
             "setup.suggest" => setup::suggest(self, params),
             "setup.apply" => setup::apply(self, params),
+            "ui.confirm_setup" => setup::confirm(self, params),
+            "overlord.setup_request" => ask::setup_request(self, params),
             "keys.list" => ui::keys_list(self),
             "config.reload" => self.reload_config(),
             "ui.view.set" => ui::set_view(self, params),

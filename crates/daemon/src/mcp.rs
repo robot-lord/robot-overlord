@@ -170,6 +170,17 @@ pub fn tools() -> Value {
                 "conversation": s("A conversation id from a recall search: digest that one instead of the previous"),
                 "limit": {"type": "integer", "description": "Conversations to return for a query (default 6)"},
             }), &[]),
+        tool("confirm_setup",
+            "Open the code-folder form on the user's screen (hides your overlay) for them to confirm: the folder they keep repos in (`code_dir`: the repo finder scans it and new repos go there). Pass what you would save; with nothing passed the form shows rlord's own suggestion, worked out from the projects it has seen. Nothing is saved until they confirm there, and rlord saves it then: you don't act again.",
+            json!({
+                "code_dir": s("The folder as you would save it (omit: rlord's suggestion)"),
+                "repo_roots": {"type": "array", "items": {"type": "string"},
+                               "description": "Folders the repo finder scans, only when they should differ from code_dir (omit: the code folder)"},
+                "description": s("The user's description, verbatim, when answering a setup request"),
+                "changed": {"type": "array", "items": {"type": "string", "enum": ["code_dir", "repo_roots"]},
+                            "description": "Hints you changed from what the user sent"},
+                "note": s("One line for the top of the form, e.g. \"Scanning both ~/ko and ~/proj, new repos in ~/ko\""),
+            }), &[]),
         tool("propose_session",
             "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
             new_session_props, &[]),
@@ -524,6 +535,15 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         ),
         "list_agents" => d.rpc("agents.list", json!({})),
         "propose_session" => d.rpc("ui.propose_session", new_session_params(args)),
+        "confirm_setup" => {
+            let mut p = Map::new();
+            for k in ["code_dir", "repo_roots", "description", "changed", "note"] {
+                if let Some(v) = args.get(k) {
+                    p.insert(k.into(), v.clone());
+                }
+            }
+            d.rpc("ui.confirm_setup", Value::Object(p))
+        }
         "confirm_new_session" => {
             let mut p = Map::new();
             for k in [
@@ -766,6 +786,7 @@ mod tests {
         "list_agents",
         "propose_session",
         "confirm_new_session",
+        "confirm_setup",
         "create_session",
         "update_session",
         "remote_control",

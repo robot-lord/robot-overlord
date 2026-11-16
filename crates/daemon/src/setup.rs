@@ -188,6 +188,58 @@ fn suggestion_value(
     })
 }
 
+/// `ui.confirm_setup` (the overlord's `confirm_setup`): open the
+/// code-folder form on the user's screen with what the overlord would
+/// save. The user's confirm there saves it (`setup.apply`).
+pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
+    let sugg = suggest(d, &json!({}))?;
+    let r = queue_confirm(d, params, sugg)?;
+    crate::ui::show_list(d)?;
+    Ok(r)
+}
+
+/// `confirm` up to showing the list: check the proposal and push the
+/// form's UI command, with `sugg` (`setup.suggest`) for its choices.
+fn queue_confirm(d: &Daemon, params: &Value, sugg: Value) -> Result<Value> {
+    let mut prefill = serde_json::Map::new();
+    let folder = |raw: &str| -> Result<String> {
+        let p = expand_tilde(raw.trim());
+        let p = p.trim_end_matches('/');
+        if p.is_empty() || !Path::new(p).is_absolute() {
+            bail!(
+                "{raw}: pass a full path (like ~/code or /Users/me/code), not a relative one or /"
+            );
+        }
+        Ok(p.to_string())
+    };
+    if let Some(c) = params["code_dir"].as_str().filter(|c| !c.trim().is_empty()) {
+        prefill.insert("code_dir".into(), json!(folder(c)?));
+    }
+    if let Some(a) = params["repo_roots"].as_array() {
+        let roots = a
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|r| !r.trim().is_empty())
+            .map(folder)
+            .collect::<Result<Vec<_>>>()?;
+        if !roots.is_empty() {
+            prefill.insert("repo_roots".into(), json!(roots));
+        }
+    }
+    for k in ["description", "note"] {
+        if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            prefill.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(c) = params["changed"].as_array() {
+        prefill.insert("changed".into(), json!(c));
+    }
+    let prefill = Value::Object(prefill);
+    d.ui_cmd(json!({"cmd": "setup", "prefill": prefill, "suggest": sugg}));
+    Ok(json!({"shown": prefill,
+              "note": "the form is open on the user's screen; rlord saves it when they confirm"}))
+}
+
 /// `setup.apply`: save the confirmed code folder, or `{"skip": true}`.
 pub(crate) fn apply(d: &Daemon, params: &Value) -> Result<Value> {
     let path = rlord_core::paths::config_path();
@@ -378,6 +430,32 @@ mod tests {
             panic!("stat-ed {}", p.display())
         });
         assert_eq!(v["suggestion"]["prompts"], true);
+    }
+
+    #[test]
+    fn confirm_queues_the_form_with_the_proposal() {
+        let d = daemon();
+        let sugg = json!({"suggestion": null, "roots": {"configured": []}});
+        let r = queue_confirm(
+            &d,
+            &json!({"code_dir": "/h/ko", "repo_roots": ["/h/ko", "/h/proj"],
+                    "description": "both", "changed": ["repo_roots"], "note": "Both",
+                    "bogus": 1}),
+            sugg.clone(),
+        )
+        .unwrap();
+        assert_eq!(r["shown"]["repo_roots"], json!(["/h/ko", "/h/proj"]));
+        assert!(r["shown"].get("bogus").is_none());
+        // No TUI up: parked for the next one.
+        let (_, cmd) = d.pending_ui.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd["cmd"], "setup");
+        assert_eq!(cmd["prefill"]["code_dir"], "/h/ko");
+        assert_eq!(cmd["suggest"], sugg);
+        // Relative paths and `/` are refused, saying what to pass.
+        let e = queue_confirm(&d, &json!({"code_dir": "ko"}), sugg.clone()).unwrap_err();
+        assert!(e.to_string().contains("full path"), "{e}");
+        assert!(queue_confirm(&d, &json!({"code_dir": "/"}), sugg.clone()).is_err());
+        assert!(queue_confirm(&d, &json!({"repo_roots": ["x"]}), sugg).is_err());
     }
 
     #[test]

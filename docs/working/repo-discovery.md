@@ -52,7 +52,7 @@ Progress: (updated per commit)
 - [x] suggestion: `code_dir.rs`, sources, `setup.*` methods
 - [x] `rlord setup`
 - [x] TUI setup form, first run, `:setup`
-- [ ] overlord: `confirm_setup`, setup request, `overlord.md`
+- [x] overlord: `confirm_setup`, setup request, `overlord.md`
 - [ ] fresh-install steps
 - [ ] docs and reconcile
 
