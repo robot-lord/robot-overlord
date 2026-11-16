@@ -610,18 +610,20 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
         "update_session" => {
             let r = session_ref(args)?;
             let id = d.rpc("session.get", json!({"ref": r}))?["id"].clone();
-            // Background first (checked once, there): a refused one
-            // leaves the session as it was. (A rename after it rewrites
-            // its file with the new name.)
+            // Background checked first (once): a refused one leaves the
+            // session as it was. Added last, after the other edits.
             let related = crate::methods::ref_list(args, "add_related");
-            let mut delivery = None;
-            if arg_str(args, "add_context").is_some() || !related.is_empty() {
-                let r = d.rpc(
-                    "session.context_add",
-                    json!({"ref": id, "context": arg_str(args, "add_context"), "related": related}),
+            let checked = if arg_str(args, "add_context").is_some() || !related.is_empty() {
+                let (note, links) = crate::context::check(
+                    &d.db(),
+                    arg_str(args, "add_context"),
+                    &related,
+                    id.as_str(),
                 )?;
-                delivery = Some(r["delivery"].clone());
-            }
+                Some(json!({"note": note, "links": links}))
+            } else {
+                None
+            };
             if let Some(n) = arg_str(args, "name") {
                 d.rpc("session.rename", json!({"ref": id, "name": n}))?;
             }
@@ -630,6 +632,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             if let Some(v) = args.get("notes").and_then(Value::as_str) {
                 d.rpc("session.notes", json!({"ref": id, "notes": v}))?;
+            }
+            let mut delivery = None;
+            if let Some(c) = checked {
+                let r = d.rpc("session.context_add", json!({"ref": id, "checked": c}))?;
+                delivery = Some(r["delivery"].clone());
             }
             let add = args.get("add_tags").cloned().unwrap_or(json!([]));
             let remove = args.get("remove_tags").cloned().unwrap_or(json!([]));

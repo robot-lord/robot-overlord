@@ -1327,14 +1327,20 @@ related list gets the rest, and the sessions that don't fit are counted
 in a line naming the file. The file is
 `<data>/sessions/<id>/context.md` (folder 0700, file 0600), written
 before the agent starts and rewritten whenever the rows change, when the
-session is renamed, and at every restart (related sessions' status as it
-is then; nothing watches them). Writing it is best effort: a failure is
+session or a session it lists as related is renamed, and at every
+restart (related sessions' status as it is then; nothing watches them). Writing it is best effort: a failure is
 logged and never stops a launch or a restart, which then carries no
 flag or pointer naming it (and its rows stay unseen). It is not fsynced
 (rlord can write it again; `private::write_synced` is for files that
-must survive a crash). A start in any mode but a hook's carries the
+must survive a crash). A launch in any mode but a hook's carries the
 background (flag, pointer, the file it names), so its rows count as seen
-then, at launch and at restart.
+then. A restart counts them seen only when it carried something fresh:
+the pointer sent again (a new conversation), or the system prompt file
+rewritten just now; never a resume without a pointer or a stale file. A
+restart into a new conversation of a session whose background went by
+hook checks the hooks again (before the DB lock): gone, it switches to
+the system prompt file (Claude) or the pointer (others) and stores that
+mode.
 
 How it reaches the agent (`context::delivery`, decided at launch and
 kept in kv `context_mode:<id>`):
@@ -1387,19 +1393,20 @@ the session must know now and it isn't `next_prompt`.
 
 Nothing counts as handed over until the hook client says it printed the
 answer: `rlord hook emit` prints it, then sends `hook.ack {ack}`
-(`send_hook_ack`, a second each way). Only then are its rows marked seen,
-the `context_sent` event logged and, for a whole one, the conversation
-recorded (kv
-`context_delivered:<id>`; pending answers are kv `context_ack:<ack>`,
-the newest per session in `context_ack_for:<id>`). A newer answer while
-one is still unacknowledged keeps the older one acknowledgeable for its
-own rows (up to 8), and acknowledging the newer one covers both. An
-answer never acknowledged (a slow daemon, a client that died) goes again
-with the next prompt: at most one duplicate. A client that never
-acknowledges gets the same answer (whole or update) at most twice per
-conversation (`UNACKED_TRIES`); after that everything counts as handed
-over (conversation reached, rows seen), logged once as
-`context_assumed_delivered`, and only what is added later goes.
+(`send_hook_ack`, a second each way). The bookkeeping is two columns on
+`session_context`: an answer stamps the rows it carries with its ack id
+(`sent_ack`, `sent_at`; the ack id is `<session id>.<fresh id>`), and an
+ack marks seen the rows still stamped with it (a newer answer that
+carried them again took them over). A whole answer also leaves kv
+`context_full_sent:<id>` (`{ack, conv}`): acknowledged, that
+conversation counts as reached (kv `context_delivered:<id>`). The ack
+logs `context_sent`. An answer never acknowledged (a slow daemon, a
+client that died) goes again with the next prompt: at most one
+duplicate. After `UNACKED_TRIES` (2) unacknowledged answers in a row to
+one conversation (kv `context_unacked:<id>`), the rows they carried
+count as seen and the conversation as reached, logged once as
+`context_assumed_delivered`; a note added since, which no answer
+carried, still goes with the next one.
 
 ## Naming
 

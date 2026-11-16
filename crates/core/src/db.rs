@@ -1248,16 +1248,22 @@ impl Db {
         body: &str,
         source: &str,
     ) -> Result<bool> {
-        if kind == "link" {
-            let there: i64 = self.conn.query_row(
-                "SELECT count(*) FROM session_context \
-                 WHERE session_id = ?1 AND kind = 'link' AND body = ?2",
-                params![session_id, body],
-                |r| r.get(0),
-            )?;
-            if there > 0 {
-                return Ok(false);
-            }
+        // A link once only. A note the same as one not handed over yet, or
+        // as the latest note: not again.
+        let dup_sql = if kind == "link" {
+            "SELECT EXISTS (SELECT 1 FROM session_context \
+             WHERE session_id = ?1 AND kind = 'link' AND body = ?2)"
+        } else {
+            "SELECT EXISTS (SELECT 1 FROM session_context \
+             WHERE session_id = ?1 AND kind = 'note' AND body = ?2 \
+             AND (seen_at IS NULL OR id = (SELECT max(id) FROM session_context \
+                  WHERE session_id = ?1 AND kind = 'note')))"
+        };
+        let dup: bool = self
+            .conn
+            .query_row(dup_sql, params![session_id, body], |r| r.get(0))?;
+        if dup {
+            return Ok(false);
         }
         self.conn.execute(
             "INSERT INTO session_context (session_id, at, kind, body, source) \
@@ -1267,15 +1273,63 @@ impl Db {
         Ok(true)
     }
 
-    /// Whether a session has any notes or links, or kv `key` is set: in
-    /// one query, without loading them.
-    pub fn context_exists_or(&self, session_id: &str, key: &str) -> Result<bool> {
+    /// Whether a session has any notes or links (without loading them).
+    pub fn context_exists(&self, session_id: &str) -> Result<bool> {
         Ok(self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1) \
-                 OR EXISTS (SELECT 1 FROM kv WHERE key = ?2)",
-            params![session_id, key],
+            "SELECT EXISTS (SELECT 1 FROM session_context WHERE session_id = ?1)",
+            params![session_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// The sessions that link to `session_id` (its related sessions'
+    /// owners).
+    pub fn context_linkers(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM session_context WHERE kind = 'link' AND body = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record that the hook answer `ack` carried rows `ids` of a session
+    /// (at `at`): the latest answer that carried a row is the one whose
+    /// acknowledgement marks it seen.
+    pub fn context_mark_sent(
+        &self,
+        session_id: &str,
+        ids: &[i64],
+        ack: &str,
+        at: i64,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE session_context SET sent_ack = ?3, sent_at = ?4 \
+             WHERE session_id = ?1 AND id = ?2",
+        )?;
+        for id in ids {
+            stmt.execute(params![session_id, id, ack, at])?;
+        }
+        Ok(())
+    }
+
+    /// The answer `ack` was acknowledged: the rows it was the latest to
+    /// carry, not seen yet, are seen at `at`. Returns how many.
+    pub fn context_ack(&self, ack: &str, at: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE session_context SET seen_at = ?2 WHERE sent_ack = ?1 AND seen_at IS NULL",
+            params![ack, at],
+        )?)
+    }
+
+    /// Every row of a session some answer carried, not seen yet, is seen
+    /// at `at` (rows no answer carried stay unseen).
+    pub fn context_mark_sent_seen(&self, session_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_context SET seen_at = ?2 \
+             WHERE session_id = ?1 AND sent_ack IS NOT NULL AND seen_at IS NULL",
+            params![session_id, at],
+        )?;
+        Ok(())
     }
 
     /// The ids of the sessions a session links to, oldest first.
@@ -1795,10 +1849,15 @@ mod tests {
             ["first", "b", "second"]
         );
         assert!(db.context_rows("b").unwrap().is_empty());
-        assert!(db.context_exists_or("a", "none").unwrap());
-        assert!(!db.context_exists_or("b", "flag:b").unwrap());
-        db.kv_set("flag:b", "1").unwrap();
-        assert!(db.context_exists_or("b", "flag:b").unwrap());
+        assert!(db.context_exists("a").unwrap() && !db.context_exists("b").unwrap());
+        assert_eq!(db.context_linkers("b").unwrap(), ["a"]);
+        // The same note again while it is unseen, or as the latest: no.
+        assert!(!db
+            .context_add("a", 14, "note", "second", "overlord")
+            .unwrap());
+        assert!(!db
+            .context_add("a", 14, "note", "first", "overlord")
+            .unwrap());
         assert_eq!(db.context_links("a").unwrap(), ["b"]);
         db.context_mark_seen("a", rows[1].id, 20).unwrap();
         let unseen = db.context_unseen("a").unwrap();

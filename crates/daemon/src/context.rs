@@ -53,12 +53,6 @@ fn mode_key(id: &str) -> String {
     format!("context_mode:{id}")
 }
 
-/// kv key: a hook answer handed out and not yet acknowledged: what to mark
-/// once it is (`ack`).
-fn ack_key(ack: &str) -> String {
-    format!("context_ack:{ack}")
-}
-
 /// kv key: answers to one conversation not acknowledged yet, in a row
 /// (`{conv, n}`).
 fn tries_key(id: &str) -> String {
@@ -69,12 +63,17 @@ fn tries_key(id: &str) -> String {
 /// carried counts as handed over anyway.
 const UNACKED_TRIES: u64 = 2;
 
-/// Unacknowledged older answers kept acknowledgeable per session, at most.
-const OLDER_MAX: usize = 8;
+/// kv key: the latest whole answer not acknowledged yet, and the
+/// conversation it went to (`{ack, conv}`): acknowledged, that
+/// conversation counts as reached.
+fn full_key(id: &str) -> String {
+    format!("context_full_sent:{id}")
+}
 
-/// kv key: the session's newest outstanding hook answer (its ack id).
-fn ack_for_key(id: &str) -> String {
-    format!("context_ack_for:{id}")
+/// An answer's ack id: the session's id, a dot, a fresh id (so an ack
+/// names its session even when the answer carried no rows).
+fn new_ack(session: &str) -> String {
+    format!("{session}.{}", rlord_core::types::new_id())
 }
 
 /// A related session, as the background lists it.
@@ -655,9 +654,9 @@ pub fn turn_on(db: &Db, id: &str) -> Result<()> {
     db.kv_set(&on_key(id), "1")
 }
 
-/// Whether session `id` has any background to give (one query).
+/// Whether session `id` has any background to give.
 pub fn has_background(db: &Db, id: &str) -> Result<bool> {
-    db.context_exists_or(id, &on_key(id))
+    Ok(db.kv_get(&on_key(id))?.is_some() || db.context_exists(id)?)
 }
 
 /// The related sessions the links in `rows` name (gone ones skipped).
@@ -844,7 +843,10 @@ pub fn hook_reply_from(
         if by_hook {
             db.kv_set(&delivered_key(&s.id), conv)?;
         }
-        db.context_mark_all_seen(&s.id, now)?;
+        // What the answers carried counts as handed over; a note added
+        // since none carried it stays unseen, for the next answer.
+        db.context_mark_sent_seen(&s.id, now)?;
+        db.kv_delete(&full_key(&s.id))?;
         db.kv_delete(&tries_key(&s.id))?;
         db.insert_event(
             &s.id,
@@ -883,80 +885,52 @@ pub fn hook_reply_from(
         &tries_key(&s.id),
         &json!({"conv": conv, "n": tried + 1}).to_string(),
     )?;
-    let ack = rlord_core::types::new_id();
-    let mut pending = json!({"session": s.id, "upto": rows.last().map(|r| r.id),
-                             "conv": conv, "full": full, "via": event, "older": []});
-    // A newer answer while one is still unacknowledged (it may have been
-    // printed, its ack lost): the older one stays acknowledgeable for its
-    // own rows, and acknowledging this one covers both.
-    if let Some(old) = db.kv_get(&ack_for_key(&s.id))? {
-        if let Some(prev) = db
-            .kv_get(&ack_key(&old))?
-            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        {
-            let upto = pending["upto"].as_i64().max(prev["upto"].as_i64());
-            pending["upto"] = json!(upto);
-            if prev["full"] == true && pending["full"] != true {
-                pending["full"] = json!(true);
-                pending["conv"] = prev["conv"].clone();
-            }
-            let mut older: Vec<Value> = prev["older"].as_array().cloned().unwrap_or_default();
-            older.push(json!(old));
-            // (Bounded: past this the oldest are dropped; this one's
-            // acknowledgement still covers their rows.)
-            while older.len() > OLDER_MAX {
-                if let Some(gone) = older.first().and_then(Value::as_str) {
-                    db.kv_delete(&ack_key(gone))?;
-                }
-                older.remove(0);
-            }
-            pending["older"] = json!(older);
-        }
+    // The rows this answer carries are marked with its ack id (a newer
+    // answer that carries them again takes them over); a whole one also
+    // remembers the conversation it went to.
+    let ack = new_ack(&s.id);
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    db.context_mark_sent(&s.id, &ids, &ack, rlord_core::types::now_ms())?;
+    if full {
+        db.kv_set(
+            &full_key(&s.id),
+            &json!({"ack": ack, "conv": conv}).to_string(),
+        )?;
     }
-    db.kv_set(&ack_key(&ack), &pending.to_string())?;
-    db.kv_set(&ack_for_key(&s.id), &ack)?;
     Ok(Some(Reply {
         output: hook_output(event, &text),
         ack,
     }))
 }
 
-/// The hook client printed the answer `ack` named: mark what it carried
-/// as handed over (its rows seen; for a full one, the conversation it went
-/// to). Returns whether `ack` was outstanding (an unknown or replaced one
+/// The hook client printed the answer `ack` named: the rows it was the
+/// latest to carry are seen; if it was the latest whole answer, the
+/// conversation it went to counts as reached. Returns whether it marked
+/// anything (an unknown ack, or one whose rows a newer answer took over,
 /// marks nothing).
 pub fn ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
-    let Some(pending) = db
-        .kv_get(&ack_key(ack))?
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-    else {
+    let Some((id, _)) = ack.split_once('.') else {
         return Ok(false);
     };
-    db.kv_delete(&ack_key(ack))?;
-    // The older answers this one covers are done with too.
-    for older in pending["older"].as_array().into_iter().flatten() {
-        if let Some(o) = older.as_str() {
-            db.kv_delete(&ack_key(o))?;
-        }
+    let rows = db.context_ack(ack, now)?;
+    let full: Value = db
+        .kv_get(&full_key(id))?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or(Value::Null);
+    let whole = full["ack"] == ack;
+    if whole {
+        db.kv_set(&delivered_key(id), full["conv"].as_str().unwrap_or(""))?;
+        db.kv_delete(&full_key(id))?;
     }
-    let Some(id) = pending["session"].as_str() else {
+    if rows == 0 && !whole {
         return Ok(false);
-    };
-    if db.kv_get(&ack_for_key(id))?.as_deref() == Some(ack) {
-        db.kv_delete(&ack_for_key(id))?;
-    }
-    if let Some(upto) = pending["upto"].as_i64() {
-        db.context_mark_seen(id, upto, now)?;
-    }
-    if pending["full"] == true {
-        db.kv_set(&delivered_key(id), pending["conv"].as_str().unwrap_or(""))?;
     }
     db.kv_delete(&tries_key(id))?;
     db.insert_event(
         id,
         now,
         "context_sent",
-        &json!({"via": pending["via"], "full": pending["full"]}).to_string(),
+        &json!({"rows": rows, "full": whole}).to_string(),
     )?;
     Ok(true)
 }
@@ -1435,35 +1409,48 @@ mod tests {
                 .unwrap()
         };
         store(&db, "a", &["one".into()], &[], 1).unwrap();
-        let first = reply("SessionStart");
-        let second = reply("UserPromptSubmit");
-        // The older one was printed after all: its ack still marks its rows.
-        assert!(ack(&db, &first.ack, 2).unwrap());
+        let older = reply("SessionStart");
+        // Its ack lost; a newer answer carries the same again.
+        let newer = reply("UserPromptSubmit");
+        assert!(text(&newer.output).contains("one"));
+        // The older ack arrives late: its rows were taken over by the newer
+        // answer, so it marks nothing; the newer one marks them.
+        assert!(!ack(&db, &older.ack, 2).unwrap());
+        assert_eq!(db.context_unseen("a").unwrap().len(), 1);
+        assert!(ack(&db, &newer.ack, 3).unwrap());
         assert!(db.context_unseen("a").unwrap().is_empty());
-        // A note added, two answers, only the newer acknowledged: both
-        // answers' rows are seen, the conversation counts as reached.
-        let db2 = Db::open_in_memory().unwrap();
-        session(&db2, "a", "alpha", "");
-        let s2 = db2.resolve_ref("a").unwrap();
-        store(&db2, "a", &["one".into()], &[], 1).unwrap();
-        let older = hook_reply(&db2, &s2, Agent::Claude, "SessionStart", Some("c"), f)
-            .unwrap()
-            .unwrap();
-        store(&db2, "a", &["two".into()], &[], 2).unwrap();
-        let newer = hook_reply(&db2, &s2, Agent::Claude, "UserPromptSubmit", Some("c"), f)
-            .unwrap()
-            .unwrap();
-        assert!(ack(&db2, &newer.ack, 3).unwrap());
-        assert!(db2.context_unseen("a").unwrap().is_empty());
-        assert!(
-            !ack(&db2, &older.ack, 4).unwrap(),
-            "covered by the newer one"
-        );
+        // Reached: the next prompt gets nothing.
         assert_eq!(
-            hook_reply(&db2, &s2, Agent::Claude, "UserPromptSubmit", Some("c"), f).unwrap(),
+            hook_reply(&db, &s, Agent::Claude, "UserPromptSubmit", Some("c"), f).unwrap(),
             None
         );
-        let _ = second;
+    }
+
+    #[test]
+    fn a_note_added_after_giving_up_is_still_delivered() {
+        let db = Db::open_in_memory().unwrap();
+        session(&db, "a", "alpha", "");
+        let s = db.resolve_ref("a").unwrap();
+        let f = Path::new("/f");
+        let prompt = || {
+            hook_reply(&db, &s, Agent::Claude, "UserPromptSubmit", Some("c"), f)
+                .unwrap()
+                .map(|r| text(&r.output).to_string())
+        };
+        store(&db, "a", &["one".into()], &[], 1).unwrap();
+        assert!(prompt().is_some());
+        store(&db, "a", &["two".into()], &[], 2).unwrap();
+        assert!(prompt().unwrap().contains("two"));
+        // Added after the last answer, before the give-up: no answer
+        // carried it.
+        store(&db, "a", &["three".into()], &[], 3).unwrap();
+        assert_eq!(prompt(), None, "gave up");
+        let unseen = db.context_unseen("a").unwrap();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].body, "three");
+        // It goes with the next answer.
+        let next = prompt().unwrap();
+        assert!(next.contains("three") && !next.contains("one"), "{next}");
     }
 
     #[test]

@@ -165,8 +165,14 @@ pub fn session_rename(db: &Db, params: &Value) -> Result<Value> {
     // Its tmux session follows the name, and its background file (which
     // names it).
     let s = db.resolve_ref(&s.id)?;
-    if let Err(e) = context::refresh_file(db, &paths::data_dir(), &s) {
-        tracing::warn!(error = %e, "rewriting the background file");
+    // ... and the files of the sessions that list it as related.
+    let linkers = db.context_linkers(&s.id).unwrap_or_default();
+    for other in
+        std::iter::once(s.clone()).chain(linkers.iter().filter_map(|id| db.resolve_ref(id).ok()))
+    {
+        if let Err(e) = context::refresh_file(db, &paths::data_dir(), &other) {
+            tracing::warn!(session = %other.id, error = %e, "rewriting the background file");
+        }
     }
     if let Err(e) = sync_tmux_name(db, &s) {
         tracing::warn!(error = %e, "renaming tmux session");
@@ -286,15 +292,23 @@ pub(crate) fn session_context_add_in(
 ) -> Result<Value> {
     let s = db.resolve_ref(p_str(params, "ref")?)?;
     refuse_overlord(&s, "given background")?;
-    let (note, links) = context::check(
-        db,
-        params["context"].as_str(),
-        &ref_list(params, "related"),
-        Some(&s.id),
-    )?;
+    // `checked`: already through `context::check` (by `update_session`,
+    // before its other edits), not checked again.
+    let (note, links) = match params.get("checked").filter(|c| c.is_object()) {
+        Some(c) => (c["note"].as_str().map(str::to_string), str_list(c, "links")),
+        None => context::check(
+            db,
+            params["context"].as_str(),
+            &ref_list(params, "related"),
+            Some(&s.id),
+        )?,
+    };
     let now = now_ms();
     if context::store(db, &s.id, note.as_slice(), &links, now)? {
-        context::refresh_file(db, base, &s)?;
+        // (Stored either way; the file is best effort.)
+        if let Err(e) = context::refresh_file(db, base, &s) {
+            tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+        }
         db.insert_event(
             &s.id,
             now,
@@ -983,26 +997,44 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // (related sessions' status, a rename: as they are now).
     // Best effort: a file that can't be written never stops the restart;
     // without it the start carries no flag or pointer naming it.
-    let mut args = spec_args(agent, &spec);
-    let mode = context::mode(db, &s.id)?;
-    let bg_file = context::file_path(&paths::data_dir(), &s.id);
-    if let Err(e) = context::refresh_file(db, &paths::data_dir(), &s) {
-        tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+    let base = paths::data_dir();
+    let bg_file = context::file_path(&base, &s.id);
+    let rewritten = match context::refresh_file(db, &base, &s) {
+        Ok(f) => f.is_some(),
+        Err(e) => {
+            tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
+            false
+        }
+    };
+    let resume = |args: &[String]| {
+        agent.resume(
+            s.agent_session.as_deref(),
+            &s.agent_session_trust,
+            &s.project_path,
+            model.as_deref(),
+            args,
+        )
+    };
+    let mut mode = context::mode(db, &s.id)?;
+    // A new conversation by hook, but the hooks no longer work
+    // (`hooks_work`, asked by the daemon before the lock): the way an
+    // agent without them gets it, from now on.
+    let hooks_gone = params.get("hooks_work").and_then(Value::as_bool) == Some(false);
+    if mode == Some(context::Delivery::Hook) && hooks_gone && !resume(&spec_args(agent, &spec))?.1 {
+        let fallback = context::delivery(agent, false);
+        context::record_mode(db, &s.id, fallback)?;
+        tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
+        mode = Some(fallback);
     }
     let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
+    let mut args = spec_args(agent, &spec);
     args.extend(context::launch_args(carried, &bg_file));
-    let (mut argv, resumed) = agent.resume(
-        s.agent_session.as_deref(),
-        &s.agent_session_trust,
-        &s.project_path,
-        model.as_deref(),
-        &args,
-    )?;
+    let (mut argv, resumed) = resume(&args)?;
     // A Pointer-mode session starting a new conversation: the pointer
-    // again, as its first prompt (its rows count as handed over once the
-    // pane is up, below).
-    if let Some(p) = context::restart_prompt(carried, resumed, &bg_file) {
-        agent.add_first_prompt(&mut argv, &p);
+    // again, as its first prompt.
+    let pointer = context::restart_prompt(carried, resumed, &bg_file);
+    if let Some(p) = &pointer {
+        agent.add_first_prompt(&mut argv, p);
     }
     let program = pane_program(agent, &mut argv);
     // What an earlier start left to confirm is over (its clock too). A
@@ -1019,10 +1051,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
     let now = now_ms();
-    // Any mode but a hook's carried it with this start (the flag, the
-    // pointer, the file the pointer named): what is there counts as
-    // handed over, as at launch (`set_mode`).
-    if carried.is_some_and(|m| m != context::Delivery::Hook) {
+    // Only what this start carried fresh counts as handed over: the
+    // pointer sent again, or the system prompt file rewritten just now.
+    // (A resume without a pointer, or a stale file, carries nothing new.)
+    let fresh =
+        pointer.is_some() || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
+    if fresh {
         db.context_mark_all_seen(&s.id, now)?;
     }
     db.set_status(&s.id, Status::Starting, now)?;
@@ -2203,6 +2237,21 @@ mod tests {
         assert_eq!(add("c", false), "next_start");
         context::set_mode(&db, "01b", context::Delivery::Pointer, 1).unwrap();
         assert_eq!(add("d", false), "file_only");
+        // The file can't be written (its folder is a file): the note is
+        // stored all the same.
+        let blocked = t.path().join("not-a-folder");
+        std::fs::write(&blocked, b"").unwrap();
+        let r = session_context_add_in(
+            &db,
+            &json!({"ref": "auth", "context": "stored anyway"}),
+            &blocked,
+        )
+        .unwrap();
+        assert!(r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["note"] == "stored anyway"));
     }
 
     #[test]

@@ -164,9 +164,11 @@ by code (`context::frame_message`).
 - **Note length is refused, not clipped** (over 8,000 chars, more than 8
   related, an unknown or overlord ref): the overlord gets the error and
   can shorten it.
-- **Bare launch with background:** a Codex (untrusted) or OpenCode
-  session launched with no prompt gets no pointer line (it would start a
-  turn). Its background is only in the file until PR 2 lets it pull.
+- **Bare launch with background:** a Pointer-mode session (Codex with
+  untrusted hooks, OpenCode) launched with no prompt gets the pointer
+  alone as its first prompt (`context::pointer_only`, since review
+  round 3): the background is in `<path>`, read it, then wait for the
+  user's request.
 - **`bind_prompt:<id>`** holds the first prompt as typed, pointer line
   included, since Codex binding matches the thread's first message.
 - **Runtime dir** keeps `Daemon::bind`'s own 0700 (set every start; the
@@ -389,6 +391,38 @@ test-only wrapper (already `#[cfg(test)]`).
 10. `compose` renders note lines once and hands them to `notes_section`;
     `update_session` adds background first (one `context::check`, in
     `session.context_add`), so a refusal still writes nothing.
+
+### Review round 8 (PR #64)
+
+A. Ack tracking redone as columns: `session_context.sent_ack` /
+   `sent_at` (migration 0010 edited in place, unreleased). An answer
+   stamps the rows it carries; `ack` marks seen the rows still stamped
+   with its id (`Db::context_ack`), plus the conversation (kv
+   `context_full_sent:<id>` for the latest whole answer). The ack id
+   names its session (`<session>.<id>`). Give-up marks seen only rows
+   some answer carried (`Db::context_mark_sent_seen`). Gone: the
+   `context_ack:*` / `context_ack_for:*` blobs and the `older` list.
+   Kept: the unacked counter. Tests: at most one duplicate, give-up,
+   replaced answer (its late ack marks nothing; the newer one marks
+   all), a note added after the give-up still goes.
+2. `session.context_add`: the file write after storing is best effort
+   (test: blocked folder, note stored).
+3. A restart marks rows seen only when it carried something fresh (a
+   pointer sent again, or the system prompt file rewritten this time).
+4. Restart into a new conversation re-checks `hooks_work` (the daemon,
+   before the lock, for sessions in Hook mode); gone: SystemPromptFile
+   for Claude, Pointer for the others, stored.
+5. `update_session` validates the background first, makes the other
+   edits, then adds it (passing the checked note and ids, not checked
+   again). A note the same as an unseen one or the latest one is not
+   added again (`Db::context_add`).
+6. A rename also rewrites `context.md` of the sessions that list it as
+   related (`Db::context_linkers`), best effort.
+8. Bare launches: corrected here and in the PR description (they get
+   `pointer_only`).
+9. `tmp_beside` is pid + counter.
+10. `context_exists_or` split back: `Db::context_exists` plus the
+    `context_on` kv in `has_background`.
 
 ## Owed / deferred
 

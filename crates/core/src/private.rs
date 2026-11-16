@@ -107,20 +107,14 @@ fn write_with(path: &Path, contents: &[u8], sync: bool) -> std::io::Result<()> {
     written
 }
 
-/// A temp file name beside `path`, unique to this process, thread and
-/// call.
+/// A temp file name beside `path`, unique to this process and call.
 fn tmp_beside(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let thread: String = format!("{:?}", std::thread::current().id())
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect();
     path.with_file_name(format!(
-        ".{}.tmp-{}-{}-{}",
+        ".{}.tmp-{}-{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
         std::process::id(),
-        thread,
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
 }

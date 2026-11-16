@@ -10,7 +10,9 @@ CREATE TABLE session_context (
   kind       TEXT NOT NULL CHECK (kind IN ('note','link')),
   body       TEXT NOT NULL,                     -- note text, or the linked session's id
   source     TEXT NOT NULL DEFAULT 'overlord',
-  seen_at    INTEGER                            -- pushed to the agent by a hook
+  seen_at    INTEGER,                           -- handed to the agent (its answer acknowledged)
+  sent_ack   TEXT,                              -- the latest hook answer that carried it
+  sent_at    INTEGER                            -- when that answer was made
 );
 
 CREATE INDEX session_context_by_session ON session_context (session_id, id);

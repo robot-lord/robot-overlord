@@ -469,6 +469,16 @@ impl Daemon {
             // (Only a launch with background asks.)
             "session.new" => context::needs_background(&params),
             "session.context_add" => true,
+            // (A restart of a session whose background goes by hook: are
+            // they still there?)
+            "session.restart" => {
+                let db = self.db();
+                db.resolve_ref(params["ref"].as_str().unwrap_or(""))
+                    .ok()
+                    .is_some_and(|s| {
+                        context::mode(&db, &s.id).ok().flatten() == Some(context::Delivery::Hook)
+                    })
+            }
             _ => false,
         };
         if wants_hooks {
