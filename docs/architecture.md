@@ -508,9 +508,10 @@ background and limited rows, `status:bg` the limited ones.
   (never text a user typed) holding `<task-notification>` with
   `<task-id>` and `<status>` `completed`, `failed`, `killed` or
   `stopped`. Most are `attachment` lines (`attachment: {type:
-  "queued_command", commandMode: "task-notification", prompt}`); some
-  are `queue-operation` lines (`content`) or `user` lines with
-  `origin.kind: "task-notification"`. An id can notify more than once (a
+  "queued_command", commandMode: "task-notification", prompt}`), the rest
+  `user` lines with `origin.kind: "task-notification"`. The
+  `queue-operation` lines that carry the same text have no origin field,
+  so they don't count. An id can notify more than once (a
   resumed agent): one not open is ignored. A successful `SendMessage`
   that resumes an agent (`toolUseResult: {success: true, resumedAgentId,
   revivedAgentId}`) opens it again. A successful `TaskStop` finishes it too
@@ -519,8 +520,11 @@ background and limited rows, `status:bg` the limited ones.
   parsed.
 - **Which sessions**: live ones whose agent runs (not stopped or failed),
   the overlords included (`Db::running_transcripts`: ids, paths and the
-  last `resumed`/`restarted`/`reforked` event, one look-up each on
-  `idx_events_session_kind`). A session that stops has its state
+  last start of its agent process: a `resumed`/`restarted`/`reforked`
+  event, or a `session_start` hook event whose `start` is `startup` or
+  `resume` (recorded from the hook's `source`; `clear` and `compact` keep
+  the process), which also catches a restart done outside rlord; look-ups
+  on `idx_events_session_kind`). A session that stops has its state
   dropped, and work launched before rlord last started its agent again
   is forgotten: its tasks died with the old process. Those are the only
   ways open work is forgotten, apart from a finish or a stop.
@@ -536,7 +540,8 @@ background and limited rows, `status:bg` the limited ones.
 - **Stale guard**: when nothing was written for `STALE_MS` (30 min), its
   subagents are hidden from the status and it shows your turn again (they
   stay open: a late notification still closes them, and they show again
-  once their files change; shells never go stale), so a lost notification (the agent restarted with
+  once their files change; shells are hidden the same way once the
+  transcript itself has been quiet that long), so a lost notification (the agent restarted with
   work running) can't leave a session stuck. "Written" is the newest
   mtime of the transcript and of each open subagent's `outputFile` and
   sidechain transcript (the 5 most recently started stat'ed), since subagents write

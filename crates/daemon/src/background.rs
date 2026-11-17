@@ -13,10 +13,11 @@
 //! output has changed for `STALE_MS`, its subagents are hidden from the
 //! status (a notification that never came can't leave a session stuck),
 //! not forgotten: a later notification still closes them, and they show
-//! again if their files change. Shells never go stale: they stay listed
-//! until a finish, a kill or the session stopping. Work is forgotten only
-//! when the session stops or rlord starts its agent again (resume,
-//! restart, refork: its tasks died with the old process).
+//! again if their files change. Shells are hidden the same way once the
+//! transcript itself has been quiet that long (they are only information). Work is forgotten only
+//! when the session stops or its agent process starts again (rlord's
+//! resume, restart or refork, or the agent's own `SessionStart` hook for a
+//! startup or resume: its tasks died with the old process).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -110,19 +111,21 @@ fn refresh(t: &mut Tracker, path: &Path, started_at: i64, now: i64) -> Shown {
         t.open
             .retain(|_, task| task.started_at == 0 || task.started_at >= started_at);
     }
-    let last = if t.of(Kind::Agent).next().is_some() {
+    let main = mtime_ms(path).unwrap_or(0);
+    let agents = if t.of(Kind::Agent).next().is_some() {
         last_write(path, t)
     } else {
-        0
+        main
     };
-    shown(t, last, now)
+    shown(t, agents, main, now)
 }
 
-/// What a tracker shows at `now`, the session having last written at
-/// `last_write`: its subagents only while that is within `STALE_MS`, its
-/// shells always.
-fn shown(t: &Tracker, last_write: i64, now: i64) -> Shown {
-    let stale = now - last_write >= STALE_MS;
+/// What a tracker shows at `now`: its subagents while the session wrote
+/// anything (`agents_write`: its transcript or their output) within
+/// `STALE_MS`, its shells while its transcript (`main_write`) did. Hidden
+/// work stays open.
+fn shown(t: &Tracker, agents_write: i64, main_write: i64, now: i64) -> Shown {
+    let stale = now - agents_write >= STALE_MS;
     let list = |kind| {
         let mut v: Vec<Task> = t.of(kind).map(|(_, t)| t.clone()).collect();
         v.sort_by_key(|t| t.started_at);
@@ -135,7 +138,11 @@ fn shown(t: &Tracker, last_write: i64, now: i64) -> Shown {
     } else {
         list(Kind::Agent)
     };
-    let (shells, shell_count) = list(Kind::Shell);
+    let (shells, shell_count) = if now - main_write >= STALE_MS {
+        (Vec::new(), 0)
+    } else {
+        list(Kind::Shell)
+    };
     Shown {
         agents,
         agent_count,
@@ -241,11 +248,10 @@ mod tests {
         let mut t = Tracker::default();
         let now = now_ms();
         assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
-        // Nothing written for the stale time: the agent is hidden, back to
-        // "your turn"; the shell still listed.
+        // Nothing written for the stale time: the agent and the shell are
+        // hidden, back to "your turn".
         let later = refresh(&mut t, &main, 0, now + STALE_MS);
-        assert_eq!(later.agent_count, 0);
-        assert_eq!(later.shell_count, 1);
+        assert_eq!(later, Shown::default());
         // Not forgotten: shown again once it writes (here: `now` again).
         assert_eq!(t.open.len(), 2);
         assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);

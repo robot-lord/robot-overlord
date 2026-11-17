@@ -26,13 +26,7 @@ pub const LEGEND: &[(&str, &str)] = &[
 
 /// "4m", "2h", "3d": how long ago `at` (ms) was, from `now`.
 pub fn ago(at: i64, now: i64) -> String {
-    let s = ((now - at) / 1000).max(0);
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
-        3600..=86_399 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86_400),
-    }
+    rlord_core::timefmt::rel_age_at(at, now)
 }
 
 /// The status itself, as a sentence.
@@ -145,50 +139,10 @@ pub fn describe(s: &Value, now: i64) -> Vec<String> {
     v
 }
 
-/// Rows `lines` take word-wrapped at `width` columns.
-pub fn wrapped_rows(lines: &[String], width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 0;
-    for l in lines {
-        let mut n = 1;
-        let mut col = 0;
-        for word in l.split_whitespace() {
-            let len = word.chars().count();
-            let need = if col == 0 { len } else { col + 1 + len };
-            if need <= width || col == 0 {
-                col = need;
-                // A word longer than the line breaks across rows.
-                while col > width {
-                    n += 1;
-                    col -= width;
-                }
-            } else {
-                n += 1;
-                col = len;
-                while col > width {
-                    n += 1;
-                    col -= width;
-                }
-            }
-        }
-        rows += n;
-    }
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn wrapping() {
-        let l = |s: &str| vec![s.to_string()];
-        assert_eq!(wrapped_rows(&l("aaa bbb"), 7), 1);
-        assert_eq!(wrapped_rows(&l("aaa bbb"), 6), 2);
-        assert_eq!(wrapped_rows(&l("aaaaaaaaaa"), 4), 3);
-        assert_eq!(wrapped_rows(&["a".into(), "b".into()], 10), 2);
-    }
 
     #[test]
     fn a_refresh_keeps_the_popup_only_over_its_row() {

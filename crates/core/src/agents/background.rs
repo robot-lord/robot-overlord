@@ -16,10 +16,11 @@
 //! - **Finish**: a later line written by the harness (never text a user
 //!   typed) holding `<task-notification>` with `<task-id>` and a final
 //!   `<status>` (`completed`, `failed`, `killed`, `stopped`). It comes in
-//!   three shapes: most often an `attachment` line (`attachment: {type:
+//!   two shapes: most often an `attachment` line (`attachment: {type:
 //!   "queued_command", commandMode: "task-notification", prompt}`), or a
-//!   `queue-operation` line (`content`), or a `user` line with `origin.kind:
-//!   "task-notification"` (`message.content`). The same id can notify more than once (a resumed agent):
+//!   `user` line with `origin.kind: "task-notification"`
+//!   (`message.content`). (The `queue-operation` lines that also carry it
+//!   have no origin, so they aren't trusted; the attachment covers them.) The same id can notify more than once (a resumed agent):
 //!   finishing an id that isn't open changes nothing. A successful
 //!   `SendMessage` that resumes an agent (`toolUseResult: {success: true,
 //!   resumedAgentId | revivedAgentId}`) opens it again. A successful
@@ -160,8 +161,11 @@ impl Tracker {
             }
             self.offset += n;
             read += n;
-            if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
-                self.feed(&v);
+            // (Most lines can't matter: only those are parsed.)
+            if worth_parsing(&buf) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
+                    self.feed(&v);
+                }
             }
         }
         Ok(())
@@ -178,19 +182,12 @@ impl Tracker {
     pub fn feed(&mut self, line: &Value) {
         let content = &line["message"]["content"];
         // Notifications the harness queued for the agent.
-        match line["type"].as_str() {
-            Some("attachment") => {
-                let a = &line["attachment"];
-                if a["type"] == "queued_command" && a["commandMode"] == "task-notification" {
-                    finish(&mut self.open, &a["prompt"]);
-                }
-                return;
+        if line["type"] == "attachment" {
+            let a = &line["attachment"];
+            if a["type"] == "queued_command" && a["commandMode"] == "task-notification" {
+                finish(&mut self.open, &a["prompt"]);
             }
-            Some("queue-operation") => {
-                finish(&mut self.open, &line["content"]);
-                return;
-            }
-            _ => {}
+            return;
         }
         if line["type"] == "assistant" {
             for b in content.as_array().into_iter().flatten() {
@@ -297,12 +294,31 @@ fn stopped<'a>(r: &'a Value, content: &Value) -> Option<&'a str> {
         .into_iter()
         .flatten()
         .any(|b| b["is_error"] == true);
-    let ok = r["message"]
-        .as_str()
-        .is_some_and(|m| m.starts_with("Successfully"))
-        || r["success"] == true;
-    let id = r["task_id"].as_str().or(r["shell_id"].as_str())?;
-    (ok && !failed).then_some(id)
+    let said = r["message"].as_str().is_some_and(|m| {
+        m.starts_with("Successfully stopped") || m.starts_with("Successfully killed")
+    });
+    let id = match (r["task_id"].as_str(), r["shell_id"].as_str()) {
+        (Some(id), _) if said => id,
+        // KillShell: `success` with its `shell_id` is enough.
+        (None, Some(id)) if said || r["success"] == true => id,
+        _ => return None,
+    };
+    (!failed).then_some(id)
+}
+
+/// Words one of the lines `Tracker::feed` acts on must hold: a cheap
+/// check before the full JSON parse.
+const NEEDLES: [&[u8]; 4] = [
+    b"toolUseResult",
+    b"task-notification",
+    b"resumedAgentId",
+    b"tool_use",
+];
+
+fn worth_parsing(line: &[u8]) -> bool {
+    NEEDLES
+        .iter()
+        .any(|n| line.windows(n.len()).any(|w| w == *n))
 }
 
 /// The id and kind of background work a tool result says it started.
@@ -546,10 +562,15 @@ mod tests {
         let attachment = json!({"type": "attachment", "attachment": {"type": "queued_command",
             "commandMode": "task-notification", "prompt": text("a1"),
             "origin": {"kind": "task-notification", "producer": "session-task"}}});
+        assert_eq!(count(&[agent_launch("a1"), attachment]), 0);
+        // A queue-operation has no origin: not trusted (its attachment is).
         let queued =
             json!({"type": "queue-operation", "operation": "enqueue", "content": text("a2")});
-        assert_eq!(count(&[agent_launch("a1"), attachment]), 0);
-        assert_eq!(count(&[agent_launch("a2"), queued]), 0);
+        assert_eq!(count(&[agent_launch("a2"), queued]), 1);
+        // The same text typed by the user (a plain prompt) closes nothing.
+        let typed_user =
+            json!({"type": "user", "message": {"role": "user", "content": text("a4")}});
+        assert_eq!(count(&[agent_launch("a4"), typed_user]), 1);
         // Another kind of queued command (the user's own prompt) isn't one.
         let typed = json!({"type": "attachment", "attachment": {"type": "queued_command",
             "commandMode": "prompt", "prompt": text("a3")}});
@@ -587,6 +608,22 @@ mod tests {
         let kill = json!({"type": "user", "toolUseResult": {"success": true,
             "message": "Successfully killed shell: b1 (x)", "shell_id": "b1"}});
         assert_eq!(count(&[bash_launch("b1"), kill]), 0);
+        // `success` and a task id alone, without the message: not a stop.
+        let bare = json!({"type": "user", "toolUseResult": {"success": true, "task_id": "a1"}});
+        assert_eq!(count(&[agent_launch("a1"), bare]), 1);
+        // Some other message.
+        let other = json!({"type": "user", "toolUseResult": {"message": "Successfully sent", "task_id": "a1"}});
+        assert_eq!(count(&[agent_launch("a1"), other]), 1);
+    }
+
+    #[test]
+    fn the_prefilter_keeps_what_matters() {
+        for l in [agent_launch("a"), bash_launch("b"), note("a", "completed")] {
+            assert!(worth_parsing(l.to_string().as_bytes()));
+        }
+        assert!(!worth_parsing(
+            br#"{"type":"assistant","message":{"content":"hi"}}"#
+        ));
     }
 
     #[test]

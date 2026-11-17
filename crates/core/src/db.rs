@@ -1604,15 +1604,20 @@ impl Db {
     }
 
     /// Live sessions whose agent is running (not stopped or failed), the
-    /// overlords included, each with its transcript and when rlord last
-    /// started its agent again (the latest `resumed` / `restarted` /
-    /// `reforked` event; 0: never). Cheap: ids, paths and one look-up each
-    /// on `idx_events_session_kind`.
+    /// overlords included, each with its transcript and when its agent
+    /// process last started (0: never seen): rlord starting it again (a
+    /// `resumed` / `restarted` / `reforked` event), or the agent's own
+    /// `SessionStart` hook for a new process (`start` `startup` or
+    /// `resume`; not `clear` or `compact`), which also catches a restart
+    /// done outside rlord. Cheap: ids, paths and look-ups on
+    /// `idx_events_session_kind`.
     pub fn running_transcripts(&self) -> Result<Vec<(String, String, i64)>> {
         let mut st = self.conn.prepare(
             "SELECT s.id, t.source_path, \
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
-                              AND e.kind IN ('resumed', 'restarted', 'reforked')), 0) \
+                              AND (e.kind IN ('resumed', 'restarted', 'reforked') \
+                                   OR (e.kind = 'session_start' AND \
+                                       json_extract(e.payload, '$.start') IN ('startup', 'resume')))), 0) \
              FROM sessions s JOIN transcripts t ON t.session_id = s.id \
              WHERE s.archived_at IS NULL AND s.status NOT IN ('stopped', 'error')",
         )?;
@@ -2493,5 +2498,38 @@ mod tests {
         db.kv_set("k", "1").unwrap();
         db.kv_set("k", "2").unwrap();
         assert_eq!(db.kv_get("k").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn running_transcripts_know_when_the_agent_last_started() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "a");
+        db.upsert_transcript_source("01aaa", "/t/a.jsonl").unwrap();
+        // Stopped: not listed.
+        db.set_status("01aaa", Status::Stopped, 1).unwrap();
+        assert!(db.running_transcripts().unwrap().is_empty());
+        db.set_status("01aaa", Status::Idle, 1).unwrap();
+        assert_eq!(db.running_transcripts().unwrap()[0].2, 0);
+        db.insert_event("01aaa", 100, "restarted", "{}").unwrap();
+        db.insert_event(
+            "01aaa",
+            200,
+            "session_start",
+            r#"{"hook":"SessionStart","start":"resume"}"#,
+        )
+        .unwrap();
+        // A compaction or a /clear keeps the same process.
+        db.insert_event(
+            "01aaa",
+            300,
+            "session_start",
+            r#"{"hook":"SessionStart","start":"compact"}"#,
+        )
+        .unwrap();
+        db.insert_event("01aaa", 400, "session_start", r#"{"hook":"SessionStart"}"#)
+            .unwrap();
+        assert_eq!(db.running_transcripts().unwrap()[0].2, 200);
+        db.insert_event("01aaa", 500, "reforked", "{}").unwrap();
+        assert_eq!(db.running_transcripts().unwrap()[0].2, 500);
     }
 }

@@ -1577,15 +1577,20 @@ impl App {
         };
         let lines = statustext::describe(s, rlord_core::types::now_ms());
         let area = f.area();
+        // (Border and padding: 2 columns a side; wide characters count
+        // two.)
         let w = lines
             .iter()
-            .map(|l| l.chars().count() as u16 + 4)
+            .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
             .max()
             .unwrap_or(10)
             .min(64)
             .min(area.width);
-        // (Border and padding: 2 columns a side.)
-        let rows = statustext::wrapped_rows(&lines, w.saturating_sub(4));
+        let inner = usize::from(w.saturating_sub(4));
+        let rows: u16 = lines
+            .iter()
+            .map(|l| theme::wrapped_rows(l, inner) as u16)
+            .sum();
         let text: Vec<Line> = lines
             .into_iter()
             .map(|l| Line::styled(l, Style::default().fg(theme::text())))

@@ -700,7 +700,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let text = tmux::capture_pane(t)?;
             let lines: Vec<&str> = text.trim_end().lines().collect();
             let tail = lines[lines.len().saturating_sub(n)..].join("\n");
-            Ok(json!({"session": s["name"], "status": s["status"], "screen": tail}))
+            Ok(json!({"session": s["name"], "status": status_word(&s), "screen": tail}))
         }
         "get_ui_state" => d.rpc("ui.state", json!({})),
         "goto_session" => d.rpc("ui.goto", json!({"ref": session_ref(args)?})),

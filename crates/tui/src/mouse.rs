@@ -306,7 +306,8 @@ impl App {
                 .map(|id| (id.to_string(), x, y)),
             _ => None,
         };
-        let changed = row.as_ref().map(|r| &r.0) != self.hover_row.as_ref().map(|r| &r.0);
+        // (A move within the row moves the popup with it: drawn again.)
+        let changed = row != self.hover_row;
         self.hover_row = row;
         if changed {
             return true;

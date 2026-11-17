@@ -220,6 +220,30 @@ pub fn selected() -> Style {
 /// The bar drawn left of the selected row.
 pub const SELECT_BAR: &str = "▌ ";
 
+/// Rows a line takes when wrapped at word boundaries to `width` columns (as
+/// a wrapping `Paragraph` does), counting wide characters as two.
+pub fn wrapped_rows(line: &str, width: usize) -> usize {
+    let w = |t: &str| Span::raw(t).width();
+    let (mut rows, mut col) = (1usize, 0usize);
+    for word in line.split(' ') {
+        let ww = w(word);
+        let need = if col == 0 { ww } else { ww + 1 };
+        if col > 0 && col + need > width {
+            rows += 1;
+            col = 0;
+        }
+        // A word longer than the line breaks across rows.
+        let ww_rows = ww.max(1).div_ceil(width.max(1));
+        if ww > width {
+            rows += ww_rows - 1;
+            col = ww - (ww_rows - 1) * width;
+        } else {
+            col += if col == 0 { ww } else { ww + 1 };
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod marker_tests {
     use super::*;
