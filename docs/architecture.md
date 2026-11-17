@@ -686,10 +686,9 @@ session"); session rows carry `forked_from`.
 
 #### The latest code (`repo_latest`)
 
-The user's checkouts are often behind, on another branch, or mid-edit, and
-before this the overlord read whatever was there. `repo_latest` (RPC
-`repo.latest`, CLI `rlord latest`) hands it the newest committed code of
-a repo instead, as plain code (`core/src/latest.rs` for git,
+The user's checkouts are often behind, on another branch, or mid-edit.
+`repo_latest` (RPC `repo.latest`, CLI `rlord latest`) hands the overlord
+the newest committed code of a repo, as plain code (`core/src/latest.rs` for git,
 `daemon/src/repo_latest.rs` for state and locks).
 
 - **One tree per repo**, always `<repo>/.worktrees/.rlord-latest`: a
@@ -838,7 +837,8 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   found; any other error keeps it). It removes
   trees unused for 30 days and any `old_trees` (with the checks above),
   keeping the record, its refs and its cache. A record with no tree is
-  kept. `rlord latest --prune [REPO]` removes the trees, the refs and the
+  kept. `rlord latest --prune [REPO]` (default: the current folder's repo;
+  `--all`: every one) removes the trees, the refs and the
   record now; `--list` shows them. Both clear the record under the
   repo's move lock, in the same step as the removal.
 - **macOS privacy.** In a repo inside a folder macOS guards
@@ -1477,9 +1477,8 @@ daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
 `branch`; the model is kept in `launch_spec` so restarts resume with the same
 `--model`.
 
-A **new branch starts from the latest default branch**, not the main
-checkout's `HEAD` (whatever the user last checked out there, never
-fetched). `Daemon::call` works the start out before the DB lock
+A **new branch starts from the latest default branch**, fetched.
+`Daemon::call` works the start out before the DB lock
 (`repo_latest::set_launch_base`, the same fetch and pick rule as
 `repo_latest`, waiting at most 4 s in all) and puts it in
 `params["base_resolved"]`, always overwriting what a caller sent. The
@@ -1495,8 +1494,8 @@ thread of its own, one launch at a time, and reopens with the error if
 it fails. Editing its Base clears a `prefer` that came with a proposal. The
 worktree is then `git worktree add --no-track -b <branch> <dir> <commit>`
 (`--no-track`: a private ref never becomes the upstream). An existing
-branch is checked out as it is. `[session] base = "head"` keeps the old
-start with no fetch; `create_session`'s `base` names a branch (or
+branch is checked out as it is. `[session] base = "head"` starts it at the main
+checkout's `HEAD`, with no fetch; `create_session`'s `base` names a branch (or
 `<remote>/<branch>`) to build on, or `"head"`; with `prefer` (`local`,
 `remote`), the side the user chose when that branch had diverged. It is also a hint on the
 `n` form, carried through the request, `confirm_new_session` and

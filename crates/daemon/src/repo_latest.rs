@@ -572,13 +572,10 @@ fn resolve(
             })
     };
     let mut fetch = fetch_one(&branch);
-    // The remote's HEAD named a branch it no longer has (renamed): ask it.
-    if fetch == Fetch::Missing
-        && matches!(
-            from,
-            Some(latest::DefaultFrom::RemoteHead | latest::DefaultFrom::Cached)
-        )
-    {
+    // The default branch the remote doesn't have (renamed): the remote
+    // asked, whatever found it (its HEAD, the record, a guess), within
+    // what is left of the budget.
+    if fetch == Fetch::Missing && from.is_some() {
         let mut failed = false;
         let retry = latest::default_branch(
             &env,
@@ -587,7 +584,7 @@ fn resolve(
             remote.as_deref(),
             None,
             true,
-            ask(want, snap, now),
+            latest::AskRemote::First(want.left(latest::LS_REMOTE)),
             &mut failed,
         );
         learned.ls_failed |= failed;
@@ -601,6 +598,13 @@ fn resolve(
                 fetch = fetch_one(&branch);
             }
         }
+    }
+    // A launch never starts at a default branch the remote says is gone.
+    if fetch == Fetch::Missing && from.is_some() && want.deadline.is_some() {
+        bail!(
+            "{} has no branch {branch} (the default branch renamed?)",
+            remote.as_deref().unwrap_or("the remote")
+        );
     }
     let is_default = want.branch.is_none() && !current_only;
     if current_only {
@@ -1014,7 +1018,7 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
         latest::tree_warnings(&env, &repo.root, &dir)
     };
     f.warnings.extend(tree_warnings.iter().cloned());
-    let dropped = drop_old_refs(&env, &repo.root, &rec, &f.branch);
+    let dropped = drop_old_refs(&env, &repo.root, &rec, f.remote.as_deref(), &f.branch);
     if !dropped.is_empty() {
         d.latest.forget(&format!("{key}\0"));
     }
@@ -1088,27 +1092,26 @@ fn moved_since(
 
 /// Drop private refs of branches not fetched for `REF_UNUSED_MS` (they
 /// keep objects alive), except `current`'s. Returns the record keys gone.
-fn drop_old_refs(env: &GitEnv, root: &Path, rec: &Rec, current: &str) -> Vec<String> {
+fn drop_old_refs(
+    env: &GitEnv,
+    root: &Path,
+    rec: &Rec,
+    remote: Option<&str>,
+    current: &str,
+) -> Vec<String> {
     let now = now_ms();
-    let old: Vec<String> = rec
-        .fetched
+    // (Keys are `<remote>/<branch>`: exactly the private ref's tail, so
+    // the same branch under another remote is never touched.)
+    let keep = remote.map(|r| format!("{r}/{current}"));
+    rec.fetched
         .iter()
-        .filter(|(k, at)| {
-            now - **at > REF_UNUSED_MS && k.split_once('/').map(|x| x.1) != Some(current)
+        .filter(|(k, at)| now - **at > REF_UNUSED_MS && Some(*k) != keep.as_ref())
+        .filter(|(k, _)| {
+            let r = format!("{}{k}", latest::REF_PREFIX);
+            latest::run(env, root, &["update-ref", "-d", &r], latest::PLUMBING).is_ok_and(|o| o.ok)
         })
         .map(|(k, _)| k.clone())
-        .collect();
-    if old.is_empty() {
-        return old;
-    }
-    let branches: Vec<String> = old
-        .iter()
-        .filter_map(|k| k.split_once('/').map(|x| x.1.to_string()))
-        .collect();
-    match latest::drop_refs(env, root, Some(&branches)) {
-        Ok(_) => old,
-        Err(_) => Vec::new(),
-    }
+        .collect()
 }
 
 /// Put `launch_base`'s answer in `session.new`'s params, over whatever a
@@ -1330,7 +1333,9 @@ pub fn prune_rpc(d: &Daemon, params: Value) -> Result<Value> {
             (p, Located::NotGit) => bail!("{} is not a git repository", p.display()),
             (_, Located::Repo(r)) => Some(r),
         },
-        None => None,
+        // Every repo: only when asked for in so many words.
+        None if params["all"] == true => None,
+        None => bail!("pass a repo, or all: true to prune every repo"),
     };
     let mut keys: Vec<(String, String)> = records(d)
         .into_iter()
@@ -1739,7 +1744,7 @@ mod tests {
         // Listed, then pruned: tree and private refs gone.
         let l = list_rpc(&d3).unwrap();
         assert_eq!(l["trees"][0]["ref"], "feat");
-        let p = prune_rpc(&d3, json!({})).unwrap();
+        let p = prune_rpc(&d3, json!({"all": true})).unwrap();
         assert_eq!(p["removed"].as_array().unwrap().len(), 1, "{p}");
         assert!(!path.exists());
         assert!(r.g(c, &["for-each-ref", latest::REF_PREFIX]).is_empty());
@@ -2355,7 +2360,7 @@ mod tests {
             rec.root = r.root().join("nowhere").to_string_lossy().into_owned();
             true
         });
-        let p = prune_rpc(&d, json!({})).unwrap();
+        let p = prune_rpc(&d, json!({"all": true})).unwrap();
         assert_eq!(p["failed"].as_array().unwrap().len(), 1, "{p}");
         assert!(!record(&d, &k).root.is_empty());
     }
@@ -2787,6 +2792,59 @@ mod tests {
             v["warnings"].to_string().contains("as you last fetched it"),
             "{v}"
         );
+    }
+
+    /// The default branch renamed on the remote (the clone still says
+    /// main): a launch asks the remote and starts at the new one, and
+    /// records it.
+    #[test]
+    fn a_launch_follows_a_renamed_default_branch() {
+        let r = Repos::new();
+        let c = &r.clone;
+        r.g(&r.remote, &["branch", "-m", "main", "trunk"]);
+        r.g(&r.remote, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+        let trunk = r.g(&r.remote, &["rev-parse", "trunk"]);
+        let d = daemon(&r);
+        let b = launch_base(&d, &json!({"repo": c, "name": "x"})).unwrap();
+        assert_eq!(b["ref"], "trunk", "{b}");
+        assert_eq!(b["commit"], trunk.as_str());
+        assert_eq!(record(&d, &key(c)).default_branch.as_deref(), Some("trunk"));
+    }
+
+    /// Pruning every repo needs `all`; a repo alone is that repo.
+    #[test]
+    fn pruning_every_repo_must_be_asked_for() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        call(&d, &r.clone, json!({}));
+        let e = prune_rpc(&d, json!({})).unwrap_err().to_string();
+        assert!(e.contains("all"), "{e}");
+        assert_eq!(records(&d).len(), 1);
+        let p = prune_rpc(&d, json!({"all": true})).unwrap();
+        assert_eq!(p["removed"].as_array().unwrap().len(), 1, "{p}");
+    }
+
+    /// An old private ref goes by remote and branch: the same branch under
+    /// another remote stays.
+    #[test]
+    fn old_private_refs_go_by_remote_and_branch() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let head = r.g(c, &["rev-parse", "HEAD"]);
+        for x in ["origin/feat", "upstream/feat"] {
+            r.g(
+                c,
+                &["update-ref", &format!("{}{x}", latest::REF_PREFIX), &head],
+            );
+        }
+        let rec = Rec {
+            fetched: [("origin/feat".to_string(), 1)].into_iter().collect(),
+            ..Rec::default()
+        };
+        let dropped = drop_old_refs(&r.env, c, &rec, Some("origin"), "main");
+        assert_eq!(dropped, vec!["origin/feat".to_string()]);
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "feat")).is_none());
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("upstream", "feat")).is_some());
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

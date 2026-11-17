@@ -304,7 +304,7 @@ which keeps one read-only checkout per repo at
 `<repo>/.worktrees/.rlord-latest`, moved to the newest commit of the
 branch asked for (detached; anything edited there is thrown away). From
 a shell: `rlord latest [REPO] [--ref B]` prints its path and commit;
-`rlord latest --list` shows them, `rlord latest --prune [REPO]` removes
+`rlord latest --list` shows them, `rlord latest --prune [REPO]` (or `--all`) removes
 them (unused ones go by themselves after 30 days).
 
 In the TUI, `n` asks the **overlord** to launch a session. Write what you

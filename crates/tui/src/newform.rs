@@ -1375,7 +1375,8 @@ impl App {
                         ),
                         None => format!("launched {}", v["name"].as_str().unwrap_or("?")),
                     };
-                    self.table.select(Some(0));
+                    // (Selected once the list has it, as a fork is.)
+                    self.pending_select = v["id"].as_str().map(str::to_string);
                 }
                 Err(e) => {
                     self.status_line = format!("not launched: {e}");

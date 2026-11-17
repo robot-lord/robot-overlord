@@ -171,9 +171,13 @@ enum Command {
         /// List the trees rlord keeps
         #[arg(long, conflicts_with_all = ["git_ref", "prefer", "prune"])]
         list: bool,
-        /// Remove the tree and rlord's private refs: of REPO, or of every repo
+        /// Remove the tree and rlord's private refs of REPO (default: the
+        /// current folder's repo)
         #[arg(long, conflicts_with_all = ["git_ref", "prefer"])]
         prune: bool,
+        /// With --prune: every repo rlord keeps a tree or refs for
+        #[arg(long, requires = "prune", conflicts_with = "repo")]
+        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1008,8 +1012,12 @@ fn main() -> Result<()> {
             prefer,
             list,
             prune,
+            all,
             json,
-        } => latest_cmd(repo, git_ref, prefer, list, prune, json).map(drop),
+        } => {
+            let prune = prune.then_some(all);
+            latest_cmd(repo, git_ref, prefer, list, prune, json).map(drop)
+        }
         Command::Attach { r#ref } => {
             let s = call("session.get", json!({"ref": r#ref}))?;
             let tmux_name = s["tmux_session"]
@@ -1957,12 +1965,27 @@ fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
 }
 
 /// `rlord latest`: one RPC each (`repo.latest`, `_list`, `_prune`).
+/// `repo.latest_prune`'s params for `rlord latest --prune [REPO] [--all]`:
+/// REPO (made absolute against `cwd`), else the current folder's repo;
+/// every repo only with `--all`.
+fn prune_params(repo: Option<String>, all: bool, cwd: &std::path::Path) -> Value {
+    if all {
+        return json!({"all": true});
+    }
+    let p = std::path::PathBuf::from(rlord_core::config::expand_tilde(
+        repo.as_deref().unwrap_or("."),
+    ));
+    let p = if p.is_absolute() { p } else { cwd.join(p) };
+    json!({"repo": p.to_string_lossy()})
+}
+
+/// `prune`: Some(all) for `--prune`.
 fn latest_cmd(
     repo: Option<String>,
     git_ref: Option<String>,
     prefer: Option<String>,
     list: bool,
-    prune: bool,
+    prune: Option<bool>,
     json: bool,
 ) -> Result<Value> {
     let abs = |r: String| -> Result<String> {
@@ -1977,10 +2000,10 @@ fn latest_cmd(
     };
     let v = if list {
         call("repo.latest_list", json!({}))?
-    } else if prune {
+    } else if let Some(all) = prune {
         call(
             "repo.latest_prune",
-            json!({"repo": repo.map(abs).transpose()?}),
+            prune_params(repo.clone(), all, &std::env::current_dir()?),
         )?
     } else {
         let repo = abs(repo.unwrap_or_else(|| ".".into()))?;
@@ -2009,7 +2032,7 @@ fn latest_cmd(
                 t["path"].as_str().or(t["repo"].as_str()).unwrap_or("?")
             );
         }
-    } else if prune {
+    } else if prune.is_some() {
         for r in v["removed"]
             .as_array()
             .map(Vec::as_slice)
@@ -2689,6 +2712,25 @@ fn lineage_lines(s: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latest_prune_is_the_current_repo_unless_all() {
+        use serde_json::json;
+        let cwd = std::path::Path::new("/w/app/sub");
+        assert_eq!(
+            super::prune_params(None, false, cwd),
+            json!({"repo": "/w/app/sub/."})
+        );
+        assert_eq!(
+            super::prune_params(Some("../other".into()), false, cwd),
+            json!({"repo": "/w/app/sub/../other"})
+        );
+        assert_eq!(
+            super::prune_params(Some("/r".into()), false, cwd),
+            json!({"repo": "/r"})
+        );
+        assert_eq!(super::prune_params(None, true, cwd), json!({"all": true}));
+    }
+
     use super::*;
     use std::path::Path;
 
