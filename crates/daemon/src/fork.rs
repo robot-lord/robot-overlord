@@ -26,7 +26,7 @@ use rlord_core::types::{now_ms, Session, Status};
 use rlord_core::{git, names, paths};
 
 use crate::context::{self, ForkFolder, NewRow};
-use crate::methods::{self, p_str, spec_args, Background, Start};
+use crate::methods::{self, p_str, Background, Start};
 use crate::Daemon;
 
 /// At or over this much of its context window, the fork is warned about.
@@ -714,8 +714,9 @@ pub(crate) fn finish(
     // A fork always has background: at least its note and link.
     let mode = context::delivery(agent, made.hooks);
     let bg_file = context::file_path(base, id);
-    // Its own look-ups (the token first: its background names it).
-    let own_tools = crate::session_tools::wiring(db, base, id, agent, "", &project, false);
+    // Its flags and look-ups (the token first: its background names it).
+    let spec = spec_of(want);
+    let mut args = methods::start_args(db, base, id, agent, &spec, "", &project, false);
     let text = context::launch_file_text_rows(db, base, id, &name, &copied, &add, now);
     let carried = match context::write_file(base, id, &text) {
         Ok(_) => Some(mode),
@@ -724,9 +725,6 @@ pub(crate) fn finish(
             (mode == context::Delivery::Hook).then_some(mode)
         }
     };
-    let spec = spec_of(want);
-    let mut args = spec_args(agent, &spec);
-    args.extend(own_tools);
     args.extend(context::launch_args(carried, &bg_file));
     let first = context::launch_prompt(want.prompt.as_deref(), carried, &bg_file);
     let launch = launch(want, made, &project, first.as_deref(), &args)?;
@@ -988,6 +986,7 @@ pub(crate) fn refork_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::methods::spec_args;
     use rlord_core::db::NewSession;
 
     /// A session in the test DB, its folder `dir` (which exists or not).
@@ -1565,12 +1564,10 @@ mod tests {
             ["claude", "--resume", "c-1", "--fork-session"]
         );
         assert_eq!(l.argv.last().unwrap(), "go");
-        {
-            let new = l.session_id.clone().unwrap();
-            assert_ne!(new, "c-1");
-            assert_eq!(&l.argv[4..6], ["--session-id", new.as_str()]);
-            assert!(l.transcript.unwrap().ends_with(format!("{new}.jsonl")));
-        }
+        let new = l.session_id.clone().unwrap();
+        assert_ne!(new, "c-1");
+        assert_eq!(&l.argv[4..6], ["--session-id", new.as_str()]);
+        assert!(l.transcript.unwrap().ends_with(format!("{new}.jsonl")));
         // No model asked for: the parent's (`--resume` doesn't restore
         // it), and no Remote Control.
         assert!(l.argv.windows(2).any(|a| a == ["--model", "m-1"]));

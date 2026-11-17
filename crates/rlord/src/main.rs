@@ -417,7 +417,7 @@ enum Command {
         #[arg(long, requires = "token_file")]
         session: bool,
         /// The session's token file (with `--session`).
-        #[arg(long)]
+        #[arg(long, requires = "session")]
         token_file: Option<std::path::PathBuf>,
         /// The daemon's socket, as the daemon resolved it. The overlord's
         /// MCP config always passes it: an agent may start this server with
@@ -2172,6 +2172,9 @@ fn ensure_daemon_current() {
 }
 
 fn run_daemon() -> Result<()> {
+    // Nothing it starts (tmux's server, agents' shared servers) may carry
+    // the session identity of a pane it was started from.
+    rlord_daemon::scrub_own_env();
     // Pin both at startup, before any rebuild or reinstall.
     rlord_daemon::build_id();
     rlord_daemon::exe_id();

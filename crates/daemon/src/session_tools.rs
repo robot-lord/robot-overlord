@@ -35,6 +35,7 @@ use rlord_core::agents::{codex, Agent};
 use rlord_core::db::{ArchivedMode, Db, SessionQuery};
 use rlord_core::types::Session;
 
+use crate::overlord::overlords_at;
 use crate::Daemon;
 
 /// The MCP server name the session's agent sees.
@@ -60,13 +61,13 @@ pub fn mcp_config_path(base: &Path, id: &str) -> PathBuf {
     crate::context::session_dir(base, id).join("mcp.json")
 }
 
-fn random_hex() -> Result<String> {
-    use std::io::Read;
-    let mut b = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .context("reading /dev/urandom")?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+/// 32 random bytes as hex (two v4 uuids' bytes: the OS's random source).
+fn random_hex() -> String {
+    [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()]
+        .iter()
+        .flat_map(|u| *u.as_bytes())
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 /// The session's token file, made if it has none (or its file is gone):
@@ -76,7 +77,7 @@ pub fn mint(db: &Db, base: &Path, id: &str) -> Result<PathBuf> {
     let token = match db.kv_get(&token_key(id))? {
         Some(t) if !t.is_empty() => t,
         _ => {
-            let t = random_hex()?;
+            let t = random_hex();
             db.kv_set(&token_key(id), &t)?;
             t
         }
@@ -118,7 +119,7 @@ pub fn resolve(db: &Db, token: &str) -> Result<Session> {
     }
     let id = found.context("unknown session token")?;
     let s = db.resolve_ref(&id).context("unknown session token")?;
-    if is_overlords(&s) {
+    if overlords_at(&s.role, &s.project_path) {
         bail!("not for the overlord");
     }
     if s.archived_at.is_some() {
@@ -127,25 +128,22 @@ pub fn resolve(db: &Db, token: &str) -> Result<Session> {
     Ok(s)
 }
 
-/// An overlord, or a session that ran in an overlord's folder.
-fn is_overlords(s: &Session) -> bool {
-    overlords_at(&s.role, &s.project_path)
+fn kind_key(id: &str) -> String {
+    format!("session_lookup:{id}")
 }
 
-use crate::overlord::overlords_at;
-
 /// How session `s`'s agent can look things up: `mcp` (the
-/// `rlord_session` tools, wired at its start), `cli` (`rlord context`
-/// only: Codex on its background server, OpenCode; not to be relied on
-/// inside Codex's sandbox), `none` (an overlord, or no token yet: its
-/// next start makes one).
-pub fn lookup_kind(base: &Path, s: &Session) -> &'static str {
+/// `rlord_session` tools: its last start was given them, kv
+/// `session_lookup:<id>`), `cli` (`rlord context` only: Codex on its
+/// background server, OpenCode, or a start whose wiring failed; not to be
+/// relied on inside Codex's sandbox), `none` (an overlord, or no token
+/// yet: its next start makes one).
+pub fn lookup_kind(db: &Db, base: &Path, s: &Session) -> &'static str {
     if overlords_at(&s.role, &s.project_path) || !token_path(base, &s.id).is_file() {
         return "none";
     }
-    match Agent::parse(&s.agent) {
-        Some(Agent::Claude) => "mcp",
-        Some(Agent::Codex) if !s.codex_daemon => "mcp",
+    match db.kv_get(&kind_key(&s.id)).ok().flatten().as_deref() {
+        Some("mcp") => "mcp",
         _ => "cli",
     }
 }
@@ -173,6 +171,7 @@ pub fn wiring(
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(session = %id, error = %e, "making the session's token");
+            let _ = db.kv_delete(&kind_key(id));
             return Vec::new();
         }
     };
@@ -180,7 +179,7 @@ pub fn wiring(
     let socket = rlord_core::paths::socket_path()
         .to_string_lossy()
         .into_owned();
-    match wiring_args(
+    let args = match wiring_args(
         agent,
         daemon,
         &bin,
@@ -193,7 +192,13 @@ pub fn wiring(
             tracing::warn!(session = %id, error = %e, "writing the session's MCP config");
             Vec::new()
         }
+    };
+    // What this start gives it (`lookup_kind`): tools only if it has flags.
+    let kind = if args.is_empty() { "cli" } else { "mcp" };
+    if let Err(e) = db.kv_set(&kind_key(id), kind) {
+        tracing::warn!(session = %id, error = %e, "recording the session's look-ups");
     }
+    args
 }
 
 /// `rlord mcp --session …` args.
@@ -265,21 +270,32 @@ pub fn lookup_section(dir: &Path) -> Option<String> {
 
 // ---- rate limit ----
 
-static CALLS: Mutex<Option<HashMap<String, VecDeque<Instant>>>> = Mutex::new(None);
+/// Each session's recent look-up calls (one per `Daemon`).
+#[derive(Default)]
+pub struct Limiter(Mutex<HashMap<String, VecDeque<Instant>>>);
 
-/// Count a call for `id`; refused over the limits.
-fn admit(id: &str, now: Instant) -> Result<()> {
-    let mut g = CALLS.lock().expect("rate mutex");
-    let q = g
-        .get_or_insert_with(HashMap::new)
-        .entry(id.to_string())
-        .or_default();
-    while q
-        .front()
-        .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600))
-    {
-        q.pop_front();
+impl Limiter {
+    /// Count a call for `id`; refused over the limits. Ids with no call in
+    /// the last hour are dropped.
+    pub fn admit(&self, id: &str, now: Instant) -> Result<()> {
+        let hour = Duration::from_secs(3600);
+        let mut g = self.0.lock().expect("rate mutex");
+        for q in g.values_mut() {
+            while q.front().is_some_and(|t| now.duration_since(*t) > hour) {
+                q.pop_front();
+            }
+        }
+        g.retain(|_, q| !q.is_empty());
+        admit_into(g.entry(id.to_string()).or_default(), now)
     }
+
+    #[cfg(test)]
+    fn ids(&self) -> usize {
+        self.0.lock().expect("rate mutex").len()
+    }
+}
+
+fn admit_into(q: &mut VecDeque<Instant>, now: Instant) -> Result<()> {
     let last_minute = q
         .iter()
         .filter(|t| now.duration_since(**t) <= Duration::from_secs(60))
@@ -463,7 +479,7 @@ pub fn call(d: &Daemon, token: &str, name: &str, args: &Value) -> Result<Value> 
     if !names().iter().any(|n| n == name) {
         bail!("{name}: not one of this session's tools");
     }
-    admit(&me.id, Instant::now())?;
+    d.session_calls.admit(&me.id, Instant::now())?;
     tracing::info!(session = %me.id, tool = name, "session tool call");
     // (Worked out once per call.)
     let seen = visible(&d.db(), &me)?;
@@ -783,14 +799,18 @@ mod tests {
 
     #[test]
     fn the_rate_limit_holds() {
+        let l = Limiter::default();
         let t0 = Instant::now();
         for _ in 0..PER_MINUTE {
-            admit("01RATE", t0).unwrap();
+            l.admit("01RATE", t0).unwrap();
         }
-        assert!(admit("01RATE", t0).is_err());
+        assert!(l.admit("01RATE", t0).is_err());
         // A minute on: room again, until the hour's cap.
         let t1 = t0 + Duration::from_secs(61);
-        admit("01RATE", t1).unwrap();
+        l.admit("01RATE", t1).unwrap();
+        // An id idle for an hour is dropped.
+        l.admit("01OTHER", t1 + Duration::from_secs(3_700)).unwrap();
+        assert_eq!(l.ids(), 1);
     }
 
     #[test]
@@ -834,6 +854,11 @@ mod tests {
         for (budget, fits) in [(header + t - 1, false), (header + t + 400, true)] {
             let text = crate::context::render_as("s", true, &rows, &[], None, budget, Some(&tail));
             assert_eq!(text.contains("Looking up more"), fits, "{budget}");
+            assert!(text.chars().count() <= budget, "{budget}");
+        }
+        // Tight slack: every budget from the header alone up, never over.
+        for budget in header..header + t + 300 {
+            let text = crate::context::render_as("s", true, &rows, &[], None, budget, Some(&tail));
             assert!(text.chars().count() <= budget, "{budget}");
         }
         let _ = std::fs::remove_dir_all(&b);
@@ -882,25 +907,21 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         add(&db, "01K", None, "");
         let s = db.resolve_ref("01K").unwrap();
-        assert_eq!(lookup_kind(&b, &s), "none");
-        mint(&db, &b, "01K").unwrap();
-        assert_eq!(lookup_kind(&b, &s), "mcp");
-        let codex_daemon = Session {
-            agent: "codex".into(),
-            codex_daemon: true,
-            ..s.clone()
-        };
-        assert_eq!(lookup_kind(&b, &codex_daemon), "cli");
-        let opencode = Session {
-            agent: "opencode".into(),
-            ..s.clone()
-        };
-        assert_eq!(lookup_kind(&b, &opencode), "cli");
-        let codex = Session {
-            agent: "codex".into(),
-            ..s
-        };
-        assert_eq!(lookup_kind(&b, &codex), "mcp");
+        let folder = s.project_path.clone();
+        assert_eq!(lookup_kind(&db, &b, &s), "none");
+        // What the last start's wiring gave it.
+        let start = |agent, daemon| wiring(&db, &b, "01K", agent, "", &folder, daemon);
+        assert!(!start(Agent::Claude, false).is_empty());
+        assert_eq!(lookup_kind(&db, &b, &s), "mcp");
+        assert!(start(Agent::Codex, true).is_empty());
+        assert_eq!(lookup_kind(&db, &b, &s), "cli");
+        assert!(!start(Agent::Codex, false).is_empty());
+        assert_eq!(lookup_kind(&db, &b, &s), "mcp");
+        assert!(start(Agent::OpenCode, false).is_empty());
+        assert_eq!(lookup_kind(&db, &b, &s), "cli");
+        // A token but no recorded start (before 1.3.0's wiring): cli.
+        db.kv_delete("session_lookup:01K").unwrap();
+        assert_eq!(lookup_kind(&db, &b, &s), "cli");
         let _ = std::fs::remove_dir_all(&b);
     }
 

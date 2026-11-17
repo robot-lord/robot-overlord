@@ -783,9 +783,10 @@ shell. RPC `sctx.tools` / `sctx.call` take the token and nothing else
 naming a session; it is a dispatch of its own, so no overlord tool is
 reachable through it.
 
-- **Token.** 32 random bytes, hex, made at a session's first start
-  (`session_tools::wiring`, from `session.new`, `session.restart` and
-  `session.fork`) and kept across restarts: kv `session_token:<id>` and
+- **Token.** 32 random bytes (two v4 uuids), hex, made at a session's
+  first start (`methods::start_args`, the one helper every start path
+  uses: `session.new`, `session.restart`, `session.fork`, a fresh
+  conversation) and kept across restarts: kv `session_token:<id>` and
   the 0600 file `<data>/sessions/<id>/token`. Removed on archive; a start
   after unarchiving makes a new one. Overlords get none and are refused.
 - **Visible set.** The session itself; sessions linked to it (its
@@ -803,18 +804,22 @@ reachable through it.
   mcp_servers.rlord_session.*` with approval `approve`; Codex on its
   background server and OpenCode none: they have only the CLI, which
   isn't relied on inside Codex's sandbox. `get_session` and the launch
-  and fork answers say which (`lookup`: `mcp`, `cli`, `none`), so the
+  and fork answers say which (`lookup`: `mcp` only when the last start's
+  wiring produced flags, kv `session_lookup:<id>`; else `cli`, or `none`
+  without a token), so the
   overlord copies the needed facts into `context` for the last two. A
   Claude or in-pane Codex pane's env gets `RLORD_SESSION_TOKEN_FILE` (a
   path); OpenCode and Codex daemon-mode panes don't, since their shell
   commands run in a shared server. The variable is scrubbed with
   `RLORD_SESSION_ID` from everything shared between sessions
-  (`agents::PANE_ENV`: the daemon, a Codex daemon pane, Codex's server,
-  OpenCode's shared server, commands rlord runs). The background ends
+  (`agents::PANE_ENV`: the daemon drops it from its own environment at
+  start, every pane unsets what it isn't given, Codex's server, OpenCode's
+  shared server, commands rlord runs). The background ends
   with a "Looking up more" section, once the token exists, naming the
   tools and the CLI form with `--token-file` and `--socket` always
   given, so it works from any shell.
-- **Bounds.** 30 calls a minute and 300 an hour per session (in memory),
+- **Bounds.** 30 calls a minute and 300 an hour per session (in memory,
+  per daemon; idle ids dropped),
   answers at most 16,000 chars, no model, agent CLI or tmux.
 - Same trust model as the rest: a process running as the user can read
   any token file. What the token gives is a read-only surface bound to

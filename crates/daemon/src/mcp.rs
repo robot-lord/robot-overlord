@@ -675,6 +675,7 @@ fn new_session_params(args: &Value) -> Value {
 fn lookup_of(d: &Daemon, id: &str) -> Value {
     match d.db().resolve_ref(id) {
         Ok(s) => json!(crate::session_tools::lookup_kind(
+            &d.db(),
             &rlord_core::paths::data_dir(),
             &s
         )),

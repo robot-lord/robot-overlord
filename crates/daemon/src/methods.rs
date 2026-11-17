@@ -406,6 +406,27 @@ pub(crate) fn spec_args(agent: Agent, spec: &Value) -> Vec<String> {
     a
 }
 
+/// A start's agent flags: the session's own (`spec_args`) and its
+/// look-ups (`session_tools::wiring`, which makes its token). Every start
+/// path uses it: a new session, a restart, a fork, a fresh conversation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_args(
+    db: &Db,
+    base: &std::path::Path,
+    id: &str,
+    agent: Agent,
+    spec: &Value,
+    role: &str,
+    folder: &str,
+    daemon: bool,
+) -> Vec<String> {
+    let mut a = spec_args(agent, spec);
+    a.extend(crate::session_tools::wiring(
+        db, base, id, agent, role, folder, daemon,
+    ));
+    a
+}
+
 /// `[session] claude_tui`, set once at daemon start (see `set_claude_tui`).
 static CLAUDE_TUI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -603,11 +624,14 @@ fn pane_cmd(
     argv: &[String],
 ) -> String {
     let env = pane_env(base, agent, session_id, program, daemon);
-    if daemon {
-        tmux::pane_command_unsetting(rlord_core::agents::PANE_ENV, &env, argv)
-    } else {
-        tmux::pane_command(&env, argv)
-    }
+    // What it isn't given is unset: tmux's server may carry another
+    // pane's (`PANE_ENV`).
+    let unset: Vec<&str> = rlord_core::agents::PANE_ENV
+        .iter()
+        .copied()
+        .filter(|k| !env.iter().any(|(e, _)| e == k))
+        .collect();
+    tmux::pane_command_unsetting(&unset, &env, argv)
 }
 
 fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
@@ -839,8 +863,7 @@ pub(crate) fn session_new_with(
     // carries no flag or pointer naming it.
     // Its own read-only look-ups, computed at every start and never
     // stored (the token first: its background names it).
-    let own_tools =
-        crate::session_tools::wiring(db, &base, &id, agent, &role, &project_path, daemon);
+    let mut args = start_args(db, &base, &id, agent, &spec, &role, &project_path, daemon);
     let file_ok = delivery.is_some() && {
         let text = context::launch_file_text_rows(db, &base, &id, &name, &[], &rows, now_ms());
         match context::write_file(&base, &id, &text) {
@@ -852,8 +875,6 @@ pub(crate) fn session_new_with(
         }
     };
     let carried = delivery.filter(|d| file_ok || *d == context::Delivery::Hook);
-    let mut args = spec_args(agent, &spec);
-    args.extend(own_tools);
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
@@ -1253,16 +1274,16 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let bg_file = context::file_path(&base, &s.id);
     // With its own read-only look-ups, computed at every start (the token
     // first: its background names it).
-    let mut own_args = spec_args(agent, &spec);
-    own_args.extend(crate::session_tools::wiring(
+    let own_args = start_args(
         db,
         &base,
         &s.id,
         agent,
+        &spec,
         &s.role,
         &s.project_path,
         s.codex_daemon,
-    ));
+    );
     let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
         Ok(f) => f.is_some(),
         Err(e) => {
@@ -1465,7 +1486,17 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
-    let mut launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
+    let args = start_args(
+        db,
+        &paths::data_dir(),
+        &s.id,
+        agent,
+        &spec,
+        &s.role,
+        &s.project_path,
+        s.codex_daemon,
+    );
+    let mut launch = agent.launch(&s.project_path, None, model, &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = tmux_name_of(db, &s)?;
@@ -2460,7 +2491,28 @@ mod tests {
         assert!(!pane_env(&base, Agent::OpenCode, "01s", None, false)
             .iter()
             .any(|(k, _)| k == "RLORD_SESSION_TOKEN_FILE"));
+        // ...and its pane unsets one tmux's server might hand it; a pane
+        // given the file sets it and unsets nothing.
+        let argv = ["opencode".to_string()];
+        let cmd = pane_cmd(&base, Agent::OpenCode, "01s", None, false, &argv);
+        assert!(
+            cmd.starts_with("exec env -u RLORD_SESSION_TOKEN_FILE "),
+            "{cmd}"
+        );
+        let cmd = pane_cmd(&base, Agent::Claude, "01s", None, false, &argv);
+        assert!(!cmd.contains(" -u "), "{cmd}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The daemon drops the pane identity from its own environment at
+    /// start, so nothing it starts inherits it.
+    #[test]
+    fn the_daemon_scrubs_pane_env_from_itself() {
+        std::env::set_var("RLORD_SESSION_TOKEN_FILE", "/x/token");
+        crate::scrub_own_env();
+        for k in rlord_core::agents::PANE_ENV {
+            assert!(std::env::var_os(k).is_none(), "{k}");
+        }
     }
 
     /// A pane on Codex's daemon names no session: a daemon its TUI starts
@@ -2476,7 +2528,7 @@ mod tests {
         );
         assert_eq!(
             pane_cmd(none, Agent::Codex, "01s", None, false, &argv),
-            "exec env RLORD_SESSION_ID=01s codex"
+            "exec env -u RLORD_SESSION_TOKEN_FILE RLORD_SESSION_ID=01s codex"
         );
     }
 

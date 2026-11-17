@@ -51,6 +51,8 @@ pub struct Daemon {
     config: std::sync::RwLock<Arc<Config>>,
     /// The repo finder's background disk scan (`repo_scan.rs`).
     repo_scan: repo_scan::Scanner,
+    /// Sessions' look-up calls, rate-limited (`session_tools`).
+    pub(crate) session_calls: session_tools::Limiter,
     /// This daemon, for work that outlives a call (a late fetch result).
     pub(crate) me: std::sync::Weak<Daemon>,
     /// `repo_latest`: fetches, per-repo locks (`repo_latest.rs`).
@@ -104,6 +106,7 @@ impl Daemon {
             db: Mutex::new(db),
             config: std::sync::RwLock::new(Arc::new(config)),
             repo_scan: repo_scan::Scanner::default(),
+            session_calls: session_tools::Limiter::default(),
             latest: Default::default(),
             notify,
             ui_view: Mutex::new(Value::Null),
@@ -954,6 +957,14 @@ impl Daemon {
             _ => return None,
         };
         Some(r)
+    }
+}
+
+/// Drop `agents::PANE_ENV` from this process's environment (the daemon,
+/// at start, before any thread): what it starts inherits none of it.
+pub fn scrub_own_env() {
+    for k in rlord_core::agents::PANE_ENV {
+        std::env::remove_var(k);
     }
 }
 

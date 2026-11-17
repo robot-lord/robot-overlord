@@ -253,7 +253,12 @@ fn compose(
     let rel_room = available.saturating_sub(notes_need.min(available / 2));
     let rel = related_section(related, rel_room, file);
     let room = available.saturating_sub(rel.chars().count());
-    out.push_str(&notes_section(&lines, room, file, overhead));
+    // (A section that can't fit, even clipped, is left out: never over
+    // budget.)
+    let notes = notes_section(&lines, room, file, overhead);
+    if notes.chars().count() <= room {
+        out.push_str(&notes);
+    }
     out.push_str(&rel);
     out
 }
@@ -351,20 +356,23 @@ pub fn render_as(
     }
     // How to look more up (`session_tools::lookup_section`) goes last; its
     // room is kept first.
-    // (Left out when the header and it don't fit together: never over
-    // budget.)
-    let tail = lookup
-        .filter(|t| header.chars().count() + t.chars().count() <= budget)
-        .unwrap_or("");
-    let mut out = compose(
-        header,
-        rows,
-        related,
-        file,
-        budget.saturating_sub(tail.chars().count()),
-    );
-    out.push_str(tail);
-    out
+    // The rest is rendered in what the tail leaves; the tail goes on only
+    // if the whole stays within budget, else the rest gets all of it.
+    if let Some(tail) = lookup {
+        let t = tail.chars().count();
+        let mut out = compose(
+            header.clone(),
+            rows,
+            related,
+            file,
+            budget.saturating_sub(t),
+        );
+        if out.chars().count() + t <= budget {
+            out.push_str(tail);
+            return out;
+        }
+    }
+    compose(header, rows, related, file, budget)
 }
 
 /// Whether the overlord launched session `id` with its background (kv

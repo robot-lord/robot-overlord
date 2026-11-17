@@ -575,6 +575,25 @@ minor releases now).
 8. One `overlord::overlords_at`, used by `visible`, `resolve`,
    `lookup_kind`, `wiring` and `search`.
 
+### Review round 4 (PR #70)
+
+1. Every pane unsets the `PANE_ENV` names it isn't given (`env -u`);
+   `rlord daemon` drops them from its own environment at start
+   (`scrub_own_env`) (tests).
+2. `lookup` is `mcp` only when the last start's wiring produced flags
+   (kv `session_lookup:<id>`), else `cli` (test).
+3. `render_as` renders the rest, then adds the lookup section only if
+   the whole stays in budget; `compose` leaves out a notes section that
+   can't fit. Test over every budget from the header up.
+4. `rlord mcp --token-file` requires `--session`.
+5. The rate limiter is per `Daemon` (`session_tools::Limiter`), drops
+   idle ids; tests use their own.
+6. `methods::start_args` (spec args plus wiring) for every start path:
+   new, restart, fork, fresh. (`limits` resumes through restart.)
+7. Token bytes from two v4 uuids.
+8. `is_overlords` gone; `overlords_at` imported at the top; fork test
+   block un-nested.
+
 ### #65 owed items
 
 Fixed here:
@@ -606,9 +625,9 @@ Still owed:
 - `session_tools::visible()` is computed once per call for every tool;
   make it lazy per tool (`session_brief` needs only links, a named ref
   could be checked without the whole set).
-- `context::compose` can go a little over a budget barely larger than
-  the header alone (the notes heading and its notice are written even
-  with no room). Real budgets (6,000+) never hit it.
+- Token resolve scans every `session_token:*` row: add a reverse key
+  for an O(1) look-up.
+- Cache `methods::rlord_bin()` (resolved at every start and render).
 
 - Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
   `docs/architecture.md` "Forking a session"): a fork starts through
