@@ -25,6 +25,7 @@ mod overlay;
 mod overlord;
 mod record;
 mod setupform;
+mod statustext;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -320,6 +321,9 @@ struct App {
     /// The last event was pointer motion that changed nothing: no need to
     /// draw again for it (motion arrives in floods).
     idle_motion: bool,
+    /// The list row under the pointer, and where the pointer is: its
+    /// status in words shows in a popup there (`statustext`).
+    hover_row: Option<(usize, u16, u16)>,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -387,6 +391,7 @@ impl App {
             hits: Default::default(),
             last_click: None,
             idle_motion: false,
+            hover_row: None,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
             preview_len: 0,
@@ -1505,17 +1510,21 @@ impl App {
             Tab::Groups => self.draw_groups(f, list_area),
         }
         if let Some(right) = right {
-            let details_h = self.config.details_height.clamp(4, 20);
-            if right.height >= details_h + 6 {
-                let [p, d] = RLayout::vertical([Constraint::Min(4), Constraint::Length(details_h)])
-                    .areas(right);
-                self.draw_preview(f, p);
-                self.draw_details(f, d);
-            } else {
-                self.draw_preview(f, right);
+            match details_split(right.height, self.config.details_height) {
+                Some(details_h) => {
+                    let [p, d] =
+                        RLayout::vertical([Constraint::Min(4), Constraint::Length(details_h)])
+                            .areas(right);
+                    self.draw_preview(f, p);
+                    self.draw_details(f, d);
+                }
+                None => self.draw_preview(f, right),
             }
         }
         self.draw_footer(f, footer_area);
+        if matches!(self.mode, Mode::Normal) {
+            self.draw_hover(f);
+        }
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
@@ -1531,6 +1540,39 @@ impl App {
             Mode::Confirm(c) => self.draw_confirm(f, c),
             _ => {}
         }
+    }
+
+    /// The popup over the list row under the pointer: its status, and every
+    /// symbol on the row, in words.
+    fn draw_hover(&self, f: &mut Frame) {
+        let Some((i, x, y)) = self.hover_row else {
+            return;
+        };
+        let Some(s) = self.sessions.get(i) else {
+            return;
+        };
+        let lines = statustext::describe(s, rlord_core::types::now_ms());
+        let area = f.area();
+        let w = lines
+            .iter()
+            .map(|l| l.chars().count() as u16 + 4)
+            .max()
+            .unwrap_or(10)
+            .min(64)
+            .min(area.width);
+        // (Border and padding: 2 columns a side.)
+        let rows = statustext::wrapped_rows(&lines, w.saturating_sub(4));
+        let text: Vec<Line> = lines
+            .into_iter()
+            .map(|l| Line::styled(l, Style::default().fg(theme::text())))
+            .collect();
+        let p = Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(theme::panel(theme::title("status"), false));
+        let h = (rows + 2).min(area.height);
+        let r = hover_rect(area, x, y, w, h);
+        f.render_widget(ratatui::widgets::Clear, r);
+        f.render_widget(p, r);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -2034,6 +2076,18 @@ impl App {
                     Style::default().fg(theme::yellow()),
                 ))
             },
+        ];
+        // Every symbol on its row, in words.
+        for (n, l) in statustext::describe(s, rlord_core::types::now_ms())
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::from(vec![
+                key(if n == 0 { "status" } else { "" }),
+                Span::styled(l, theme::muted()),
+            ]));
+        }
+        lines.extend([
             Line::raw(""),
             Line::from({
                 let mut v = vec![key("groups")];
@@ -2097,7 +2151,7 @@ impl App {
                 key("usage"),
                 Span::styled(usage_details(&s["usage"]), theme::muted()),
             ]),
-        ];
+        ]);
         // Lineage: what it was forked from, and its forks in the list.
         if s["forked_from"].is_string() {
             lines.push(Line::from(vec![
@@ -2692,6 +2746,30 @@ fn usage_details(u: &Value) -> String {
         u.turns,
         compact(u.tokens)
     )
+}
+
+/// The details panel's height under the preview, in a right column
+/// `right_h` rows tall: the larger of the configured height and three
+/// fifths of the column (the preview is a quick glance), leaving the
+/// preview at least 6 rows. None: too short for both.
+fn details_split(right_h: u16, configured: u16) -> Option<u16> {
+    let want = configured.clamp(4, 40).max(right_h * 3 / 5);
+    let h = want.min(right_h.saturating_sub(6));
+    (h >= 4).then_some(h)
+}
+
+/// Where a `w`×`h` popup for the pointer at (`x`, `y`) goes: just below
+/// and right of it, moved back inside `area` (above it when no room below).
+fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = (x + 2).min(area.right().saturating_sub(w)).max(area.x);
+    let y = if y + 1 + h <= area.bottom() {
+        y + 1
+    } else {
+        y.saturating_sub(h).max(area.y)
+    };
+    Rect::new(x, y, w, h)
 }
 
 /// A session's status, or in its place that it is stopped on a usage

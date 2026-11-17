@@ -547,11 +547,19 @@ says "out of usage until …" when the active one is limited.
 
 The preview is the session's live pane, in colour (captured with ANSI
 attributes), refreshed every `preview_refresh_ms`; `l` swaps it for the event
-log. Under it sits the **details** card — agent/model/status, repo and branch,
+log. It is a quick glance: the **details** card under it takes most of
+the column (three fifths, or `details_height` rows if more). The card has
+agent/model/status, repo and branch,
 working dir, the four timestamps, tags and group (all of them, wrapped
 over as many lines as they need) — plus two fields you write:
 a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
 free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
+Its **status** line spells out every symbol on the row in words: the
+status, background tasks with what they are and how long ago they
+started, a usage limit, and Remote Control (`⇄`: green connected,
+reachable from the Claude app; dim connecting or waiting for a restart;
+red failing, with why). Hovering the pointer over a row in the list shows
+the same in a small popup. `?` lists every status symbol.
 `rlord show <ref>` prints the same card. The list always wins on space: it
 keeps its width and the preview drops out first when the terminal is narrow.
 Where its `list_width_pct` share is too narrow for a readable name, Status,

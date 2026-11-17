@@ -121,17 +121,30 @@ pub fn fresh(open: usize, changed_at: i64, now: i64) -> Option<usize> {
 
 /// Annotate list rows with `background`: how many background tasks are
 /// still running for a session whose turn is over (stored status `idle`),
-/// else null.
+/// else null; and `background_tasks`: each one's `{label, started_at}`
+/// (oldest first, at most 5).
 pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     let seen = d.background.seen.lock().expect("background mutex");
     let now = now_ms();
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
-        let n = seen
-            .get(id)
-            .filter(|_| row["status"] == "idle")
-            .and_then(|s| count(s, now));
-        row["background"] = n.map_or(Value::Null, |n| json!(n));
+        let s = seen.get(id).filter(|_| row["status"] == "idle");
+        match s.and_then(|s| Some((s, count(s, now)?))) {
+            Some((s, n)) => {
+                let mut tasks: Vec<_> = s.tracker.open.values().collect();
+                tasks.sort_by_key(|t| t.started_at);
+                row["background"] = json!(n);
+                row["background_tasks"] = tasks
+                    .iter()
+                    .take(5)
+                    .map(|t| json!({"label": t.label, "started_at": t.started_at}))
+                    .collect();
+            }
+            None => {
+                row["background"] = Value::Null;
+                row["background_tasks"] = Value::Null;
+            }
+        }
     }
 }
 
@@ -155,7 +168,7 @@ mod tests {
             Default::default(),
         );
         let mut t = Tracker::default();
-        t.open.insert("a1".into());
+        t.open.insert("a1".into(), Default::default());
         d.background.seen.lock().unwrap().insert(
             "s1".into(),
             Seen {

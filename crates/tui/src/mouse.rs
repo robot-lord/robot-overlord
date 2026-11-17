@@ -297,6 +297,16 @@ impl App {
     /// their selection, like the launcher, don't follow: the rows would
     /// move under the pointer.)
     pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
+        // Over a session row in the list: its status in words, in a popup.
+        let row = match (&self.mode, self.hits.at(x, y)) {
+            (Mode::Normal, Some(Hit::Row(i))) => Some((i, x, y)),
+            _ => None,
+        };
+        if row.map(|r| r.0) != self.hover_row.map(|r| r.0) {
+            self.hover_row = row;
+            return true;
+        }
+        self.hover_row = row;
         match (&mut self.mode, self.hits.at(x, y)) {
             (Mode::Menu(m), Some(Hit::Pick(i))) if i < m.items.len() && m.sel != i => {
                 m.sel = i;

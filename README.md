@@ -60,7 +60,7 @@ session from last week decide? rlord is built around a few ideas:
   3 earlier") and keeps its earlier conversations, which you can read or
   continue.
 - **One list for everything.** Live status (working, needs you, your
-  turn), how much each session has used (turns, tokens or context %),
+  turn, waiting on background work), how much each session has used (turns, tokens or context %),
   sorting by your last message, the agent's or usage, groups by tag,
   favourites, search, and a live preview of the selected session.
 

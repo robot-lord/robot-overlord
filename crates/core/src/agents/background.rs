@@ -23,13 +23,13 @@
 //! Codex and OpenCode have no such work yet: `Tracker::advance` leaves
 //! them at zero (the place to add an adapter).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::transcript::Format;
+use super::transcript::{clip, parse_iso_ms, Format};
 
 /// The first look at a transcript reads at most its last this many bytes
 /// (work launched before that is missed; the stale guard covers it).
@@ -40,13 +40,28 @@ pub const CHUNK: u64 = 4 << 20;
 /// Final `<status>` values of a task notification.
 const FINAL: [&str; 4] = ["completed", "failed", "killed", "stopped"];
 
+/// Tool calls whose description is remembered until their result comes.
+const PENDING_CAP: usize = 64;
+
+/// One piece of background work still running.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Task {
+    /// What it is: the tool call's description (or the tool's name).
+    pub label: String,
+    /// When it was launched (ms; 0 when the line had no time).
+    pub started_at: i64,
+}
+
 /// What has been read of one transcript, and the work still open in it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Tracker {
     /// Bytes read so far (always at a line's end).
     pub offset: u64,
     /// Task/agent ids launched and not yet finished.
-    pub open: BTreeSet<String>,
+    pub open: BTreeMap<String, Task>,
+    /// Tool calls not yet answered: `tool_use_id → description`, for
+    /// the label of a launch (a Bash result doesn't repeat it).
+    pending: HashMap<String, String>,
 }
 
 impl Tracker {
@@ -66,6 +81,7 @@ impl Tracker {
         let mut skip_partial = false;
         if self.offset > len || (self.offset == 0 && len > FIRST_READ) {
             self.open.clear();
+            self.pending.clear();
             self.offset = len.saturating_sub(FIRST_READ);
             skip_partial = self.offset > 0;
         }
@@ -92,22 +108,61 @@ impl Tracker {
             }
             self.offset += n as u64;
             if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
-                feed(&mut self.open, &v);
+                self.feed(&v);
             }
         }
         Ok(self.open != before)
     }
+
+    /// Apply one transcript line to the open background work.
+    pub fn feed(&mut self, line: &Value) {
+        let content = &line["message"]["content"];
+        if line["type"] == "assistant" {
+            for b in content.as_array().into_iter().flatten() {
+                if b["type"] == "tool_use" {
+                    // (Bounded: answers that never came are forgotten.)
+                    if self.pending.len() >= PENDING_CAP {
+                        self.pending.clear();
+                    }
+                    let label = b["input"]["description"]
+                        .as_str()
+                        .or(b["name"].as_str())
+                        .unwrap_or("task");
+                    if let Some(id) = b["id"].as_str() {
+                        self.pending.insert(id.to_string(), clip(label, 60));
+                    }
+                }
+            }
+            return;
+        }
+        if line["type"] != "user" {
+            return;
+        }
+        let asked: Option<String> = content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b["tool_use_id"].as_str())
+            .find_map(|id| self.pending.remove(id));
+        let r = &line["toolUseResult"];
+        if let Some(id) = launched(r) {
+            let label = r["description"]
+                .as_str()
+                .map(|d| clip(d, 60))
+                .or(asked)
+                .unwrap_or_else(|| "task".to_string());
+            let started_at = line["timestamp"]
+                .as_str()
+                .and_then(parse_iso_ms)
+                .unwrap_or(0);
+            self.open.insert(id.to_string(), Task { label, started_at });
+        }
+        finish(&mut self.open, content);
+    }
 }
 
-/// Apply one transcript line to the set of open background work.
-pub fn feed(open: &mut BTreeSet<String>, line: &Value) {
-    if line["type"] != "user" {
-        return;
-    }
-    if let Some(id) = launched(&line["toolUseResult"]) {
-        open.insert(id.to_string());
-    }
-    let content = &line["message"]["content"];
+/// Close the work whose final notification is in `content`.
+fn finish(open: &mut BTreeMap<String, Task>, content: &Value) {
     let mut texts: Vec<&str> = Vec::new();
     match content {
         Value::String(s) => texts.push(s),
@@ -180,11 +235,34 @@ mod tests {
     }
 
     fn count(lines: &[Value]) -> usize {
-        let mut open = BTreeSet::new();
+        let mut t = Tracker::default();
         for l in lines {
-            feed(&mut open, l);
+            t.feed(l);
         }
-        open.len()
+        t.open.len()
+    }
+
+    #[test]
+    fn labels_and_start_times() {
+        let call = json!({"type": "assistant", "message": {"content": [{"type": "tool_use",
+            "id": "toolu_1", "name": "Bash", "input": {"command": "x", "description": "Run tests",
+            "run_in_background": true}}]}});
+        let mut launch = bash_launch("b1");
+        launch["timestamp"] = json!("1970-01-01T00:00:01.000Z");
+        let mut t = Tracker::default();
+        t.feed(&call);
+        t.feed(&launch);
+        t.feed(&agent_launch("a1"));
+        assert_eq!(
+            t.open["b1"],
+            Task {
+                label: "Run tests".into(),
+                started_at: 1000
+            }
+        );
+        // An agent's result names its own description; none here.
+        assert_eq!(t.open["a1"].label, "task");
+        assert!(t.pending.is_empty());
     }
 
     #[test]
@@ -250,7 +328,7 @@ mod tests {
         assert!(!t.advance(&p).unwrap());
         writeln!(f, "{}", &n[10..]).unwrap();
         assert!(t.advance(&p).unwrap());
-        assert_eq!(t.open.iter().collect::<Vec<_>>(), ["b1"]);
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1"]);
     }
 
     #[test]
@@ -269,7 +347,7 @@ mod tests {
         while t.offset < std::fs::metadata(&p).unwrap().len() {
             t.advance(&p).unwrap();
         }
-        assert_eq!(t.open.iter().collect::<Vec<_>>(), ["new"]);
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["new"]);
     }
 
     #[test]

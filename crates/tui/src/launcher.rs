@@ -395,7 +395,7 @@ impl App {
         if self.config.jump_digits {
             left.insert(4, row("1–9".into(), "attach the Nth session"));
         }
-        let right = vec![
+        let mut right = vec![
             head("Ask the overlord"),
             Line::styled(
                 format!("{} opens it. Say what you want:", k(Action::Overlord)),
@@ -447,10 +447,20 @@ impl App {
             }),
             Line::from(""),
             head("Status"),
-            row("needs you".into(), "blocked on a prompt or question"),
-            row("your turn".into(), "finished: the next prompt is yours"),
-            row("◔ bg N".into(), "turn over, background work still running"),
+            Line::styled(
+                "  hover a row (or see Details) for its status in words",
+                theme::muted(),
+            ),
         ];
+        right.extend(crate::statustext::LEGEND.iter().map(|(k, what)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {k:<12}"),
+                    Style::default().fg(theme::text()).bold(),
+                ),
+                Span::styled(what.to_string(), theme::muted()),
+            ])
+        }));
         // Side by side when wide, else stacked (both heights).
         let wide = f.area().width >= 84;
         let h = if wide {
