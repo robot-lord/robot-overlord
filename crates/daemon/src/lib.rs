@@ -553,8 +553,9 @@ impl Daemon {
             }
             _ => {}
         }
-        // A status filter is matched on the status each row shows
-        // (`shown_status`), after annotating; `limited` and `background`
+        // A status filter is matched after annotating
+        // (`shown_status_matches`: the overlays and your turn by the status
+        // shown, the others by the stored one); `limited` and `background`
         // aren't stored, so with one of them the DB query drops the filter.
         let status_filter = (method == "session.list")
             .then(|| take_status_filter(&mut params))
@@ -1317,22 +1318,31 @@ fn set_shown_status(rows: &mut [Value]) {
 fn shown_status(r: &Value) -> &str {
     if !r["limit"].is_null() {
         "limited"
-    } else if !r["background_tasks"].is_null() {
+    } else if !r["async_tasks"].is_null() {
         "background"
     } else {
         r["status"].as_str().unwrap_or("")
     }
 }
 
-/// Whether a row's shown status is one of those a filter asked for.
+/// Whether a row matches a status filter. The overlays and the status they
+/// are drawn over (`idle`: your turn, `background`, `limited`) match the
+/// status the row shows, so `status:turn` leaves out a row shown as
+/// background work or limited. The other stored statuses (`stopped`,
+/// `working`, `error`, …) match the stored status: a limit drawn over a
+/// stopped session doesn't change that it is stopped.
 fn shown_status_matches(r: &Value, taken: &[Overlay], others: &[String]) -> bool {
-    let s = r["shown_status"]
+    let shown = r["shown_status"]
         .as_str()
         .unwrap_or_else(|| shown_status(r));
-    match Overlay::of(s) {
-        Some(o) => taken.contains(&o),
-        None => others.iter().any(|o| o == s),
+    let stored = r["status"].as_str().unwrap_or("");
+    if Overlay::of(shown).is_some_and(|o| taken.contains(&o)) {
+        return true;
     }
+    others.iter().any(|o| match o.as_str() {
+        "idle" => shown == "idle",
+        o => stored == o,
+    })
 }
 
 /// A `session.list` query's `status` filter, split into the overlay
@@ -1369,9 +1379,8 @@ mod tests {
     #[test]
     fn filters_match_the_status_shown() {
         let idle = json!({"status": "idle"});
-        let bg = json!({"status": "idle", "background_tasks": 2});
-        let limited_bg =
-            json!({"status": "idle", "background_tasks": 2, "limit": {"until": "3pm"}});
+        let bg = json!({"status": "idle", "async_tasks": 2});
+        let limited_bg = json!({"status": "idle", "async_tasks": 2, "limit": {"until": "3pm"}});
         let turn = (vec![], vec!["idle".to_string()]);
         let bgf = (vec![Overlay::Background], vec![]);
         let lim = (vec![Overlay::Limited], vec![]);
@@ -1384,6 +1393,12 @@ mod tests {
         assert!(m(&bg, &bgf));
         assert!(!m(&limited_bg, &bgf));
         assert!(m(&limited_bg, &lim));
+        // status:stopped still finds a stopped session a limit is drawn over.
+        let limited_stopped = json!({"status": "stopped", "limit": {"until": "3pm"}});
+        let stopped = (vec![], vec!["stopped".to_string()]);
+        assert!(m(&limited_stopped, &stopped));
+        assert!(m(&limited_stopped, &lim));
+        assert!(!m(&idle, &stopped));
     }
 
     #[test]

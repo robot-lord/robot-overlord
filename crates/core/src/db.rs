@@ -226,7 +226,7 @@ pub fn normalize_status(s: &str) -> String {
         "your-turn" | "yourturn" | "turn" | "yours" => "idle".to_string(),
         "run" | "busy" => "working".to_string(),
         // Not stored: laid over `idle` by the daemon (background.rs).
-        "bg" | "background" | "waiting-background" => "background".to_string(),
+        "bg" | "background" | "background-work" | "waiting-background" => "background".to_string(),
         other => other.to_string(),
     }
 }
@@ -1622,6 +1622,24 @@ impl Db {
              WHERE s.archived_at IS NULL AND s.status NOT IN ('stopped', 'error')",
         )?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Of these sub-agent ids of a session, those the hooks saw finish
+    /// (`SubagentStop`), with when: `(agent id, finished_at)`.
+    pub fn finished_subagents(&self, session_id: &str, ids: &[&str]) -> Result<Vec<(String, i64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; ids.len()].join(",");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT agent_id, finished_at FROM subagents \
+             WHERE session_id = ? AND finished_at IS NOT NULL AND agent_id IN ({marks})"
+        ))?;
+        let params = std::iter::once(session_id).chain(ids.iter().copied());
+        let rows = st.query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 

@@ -483,69 +483,94 @@ hooks and `discover` keep the stored status to themselves.
 
 ### Background work (`daemon/src/background.rs`)
 
-"Waiting on background work" is not a stored status either: it is laid
-over `idle` (your turn) as `background_tasks: N` (and `background_work`,
-what and since when) on the row, shown `◔ bg N` (the list), `bg N`
-(`rlord ls`), status `background` (`list_sessions`, `get_session`),
-filtered by `status:bg`. A `waiting_input` session never gets it, and a
-usage limit is drawn over it. The daemon decides the precedence once
-and sets `shown_status` on each row (limited, else background, else the
-stored status); the list, `rlord ls`, the MCP tools and the status
-filters all read it. Filters match it: `status:turn` leaves out the
-background and limited rows, `status:bg` the limited ones.
+"Waiting on background work" is not a stored status either. It is laid
+over `idle` (your turn) as `async_tasks: N` on the row (with
+`async_work`: what and since when). It shows as `◔ bg N` in the list,
+`bg N` in `rlord ls`, and status `background work` (with `async_labels`)
+in `list_sessions`, `get_session` and `read_screen`. `status:bg` filters
+it. A `waiting_input` session never gets it, and a usage limit is drawn
+over it. The daemon decides the precedence once and sets `shown_status`
+on each row (limited, else `background`, else the stored status). The
+list, `rlord ls` and the MCP tools all read it. (`async_*`, not
+`background_*`: `background` is a session's context, `session.context`.)
+
+Status filters: the overlays and the status they are drawn over (your
+turn, `background`, `limited`) match `shown_status`, so `status:turn`
+leaves out the rows shown as background work or limited. The other
+stored statuses (`stopped`, `working`, `error`, …) match the stored
+status, so `status:stopped` still finds a stopped session a limit is
+drawn over (`shown_status_matches`).
 
 - **Only subagents set it.** An async Agent or a skill forked into the
   background means the session's work goes on. A background shell (`Bash`
   with `run_in_background`) is often a dev server or a watcher that never
-  ends, so it never changes the status: rows carry it as
-  `background_shells` and the details say "2 background shells".
-- **Detection** (`agents::background`, Claude Code only; `Tracker::advance`
-  is where another agent's adapter goes). A launch is a `user` line whose
-  structured `toolUseResult` names the work: `agentId` with `isAsync:
-  true` / `status: "async_launched"` (Agent) or `background: true` (a
-  forked skill); `backgroundTaskId` (a shell, also one moved to the
-  background at its timeout). A finish is a later line the harness wrote
-  (never text a user typed) holding `<task-notification>` with
-  `<task-id>` and `<status>` `completed`, `failed`, `killed` or
-  `stopped`. Most are `attachment` lines (`attachment: {type:
-  "queued_command", commandMode: "task-notification", prompt}`), the rest
-  `user` lines with `origin.kind: "task-notification"`. The
-  `queue-operation` lines that carry the same text have no origin field,
-  so they don't count. An id can notify more than once (a
-  resumed agent): one not open is ignored. A successful `SendMessage`
-  that resumes an agent (`toolUseResult: {success: true, resumedAgentId,
-  revivedAgentId}`) opens it again. A successful `TaskStop` finishes it too
-  (`toolUseResult: {message: "Successfully stopped task: …", task_id}`;
-  the older `KillShell` has `shell_id`). The tool result's text is never
-  parsed.
-- **Which sessions**: live ones whose agent runs (not stopped or failed),
-  the overlords included (`Db::running_transcripts`: ids, paths and the
-  last start of its agent process: a `resumed`/`restarted`/`reforked`
-  event, or a `session_start` hook event whose `start` is `startup` or
-  `resume` (recorded from the hook's `source`; `clear` and `compact` keep
-  the process), which also catches a restart done outside rlord; look-ups
-  on `idx_events_session_kind`). A session that stops has its state
-  dropped, and work launched before rlord last started its agent again
-  is forgotten: its tasks died with the old process. Those are the only
-  ways open work is forgotten, apart from a finish or a stop.
-- **Read**: a 5s tick reads only what each live session's transcript
-  appended since its byte offset (whole lines, at most 4 MB a tick; a
-  longer line is skipped unparsed); the first look starts at the last
-  4 MB (skipping its first line unless the byte before it is a newline),
-  and a new inode or a shorter file starts over. The read state is only
-  touched by the scan thread; the rows read only what the last
-  tick decided to show, and a change to that (going stale included)
-  pushes to the list. Not `transcript_stats`' cursor: that one reads all
-  that's unread at once and keeps usage totals.
-- **Stale guard**: when nothing was written for `STALE_MS` (30 min), its
-  subagents are hidden from the status and it shows your turn again (they
-  stay open: a late notification still closes them, and they show again
-  once their files change; shells are hidden the same way once the
-  transcript itself has been quiet that long), so a lost notification (the agent restarted with
-  work running) can't leave a session stuck. "Written" is the newest
-  mtime of the transcript and of each open subagent's `outputFile` and
-  sidechain transcript (the 5 most recently started stat'ed), since subagents write
-  there, not in the main transcript.
+  ends, so it never changes the status. Rows carry it as `async_shells`,
+  and the details say "2 background shells".
+- **Detection** (`agents::background`, Claude Code only;
+  `Tracker::advance` is where another agent's adapter goes).
+  - A launch is a `user` line whose structured `toolUseResult` names the
+    work: `agentId` with `isAsync: true` / `status: "async_launched"` (an
+    Agent) or `background: true` (a forked skill), or `backgroundTaskId`
+    (a shell, also one moved to the background at its timeout).
+  - A finish is a later line the harness wrote (never text a user typed)
+    holding `<task-notification>` with `<task-id>` and `<status>`
+    `completed`, `failed`, `killed` or `stopped`. Most are `attachment`
+    lines (`attachment: {type: "queued_command", commandMode:
+    "task-notification", prompt}`), the rest `user` lines with
+    `origin.kind: "task-notification"`. The `queue-operation` lines that
+    carry the same text have no origin field, so they don't count.
+  - An id can notify more than once (a resumed agent); a notification
+    for an id that isn't open is ignored. A successful `SendMessage` that
+    resumes an agent (`toolUseResult: {success: true, resumedAgentId,
+    revivedAgentId}`) opens it again.
+  - A successful `TaskStop` finishes a task too (`toolUseResult:
+    {message: "Successfully stopped task: …", task_id}`); the older
+    `KillShell` result has `shell_id`. The tool result's text is never
+    parsed.
+- **Cross-check with the hooks.** The sub-agent hooks (`subagents`
+  rows, the `⚙` count) also see agents finish. A `SubagentStop` recorded
+  after an open agent was (re)started closes it in the tracker too, so the
+  two never disagree about a finished agent. The tracker still covers what
+  the hooks don't: forked skills, shells and labels.
+- **Which sessions.** Live ones whose agent runs (not stopped or failed),
+  the overlords included. `Db::running_transcripts` returns ids, paths
+  and the last start of each agent process, using
+  `idx_events_session_kind`. A start is either:
+  - a `resumed`, `restarted` or `reforked` event, or
+  - a `session_start` hook event whose `start` is `startup` or `resume`
+    (recorded from the hook's `source`). This also catches a restart done
+    outside rlord. `clear` and `compact` keep the same process.
+
+  Open work is forgotten in only these ways besides a finish or a stop
+  call:
+  - the session stops (its state is dropped);
+  - its agent process starts again (work launched before the start is
+    forgotten, since its tasks died with the old process).
+
+  A `/clear` moves the session to a new transcript in the same process,
+  and the open work carries over to it.
+- **Read.** A 5s tick takes one stat of each transcript. If its length,
+  inode and mtime are unchanged, nothing is opened, and the subagents'
+  own files are stat'ed only while some are open. Otherwise it reads what
+  was appended since its byte offset: whole lines only, at most 4 MB a
+  tick, and a longer line is skipped unparsed. A cheap substring check
+  picks the lines worth a JSON parse. The first look starts at the last
+  4 MB, skipping its first line unless the byte before it is a newline.
+  A new inode or a shorter file is read afresh, with the open work
+  carried over. The read state is only touched by the scan thread. The
+  rows read only what the last tick decided to show, and a change to that
+  (going stale included) pushes to the list. This is not
+  `transcript_stats`' cursor: that one reads everything unread at once
+  and keeps usage totals.
+- **Stale guard.** When nothing was written for `STALE_MS` (30 min), the
+  subagents are hidden from the status and it shows your turn again, so a
+  lost notification (the agent restarted with work running) can't leave
+  a session stuck. "Written" is the newest mtime of the transcript and of
+  each open subagent's `outputFile` and sidechain transcript (the 5 most
+  recently started are stat'ed), since subagents write there, not in the
+  main transcript. Hidden work stays open: a late notification still
+  closes it, and it shows again once its files change. Shells are hidden
+  the same way once the transcript itself has been quiet that long.
 
 ## Transcript store (raw conversation data)
 

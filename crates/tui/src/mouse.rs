@@ -306,10 +306,11 @@ impl App {
                 .map(|id| (id.to_string(), x, y)),
             _ => None,
         };
-        // (A move within the row moves the popup with it: drawn again.)
-        let changed = row != self.hover_row;
-        self.hover_row = row;
-        if changed {
+        // Keyed on the row's session: placed once when it opens on a row, and
+        // left there while the pointer moves within it (motion arrives in
+        // floods; no redraw for those).
+        if row.as_ref().map(|r| &r.0) != self.hover_row.as_ref().map(|r| &r.0) {
+            self.hover_row = row;
             return true;
         }
         match (&mut self.mode, self.hits.at(x, y)) {

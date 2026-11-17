@@ -4,25 +4,52 @@
 
 use serde_json::Value;
 
-/// Every status symbol the list shows, and what it means (the help
-/// screen's legend).
-pub const LEGEND: &[(&str, &str)] = &[
-    ("● working", "the agent is working"),
+use crate::theme::status_parts;
+
+/// What each stored status means (its glyph and label are
+/// `theme::status_parts`'s, as the list draws them).
+const MEANINGS: [(&str, &str); 6] = [
+    ("working", "the agent is working"),
     (
-        "◐ needs you",
+        "waiting_input",
         "blocked on a permission prompt or a question",
     ),
-    ("○ your turn", "finished: the next prompt is yours"),
-    ("◔ bg N", "turn over, N background subagents still running"),
-    (
-        "◷ till …",
-        "stopped on a usage limit until then (↻: resumes)",
-    ),
-    ("◌ starting", "the agent is starting"),
-    ("■ stopped", "not running (can be resumed)"),
-    ("✕ error", "the agent failed"),
-    ("⇄", "Remote Control: green on, dim connecting, red failing"),
+    ("idle", "it finished, the next prompt is yours"),
+    ("starting", "the agent is starting"),
+    ("stopped", "not running (can be resumed)"),
+    ("error", "the agent failed"),
 ];
+
+/// Every status symbol the list shows, and what it means (the help
+/// screen's legend).
+pub fn legend() -> Vec<(String, &'static str)> {
+    let mut v: Vec<(String, &'static str)> = MEANINGS
+        .iter()
+        .map(|(st, what)| {
+            let (glyph, label, _) = status_parts(st);
+            (format!("{glyph} {label}"), *what)
+        })
+        .collect();
+    v.insert(
+        3,
+        (
+            "◔ bg N".into(),
+            "turn over, N background subagents still running",
+        ),
+    );
+    v.insert(
+        4,
+        (
+            "◷ till …".into(),
+            "stopped on a usage limit until then (↻: resumes)",
+        ),
+    );
+    v.push((
+        "⇄".into(),
+        "Remote Control: green on, dim connecting, red failing",
+    ));
+    v
+}
 
 /// "4m", "2h", "3d": how long ago `at` (ms) was, from `now`.
 pub fn ago(at: i64, now: i64) -> String {
@@ -44,11 +71,11 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             format!("Stopped on a usage limit until {until}.{resume}")
         };
     }
-    if let Some(n) = s["background_tasks"]
+    if let Some(n) = s["async_tasks"]
         .as_u64()
         .filter(|_| s["shown_status"] == "background")
     {
-        let tasks: Vec<&Value> = s["background_work"]
+        let tasks: Vec<&Value> = s["async_work"]
             .as_array()
             .map(|a| a.iter().collect())
             .unwrap_or_default();
@@ -72,14 +99,18 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
         out.push_str(". Its turn is over; it goes on when they finish.");
         return out;
     }
-    match s["status"].as_str().unwrap_or("") {
-        "working" => "Working.".into(),
-        "waiting_input" => "Needs you: blocked on a permission prompt or a question.".into(),
-        "idle" => "Your turn: it finished, the next prompt is yours.".into(),
-        "starting" => "Starting.".into(),
-        "stopped" => "Stopped: not running.".into(),
-        "error" => "Error: the agent failed.".into(),
-        other => format!("Status: {other}."),
+    let st = s["status"].as_str().unwrap_or("");
+    let (_, label, _) = status_parts(st);
+    match MEANINGS.iter().find(|(k, _)| *k == st) {
+        Some((_, what)) => {
+            let mut c = label.chars();
+            let first: String = c
+                .next()
+                .map(|f| f.to_uppercase().collect())
+                .unwrap_or_default();
+            format!("{first}{}: {what}.", c.as_str())
+        }
+        None => format!("Status: {st}."),
     }
 }
 
@@ -106,7 +137,7 @@ pub fn remote_sentence(s: &Value) -> Option<String> {
 /// Background shells (dev servers, watchers) still running, if any:
 /// information, never a status.
 pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
-    let sh = &s["background_shells"];
+    let sh = &s["async_shells"];
     let n = sh["count"].as_u64().filter(|n| *n > 0)?;
     let tasks: Vec<&Value> = sh["tasks"]
         .as_array()
@@ -181,11 +212,19 @@ mod tests {
         );
         let s = json!({"status": "waiting_input"});
         assert!(status_sentence(&s, 0).starts_with("Needs you"));
+        assert_eq!(
+            status_sentence(&json!({"status": "stopped"}), 0),
+            "Stopped: not running (can be resumed)."
+        );
+        // The legend uses the list's own glyphs and labels.
+        let l = legend();
+        assert_eq!(l[0].0, "● working");
+        assert!(l.iter().any(|(k, _)| k == "○ your turn"));
     }
 
     #[test]
     fn background_work_with_labels_and_age() {
-        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 2, "background_work": [
+        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 2, "async_work": [
             {"label": "Run tests", "started_at": 60_000},
             {"label": "Review PR", "started_at": 120_000}]});
         assert_eq!(
@@ -193,13 +232,13 @@ mod tests {
             "Waiting on 2 background tasks: Run tests, Review PR, started 4m ago. \
              Its turn is over; it goes on when they finish."
         );
-        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 1});
+        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 1});
         assert!(status_sentence(&s, 0).starts_with("Waiting on 1 background task."));
     }
 
     #[test]
     fn limit_wins_and_remote_is_spelled_out() {
-        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 1,
+        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 1,
             "limit": {"until": "3:00pm", "resume": true},
             "remote": {"state": "on"}});
         assert_eq!(
@@ -219,7 +258,7 @@ mod tests {
 
     #[test]
     fn shells_are_information_not_status() {
-        let s = json!({"status": "idle", "background_shells": {"count": 2, "tasks": [
+        let s = json!({"status": "idle", "async_shells": {"count": 2, "tasks": [
             {"label": "Dev server", "started_at": 0},
             {"label": "Watch tests", "started_at": 60_000}]}});
         assert_eq!(

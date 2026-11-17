@@ -92,7 +92,7 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background (its turn is over but background work it started still runs, `background_tasks` subagents, `background_labels` says what: the user is waiting on the agent; it carries on by itself when they finish. Background shells (dev servers, watchers) don't change the status: `background_shells` lists them); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background work (its turn is over but background work it started still runs, `async_tasks` subagents, `async_labels` says what: the user is waiting on the agent; it carries on by itself when they finish. Background shells (dev servers, watchers) don't change the status: `async_shells` lists them); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
                 "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:bg (waiting on background work) status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
@@ -351,19 +351,19 @@ fn labels(tasks: &Value) -> Value {
 }
 
 /// Background work, as list_sessions and get_session show it (read from
-/// the annotated session `s`): `background_tasks` (how many subagents run
-/// while its turn is over) with `background_labels` (what), and
-/// `background_shells` (`{count, labels}`, information only).
+/// the annotated session `s`): `async_tasks` (how many subagents run
+/// while its turn is over) with `async_labels` (what), and
+/// `async_shells` (`{count, labels}`, information only).
 fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
-    if let Some(n) = s["background_tasks"].as_u64() {
-        out.push(("background_tasks", json!(n)));
-        out.push(("background_labels", labels(&s["background_work"])));
+    if let Some(n) = s["async_tasks"].as_u64() {
+        out.push(("async_tasks", json!(n)));
+        out.push(("async_labels", labels(&s["async_work"])));
     }
-    if let Some(n) = s["background_shells"]["count"].as_u64() {
+    if let Some(n) = s["async_shells"]["count"].as_u64() {
         out.push((
-            "background_shells",
-            json!({"count": n, "labels": labels(&s["background_shells"]["tasks"])}),
+            "async_shells",
+            json!({"count": n, "labels": labels(&s["async_shells"]["tasks"])}),
         ));
     }
     out
@@ -378,7 +378,8 @@ fn status_word(s: &Value) -> Value {
         .or(s["status"].as_str())
         .unwrap_or("")
     {
-        st @ ("background" | "limited") => json!(st),
+        "background" => json!("background work"),
+        "limited" => json!("limited"),
         st => json!(rlord_core::types::Status::label_of(st)),
     }
 }
@@ -682,7 +683,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 s[k] = v;
             }
             if let Some(o) = s.as_object_mut() {
-                o.remove("background_work");
+                o.remove("async_work");
             }
             // Right after rlord starts, sub-agent data may still be loading.
             if d.warm.is_loading(id.as_str().unwrap_or("")) {

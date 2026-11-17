@@ -452,7 +452,7 @@ impl App {
                 theme::muted(),
             ),
         ];
-        right.extend(crate::statustext::LEGEND.iter().map(|(k, what)| {
+        right.extend(crate::statustext::legend().into_iter().map(|(k, what)| {
             Line::from(vec![
                 Span::styled(
                     format!("  {k:<12}"),

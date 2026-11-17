@@ -106,20 +106,35 @@ impl Tracker {
     /// `CHUNK`). A file that shrank or was replaced (new inode) is read
     /// again from its tail.
     pub fn advance(&mut self, path: &Path) -> std::io::Result<()> {
+        let meta = std::fs::metadata(path)?;
+        self.advance_with(path, &meta)
+    }
+
+    /// `advance` with the file's metadata already in hand (one stat per
+    /// tick): nothing is opened when nothing was appended.
+    pub fn advance_with(&mut self, path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
         // Adapter hook: only Claude Code transcripts are read today.
         if Format::of(path) != Format::Claude {
             self.open.clear();
             return Ok(());
         }
-        let mut f = std::fs::File::open(path)?;
-        let meta = f.metadata()?;
         let (len, ino) = (meta.len(), meta.ino());
+        if self.ino == ino && self.offset == len {
+            return Ok(());
+        }
         if self.ino != ino || self.offset > len {
+            // Another file (a `/clear` moves the session to a new one, in
+            // the same process) or a rewrite: read it afresh, but the open
+            // work carries over. A new process is what ends it (`forget_open`,
+            // by the caller).
+            let open = std::mem::take(&mut self.open);
             *self = Tracker {
                 ino,
+                open,
                 ..Default::default()
             };
         }
+        let mut f = std::fs::File::open(path)?;
         if self.offset == 0 && len > FIRST_READ {
             self.offset = len - FIRST_READ;
             // Starting mid-file: the first line is cut, unless the byte
@@ -312,7 +327,7 @@ const NEEDLES: [&[u8]; 4] = [
     b"toolUseResult",
     b"task-notification",
     b"resumedAgentId",
-    b"tool_use",
+    br#""type":"tool_use""#,
 ];
 
 fn worth_parsing(line: &[u8]) -> bool {
@@ -551,7 +566,11 @@ mod tests {
         );
         std::fs::rename(&q, &p).unwrap();
         t.advance(&p).unwrap();
-        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1", "b2", "b3"]);
+        // Read from the start; the open work carries over (same process).
+        assert_eq!(
+            t.open.keys().collect::<Vec<_>>(),
+            ["a1", "a2", "b1", "b2", "b3"]
+        );
     }
 
     #[test]
@@ -624,6 +643,12 @@ mod tests {
         assert!(!worth_parsing(
             br#"{"type":"assistant","message":{"content":"hi"}}"#
         ));
+        // The words alone in text don't make a tool call.
+        assert!(!worth_parsing(
+            br#"{"type":"user","message":{"content":"a tool_use block"}}"#
+        ));
+        let call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t"}]}}"#;
+        assert!(worth_parsing(call.as_bytes()));
     }
 
     #[test]

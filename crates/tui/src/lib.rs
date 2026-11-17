@@ -2811,13 +2811,13 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// limit and until when (`limit`, from the daemon's `limits`). `full`:
 /// in words (the details pane); otherwise what fits the list's column.
 /// `↻`: a resume is scheduled for when it resets. Its turn over while
-/// subagents it started still run (`background_tasks`, from the daemon's
+/// subagents it started still run (`async_tasks`, from the daemon's
 /// `background`): that, in place of "your turn".
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let Some(until) = l["until"].as_str() else {
         if s["shown_status"] == "background" {
-            let n = s["background_tasks"].as_u64().unwrap_or(0);
+            let n = s["async_tasks"].as_u64().unwrap_or(0);
             return theme::background_chip(n, full);
         }
         return theme::status_chip(s["status"].as_str().unwrap_or("-"));

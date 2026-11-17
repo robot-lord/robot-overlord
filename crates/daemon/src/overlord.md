@@ -165,10 +165,10 @@ session.
 Each status means one thing: `working`; `needs you` (blocked mid-turn on
 the user: a permission prompt or a question it asked; it can't go on until
 they answer); `your turn` (it finished its turn: the next prompt is the
-user's, nothing is blocked); `background` (its turn is over but
-`background_tasks` subagents it started still run: the user is waiting
+user's, nothing is blocked); `background work` (its turn is over but
+`async_tasks` subagents it started still run: the user is waiting
 on it, not the other way round; don't count it as waiting on the user.
-`background_shells`, such as a dev server, are only information); `stopped`.
+`async_shells`, such as a dev server, are only information); `stopped`.
 "What's waiting on me?", "what
 needs me?": the `needs you` sessions first, with what each asks
 (`read_screen` if the description doesn't say), then the `your turn` ones

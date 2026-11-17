@@ -2631,7 +2631,7 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
                 Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
                 Some(until) => truncate(&format!("till {until}"), 16),
                 None => match s["shown_status"].as_str() {
-                    Some("background") => format!("bg {}", s["background_tasks"]),
+                    Some("background") => format!("bg {}", s["async_tasks"]),
                     _ => rlord_core::types::Status::label_of(get("status")).to_string(),
                 },
             },

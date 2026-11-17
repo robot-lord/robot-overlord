@@ -18,6 +18,20 @@ file). PR #68.
   attachment with `commandMode: "task-notification"`, or a `user` line
   with `origin.kind: "task-notification"`. `queue-operation` lines carry
   no origin, so they are ignored.
+- Row fields are `async_tasks` / `async_labels` / `async_shells`, not
+  `background_*`: `background` is the session's context. The overlord sees
+  the status as `background work`.
+- The hooks' `SubagentStop` closes an agent the tracker still holds open
+  (round 6), so the `⚙` count and `bg` don't disagree.
+- `/clear` (a new transcript, same process) carries the open work over.
+- Status filters: the overlays and your turn match the shown status;
+  `stopped`, `working`, `error` and the rest match the stored one.
+- Declined (round 6): re-checking a stored status under the overlay. The
+  overlay applies to `idle` only and the stored status is trusted.
+- Declined (round 6): TaskOutput `block: true` as a finish. That tool was
+  removed from Claude Code: the installed version's own help says "the
+  TaskOutput tool was removed", and no transcript here has a TaskOutput
+  call to take a shape from.
 - The stale guard (30 min) hides work; it never forgets it. Work is
   forgotten on a stop, or when a new agent process starts (an rlord
   resume, restart or refork event, or a `SessionStart` hook with source
@@ -30,6 +44,9 @@ file). PR #68.
 - **Needs-you reason.** The popup and details say "blocked on a permission
   prompt or a question". rlord doesn't store which; the hook payload
   (`PermissionRequest` tool, `AskUserQuestion`) could be kept for it.
+- **Hover.** The popup is placed once when it opens on a row and stays
+  there while the pointer moves within that row (round 6 reversed round
+  5's follow-the-pointer, because of the motion flood).
 - **Live hover check.** A scratch tmux socket confirmed that tmux records
   all-motion mode (`mouse_all_flag=1`) for a pane that asks for it, with
   mouse on. Motion events have not been watched reaching a live TUI.
