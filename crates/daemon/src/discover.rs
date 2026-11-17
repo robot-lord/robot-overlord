@@ -19,7 +19,7 @@
 //! session is waiting for a thread in the same folder. Otherwise the hooks
 //! (or the user) decide.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +94,8 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
         }
     }
     let waiting = waiters(d, &sessions)?;
+    // The threads already taken: read once a pass, each bound one added.
+    let mut tracked = d.db().agent_session_ids()?;
     let now = now_ms();
     for s in &sessions {
         // Its program exited (no SessionEnd hook to say so).
@@ -105,9 +107,9 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
                 continue;
             }
         }
-        if s.agent_session.is_none() {
-            let (others, queue) = place_of(&waiting, s, now);
-            changed |= bind(d, s, others, queue)? || first_prompt_due(d, s)?;
+        if let Some(me) = waiting.iter().find(|w| w.id == s.id) {
+            let around = place_of(&waiting, s, now);
+            changed |= bind(d, s, &me.want, &mut tracked, &around)? || first_prompt_due(d, s)?;
         } else {
             changed |= follow(d, s)?;
         }
@@ -272,49 +274,51 @@ fn settles(screen: &str, up_ms: Option<i64>) -> Option<bool> {
 }
 
 /// Find the conversation a session launched, in its agent's index (see
-/// `pick_thread`). `others`: another session waits for one in this folder.
-/// `queue`: for a user fork, its place among the forks of the same parent
-/// waiting in the same folder (`place_of`).
-fn bind(d: &Daemon, s: &Session, others: bool, queue: Option<Queue>) -> Result<bool> {
-    let w = bind_inputs(&d.db(), s)?;
+/// `pick_thread`). `w`: what it waits with (`waiters`); `tracked`: the
+/// threads already taken (read once a pass; a thread bound here is added);
+/// `around`: who else waits in its folder (`place_of`).
+fn bind(
+    d: &Daemon,
+    s: &Session,
+    w: &Wanted,
+    tracked: &mut HashSet<String>,
+    around: &Around,
+) -> Result<bool> {
     // (Codex's index and the rollouts are read without the DB lock.)
-    let candidates = untracked_threads(s, w.since, &w.tracked);
-    let fork = match (&w.fork, queue) {
-        (Some(parent), Some(q)) => Some(ForkQueue {
-            parent,
-            since: w.since,
-            place: q.place,
-            waiting: q.waiting,
-        }),
-        (Some(parent), None) => Some(ForkQueue {
-            parent,
-            since: w.since,
-            place: 0,
-            waiting: 1,
-        }),
-        (None, _) => None,
-    };
+    let candidates = untracked_threads(s, w.since, tracked);
+    let q = around.queue.unwrap_or(Queue {
+        place: 0,
+        waiting: 1,
+    });
+    let fork = w.fork.as_deref().map(|parent| ForkQueue {
+        parent,
+        since: w.since,
+        place: q.place,
+        waiting: q.waiting,
+    });
     let Some(t) = pick_thread(
         &candidates,
         w.prompt.as_deref(),
-        others,
+        around.others,
+        &around.awaited,
         fork,
         &|t| rollout_fork(d, t),
         now_ms(),
     ) else {
         return Ok(false);
     };
-    record_bind(&d.db(), s, t)
+    let bound = record_bind(&d.db(), s, t)?;
+    if bound {
+        tracked.insert(t.id.clone());
+    }
+    Ok(bound)
 }
 
-/// A session waiting for its thread: its folder, the thread it was forked
-/// from (a user fork) and since when it waits.
-#[derive(Debug, Clone)]
+/// A session waiting for its thread: its folder and what it waits with.
 struct Waiter {
     id: String,
     folder: String,
-    fork: Option<String>,
-    since: i64,
+    want: Wanted,
 }
 
 /// Every session in `sessions` still waiting for its thread (one short
@@ -323,12 +327,10 @@ fn waiters(d: &Daemon, sessions: &[Session]) -> Result<Vec<Waiter>> {
     let db = d.db();
     let mut out = Vec::new();
     for s in sessions.iter().filter(|s| s.agent_session.is_none()) {
-        let w = bind_inputs(&db, s)?;
         out.push(Waiter {
             id: s.id.clone(),
             folder: s.project_path.clone(),
-            fork: w.fork,
-            since: w.since,
+            want: bind_inputs(&db, s)?,
         });
     }
     Ok(out)
@@ -342,32 +344,51 @@ struct Queue {
     waiting: usize,
 }
 
-/// For session `s`, waiting: whether another session waits for a thread in
-/// its folder (`others`, for a session that isn't a fork: a waiting fork
-/// counts only for `UNREAD_GRACE_MS`, so forks never hold an ordinary
-/// session unbound), and, for a fork, its `Queue` among its parent's forks
-/// waiting there.
-fn place_of(waiting: &[Waiter], s: &Session, now: i64) -> (bool, Option<Queue>) {
+/// Who else waits for a thread in a waiting session's folder.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Around {
+    /// For a session that isn't a fork: another session waits there (a
+    /// waiting fork counts only for `UNREAD_GRACE_MS`, so forks never hold
+    /// an ordinary session unbound).
+    others: bool,
+    /// The threads the rlord forks waiting there were forked from: a
+    /// forked thread from one of them is theirs, not an ordinary session's.
+    awaited: Vec<String>,
+    /// For a fork: its place among its parent's forks waiting there.
+    queue: Option<Queue>,
+}
+
+/// Who else waits in the folder of session `s` (one of `waiting`).
+fn place_of(waiting: &[Waiter], s: &Session, now: i64) -> Around {
     let me = waiting.iter().find(|w| w.id == s.id);
-    let here = |w: &&Waiter| w.id != s.id && w.folder == s.project_path;
-    let others = waiting
+    let here: Vec<&Waiter> = waiting
         .iter()
-        .filter(here)
-        .any(|w| w.fork.is_none() || now - w.since < UNREAD_GRACE_MS);
+        .filter(|w| w.id != s.id && w.folder == s.project_path)
+        .collect();
+    let others = here
+        .iter()
+        .any(|w| w.want.fork.is_none() || now - w.want.since < UNREAD_GRACE_MS);
+    let mut awaited: Vec<String> = here.iter().filter_map(|w| w.want.fork.clone()).collect();
+    awaited.sort();
+    awaited.dedup();
     let queue = me.and_then(|me| {
-        let parent = me.fork.as_deref()?;
+        let parent = me.want.fork.as_deref()?;
         let mut peers: Vec<&Waiter> = waiting
             .iter()
-            .filter(|w| w.folder == me.folder && w.fork.as_deref() == Some(parent))
+            .filter(|w| w.folder == me.folder && w.want.fork.as_deref() == Some(parent))
             .collect();
-        peers.sort_by(|a, b| (a.since, &a.id).cmp(&(b.since, &b.id)));
+        peers.sort_by(|a, b| (a.want.since, &a.id).cmp(&(b.want.since, &b.id)));
         let place = peers.iter().position(|w| w.id == me.id)?;
         Some(Queue {
             place,
             waiting: peers.len(),
         })
     });
-    (others, queue)
+    Around {
+        others,
+        awaited,
+        queue,
+    }
 }
 
 /// A user fork looking for its thread: its parent's thread, since when it
@@ -392,12 +413,13 @@ pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
     if w.fork.is_some() {
         return Ok(false); // (a fork: left to `bind`, outside the lock)
     }
-    let candidates = untracked_threads(s, w.since, &w.tracked);
+    let candidates = untracked_threads(s, w.since, &db.agent_session_ids()?);
     let not_forked = |_: &codex::Thread| Some(None);
     match pick_thread(
         &candidates,
         w.prompt.as_deref(),
         false,
+        &[],
         None,
         &not_forked,
         now_ms(),
@@ -415,8 +437,6 @@ struct Wanted {
     prompt: Option<String>,
     /// A user fork: the thread it was forked from.
     fork: Option<String>,
-    /// The threads already taken.
-    tracked: std::collections::HashSet<String>,
 }
 
 fn bind_inputs(db: &Db, s: &Session) -> Result<Wanted> {
@@ -434,15 +454,10 @@ fn bind_inputs(db: &Db, s: &Session) -> Result<Wanted> {
         since,
         prompt,
         fork,
-        tracked: db.agent_session_ids()?,
     })
 }
 
-fn untracked_threads(
-    s: &Session,
-    since: i64,
-    tracked: &std::collections::HashSet<String>,
-) -> Vec<codex::Thread> {
+fn untracked_threads(s: &Session, since: i64, tracked: &HashSet<String>) -> Vec<codex::Thread> {
     codex::threads_started_in(&codex::home(), &s.project_path, since, s.codex_daemon)
         .into_iter()
         .filter(|t| !tracked.contains(&t.id))
@@ -521,9 +536,9 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 ///   rollout says it was forked from that one. Its first message is its
 ///   parent's, so the prompt can't tell it.
 /// - otherwise, by the rules below; the one thread they narrow to is
-///   taken only if its rollout says it is no fork (not a user fork of
-///   another session in the same folder, nor an archive summary's `codex
-///   exec fork`):
+///   taken unless its rollout says it was forked from a thread an rlord
+///   fork waiting in this folder is looking for (`awaited`: that fork's
+///   own). A fork of anything else is the user's own, made in the pane:
 /// - launched with a prompt: the thread whose first message is that
 ///   prompt. One that has no first message yet may still become it: wait.
 /// - no prompt (a fresh conversation, or launched without one): the only
@@ -535,12 +550,14 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 /// `forked_from` reads a thread's rollout (`rollout_fork`): every
 /// candidate's for a fork, else only the one left. A rollout that can't
 /// be read yet (None): for a fork, that candidate is skipped; for any
-/// other session, wait `UNREAD_GRACE_MS` after the thread was indexed,
-/// then take it (as before forks: never unbound for ever).
+/// other session, taken at once when no rlord fork waits in this folder,
+/// else `UNREAD_GRACE_MS` after the thread was indexed (never unbound for
+/// ever).
 fn pick_thread<'a>(
     candidates: &'a [codex::Thread],
     prompt: Option<&str>,
     others_waiting: bool,
+    awaited: &[String],
     fork: Option<ForkQueue>,
     forked_from: &dyn Fn(&codex::Thread) -> Option<Option<String>>,
     now: i64,
@@ -583,13 +600,17 @@ fn pick_thread<'a>(
         None if others_waiting => Vec::new(),
         None => candidates.iter().collect(),
     };
-    // Narrowed to one: not a fork (a user fork binds by `bind_fork`, never
-    // here). A rollout not readable yet: wait a moment, then take it, as
-    // before forks (an ordinary session must not stay unbound).
+    // Narrowed to one: taken unless it is a fork an rlord fork waiting here
+    // is looking for (that one binds it by `bind_fork`); a fork of anything
+    // else is the user's own, made in this session's pane. A rollout not
+    // readable yet: taken at once, unless an rlord fork waits here; then
+    // after a moment, as before forks (an ordinary session must not stay
+    // unbound).
     match fit.as_slice() {
         [one] => match forked_from(one) {
             Some(None) => Some(*one),
-            Some(Some(_)) => None,
+            Some(Some(parent)) => (!awaited.contains(&parent)).then_some(*one),
+            None if awaited.is_empty() => Some(*one),
             None => (now - one.created_at_ms >= UNREAD_GRACE_MS).then_some(*one),
         },
         _ => None,
@@ -754,6 +775,8 @@ mod tests {
     #[test]
     fn a_fork_binds_only_the_thread_forked_from_its_parent() {
         let read = std::cell::RefCell::new(Vec::new());
+        // The parents rlord forks waiting in the folder are looking for.
+        let awaited = std::cell::RefCell::new(vec!["parent".to_string()]);
         // (The test's threads were indexed at 1: a moment ago.)
         let pick_at =
             |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>, now| {
@@ -764,7 +787,8 @@ mod tests {
                     place: 0,
                     waiting: 1,
                 });
-                pick_thread(c, prompt, others, q, &|t| rollouts(&read, t), now)
+                let awaited = awaited.borrow();
+                pick_thread(c, prompt, others, &awaited, q, &|t| rollouts(&read, t), now)
                     .map(|t| t.id.clone())
             };
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>| {
@@ -798,22 +822,36 @@ mod tests {
         c.push(thread("f2", "fix the login test"));
         assert_eq!(pick(&c, None, false, Some("parent")), None);
         assert_eq!(pick(&c, None, false, Some("absent")), None);
-        // An ordinary session never takes a forked thread: the one it is
-        // narrowed to must say it is none.
+        // An ordinary session never takes the thread an rlord fork waiting
+        // here is looking for.
         let only_forks = [thread("f1", "fix the login test")];
         assert_eq!(pick(&only_forks, None, false, None), None);
         assert_eq!(
             pick(&only_forks, Some("fix the login test"), false, None),
             None
         );
-        // One whose rollout can't be read yet: wait a moment, then take
-        // it (an ordinary session never stays unbound).
+        // A fork of another thread is the user's own: taken.
+        assert_eq!(
+            pick(&[thread("g1", "fix it")], Some("fix it"), false, None).as_deref(),
+            Some("g1")
+        );
+        // One whose rollout can't be read yet, with an rlord fork waiting
+        // here: wait a moment, then take it (never unbound).
         let unread = [thread("u1", "fix it")];
         assert_eq!(pick(&unread, Some("fix it"), false, None), None);
         assert_eq!(
             pick_at(&unread, Some("fix it"), false, None, 1 + UNREAD_GRACE_MS).as_deref(),
             Some("u1")
         );
+        // No rlord fork waiting here: the user's own fork, and an unread
+        // rollout, are taken at once.
+        awaited.borrow_mut().clear();
+        assert_eq!(pick(&only_forks, None, false, None).as_deref(), Some("f1"));
+        assert_eq!(
+            pick(&unread, Some("fix it"), false, None).as_deref(),
+            Some("u1")
+        );
+        awaited.borrow_mut().push("parent".into());
         // Its own (and a fork with another first message): taken, reading
         // only the rollout of the one left.
         let mixed = [thread("own", "fix it"), thread("f2", "speed it up")];
@@ -901,69 +939,34 @@ mod tests {
             waiting,
         };
         let id = |t: Option<&codex::Thread>| t.map(|t| t.id.clone());
+        let pick = |c: &[codex::Thread], others: bool, fork: ForkQueue, now: i64| {
+            id(pick_thread(c, None, others, &[], Some(fork), &forked, now))
+        };
         // Fork A (started 1000, oldest) takes the thread made closest
         // after its start; fork B (2000) waits its turn.
         assert_eq!(
-            id(pick_thread(
-                &both,
-                None,
-                true,
-                Some(q(1_000, 0, 2)),
-                &forked,
-                3_000
-            ))
-            .as_deref(),
+            pick(&both, true, q(1_000, 0, 2), 3_000).as_deref(),
             Some("ta")
         );
-        assert_eq!(
-            pick_thread(&both, None, true, Some(q(2_000, 1, 2)), &forked, 3_000),
-            None
-        );
+        assert_eq!(pick(&both, true, q(2_000, 1, 2), 3_000), None);
         // A bound: B is the only one waiting, with its one thread left.
         let left = [fork_thread("tb", 2_500)];
         assert_eq!(
-            id(pick_thread(
-                &left,
-                None,
-                false,
-                Some(q(2_000, 0, 1)),
-                &forked,
-                3_000
-            ))
-            .as_deref(),
+            pick(&left, false, q(2_000, 0, 1), 3_000).as_deref(),
             Some("tb")
         );
         // A's thread not there yet: A waits, rather than take B's.
-        assert_eq!(
-            pick_thread(&left, None, true, Some(q(1_000, 0, 2)), &forked, 3_000),
-            None
-        );
+        assert_eq!(pick(&left, true, q(1_000, 0, 2), 3_000), None);
         // ...until it waited: then the closest after its start, in
         // creation order (never unbound for ever).
         let late = 1_000 + UNREAD_GRACE_MS;
         assert_eq!(
-            id(pick_thread(
-                &left,
-                None,
-                true,
-                Some(q(1_000, 0, 2)),
-                &forked,
-                late
-            ))
-            .as_deref(),
+            pick(&left, true, q(1_000, 0, 2), late).as_deref(),
             Some("tb")
         );
         // A later fork whose elders never got a thread binds after waiting.
         assert_eq!(
-            id(pick_thread(
-                &left,
-                None,
-                true,
-                Some(q(2_000, 1, 2)),
-                &forked,
-                2_000 + UNREAD_GRACE_MS
-            ))
-            .as_deref(),
+            pick(&left, true, q(2_000, 1, 2), 2_000 + UNREAD_GRACE_MS).as_deref(),
             Some("tb")
         );
 
@@ -971,8 +974,11 @@ mod tests {
         let w = |id: &str, fork: Option<&str>, since| Waiter {
             id: id.into(),
             folder: "/src/app".into(),
-            fork: fork.map(str::to_string),
-            since,
+            want: Wanted {
+                since,
+                prompt: None,
+                fork: fork.map(str::to_string),
+            },
         };
         let waiting = [
             w("fb", Some("parent"), 2_000),
@@ -992,28 +998,32 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            place_of(&waiting, &session("fa"), 3_000).1,
+            place_of(&waiting, &session("fa"), 3_000).queue,
             Some(Queue {
                 place: 0,
                 waiting: 2
             })
         );
         assert_eq!(
-            place_of(&waiting, &session("fb"), 3_000).1,
+            place_of(&waiting, &session("fb"), 3_000).queue,
             Some(Queue {
                 place: 1,
                 waiting: 2
             })
         );
-        assert_eq!(place_of(&waiting, &session("plain"), 3_000).1, None);
-        // An ordinary session: the forks hold it back only while young.
+        // An ordinary session: no queue; the parents the forks here wait on.
+        let plain = place_of(&waiting, &session("plain"), 3_000);
+        assert_eq!(plain.queue, None);
+        assert_eq!(plain.awaited, ["elsewhere", "parent"]);
+        // The forks hold it back only while young.
         let alone = [w("plain", None, 500), w("fa", Some("parent"), 1_000)];
-        assert!(place_of(&alone, &session("plain"), 3_000).0);
-        assert!(!place_of(&alone, &session("plain"), 1_000 + UNREAD_GRACE_MS).0);
+        assert!(place_of(&alone, &session("plain"), 3_000).others);
+        assert!(!place_of(&alone, &session("plain"), 1_000 + UNREAD_GRACE_MS).others);
         // Forks past the grace: no longer; another ordinary session always.
-        assert!(!place_of(&waiting, &session("plain"), 1_000_000).0);
+        assert!(!place_of(&waiting, &session("plain"), 1_000_000).others);
         let two_plain = [w("plain", None, 500), w("plain2", None, 600)];
-        assert!(place_of(&two_plain, &session("plain"), 1_000_000).0);
+        let two = place_of(&two_plain, &session("plain"), 1_000_000);
+        assert!(two.others && two.awaited.is_empty());
     }
 
     /// A fork bound from the index whose rollout is on disk is no longer
@@ -1059,7 +1069,7 @@ mod tests {
     #[test]
     fn a_thread_is_bound_only_when_it_is_clearly_the_sessions() {
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool| {
-            pick_thread(c, prompt, others, None, &|_| Some(None), 2).map(|t| t.id.clone())
+            pick_thread(c, prompt, others, &[], None, &|_| Some(None), 2).map(|t| t.id.clone())
         };
         let one = [thread("a", "fix the login test")];
         // Launched with that prompt: it's the one, even with a sibling waiting.
