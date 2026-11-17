@@ -57,6 +57,17 @@ base work now is in `docs/architecture.md` ("The latest code
 - **Threads per git call**: `latest::run` starts a waiting thread and two
   reader threads for every git command; a pool, or one reader thread
   for both streams, would do.
+- **Bare repos** put the tree inside the bare repo's own folder (its git
+  dir).
+- **Related sessions are checked before the fetch wait** (`precheck_new`),
+  so one archived during the wait is caught only by `session_new`'s
+  own use of the checked links.
+- **Duplicated text and parsing**: the "local one / remote's" side
+  wording and `prefer` parsing appear in more than one place; one
+  helper each.
+- **Prune vs a running fetch**: prune can delete a private ref while a
+  fetch for it is running; the fetch writes the ref again afterwards
+  (and `forget` keeps a running slot).
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored

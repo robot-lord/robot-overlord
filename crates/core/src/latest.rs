@@ -1237,11 +1237,7 @@ fn moved_tree(dir: &Path) -> bool {
         return false;
     }
     std::fs::read_to_string(&git).is_ok_and(|t| {
-        let Some(p) = t
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(|p| Path::new(p.trim()))
-        else {
+        let Some(p) = t.trim().strip_prefix("gitdir:").map(|p| gitdir_at(dir, p)) else {
             return false;
         };
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1278,8 +1274,32 @@ pub fn leftover(repo: &Repo, dir: &Path) -> bool {
     std::fs::read_to_string(&git).is_ok_and(|t| {
         t.trim()
             .strip_prefix("gitdir:")
-            .is_some_and(|p| Path::new(p.trim()).starts_with(repo.common.join("worktrees")))
+            .is_some_and(|p| gitdir_at(dir, p).starts_with(repo.common.join("worktrees")))
     })
+}
+
+/// A `.git` file's `gitdir:` path, resolved against the tree folder `dir`
+/// when it is relative (`worktree.useRelativePaths`), `..` taken
+/// lexically.
+fn gitdir_at(dir: &Path, p: &str) -> PathBuf {
+    use std::path::Component;
+    let p = Path::new(p.trim());
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        dir.join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in full.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// What moving the tree did.
@@ -1402,7 +1422,13 @@ pub fn tree_move(
         }
         dirty
     } else {
-        in_tree(&["status", "--porcelain", "--untracked-files=all"])?
+        // (Ignored files too: `clean -fdx` takes them.)
+        in_tree(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ])?
     };
     in_tree(&["checkout", "--quiet", "--detach", "--force", commit])?;
     in_tree(&["clean", "-fdxq"])?;
@@ -1854,6 +1880,21 @@ mod tests {
         }
         assert!(check_branch(TREE_NAME).is_err());
         assert_ne!(workspace_dirname("x/.rlord-latest"), TREE_NAME);
+    }
+
+    #[test]
+    fn a_relative_gitdir_is_resolved_against_the_tree() {
+        assert_eq!(
+            gitdir_at(
+                Path::new("/r/.worktrees/.rlord-latest"),
+                " ../../.git/worktrees/-rlord-latest\n"
+            ),
+            PathBuf::from("/r/.git/worktrees/-rlord-latest")
+        );
+        assert_eq!(
+            gitdir_at(Path::new("/x"), "/r/.git/worktrees/a"),
+            PathBuf::from("/r/.git/worktrees/a")
+        );
     }
 
     #[test]

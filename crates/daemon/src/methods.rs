@@ -641,7 +641,8 @@ pub(crate) fn new_location(cfg: &Config, params: &Value) -> Result<Location> {
 /// `session.new`'s cheap checks (the agent is installed, Remote Control
 /// is possible, the background is within its limits), run before its base
 /// is worked out (which may fetch), so a launch that will be refused
-/// waits on nothing. `session_new` makes them again under the DB lock.
+/// waits on nothing. `Daemon::call` runs them once and hands the result to
+/// `session_new_with`; a direct `session_new` runs them itself.
 pub(crate) fn precheck_new(db: &Db, cfg: &Config, params: &Value) -> Result<Prechecked> {
     let context = params["context"]
         .as_str()

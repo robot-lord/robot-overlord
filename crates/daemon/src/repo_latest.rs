@@ -77,6 +77,9 @@ pub struct Timing {
     /// How long, in all, a launch waits on the first fetch of a named base
     /// that is only on the remote, before it refuses ("still fetching").
     pub named_base_wait: Duration,
+    /// The tree job's own wait, even when a slow fetch spent the call's
+    /// budget: a tree already right, or a cheap move, still answers.
+    pub tree_min_wait: Duration,
 }
 
 impl Default for Timing {
@@ -88,6 +91,7 @@ impl Default for Timing {
             failed_fresh: Duration::from_secs(120),
             named_retry: Duration::from_secs(10),
             named_base_wait: Duration::from_secs(20),
+            tree_min_wait: Duration::from_secs(2),
         }
     }
 }
@@ -186,6 +190,25 @@ impl Latest {
     #[cfg(test)]
     pub(crate) fn set_for_test(&self, env: GitEnv, timing: Timing, guard: Guard) {
         *self.settings.write().unwrap() = Settings { env, timing, guard };
+    }
+
+    /// Forget the fetches of the repo `key` for `dropped`, the record's
+    /// `<remote>/<branch>` keys whose private refs were just deleted, and
+    /// only those.
+    pub fn forget_refs(&self, key: &str, dropped: &[String]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let (lock, _) = &*self.fetches;
+        let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        for k in dropped {
+            if let Some((r, b)) = k.split_once('/') {
+                let slot = format!("{key}\0{r}\0{b}");
+                if map.get(&slot).is_some_and(|s| !s.running) {
+                    map.remove(&slot);
+                }
+            }
+        }
     }
 
     /// When `key`'s last successful fetch finished (wall clock, ms).
@@ -1086,7 +1109,8 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
     // (By ref and commit: a call joining a running job records the same
     // ref it asked for.)
     let request = format!("{}\0{commit}", f.branch);
-    match d.latest.tree_job(&key, &request, want.left(want.wait), job) {
+    let tree_wait = want.left(want.wait).max(d.latest.timing().tree_min_wait);
+    match d.latest.tree_job(&key, &request, tree_wait, job) {
         Job::Done(Ok(t)) => {
             v["path"] = json!(dir);
             if let Some(m) = t.moved {
@@ -1186,7 +1210,8 @@ fn move_tree(
             )?;
             if m.discarded > 0 {
                 warnings.push(format!(
-                    "discarded: {} file(s) edited in rlord's tree were thrown away (it is read-only)",
+                    "discarded: edits in rlord's tree (at least {} file(s)) were thrown away \
+                     (it is read-only)",
                     m.discarded
                 ));
             }
@@ -1208,9 +1233,7 @@ fn move_tree(
     };
     warnings.extend(tree_warnings.iter().cloned());
     let dropped = drop_old_refs(&env, &repo.root, &rec, remote, branch);
-    if !dropped.is_empty() {
-        d.latest.forget(&format!("{key}\0"));
-    }
+    d.latest.forget_refs(key, &dropped);
     let now = now_ms();
     update(d, key, |r| {
         r.tree = Some(dir.to_string_lossy().into_owned());
@@ -1271,6 +1294,9 @@ fn moved_since(
         m["from_ref"] = json!(old_ref);
     } else if latest::is_ancestor(env, root, &old, commit) {
         m["commits"] = json!(latest::count_between(env, root, &old, commit));
+    } else if latest::commit_of(env, root, &old).is_none() {
+        // (Its object is gone: whether it was rewritten can't be told.)
+        m["rewritten"] = json!("unknown");
     } else {
         m["rewritten"] = json!(true);
     }
@@ -1307,7 +1333,6 @@ pub fn set_launch_base(d: &Daemon, params: &mut Value) -> Result<()> {
     if !params.is_object() {
         bail!("session.new takes an object of params");
     }
-    params["base_resolved"] = Value::Null;
     params["location_resolved"] = Value::Null;
     // (Worked out once, here: `session_new` takes it as is.)
     if let Ok((repo, project, branch)) = crate::methods::new_location(&d.config(), params) {
@@ -1697,7 +1722,7 @@ pub fn sweep(d: &Daemon) -> Value {
                 .and_then(|r| r.ok());
             let dropped = drop_old_refs(&env, Path::new(&root), &rec, remote.as_deref(), &keep);
             if !dropped.is_empty() {
-                d.latest.forget(&format!("{key}\0"));
+                d.latest.forget_refs(&key, &dropped);
                 update(d, &key, |r| {
                     for k in &dropped {
                         r.fetched.remove(k);
@@ -1751,6 +1776,7 @@ mod tests {
             failed_fresh: Duration::from_secs(120),
             named_retry: Duration::from_secs(10),
             named_base_wait: Duration::from_millis(wait_ms),
+            tree_min_wait: Duration::from_millis(wait_ms),
         }
     }
 
@@ -3392,6 +3418,39 @@ mod tests {
         let v = call(&d, c, json!({"ref": "feat"}));
         assert_eq!(v["ref"], "feat", "{v}");
         assert_eq!(record(&d, &key(c)).branch.as_deref(), Some("feat"));
+    }
+
+    /// A slow fetch spends the call's budget: an existing tree still
+    /// answers with its path (the tree job has a wait of its own), never
+    /// "preparing".
+    #[test]
+    fn a_slow_fetch_never_makes_an_existing_tree_preparing() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        let first = call(&d, c, json!({}));
+        let slow = r.root().join("slow-upload-pack");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\nexec git-upload-pack \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.g(
+            c,
+            &["config", "remote.origin.uploadpack", slow.to_str().unwrap()],
+        );
+        let d = again(&r, &d);
+        d.latest.set_for_test(
+            r.env.clone(),
+            Timing {
+                tree_min_wait: Duration::from_secs(5),
+                ..timing(200)
+            },
+            Guard::with(None, false),
+        );
+        let v = latest_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(v["fetch"], "running", "{v}");
+        assert!(v.get("tree").is_none(), "{v}");
+        assert_eq!(v["path"], first["path"], "{v}");
+        assert_eq!(v["commit"], first["commit"]);
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.
