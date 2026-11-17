@@ -1790,3 +1790,15 @@ page; 6 needs 3; 7 needs 6; 8 and 9 need 5 and 7.
    (`tag:`, `status:`, `agent:`) from this slice on, so the overlord's
    `set_list_view` means the same on both. Any objection to changing the
    box's meaning from plain free text?
+
+### Slice 2 answers (user, 2026-11-17)
+
+1. UI target: the surface used last, plus a config override
+   `[web] ui_target = auto | terminal | web`.
+2. Key screen: shown read-only in the page; editing stays in the terminal.
+3. The overlord's first-run dialog stays terminal-only this slice.
+4. Direct launches (`session.new`, `session.fork`): the relayed phone
+   gets the same as local (not off by default).
+5. Defaults taken, not asked: a browser adopts the daemon's default view
+   only when it has no saved one; the one-line notice on the other surface
+   stays; the filter syntax change already landed (`1a2d5b6`).
