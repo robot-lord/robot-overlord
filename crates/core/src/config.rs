@@ -677,6 +677,32 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub update: UpdateConfig,
     pub limits: LimitsConfig,
+    pub web: WebConfig,
+}
+
+/// The opt-in web UI (the `rlord-web` plugin). Read by the daemon, which
+/// starts the plugin, and by the plugin, which listens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Start the plugin when the daemon starts (else the first `rlord web`
+    /// starts it for that daemon run). Installing doesn't set it.
+    pub enabled: bool,
+    /// Its port, on 127.0.0.1 only; 0 = any free port. Fixed by default:
+    /// the browser keeps the token per origin, and the origin includes the
+    /// port.
+    pub port: u16,
+}
+
+pub const DEFAULT_WEB_PORT: u16 = 47811;
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            enabled: false,
+            port: DEFAULT_WEB_PORT,
+        }
+    }
 }
 
 /// Sessions stopped by a usage limit.
@@ -762,6 +788,7 @@ impl Default for Config {
             archive: ArchiveConfig::default(),
             update: UpdateConfig::default(),
             limits: LimitsConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }
@@ -793,6 +820,21 @@ impl Config {
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         write_config(&path, &set_in(&text, section, field, value)?)
+    }
+
+    /// Set `[section] field` to a boolean, keeping the rest of the file as
+    /// written.
+    pub fn set_bool(section: &str, field: &str, value: bool) -> Result<()> {
+        let path = paths::config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        write_config(
+            &path,
+            &set_value_of(&text, section, field, toml_edit::Value::from(value))?,
+        )
     }
 
     /// Save the overlord's agent, model and effort (the setup dialog's
@@ -918,6 +960,11 @@ fn set_code_dir_in(text: &str, code_dir: &str, roots: &RootsEdit) -> Result<Stri
 
 /// `text` with `[section] field = value` set (see `Config::set_value`).
 fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String> {
+    set_value_of(text, section, field, toml_edit::Value::from(value))
+}
+
+/// `text` with `[section] field` set to a TOML value.
+fn set_value_of(text: &str, section: &str, field: &str, value: toml_edit::Value) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", paths::config_path().display()))?;
@@ -931,7 +978,7 @@ fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String>
     let table = doc[section]
         .as_table_mut()
         .with_context(|| format!("[{section}] isn't a table"))?;
-    set_value_in(table, field, toml_edit::Value::from(value));
+    set_value_in(table, field, value);
     let out = doc.to_string();
     toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
     Ok(out)
@@ -1097,11 +1144,28 @@ channel = "stable"
 # resets: it is sent this message then, if nobody touched it meanwhile.
 [limits]
 resume_message = "continue"
+
+# The web UI: an opt-in plugin (`rlord web install`), on 127.0.0.1 only.
+# `rlord web` starts it for the daemon's run; enabled = true starts it with
+# the daemon. Its link carries a token: `rlord web url`.
+[web]
+enabled = false
+port = 47811     # fixed: the browser keeps the token per address (0 = any)
 "##;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bool_is_written_as_one() {
+        let t = "[web]\nenabled = true   # mine\nport = 47900\n";
+        let out = set_value_of(t, "web", "enabled", toml_edit::Value::from(false)).unwrap();
+        assert_eq!(out, "[web]\nenabled = false   # mine\nport = 47900\n");
+        let c: Config = toml::from_str(&out).unwrap();
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 47900);
+    }
 
     #[test]
     fn set_in_keeps_the_file_as_written() {
@@ -1172,6 +1236,19 @@ mod tests {
         assert_eq!(c.keys.overlord, "M-o");
         assert_eq!(c.session.code_dir, "");
         assert!(c.session.scan_roots().is_empty());
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 47811);
+    }
+
+    #[test]
+    fn web_section_reads_and_defaults() {
+        let c: Config = toml::from_str("[web]\nenabled = true\n").unwrap();
+        assert!(c.web.enabled);
+        assert_eq!(c.web.port, DEFAULT_WEB_PORT);
+        let c: Config = toml::from_str("[web]\nport = 0\n").unwrap();
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 0);
+        assert!(toml::from_str::<Config>("[web]\nport = 70000\n").is_err());
     }
 
     #[test]

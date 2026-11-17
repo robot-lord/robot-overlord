@@ -26,6 +26,8 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
 libc.workspace = true
+# The web plugin's hash check (plugin.rs); not network code.
+sha2 = "0.10"
 tempfile = { version = "3", optional = true }
 memchr = "2"
 

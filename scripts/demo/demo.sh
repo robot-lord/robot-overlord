@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # A throwaway rlord full of made-up sessions, for screenshots and trying the
 # UI. Fully separate from a real install: its own data, config and tmux
-# server (rlord-demo); "claude", "codex" and "opencode" are stand-ins
+# server (rlord-demo, or $RLORD_DEMO_SOCKET for a second demo beside
+# it); "claude", "codex" and "opencode" are stand-ins
 # (scripts/demo/bin) that draw a screen and report state as the real ones
 # would (rlord's hooks; OpenCode: its session database), with no model.
 #
-#   scripts/demo/demo.sh [DIR]     # set up (DIR default: a new temp dir)
-#   source DIR/env.sh && rlord     # look around
+#   scripts/demo/demo.sh [--web] [DIR]  # set up (DIR default: a new temp dir)
+#   source DIR/env.sh && rlord          # look around
+#   source DIR/env.sh && rlord web      # with --web: the web UI
 #   scripts/demo/demo.sh --stop DIR
+#
+# --web also builds the web page and the rlord-web plugin and puts the
+# plugin beside the demo's rlord (unverified, as a checkout's build runs it).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -17,9 +22,15 @@ if [[ ${1:-} == --stop ]]; then
   # shellcheck disable=SC1091
   source "$d/env.sh"
   rlord tmux unbind >/dev/null 2>&1 || true
-  tmux -L rlord-demo kill-server 2>/dev/null || true
+  tmux -L "$RLORD_TMUX_SOCKET" kill-server 2>/dev/null || true
   pkill -f "$d/bin/rlord daemon" 2>/dev/null || true
   exit 0
+fi
+
+web=
+if [[ ${1:-} == --web ]]; then
+  web=1
+  shift
 fi
 
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
@@ -35,6 +46,10 @@ fi
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
+if [[ -n $web ]]; then
+  (cd "$root" && cargo xtask web build >/dev/null && cargo build --release -q -p robot-overlord-web)
+  cp "$root/target/release/rlord-web" "$d/bin/rlord-web"
+fi
 # tmux by itself (not its whole folder, which may hold a real agent): the
 # stand-in login shell below runs rlord's own panes, the list included.
 ln -sf "$(command -v tmux)" "$d/bin/tmux"
@@ -53,7 +68,7 @@ chmod +x "$d/bin/demo-shell"
 cat > "$d/env.sh" <<EOF
 export XDG_DATA_HOME=$d/data XDG_CONFIG_HOME=$d/config XDG_RUNTIME_DIR=$d/run
 export XDG_STATE_HOME=$d/state CLAUDE_CONFIG_DIR=$d/claude CODEX_HOME=$d/codex
-export RLORD_TMUX_SOCKET=rlord-demo RLORD_DEMO_DIR=$d
+export RLORD_TMUX_SOCKET=${RLORD_DEMO_SOCKET:-rlord-demo} RLORD_DEMO_DIR=$d
 # Only the stand-in agents: never ask a login shell where a real one is.
 export RLORD_NO_LOGIN_SHELL=1 SHELL=$d/bin/demo-shell
 export PATH=$d/bin:\$PATH
@@ -302,5 +317,6 @@ fi
 
 echo "demo ready in $d"
 echo "  source $d/env.sh && rlord"
+if [[ -n $web ]]; then echo "  source $d/env.sh && rlord web    # or: rlord web url"; fi
 echo "  scripts/demo/screenshots.sh $d    # images into docs/images"
 echo "  scripts/demo/demo.sh --stop $d"

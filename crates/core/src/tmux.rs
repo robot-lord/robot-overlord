@@ -255,6 +255,17 @@ fn run(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The id (`@n`) of the window a session is showing.
+pub fn current_window_id(session: &str) -> Result<String> {
+    run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{}:", exact(session)),
+        "#{window_id}",
+    ])
+}
+
 /// Rename a tmux session in place (attached clients stay attached).
 pub fn rename_session(old: &str, new: &str) -> Result<()> {
     run(&["rename-session", "-t", &exact(old), new])?;
@@ -428,8 +439,14 @@ pub fn capture_pane_ansi(name: &str) -> Result<String> {
     run(&["capture-pane", "-p", "-e", "-t", &pane_id])
 }
 
+/// Kill a session, and the web view sessions grouped with it: a window
+/// lives while any session links it, so the agent would otherwise keep
+/// running under a browser's view.
 pub fn kill_session(name: &str) -> Result<()> {
     if has_session(name) {
+        for view in views_of(name) {
+            let _ = run(&["kill-session", "-t", &exact(&view)]);
+        }
         run(&["kill-session", "-t", &exact(name)])?;
     }
     Ok(())
@@ -446,28 +463,53 @@ pub struct Client {
     pub activity: i64,
 }
 
+/// The terminals attached to the server, people only: no control-mode
+/// clients and no web views (`view_clients` has those), so a browser is
+/// never taken for the user's terminal and moved around.
 pub fn list_clients() -> Vec<Client> {
+    people(all_clients())
+}
+
+/// Clients that aren't web views.
+fn people(all: Vec<(Client, String)>) -> Vec<Client> {
+    all.into_iter()
+        .filter(|(c, _)| !is_view(&c.session))
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// Every non-control-mode client, with its session's group ("" if none).
+fn all_clients() -> Vec<(Client, String)> {
     let Ok(out) = run(&[
         "list-clients",
         "-F",
-        // Space-separated: none of the leading fields contain spaces; the
-        // session name (which may) comes last.
-        "#{client_activity} #{client_control_mode} #{client_name} #{session_name}",
+        "#{client_activity}\t#{client_control_mode}\t#{client_name}\t#{session_group}\t#{session_name}",
     ]) else {
         return vec![]; // no server
     };
+    parse_clients(&out)
+}
+
+/// `list-clients` lines as `all_clients` asks for them (tab-separated).
+fn parse_clients(out: &str) -> Vec<(Client, String)> {
     out.lines()
         .filter_map(|l| {
-            let mut f = l.splitn(4, ' ');
+            let mut f = l.splitn(5, '\t');
             let activity = f.next()?.parse().ok()?;
             if f.next()? == "1" {
                 return None; // control-mode client (a program, not a person)
             }
-            Some(Client {
-                activity,
-                name: f.next()?.to_string(),
-                session: f.next()?.to_string(),
-            })
+            let name = f.next()?.to_string();
+            let group = f.next()?.to_string();
+            let session = f.next()?.to_string();
+            Some((
+                Client {
+                    activity,
+                    name,
+                    session,
+                },
+                group,
+            ))
         })
         .collect()
 }
@@ -486,6 +528,164 @@ pub fn user_client<'a>(clients: &'a [Client], home: Option<&str>) -> Option<&'a 
         .filter(ours)
         .max_by_key(|c| c.activity)
         .or_else(|| clients.iter().max_by_key(|c| c.activity))
+}
+
+// ---- web views (a browser's pane, `docs/working/web-ui-remote.md`) ----
+//
+// A browser pane is a tmux client on a PTY attached to a throwaway "view
+// session" grouped with the target: it shares the target's windows, but has
+// its own status row (off) and key table (`rlord-web`: only mouse), and goes
+// when its client does. The target never changes.
+
+/// Name prefix of web view sessions (`webview-<n>`).
+pub const VIEW_PREFIX: &str = "webview-";
+
+/// The key table web views use: no keyboard bindings (keys go to the pane;
+/// rlord's navigation, the user's profile and any prefix are unreachable),
+/// and copies of root's pane mouse bindings (`bind_web_table`).
+pub const WEB_TABLE: &str = "rlord-web";
+
+/// Whether a tmux session is a web view session.
+pub fn is_view(session: &str) -> bool {
+    session.starts_with(VIEW_PREFIX)
+}
+
+/// Whether a root key is a pane mouse key the web table copies.
+fn is_pane_mouse_key(key: &str) -> bool {
+    key.ends_with("Pane")
+        && ["Wheel", "Mouse", "DoubleClick", "TripleClick"]
+            .iter()
+            .any(|p| key.starts_with(p))
+}
+
+/// (Re)make the web key table from root's current pane mouse bindings
+/// (`MouseDown1Pane`, `WheelUpPane`, …: selecting, copy mode on the wheel,
+/// passthrough to mouse apps). Call before attaching a view: the root table
+/// changes with config reloads and is gone with the server. Idempotent.
+pub fn bind_web_table() -> Result<()> {
+    let mut conf = String::new();
+    for (key, cmd) in bindings("root") {
+        if is_pane_mouse_key(&key) {
+            conf.push_str(&format!("bind-key -T {WEB_TABLE} {key} {cmd}\n"));
+        }
+    }
+    // (Errors when the table doesn't exist yet: fine.)
+    let _ = run(&["unbind-key", "-a", "-T", WEB_TABLE]);
+    if conf.is_empty() {
+        return Ok(());
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("rlord-web-keys-{}-{n}.conf", std::process::id()));
+    std::fs::write(&tmp, conf)?;
+    let r = run(&["source-file", &tmp.to_string_lossy()]);
+    let _ = std::fs::remove_file(&tmp);
+    r.map(|_| ())
+}
+
+/// The tmux client a web view runs in its PTY: one invocation that makes
+/// view session `view` grouped with `target`, attaches, and sets the view's
+/// options (status row off, the web key table, gone when unattached).
+/// Checks `target` exists first: `new-session -t` on a missing name makes a
+/// fresh shell instead of failing. After attaching, confirm with
+/// `view_shows` (the target can go in between).
+pub fn view_command(target: &str, view: &str) -> Result<Command> {
+    if !is_view(view) {
+        bail!("{view:?} isn't a web view session name");
+    }
+    if !has_session(target) {
+        bail!("tmux session {target} is not running");
+    }
+    let v = format!("{}:", exact(view));
+    let mut c = tmux_cmd();
+    c.env_remove("TMUX")
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .args(["new-session", "-t", &exact(target), "-s", view]);
+    for (opt, val) in [
+        ("status", "off"),
+        ("key-table", WEB_TABLE),
+        ("destroy-unattached", "on"),
+    ] {
+        c.args([";", "set-option", "-t", &v, opt, val]);
+    }
+    Ok(c)
+}
+
+/// Whether view session `view` shows `target`'s window (made by
+/// `view_command`, not a stray shell).
+pub fn view_shows(view: &str, target: &str) -> bool {
+    match (current_window_id(view), current_window_id(target)) {
+        (Ok(a), Ok(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
+}
+
+/// A session's group ("" when it isn't grouped).
+fn session_group(session: &str) -> String {
+    run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{}:", exact(session)),
+        "#{session_group}",
+    ])
+    .unwrap_or_default()
+}
+
+/// The web view sessions grouped with `target`. (By group, not name: a
+/// group keeps the name it was made with when the target is renamed.)
+fn views_of(target: &str) -> Vec<String> {
+    let group = session_group(target);
+    if group.is_empty() {
+        return vec![];
+    }
+    run(&["list-sessions", "-F", "#{session_group}\t#{session_name}"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(g, name)| *g == group && is_view(name))
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+/// The web views showing `target`, as clients of `target` itself (their
+/// `activity` is the browser's last input), so "is someone typing in it"
+/// counts a browser too.
+pub fn view_clients(target: &str) -> Vec<Client> {
+    let all = all_clients();
+    if !all.iter().any(|(c, _)| is_view(&c.session)) {
+        return vec![]; // no web views: skip asking for the group
+    }
+    let group = session_group(target);
+    views_in_group(all, &group, target)
+}
+
+fn views_in_group(all: Vec<(Client, String)>, group: &str, target: &str) -> Vec<Client> {
+    all.into_iter()
+        .filter(|(c, g)| !group.is_empty() && g == group && is_view(&c.session))
+        .map(|(c, _)| Client {
+            session: target.to_string(),
+            ..c
+        })
+        .collect()
+}
+
+/// Kill web view sessions no client is attached to (left by a bridge that
+/// died between making one and attaching). Returns their names.
+pub fn sweep_views() -> Vec<String> {
+    let out = run(&[
+        "list-sessions",
+        "-F",
+        "#{session_attached}\t#{session_name}",
+    ]);
+    out.unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(n, name)| *n == "0" && is_view(name))
+        .filter(|(_, name)| run(&["kill-session", "-t", &exact(name)]).is_ok())
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 /// Point a specific client at a session.
@@ -1545,6 +1745,47 @@ mod tests {
             user_client(&clients, Some("home")).unwrap().name,
             "/dev/ttys1"
         );
+    }
+
+    #[test]
+    fn web_views_are_not_the_users_terminal() {
+        let out = "10\t0\t/dev/ttys1\t\trlord-red-fox\n\
+                   30\t0\t/dev/ttys9\trlord-red-fox\twebview-1\n\
+                   40\t1\tclient-77\t\trlord-red-fox\n\
+                   20\t0\t/dev/ttys2\t\thome sweet home\n";
+        let all = parse_clients(out);
+        // The control-mode client is gone; names with spaces survive.
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].0.session, "home sweet home");
+        let people = people(all.clone());
+        assert_eq!(people.len(), 2);
+        // The browser (the most recent on an rlord session) is never
+        // picked as the user's terminal.
+        assert_eq!(user_client(&people, None).unwrap().name, "/dev/ttys1");
+        // It counts as a client of the session its group shows.
+        let v = views_in_group(all.clone(), "rlord-red-fox", "rlord-red-fox");
+        assert_eq!(v.len(), 1);
+        assert_eq!((v[0].name.as_str(), v[0].activity), ("/dev/ttys9", 30));
+        assert_eq!(v[0].session, "rlord-red-fox");
+        assert!(views_in_group(all.clone(), "", "rlord-red-fox").is_empty());
+        assert!(views_in_group(all, "other", "other").is_empty());
+    }
+
+    #[test]
+    fn web_table_takes_pane_mouse_keys_only() {
+        for k in [
+            "MouseDown1Pane",
+            "MouseDrag1Pane",
+            "WheelUpPane",
+            "DoubleClick1Pane",
+            "TripleClick1Pane",
+        ] {
+            assert!(is_pane_mouse_key(k), "{k}");
+        }
+        for k in ["MouseDown1Status", "WheelUpStatus", "M-d", "F12", "C-b"] {
+            assert!(!is_pane_mouse_key(k), "{k}");
+        }
+        assert!(is_view("webview-3") && !is_view("rlord-webview-3"));
     }
 
     #[test]

@@ -81,6 +81,12 @@ else
   step ls-first rlord ls
 fi
 step ping rlord ping
+# The web plugin from the same release files: the installed rlord's
+# compiled-in hash must take it, and it must start.
+step web-install rlord web install --yes --from /dist
+step web-status rlord web status
+step web-url rlord web url
+step web-stop rlord web stop
 
 # First run with no agent: the list opens on the overlord's setup dialog.
 tui() {

@@ -7,6 +7,16 @@
 //! packaging tools at their pinned versions (`cargo xtask install-tools`,
 //! xtask/src/tools.rs). Writes no SHA256SUMS: the caller sums the full set
 //! of files.
+//!
+//! Each target also gets the opt-in web plugin, `rlord-web`, in its own
+//! tarball, and `rlord` is built with that plugin's SHA-256 compiled in
+//! (`RLORD_WEB_SHA256`), so it only ever installs or starts that exact
+//! file. Order per target: the plugin (with the page embedded), signed on
+//! macOS (the same identity as `rlord`, see [`sign`]), hashed; then
+//! `rlord` with the hash. Nothing may touch the plugin
+//! after it is hashed. The page is built once, before any target
+//! (`cargo xtask web build`), or taken from `RLORD_WEB_DIST` (the release
+//! workflow builds it in its own job, so Node stays off the build jobs).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +57,9 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
     std::fs::create_dir_all(dist).with_context(|| format!("creating {}", dist.display()))?;
     let dist = dist.canonicalize()?;
     let ver = version::current()?;
+    // No network code in the rlord binary (the web plugin holds it).
+    crate::check_deps::check()?;
+    web_page()?;
     let stage = TempDir::new_in(Path::new("target"), "pack")?;
     let target_dir = target_dir()?;
 
@@ -55,20 +68,39 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
             if !is_apple_silicon_mac() {
                 bail!("build macOS on Apple Silicon");
             }
-            cmd::run(cargo().arg("build").args(build_args(MAC)))?;
+            let plugin = plugin_binary(&target_dir, MAC);
+            cmd::run(
+                cargo()
+                    .arg("build")
+                    .args(plugin_args(MAC))
+                    .env("RLORD_WEB_REQUIRE_ASSETS", "1"),
+            )?;
+            // Signed like rlord (its own identifier) before it is hashed,
+            // and never touched after: the hash is of the signed file.
+            sign(&plugin, WEB_SIGN_ID, !ver.is_dev())?;
+            cmd::run(Command::new("codesign").arg("--verify").arg(&plugin))?;
+            let hash = sha256(&plugin)?;
+            cmd::run(
+                cargo()
+                    .arg("build")
+                    .args(build_args(MAC))
+                    .env("RLORD_WEB_SHA256", &hash),
+            )?;
             let bin = binary(&target_dir, MAC);
             // The linker ad-hoc signs, but post-link strip can leave the
             // signature stale; re-sign so the binary runs on other Macs
             // (arm64 refuses unsigned code). With a Developer ID in the
             // keychain the signature keeps one identity across builds, so
             // macOS privacy grants (folder access) survive an update.
-            sign(&bin, !ver.is_dev())?;
+            sign(&bin, SIGN_ID, !ver.is_dev())?;
             cmd::run(Command::new("codesign").arg("--verify").arg(&bin))?;
             let reported = cmd::output(Command::new(&bin).arg("--version"))?;
             if reported != format!("rlord {ver}") {
                 bail!("built binary reports the wrong version ({reported})");
             }
             pack(&ver, MAC, &bin, stage.path(), &dist)?;
+            pack_web(&ver, MAC, &plugin, stage.path(), &dist)?;
+            check_install(&ver, MAC, &bin, &dist)?;
         }
         Platform::Linux => {
             // Only the pinned tools, run from their folder (not through
@@ -81,8 +113,24 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
                 c
             };
             for t in LINUX {
-                cmd::run(tool("zigbuild").args(build_args(t)))?;
-                pack(&ver, t, &binary(&target_dir, t), stage.path(), &dist)?;
+                let plugin = plugin_binary(&target_dir, t);
+                cmd::run(
+                    tool("zigbuild")
+                        .args(plugin_args(t))
+                        .env("RLORD_WEB_REQUIRE_ASSETS", "1"),
+                )?;
+                let hash = sha256(&plugin)?;
+                cmd::run(
+                    tool("zigbuild")
+                        .args(build_args(t))
+                        .env("RLORD_WEB_SHA256", &hash),
+                )?;
+                let bin = binary(&target_dir, t);
+                pack(&ver, t, &bin, stage.path(), &dist)?;
+                pack_web(&ver, t, &plugin, stage.path(), &dist)?;
+                if is_native_linux(t) {
+                    check_install(&ver, t, &bin, &dist)?;
+                }
             }
             // Distro packages: the same static binaries, requiring tmux.
             let out_dir = format!("{}/", dist.display());
@@ -113,6 +161,89 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The web page, ready to embed: copied from `RLORD_WEB_DIST` (built by
+/// the workflow's own job), else built here.
+fn web_page() -> Result<()> {
+    let dist = Path::new(WEB_DIST);
+    match std::env::var_os("RLORD_WEB_DIST").filter(|d| !d.is_empty()) {
+        Some(from) => {
+            let from = PathBuf::from(from);
+            if !from.join("index.html").is_file() {
+                bail!("RLORD_WEB_DIST={} holds no index.html", from.display());
+            }
+            if dist.exists() {
+                std::fs::remove_dir_all(dist)?;
+            }
+            std::fs::create_dir_all(dist)?;
+            // (`from/.`: its contents, hidden files too.)
+            cmd::run(Command::new("cp").arg("-R").arg(from.join(".")).arg(dist))?;
+        }
+        None => crate::web::main(&["build".to_string()])?,
+    }
+    for f in ["index.html", WEB_LICENSES] {
+        if !dist.join(f).is_file() {
+            bail!("the web page has no {f} ({WEB_DIST})");
+        }
+    }
+    Ok(())
+}
+
+/// Where `cargo xtask web build` puts the page; `rlord-web` embeds it.
+const WEB_DIST: &str = "crates/web/ui/dist";
+/// The bundled npm packages' licenses, written by the page's build.
+const WEB_LICENSES: &str = "THIRD-PARTY-LICENSES.md";
+
+/// SHA-256 of a file, lowercase hex.
+fn sha256(path: &Path) -> Result<String> {
+    let out = cmd::output(Command::new("shasum").args(["-a", "256", "--"]).arg(path))?;
+    let sum = out.split_whitespace().next().unwrap_or("");
+    if sum.len() != 64 || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("shasum printed no SHA-256 for {}", path.display());
+    }
+    Ok(sum.to_lowercase())
+}
+
+/// Whether this machine runs `target`'s Linux binaries.
+fn is_native_linux(target: Target) -> bool {
+    std::env::consts::OS == "linux"
+        && target
+            .triple
+            .starts_with(&format!("{}-", std::env::consts::ARCH))
+}
+
+/// The coupling the release depends on, checked before anything ships:
+/// the `rlord` just built installs the plugin just packed (`rlord web
+/// install --from`, which checks it against the compiled-in hash), in a
+/// scratch home.
+fn check_install(ver: &Version, target: Target, rlord: &Path, dist: &Path) -> Result<()> {
+    let home = TempDir::new_in(Path::new("target"), "web-install-check")?;
+    let home = home.path().canonicalize()?;
+    let from = home.join("release");
+    std::fs::create_dir(&from)?;
+    let tarball = ver.web_tarball(target);
+    std::fs::copy(dist.join(&tarball), from.join(&tarball))?;
+    std::fs::write(
+        from.join("SHA256SUMS"),
+        format!("{}  {tarball}\n", sha256(&from.join(&tarball))?),
+    )?;
+    let out = cmd::output(
+        Command::new(rlord)
+            .args(["web", "install", "--yes", "--from"])
+            .arg(&from)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_RUNTIME_DIR", home.join("run"))
+            .env_remove("RLORD_WEB_BIN")
+            .stdin(Stdio::null()),
+    )
+    .with_context(|| format!("the built rlord refuses its own web plugin ({tarball})"))?;
+    if !out.contains("installed") {
+        bail!("`rlord web install` of the built plugin said: {out}");
+    }
+    Ok(())
+}
+
 fn build_args(target: Target) -> [&'static str; 6] {
     [
         "--release",
@@ -139,18 +270,60 @@ fn binary(target_dir: &Path, target: Target) -> PathBuf {
     target_dir.join(target.triple).join("release/rlord")
 }
 
+/// The web plugin's build: its own package and invocation, so its
+/// dependencies' features never unify into `rlord`'s.
+fn plugin_args(target: Target) -> [&'static str; 6] {
+    [
+        "--release",
+        "--locked",
+        "-p",
+        "robot-overlord-web",
+        "--target",
+        target.triple,
+    ]
+}
+
+fn plugin_binary(target_dir: &Path, target: Target) -> PathBuf {
+    target_dir.join(target.triple).join("release/rlord-web")
+}
+
+/// The plugin's tarball: the binary, both licenses, and the bundled npm
+/// packages' licenses. No installer: `rlord web install` puts it in place.
+fn pack_web(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) -> Result<()> {
+    let licenses = Path::new(WEB_DIST).join(WEB_LICENSES);
+    tar(
+        &ver.web_tarball_stem(target),
+        &[
+            bin,
+            &licenses,
+            Path::new("LICENSE-MIT"),
+            Path::new("LICENSE-APACHE"),
+        ],
+        stage,
+        &dist.join(ver.web_tarball(target)),
+    )
+}
+
 /// One tarball per target: the binary, the installer, the licenses.
 fn pack(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) -> Result<()> {
-    let name = ver.tarball_stem(target);
-    let dir = stage.join(&name);
+    tar(
+        &ver.tarball_stem(target),
+        &[
+            bin,
+            Path::new("scripts/install.sh"),
+            Path::new("LICENSE-MIT"),
+            Path::new("LICENSE-APACHE"),
+            Path::new("README.md"),
+        ],
+        stage,
+        &dist.join(ver.tarball(target)),
+    )
+}
+
+/// `out`: a tarball of `files` in a top-level folder `name`.
+fn tar(name: &str, files: &[&Path], stage: &Path, out: &Path) -> Result<()> {
+    let dir = stage.join(name);
     std::fs::create_dir(&dir)?;
-    let files = [
-        bin,
-        Path::new("scripts/install.sh"),
-        Path::new("LICENSE-MIT"),
-        Path::new("LICENSE-APACHE"),
-        Path::new("README.md"),
-    ];
     for f in files {
         let to = dir.join(f.file_name().context("file name")?);
         std::fs::copy(f, &to).with_context(|| format!("copying {}", f.display()))?;
@@ -165,16 +338,18 @@ fn pack(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) ->
             .env("COPYFILE_DISABLE", "1")
             .arg("--no-xattrs")
             .arg("-czf")
-            .arg(dist.join(ver.tarball(target)))
+            .arg(out)
             .arg("-C")
             .arg(stage)
-            .arg(&name),
+            .arg(name),
     )
 }
 
 /// The identifier a Developer ID signature carries. Fixed, so macOS sees
 /// every build as the same program.
 const SIGN_ID: &str = "com.robot-lord.rlord";
+/// The web plugin's (`rlord-web`): its own program to macOS.
+const WEB_SIGN_ID: &str = "com.robot-lord.rlord-web";
 
 /// What to sign with.
 #[derive(Debug, PartialEq, Eq)]
@@ -187,11 +362,11 @@ enum Signer {
     AdHoc,
 }
 
-/// Sign `bin`. Outside CI a Mac must have a Developer ID (an ad-hoc dev
+/// Sign `bin` with signing identifier `id`. Outside CI a Mac must have a Developer ID (an ad-hoc dev
 /// build would reset every user's macOS privacy grants); set
 /// `RLORD_SIGN_IDENTITY=-` to sign ad-hoc on purpose. In CI see
 /// [`ci_adhoc_allowed`].
-fn sign(bin: &Path, stable: bool) -> Result<()> {
+fn sign(bin: &Path, id: &str, stable: bool) -> Result<()> {
     let ci = std::env::var_os("CI").is_some_and(|v| !v.is_empty());
     let release = std::env::var("RLORD_RELEASE").ok();
     let ci = ci.then(|| ci_adhoc_allowed(release.as_deref(), stable));
@@ -206,14 +381,19 @@ fn sign(bin: &Path, stable: bool) -> Result<()> {
     let env = std::env::var("RLORD_SIGN_IDENTITY").ok();
     let signer = choose(env.as_deref(), &listing, ci)?;
     match &signer {
-        Signer::Id { name, .. } => eprintln!("signing with {name}"),
+        Signer::Id { name, .. } => eprintln!("signing {id} with {name}"),
         Signer::AdHoc if ci.is_some() => eprintln!(
             "warning: signing ad-hoc: no Developer ID in the keychain. A \
              published release would refuse this (RLORD_RELEASE=1)."
         ),
-        Signer::AdHoc => eprintln!("signing ad-hoc"),
+        Signer::AdHoc => eprintln!("signing {id} ad-hoc"),
     }
-    cmd::run(Command::new("codesign").args(sign_args(&signer)).arg(bin)).context(
+    cmd::run(
+        Command::new("codesign")
+            .args(sign_args(&signer, id))
+            .arg(bin),
+    )
+    .context(
         "codesign failed. With a Developer ID it needs the network (secure \
          timestamp) and keychain access to the key (run once from a GUI \
          session and choose Always Allow). RLORD_SIGN_IDENTITY=- signs ad-hoc.",
@@ -283,17 +463,13 @@ fn developer_ids(listing: &str) -> Vec<(String, String)> {
 }
 
 /// `codesign` arguments. No hardened runtime: only notarization needs it
-/// (not done), and it would stop debuggers attaching.
-fn sign_args(signer: &Signer) -> Vec<&str> {
+/// (not done), and it would stop debuggers attaching. `id` is the
+/// signing identifier (a Developer ID signature only).
+fn sign_args<'a>(signer: &'a Signer, id: &'a str) -> Vec<&'a str> {
     match signer {
-        Signer::Id { hash, .. } => vec![
-            "--force",
-            "--sign",
-            hash,
-            "--timestamp",
-            "--identifier",
-            SIGN_ID,
-        ],
+        Signer::Id { hash, .. } => {
+            vec!["--force", "--sign", hash, "--timestamp", "--identifier", id]
+        }
         Signer::AdHoc => vec!["--force", "--sign", "-"],
     }
 }
@@ -323,7 +499,7 @@ mod sign_tests {
             }
         );
         assert_eq!(
-            sign_args(&s),
+            sign_args(&s, SIGN_ID),
             [
                 "--force",
                 "--sign",
@@ -333,6 +509,8 @@ mod sign_tests {
                 SIGN_ID
             ]
         );
+        // The web plugin: same identity, its own identifier.
+        assert_eq!(sign_args(&s, WEB_SIGN_ID)[5], "com.robot-lord.rlord-web");
     }
 
     #[test]
@@ -359,7 +537,10 @@ mod sign_tests {
         let none = "     0 valid identities found\n";
         assert_eq!(choose(None, none, Some(true)).unwrap(), Signer::AdHoc);
         assert!(choose(None, none, None).is_err());
-        assert_eq!(sign_args(&Signer::AdHoc), ["--force", "--sign", "-"]);
+        assert_eq!(
+            sign_args(&Signer::AdHoc, SIGN_ID),
+            ["--force", "--sign", "-"]
+        );
     }
 
     #[test]

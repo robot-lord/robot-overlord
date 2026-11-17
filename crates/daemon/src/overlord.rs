@@ -758,11 +758,11 @@ fn fresh_one_if_idle(d: &crate::Daemon, s: Session, active: bool, mins: u64) -> 
         return Ok(());
     }
     // Someone is looking at it: its overlay is open (the active one's), or
-    // a terminal shows it.
+    // a terminal (or a browser's view) shows it.
     let overlay_open = active && d.overlay.lock().expect("ui mutex").is_some();
-    let attached = tmux::list_clients()
-        .iter()
-        .any(|c| Some(c.session.as_str()) == s.tmux_session.as_deref());
+    let attached = s.tmux_session.as_deref().is_some_and(|t| {
+        tmux::list_clients().iter().any(|c| c.session == t) || !tmux::view_clients(t).is_empty()
+    });
     if overlay_open || attached {
         return Ok(());
     }

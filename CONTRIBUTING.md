@@ -42,6 +42,25 @@ imported: `RLORD_TMUX_PROFILE=default rlord` (agent sessions switch to
 rlord's own bar and clickable hints for that run; a plain `rlord` switches
 back). `rlord tmux profile` says which setup is active and why.
 
+### The web UI
+
+The web plugin (`crates/web`, binary `rlord-web`) builds with the rest of
+the workspace and embeds a placeholder page until the real one is built.
+The page (`crates/web/ui/`, TypeScript) needs Node (the major in
+`crates/web/ui/.node-version`):
+
+```sh
+cargo xtask web check      # types, lint, format, unit tests (installs the pinned tools first)
+cargo xtask web build      # the page into crates/web/ui/dist/; rebuild rlord-web to embed it
+cargo xtask web watch      # rebuild on change; run a debug rlord-web with RLORD_WEB_ASSETS=crates/web/ui/dist
+cargo build -p robot-overlord-web && rlord web   # a checkout's rlord runs the rlord-web beside it
+```
+
+`scripts/demo/demo.sh --web DIR` sets up the demo with the plugin
+(`RLORD_DEMO_SOCKET` and `[web] port` in its config run a second demo
+beside another). `cargo xtask check-deps` keeps network crates out of
+`rlord`; see "Web UI" in docs/architecture.md.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
@@ -78,7 +97,8 @@ cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --worksp
 
 Never touch the default tmux server in tests or scripts: rlord runs on its
 own socket (`tmux -L rlord`), and tests use scratch sockets
-(`RLORD_TMUX_SOCKET`).
+(`RLORD_TMUX_SOCKET`). Tests that need tmux are gated: `RLORD_TMUX_TESTS=1
+cargo test --workspace`.
 
 ## Versions and releases
 
@@ -112,12 +132,15 @@ after the checks, so rehearse that with a manual dry run of the workflow
   as a pre-release. `build-release macos` signs with the keychain's
   "Developer ID Application" identity, by its hash (secure timestamp,
   identifier `com.robot-lord.rlord`), so macOS keeps privacy grants such as
-  folder access across updates. Without one it refuses outside CI.
+  folder access across updates. The web plugin (`rlord-web`) is signed
+  the same way, identifier `com.robot-lord.rlord-web`, before its hash is
+  compiled into `rlord`. Without an identity it refuses outside CI.
   `RLORD_SIGN_IDENTITY` picks an identity by name or hash, or `-` signs
   ad-hoc on purpose. Stable releases are signed the same way in CI:
   release.yml's macOS job runs in the `release` environment, imports the
   `MACOS_SIGN_P12` / `MACOS_SIGN_P12_PASSWORD` secrets into a throwaway
-  keychain, and checks the shipped binary's Developer ID signature. In CI
+  keychain, and checks the Developer ID signature of both shipped
+  binaries (`rlord` and `rlord-web`). In CI
   without an identity, a publishing run (`RLORD_RELEASE=1`) fails; a
   release dry run, or a dev version elsewhere in CI, signs ad-hoc with a
   warning. Not notarized and no hardened runtime: `get.sh` downloads with

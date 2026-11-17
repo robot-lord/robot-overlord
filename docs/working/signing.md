@@ -13,6 +13,13 @@ since 0.23.0-dev.31; see CONTRIBUTING.md, "Versions and releases".
   binary is signed by a Developer ID with identifier
   `com.robot-lord.rlord`. A publishing run with no identity fails; a dry
   run without the secrets signs ad-hoc with a warning.
+- **The web plugin** (feat/web-ui): `rlord-web` goes through the same
+  `sign()`, identifier `com.robot-lord.rlord-web`, before it is hashed
+  for `RLORD_WEB_SHA256`; "Verify signature" checks both binaries.
+- **"Verify signature" fixed** (feat/web-ui): it read `codesign -dv`,
+  which prints no `Authority=` lines, so a real Developer ID signature
+  failed the check. It reads `codesign -dvv` now. main still has `-dv`
+  until this branch merges (or a separate fix lands there first).
 
 ## One-time setup (maintainer)
 

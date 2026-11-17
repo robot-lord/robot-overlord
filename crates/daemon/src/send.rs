@@ -138,7 +138,10 @@ pub fn type_into(
     }
     if let Some(t) = checks.attached {
         let now_s = now_ms() / 1000;
-        if user_active(&tmux::list_clients(), t, checks.overlay, now_s) {
+        // A browser's view of it counts as a terminal showing it.
+        let mut clients = tmux::list_clients();
+        clients.extend(tmux::view_clients(t));
+        if user_active(&clients, t, checks.overlay, now_s) {
             return Ok(Typed::NotNow(
                 "someone is typing in it (a terminal showing it was just used)".into(),
             ));

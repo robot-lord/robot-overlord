@@ -330,7 +330,25 @@ pub fn show_list(d: &Daemon) -> Result<Value> {
 }
 
 pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
-    let r = methods::p_str(params, "ref")?;
+    let s = ensure_running(d, methods::p_str(params, "ref")?)?;
+    let t = s
+        .tmux_session
+        .as_deref()
+        .context("session has no tmux session")?;
+    if overlord::is_overlord_role(&s.role) {
+        // Full screen: hand the window's size back from any overlay.
+        let _ = tmux::auto_size_window(t);
+    }
+    hide_overlord(d);
+    switch_user_to(t)?;
+    Ok(json!({"switched_to": {"id": s.id, "name": s.name}}))
+}
+
+/// Make sure session `r` runs: an overlord is ensured, a stopped session
+/// (or one whose tmux session is gone) is restarted on its conversation.
+/// Returns its row as it is now. (Enter in the list, and the web UI's
+/// Resume.)
+pub fn ensure_running(d: &Daemon, r: &str) -> Result<rlord_core::types::Session> {
     let found = d.db().resolve_ref(r)?;
     let id = found.id.clone();
     let needs_start = |s: &rlord_core::types::Session| {
@@ -354,17 +372,7 @@ pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
         db.resolve_ref(&s.id)?
     };
     d.changed();
-    let t = s
-        .tmux_session
-        .as_deref()
-        .context("session has no tmux session")?;
-    if overlord::is_overlord_role(&s.role) {
-        // Full screen: hand the window's size back from any overlay.
-        let _ = tmux::auto_size_window(t);
-    }
-    hide_overlord(d);
-    switch_user_to(t)?;
-    Ok(json!({"switched_to": {"id": s.id, "name": s.name}}))
+    Ok(s)
 }
 
 /// Set (and optionally save as default) the TUI list view; show it unless

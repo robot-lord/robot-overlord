@@ -72,8 +72,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: target/debug/xtask release-preflight
 
-  build-macos:
+  # The web plugin's page, built once here so Node stays off the jobs that
+  # compile the binaries, and every target embeds identical bytes. Pinned
+  # tools, lockfile integrity, no install scripts, no cache. The build jobs
+  # take it through RLORD_WEB_DIST and embed it in each target's plugin.
+  web-assets:
     needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/web/ui/.node-version
+          package-manager-cache: false
+      # The toolchain, components and targets in rust-toolchain.toml (for xtask).
+      - run: rustup toolchain install
+      - run: cargo xtask web install
+      - run: cargo xtask web check
+      - run: cargo xtask web build
+      # Not dist-*: the release job merges those into the release's files.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-page
+          path: crates/web/ui/dist
+          if-no-files-found: error
+
+  # Each build job makes rlord-web first, then rlord with the plugin's
+  # SHA-256 compiled in (xtask/src/build.rs), and checks that the rlord
+  # takes its own plugin.
+  build-macos:
+    needs: [preflight, web-assets]
     if: needs.preflight.outputs.skip != 'true'
     runs-on: macos-15
     # Holds the signing secrets; its required reviewers approve each run.
@@ -83,6 +115,10 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-page
+          path: web-page
       # The toolchain, components and targets in rust-toolchain.toml.
       - run: rustup toolchain install
       # The Developer ID certificate and key into a throwaway keychain, so
@@ -119,20 +155,25 @@ jobs:
           # xtask/src/build.rs: a publishing run ("1") refuses to sign
           # ad-hoc; a dry run may, with a warning, without the secrets.
           RLORD_RELEASE: ${{ env.DRY_RUN == 'false' && '1' || 'dry-run' }}
-      # The Developer ID signature, checked on the shipped binary.
+          RLORD_WEB_DIST: ${{ github.workspace }}/web-page
+      # The Developer ID signature, checked on the shipped binaries: rlord
+      # and the web plugin (signed before rlord compiled in its hash).
+      # -dvv: plain -dv prints no Authority lines.
       - name: Verify signature
         if: steps.keychain.outputs.signed == 'true'
         run: |
           set -o pipefail
           tmp=$(mktemp -d)
           for t in dist/*.tar.gz; do tar -xzf "$t" -C "$tmp"; done
-          bin=$(find "$tmp" -type f -name rlord | head -n1)
-          [[ -n $bin ]] || { echo "::error::no rlord binary in the tarball"; exit 1; }
-          codesign --verify --strict "$bin"
-          info=$(codesign -dv "$bin" 2>&1)
-          echo "$info"
-          grep -q '^Authority=Developer ID Application: ' <<<"$info" || { echo "::error::not signed with a Developer ID"; exit 1; }
-          grep -qx 'Identifier=com.robot-lord.rlord' <<<"$info" || { echo "::error::wrong signing identifier"; exit 1; }
+          for name in rlord rlord-web; do
+            bin=$(find "$tmp" -type f -name "$name" | head -n1)
+            [[ -n $bin ]] || { echo "::error::no $name binary in the tarballs"; exit 1; }
+            codesign --verify --strict "$bin"
+            info=$(codesign -dvv "$bin" 2>&1)
+            echo "$info"
+            grep -q '^Authority=Developer ID Application: ' <<<"$info" || { echo "::error::$name is not signed with a Developer ID"; exit 1; }
+            grep -qx "Identifier=com.robot-lord.$name" <<<"$info" || { echo "::error::$name has the wrong signing identifier"; exit 1; }
+          done
       - name: Delete keychain
         if: always()
         run: |
@@ -146,7 +187,7 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    needs: preflight
+    needs: [preflight, web-assets]
     if: needs.preflight.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     steps:
@@ -154,6 +195,10 @@ jobs:
         with:
           ref: ${{ env.REF }}
           persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-page
+          path: web-page
       # The toolchain, components and targets in rust-toolchain.toml.
       - run: rustup toolchain install
       # zig, cargo-zigbuild, cargo-deb and cargo-generate-rpm at the
@@ -161,13 +206,16 @@ jobs:
       # where the project ships a binary, otherwise `cargo install --locked`.
       - run: cargo xtask install-tools
       - run: cargo xtask build-release linux dist
+        env:
+          RLORD_WEB_DIST: ${{ github.workspace }}/web-page
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-linux
           path: dist/*
           if-no-files-found: error
 
-  # Install each build with get.sh on several distros, natively per arch.
+  # Install each build with get.sh on several distros, natively per arch,
+  # and the web plugin beside it with `rlord web install --from`.
   smoke-linux:
     needs: build-linux
     strategy:
@@ -191,7 +239,7 @@ jobs:
       - run: scripts/smoke-linux.sh dist ubuntu:22.04 ubuntu:24.04 debian:12 fedora:41 amazonlinux:2023
 
   release:
-    needs: [preflight, build-macos, build-linux, smoke-linux]
+    needs: [preflight, web-assets, build-macos, build-linux, smoke-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # the GitHub Release

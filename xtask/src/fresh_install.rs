@@ -99,6 +99,10 @@ impl Way {
         v.extend(
             [
                 "ping",
+                "web-install",
+                "web-status",
+                "web-url",
+                "web-stop",
                 "tui-first-run",
                 "tui-setup-form",
                 "agents-none-json",
@@ -222,6 +226,18 @@ fn judge(step: &Step, way: Way, ver: &Version) -> Option<String> {
             "with no daemon, `rlord ping` should fail and say so",
         ),
         "ls-first" => need(ok && has("no sessions"), "expected `no sessions`"),
+        "web-install" => need(
+            ok && has("installed"),
+            "`rlord web install --from` should install the release's plugin",
+        ),
+        "web-status" => need(
+            ok && has("(verified)"),
+            "the installed plugin should match this rlord's compiled-in hash",
+        ),
+        "web-url" => need(
+            ok && has("http://127.0.0.1:"),
+            "`rlord web url` should start the plugin and print its address",
+        ),
         "ping" | "ping-after-reset" => need(
             ok && has(&format!("daemon v{ver}")),
             &format!("expected a daemon on v{ver}"),

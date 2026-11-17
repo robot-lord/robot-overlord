@@ -48,6 +48,8 @@ daemon is `rlord daemon` (started on demand by the first client that needs it, o
   hook ingest, reconciliation loops.
 - `rlord-cli` — thin client subcommands, `hook emit`, `mcp` stdio shim.
 - `rlord-tui` — ratatui client.
+- `rlord-web` (`crates/web`) — the opt-in web UI plugin, its own
+  executable ("Web UI" below).
 
 ### Why the daemon fixes the responsiveness problem
 
@@ -747,7 +749,9 @@ sentinels; a worker reports done via the MCP tool (or the human does via CLI).
 ### Internal API (the single implementation)
 
 JSON-RPC over `$XDG_RUNTIME_DIR/robot-overlord/daemon.sock` (perms 0700 dir /
-0600 socket — the socket is root-of-trust; no TCP listener at all in v1).
+0600 socket — the socket is root-of-trust). The `rlord` binary listens on
+nothing else: the only network listener is the opt-in web plugin's, on
+`127.0.0.1` ("Web UI" below).
 Methods, grouped: `session.{list,get,create,launch,restart,stop,archive,
 unarchive,rename,set_tags,set_group,fork}`, `msg.{send,list,ack}`,
 `events.{query,subscribe}`, `agent.{install,doctor}`. `subscribe` upgrades the
@@ -930,6 +934,132 @@ sort/filter/pivot verbs as first-class keys, group/tag views, archived view,
 preview pane (control-mode capture stream), attach on Enter, message compose.
 Deliberately thin — no business logic; if the TUI dies the fleet doesn't care.
 (This is the anti-`home.go` rule: the daemon owns behavior, clients own pixels.)
+
+### Web UI (an opt-in plugin)
+
+The web UI is a separate executable, `rlord-web` (`crates/web`), that the
+user installs on purpose. A user who hasn't has no file on disk that can
+serve a session over a socket.
+
+**What stays out of `rlord`.** The `rlord` binary (core, daemon, TUI, CLI)
+has no HTTP server, websocket, TLS or network-client crate. `cargo xtask
+check-deps` (CI's `check` job, and the start of every release build) fails
+when `cargo tree -p robot-overlord` names one (axum, hyper, h2, http,
+tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate)
+or when the four main crates' source names a TCP or UDP socket type. One
+file is exempt, by name and with its reason: `core/src/agents/opencode_service.rs`,
+the OpenCode adapter's HTTP client for OpenCode's own background server
+on a local address. tokio's `net` feature compiles its TCP types (it has
+no Unix-sockets-only feature); they stay unused. Downloads (`rlord
+update`, `rlord web install`) run `curl` or `gh` from a compiled-in script.
+
+**Install and verification.** Each release has a plugin tarball per target
+(`rlord-web-v<ver>-<target>.tar.gz`: the binary, both licenses and the
+bundled npm packages' `THIRD-PARTY-LICENSES.md`), never in the rlord
+tarball, the packages, Homebrew or crates.io. The release build makes
+`rlord-web` first, signs it on macOS (the same Developer ID as `rlord`,
+identifier `com.robot-lord.rlord-web`), hashes the signed file, then
+builds `rlord` with that SHA-256 compiled in (`RLORD_WEB_SHA256`, read by
+`plugin::COMPILED_SHA256`), and checks the new `rlord` installs the new
+plugin (`xtask/src/build.rs`). Nothing may touch the plugin after it is
+hashed. So the trust root is the `rlord` the user already runs: the check
+needs no signature, and a swapped asset or a tampered `SHA256SUMS` can't
+produce a plugin it will run.
+
+- `rlord web install` (`crates/rlord/src/web_install.rs`) downloads the
+  tarball and `SHA256SUMS` (`web-install.sh`: `gh` when logged in, else
+  `curl`; `gh attestation verify` for a stable release when `gh` is
+  there), checks the tarball against `SHA256SUMS`, unpacks it beside the
+  destination, checks the plugin against the compiled-in hash, and
+  renames it to `<data dir>/plugins/rlord-web`. `--from DIR` takes the
+  files from a folder (smoke tests); `--if-installed` (run by `update.sh`)
+  only replaces an installed one. `rlord web` asks `[y/N]` when there is
+  none. `rlord web remove` stops it, deletes it and `web.token`, and turns
+  `[web] enabled` off.
+- The daemon checks the hash again before every start, so a plugin from
+  another version never runs: that check is also the version match. After
+  an update that couldn't fetch the new plugin, `rlord web status` says
+  to run `rlord web install`.
+- A build with no hash (a checkout, `cargo install`) never downloads; it
+  runs `RLORD_WEB_BIN` or an `rlord-web` beside its own executable,
+  unverified, and says so. A debug build's CLI also takes
+  `RLORD_TEST_WEB_SHA256` for the install tests.
+
+**Running it.** The daemon runs the plugin as a child (`daemon/src/web.rs`
+`Web`): started by `rlord web` (`web.start`) or at daemon start with `[web]
+enabled`, its output appended to `<data dir>/web.log`, restarted with
+backoff (1 s doubling to 60 s, given up after five failures in a row),
+SIGTERM then SIGKILL on `web.stop` and at daemon exit. The plugin's first
+call is `web.hello {protocol, version, pid, port}`; another
+`plugin::WEB_PROTOCOL` is refused, and the plugin exits 3 (not retried);
+a taken port is exit 4 (not retried). The plugin also exits when its
+`web.subscribe` stream ends, so a crashed daemon leaves no listener. A
+daemon restart restarts it; open pages reconnect with the same token.
+
+**The daemon's side** (no HTTP types): `web.call {op, args}` is the only
+way a browser request reaches the daemon. `web::OPS` lists each op, the
+method it calls and the only arguments passed on; `admin.*`, `mcp.*`,
+`hook.*`, `web.*`, `config.*`, `ui.*`, `tmux.*` and `setup.*` can never be
+on it, nor can the lifecycle methods (`web.status`, `web.start`,
+`web.stop`, `web.rotate`, which only the CLI calls). The list lives in the
+daemon, the always-installed side, so a bug in the plugin can't reach a
+method the web was never given. It is not a boundary against a local
+process, which can call the socket itself. `snapshot {view, rev}` is the
+list in one answer (rows for a `session.list` query, groups, labels, the
+overlord and its roster); `rev` is `<boot id>-<changes>`, and a current
+`rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
+most every 100 ms. `web.pane_target` names a pane's tmux session and
+starts nothing. Adding an op: put it on `OPS` with its arguments, add it to
+`OPS` in `crates/web/ui/src/proto.ts` (a test holds the two lists
+together), and test it in `crates/daemon/tests/web_api.rs`.
+
+**The plugin.** Listens on `127.0.0.1:<[web] port>` only (default 47811:
+fixed, since the browser keeps the token per origin). The token (32 random
+bytes, `<data dir>/web.token`, 0600, kept across restarts) travels in the
+URL fragment (`/#t=<token>`), never to the server or in a Referer; the
+page keeps it in `localStorage` and takes it out of the address bar. No
+cookies (cookies for `127.0.0.1` are shared by every port). Static files
+need no token; everything else is on websockets, which authenticate in
+their first frame (4401 on failure). Every request's `Host` must be
+exactly `127.0.0.1:<port>` (DNS rebinding) and every upgrade's `Origin`
+exactly `http://127.0.0.1:<port>`; `localhost` is refused. Every response
+carries a strict CSP (`script-src 'self'`; `style-src` also allows
+`'unsafe-inline'` because xterm.js makes `<style>` elements at run time),
+`nosniff`, `no-referrer`, `same-origin` opener and resource policies and
+`no-store`. Limits: 16 control sockets, 32 pane sockets, 1 MiB per control
+frame, 64 KiB per pane frame. `rlord web new-token` replaces the token and
+drops every open page.
+
+**Panes.** One tmux client per pane websocket, on a PTY (`openpty`),
+attached to a throwaway session grouped with the target
+(`tmux::view_command`, prefix `webview-`): `status off`, key table
+`rlord-web` (no keyboard bindings, root's pane mouse bindings copied in by
+`bind_web_table`), `destroy-unattached`. So the browser shows the bare
+pane, and rlord's navigation keys and the user's tmux profile can't move
+it elsewhere. The plugin sweeps leftover views at start
+(`sweep_views`). Elsewhere, views are invisible or follow their target:
+`list_clients` drops view clients, `kill_session` kills a target's views
+first, and `send::user_active` and the overlord's idle check count a
+browser through tmux's own client activity. Opening a pane never starts
+anything (a stopped session shows Resume). The window takes the size of
+the latest active client (`window-size latest`); the page keeps a pane
+open only while its view is visible.
+
+**The page** (`crates/web/ui/`): TypeScript, Preact with signals and
+xterm.js 6, built by Vite into `dist/`, which `crates/web/build.rs` embeds
+(a placeholder page without it; `RLORD_WEB_REQUIRE_ASSETS=1` makes that an
+error). Node is needed to build the page, never to install or run rlord.
+`cargo xtask web install|check|build|watch` runs the pinned tools from
+`node_modules/.bin` (`npm ci --ignore-scripts`). The page's types are
+hand-written in `src/proto.ts` and held to the daemon by tests: a snapshot
+fixture (`test/fixtures/snapshot.json`, checked by `web_api.rs`) and the
+ops list. The release workflow builds the page once in its own job
+(`web-assets`) and hands it to the build jobs as `RLORD_WEB_DIST`.
+
+The overlord knows nothing of the web UI: a web-only user's `goto` or
+`show_list` fails as it does with no terminal attached. Remote access (an
+end-to-end encrypted relay, a phone app) is planned in
+`docs/working/web-ui-remote.md` and `docs/working/e2e-crypto.md`.
 
 ## rlord's private tmux server (2026-11-10)
 

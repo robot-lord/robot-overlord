@@ -687,6 +687,56 @@ see that setting, so a session that never connects is reported as such
 after a few tries. While connected, the conversation is also stored on
 Anthropic's servers.
 
+## The web UI
+
+rlord can show the list, the overlord and any session in your browser, on
+this machine only. It's an opt-in plugin, `rlord-web`, that rlord doesn't
+ship with:
+
+```sh
+rlord web            # the first time: asks, installs the plugin, then opens the browser
+rlord web install    # just install it (--yes: don't ask)
+rlord web url        # the link, to open yourself
+rlord web status     # installed? running? on which port?
+rlord web stop       # stop it (rlord web starts it again)
+rlord web new-token  # a new link: the old one stops working, open pages disconnect
+rlord web remove     # delete the plugin and its token
+```
+
+- **Installing** downloads the plugin for your rlord's version from the
+  same GitHub release (`gh` when it's logged in, else `curl`) and checks it
+  against a SHA-256 built into rlord: rlord only ever runs the exact
+  plugin it was released with. `rlord update` updates an installed plugin
+  along with rlord; after `brew upgrade` or a newer package, run `rlord
+  web install` again (`rlord web` says so). Release installs only (get.sh, Homebrew, `.deb`,
+  `.rpm`): a `cargo install` or a build from source runs an `rlord-web` it
+  finds beside itself (`cargo build -p robot-overlord-web`).
+- **It listens on `127.0.0.1` only** (port 47811), so only this machine can
+  reach it. The link `rlord web` opens carries a token, and anyone with the
+  link can drive your sessions as you do: keep it private, and
+  `rlord web new-token` if it leaks. The browser remembers it, so later
+  visits to `http://127.0.0.1:47811/` need no token.
+- **It runs with the daemon.** `rlord web` starts it until the daemon
+  stops; to start it with the daemon every time:
+
+  ```toml
+  [web]
+  enabled = true
+  port = 47811   # another, if that one is taken
+  ```
+
+- **What it does:** the list (tabs, groups, filter, sort, archived), the
+  overlord's pane and any session's pane, live; a box to tell the overlord
+  something; and a session's buttons: Resume, Restart, Stop, Archive and
+  Unarchive, Pin, and Edit (name, description, tags, notes). Pick another
+  agent in the overlord's view to switch the overlord to it. Panes are the
+  real ones: what you type goes to the agent, and the same session can be
+  open in a terminal at the same time (the window takes the size of
+  whichever was used last). Opening a stopped session never starts it:
+  press Resume.
+- New sessions, forks and setup are terminal-only for now, and the
+  overlord's `goto` and view commands act on a terminal, not the browser.
+
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated

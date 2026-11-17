@@ -124,6 +124,19 @@ impl Version {
         format!("rlord-{}-{}", self.tag(), target.triple)
     }
 
+    /// `rlord-web-v<ver>-<target>.tar.gz`: the opt-in web plugin and its
+    /// licenses (`rlord web install` downloads it; `plugin::tarball_stem`
+    /// in rlord-core names it the same way).
+    pub fn web_tarball(&self, target: Target) -> String {
+        format!("{}.tar.gz", self.web_tarball_stem(target))
+    }
+
+    /// The plugin tarball's name without `.tar.gz`: also its top-level
+    /// folder.
+    pub fn web_tarball_stem(&self, target: Target) -> String {
+        format!("rlord-web-{}-{}", self.tag(), target.triple)
+    }
+
     pub fn deb(&self, target: Target) -> String {
         format!("rlord_{}-1_{}.deb", self.package_version(), target.deb_arch)
     }
@@ -132,12 +145,19 @@ impl Version {
         format!("rlord-{}-1.{}.rpm", self.package_version(), target.rpm_arch)
     }
 
-    /// The three tarballs every stable release has.
+    /// The tarballs every stable release has: rlord's and the web
+    /// plugin's, for each target.
     pub fn tarballs(&self) -> Vec<String> {
-        std::iter::once(MAC)
-            .chain(LINUX)
+        let targets = || std::iter::once(MAC).chain(LINUX);
+        targets()
             .map(|t| self.tarball(t))
+            .chain(targets().map(|t| self.web_tarball(t)))
             .collect()
+    }
+
+    /// What a development build (macOS only) uploads, SHA256SUMS aside.
+    pub fn dev_assets(&self) -> Vec<String> {
+        vec![self.tarball(MAC), self.web_tarball(MAC)]
     }
 
     /// Every file the release workflow builds (SHA256SUMS aside).
@@ -328,6 +348,17 @@ mod tests {
             s.tarball_stem(LINUX[0]),
             "rlord-v1.0.0-x86_64-unknown-linux-musl"
         );
+        assert_eq!(
+            s.web_tarball(MAC),
+            "rlord-web-v1.0.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            v("0.23.0-dev.8").dev_assets(),
+            [
+                "rlord-v0.23.0-dev.8-aarch64-apple-darwin.tar.gz",
+                "rlord-web-v0.23.0-dev.8-aarch64-apple-darwin.tar.gz",
+            ]
+        );
         assert_eq!(s.deb(LINUX[0]), "rlord_1.0.0-1_amd64.deb");
         assert_eq!(s.deb(LINUX[1]), "rlord_1.0.0-1_arm64.deb");
         assert_eq!(s.rpm(LINUX[0]), "rlord-1.0.0-1.x86_64.rpm");
@@ -338,6 +369,9 @@ mod tests {
                 "rlord-v1.0.0-aarch64-apple-darwin.tar.gz",
                 "rlord-v1.0.0-x86_64-unknown-linux-musl.tar.gz",
                 "rlord-v1.0.0-aarch64-unknown-linux-musl.tar.gz",
+                "rlord-web-v1.0.0-aarch64-apple-darwin.tar.gz",
+                "rlord-web-v1.0.0-x86_64-unknown-linux-musl.tar.gz",
+                "rlord-web-v1.0.0-aarch64-unknown-linux-musl.tar.gz",
                 "rlord_1.0.0-1_amd64.deb",
                 "rlord_1.0.0-1_arm64.deb",
                 "rlord-1.0.0-1.x86_64.rpm",

@@ -82,6 +82,9 @@ session from last week decide? rlord is built around a few ideas:
   rlord.
 - **Remote Control.** Pick a Claude Code session up from the Claude app on
   your phone while it keeps running at your desk.
+- **A web UI, if you want one.** `rlord web` installs an opt-in plugin
+  that shows the list, the overlord and every session in your browser, on
+  this machine only (`127.0.0.1`).
 - **macOS and Linux.**
 
 ## Install
@@ -199,7 +202,7 @@ The [user guide](docs/guide.md) covers each part in detail;
 Everything is optional. `rlord config init` writes a commented
 `~/.config/robot-overlord/config.toml`: layout, theme, keys, what the
 Usage column shows, the default agent for new sessions, the overlord's
-agent, model and effort, archive summaries, update channel. Standing instructions for the
+agent, model and effort, archive summaries, update channel, the web UI. Standing instructions for the
 overlord go in `~/.config/robot-overlord/overlord.md`.
 
 ## Updating

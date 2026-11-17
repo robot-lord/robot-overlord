@@ -9,6 +9,7 @@
 
 mod build;
 mod bump;
+mod check_deps;
 mod cmd;
 mod demo_wrap;
 mod dev_daemon;
@@ -21,6 +22,7 @@ mod smoke;
 mod tap;
 mod tools;
 mod version;
+mod web;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -37,6 +39,10 @@ usage: cargo xtask <task>
       the Linux build's packaging tools, pinned, into target/release-tools
   smoke-linux DIST [IMAGE…]
       install DIST with get.sh in Linux containers and run a few commands
+  check-deps
+      fail if the rlord binary depends on network code (the web plugin's)
+  web install|check|build|watch
+      the web plugin's page (crates/web/ui): install its pinned tools, check, build
   check-version-bump [BASE] [REV]
       fail unless REV bumps the version above BASE's (origin/main, HEAD)
   update-tap VERSION SHA256SUMS [TAP_REPO]
@@ -91,6 +97,8 @@ fn main() -> ExitCode {
         "smoke-linux" => smoke::main(rest, &invoked_from),
         "dev-daemon" => dev_daemon::main(rest),
         "check-version-bump" => bump::main(rest),
+        "check-deps" => check_deps::main(rest),
+        "web" => web::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
