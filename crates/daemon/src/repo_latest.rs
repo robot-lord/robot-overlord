@@ -253,15 +253,19 @@ impl Latest {
             .wait_timeout_while(map, wait, |m| m.get(key).is_some_and(|s| s.running))
             .unwrap_or_else(|e| e.into_inner())
             .0;
-        let slot = map.entry(key.to_string()).or_default();
+        // (Forgotten meanwhile, its refs deleted: its outcome is gone with
+        // it, so nothing can be said of it; never `cached`.)
+        let Some(slot) = map.get_mut(key) else {
+            return Fetch::Failed("the fetch's outcome was dropped with its refs".into());
+        };
         if slot.running {
             return Fetch::Running;
         }
         slot.unseen = false;
-        slot.last
-            .as_ref()
-            .map(|(_, f)| f.clone())
-            .unwrap_or(Fetch::Cached)
+        match &slot.last {
+            Some((_, f)) => f.clone(),
+            None => Fetch::Failed("the fetch left no outcome".into()),
+        }
     }
 }
 
@@ -621,6 +625,7 @@ fn resolve(
             // (Recorded even when nothing answered: not asked again soon.)
             if failed && found.is_err() {
                 update(d, &key_of(repo), |r| {
+                    r.root = repo.root.to_string_lossy().into_owned();
                     r.ls_failed_at = now;
                     true
                 });
@@ -1696,7 +1701,11 @@ pub fn sweep(d: &Daemon) -> Value {
             let rec = record(d, &key);
             let env = d.latest.env();
             let keep = rec.branch.clone().unwrap_or_default();
-            let dropped = drop_old_refs(&env, Path::new(&root), &rec, None, &keep);
+            // (The tree's own ref is kept by `<remote>/<branch>`.)
+            let remote = latest::remote_of(&env, Path::new(&root))
+                .ok()
+                .and_then(|r| r.ok());
+            let dropped = drop_old_refs(&env, Path::new(&root), &rec, remote.as_deref(), &keep);
             if !dropped.is_empty() {
                 d.latest.forget(&format!("{key}\0"));
                 update(d, &key, |r| {
@@ -2815,7 +2824,10 @@ mod tests {
         let d = daemon(&r);
         let b = launch_base(&d, &json!({"repo": c, "name": "x"})).unwrap();
         assert_eq!(b["head"], true, "{b}");
-        assert!(record(&d, &key(c)).ls_failed_at > 0);
+        let rec = record(&d, &key(c));
+        assert!(rec.ls_failed_at > 0);
+        // (Never a record without its repo's root.)
+        assert_eq!(rec.root, c.to_string_lossy());
     }
 
     /// An unseen failure of a named branch older than `named_retry` is
@@ -3214,6 +3226,31 @@ mod tests {
         sweep(&d);
         assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "main")).is_none());
         assert!(record(&d, &key(c)).fetched.is_empty());
+    }
+
+    /// The sweep keeps the tree's own private ref (by remote and branch)
+    /// however old, and drops the others.
+    #[test]
+    fn the_sweep_keeps_the_trees_own_ref() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        call(&d, c, json!({}));
+        let head = r.g(c, &["rev-parse", "HEAD"]);
+        r.g(
+            c,
+            &["update-ref", &latest::private_ref("origin", "feat"), &head],
+        );
+        update(&d, &key(c), |rec| {
+            rec.fetched.insert("origin/feat".into(), 1);
+            for at in rec.fetched.values_mut() {
+                *at = 1;
+            }
+            true
+        });
+        sweep(&d);
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "main")).is_some());
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "feat")).is_none());
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

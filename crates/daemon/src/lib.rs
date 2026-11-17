@@ -236,6 +236,9 @@ impl Daemon {
     pub fn bind_nav_keys(&self) {
         let cfg = self.config();
         let bindings = cfg.tmux.bindings();
+        if let Some(why) = cfg.session.base_problem() {
+            tracing::warn!("{why}: change it in config.toml");
+        }
         if let Some(verb) = cfg.tmux.switch_overlap() {
             tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
                 "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");

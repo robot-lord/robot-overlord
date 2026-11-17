@@ -622,6 +622,14 @@ impl NewForm {
             .to_string()
     }
 
+    /// The base the user (or the overlord) typed, when it can count: a
+    /// worktree on, not a plain folder.
+    fn typed_base(&self) -> Option<&str> {
+        let b = self.base.trim();
+        (!b.is_empty() && self.workspace && !matches!(self.location, Location::Folder(_)))
+            .then_some(b)
+    }
+
     /// A key typed in the Base field: a character added, or (None) the
     /// last one taken away. A side chosen for the old base (`prefer`)
     /// isn't for the new one: cleared.
@@ -1267,8 +1275,8 @@ impl App {
             "workspace": f.workspace,
             // Empty: the configured default, sent as one (not chosen), so
             // it never overrides `[session] base`.
-            "base": if f.base.trim().is_empty() { f.default_base.as_str() } else { f.base.trim() },
-            "prefer": if f.base.trim().is_empty() || f.prefer.is_empty() { None } else { Some(f.prefer.as_str()) },
+            "base": f.typed_base().unwrap_or(f.default_base.as_str()),
+            "prefer": if f.typed_base().is_none() || f.prefer.is_empty() { None } else { Some(f.prefer.as_str()) },
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
             // The overlord's resolved values the user left as they were.
@@ -1322,8 +1330,9 @@ impl App {
             "model": f.model,
             "workspace": f.workspace,
             "branch": if f.branch.trim().is_empty() { None } else { Some(f.branch.trim()) },
-            "base": if f.base.trim().is_empty() { None } else { Some(f.base.trim()) },
-            "prefer": if f.prefer.is_empty() || f.base.trim().is_empty() { None } else { Some(f.prefer.as_str()) },
+            // (A base only for a new branch in a worktree.)
+            "base": f.typed_base(),
+            "prefer": if f.prefer.is_empty() || f.typed_base().is_none() { None } else { Some(f.prefer.as_str()) },
         });
         match &f.location {
             Location::Repo(p) => params["repo"] = json!(p),
@@ -2157,6 +2166,28 @@ mod tests {
         answer(&mut app, Ok(json!({"id": "x1", "name": "n"})));
         assert!(app.poll_launch());
         assert_eq!(app.pending_select.as_deref(), Some("x1"));
+    }
+
+    /// A typed base counts only with a worktree in a repo.
+    #[test]
+    fn a_typed_base_needs_a_worktree() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.open_new_form(FormKind::Manual);
+        let mut f = match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        };
+        f.location = Location::Repo("/r".into());
+        f.workspace = true;
+        f.base = "feat".into();
+        assert_eq!(f.typed_base(), Some("feat"));
+        f.workspace = false;
+        assert_eq!(f.typed_base(), None);
+        f.workspace = true;
+        f.location = Location::Folder("/d".into());
+        assert_eq!(f.typed_base(), None);
     }
 
     /// A side chosen for a proposed base goes when the base is edited.

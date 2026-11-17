@@ -2058,8 +2058,17 @@ fn latest_cmd(
                 f["error"].as_str().unwrap_or("")
             );
         }
+        if v["failed"].as_array().is_some_and(|f| !f.is_empty()) {
+            anyhow::bail!("some trees could not be removed");
+        }
     } else if v["git"] == false {
         println!("{} (not a git repo)", v["path"].as_str().unwrap_or("?"));
+    } else if v["tree"] == "preparing" {
+        eprintln!(
+            "rlord's tree for {} is still being made: run this again shortly",
+            v["repo"].as_str().unwrap_or("the repo")
+        );
+        anyhow::bail!("the tree isn't ready yet");
     } else if v["diverged"] == true {
         let side = |s: &Value| {
             format!(
