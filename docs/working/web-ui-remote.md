@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1 steps 1–2 being built; server placement being redesigned)
+**Status:** in progress (slice 1: steps 1–2 built; steps 3–14 replanned for the plugin shape, not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -80,8 +80,8 @@ Decided 2026-11-17 (user):
   session state first, live pane streaming over a relayed channel after.
 - **Key model:** per-device keys with a Noise handshake; the QR carries
   rlord's public key and a one-time pairing secret.
-- **First slice:** the local web UI, served by the rlord daemon on
-  localhost. No relay yet.
+- **First slice:** the local web UI on localhost. No relay yet. (First
+  planned inside the daemon; now an opt-in plugin, see the slice 1 plan.)
 
 ## Progress
 
@@ -90,9 +90,8 @@ Decided 2026-11-17 (user):
 - 2026-11-17, user: the web server will not live in the daemon. It becomes
   a separate opt-in executable (a plugin, downloaded only on opt-in); the
   main `rlord` binary keeps a thin `rlord web` command and no HTTP,
-  websocket or network code. The plan below still puts it in the daemon
-  (steps 3 to 12) and needs revising before those steps. Steps 1 and 2
-  (tmux and `send.rs`, in core/daemon) stand.
+  websocket or network code. Steps 1 and 2 (tmux and `send.rs`, in
+  core/daemon) stand.
 - Step 1 done: the view session holds on tmux 3.8 (macOS), 3.2a (Ubuntu
   22.04) and 3.4 (Ubuntu 24.04, CI's). All seven behaviours pass
   (`crates/daemon/tests/web_tmux.rs`, gated, socket `rlord-test-web`). The
@@ -120,70 +119,266 @@ Decided 2026-11-17 (user):
   - Owed to the bridge: call `bind_web_table` before attaching a view
     (root changes on reload and goes with the server), and
     `sweep_views` on its start. Neither is called by the daemon.
+- Slice 1 replanned for the plugin (Fable planning agent, 2026-11-17):
+  `rlord-web` in `crates/web`, supervised by the daemon, verified by a
+  hash compiled into `rlord`; TypeScript 7, Vite 8, Preact 11 and
+  xterm.js 6. Steps 3 to 14 below replace the old 3 to 12; eight open
+  questions wait for the user.
 
-## Slice 1 plan: local web UI
+## Slice 1 plan: local web UI, as an opt-in plugin
 
-Planned 2026-11-17. Nothing here is built. The tmux behaviours marked
-"verify" were reasoned from tmux's documentation and source, not run:
-step 1 proves them on a scratch socket before anything depends on them.
+Planned 2026-11-17, revised the same day for the plugin shape (the user's
+changes are recorded under "Answers and changes"). Steps 1 and 2 are built;
+nothing from step 3 on is. Version numbers below were read from the npm
+registry, crates.io and nodejs.org on 2026-11-17, not from memory.
 
 ### Decisions
 
-#### Where it lives, how it starts, how the user opens it
+#### Shape: two executables
 
-- **In the daemon process**, as a module tree in the daemon crate:
-  `crates/daemon/src/web/`. Not a subcommand process and not a new crate.
-  The daemon already knows the active overlord and when it switches, owns
-  the change broadcast (`Daemon::changed`), and holds the session locks the
-  pane bridge must respect. A module keeps `pub(crate)` access to `Daemon`
-  and adds nothing to the crates.io publish list (`xtask/src/publish.rs`).
-  Embedded assets must sit inside the crate directory, because
-  `cargo publish` packages only that.
-- Layout:
-  - `web/mod.rs`: lifecycle (`Web` state on `Daemon`, `start`, `stop`,
-    `status`), the token.
-  - `web/api.rs`: the message layer. No HTTP or websocket types in it.
-  - `web/http.rs`: axum routes, Host/Origin checks, headers, static files.
-  - `web/pane.rs`: the PTY bridge, view sessions, the registry of open
-    panes.
-  - `web/assets.rs` and `web/assets/`: the embedded page, scripts, styles
-    and vendored xterm.js.
-- **Off by default.** The daemon has never opened a TCP port
-  (`docs/architecture.md`, "Internal API"); doing so silently on upgrade
-  changes its security posture. Config:
+- **`rlord` (core, daemon, tui, CLI) has no HTTP, websocket or TCP code and
+  no such dependency.** It gains: a `[web]` config section, a daemon module
+  that answers the plugin over the Unix socket and supervises it as a child
+  process, a `rlord web` command, and a compiled-in install script.
+- **`rlord-web` is the plugin**: a separate executable holding the HTTP
+  server, websockets, PTY bridge and embedded page. Later it also carries
+  the E2E relay client. It is never in the `rlord` tarball, the deb, the
+  rpm, the Homebrew formula or crates.io. A user who has not opted in has
+  no file on disk that can send a session anywhere.
+- **Split of work.** Whatever needs the daemon's state stays in the daemon
+  and is reached over the socket. Whatever touches a network socket is in
+  the plugin. The tmux view helpers stay in `rlord_core::tmux` (built); the
+  plugin calls them directly, on the same tmux server.
+
+| Concern | Where |
+| --- | --- |
+| Op allow-list, `snapshot`, `rev`, change stream, pane target lookup | daemon, `crates/daemon/src/web.rs` |
+| Start, stop, restart of the plugin; `web.status` | daemon, same module |
+| Plugin path, hash check, protocol version, `[web]` config | `crates/core/src/plugin.rs`, `config.rs` |
+| Opt-in prompt, download, open browser | `crates/rlord/src/main.rs` + `crates/rlord/web-install.sh` |
+| Token, HTTP, websockets, headers, limits, PTY bridge, assets | plugin, `crates/web/` |
+
+#### Crate layout and keeping the main binary clean
+
+- New workspace member `crates/web`: package `robot-overlord-web`,
+  `publish = false`, `[[bin]] name = "rlord-web"`. In `members`, not in
+  `default-members`, so a plain `cargo build` or `cargo test` at the root
+  is unchanged; `--workspace` (CI) includes it.
+- It depends on `rlord-core` only (paths, config, `private::write`, tmux
+  helpers, `plugin.rs`). It does not depend on `rlord-daemon` (that would
+  pull SQLite into the plugin); it has its own small async client for the
+  socket's newline-delimited JSON. `rlord-daemon` is a dev-dependency, for
+  integration tests against an in-memory `Daemon`.
+- Its own dependencies: `axum` 0.8 with `ws` (hyper 1, tokio-tungstenite),
+  `tokio`, `serde`, `serde_json`, `libc` (`openpty`, as the step 1 test
+  does; no PTY crate), `subtle` (constant-time compare). `sha2` goes in
+  `rlord-core` (hash check; not network code).
+- No crate under `crates/{core,daemon,tui,rlord}` depends on
+  `robot-overlord-web`. Release builds use `cargo build -p <package>`, one
+  invocation per binary, so the plugin's dependency features never unify
+  into `rlord`.
+- **Guard: `cargo xtask check-deps`** (run by CI's `check` job and by
+  `build-release`). It fails when `cargo tree -p robot-overlord -e
+  normal,build` names a crate on a deny list (`axum`, `hyper`, `h2`,
+  `http`, `tungstenite`, `tokio-tungstenite`, `rustls`, `native-tls`,
+  `reqwest`, `ureq`, `curl`, `robot-overlord-web`), or when
+  `TcpListener`, `TcpStream` or `UdpSocket` appears in the source of the
+  four main crates.
+- Stated plainly: tokio's `net` feature is already on in the main binary
+  for Unix sockets, and it compiles tokio's TCP types too. They are unused
+  and the guard keeps them unused; tokio has no feature that gives Unix
+  sockets alone. `rlord update` also already downloads, by running `curl`
+  or `gh` from a compiled-in script. The plugin download works the same
+  way, so the main binary still links no network client.
+- `crates/web` is not added to `version::CRATES` or to
+  `xtask/src/publish.rs`.
+
+#### Opt-in, install and verification
+
+- **Opt-in is an explicit act.** `rlord web` with no plugin installed says
+  what will happen (the file and version it downloads and from where, that
+  it opens a listener on `127.0.0.1` only, that `rlord web remove` undoes
+  it) and asks `[y/N]`. Without a terminal it fails and names
+  `rlord web install --yes`. Nothing else installs the plugin: not the
+  daemon, not `rlord update`, not a config key.
+- **Where it comes from.** The same GitHub release as the running `rlord`
+  (tag `v<own version>`), a second tarball per target:
+  `rlord-web-v<version>-<target>.tar.gz` (the binary, both licenses, and
+  `THIRD-PARTY-LICENSES` for the bundled npm packages).
+- **Install location.** `<data dir>/plugins/rlord-web` (0700 directory,
+  0755 file), written with copy-then-rename as `install.sh` does. Not on
+  `PATH`: nobody runs it by hand. The same place for every install method
+  (get.sh, Homebrew, deb, rpm), since the plugin is per user.
+- **Verification: the hash of the plugin is compiled into `rlord`.** The
+  release build makes `rlord-web` first, signs it (macOS ad-hoc), takes
+  the SHA-256 of the executable and builds `rlord` with
+  `RLORD_WEB_SHA256=<hex>` (`option_env!` in `core/src/plugin.rs`; `rlord`
+  is built per target, so one hash each). The trust root is the `rlord`
+  the user already runs: a swapped release asset, a tampered
+  `SHA256SUMS` or a compromised download path cannot produce a plugin this
+  `rlord` will start. No signing key to hold or lose.
+  - The script downloads the tarball and `SHA256SUMS` (with `gh` when
+    logged in, else `curl`, as `update.sh`), checks the tarball against
+    `SHA256SUMS` (catches a broken download early), and unpacks to a temp
+    directory. `rlord` then hashes the unpacked executable in Rust
+    (`plugin::verify`) and only then moves it into place.
+  - The daemon runs `plugin::verify` again before every spawn. A plugin
+    left over from another version therefore never starts; that check is
+    also the version match.
+  - When `gh` is present and the release is stable, the script also runs
+    `gh attestation verify` on the tarball (stable releases carry build
+    provenance). Extra evidence; not required, since dev builds have none.
+- **A build with no compiled-in hash** (a checkout's `cargo build`, or
+  `cargo install robot-overlord` from crates.io) never downloads. It uses
+  `RLORD_WEB_BIN`, or an `rlord-web` next to its own executable
+  (`target/debug/`), unverified, and says so. For crates.io installs
+  `rlord web` says the plugin comes with release installs (open
+  question 2).
+- **Updates.** `update.sh` ends with `rlord web install --if-installed`:
+  silent when the user never opted in, otherwise it fetches the plugin for
+  the new version. If that fails (offline), the old plugin fails
+  `plugin::verify`, the daemon does not start it, and `rlord web` and
+  `rlord web status` say to run `rlord web install`.
+- **Removal.** `rlord web remove` stops the plugin, deletes it and
+  `web.token`, and sets `enabled = false`.
+
+#### Compatibility handshake
+
+- `rlord_core::plugin::WEB_PROTOCOL: u32`, bumped whenever a `web.*` method
+  the plugin uses changes shape.
+- The plugin's first call is `web.hello {protocol, version, pid, port}`.
+  The daemon answers `{protocol, version}` and refuses a different
+  protocol with a typed error; the plugin then exits with code 3, which the
+  daemon does not retry.
+- Release installs are held to the exact build by the hash. The protocol
+  number is what lets a checkout's plugin run against a checkout's daemon
+  a few commits apart, and gives a clear message instead of a parse error.
+- The page gets a build id (version plus a hash of the asset table) in
+  `hello` on the control websocket; a page from another build reloads.
+
+#### How it starts, stops and is supervised
+
+- **The daemon runs the plugin as a child process.** No launchd or systemd
+  unit of its own, no detached process to track.
+- Config, read by both sides:
 
   ```toml
   [web]
-  enabled = false   # true: start the listener with the daemon
+  enabled = false   # true: the daemon starts the plugin when it starts
   port = 47811      # 127.0.0.1 only; 0 = any free port
   ```
 
   A fixed port matters: the browser stores the token per origin, and the
-  origin includes the port.
-- **Start and stop.** `web::start` runs in `run_daemon`
-  (`crates/rlord/src/main.rs`) when `enabled`. Otherwise the first
-  `rlord web` starts it for this daemon run. The listener shuts down
-  gracefully on `web.stop` and with the daemon. A port already in use is
-  logged and reported by `web.status`; it never stops the daemon. A config
-  change applies on the next daemon start or `rlord web`.
-- **Opening it.** New CLI command:
-  - `rlord web`: start if needed, open the browser at the token URL
-    (`open` on macOS, `xdg-open` elsewhere), print the URL if that fails.
-  - `rlord web --print`: print the URL only.
-  - `rlord web --stop`: stop the listener.
-  - `rlord web --new-token`: replace the token and close every open web
-    connection.
-  These call new daemon methods `web.status`, `web.start`, `web.stop`,
-  `web.rotate` over the Unix socket (in `Daemon::call_ui`, own locking).
-  They are never reachable from the web API or MCP. A `:web` command in
-  the list is the last, optional step.
+  origin includes the port. Installing does not set `enabled`.
+- **Start.** With `enabled` and a verified plugin, at daemon start.
+  Otherwise the first `rlord web` starts it for this daemon run
+  (`web.start`). The daemon spawns `rlord-web serve` with the daemon's
+  environment (so the socket, data dir and `RLORD_TMUX_SOCKET` match),
+  output appended to `<data dir>/web.log`. `web.start` returns when the
+  plugin's `web.hello` arrives (5 second limit) with the port it bound.
+- **Stop.** `web.stop`, and daemon exit: SIGTERM, then SIGKILL after 2
+  seconds. The plugin also exits when its subscription to the daemon ends,
+  so a daemon that crashed leaves no listener behind.
+- **Restart.** An unexpected exit is retried with backoff (1 s doubling to
+  60 s; stop after five failures in a row). Exit code 3 (incompatible) and
+  4 (port in use) are not retried. `web.status` reports state, pid, port,
+  the last error line and why it isn't running (not installed, hash
+  mismatch, port in use). A failure never stops the daemon.
+- **A daemon restart restarts the plugin**, so open panes drop and the page
+  reconnects (the token file persists). Accepted, as in the first plan
+  (open question 5).
+- **On its own start** the plugin calls `tmux::sweep_views()`, and before
+  attaching each view `tmux::bind_web_table()` (both owed from step 2).
+
+#### The `rlord web` command
+
+Subcommands replace the first plan's flags; there are more verbs now.
+
+- `rlord web`: opt in if needed, start if needed, open the browser at the
+  token URL (`open` on macOS, `xdg-open` elsewhere), print the URL if that
+  fails.
+- `rlord web url`: start if needed, print the URL only.
+- `rlord web status`: installed or not, running or not, port, last error.
+- `rlord web start` / `stop`.
+- `rlord web new-token`: delete the token and restart the plugin, which
+  closes every open web connection.
+- `rlord web install [--yes] [--if-installed] [--from DIR]` (`--from`: a
+  local folder of release files, for the smoke tests; still hash-checked)
+  and `rlord web remove`.
+
+The CLI composes the URL from `web.status` (port) and the token file. It
+calls `web.status`, `web.start`, `web.stop`, `web.rotate` over the Unix
+socket (`Daemon::call_ui`). Those four and `web.hello` are never on the
+allow-list below, and never reachable from MCP. A `:web` command in the
+list is the last, optional step.
+
+#### Daemon RPC additions (`crates/daemon/src/web.rs`)
+
+No HTTP types; this is the old plan's `web/api.rs`, now on the daemon side
+of the socket. The relay client will use the same four calls.
+
+- **`web.hello`**: above.
+- **`web.call {op, args}`**: the only way a browser request reaches the
+  daemon. `op` comes from a fixed allow-list mapped to daemon methods, not
+  a pass-through; `admin.*`, `mcp.*`, `hook.*`, `web.*`, `config.*`,
+  `ui.*`, `tmux.*` and `setup.*` are off it. The list lives in the daemon,
+  the always-installed and smaller side, so a parsing bug in the plugin
+  can't reach a method the web was never meant to have. (It is not a
+  boundary against a hostile local process, which can call the socket
+  itself, as today.)
+- **Op `snapshot {view, rev}`**: everything the list needs in one answer
+  (rows for the asked view, the same query object as `session.list`;
+  status labels; groups with counts and favourites; active overlord and
+  roster) and a `rev`. A client passing the current `rev` gets
+  `{"unchanged": true}`. Grouping, sorting and labels are computed in
+  Rust; the page only draws.
+- **`rev`** is `"<boot id>-<n>"`: a random id per daemon start plus a
+  counter that `Daemon::changed()` increments. Cheap, and never repeats
+  across a restart.
+- **`web.subscribe`**: takes over the connection as `events.subscribe`
+  does (shared loop), then sends `{"notify":"changed","rev":"…"}` at most
+  once per 100 ms; a lagged receiver counts as a change. It is not counted
+  as a TUI subscriber and gets no `ui` commands in this slice.
+- **`web.pane_target {target}`**: `overlord` resolves to
+  `overlord::session`, anything else through `resolve_ref`. Returns the
+  tmux session name and whether it is running. It starts nothing.
+- **No web-input reporting**: `send::user_active` already counts a
+  browser through tmux's own client activity (step 2).
+
+| Layer | Slice 1 | Relay later |
+| --- | --- | --- |
+| Requests + events | browser ⇄ plugin: one control websocket, JSON text frames; plugin ⇄ daemon: `web.call`, `web.subscribe` | the mailbox; `changed` + `rev` is the "anything for me?" signal |
+| Pane messages | one websocket per pane; binary = bytes, text = control | the relayed live channel, same messages in Noise frames |
+| Auth | token in the first frame | Noise handshake as the first frames |
+
+Browser-side messages are unchanged from the first plan: requests
+`{"id","op","args"}` answered by `{"id","ok"}` or `{"id","error":{"code",
+"message"}}`; events `{"event":"changed","rev"}`; pane messages
+`Open {target, cols, rows}`, `Input(bytes)`, `Resize`, `Close` in and
+`Opened`, `Output(bytes)`, `Closed {reason}` out.
+
+#### The plugin (`crates/web/src/`)
+
+- `main.rs`: `serve` and `--version`; exit codes.
+- `daemon.rs`: the async socket client (`hello`, `call`, `subscribe`).
+- `token.rs`: the token file.
+- `http.rs`: axum routes, Host and Origin checks, headers, limits, the
+  control websocket.
+- `pane.rs`: the PTY bridge (`openpty`, tokio `AsyncFd`), view sessions,
+  the pane websocket.
+- `assets.rs` + `build.rs`: the embedded page.
+- `ui/`: the TypeScript client (below).
 
 #### Auth, headers, assets
 
+The reviewed design stands. Only its owner changed: all of it is in the
+plugin.
+
 - **Bind** `127.0.0.1` only (not `::1`, not `0.0.0.0`).
-- **Token.** 32 random bytes from `/dev/urandom`, hex. Stored in
-  `<data dir>/web.token` with `rlord_core::private::write` (0600), reused
-  across restarts so open pages reconnect.
+- **Token.** 32 random bytes from `/dev/urandom`, hex. The plugin creates
+  `<data dir>/web.token` with `rlord_core::private::write` (0600) when it
+  is missing and reuses it across restarts so open pages reconnect. The
+  CLI only reads it.
 - **No cookies.** Cookies for `127.0.0.1` are shared by every port, so any
   other local web server the browser visits would receive ours. The token
   travels in the URL fragment: `http://127.0.0.1:<port>/#t=<token>`. A
@@ -209,21 +404,22 @@ step 1 proves them on a scratch socket before anything depends on them.
     `Cross-Origin-Opener-Policy: same-origin`,
     `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: no-store`.
   `style-src 'unsafe-inline'` only because xterm.js creates `<style>`
-  elements at run time. Scripts stay strict.
+  elements at run time (to re-check against xterm.js 6 in step 10; drop it
+  if 6 no longer needs it). Scripts stay strict: the build must emit no
+  inline script, and a test checks the built `index.html`.
 - **Limits**: 16 control sockets, 32 pane sockets, 64 KiB per pane input
   frame, 1 MiB per control frame.
-- **Assets embedded** with `include_bytes!`, from a fixed table (path,
-  content type, bytes). No CDN. `RLORD_WEB_ASSETS=<dir>` reads them from
-  disk for development.
-- **xterm.js vendored**: `@xterm/xterm` 5.5.0 and `@xterm/addon-fit` 0.10.0
-  (the spike's versions), minified `xterm.js`, `xterm.css`, `addon-fit.js`
-  plus `LICENSE`, under `crates/daemon/src/web/assets/vendor/xterm/`. MIT,
-  compatible with `MIT OR Apache-2.0`. `cargo xtask vendor-web` downloads
-  the npm tarballs at pinned versions and checks pinned SHA-512 sums (in
-  `xtask/src/tools.rs`). A test checks committed files against the sums.
-  No npm, no bundler.
+- **Assets embedded.** `build.rs` walks `crates/web/ui/dist/` and writes a
+  table (path, content type, `include_bytes!`); file names carry content
+  hashes, so no hand-kept list. No CDN, no outside URL. With no `dist/`
+  (a Rust-only build or CI's `check` job) it embeds a one-line page naming
+  `cargo xtask web build`; with `RLORD_WEB_REQUIRE_ASSETS=1` (set by
+  `build-release`) a missing `dist/` is an error. Debug builds read
+  `RLORD_WEB_ASSETS=<dir>` from disk instead, for development.
 
 #### Pane streaming: a tmux client per view, through a view session
+
+Unchanged, and proven in steps 1 and 2. The bridge now runs in the plugin.
 
 **Chosen: the spike's bridge (one tmux client on a PTY per websocket),
 attached to a throwaway grouped session instead of the target itself.**
@@ -234,39 +430,28 @@ Rejected:
   But the bridge would rebuild terminal state for a view joining
   mid-stream (alternate screen, cursor-key mode, mouse modes, bracketed
   paste), decode `%output`, re-encode input via `send-keys -H`, and add
-  flow control. The daemon has no control-mode client today.
+  flow control.
 - **capture-pane frames plus `send-keys`** (the TUI overlay,
   `tmux::capture_frame`). A browser terminal sends raw bytes, not named
   keys; scrollback and mouse need hand-written handling again; whole-screen
   frames are the wrong shape for a relayed byte channel.
 
-The view session:
+The view session (`tmux::view_command`, `VIEW_PREFIX`, `WEB_TABLE`):
 
 - Per pane websocket, one tmux command in the PTY creates a session
-  grouped with the target and attaches: `new-session -t <target> -s
-  webview-<n>`, then in the same invocation `set-option status off`,
-  `set-option key-table rlord-web`, `set-option destroy-unattached on`.
+  grouped with the target and attaches, with `status off`, `key-table
+  rlord-web` and `destroy-unattached on`.
 - **Status row gone**: `status` is a session option.
-- **Navigation gone**: the `rlord-web` key table has no bindings, and tmux
-  doesn't fall back to root from a session's default table, so nav keys,
-  the user's profile and the prefix are unreachable (as the key screen does,
-  `tmux::set_key_table`). The table gets copies of root's pane mouse
-  bindings (`Wheel*Pane`, `Mouse*Pane`, double/triple click).
-- **Cleanup**: `destroy-unattached` removes it when the client exits. On
-  start, kill leftover `webview-*` sessions with no client.
-
-What the view session forces elsewhere (step 2):
-
-- `tmux::list_clients` (`crates/core/src/tmux.rs`) must drop view-session
-  clients, or `tmux::user_client` picks the browser as "the user's
-  terminal" and `ui.goto` / `show_list` move it.
-- `send::user_active` (`daemon/src/send.rs`) must count recent web input,
-  or rlord pastes a message while the user types in the browser.
-- `tmux::kill_session` must kill grouped view sessions too: a window lives
-  while any session links it, so a stopped agent would keep running.
-- `new-session -t <name>` on a missing name creates a shell; tmux refuses
-  a command next to `-t`. Check `has_session` first, and after attaching
-  confirm the view session's window id equals the target's.
+- **Navigation gone**: the `rlord-web` key table has no keyboard bindings,
+  and tmux doesn't fall back to root from a session's default table, so
+  nav keys, the user's profile and the prefix are unreachable. The table
+  holds copies of root's pane mouse bindings (`bind_web_table`).
+- **Cleanup**: `destroy-unattached` removes it when the client exits;
+  `sweep_views` kills leftovers with no client.
+- Already handled in core and daemon (step 2): `list_clients` drops view
+  clients, `kill_session` kills the target's views first, `user_active`
+  and the overlord's idle check count a browser, `view_command` refuses a
+  missing target and `view_shows` confirms the window id after attaching.
 
 Sizing:
 
@@ -282,49 +467,93 @@ Other bridge rules:
 
 - Opening a pane never starts anything. Not running: typed "not running",
   page shows Resume. A reconnect loop can't respawn agents.
-- Target resolved on every open: `overlord` means `overlord::session`,
-  else a session id via `resolve_ref`. A `changed` event showing a new
-  active overlord makes the page reopen the pane.
-- PTY command from `tmux::command()` (socket, config file, locale, `TMUX`
-  removed), with `TERM=xterm-256color`, `COLORTERM=truecolor`.
+- Target resolved on every open with `web.pane_target`. A `changed` event
+  showing a new active overlord makes the page reopen the pane.
 - Copy: xterm.js selection with the modifier held
-  (`macOptionClickForcesSelection`). OSC 52 is a follow-up.
+  (`macOptionClickForcesSelection`). OSC 52 (`@xterm/addon-clipboard`) is a
+  follow-up.
 
-#### The API layer (what the relay will reuse)
+#### The frontend stack
 
-`web/api.rs` knows nothing of HTTP:
+TypeScript, built to static files that are embedded in `rlord-web`. Node is
+needed to develop and build the page, never to install or run rlord.
 
-- **Requests.** `{"id", "op", "args"}` in, `{"id", "ok"}` or `{"id",
-  "error": {"code", "message"}}` out, via `api::handle(&Daemon, Request)`.
-  `op` from a fixed allow-list mapped to daemon methods; not a
-  pass-through. `admin.reset`, `mcp.*`, `hook.*`, `web.*`, `config.*` and
-  `ui.*` are off it.
-- **Events.** `api::events(&Daemon)` wraps `Daemon::notify`: `{"event":
-  "changed"}`, at most one per 100 ms; a lagged receiver counts as a
-  change. `ui` commands not forwarded in this slice.
-- **Pane messages.** `Open {target, cols, rows}`, `Input(bytes)`,
-  `Resize`, `Close` in; `Opened`, `Output(bytes)`, `Closed {reason}` out.
-
-`snapshot` returns everything the list needs in one answer (rows for the
-asked view, same query object as `session.list`; status labels; groups with
-counts and favourites; active overlord and roster) and a `rev`. A client
-passing its last `rev` gets `{"unchanged": true}`. Grouping, sorting and
-labels are computed in Rust; the page only draws.
-
-| Layer | Slice 1 | Relay later |
+| Piece | Choice, pinned | Why |
 | --- | --- | --- |
-| Requests + events | one control websocket, JSON text frames | the mailbox; `changed` + `rev` is the "anything for me?" signal |
-| Pane messages | one websocket per pane; binary = bytes, text = control | the relayed live channel, same messages in Noise frames |
-| Auth | token in the first frame | Noise handshake as the first frames |
+| Type checker | `typescript` 7.0.2 | The native (Go) compiler has been the stable `typescript` package and `tsc` since 7.0, 2026-07-08; `tsgo` was only the preview's name. 7.1 is in beta. |
+| Build | `vite` 8.3.8 | Stable since 2026-03; bundles with Rolldown (1.0 in 2026-05) and transforms TS and JSX with Oxc, no esbuild or Rollup. Vite pins its own Rolldown (`~1.2.18`), so Rolldown is not pinned separately. |
+| Lint | `oxlint` 1.94.0 + `oxlint-tsgolint` 7.0.2007 | Type-aware linting went stable 2026-07 and uses TypeScript 7's own checker; `no-floating-promises` and friends matter in websocket code. |
+| Format | `@biomejs/biome` 2.6.8, formatter only | Oxfmt is still 0.x (0.79, beta since 2026-02), so it fails "stable". Switch to it at its 1.0 and drop Biome. |
+| UI | `preact` 11.2.0 + `@preact/signals` 2.11.4 | See below. |
+| Terminal | `@xterm/xterm` 6.0.0, `@xterm/addon-fit` 0.11.0, `@xterm/addon-webgl` 0.19.0 | 6.0.0 is the current stable major (6.1 is beta only). 6 removed the canvas renderer: WebGL for speed, falling back to the DOM renderer when the context is lost or missing. 6 also dropped the Alt-as-Ctrl-arrow hack and reworked the viewport, so the spike's key and scroll behaviour is re-checked by hand. |
+| Unit tests | `vitest` 5.1.0 | Runs on the same Vite config. |
+| Runtime for the tools | Node 26.13.1 (current LTS), `npm ci --ignore-scripts` with the committed `package-lock.json` | npm ships with Node, so no second tool to pin. |
 
-#### The frontend
+All versions exact in `package.json` (no `^`), integrity hashes in the
+lockfile, Node in `crates/web/ui/.node-version`.
 
-- **No framework, no build step.** Hand-written ES modules embedded as
-  they are: `index.html`, `app.css`, `app.js`, `api.js`, `list.js`,
-  `pane.js`. Testable logic lives in Rust behind `snapshot`.
-- **Live updates.** `changed` pushed; page debounces and calls `snapshot`
-  with its view and `rev`. `hello` on connect carries the build id; a page
-  from an older build reloads.
+**A signals framework over hand-written DOM: yes.** The page is a live
+list that redraws on every `changed`, with filters, tabs, groups and three
+routes. By hand that means writing keyed list diffing and update
+bookkeeping ourselves. Signals give fine-grained updates for about 6 kB.
+
+- **Preact 11 + signals, chosen.** Plain TSX that `tsc` checks with no
+  framework tooling; Vite 8 compiles it natively (`jsx: "react-jsx"`,
+  `jsxImportSource: "preact"`), so no compiler plugin; the smallest
+  runtime; 11 has been stable since 2026-09.
+- **Solid, not yet.** `solid-js` 2.0.0 was published on 2026-11-17, hours
+  before this plan, and the stable `vite-plugin-solid` (2.11.16) still
+  requires Solid 1. Solid 1.9 would mean adopting a major the day it was
+  superseded. Worth another look once 2.x and its plugin settle.
+- **Svelte 5, no.** Checking `.svelte` files needs `svelte-check`, which
+  supports TypeScript 5 and 6 only: TypeScript 7.0 has no stable
+  programmatic API (due in 7.1). It would hold the type checker a major
+  back.
+- **Vite+ (`vite-plus` 1.7.0, stable since 2026-09), no.** It bundles
+  these same tools behind one CLI but also wants to manage the runtime and
+  package manager, trails the tools' own releases, and includes the
+  pre-1.0 Oxfmt. Separate pins are plainer.
+
+**Node against a Rust-only pipeline.** A Node-free build is possible
+(the standalone esbuild binary, plus the native `tsc` and `oxlint`
+binaries fetched from their npm tarballs), but it gives up Vite, Rolldown
+and Vitest, the stack asked for, and is a path nobody else walks. Chosen:
+Node for developers of the page, CI and the release build only, always
+behind `cargo xtask`:
+
+- `cargo xtask web install`: `npm ci --ignore-scripts` in `crates/web/ui`
+  (checks the Node version against `.node-version` first).
+- `cargo xtask web check`: `tsc --noEmit`, `oxlint --type-aware
+  --deny-warnings`, `biome format` (check only), `vitest run`.
+- `cargo xtask web build`: `vite build` into `crates/web/ui/dist/` (not
+  committed).
+- `cargo xtask web watch`: `vite build --watch`, to pair with a debug
+  plugin run with `RLORD_WEB_ASSETS`. No Vite dev server: its origin would
+  fail the Origin check, and the checks get no development exceptions.
+
+Someone working only on Rust needs none of this: the plugin builds with
+the placeholder page.
+
+#### Frontend layout and behaviour (`crates/web/ui/`)
+
+- `package.json`, `package-lock.json`, `.node-version`, `tsconfig.json`,
+  `vite.config.ts`, `.oxlintrc.json`, `biome.json`, `index.html`.
+- `tsconfig.json`: `strict`, `noUncheckedIndexedAccess`,
+  `exactOptionalPropertyTypes`, `verbatimModuleSyntax`,
+  `erasableSyntaxOnly`, `moduleResolution: "bundler"`, `noEmit`.
+- `src/main.tsx` (mount, routes), `src/proto.ts` (message and snapshot
+  types), `src/api.ts` (control socket: token, auth frame, reconnect,
+  requests by id), `src/store.ts` (signals: snapshot, connection, view
+  state), `src/pane.ts` (xterm.js and the pane socket),
+  `src/views/{List,Overlord,Session}.tsx`, `src/components/`,
+  `src/app.css`.
+- `test/`: Vitest for `api.ts` and `store.ts` (reconnect, `rev`, request
+  matching), and a type check of `test/fixtures/snapshot.json` against
+  `proto.ts`. A Rust test in the daemon fails when a real `snapshot`
+  differs in shape from that fixture, so the hand-written types can't
+  drift from the daemon unnoticed.
+- **Live updates.** `changed` pushed; the page debounces and calls
+  `snapshot` with its view and `rev`.
 - **Reconnect** as in the spike; `term.reset()` on each pane connect.
 - **Views** (hash routes; wide screens list beside pane, narrow one at a
   time):
@@ -344,6 +573,33 @@ labels are computed in Rust; the page only draws.
   fork and setup forms, key screen, usage, sub-agents, history search,
   Remote Control, limit resume.
 
+#### Release and packaging
+
+- `version.rs`: `Version::web_tarball(target)`; the three plugin tarballs
+  join `tarballs()` and `workflow_assets()`, so preflight, the workflow's
+  asset check, `SHA256SUMS`, the provenance attestation and
+  `verify_and_publish` cover them with no further change.
+- `build.rs` (`cargo xtask build-release`), per target: build the page
+  once (`cargo xtask web build`, unless `RLORD_WEB_DIST` points at a
+  prebuilt one), build `rlord-web` with `RLORD_WEB_REQUIRE_ASSETS=1`, sign
+  it on macOS, hash it, build `rlord` with `RLORD_WEB_SHA256`, run
+  `check-deps`, pack both tarballs. The deb and rpm are made from that same
+  `rlord`, so they carry the hash too.
+- `release.yml`: a new `web-assets` job (Linux, Node from `.node-version`
+  through `actions/setup-node` pinned by commit) runs `cargo xtask web
+  check` and `web build` and uploads `dist/`; `build-macos` and
+  `build-linux` download it and set `RLORD_WEB_DIST`. One build of the
+  page, identical bytes on every target, and Node stays off the two jobs
+  that compile the binaries. Dev builds (`cargo xtask release` on the Mac)
+  build the page locally.
+- `ci.yml`: a new `web` job: `cargo xtask web check`, `web build`, then
+  `cargo test -p robot-overlord-web` against the real page. The existing
+  `check` job gains `cargo xtask check-deps` and needs no Node.
+- `smoke-linux` and `fresh-install`: after installing, `rlord web install
+  --yes --from DIST` and `rlord web status`, proving the compiled-in hash
+  matches the shipped plugin on each distro.
+- Homebrew formula, deb and rpm: unchanged, `rlord` only.
+
 #### The overlord's instructions
 
 Nothing new for the overlord: no MCP tool, meta-context or list concept.
@@ -356,114 +612,198 @@ the web UI a target for them is the next slice (changes `ui.state` and
 
 #### Tests
 
-Never `tmux -L rlord` or the default server, no real agent, no model.
+Never `tmux -L rlord` or the default server, no real agent, no model, no
+download from the network.
 
-- **Unit:** token file (0600, reused, rotate), constant-time compare,
-  Host/Origin checks; op allow-list reaches real methods and forbidden
-  families don't; `snapshot` shape and `rev` stability; assets (every file
-  `index.html` names exists, no outside URLs, CSP names no outside host,
-  vendored sums); pane frame bounds; `list_clients` drops view clients;
-  `user_active` counts web input.
-- **Integration, no tmux** (`crates/daemon/tests/web_http.rs`,
-  `127.0.0.1:0`, in-memory `Daemon`): wrong Host 404; bad/no Origin 403;
-  wrong token 4401; right token `hello`; `snapshot` answers; a change gives
-  `changed`; off-list op errors.
-- **Gated tmux** (`RLORD_TMUX_TESTS=1`, own test file, socket
-  `rlord-test-web`): step 1's behaviours; end to end against `cat`: bytes
-  echo, resize changes width, no status row, a root binding doesn't fire
-  and reaches the pane, `list_clients` hides the web client, killing the
-  target closes the socket and leaves no view session.
-- **By hand** against `scripts/demo/demo.sh` in a real browser: drawing,
-  fit, focus, Option as Meta, browser-kept keys, wheel, selection/copy, two
-  tabs, TUI overlay open at once, daemon restart, overlord switch, phone
-  width.
+- **Unit, core:** `plugin::verify` (right hash, wrong hash, missing file),
+  plugin path, `[web]` config.
+- **Unit and in-memory, daemon** (`crates/daemon/tests/web_api.rs`):
+  `web.call` reaches real methods and refuses every forbidden family and
+  the lifecycle methods; `snapshot` shape (against the shared fixture) and
+  `unchanged`; `rev` moves on a change and differs across a restart;
+  `web.subscribe` coalesces and treats lag as a change; `web.hello`
+  refuses another protocol; `web.pane_target` starts nothing.
+- **Supervision, daemon** (a stand-in `rlord-web` shell script through
+  `RLORD_WEB_BIN`, no network): start waits for hello; stop kills; backoff
+  on a crash; codes 3 and 4 not retried; a hash mismatch is reported and
+  nothing is spawned.
+- **Unit, plugin:** token file (0600, reused, recreated), constant-time
+  compare, Host and Origin checks, pane frame bounds, asset table (every
+  file `index.html` names exists, no outside URL, no inline script, CSP
+  names no outside host).
+- **Integration, plugin, no tmux** (`crates/web/tests/http.rs`,
+  `127.0.0.1:0`, an in-memory `Daemon` on a temp socket): wrong Host 404;
+  bad or no Origin 403; wrong token 4401; right token `hello`; `snapshot`
+  answers; a change gives `changed`; an off-list op errors; the plugin
+  exits when the daemon goes away.
+- **Gated tmux** (`RLORD_TMUX_TESTS=1`, `RLORD_TMUX_SOCKET=rlord-test-web`):
+  steps 1 and 2's tests (built); end to end against `cat` through the
+  plugin's bridge: bytes echo, resize changes width, no status row, a root
+  binding doesn't fire and reaches the pane, `list_clients` hides the web
+  client, killing the target closes the socket and leaves no view
+  session, `sweep_views` clears a leftover at start.
+- **Install** (`crates/rlord/tests/web_install.rs`): `web-install.sh` with
+  `--from` a temp folder: installs a matching file, refuses a mismatching
+  one, `--if-installed` does nothing when absent, `remove` cleans up.
+- **CLI:** `rlord web` without a terminal and without the plugin fails and
+  names `install --yes`; `check-deps` has its own test with a planted
+  forbidden dependency name.
+- **Frontend:** `cargo xtask web check` (types, lint, format, Vitest).
+- **By hand** against `scripts/demo/demo.sh --web` (builds the page and
+  `rlord-web`, copies it beside the demo's `rlord`; own data and tmux
+  server `rlord-demo`) in a real browser: drawing, fit, focus, Option as
+  Meta, browser-kept keys, wheel, selection/copy, two tabs, TUI overlay
+  open at once, daemon restart, overlord switch, phone width, WebGL
+  fallback.
 
 ### Implementation steps
 
 One commit each. The PR bumps the version to the next `-dev.N` and
-regenerates `Cargo.lock`.
+regenerates `Cargo.lock`. Steps 1 and 2 are done; 3 onward replace the
+first plan's steps 3 to 12.
 
-1. **Prove the view session** on a scratch socket (gated test, small
-   `tmux.rs` helpers): grouped session shows the target's pane; `status
-   off` leaves the target's on; empty key table blocks root bindings and
-   passes the key; unbound mouse reaches a mouse app; `destroy-unattached`
-   cleans up; killing the target alone leaves the window alive;
-   `new-session -t` on a missing name makes a shell. If any fails on tmux
-   3.2 or CI's tmux, stop and report. Fallback: attach to the target
-   directly, refuse `rlord nav` from web clients, accept the status row.
-2. **tmux helpers and side effects** (`tmux.rs`, `send.rs`): view prefix,
-   view-session command, `rlord-web` table with mouse bindings, window-id
-   check, leftover sweep; `list_clients`, `kill_session`, `user_active`
-   changes. Check every place a tmux session ends (`methods.rs` stop and
-   archive, `overlord.rs`, `admin.reset`).
-3. **Config and token** (`config.rs`, `web/mod.rs`): `[web]`, token file,
-   `Web` state on `Daemon`, `Daemon::subscribe`.
-4. **API layer** (`web/api.rs`): types, allow-list, `snapshot` + `rev`,
-   coalesced events. Move `group_list` from `crates/tui/src/groups.rs` into
-   `rlord_core`. Extract "make sure this session runs" from `ui::goto` for
-   Resume.
-5. **HTTP and control socket** (`web/http.rs`, `web/assets.rs`; `axum`
-   with `ws`, `futures-util`): static files, headers, checks, first-frame
-   auth, limits, `hello`, requests and events, graceful shutdown;
-   placeholder page; no-tmux integration tests.
-6. **Lifecycle and CLI** (`lib.rs`, `crates/rlord/src/main.rs`): `web.*`
-   methods, start when enabled, `rlord web` and flags, browser opener.
-7. **Pane bridge** (`web/pane.rs`; `portable-pty`): resolution, PTY and
-   view session, registry (open panes, last input per session), pane
-   websocket, cleanup; gated end-to-end tests.
-8. **Vendor xterm.js** (`xtask/src/vendor_web.rs`, sums in
-   `xtask/src/tools.rs`) with the checksum test.
-9. **Page: list** (`index.html`, `app.css`, `app.js`, `api.js`,
-   `list.js`).
-10. **Page: panes** (`pane.js`, overlord and session views, visible-only
-    connections, reconnect, Resume, follow overlord switch), then the
-    by-hand browser pass.
+1. **Done.** Prove the view session on a scratch socket
+   (`crates/daemon/tests/web_tmux.rs`).
+2. **Done.** tmux helpers and side effects (`tmux.rs`, `send.rs`,
+   `overlord.rs`).
+3. **Skeleton and guard.** `crates/web` (`rlord-web --version`, a `serve`
+   that only says hello and waits), workspace entry;
+   `core/src/plugin.rs` (path, `WEB_PROTOCOL`, `verify`, `sha2`); `[web]`
+   in `config.rs`; `cargo xtask check-deps` and its CI line.
+4. **Daemon web API** (`daemon/src/web.rs`): `web.hello`, `web.call` with
+   the allow-list, `snapshot` and `rev`, `web.subscribe`,
+   `web.pane_target`. Move `group_list` from `crates/tui/src/groups.rs`
+   into `rlord_core`. Extract "make sure this session runs" from
+   `ui::goto` for Resume. Snapshot fixture.
+5. **Supervision and the command** (`daemon/src/web.rs`, `lib.rs`,
+   `crates/rlord/src/main.rs`): spawn, hello wait, backoff, stop;
+   `web.status`, `web.start`, `web.stop`, `web.rotate`; start when
+   enabled; `rlord web` with `url`, `status`, `start`, `stop`,
+   `new-token` and the browser opener, using a plugin beside the
+   executable or `RLORD_WEB_BIN`. Stand-in plugin tests.
+6. **Plugin: HTTP and control socket** (`daemon.rs`, `token.rs`,
+   `http.rs`, `assets.rs`, `build.rs`): socket client, token, static
+   files, headers, checks, first-frame auth, limits, `hello`, requests and
+   events, exit with the daemon; placeholder page; no-tmux integration
+   tests.
+7. **Plugin: pane bridge** (`pane.rs`): `web.pane_target`, `openpty`,
+   view session, `bind_web_table` before each attach, `sweep_views` at
+   start, pane websocket, cleanup; gated end-to-end tests.
+8. **Frontend toolchain** (`crates/web/ui/`, `xtask/src/web.rs`): pinned
+   `package.json` and lockfile, configs, a page that connects and shows
+   the connection state; `cargo xtask web install|check|build|watch`;
+   `build.rs` embedding; CI's `web` job; `demo.sh --web`. Confirm here
+   that `npm ci --ignore-scripts` leaves every tool working.
+9. **Page: list** (`proto.ts`, `api.ts`, `store.ts`, `views/List.tsx`).
+10. **Page: panes** (`pane.ts`, overlord and session views, visible-only
+    connections, reconnect, Resume, follow overlord switch, WebGL with
+    DOM fallback), then the by-hand browser pass, including the xterm.js 6
+    checks and whether `style-src 'unsafe-inline'` can go.
 11. **Actions 3 to 7**, each op on the allow-list with a test.
-12. **Docs and cleanup**: `docs/architecture.md` "Web UI" section (fix "no
-    TCP listener at all in v1"), `docs/guide.md`, README, config template.
-    Delete `spikes/web-ui/`, fold `web-ui-spike.md` in. Optional `:web`.
+12. **Opt-in install** (`crates/rlord/web-install.sh`, `main.rs`): the
+    prompt, `install` (`--yes`, `--if-installed`, `--from`), `remove`,
+    the hash check before the move into place, the line in `update.sh`.
+13. **Release packaging** (`xtask/src/version.rs`, `build.rs`,
+    `release.rs`, `preflight.rs`, `smoke.rs`, `fresh_install.rs`,
+    `release.yml`): the second tarball per target, build order with the
+    compiled-in hash, the `web-assets` job, smoke checks. A dry run of the
+    release workflow before the first real one.
+14. **Docs and cleanup**: `docs/architecture.md` "Web UI" section (the
+    daemon still has no TCP listener; the plugin does, and say how it is
+    installed and verified), `docs/guide.md`, README, `SECURITY.md`,
+    config template. Delete `spikes/web-ui/`, fold `web-ui-spike.md` in.
+    Optional `:web`.
 
 ### Risks
 
-- The view session rests on tmux details not yet run (step 1 has the
-  fallback).
-- A missed kill path leaves an agent running under a view session.
-- A first TCP listener: Host, Origin, first-frame auth and CSP stand
-  between a hostile page and the user's agents; most tests go there.
+- **The compiled-in hash couples two builds.** A wrong build order, a
+  re-sign after hashing or a rebuilt plugin gives an `rlord` that refuses
+  its own plugin. The smoke step installs the shipped plugin with the
+  shipped `rlord` on every platform before a release is published.
+- **The release build now runs npm packages** (the bundler and compiler,
+  at build time). Bounded by exact pins, lockfile integrity,
+  `--ignore-scripts`, no cache, and a separate job that only produces
+  static files; the output is embedded in the plugin, never in `rlord`.
+- **A young toolchain.** TypeScript 7.0, Vite 8, Preact 11 and Vitest 5
+  are all 2026 majors; type-aware Oxlint has been stable four months.
+  Expect rough edges and patch bumps. Each is replaceable without touching
+  the Rust side.
+- **xterm.js 6 is new to this project** (the spike used 5.5): renderer,
+  viewport and Alt-key changes, and its CSP needs, are unverified until
+  step 10.
+- **A first TCP listener**: Host, Origin, first-frame auth and CSP stand
+  between a hostile page and the user's agents; most plugin tests go
+  there.
+- **Two processes can disagree**: plugin and daemon versions, a stale
+  token, a plugin that outlives its daemon. Covered by the hash check
+  before spawn, the protocol handshake and exit-with-the-daemon, each with
+  a test.
+- **Opt-in must stay honest.** `check-deps` is the only thing stopping a
+  later change from adding a network crate to `rlord`; it has to stay in
+  CI and in `build-release`.
+- A missed kill path leaves an agent running under a view session
+  (step 2 covered the known ones).
 - Browser behaviour unverified (Cmd-W/Cmd-T, Option as Meta, IME).
-- New dependencies (`axum`, `hyper`, `tokio-tungstenite`, `portable-pty`)
-  grow the daemon and `deny.toml` surface; `openpty` via `libc` can replace
-  `portable-pty`.
 - Size mismatches between overlay and web views look odd; accepted.
-- Daemon restart drops every pane; the start-up sweep cleans leftovers.
+- A daemon restart drops every pane; the plugin's start-up sweep cleans
+  leftovers.
 
-### Answers (user, 2026-11-17)
+### Open questions for the user
+
+1. **Verification.** The plugin's SHA-256 compiled into `rlord`, plus
+   `SHA256SUMS`, plus `gh attestation verify` when `gh` is there. No
+   separate signature or signing key. Enough, or do you want a detached
+   signature (minisign or cosign) as well?
+2. **`cargo install robot-overlord` users** get no plugin download (their
+   build has no compiled-in hash). Acceptable, or should those builds fall
+   back to trusting the release's `SHA256SUMS`?
+3. **Framework.** Preact 11 with signals now. Solid 2.0.0 came out today
+   with no stable Vite plugin yet; Svelte 5 can't be type-checked by
+   TypeScript 7. Go with Preact, wait for Solid 2, or stay with
+   hand-written DOM?
+4. **Node in the release build** (one job, pinned, scripts off, page built
+   once). The alternative is committing the built `dist/` and having CI
+   check it matches a rebuild: no Node at release time, but built files in
+   every page change's diff.
+5. **Plugin lifetime.** Planned: a child of the daemon that restarts with
+   it, so `rlord reset` or an update drops open panes for a moment. The
+   alternative is a plugin that outlives the daemon and reconnects, which
+   keeps panes open but needs its own start-up and version handling.
+6. **Formatter.** Biome's formatter until Oxfmt reaches 1.0, or take
+   Oxfmt 0.79 now for one tool family?
+7. **A headless-browser smoke test** (Playwright 1.65) would catch a CSP
+   or bundling break that unit tests can't see, at the cost of a browser
+   download in CI. Planned: by hand only in this slice.
+8. **Command shape.** `rlord web` now has subcommands (`install`,
+   `remove`, `start`, `stop`, `status`, `url`, `new-token`) in place of
+   the first plan's flags. Fine?
+
+### Answers and changes (user, 2026-11-17)
+
+To the first plan's questions:
 
 1. Off by default; `rlord web` or `[web] enabled = true` starts it.
 2. Port 47811 (default taken, not asked).
 3. Web as a UI-command target: next slice.
 4. Resume button, never auto-resume.
 5. Latest active view sets the size.
-6. Delete `spikes/web-ui/` and fold the spike doc in at step 12 (default).
+6. Delete `spikes/web-ui/` and fold the spike doc in at the last step
+   (default).
 7. `:web` last and optional (default).
 
-### Changes from the user after planning (2026-11-17); slice 1 plan needs revising
+Changes after the first plan, which this revision implements:
 
-- **Web server is an opt-in plugin, not part of the daemon.** Main `rlord`
-  keeps only a thin `rlord web` command section with no HTTP, websocket or
-  network code. Opting in downloads a separate `rlord-web` executable;
-  the point is that a user who doesn't opt in has nothing that could send
-  sessions over the network. The plugin talks to the daemon over its Unix
-  socket (needs `snapshot`, a streaming subscribe, web-input reporting,
-  a protocol version handshake). tmux-side helpers (view sessions,
-  `list_clients` filter, `kill_session`) stay in core/daemon.
-- **Server side all Rust.** No JavaScript server.
-- **Client in TypeScript**, not plain JavaScript. Build compiles it to
-  the embedded assets; tooling choice (and how type-checking runs in CI)
-  to be planned.
-- **Most modern web stack available.** The re-plan must research the
-  current (late 2026) state rather than assume: TypeScript's native
-  compiler (TS 7 / `tsgo`), Rolldown/Vite or oxc for building, oxlint or
-  Biome for lint/format, the current xterm.js major, and whether a light
-  UI framework (signals-based) beats hand-written DOM. Pick the newest
-  stable choices, pinned, with reasons.
+- The web server is an opt-in plugin, a separate `rlord-web` executable
+  downloaded only on opt-in. Main `rlord` keeps a thin `rlord web` command
+  and no HTTP, websocket or network code, so a user who doesn't opt in has
+  nothing that could send sessions over the network.
+- Server side all Rust; no JavaScript server.
+- Browser client in TypeScript.
+- The most modern stable web stack, researched as of late 2026, pinned,
+  with reasons.
+
+What the revision replaced from the first plan: the server as a module in
+the daemon (`crates/daemon/src/web/`), the op allow-list in the server
+process, vendored xterm.js 5.5 with `cargo xtask vendor-web`, hand-written
+ES modules with no build step, `portable-pty`, the `rlord web --flags`
+form, and web-input reporting over IPC.
