@@ -236,9 +236,6 @@ impl Daemon {
     pub fn bind_nav_keys(&self) {
         let cfg = self.config();
         let bindings = cfg.tmux.bindings();
-        if let Some(why) = cfg.session.base_problem() {
-            tracing::warn!("{why}: change it in config.toml");
-        }
         if let Some(verb) = cfg.tmux.switch_overlap() {
             tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
                 "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");
@@ -258,6 +255,10 @@ impl Daemon {
     /// DB state against the live tmux server.
     pub fn startup(&self) -> Result<()> {
         methods::set_claude_tui(&self.config());
+        // (Said once, here.)
+        if let Some(why) = self.config().session.base_problem() {
+            tracing::warn!("{why}: change it in config.toml");
+        }
         let db = self.db.lock().expect("db mutex poisoned");
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
@@ -516,10 +517,14 @@ impl Daemon {
         // Where a new session's branch starts (it may fetch: seconds):
         // worked out here, never under the DB lock, and never taken from
         // the caller.
+        // (A launch that will be refused anyway waits on no fetch; its
+        // checks run once, here, and `session_new` takes their result.)
+        let mut prechecked = None;
         if method == "session.new" {
-            // (A launch that will be refused anyway waits on no fetch.)
-            methods::precheck_new(&self.db(), &self.config(), &params)
-                .map_err(MethodError::Internal)?;
+            prechecked = Some(
+                methods::precheck_new(&self.db(), &self.config(), &params)
+                    .map_err(MethodError::Internal)?,
+            );
             repo_latest::set_launch_base(self, &mut params).map_err(MethodError::Internal)?;
         }
         // Whether rlord's hooks work for the agent (it reads the agent's
@@ -563,7 +568,9 @@ impl Daemon {
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
-            "session.new" => methods::session_new(&db, &self.config(), &params),
+            "session.new" => {
+                methods::session_new_with(&db, &self.config(), &params, prechecked.take())
+            }
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
                 let (found, roots, cfg) = scanned.expect("scanned for repo.find");

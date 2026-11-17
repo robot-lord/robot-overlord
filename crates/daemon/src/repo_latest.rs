@@ -106,8 +106,9 @@ struct Slot {
     last: Option<(Instant, Fetch)>,
     /// No caller has seen `last` (they stopped waiting before it came).
     unseen: bool,
-    /// The last success.
+    /// The last success, and when (wall clock, ms).
     ok_at: Option<Instant>,
+    ok_ms: Option<i64>,
 }
 
 type Fetches = Arc<(Mutex<HashMap<String, Slot>>, Condvar)>;
@@ -125,19 +126,25 @@ pub struct Latest {
 }
 
 /// What a tree job (making or moving a repo's tree) did, for the answer.
+#[derive(Clone)]
 struct TreeDone {
     moved: Option<Value>,
     warnings: Vec<String>,
 }
 
-/// A repo's tree job: whether one runs, for which request (the commit it
-/// moves the tree to), and how it went.
+/// A repo's tree jobs: whether one runs, for which request (the ref and
+/// commit it moves the tree to), its generation, and the results of
+/// recent ones by generation (read by every waiter, kept a short while).
 #[derive(Default)]
 struct JobSlot {
     running: bool,
     request: String,
-    done: Option<std::result::Result<TreeDone, String>>,
+    gen: u64,
+    done: HashMap<u64, (Instant, std::result::Result<TreeDone, String>)>,
 }
+
+/// How long a tree job's result stays readable for its waiters.
+const JOB_RESULT_KEEP: Duration = Duration::from_secs(30);
 
 type Jobs = Arc<(Mutex<HashMap<String, JobSlot>>, Condvar)>;
 
@@ -179,6 +186,13 @@ impl Latest {
     #[cfg(test)]
     pub(crate) fn set_for_test(&self, env: GitEnv, timing: Timing, guard: Guard) {
         *self.settings.write().unwrap() = Settings { env, timing, guard };
+    }
+
+    /// When `key`'s last successful fetch finished (wall clock, ms).
+    fn ok_ms(&self, key: &str) -> Option<i64> {
+        let (lock, _) = &*self.fetches;
+        let map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(key).and_then(|s| s.ok_ms)
     }
 
     /// Forget every fetch of the repo whose keys start with `prefix` (its
@@ -290,6 +304,7 @@ impl Latest {
         let deadline = Instant::now() + wait;
         let (lock, cv) = &*self.jobs;
         let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Another request's job: waited out first.
         loop {
             let slot = map.entry(key.to_string()).or_default();
             if !slot.running || slot.request == request {
@@ -305,50 +320,64 @@ impl Latest {
                 .0;
         }
         let slot = map.entry(key.to_string()).or_default();
-        if !slot.running {
+        slot.done
+            .retain(|_, (at, _)| at.elapsed() < JOB_RESULT_KEEP);
+        // Joined (the same request running), or started.
+        let mine = if slot.running {
+            slot.gen
+        } else {
+            slot.gen += 1;
             slot.running = true;
             slot.request = request.to_string();
-            slot.done = None;
+            let gen = slot.gen;
             let state = self.jobs.clone();
             let k = key.to_string();
             let spawned = std::thread::Builder::new()
                 .name("repo-tree".into())
                 .spawn(move || {
                     // (Its slot freed even if `job` panics.)
-                    struct Done(Jobs, String, Option<std::result::Result<TreeDone, String>>);
+                    struct Done(
+                        Jobs,
+                        String,
+                        u64,
+                        Option<std::result::Result<TreeDone, String>>,
+                    );
                     impl Drop for Done {
                         fn drop(&mut self) {
                             let (lock, cv) = &*self.0;
                             let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
                             let slot = map.entry(self.1.clone()).or_default();
-                            slot.running = false;
-                            slot.done = Some(
-                                self.2
-                                    .take()
-                                    .unwrap_or_else(|| Err("the tree job panicked".into())),
-                            );
+                            if slot.gen == self.2 {
+                                slot.running = false;
+                            }
+                            let r = self
+                                .3
+                                .take()
+                                .unwrap_or_else(|| Err("the tree job panicked".into()));
+                            slot.done.insert(self.2, (Instant::now(), r));
                             cv.notify_all();
                         }
                     }
-                    let mut d = Done(state, k, None);
-                    d.2 = Some(job());
+                    let mut d = Done(state, k, gen, None);
+                    d.3 = Some(job());
                 });
             if spawned.is_err() {
                 slot.running = false;
                 return Job::Done(Err("couldn't start a thread".into()));
             }
-        }
+            gen
+        };
         let left = deadline.saturating_duration_since(Instant::now());
-        let mut map = cv
-            .wait_timeout_while(map, left, |m| m.get(key).is_some_and(|s| s.running))
+        let map = cv
+            .wait_timeout_while(map, left, |m| {
+                m.get(key).is_some_and(|s| !s.done.contains_key(&mine))
+            })
             .unwrap_or_else(|e| e.into_inner())
             .0;
-        match map.get_mut(key) {
-            Some(s) if !s.running && s.request == request => match s.done.take() {
-                Some(r) => Job::Done(r),
-                None => Job::Running,
-            },
-            _ => Job::Running,
+        // (Read, not taken: every waiter of this job gets it.)
+        match map.get(key).and_then(|s| s.done.get(&mine)) {
+            Some((_, r)) => Job::Done(r.clone()),
+            None => Job::Running,
         }
     }
 
@@ -377,6 +406,7 @@ fn run_fetch<F: FnOnce() -> Fetch>(state: Fetches, key: String, fetch: F) {
             let now = Instant::now();
             if f == Fetch::Fetched {
                 slot.ok_at = Some(now);
+                slot.ok_ms = Some(now_ms());
             }
             slot.running = false;
             slot.last = Some((now, f));
@@ -474,10 +504,12 @@ struct Want<'a> {
     prefer: Option<Prefer>,
     /// How long to wait on a fetch.
     wait: Duration,
-    /// A launch: everything it waits on (`ls-remote`, the fetch, a retry)
-    /// ends by then, and the remote is asked for the default branch only
-    /// when nothing local answers.
+    /// Everything the call waits on (`ls-remote`, fetches, a retry, the
+    /// tree job) ends by then.
     deadline: Option<Instant>,
+    /// A launch's base (vs the tool): the remote is asked for the default
+    /// branch only when nothing local answers, never the checkout's own.
+    launch: bool,
 }
 
 impl Want<'_> {
@@ -710,7 +742,7 @@ fn resolve(
         // one: it bails below (and starts at HEAD, saying why).
         let retry = retry
             .ok()
-            .filter(|(_, f)| want.deadline.is_none() || *f != latest::DefaultFrom::Current);
+            .filter(|(_, f)| !want.launch || *f != latest::DefaultFrom::Current);
         if let Some((b, f)) = retry {
             if b != branch {
                 branch = b;
@@ -723,7 +755,7 @@ fn resolve(
         }
     }
     // A launch never starts at a default branch the remote says is gone.
-    if fetch == Fetch::Missing && from.is_some() && want.deadline.is_some() {
+    if fetch == Fetch::Missing && from.is_some() && want.launch {
         bail!(
             "{} has no branch {branch} (the default branch renamed?)",
             remote.as_deref().unwrap_or("the remote")
@@ -741,7 +773,11 @@ fn resolve(
         .as_deref()
         .and_then(|r| snap.fetched.get(&key(r)).copied());
     if fetch == Fetch::Fetched {
-        fetched_at = Some(now);
+        // (When it really finished: it may have been handed over later.)
+        let k = remote
+            .as_deref()
+            .map(|r| format!("{}\0{r}\0{branch}", repo.common.display()));
+        fetched_at = k.and_then(|k| d.latest.ok_ms(&k)).or(Some(now));
     }
     let local = latest::commit_of(&env, root, &format!("refs/heads/{branch}"));
     // The remote's side: rlord's private ref or the user's own
@@ -912,13 +948,13 @@ fn resolve(
 /// checkout's branch; nobody within `LS_RETRY_MS` of a failure.
 fn ask(want: &Want, snap: &Rec, now: i64) -> latest::AskRemote {
     let failed = now - snap.ls_failed_at < LS_RETRY_MS;
-    match (want.deadline.is_some(), failed) {
+    match (want.launch, failed) {
         // (A launch never falls back to the checkout's branch, asked or
         // not.)
         (true, true) => latest::AskRemote::Launch(Duration::ZERO),
         (true, false) => latest::AskRemote::Launch(want.left(latest::LS_REMOTE)),
         (false, true) => latest::AskRemote::Never,
-        (false, false) => latest::AskRemote::First(latest::LS_REMOTE),
+        (false, false) => latest::AskRemote::First(want.left(latest::LS_REMOTE)),
     }
 }
 
@@ -991,7 +1027,9 @@ pub fn latest_rpc(d: &Daemon, params: Value) -> Result<Value> {
             .filter(|s| !s.is_empty()),
         prefer,
         wait,
-        deadline: None,
+        // (The tool's whole call: its budget, across all it waits on.)
+        deadline: Some(Instant::now() + wait),
+        launch: false,
     };
     latest_in(d, &want)
 }
@@ -1045,7 +1083,10 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
             .map_err(|e| format!("{e:#}"))
         }
     };
-    match d.latest.tree_job(&key, &commit, want.left(want.wait), job) {
+    // (By ref and commit: a call joining a running job records the same
+    // ref it asked for.)
+    let request = format!("{}\0{commit}", f.branch);
+    match d.latest.tree_job(&key, &request, want.left(want.wait), job) {
         Job::Done(Ok(t)) => {
             v["path"] = json!(dir);
             if let Some(m) = t.moved {
@@ -1327,6 +1368,7 @@ pub fn launch_base(d: &Daemon, params: &Value) -> Result<Value> {
         prefer,
         wait,
         deadline: Some(Instant::now() + wait),
+        launch: true,
     };
     match base(d, &cfg, &want) {
         Ok(v) => Ok(v),
@@ -1563,9 +1605,17 @@ fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<(Str
             .is_some_and(|e| latest::adoptable(e, &live))
             .then(|| live.clone()),
     };
+    // (Refused, or git couldn't: with `All`, said as left with why, and
+    // the refs and record go all the same.)
+    let mut refused = None;
     if let Some(t) = current.as_deref() {
         if let Some(e) = latest::entry_at(list, t) {
-            latest::tree_remove(&env, &repo, t, Some(t), e, fs_ok)?;
+            if let Err(e) = latest::tree_remove(&env, &repo, t, Some(t), e, fs_ok) {
+                if what != Remove::All {
+                    return Err(e);
+                }
+                refused = Some((t.to_string_lossy().into_owned(), format!("{e:#}")));
+            }
         }
     }
     if what == Remove::All {
@@ -1584,6 +1634,9 @@ fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<(Str
     // and why, never "removed".
     if what != Remove::All {
         return Ok(None);
+    }
+    if refused.is_some() {
+        return Ok(refused);
     }
     let path = live.to_string_lossy().into_owned();
     let not_ours = "not rlord's tree as git sees it: left in place";
@@ -3210,6 +3263,137 @@ mod tests {
         assert!(v.get("path").is_none());
     }
 
+    /// Two calls waiting on one tree job both get its result (read, not
+    /// taken).
+    #[test]
+    fn every_waiter_of_a_tree_job_gets_its_result() {
+        let l = Arc::new(Latest::default());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let l1 = l.clone();
+        let a = std::thread::spawn(move || {
+            l1.tree_job("k", "main\0c1", Duration::from_secs(5), move || {
+                let _ = rx.recv();
+                Ok(TreeDone {
+                    moved: Some(json!({"created": true})),
+                    warnings: vec!["w".into()],
+                })
+            })
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let l2 = l.clone();
+        let b = std::thread::spawn(move || {
+            l2.tree_job("k", "main\0c1", Duration::from_secs(5), || {
+                panic!("a second job for the same request")
+            })
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        tx.send(()).unwrap();
+        for t in [a, b] {
+            match t.join().unwrap() {
+                Job::Done(Ok(d)) => assert_eq!(d.warnings, ["w"]),
+                _ => panic!("a waiter got no result"),
+            }
+        }
+    }
+
+    /// The tool's whole call is capped at its wait, a slow remote or not.
+    #[test]
+    fn the_tools_call_is_capped_in_all() {
+        let r = Repos::new();
+        let c = &r.clone;
+        r.g(c, &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
+        let slow = r.root().join("slow-upload-pack");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 2\nexec git-upload-pack \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.g(
+            c,
+            &["config", "remote.origin.uploadpack", slow.to_str().unwrap()],
+        );
+        let d = daemon(&r);
+        d.latest
+            .set_for_test(r.env.clone(), timing(300), Guard::with(None, false));
+        let t = Instant::now();
+        let _ = latest_rpc(&d, json!({"repo": c}));
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// A Fetched outcome handed to a later call keeps when it really
+    /// finished.
+    #[test]
+    fn a_handed_over_fetch_keeps_its_finish_time() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let slow = r.root().join("slow-upload-pack");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\nexec git-upload-pack \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.g(
+            c,
+            &["config", "remote.origin.uploadpack", slow.to_str().unwrap()],
+        );
+        let d = daemon(&r);
+        d.latest
+            .set_for_test(r.env.clone(), timing(100), Guard::with(None, false));
+        let first = latest_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(first["fetch"], "running", "{first}");
+        std::thread::sleep(Duration::from_millis(1800));
+        let before = now_ms();
+        d.latest
+            .set_for_test(r.env.clone(), timing(5_000), Guard::with(None, false));
+        let v = latest_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(v["fetch"], "fetched", "{v}");
+        assert!(v["fetched_at"].as_i64().unwrap() <= before, "{v}");
+    }
+
+    /// Prune of a recorded tree it may not touch (a branch checked out in
+    /// it, unrecorded name): left, with why; the refs and record go.
+    #[test]
+    fn a_refused_tree_is_left_and_the_rest_pruned() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        call(&d, c, json!({}));
+        let other = c.join(".worktrees/not-rlords");
+        r.g(
+            c,
+            &["worktree", "add", "-q", "-b", "x", other.to_str().unwrap()],
+        );
+        update(&d, &key(c), |rec| {
+            rec.tree = Some(other.to_string_lossy().into_owned());
+            true
+        });
+        let p = prune_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(p["left"][0]["path"], json!(other), "{p}");
+        assert!(p["left"][0]["why"].is_string());
+        assert!(other.exists());
+        assert!(records(&d).is_empty());
+        assert!(r.g(c, &["for-each-ref", latest::REF_PREFIX]).is_empty());
+    }
+
+    /// Two refs at one commit: each call's own ref is recorded (tree jobs
+    /// go by ref and commit).
+    #[test]
+    fn the_recorded_ref_is_the_callers() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let head = r.g(c, &["rev-parse", "HEAD"]);
+        r.g(
+            &r.other,
+            &["push", "-q", "origin", &format!("{head}:refs/heads/feat")],
+        );
+        let d = daemon(&r);
+        call(&d, c, json!({}));
+        assert_eq!(record(&d, &key(c)).branch.as_deref(), Some("main"));
+        let v = call(&d, c, json!({"ref": "feat"}));
+        assert_eq!(v["ref"], "feat", "{v}");
+        assert_eq!(record(&d, &key(c)).branch.as_deref(), Some("feat"));
+    }
+
     /// A failed `ls-remote` is remembered: not asked again for a while.
     #[test]
     fn a_failed_ls_remote_is_not_retried_at_once() {
@@ -3228,6 +3412,7 @@ mod tests {
             prefer: None,
             wait: Duration::ZERO,
             deadline: None,
+            launch: false,
         };
         assert_eq!(ask(&want, &rec, now_ms()), latest::AskRemote::Never);
         assert_eq!(

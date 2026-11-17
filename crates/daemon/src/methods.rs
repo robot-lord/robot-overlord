@@ -701,6 +701,17 @@ pub(crate) fn new_worktree(
 }
 
 pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+    session_new_with(db, cfg, params, None)
+}
+
+/// `session_new` with `precheck_new` already run (`Daemon::call` runs it
+/// before the base); None: run here.
+pub(crate) fn session_new_with(
+    db: &Db,
+    cfg: &Config,
+    params: &Value,
+    prechecked: Option<Prechecked>,
+) -> Result<Value> {
     let p_opt = |k: &str| {
         params
             .get(k)
@@ -713,7 +724,10 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // its base, `Daemon::call`): the agent is installed (else how to get
     // it, rather than fail in the pane), Remote Control is possible, the
     // overlord's notes and related sessions are within their limits.
-    let Prechecked { agent, note, links } = precheck_new(db, cfg, params)?;
+    let Prechecked { agent, note, links } = match prechecked {
+        Some(p) => p,
+        None => precheck_new(db, cfg, params)?,
+    };
     // Internal-only knobs (the overlord uses them; the MCP surface never
     // forwards them): adapter flags that must survive restarts, a role, and a
     // fixed tmux name.

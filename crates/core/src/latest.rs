@@ -286,22 +286,12 @@ pub fn first_line(s: &str) -> String {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    clip(l, 200)
+    crate::agents::transcript::clip(l, 199)
 }
 
 /// A commit id as shown: its first 7 characters.
 pub fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,10 +484,10 @@ pub fn pick(
             })
         }
     };
-    match (prefer, default_branch) {
-        (Some(Prefer::Local), _) => Some(chosen(l, Source::Local, a, b, true)),
-        (Some(Prefer::Remote), _) | (None, true) => Some(chosen(r, Source::Remote, a, b, true)),
-        (None, false) => Some(Pick::Diverged {
+    // (The remote's side and the default branch were answered above.)
+    match prefer {
+        Some(Prefer::Local) => Some(chosen(l, Source::Local, a, b, true)),
+        _ => Some(Pick::Diverged {
             local_ahead: a,
             remote_ahead: b,
         }),
@@ -1020,7 +1010,10 @@ pub fn commit_info(env: &GitEnv, repo: &Path, commit: &str) -> Option<(String, i
     .ok()?;
     let t = o.ok.then(|| o.text().to_string())?;
     let (ct, subject) = t.split_once(' ').unwrap_or((&t, ""));
-    Some((clip(subject, 100), ct.parse::<i64>().ok()? * 1000))
+    Some((
+        crate::agents::transcript::clip(subject, 99),
+        ct.parse::<i64>().ok()? * 1000,
+    ))
 }
 
 /// When `rev` last moved, from its reflog (ms), if it keeps one.
@@ -1475,7 +1468,8 @@ pub fn tree_remove(
     )
 }
 
-/// Delete the private refs: all of them, or those of `branches`.
+/// Delete all of the repo's private refs (`refs/rlord/latest/*`).
+/// Returns how many went.
 pub fn drop_refs(env: &GitEnv, repo: &Path) -> Result<usize> {
     let out = git(
         env,
