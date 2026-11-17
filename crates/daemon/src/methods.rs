@@ -683,7 +683,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             let branch = p_opt("branch").unwrap_or_else(|| git::sanitize_branch(&name));
             let dir = git::workspace_path(repo, &cfg.session.workspace_dir, &branch);
             git::ensure_excluded(repo, &cfg.session.workspace_dir)?;
-            git::worktree_add(repo, &branch, &dir)?;
+            git::worktree_add(repo, &branch, &dir, None)?;
             let dir = dir.to_string_lossy().into_owned();
             (dir.clone(), Some(dir), Some(branch))
         }
@@ -728,64 +728,154 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
-    let mut launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
-    let program = pane_program(agent, &mut launch.argv);
-    let argv = &launch.argv;
+    let launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
     };
     let launch_spec = spec.to_string();
-    let now = now_ms();
-
-    db.insert_session(&NewSession {
-        id: &id,
-        name: &name,
-        agent: agent.name(),
-        agent_session: launch.session_id.as_deref(),
-        project_path: &project_path,
-        tmux_session: Some(&tmux_name),
-        launch_spec: &launch_spec,
-        created_at: now,
-        repo_path: repo.as_deref(),
-        workspace_path: workspace_path.as_deref(),
-        branch: branch.as_deref(),
-        role: &role,
-    })?;
-    if let Some(r) = &repo {
-        db.touch_repo(r, now)?;
-    }
-    if let Some(t) = &launch.transcript {
-        db.upsert_transcript_source(&id, &t.to_string_lossy())?;
-    }
-    hold_deferred(db, &id, &launch)?;
-    note_first_prompt(db, &id, agent, first.as_deref(), now)?;
-    if let Some(mode) = delivery {
-        context::turn_on(db, &id)?;
-        context::store(db, &id, &notes, &links, now)?;
-        if carried == Some(mode) {
-            context::set_mode(db, &id, mode, now)?;
-        } else {
-            // (It didn't go out with the launch: its rows stay unseen.)
-            context::record_mode(db, &id, mode)?;
-        }
-    }
-
-    let cmd = pane_cmd(&id, program.as_deref(), daemon, argv);
-    note_launch(db, &id, argv)?;
-    // (Its folder is in the gate before its first hook can run.)
-    crate::codex_daemon::sync_gate(db);
-    tmux::new_session(&tmux_name, &project_path, &cmd)?;
-    db.insert_event(
-        &id,
-        now,
-        "launched",
-        &json!({"argv": argv, "workspace": workspace_path, "branch": branch}).to_string(),
+    start(
+        db,
+        Start {
+            id: &id,
+            name: &name,
+            agent,
+            launch_spec: &launch_spec,
+            launch,
+            first: first.as_deref(),
+            project_path: &project_path,
+            repo: repo.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+            branch: branch.as_deref(),
+            role: &role,
+            tmux_name: &tmux_name,
+            daemon,
+            forked_from: None,
+            kv: Vec::new(),
+            background: delivery.map(|mode| Background {
+                mode,
+                carried,
+                copy_from: None,
+                rows: context::rows_from(&notes, &links, "overlord"),
+            }),
+            event: (
+                "launched",
+                json!({"workspace": workspace_path, "branch": branch}),
+            ),
+        },
     )?;
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
     Ok(serde_json::to_value(s)?)
+}
+
+/// A new session's background, as `start` stores it: how it reaches the
+/// agent (`mode`), how the launch carries it (`carried`: None when it
+/// doesn't, its file couldn't be written), the session whose rows are
+/// copied first (unseen) with the row ids left out (a fork's parent),
+/// and the rows to add after them.
+pub(crate) struct Background<'a> {
+    pub mode: context::Delivery,
+    pub carried: Option<context::Delivery>,
+    pub copy_from: Option<(&'a str, &'a [i64])>,
+    pub rows: Vec<context::NewRow>,
+}
+
+/// What a new session and a fork have decided before the pane starts.
+pub(crate) struct Start<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub agent: Agent,
+    /// The launch spec as stored.
+    pub launch_spec: &'a str,
+    /// The agent's command, and what is known of its conversation.
+    pub launch: rlord_core::agents::Launch,
+    /// The first prompt as typed (an agent that picks its own id is bound
+    /// by it).
+    pub first: Option<&'a str>,
+    pub project_path: &'a str,
+    pub repo: Option<&'a str>,
+    pub workspace_path: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub role: &'a str,
+    pub tmux_name: &'a str,
+    /// On Codex's shared background server.
+    pub daemon: bool,
+    /// A fork's parent (its rlord id).
+    pub forked_from: Option<&'a str>,
+    /// kv keys written with its row, before its pane starts (a fork's
+    /// `bind_fork`, `fork_pending`): a running session never lacks them.
+    pub kv: Vec<(String, String)>,
+    pub background: Option<Background<'a>>,
+    /// The event logged once the pane is up (`launched`, `forked`): its
+    /// detail, to which the argv is added.
+    pub event: (&'static str, Value),
+}
+
+/// What a new session and a fork share once everything is decided: the
+/// row, its background, its pane, the log.
+pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
+    let Start { id, agent, .. } = s;
+    let mut launch = s.launch;
+    let program = pane_program(agent, &mut launch.argv);
+    let argv = &launch.argv;
+    let now = now_ms();
+    db.insert_session(&NewSession {
+        id,
+        name: s.name,
+        agent: agent.name(),
+        agent_session: launch.session_id.as_deref(),
+        project_path: s.project_path,
+        tmux_session: Some(s.tmux_name),
+        launch_spec: s.launch_spec,
+        created_at: now,
+        repo_path: s.repo,
+        workspace_path: s.workspace_path,
+        branch: s.branch,
+        role: s.role,
+    })?;
+    if let Some(parent) = s.forked_from {
+        db.set_forked_from(id, parent)?;
+    }
+    for (k, v) in &s.kv {
+        db.kv_set(k, v)?;
+    }
+    if let Some(r) = s.repo {
+        db.touch_repo(r, now)?;
+    }
+    if let Some(t) = &launch.transcript {
+        db.upsert_transcript_source(id, &t.to_string_lossy())?;
+    }
+    hold_deferred(db, id, &launch)?;
+    note_first_prompt(db, id, agent, s.first, now)?;
+    if let Some(bg) = &s.background {
+        context::turn_on(db, id)?;
+        if let Some((from, except)) = bg.copy_from {
+            db.context_copy(from, id, except)?;
+        }
+        context::store_rows(db, id, &bg.rows, now)?;
+        if bg.carried == Some(bg.mode) {
+            context::set_mode(db, id, bg.mode, now)?;
+        } else {
+            // (It didn't go out with the launch: its rows stay unseen.)
+            context::record_mode(db, id, bg.mode)?;
+        }
+    }
+
+    let cmd = pane_cmd(id, program.as_deref(), s.daemon, argv);
+    note_launch(db, id, argv)?;
+    // (Its folder is in the gate before its first hook can run.)
+    crate::codex_daemon::sync_gate(db);
+    tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
+    // The pane is up: from here nothing fails the start (a caller undoes a
+    // start that failed, and must never undo a running one).
+    let (kind, mut detail) = s.event;
+    detail["argv"] = json!(argv);
+    if let Err(e) = db.insert_event(id, now, kind, &detail.to_string()) {
+        tracing::warn!(session = %id, error = %e, "logging a start");
+    }
+    Ok(())
 }
 
 /// Add an importable conversation (see `import::import`, which finds it and
@@ -905,7 +995,7 @@ pub(crate) fn import_candidate(
 /// A tmux name for a session called `name` (see `names::tmux_name_for`),
 /// not taken by another session or live tmux session; `own` is the
 /// session's current one (free for itself).
-fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
+pub(crate) fn tmux_name_for(db: &Db, name: &str, own: Option<&str>) -> String {
     // A DB error counts as free: worst case a duplicate name, which tmux's
     // own check still catches.
     // The overlords' fixed names are reserved, even before they exist.
@@ -985,7 +1075,10 @@ pub fn sync_tmux_names(db: &Db) -> Result<()> {
 }
 
 pub fn session_get(db: &Db, params: &Value) -> Result<Value> {
-    let s = db.resolve_ref(p_str(params, "ref")?)?;
+    let mut s = [db.resolve_ref(p_str(params, "ref")?)?];
+    // (Its forks: shown here, so read here, not on every lookup.)
+    db.attach_forks(&mut s)?;
+    let [s] = s;
     Ok(serde_json::to_value(s)?)
 }
 
@@ -1000,13 +1093,29 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // A fork whose conversation was never made (its agent never got that
+    // far) forks again rather than resume, from its parent's conversation
+    // as it is now: its note says so in its file before the pane starts;
+    // the database takes the note (and the fork's other changes) only
+    // once the pane is up, so a restart that fails changes nothing.
+    let refork = crate::fork::pending(db, &s)?;
+    let renewed_at = now_ms();
+    let renewed = match &refork {
+        Some(_) => crate::fork::renewed_note(db, &s, renewed_at)?,
+        None => None,
+    };
+    let renewed_note = renewed.as_deref().map(|body| context::Renewed {
+        source: "fork",
+        body,
+        at: renewed_at,
+    });
     // Its background as it was launched with, its file rewritten first
     // (related sessions' status, a rename: as they are now).
     // Best effort: a file that can't be written never stops the restart;
     // without it the start carries no flag or pointer naming it.
     let base = paths::data_dir();
     let bg_file = context::file_path(&base, &s.id);
-    let rewritten = match context::refresh_file(db, &base, &s) {
+    let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
         Ok(f) => f.is_some(),
         Err(e) => {
             tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
@@ -1016,13 +1125,25 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // The command with the session's own flags; the background's flag or
     // pointer is added to it below (both go last, where a launch puts
     // them).
-    let (mut argv, resumed) = agent.resume(
-        s.agent_session.as_deref(),
-        &s.agent_session_trust,
-        &s.project_path,
-        model.as_deref(),
-        &spec_args(agent, &spec),
-    )?;
+    let (mut argv, resumed) = match &refork {
+        Some(parent) => (
+            crate::fork::refork_argv(
+                agent,
+                &s,
+                parent,
+                model.as_deref(),
+                &spec_args(agent, &spec),
+            )?,
+            false,
+        ),
+        None => agent.resume(
+            s.agent_session.as_deref(),
+            &s.agent_session_trust,
+            &s.project_path,
+            model.as_deref(),
+            &spec_args(agent, &spec),
+        )?,
+    };
     let mut mode = context::mode(db, &s.id)?;
     // A new conversation by hook, but the hooks no longer work
     // (`hooks_work`: see `Daemon::restart_hooks`, asked before the lock):
@@ -1038,11 +1159,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     }
     let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
     argv.extend(context::launch_args(carried, &bg_file));
-    // A Pointer-mode session starting a new conversation: the pointer
-    // again, as its first prompt; its conversation is then bound by that
+    // A new conversation's first prompt: a Pointer-mode session starting
+    // one gets the pointer again; a re-forked fork whose conversation was
+    // never written, its own first words too, as at the fork
+    // (`fork::restart_prompt`). Its conversation is then bound by that
     // prompt, from now.
-    let pointer = context::restart_prompt(carried, resumed, &bg_file);
-    if let Some(p) = &pointer {
+    let first = crate::fork::restart_prompt(&spec, refork.is_some(), carried, resumed, &bg_file);
+    // (What it hands over: the pointer.)
+    let pointer_sent = first.is_some() && carried == Some(context::Delivery::Pointer);
+    if let Some(p) = &first {
         agent.add_first_prompt(&mut argv, p);
     }
     let program = pane_program(agent, &mut argv);
@@ -1054,43 +1179,97 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let tmux_name = tmux_name_of(db, &s)?;
     let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, &argv);
     note_launch(db, &s.id, &argv)?;
+    // A re-fork binds its new thread as at the fork: the key that says so
+    // is written before the pane starts, so it can't be lost after.
+    if let Some(parent) = &refork {
+        crate::fork::refork_bind_key(db, &s, parent)?;
+    }
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    // The pane is up: from here nothing fails the restart (as at `start`).
+    // Each step is logged if it fails, and the status, the seen marks and
+    // the event are always written.
+    let session = s.id.clone();
+    let logged = |what: &str, r: Result<()>| {
+        if let Err(e) = r {
+            tracing::warn!(session = %session, error = %e, "restart: {what}");
+        }
+    };
     let now = now_ms();
     if let Some(fallback) = fell_back {
-        context::record_mode(db, &s.id, fallback)?;
+        logged(
+            "recording the mode",
+            context::record_mode(db, &s.id, fallback),
+        );
         tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
     }
-    if let Some(p) = &pointer {
-        note_first_prompt(db, &s.id, agent, Some(p), now)?;
+    if let Some(p) = &first {
+        logged(
+            "noting the first prompt",
+            note_first_prompt(db, &s.id, agent, Some(p), now),
+        );
+    } else if refork.is_some() {
+        // (Its thread, forked from the parent's, is one started from now.)
+        logged(
+            "noting the first prompt",
+            note_first_prompt(db, &s.id, agent, None, now),
+        );
+    }
+    // The re-fork's note (as its file already showed it) and its new
+    // thread are stored now, before what it handed over is marked seen.
+    if let Some(body) = &renewed {
+        logged(
+            "renewing the fork's note",
+            crate::fork::renote(db, &s, body, renewed_at),
+        );
+    }
+    if refork.is_some() {
+        logged("unbinding the old thread", crate::fork::reforked(db, &s));
     }
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.
     // (A resume without a pointer, or a stale file, carries nothing new.)
-    let fresh =
-        pointer.is_some() || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
+    let fresh = pointer_sent || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
     if fresh {
-        db.context_mark_all_seen(&s.id, now)?;
+        logged(
+            "marking its background seen",
+            db.context_mark_all_seen(&s.id, now),
+        );
     }
-    db.set_status(&s.id, Status::Starting, now)?;
+    logged(
+        "setting its status",
+        db.set_status(&s.id, Status::Starting, now).map(|_| ()),
+    );
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
     crate::codex_daemon::sync_gate(db);
-    db.insert_event(
-        &s.id,
-        now,
-        if resumed { "resumed" } else { "restarted" },
-        &match (resumed, agent.deferred(model.as_deref())) {
-            // (Resumed: whatever model the conversation has by now.)
-            (true, Some(d)) => json!({"argv": argv,
-                "model": format!("the session keeps its own (launched with {})", d.model)}),
-            _ => json!({"argv": argv}),
-        }
-        .to_string(),
-    )?;
+    logged(
+        "logging the event",
+        db.insert_event(
+            &s.id,
+            now,
+            match (resumed, &refork) {
+                (true, _) => "resumed",
+                // (Forked again: the `forked` event's branch point, now.)
+                (false, Some(_)) => "reforked",
+                (false, None) => "restarted",
+            },
+            &match (resumed, agent.deferred(model.as_deref())) {
+                // (Resumed: whatever model the conversation has by now.)
+                (true, Some(d)) => json!({"argv": argv,
+                    "model": format!("the session keeps its own (launched with {})", d.model)}),
+                (_, _) if refork.is_some() => {
+                    json!({"argv": argv, "from": s.forked_from, "from_conversation": refork})
+                }
+                _ => json!({"argv": argv}),
+            }
+            .to_string(),
+        )
+        .map(|_| ()),
+    );
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
@@ -1163,8 +1342,12 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
             db.clear_agent_session(&s.id)?;
             db.kv_set(&bind_since_key(&s.id), &now.to_string())?;
             db.kv_set(&bind_prompt_key(&s.id), "")?;
+            // (A fresh conversation is no fork.)
+            db.kv_delete(&bind_fork_key(&s.id))?;
         }
     }
+    // Nor is there a fork to make again at its next restart.
+    db.kv_delete(&crate::fork::pending_key(&s.id))?;
     db.set_status(&s.id, Status::Starting, now)?;
     db.insert_event(
         &s.id,
@@ -1413,8 +1596,7 @@ fn hook_emit_in(
         }
         if bound {
             // What binding from the agent's index would have needed.
-            db.kv_delete(&bind_since_key(&s.id))?;
-            db.kv_delete(&bind_prompt_key(&s.id))?;
+            clear_bind_keys(db, &s.id)?;
         }
         // The session's background, for its own conversation only (not a
         // sub-agent's thread; a forked or background copy was refused
@@ -1465,6 +1647,9 @@ fn hook_emit_in(
         if whose != Whose::Other {
             if let Some(tp) = payload.get("transcript_path").and_then(Value::as_str) {
                 db.upsert_transcript_source(&s.id, tp)?;
+                // A fork whose own conversation is written: no longer one
+                // to make again at a restart.
+                crate::fork::conversation_seen(db, &s.id, tp)?;
             }
         }
         // Who this event is about, when it blocks or unblocks: a sub-agent
@@ -1880,6 +2065,22 @@ pub(crate) fn bind_since_key(id: &str) -> String {
 /// how its thread is told from another started in the same folder.
 pub(crate) fn bind_prompt_key(id: &str) -> String {
     format!("bind_prompt:{id}")
+}
+
+/// kv key: for a user fork whose agent assigns its own id (Codex), the
+/// thread it was forked from: its conversation is the thread whose rollout
+/// says so (`discover::pick_thread`), not one picked by first message (a
+/// fork's is its parent's).
+pub(crate) fn bind_fork_key(id: &str) -> String {
+    format!("bind_fork:{id}")
+}
+
+/// What an agent that picks its own id needed to find a conversation, once
+/// one is bound.
+pub(crate) fn clear_bind_keys(db: &Db, id: &str) -> Result<()> {
+    db.kv_delete(&bind_since_key(id))?;
+    db.kv_delete(&bind_prompt_key(id))?;
+    db.kv_delete(&bind_fork_key(id))
 }
 
 #[cfg(test)]

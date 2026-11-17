@@ -56,13 +56,16 @@ if [[ $sub == resume ]]; then
   tr=$(sqlite3 "$db" "select rollout_path from threads where id='$tid'")
   [[ -n $tr ]] || { echo "No saved session found with ID $tid" >&2; exit 1; }
 else
+  # (`codex fork <id>`: a new thread whose rollout names the one it was
+  # forked from.)
+  forked=''; [[ $sub == fork ]] && forked=$tid
   tid=$(python3 -c 'import uuid; print(uuid.uuid4())')
   day=$home/sessions/$(date -u +%Y/%m/%d)
   mkdir -p "$day"
   tr=$day/rollout-$(date -u +%Y-%m-%dT%H-%M-%S)-$tid.jsonl
   ms=$(python3 -c 'import time; print(int(time.time() * 1000))')
-  python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": "session_meta", "payload": {"id": sys.argv[2], "cwd": sys.argv[3], "originator": "codex-tui", "cli_version": "0.167.2"}}))' \
-    "$(now)" "$tid" "$PWD" >"$tr"
+  python3 -c 'import json,sys; print(json.dumps({"timestamp": sys.argv[1], "type": "session_meta", "payload": {"id": sys.argv[2], "forked_from_id": sys.argv[4] or None, "cwd": sys.argv[3], "originator": "codex-tui", "cli_version": "0.167.2"}}))' \
+    "$(now)" "$tid" "$PWD" "$forked" >"$tr"
   # (The first prompt, as Codex records it: quotes doubled for SQL.)
   first=$(printf '%s' "$prompt" | sed "s/'/''/g")
   source=cli; [[ $daemon == 1 ]] && source=vscode

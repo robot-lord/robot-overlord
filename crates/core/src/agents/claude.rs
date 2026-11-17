@@ -41,10 +41,17 @@ pub fn project_slug(project_path: &str) -> String {
         .collect()
 }
 
+/// Where Claude writes conversation `session_uuid` started in
+/// `project_path`: under its real path (Claude's own working directory is
+/// the resolved one, so a folder reached through a symlink is filed under
+/// its target). A folder that can't be resolved (gone) is taken as given.
 pub fn transcript_path(project_path: &str, session_uuid: &str) -> PathBuf {
+    let real = std::fs::canonicalize(project_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| project_path.to_string());
     config_dir()
         .join("projects")
-        .join(project_slug(project_path))
+        .join(project_slug(&real))
         .join(format!("{session_uuid}.jsonl"))
 }
 
@@ -101,6 +108,46 @@ pub fn resume_argv(
     }
     argv.extend(extra.iter().cloned());
     Ok(argv)
+}
+
+/// Whether a user fork's new conversation id can be chosen by rlord:
+/// `--resume <parent> --fork-session --session-id <new>` starts the fork
+/// on `<new>`, its hooks report `<new>`, and its transcript is written
+/// under `<new>` from its first message on (not before: until then a
+/// restart forks again, `daemon::fork::pending`). Live check F1, Claude
+/// Code 2.1.326. False: the fork's id is bound from its first hook.
+pub const FORK_MINTS_ID: bool = true;
+
+/// Whether a user fork can start in another worktree of the parent's repo:
+/// `--resume <parent>` from there (its top, or the parent's subfolder of
+/// it) still finds the parent's conversation, and the fork's transcript
+/// goes under the new folder (live checks F2, F2b, Claude Code 2.1.326). There, a new worktree of a repo Claude already
+/// trusted started without its folder-trust question.
+pub const FORK_ELSEWHERE: bool = true;
+
+/// A user fork of conversation `parent` (a new session that starts from a
+/// copy of it; the parent is untouched): `claude --resume <parent>
+/// --fork-session [--session-id <new>] [--model m] <extra…> [prompt]`.
+/// (Not the archive summary's fork: `summary_argv`.)
+pub fn fork_argv(
+    parent: &str,
+    new_id: Option<&str>,
+    first_prompt: Option<&str>,
+    model: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = ["claude", "--resume", parent, "--fork-session"]
+        .map(String::from)
+        .to_vec();
+    if let Some(id) = new_id {
+        argv.extend(["--session-id".to_string(), id.to_string()]);
+    }
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        argv.extend(["--model".to_string(), m.to_string()]);
+    }
+    argv.extend(extra.iter().cloned());
+    argv.extend(first_prompt.map(str::to_string));
+    argv
 }
 
 /// Map a Claude hook event to (event kind for our log, what it does to the
@@ -739,5 +786,68 @@ mod tests {
         assert!(a.background);
         assert_eq!(a.output_tokens, 260);
         assert_eq!(a.finished_at.unwrap() - a.started_at.unwrap(), 4000);
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    /// A folder reached through a symlink is filed under its real path,
+    /// as Claude (whose working directory is the resolved one) files it.
+    #[test]
+    fn a_transcript_is_found_under_the_real_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = transcript_path(link.to_str().unwrap(), "c-1");
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        assert_eq!(via_link, transcript_path(resolved.to_str().unwrap(), "c-1"));
+        assert!(via_link
+            .to_string_lossy()
+            .contains(&project_slug(resolved.to_str().unwrap())));
+        // A folder that is gone: as given.
+        assert!(transcript_path("/nonexistent/rlord-x", "c-1")
+            .to_string_lossy()
+            .contains("-nonexistent-rlord-x"));
+    }
+
+    #[test]
+    fn a_user_fork_resumes_the_parent_into_a_new_id() {
+        let extra = vec!["--settings".to_string(), "{}".to_string()];
+        assert_eq!(
+            fork_argv(
+                "p-1",
+                Some("n-2"),
+                Some("try it with a queue"),
+                Some(" opus "),
+                &extra
+            ),
+            [
+                "claude",
+                "--resume",
+                "p-1",
+                "--fork-session",
+                "--session-id",
+                "n-2",
+                "--model",
+                "opus",
+                "--settings",
+                "{}",
+                "try it with a queue"
+            ]
+        );
+        // No id of rlord's choosing, no model, no prompt: opens idle.
+        assert_eq!(
+            fork_argv("p-1", None, None, Some(""), &[]),
+            ["claude", "--resume", "p-1", "--fork-session"]
+        );
+        // Never the summary's one-shot flags.
+        let a = fork_argv("p-1", Some("n"), Some("x"), None, &[]);
+        assert!(!a
+            .iter()
+            .any(|x| x == "-p" || x == "--no-session-persistence"));
     }
 }

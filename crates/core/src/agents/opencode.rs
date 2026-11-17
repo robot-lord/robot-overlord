@@ -793,6 +793,82 @@ fn run_bounded(bin: &Path, args: &[&str], limit: Duration) -> Option<String> {
         .map(|(_, text)| text)
 }
 
+// ---- user forks ----
+
+/// How long a fork call may take: the server copies the whole conversation.
+pub const FORK_LIMIT: Duration = Duration::from_secs(60);
+
+/// What a fork of a session with no finished turn is refused with.
+pub const NOTHING_TO_FORK: &str = "it has no conversation yet";
+
+/// The server's path for forking session `id` (`POST`, body `{}`: the
+/// whole conversation; checked against OpenCode 2.2.7's route table).
+pub fn fork_path(id: &str) -> String {
+    format!("/api/session/{id}/fork")
+}
+
+/// The new session's id in what OpenCode answered a fork with (`{data:
+/// {id, …}}`). `success`: the answer's HTTP status was 2xx (`Some(true)`),
+/// an error (`Some(false)`), or isn't known (`None`: OpenCode's client
+/// printed it). Only an error answer whose error is `ForkEmpty`
+/// (`Session.ForkEmptyError`: no finished turn to copy) says "nothing to
+/// fork"; a success never does, nor a word in a session's data.
+pub fn fork_response(text: &str, success: Option<bool>) -> anyhow::Result<String> {
+    let v: Option<Value> = serde_json::from_str(text.trim()).ok();
+    if success != Some(false) {
+        if let Some(id) = v
+            .as_ref()
+            .and_then(|v| v["data"]["id"].as_str())
+            .filter(|id| is_session_id(id))
+        {
+            return Ok(id.to_string());
+        }
+    }
+    if success != Some(true) && v.as_ref().is_some_and(fork_empty) {
+        anyhow::bail!("{NOTHING_TO_FORK}");
+    }
+    match (v, success) {
+        (None, _) => anyhow::bail!("OpenCode's answer to the fork isn't JSON"),
+        (Some(_), Some(true)) => anyhow::bail!("OpenCode's answer to the fork has no session id"),
+        (Some(v), _) => {
+            let said = v["message"]
+                .as_str()
+                .or(v["error"]["message"].as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| text.trim().to_string());
+            anyhow::bail!(
+                "OpenCode didn't fork it: {}",
+                said.chars().take(200).collect::<String>()
+            )
+        }
+    }
+}
+
+/// OpenCode's own client making a fork of `id` (`opencode api POST
+/// /api/session/<id>/fork -d {}`): it knows how to reach the server and
+/// starts it when none runs, as a launch's create step does. Run from the
+/// parent's folder, bounded by `FORK_LIMIT`, by the daemon.
+pub fn fork_api_argv(id: &str) -> Vec<String> {
+    ["opencode", "api", "POST", &fork_path(id), "-d", "{}"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Whether an error answer is `ForkEmpty` (by its error's name or type,
+/// `_tag` as OpenCode 2.2.7 gives it, at the top or under `error`; with or
+/// without a `Session.` prefix or `Error` suffix).
+pub fn fork_empty(v: &Value) -> bool {
+    let is = |s: &str| {
+        let last = s.rsplit('.').next().unwrap_or(s);
+        matches!(last, "ForkEmpty" | "ForkEmptyError")
+    };
+    [v, &v["error"]].into_iter().any(|e| {
+        ["_tag", "name", "type"]
+            .iter()
+            .any(|k| e[*k].as_str().is_some_and(is))
+    })
+}
+
 // ---- archive summaries (the fallback; see the daemon's `summary`) ----
 
 /// `opencode run` for a one-shot answer in a session of its own, created
@@ -2453,5 +2529,65 @@ pub(crate) mod tests {
             let e = json!({"type": kind, "message": "x", "status": 429, "retryAfterMs": 45_000});
             assert_eq!(usage_limit(&row(e)), None, "{kind}");
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    #[test]
+    fn a_fork_answer_names_the_new_session() {
+        let ok = Some(true);
+        let failed = Some(false);
+        // The shape OpenCode 2.2.7's server answers with.
+        let made = r#"{"data":{"id":"ses_1e0f5d2c3b4aXyZ12345678901","directory":"/src/app","forkSessionID":"ses_1"}}"#;
+        assert_eq!(
+            fork_response(made, ok).unwrap(),
+            "ses_1e0f5d2c3b4aXyZ12345678901"
+        );
+        assert!(is_session_id(&fork_response(made, None).unwrap()));
+        let empty = r#"{"_tag":"Session.ForkEmptyError","message":"nothing to fork"}"#;
+        assert_eq!(
+            fork_response(empty, failed).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
+        assert_eq!(
+            fork_response(empty, None).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
+        // A success is never "nothing to fork", whatever it says.
+        assert_ne!(
+            fork_response(empty, ok).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
+        assert!(fork_response("<html>", None).is_err());
+        // The word in a fork's own data is no error.
+        let titled = r#"{"data":{"id":"ses_9","title":"Debug ForkEmptyError handling"}}"#;
+        assert_eq!(fork_response(titled, ok).unwrap(), "ses_9");
+        // Nor in an error's message: only its name or type says so.
+        let other = r#"{"_tag":"Session.NotFound","message":"not a ForkEmpty case"}"#;
+        let e = fork_response(other, failed).unwrap_err().to_string();
+        assert_ne!(e, NOTHING_TO_FORK);
+        assert!(e.contains("not a ForkEmpty case"), "{e}");
+        let nested = r#"{"error":{"name":"ForkEmptyError"}}"#;
+        assert_eq!(
+            fork_response(nested, failed).unwrap_err().to_string(),
+            NOTHING_TO_FORK
+        );
+        assert!(fork_response(r#"{"data":{"id":"../x"}}"#, ok).is_err());
+        assert!(fork_response(r#"{"data":{}}"#, ok).is_err());
+        assert_eq!(fork_path("ses_1"), "/api/session/ses_1/fork");
+        assert_eq!(
+            fork_api_argv("ses_1"),
+            [
+                "opencode",
+                "api",
+                "POST",
+                "/api/session/ses_1/fork",
+                "-d",
+                "{}"
+            ]
+        );
     }
 }

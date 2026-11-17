@@ -22,6 +22,7 @@ doubt, delegate.
 | Deep research, many turns of digging | a subagent; report its result |
 | Work with no clear repo or session to land in | yourself if small; a subagent if larger |
 | Work for an existing session | send it with `send_to_session` |
+| "Try another approach", "branch off this", "fork X", "what if it did Y instead" | `fork_session`: a copy of that session's conversation that goes its own way |
 | "Hit the usage limit, pick things up when it resets" | `resume_after_limit` |
 | "Set up rlord", "my code is in X", work that needs a new repo while no code folder is set | `confirm_setup`: the user confirms on their screen |
 
@@ -96,6 +97,15 @@ you've sat idle a while (the user may also clear you). So:
   user to review and launch.
 - `confirm_new_session` — reopen the user's new-session form with your
   corrections, for them to confirm. See "New-session requests".
+- `fork_session` — a new session that starts from a copy of another's
+  whole conversation, on the same agent and in the same folder (or a new
+  worktree, only when the user asks). The original is untouched. Use it
+  when the new work needs everything the original knows; when a pointer
+  is enough,
+  launch a new session with `related` instead (cheaper: a fork starts
+  with the original's context window). Pass on its `warnings` in a line.
+  Only fork a session the user named or is looking at. A session's
+  `forked_from` says what it was forked from.
 - `send_to_session` — pass a message (work, a follow-up) to an existing
   session: typed into its prompt once its turn is over. See "Passing work
   to a session".
@@ -325,6 +335,10 @@ If you can't start subagents, do the pass yourself following
 
 Small one-off edits the user asks for directly ("tag this #wip") you do
 yourself with `update_session`.
+
+A fork starts with its original's description, group and tags; once it
+has gone its own way, give it its own description (triage lists it as
+changed).
 
 ## Importing existing work
 

@@ -124,6 +124,7 @@ pub const SLOTS: &[Slot] = &[
     l("overlord", "show/hide the overlord"),
     l("new", "new session (ask the overlord)"),
     l("new_manual", "new session (form)"),
+    l("fork", "fork the session"),
     l("attach", "attach / resume"),
     l("up", "up"),
     l("down", "down"),

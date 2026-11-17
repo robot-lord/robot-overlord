@@ -653,6 +653,12 @@ impl App {
                     KeyCode::Right
                 }
             }),
+            // Again on Fork: fork; on the folder row: the other choice.
+            Mode::Fork(s) => s.click_row(i).then(|| s.current()).and_then(|r| match r {
+                crate::forkform::Row::Fork => Some(KeyCode::Enter),
+                crate::forkform::Row::Folder => Some(KeyCode::Right),
+                _ => None,
+            }),
             _ => None,
         };
         match then {
@@ -1697,7 +1703,7 @@ mod tests {
             labels(&app),
             [
                 "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes"
+                "notes", "fork"
             ]
         );
         // Drawn at the pointer, over everything; its entries are picks.
@@ -1716,7 +1722,7 @@ mod tests {
         app.open_menu(30, 8, false);
         assert_eq!(
             labels(&app),
-            ["unarchive", "rename", "tags", "describe", "notes"]
+            ["unarchive", "rename", "tags", "describe", "notes", "fork"]
         );
         // A group: open, rename, favourite.
         app.mode = Mode::Normal;

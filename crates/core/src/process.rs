@@ -63,6 +63,32 @@ pub fn run_to_file(
     Ok((waited?, text))
 }
 
+/// Run an agent's own command for rlord (an archive summary, a fork call,
+/// removing what a failed fork made) in folder `cwd`, to its end, at most
+/// `limit`: its exit status and what it printed, through a file in
+/// `out_dir` (`run_to_file`). It is not one of rlord's sessions: its hooks
+/// must not report as one (no `RLORD_SESSION_ID`, `TMUX_PANE`). `name`
+/// says what ran in an error.
+pub fn run_agent(
+    out_dir: &Path,
+    name: &str,
+    argv: &[String],
+    cwd: &str,
+    stdin: Option<&str>,
+    limit: Duration,
+) -> Result<(ExitStatus, String)> {
+    let Some((program, args)) = argv.split_first() else {
+        bail!("running {name}: no command");
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("RLORD_SESSION_ID")
+        .env_remove("TMUX_PANE")
+        .stderr(Stdio::null());
+    run_to_file(cmd, out_dir, limit, stdin).with_context(|| format!("running {name}"))
+}
+
 /// A file name in `dir` no other run uses: `<prefix>-<pid>-<uuid>.txt`.
 pub fn unique_file(dir: &Path, prefix: &str) -> PathBuf {
     dir.join(format!(

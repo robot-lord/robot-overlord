@@ -3,6 +3,7 @@ pub mod autostart;
 pub mod codex_daemon;
 pub mod context;
 pub mod discover;
+pub mod fork;
 pub mod import;
 pub mod limits;
 pub mod locks;
@@ -70,6 +71,8 @@ pub struct Daemon {
     /// One session at a time: typing into it vs restarting, stopping or
     /// archiving it (locks.rs, which has the lock order).
     pub(crate) sessions: locks::SessionLocks,
+    /// Each Codex thread's fork flag, read once (`discover`).
+    pub(crate) fork_flags: Mutex<discover::ForkFlags>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
@@ -104,6 +107,7 @@ impl Daemon {
             summaries: Default::default(),
             limits: Default::default(),
             roster: Mutex::new(None),
+            fork_flags: Default::default(),
         })
     }
 
@@ -434,6 +438,7 @@ impl Daemon {
         if matches!(
             method,
             "session.new"
+                | "session.fork"
                 | "session.restart"
                 // (Enter on a stopped session resumes it.)
                 | "ui.goto"
@@ -791,6 +796,23 @@ impl Daemon {
                 Ok(json!({"styled": true}))
             }
             "session.import_scan" => import::scan(self, params),
+            // (Its own locking: OpenCode's fork call, the hooks check and
+            // `git worktree add` run without the DB lock.)
+            "session.fork" => {
+                let r = fork::fork(self, params);
+                if let Ok(v) = &r {
+                    self.changed();
+                    self.bind_nav_keys();
+                    if let Some(id) = v["id"].as_str() {
+                        // A new tmux session starts on rlord's defaults.
+                        profile::sync_ref(self, id);
+                        // Its copied history: loaded in the background, as
+                        // for an import.
+                        warm::enqueue_ref(self, id);
+                    }
+                }
+                r
+            }
             "session.import" => {
                 let r = import::import(self, params);
                 if let Ok(v) = &r {

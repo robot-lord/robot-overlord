@@ -206,17 +206,33 @@ fn random_u64() -> u64 {
     u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
 }
 
-/// A fresh `rlord-adjective-noun` name for which `taken` is false. After a
-/// run of collisions a numeric suffix keeps it unique however full the space.
+/// The first name `taken` says no to: `first` (if any), then
+/// `numbered(2)`, `numbered(3)`, … up to 9,999; past that a random number.
+/// Bounded: if `taken` says yes to everything, give up on uniqueness rather
+/// than spin (the random number keeps it distinct in practice). The one
+/// generator behind every name rlord picks.
+fn first_free(
+    first: Option<String>,
+    numbered: impl Fn(u64) -> String,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    first
+        .into_iter()
+        .chain((2..10_000).map(&numbered))
+        .find(|n| !taken(n))
+        .unwrap_or_else(|| numbered(random_u64() % 1_000_000))
+}
+
 /// A session's tmux name: its rlord name, tmux-safe, plus `-rlord` (so a
 /// glance at tmux's session name says which rlord session this is). Taken
 /// names get a number: `web-rlord`, `web-2-rlord`, …
 pub fn tmux_name_for(name: &str, taken: impl Fn(&str) -> bool) -> String {
     let base = tmux_safe(name);
-    std::iter::once(format!("{base}-rlord"))
-        .chain((2..10_000).map(|i| format!("{base}-{i}-rlord")))
-        .find(|n| !taken(n))
-        .unwrap_or_else(|| format!("{base}-{}-rlord", random_u64() % 1_000_000))
+    first_free(
+        Some(format!("{base}-rlord")),
+        |i| format!("{base}-{i}-rlord"),
+        taken,
+    )
 }
 
 /// Whether `tmux` is what `tmux_name_for` would give `name` (any number).
@@ -253,6 +269,8 @@ fn tmux_safe(name: &str) -> String {
     }
 }
 
+/// A fresh `rlord-adjective-noun` name for which `taken` is false. After a
+/// run of collisions a numeric suffix keeps it unique however full the space.
 pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
     let pick = || {
         let r = random_u64();
@@ -267,16 +285,27 @@ pub fn tmux_name(taken: impl Fn(&str) -> bool) -> String {
         }
     }
     let base = pick();
-    // Bounded: if `taken` says yes to everything, give up on uniqueness
-    // rather than spin (the id suffix keeps it distinct in practice).
-    (2..10_000)
-        .map(|i| format!("{base}-{i}"))
-        .find(|n| !taken(n))
-        .unwrap_or_else(|| format!("{base}-{}", random_u64() % 1_000_000))
+    first_free(None, |i| format!("{base}-{i}"), taken)
+}
+
+/// A fork's default name: `<parent>-fork`, then `-fork-2`, `-fork-3`, …
+/// (the first `taken` says no to). A fork of `x-fork` is `x-fork-fork`.
+pub fn fork_name(parent: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = format!("{}-fork", parent.trim());
+    first_free(Some(base.clone()), |i| format!("{base}-{i}"), taken)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_fork_is_named_after_its_parent() {
+        let none = |_: &str| false;
+        assert_eq!(fork_name("api", none), "api-fork");
+        assert_eq!(fork_name("api-fork", none), "api-fork-fork");
+        let taken = |n: &str| n == "api-fork" || n == "api-fork-2";
+        assert_eq!(fork_name("api", taken), "api-fork-3");
+    }
 
     #[test]
     fn tmux_names_follow_the_session_name() {

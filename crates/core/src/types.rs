@@ -100,6 +100,31 @@ pub struct Session {
     /// spec's `codex_host`), not in its pane: see `agents::codex::on_daemon`.
     #[serde(default)]
     pub codex_daemon: bool,
+    /// The session it was forked from (`session.fork`): its rlord id, and
+    /// its name as it is now (None when that session is gone).
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    #[serde(default)]
+    pub forked_from_name: Option<String>,
+    /// How many sessions were forked from it (live or archived), and how
+    /// many of them aren't archived: on every listed row (`Db::sessions`).
+    #[serde(default)]
+    pub fork_count: usize,
+    #[serde(default)]
+    pub live_fork_count: usize,
+    /// The sessions forked from it (live or archived), oldest first: only
+    /// for one session (`session.get`), never on list rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forks: Vec<ForkRef>,
+}
+
+/// A session forked from another (`Session::forks`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkRef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Session {

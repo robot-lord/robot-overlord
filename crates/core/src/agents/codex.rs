@@ -116,6 +116,37 @@ pub fn resume_argv(session_id: &str, model: Option<&str>, extra: &[String]) -> V
     )
 }
 
+/// What a fork run in another folder than its parent's last one works in
+/// (`tui.resume_cwd`, this run only): the folder it is started in. Without
+/// it Codex asks first ("Working directory · fork", the parent's folder
+/// highlighted), which would hold the pane, and with the parent's folder
+/// the thread is indexed there and never bound (codex-cli 0.169.0).
+pub const FORK_CWD: &str = "tui.resume_cwd=\"current\"";
+
+/// A user fork of thread `parent` (a new thread that starts from a copy of
+/// it; the parent is untouched): `codex fork <parent> --no-alt-screen
+/// [--model m] -c tui.resume_cwd="current" <extra…> [prompt]`. Codex
+/// assigns the new thread's id; its rollout names the parent
+/// (`rollout_forked_from`), and its folder is the one it was started in
+/// (`FORK_CWD`). (Not the archive summary's `codex exec fork`:
+/// `summary_argv`.)
+pub fn fork_argv(
+    parent: &str,
+    first_prompt: Option<&str>,
+    model: Option<&str>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut own = vec!["-c".to_string(), FORK_CWD.to_string()];
+    own.extend(extra.iter().cloned());
+    let mut argv = with_model(
+        vec!["codex".to_string(), "fork".to_string(), parent.to_string()],
+        model,
+        &own,
+    );
+    argv.extend(first_prompt.map(str::to_string));
+    argv
+}
+
 /// A TOML basic string (for a `-c key=value` override's value).
 pub fn toml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -530,6 +561,69 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
         .into_iter::<String>()
         .next()?
         .ok()
+}
+
+/// What a rollout's first line (its `session_meta`) says it was forked
+/// from: `Some(Some(thread))` a fork of that thread, `Some(None)` not a
+/// fork, `None` can't be told (`rollout_first_line`: not yet, or never).
+/// Only the first line counts: a fork's history copied after it may hold
+/// other threads' meta.
+pub fn rollout_forked_from(path: &Path) -> Option<Option<String>> {
+    match rollout_first_line(path) {
+        FirstLine::Says(from) => Some(from),
+        FirstLine::NotYet | FirstLine::Unreadable => None,
+    }
+}
+
+/// A rollout's first line, as `rollout_first_line` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstLine {
+    /// Complete: what it was forked from (None: not a fork).
+    Says(Option<String>),
+    /// No file, or no complete first line yet: it is still being written.
+    NotYet,
+    /// Complete but never readable: longer than `FIRST_LINE_MAX`, or not
+    /// JSON. Reading it again won't help.
+    Unreadable,
+}
+
+/// How much of a rollout's first line is read (it carries the
+/// instructions).
+pub const FIRST_LINE_MAX: u64 = 4 << 20;
+
+/// Read a rollout's first line whole, up to `FIRST_LINE_MAX`.
+pub fn rollout_first_line(path: &Path) -> FirstLine {
+    use std::io::{BufRead, Read};
+    let Ok(f) = std::fs::File::open(path) else {
+        return FirstLine::NotYet;
+    };
+    let mut line = Vec::new();
+    if std::io::BufReader::new(f.take(FIRST_LINE_MAX))
+        .read_until(b'\n', &mut line)
+        .is_err()
+    {
+        return FirstLine::NotYet;
+    }
+    if line.last() != Some(&b'\n') {
+        // No newline in the whole cap: a line longer than it, for good.
+        return if line.len() as u64 >= FIRST_LINE_MAX {
+            FirstLine::Unreadable
+        } else {
+            FirstLine::NotYet
+        };
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+        return FirstLine::Unreadable;
+    };
+    if v["type"] != "session_meta" {
+        return FirstLine::Says(None);
+    }
+    FirstLine::Says(
+        v["payload"]["forked_from_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    )
 }
 
 // ---- reading rollout lines (see `transcript::Line`) ----
@@ -1519,5 +1613,119 @@ mod tests {
             assert!(!argv.iter().any(|x| x.contains("dangerously")));
         }
         assert!(!b.contains(&"--model".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_user_fork_runs_codex_fork_with_the_sessions_flags() {
+        let extra = host_args(false);
+        assert_eq!(
+            fork_argv("t-1", Some("try a queue"), Some("gpt-x"), &extra),
+            [
+                "codex",
+                "fork",
+                "t-1",
+                "--no-alt-screen",
+                "--model",
+                "gpt-x",
+                "-c",
+                "tui.resume_cwd=\"current\"",
+                "--no-daemon",
+                "try a queue"
+            ]
+        );
+        // Always in the folder it is started in, with no question first.
+        assert_eq!(
+            fork_argv("t-1", None, None, &[]),
+            ["codex", "fork", "t-1", "--no-alt-screen", "-c", FORK_CWD]
+        );
+        // Not the summary's `codex exec fork`.
+        assert!(!fork_argv("t-1", None, None, &[]).contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn a_rollout_says_which_thread_it_was_forked_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let meta = |forked: Value| {
+            json!({"timestamp": "2026-11-16T10:00:00Z", "type": "session_meta",
+                   "payload": {"id": "t-2", "forked_from_id": forked, "cwd": "/src/app",
+                               "instructions": "x".repeat(200)}})
+            .to_string()
+        };
+        let parent_meta = json!({"type": "session_meta",
+            "payload": {"id": "t-1", "forked_from_id": "t-0", "cwd": "/src/app"}})
+        .to_string();
+        let fork = write(
+            "fork.jsonl",
+            &format!("{}\n{parent_meta}\n", meta(json!("t-1"))),
+        );
+        assert_eq!(rollout_forked_from(&fork), Some(Some("t-1".into())));
+        // Not a fork: the parent's meta copied after the first line doesn't count.
+        let plain = write(
+            "plain.jsonl",
+            &format!("{}\n{parent_meta}\n", meta(Value::Null)),
+        );
+        assert_eq!(rollout_forked_from(&plain), Some(None));
+        let older = write(
+            "older.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t-3\",\"cwd\":\"/a\"}}\n",
+        );
+        assert_eq!(rollout_forked_from(&older), Some(None));
+        // A long first line is read whole.
+        let long = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"t-4\",\"forked_from_id\":\"t-1\",\
+             \"instructions\":\"{}\"}}}}\n",
+            "y".repeat(100 * 1024)
+        );
+        assert_eq!(
+            rollout_forked_from(&write("long.jsonl", &long)),
+            Some(Some("t-1".into()))
+        );
+        // Can't be told yet: no file, a first line still being written (no
+        // line end), one that doesn't parse. Asked again, never "not a fork".
+        assert_eq!(rollout_forked_from(&dir.path().join("absent.jsonl")), None);
+        let partial = meta(json!("t-1"));
+        assert_eq!(
+            rollout_forked_from(&write("partial.jsonl", &partial[..partial.len() / 2])),
+            None
+        );
+        assert_eq!(rollout_forked_from(&write("unended.jsonl", &partial)), None);
+        assert_eq!(
+            rollout_forked_from(&write("junk.jsonl", "not json\n")),
+            None
+        );
+        // Another first line than a meta one: not a fork.
+        assert_eq!(
+            rollout_forked_from(&write("other.jsonl", "{\"type\":\"event_msg\"}\n")),
+            Some(None)
+        );
+        // Not yet, or never: a line still being written can still be
+        // read; one that isn't JSON, or is longer than the cap, can't.
+        assert_eq!(
+            rollout_first_line(&dir.path().join("unended.jsonl")),
+            FirstLine::NotYet
+        );
+        assert_eq!(
+            rollout_first_line(&dir.path().join("junk.jsonl")),
+            FirstLine::Unreadable
+        );
+        let huge = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"instructions\":\"{}\"}}}}\n",
+            "z".repeat(FIRST_LINE_MAX as usize)
+        );
+        assert_eq!(
+            rollout_first_line(&write("huge.jsonl", &huge)),
+            FirstLine::Unreadable
+        );
     }
 }

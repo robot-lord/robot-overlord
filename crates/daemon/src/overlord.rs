@@ -1139,6 +1139,24 @@ mod tests {
         }
     }
 
+    /// A fork is routed (a row in the table) and its tool described.
+    #[test]
+    fn instructions_route_forks() {
+        let table = INSTRUCTIONS
+            .split("## How to route a request")
+            .nth(1)
+            .and_then(|t| t.split("\n## ").next())
+            .unwrap();
+        assert!(
+            table
+                .lines()
+                .any(|l| l.starts_with('|') && l.contains("`fork_session`")),
+            "no routing row for forks"
+        );
+        assert!(INSTRUCTIONS.contains("- `fork_session` —"));
+        assert!(INSTRUCTIONS.contains("`forked_from`"));
+    }
+
     /// Subagents may only use rlord tools that exist.
     #[test]
     fn subagent_tools_exist() {

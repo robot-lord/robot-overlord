@@ -643,12 +643,69 @@ pub fn check(
 /// Store checked notes and links for session `id`. Returns whether
 /// anything was added.
 pub fn store(db: &Db, id: &str, notes: &[String], links: &[String], now: i64) -> Result<bool> {
-    let mut added = false;
-    for n in notes {
-        added |= db.context_add(id, now, "note", n, "overlord")?;
+    store_rows(db, id, &rows_from(notes, links, "overlord"), now)
+}
+
+/// Where a fork works, for its note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkFolder {
+    /// Its parent's folder.
+    Shared,
+    /// A worktree of its own (path, branch), branched from the parent's
+    /// last commit.
+    Worktree(String, String),
+}
+
+/// The note a fork gets (plain code, `source = 'fork'`): what it was
+/// forked from and when, that the two go on separately, and where it
+/// works.
+pub fn fork_note(parent_name: &str, parent_id: &str, at: i64, folder: &ForkFolder) -> String {
+    let ts = rlord_core::timefmt::fmt_ts(at);
+    let when = format!("{} UTC", ts.get(..16).unwrap_or(&ts));
+    let mut out = format!(
+        "Forked from session \"{}\" ({parent_id}) at {when}. The conversation up to then \
+         is a copy of that session's; from here the two go on separately.",
+        one_line(parent_name, 80)
+    );
+    match folder {
+        ForkFolder::Shared => out.push_str(" It works in the same folder as that session."),
+        ForkFolder::Worktree(path, branch) => out.push_str(&format!(
+            " It works in its own worktree, {path} (branch {branch}), branched from that \
+             session's last commit; changes not committed there were not carried over."
+        )),
     }
-    for l in links {
-        added |= db.context_add(id, now, "link", l, "overlord")?;
+    out
+}
+
+/// A row to add: its kind (`note`, `link`), body and source (`overlord`,
+/// or `fork` for what a fork's own code wrote).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRow {
+    pub kind: &'static str,
+    pub body: String,
+    pub source: &'static str,
+}
+
+/// Notes, then links, as rows from `source`.
+pub fn rows_from(notes: &[String], links: &[String], source: &'static str) -> Vec<NewRow> {
+    let row = |kind, body: &String| NewRow {
+        kind,
+        body: body.clone(),
+        source,
+    };
+    notes
+        .iter()
+        .map(|n| row("note", n))
+        .chain(links.iter().map(|l| row("link", l)))
+        .collect()
+}
+
+/// Store rows (already checked) for session `id`, in order. Returns
+/// whether anything was added.
+pub fn store_rows(db: &Db, id: &str, rows: &[NewRow], now: i64) -> Result<bool> {
+    let mut added = false;
+    for r in rows {
+        added |= db.context_add(id, now, r.kind, &r.body, r.source)?;
     }
     Ok(added)
 }
@@ -683,18 +740,52 @@ pub fn launch_file_text(
     links: &[String],
     at: i64,
 ) -> String {
-    let rows: Vec<ContextRow> = notes
+    launch_file_text_rows(db, name, &[], &rows_from(notes, links, "overlord"), at)
+}
+
+/// Of `rows`, those a new session's `store_rows` will store after
+/// `copied` (stored unseen, as `context_copy` does): `Db::context_add`
+/// skips a link already there and a note the same as one not handed over
+/// yet, and in a new session nothing is handed over yet. So its file,
+/// rendered before the rows are stored, shows exactly what is stored.
+pub fn kept_rows<'a>(
+    copied: impl IntoIterator<Item = &'a ContextRow>,
+    rows: Vec<NewRow>,
+) -> Vec<NewRow> {
+    let mut seen: std::collections::HashSet<(String, String)> = copied
+        .into_iter()
+        .map(|r| (r.kind.clone(), r.body.clone()))
+        .collect();
+    rows.into_iter()
+        .filter(|r| seen.insert((r.kind.to_string(), r.body.clone())))
+        .collect()
+}
+
+/// `launch_file_text` for rows copied from another session (`copied`, as
+/// they are stored there) followed by new ones, already as they will be
+/// stored (`kept_rows`).
+pub fn launch_file_text_rows(
+    db: &Db,
+    name: &str,
+    copied: &[ContextRow],
+    rows: &[NewRow],
+    at: i64,
+) -> String {
+    let rows: Vec<ContextRow> = copied
         .iter()
-        .map(|n| ("note", n))
-        .chain(links.iter().map(|l| ("link", l)))
-        .enumerate()
-        .map(|(i, (kind, body))| ContextRow {
-            id: i as i64 + 1,
+        .cloned()
+        .chain(rows.iter().map(|r| ContextRow {
+            id: 0,
             at,
-            kind: kind.to_string(),
-            body: body.clone(),
-            source: "overlord".to_string(),
+            kind: r.kind.to_string(),
+            body: r.body.clone(),
+            source: r.source.to_string(),
             seen_at: None,
+        }))
+        .enumerate()
+        .map(|(i, r)| ContextRow {
+            id: i as i64 + 1,
+            ..r
         })
         .collect();
     render_as(name, true, &rows, &related_of(db, &rows), None, FILE_BUDGET)
@@ -702,10 +793,34 @@ pub fn launch_file_text(
 
 /// The session's whole background for its file; None when it has none.
 pub fn file_text(db: &Db, s: &Session) -> Result<Option<String>> {
+    file_text_with(db, s, None)
+}
+
+/// A note as it is about to be rewritten (`source`, new body and time):
+/// rendered in place of the stored one before the change is stored.
+pub struct Renewed<'a> {
+    pub source: &'a str,
+    pub body: &'a str,
+    pub at: i64,
+}
+
+/// `file_text`, with the notes from `renewed.source` shown as they will be
+/// (stored only once the start that carries them is under way).
+pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result<Option<String>> {
     if !has_background(db, &s.id)? {
         return Ok(None);
     }
-    let rows = db.context_rows(&s.id)?;
+    let mut rows = db.context_rows(&s.id)?;
+    if let Some(r) = renewed {
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.kind == "note" && row.source == r.source)
+        {
+            row.body = r.body.to_string();
+            row.at = r.at;
+            row.seen_at = None;
+        }
+    }
     Ok(Some(render_as(
         &s.name,
         launched_with_it(db, &s.id)?,
@@ -719,7 +834,18 @@ pub fn file_text(db: &Db, s: &Session) -> Result<Option<String>> {
 /// Rewrite the session's background file from its rows (nothing when it
 /// has no background). Returns the file.
 pub fn refresh_file(db: &Db, base: &Path, s: &Session) -> Result<Option<PathBuf>> {
-    match file_text(db, s)? {
+    refresh_file_with(db, base, s, None)
+}
+
+/// `refresh_file`, rendering a note about to be rewritten as it will be
+/// (`file_text_with`).
+pub fn refresh_file_with(
+    db: &Db,
+    base: &Path,
+    s: &Session,
+    renewed: Option<&Renewed>,
+) -> Result<Option<PathBuf>> {
+    match file_text_with(db, s, renewed)? {
         Some(text) => Ok(Some(write_file(base, &s.id, &text)?)),
         None => Ok(None),
     }

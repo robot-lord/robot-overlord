@@ -116,7 +116,7 @@ pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
     let mut recreated = false;
     if !c.dir_exists && c.recreatable && params["recreate_worktree"].as_bool() == Some(true) {
         if let (Some(repo), Some(branch)) = (&c.repo, &c.branch) {
-            git::worktree_add(repo, branch, std::path::Path::new(&c.cwd))
+            git::worktree_add(repo, branch, std::path::Path::new(&c.cwd), None)
                 .with_context(|| format!("recreating the worktree at {}", c.cwd))?;
             recreated = true;
         }

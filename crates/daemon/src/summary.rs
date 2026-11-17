@@ -52,10 +52,11 @@ impl Summaries {
     }
 }
 
-/// Where summary runs' output files go (`spawn_wait`, Codex's answer):
+/// Where the output files of agent commands rlord runs go (`spawn_wait`,
+/// Codex's answer; a fork's OpenCode calls too):
 /// beside the excerpt runs' folder (`<data>/summaries`), never in it, so a
 /// run never sees another's output.
-fn output_dir() -> PathBuf {
+pub(crate) fn output_dir() -> PathBuf {
     paths::data_dir().join("summary-output")
 }
 
@@ -416,15 +417,8 @@ fn spawn_wait_in(
     cwd: &str,
     stdin: Option<&str>,
 ) -> Result<(std::process::ExitStatus, String)> {
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(cwd)
-        // Not one of rlord's sessions: its hooks must not report as one.
-        .env_remove("RLORD_SESSION_ID")
-        .env_remove("TMUX_PANE")
-        .stderr(std::process::Stdio::null());
-    rlord_core::process::run_to_file(cmd, dir, TIMEOUT, stdin)
-        .with_context(|| format!("running {name}"))
+    // (Not one of rlord's sessions: its hooks must not report as one.)
+    rlord_core::process::run_agent(dir, name, argv, cwd, stdin, TIMEOUT)
 }
 
 /// The answer in `claude -p --output-format json`'s output.
