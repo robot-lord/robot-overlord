@@ -403,19 +403,24 @@ fn stopped<'a>(r: &'a Value, content: &Value) -> Option<&'a str> {
 
 /// Words one of the lines `Tracker::feed` acts on must hold: a cheap
 /// check before the full JSON parse.
-/// (Launches, finishes, resumes, stops, and the tool calls whose labels
-/// launches take. `pending` drops unanswered calls by its cap, so other
-/// tool results needn't be parsed.)
-const NEEDLES: [&[u8]; 9] = [
+/// (Launches, finishes, resumes, stops as `stopped` takes them, and the
+/// calls that can launch, for their labels. `pending` drops unanswered
+/// calls by its cap, so other tool calls and results needn't be parsed.)
+const NEEDLES: [&[u8]; 14] = [
     b"backgroundTaskId",
     b"async_launched",
     br#""isAsync":true"#,
     br#""background":true"#,
     b"resumedAgentId",
+    b"revivedAgentId",
     b"Successfully stopped",
     b"Successfully killed",
+    br#""shell_id""#,
     b"task-notification",
-    br#""type":"tool_use""#,
+    b"run_in_background",
+    br#""name":"Agent""#,
+    br#""name":"Task""#,
+    br#""name":"Skill""#,
 ];
 
 fn worth_parsing(line: &[u8]) -> bool {
@@ -778,11 +783,12 @@ mod tests {
         assert!(!worth_parsing(
             br#"{"type":"assistant","message":{"content":"hi"}}"#
         ));
-        // The words alone in text don't make a tool call.
-        assert!(!worth_parsing(
-            br#"{"type":"user","message":{"content":"a tool_use block"}}"#
-        ));
-        let call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t"}]}}"#;
+        // Only calls that can launch, not every tool call.
+        let read =
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}"#;
+        assert!(!worth_parsing(read.as_bytes()));
+        let call =
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Agent"}]}}"#;
         assert!(worth_parsing(call.as_bytes()));
     }
 

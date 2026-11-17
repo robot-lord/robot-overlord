@@ -128,11 +128,11 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
 /// tasks died with the old process). Returns what it shows at `now`.
 fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Shown {
     use std::os::unix::fs::MetadataExt;
-    // A new process (after a restart in rlord): what ran before is gone,
-    // even before its new transcript exists.
-    drop_before(&mut s.tracker, started_at);
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
+        // A new process (after a restart in rlord): what ran before is
+        // gone, even before its new transcript exists.
+        drop_before(&mut s.tracker, started_at);
         // (The transcript can't be seen: its subagents' own files still
         // tell whether they run.)
         let agents = last_write(0, &s.tracker);
@@ -156,7 +156,8 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
         }
     }
     let t = &mut s.tracker;
-    // (What the read just found, launched before the start, goes too.)
+    // A new process: what ran before it is gone (what the read just found
+    // included).
     drop_before(t, started_at);
     // (The subagents' own files only while some are open.)
     let agents = if t.of(Kind::Agent).next().is_some() {

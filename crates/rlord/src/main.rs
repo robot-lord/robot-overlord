@@ -2630,13 +2630,18 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             pin,
             truncate(get("name"), 23),
             // Stopped on a usage limit: that, and until when.
-            match s["limit"]["until"].as_str() {
-                Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
-                Some(until) => truncate(&format!("till {until}"), 16),
-                None => match s["shown_status"].as_str() {
-                    Some("background") => format!("bg {}", s["async_tasks"]),
-                    _ => rlord_core::types::Status::label_of(get("status")).to_string(),
-                },
+            match s["shown_status"]
+                .as_str()
+                .or(s["status"].as_str())
+                .unwrap_or("-")
+            {
+                "limited" if s["limit"]["reset"] == true => "limit reset".to_string(),
+                "limited" => truncate(
+                    &format!("till {}", s["limit"]["until"].as_str().unwrap_or("?")),
+                    16,
+                ),
+                "background" => format!("bg {}", s["async_tasks"]),
+                st => rlord_core::types::Status::label_of(st).to_string(),
             },
             rel_age(
                 [

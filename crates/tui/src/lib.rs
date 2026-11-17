@@ -853,7 +853,7 @@ impl App {
                 // map is the one just drawn).
                 if std::mem::take(&mut self.hover_stale) {
                     let keep = self.hover_row.as_ref().is_some_and(|(id, x, y)| {
-                        hover_still_there(self.hits.at(*x, *y), &self.sessions, id)
+                        hover_still_there(self.hits.under_popup(*x, *y), &self.sessions, id)
                     });
                     if !keep && self.hover_row.take().is_some() {
                         terminal.draw(|f| self.draw(f))?;
@@ -2780,15 +2780,19 @@ fn usage_details(u: &Value) -> String {
     )
 }
 
+/// The status a row shows (the daemon's `shown_status`; the stored one for
+/// a row without it).
+fn shown(s: &Value) -> &str {
+    s["shown_status"]
+        .as_str()
+        .or(s["status"].as_str())
+        .unwrap_or("-")
+}
+
 /// Whether the hovered session `id` is still the list row `hit` (what is
 /// under the pointer now).
 fn hover_still_there(hit: Option<mouse::Hit>, sessions: &[Value], id: &str) -> bool {
-    match hit {
-        // (The pointer on the popup itself: it stays.)
-        Some(mouse::Hit::Popup) => true,
-        Some(mouse::Hit::Row(i)) => sessions.get(i).is_some_and(|s| s["id"] == id),
-        _ => false,
-    }
+    matches!(hit, Some(mouse::Hit::Row(i)) if sessions.get(i).is_some_and(|s| s["id"] == id))
 }
 
 /// The details panel's height under the preview, in a right column
@@ -2825,12 +2829,13 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// `background`): that, in place of "your turn".
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
-    let Some(until) = l["until"].as_str() else {
-        if s["shown_status"] == "background" {
+    let until = match shown(s) {
+        "limited" => l["until"].as_str().unwrap_or("?"),
+        "background" => {
             let n = s["async_tasks"].as_u64().unwrap_or(0);
             return theme::background_chip(n, full);
         }
-        return theme::status_chip(s["status"].as_str().unwrap_or("-"));
+        st => return theme::status_chip(st),
     };
     let resume = if l["resume"] == true { " ↻" } else { "" };
     // Its reset time passed: held a minute more.

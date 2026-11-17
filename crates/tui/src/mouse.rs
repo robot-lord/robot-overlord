@@ -131,6 +131,18 @@ impl Hits {
         }
     }
 
+    /// Forget the hover popup's area (closed: what it covered is hit).
+    pub(crate) fn drop_popup(&self) {
+        self.0
+            .borrow_mut()
+            .retain(|(_, h)| !matches!(h, Hit::Popup));
+    }
+
+    /// The topmost region under the pointer, the hover popup left out.
+    pub(crate) fn under_popup(&self, x: u16, y: u16) -> Option<Hit> {
+        hit_at(&self.0.borrow(), x, y, |h| !matches!(h, Hit::Popup)).cloned()
+    }
+
     /// The topmost region under the pointer.
     pub(crate) fn at(&self, x: u16, y: u16) -> Option<Hit> {
         hit_at(&self.0.borrow(), x, y, |_| true).cloned()
@@ -282,8 +294,12 @@ impl App {
             return Ok(false);
         }
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, false, terminal),
-            MouseEventKind::Down(MouseButton::Right) => self.click(m.column, m.row, true, terminal),
+            MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
+                // The popup goes, and the click lands on what it covered.
+                self.hover_row = None;
+                self.hits.drop_popup();
+                self.click(m.column, m.row, button == MouseButton::Right, terminal)
+            }
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, true, terminal),
             MouseEventKind::ScrollDown => self.wheel(m.column, m.row, false, terminal),
             MouseEventKind::Moved => {
@@ -1797,6 +1813,7 @@ mod tests {
         // A limited session: resume it, unless that is already scheduled.
         app.mode = Mode::Normal;
         app.sessions[1]["limit"] = json!({"until": "3:00pm", "resume": false});
+        app.sessions[1]["shown_status"] = json!("limited");
         app.table.select(Some(1));
         app.open_menu(30, 8, false);
         assert_eq!(

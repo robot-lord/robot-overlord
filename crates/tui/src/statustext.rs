@@ -56,7 +56,12 @@ use rlord_core::timefmt::rel_age_at;
 /// The status itself, as a sentence.
 pub fn status_sentence(s: &Value, now: i64) -> String {
     let l = &s["limit"];
-    if let Some(until) = l["until"].as_str() {
+    let shown = s["shown_status"]
+        .as_str()
+        .or(s["status"].as_str())
+        .unwrap_or("");
+    if shown == "limited" {
+        let until = l["until"].as_str().unwrap_or("?");
         let resume = if l["resume"] == true {
             " It resumes by itself then."
         } else {
@@ -68,10 +73,8 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             format!("Stopped on a usage limit until {until}.{resume}")
         };
     }
-    if let Some(n) = s["async_tasks"]
-        .as_u64()
-        .filter(|_| s["shown_status"] == "background")
-    {
+    if shown == "background" {
+        let n = s["async_tasks"].as_u64().unwrap_or(0);
         let tasks: Vec<&Value> = s["async_work"]
             .as_array()
             .map(|a| a.iter().collect())
@@ -99,7 +102,7 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
         out.push_str(". Its turn is over; it goes on when they finish.");
         return out;
     }
-    let st = s["status"].as_str().unwrap_or("");
+    let st = shown;
     let (_, label, _) = status_parts(st);
     match MEANINGS.iter().find(|(k, _)| *k == st) {
         Some((_, what)) => {
@@ -226,7 +229,7 @@ mod tests {
 
     #[test]
     fn limit_wins_and_remote_is_spelled_out() {
-        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 1,
+        let s = json!({"status": "idle", "shown_status": "limited", "async_tasks": 1,
             "limit": {"until": "3:00pm", "resume": true},
             "remote": {"state": "on"}});
         assert_eq!(
