@@ -108,12 +108,13 @@ after the checks, so rehearse that with a manual dry run of the workflow
 
 - **Dev builds** are built on the maintainer's Apple Silicon Mac and uploaded
   as a pre-release. `build-release macos` signs with the keychain's
-  "Developer ID Application" identity when there is one (hardened runtime,
-  secure timestamp, identifier `com.robot-lord.rlord`), so macOS keeps
-  privacy grants such as folder access across updates. With no identity it
-  signs ad-hoc, as CI does. Set `RLORD_SIGN_IDENTITY` to choose one, or
-  to `-` for ad-hoc. Not notarized: `get.sh` downloads with curl, which
-  sets no quarantine flag.
+  "Developer ID Application" identity, by its hash (secure timestamp,
+  identifier `com.robot-lord.rlord`), so macOS keeps privacy grants such as
+  folder access across updates. Without one it refuses, except in CI
+  (`CI` set), which signs ad-hoc. `RLORD_SIGN_IDENTITY` picks an identity
+  by name or hash, or `-` signs ad-hoc on purpose. Not notarized and no
+  hardened runtime: `get.sh` downloads with curl, which sets no quarantine
+  flag. Signing CI's stable builds is owed (`docs/working/signing.md`).
 - **Stable releases** are built in GitHub Actions
   (`.github/workflows/release.yml`), so anyone can see how the binaries were
   made. `cargo xtask release` pushes the `vX.Y.Z` tag, which starts the workflow. A

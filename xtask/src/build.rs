@@ -62,16 +62,7 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
             // (arm64 refuses unsigned code). With a Developer ID in the
             // keychain the signature keeps one identity across builds, so
             // macOS privacy grants (folder access) survive an update.
-            let identity = sign_identity();
-            match &identity {
-                Some(name) => eprintln!("signing with {name}"),
-                None => eprintln!("signing ad-hoc (no Developer ID Application identity)"),
-            }
-            cmd::run(
-                Command::new("codesign")
-                    .args(sign_args(identity.as_deref()))
-                    .arg(&bin),
-            )?;
+            sign(&bin)?;
             cmd::run(Command::new("codesign").arg("--verify").arg(&bin))?;
             let reported = cmd::output(Command::new(&bin).arg("--version"))?;
             if reported != format!("rlord {ver}") {
@@ -181,81 +172,167 @@ fn pack(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) ->
     )
 }
 
-/// The bundle-style identifier a Developer ID signature carries. Fixed, so
-/// macOS sees every build as the same program.
+/// The identifier a Developer ID signature carries. Fixed, so macOS sees
+/// every build as the same program.
 const SIGN_ID: &str = "com.robot-lord.rlord";
 
-/// `codesign` arguments: a Developer ID with hardened runtime and a secure
-/// timestamp, or ad-hoc (`-`) when there is none.
-fn sign_args(identity: Option<&str>) -> Vec<String> {
-    match identity {
-        Some(name) => [
-            "--force",
-            "--sign",
-            name,
-            "--options",
-            "runtime",
-            "--timestamp",
-            "--identifier",
-            SIGN_ID,
-        ]
-        .map(String::from)
-        .to_vec(),
-        None => ["--force", "--sign", "-"].map(String::from).to_vec(),
-    }
+/// What to sign with.
+#[derive(Debug, PartialEq, Eq)]
+enum Signer {
+    /// A Developer ID, by its SHA-1 hash (unambiguous across renewals) and name.
+    Id {
+        hash: String,
+        name: String,
+    },
+    AdHoc,
 }
 
-/// The identity to sign with. `RLORD_SIGN_IDENTITY` wins ("-" or "" for
-/// ad-hoc); otherwise the keychain's first valid "Developer ID
-/// Application" identity, if any (none on CI runners: ad-hoc there).
-fn sign_identity() -> Option<String> {
-    if let Ok(v) = std::env::var("RLORD_SIGN_IDENTITY") {
-        let v = v.trim();
-        return (!v.is_empty() && v != "-").then(|| v.to_string());
-    }
-    let out = Command::new("security")
+/// Sign `bin`. Outside CI a Mac must have a Developer ID (an ad-hoc dev
+/// build would reset every user's macOS privacy grants); set
+/// `RLORD_SIGN_IDENTITY=-` to sign ad-hoc on purpose.
+fn sign(bin: &Path) -> Result<()> {
+    let ci = std::env::var_os("CI").is_some_and(|v| !v.is_empty());
+    let listing = Command::new("security")
         .args(["find-identity", "-v", "-p", "codesigning"])
         .stderr(Stdio::null())
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let env = std::env::var("RLORD_SIGN_IDENTITY").ok();
+    let signer = choose(env.as_deref(), &listing, ci)?;
+    match &signer {
+        Signer::Id { name, .. } => eprintln!("signing with {name}"),
+        Signer::AdHoc => eprintln!("signing ad-hoc"),
     }
-    developer_id(&String::from_utf8_lossy(&out.stdout))
+    cmd::run(Command::new("codesign").args(sign_args(&signer)).arg(bin)).context(
+        "codesign failed. With a Developer ID it needs the network (secure \
+         timestamp) and keychain access to the key (run once from a GUI \
+         session and choose Always Allow). RLORD_SIGN_IDENTITY=- signs ad-hoc.",
+    )
 }
 
-/// The first "Developer ID Application: …" name in `security
-/// find-identity -v` output.
-fn developer_id(listing: &str) -> Option<String> {
-    listing.lines().find_map(|line| {
-        let start = line.find('"')?;
-        let rest = &line[start + 1..];
-        let name = &rest[..rest.find('"')?];
-        name.starts_with("Developer ID Application:")
-            .then(|| name.to_string())
-    })
+/// Pick the signer. `env` is `RLORD_SIGN_IDENTITY`: "-" for ad-hoc, a name
+/// or hash to match, or empty/unset for the first "Developer ID
+/// Application" in `listing` (`security find-identity -v` output). With
+/// none found, CI signs ad-hoc and anywhere else it is an error.
+fn choose(env: Option<&str>, listing: &str, ci: bool) -> Result<Signer> {
+    let env = env.map(str::trim).filter(|v| !v.is_empty());
+    if env == Some("-") {
+        return Ok(Signer::AdHoc);
+    }
+    let ids = developer_ids(listing);
+    let found = match env {
+        Some(want) => ids.into_iter().find(|(h, n)| h == want || n == want),
+        None => ids.into_iter().next(),
+    };
+    match (found, env) {
+        (Some((hash, name)), _) => Ok(Signer::Id { hash, name }),
+        (None, Some(want)) => {
+            bail!("no valid Developer ID Application identity matches RLORD_SIGN_IDENTITY={want}")
+        }
+        (None, None) if ci => Ok(Signer::AdHoc),
+        (None, None) => bail!(
+            "no valid \"Developer ID Application\" identity in the keychain \
+             (security find-identity -v -p codesigning). Set \
+             RLORD_SIGN_IDENTITY=- to sign ad-hoc on purpose."
+        ),
+    }
+}
+
+/// `(hash, name)` of each "Developer ID Application" line in `security
+/// find-identity -v` output, in order.
+fn developer_ids(listing: &str) -> Vec<(String, String)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let hash = line.split_whitespace().nth(1)?;
+            let rest = &line[line.find('"')? + 1..];
+            let name = &rest[..rest.find('"')?];
+            (hash.len() == 40 && name.starts_with("Developer ID Application:"))
+                .then(|| (hash.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// `codesign` arguments. No hardened runtime: only notarization needs it
+/// (not done), and it would stop debuggers attaching.
+fn sign_args(signer: &Signer) -> Vec<&str> {
+    match signer {
+        Signer::Id { hash, .. } => vec![
+            "--force",
+            "--sign",
+            hash,
+            "--timestamp",
+            "--identifier",
+            SIGN_ID,
+        ],
+        Signer::AdHoc => vec!["--force", "--sign", "-"],
+    }
 }
 
 #[cfg(test)]
 mod sign_tests {
     use super::*;
 
-    #[test]
-    fn picks_the_developer_id_identity() {
-        let listing = "  1) ABCDEF \"Apple Development: X (T1)\"\n  2) 012345 \"Developer ID Application: Brandon Ayers (PL2X8AJK8A)\"\n     2 valid identities found\n";
-        assert_eq!(
-            developer_id(listing).as_deref(),
-            Some("Developer ID Application: Brandon Ayers (PL2X8AJK8A)")
-        );
-        assert_eq!(developer_id("     0 valid identities found\n"), None);
+    const H1: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+    const H2: &str = "89ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    const NAME: &str = "Developer ID Application: B A (PL2X8AJK8A)";
+
+    fn listing() -> String {
+        format!(
+            "  1) {H1} \"Apple Development: X (T1)\"\n  2) {H2} \"{NAME}\"\n     2 valid identities found\n"
+        )
     }
 
     #[test]
-    fn signs_ad_hoc_without_an_identity() {
-        assert_eq!(sign_args(None), ["--force", "--sign", "-"]);
-        let a = sign_args(Some("Developer ID Application: X (T)"));
-        assert!(a.windows(2).any(|w| w == ["--options", "runtime"]));
-        assert!(a.windows(2).any(|w| w == ["--identifier", SIGN_ID]));
-        assert!(a.contains(&"--timestamp".to_string()));
+    fn picks_the_developer_id_by_hash() {
+        let s = choose(None, &listing(), false).unwrap();
+        assert_eq!(
+            s,
+            Signer::Id {
+                hash: H2.into(),
+                name: NAME.into()
+            }
+        );
+        assert_eq!(
+            sign_args(&s),
+            [
+                "--force",
+                "--sign",
+                H2,
+                "--timestamp",
+                "--identifier",
+                SIGN_ID
+            ]
+        );
+    }
+
+    #[test]
+    fn the_override() {
+        assert_eq!(choose(Some("-"), &listing(), false).unwrap(), Signer::AdHoc);
+        // Empty counts as unset: the keychain is searched.
+        assert!(matches!(
+            choose(Some(" "), &listing(), false).unwrap(),
+            Signer::Id { .. }
+        ));
+        assert!(matches!(
+            choose(Some(H2), &listing(), false).unwrap(),
+            Signer::Id { .. }
+        ));
+        assert!(matches!(
+            choose(Some(NAME), &listing(), false).unwrap(),
+            Signer::Id { .. }
+        ));
+        assert!(choose(Some("nope"), &listing(), true).is_err());
+    }
+
+    #[test]
+    fn no_identity_is_an_error_except_on_ci() {
+        let none = "     0 valid identities found\n";
+        assert_eq!(choose(None, none, true).unwrap(), Signer::AdHoc);
+        assert!(choose(None, none, false).is_err());
+        assert_eq!(sign_args(&Signer::AdHoc), ["--force", "--sign", "-"]);
     }
 }
