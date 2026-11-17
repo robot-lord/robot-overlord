@@ -132,13 +132,7 @@ fn is_overlords(s: &Session) -> bool {
     overlords_at(&s.role, &s.project_path)
 }
 
-/// `is_overlords` for a session's role and folder.
-fn overlords_at(role: &str, folder: &str) -> bool {
-    crate::overlord::is_overlord_role(role)
-        || crate::overlord::dirs()
-            .iter()
-            .any(|d| d.to_string_lossy() == folder)
-}
+use crate::overlord::overlords_at;
 
 /// How session `s`'s agent can look things up: `mcp` (the
 /// `rlord_session` tools, wired at its start), `cli` (`rlord context`
@@ -262,9 +256,10 @@ pub fn lookup_section(dir: &Path) -> Option<String> {
          You can look up more yourself, read-only: your own brief again, \
          related sessions' descriptions, notes and summaries, and their \
          history. Use the `{SERVER}` tools if you have them; otherwise run \
-         `{} context --token-file {} help`.\n",
+         `{} context --token-file {} --socket {} help`.\n",
         crate::methods::rlord_bin(),
-        token.display()
+        token.display(),
+        rlord_core::paths::socket_path().display()
     ))
 }
 
@@ -361,14 +356,10 @@ pub fn visible(db: &Db, me: &Session) -> Result<Vec<Seen>> {
         archived: ArchivedMode::All,
         ..Default::default()
     })?;
-    let dirs: Vec<String> = crate::overlord::dirs()
-        .iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect();
     let mut out: Vec<Seen> = all
         .into_iter()
         .filter(|s| s.id != me.id)
-        .filter(|s| !crate::overlord::is_overlord_role(&s.role) && !dirs.contains(&s.project_path))
+        .filter(|s| !overlords_at(&s.role, &s.project_path))
         .filter_map(|s| {
             let (rank, why) = if linked.contains(&s.id) || s.forked_from.as_deref() == Some(&me.id)
             {
@@ -407,6 +398,12 @@ fn pick<'a>(me: &'a Session, seen: &'a [Seen], r: &str) -> Result<&'a Session> {
     }
     if let Some(s) = all.iter().find(|s| s.name == r) {
         return Ok(s);
+    }
+    if !r.is_empty() {
+        let ids: Vec<&&Session> = all.iter().filter(|s| s.id.starts_with(r)).collect();
+        if let [s] = ids.as_slice() {
+            return Ok(s);
+        }
     }
     let pre: Vec<&&Session> = all
         .iter()
@@ -814,6 +811,7 @@ mod tests {
         mint(&db, &b, "01L").unwrap();
         let tail = lookup_section(&dir).unwrap();
         assert!(tail.contains("rlord_session") && tail.contains("context --token-file"));
+        assert!(tail.contains(" --socket "));
         let rows: Vec<rlord_core::db::ContextRow> = (0..50)
             .map(|i| rlord_core::db::ContextRow {
                 id: i + 1,
@@ -827,6 +825,17 @@ mod tests {
         let text = crate::context::render_as("s", true, &rows, &[], None, 6_000, Some(&tail));
         assert!(text.ends_with(&tail));
         assert!(text.chars().count() <= 6_000, "{}", text.chars().count());
+        // A budget too small for the section too: it is left out, never
+        // over budget.
+        let header = crate::context::render_as("s", true, &[], &[], None, 100_000, None)
+            .chars()
+            .count();
+        let t = tail.chars().count();
+        for (budget, fits) in [(header + t - 1, false), (header + t + 400, true)] {
+            let text = crate::context::render_as("s", true, &rows, &[], None, budget, Some(&tail));
+            assert_eq!(text.contains("Looking up more"), fits, "{budget}");
+            assert!(text.chars().count() <= budget, "{budget}");
+        }
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -905,6 +914,14 @@ mod tests {
         // A unique prefix of a visible name; one that is ambiguous, or
         // names only sessions outside the set, is refused.
         assert_eq!(pick(&me, &seen, "01LIN").unwrap().id, "01LINKED");
+        // A unique id prefix that is no name's prefix.
+        {
+            let db = d.db();
+            db.rename("01LINKED", "web-app").unwrap();
+        }
+        let seen = visible(&d.db(), &me).unwrap();
+        assert_eq!(pick(&me, &seen, "01LINK").unwrap().id, "01LINKED");
+        assert_eq!(pick(&me, &seen, "web").unwrap().id, "01LINKED");
         // (01STRANGER is not visible: no clash.)
         assert_eq!(pick(&me, &seen, "01S").unwrap().id, "01SAMEREPO");
         assert_eq!(pick(&me, &seen, "01SA").unwrap().id, "01SAMEREPO");
@@ -945,7 +962,9 @@ mod tests {
         }
         let hits = call(&d, &token, "search_history", &json!({"query": "zebracorn"})).unwrap();
         let hit = &hits["sessions"][0]["hits"][0];
-        let t = hit["transcript"].as_str().expect("names the older transcript");
+        let t = hit["transcript"]
+            .as_str()
+            .expect("names the older transcript");
         let r = call(
             &d,
             &token,

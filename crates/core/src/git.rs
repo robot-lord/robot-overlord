@@ -98,6 +98,8 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
         bail!("workspace directory already exists: {}", dir.display());
     }
     let exists = branch_exists(repo, branch);
+    // (What was there before: a failure removes only what this call made.)
+    let was_registered = worktree_registered(repo, dir);
     if exists && start.is_some() {
         bail!("branch {branch} already exists");
     }
@@ -123,13 +125,13 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
     if let Err(e) = made {
         // git makes a new branch before its folder: a failure after that
         // leaves the branch behind (and maybe this worktree, registered).
-        // Only what this call made is removed: this worktree if git
-        // registered it, then the branch (`branch -D` refuses one checked
-        // out anywhere). No repo-wide prune.
+        // Only what this call made is removed: a registration at `dir`
+        // that wasn't there before, then a branch that wasn't (`branch -D`
+        // refuses one checked out anywhere). No repo-wide prune.
+        if !was_registered && worktree_registered(repo, dir) {
+            let _ = git(&["-C", repo, "worktree", "remove", "--force", &dir_s]);
+        }
         if !exists && branch_exists(repo, branch) {
-            if worktree_registered(repo, dir) {
-                let _ = git(&["-C", repo, "worktree", "remove", "--force", &dir_s]);
-            }
             let _ = git(&["-C", repo, "branch", "-D", branch]);
         }
         return Err(e);
@@ -139,12 +141,26 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
 
 /// Whether `repo` lists a worktree at `dir`.
 fn worktree_registered(repo: &str, dir: &Path) -> bool {
-    let real = std::fs::canonicalize(dir).ok();
+    let want = canonical_path(dir);
     git(&["-C", repo, "worktree", "list", "--porcelain"]).is_ok_and(|out| {
         out.lines()
             .filter_map(|l| l.strip_prefix("worktree "))
-            .any(|w| Path::new(w) == dir || real.as_deref() == Some(Path::new(w)))
+            .any(|w| canonical_path(Path::new(w)) == want)
     })
+}
+
+/// `p` with symlinks resolved, also when it is missing: its nearest
+/// existing ancestor resolved, the rest joined back on.
+fn canonical_path(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical_path(parent).join(name)
+        }
+        _ => p.to_path_buf(),
+    }
 }
 
 /// The commit checked out in the folder `dir` (its HEAD).
@@ -531,6 +547,26 @@ mod tests {
             assert!(!branch_exists(r, "z-fork"));
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The user's own registration of a folder that is gone ("missing
+        // but already registered"): git refuses the add, and that
+        // registration survives (only this call's new branch goes).
+        let gone = repo.join(".worktrees").join("gone");
+        worktree_add(r, "gone-branch", &gone, Some(&first)).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(worktree_add(r, "new-branch", &gone, Some(&first)).is_err());
+        assert!(worktree_registered(r, &gone));
+        assert!(branch_exists(r, "gone-branch"));
+        assert!(!branch_exists(r, "new-branch"));
+        // A missing folder under a symlinked path still matches.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        assert!(worktree_registered(
+            r,
+            &link.join(".worktrees").join("gone")
+        ));
+        // (Tidied up for what follows.)
+        git(&["-C", r, "worktree", "prune"]).unwrap();
+        git(&["-C", r, "branch", "-D", "gone-branch"]).unwrap();
         assert_eq!(
             has_changes(&dir.path().join("none").to_string_lossy()),
             None

@@ -804,13 +804,16 @@ reachable through it.
   background server and OpenCode none: they have only the CLI, which
   isn't relied on inside Codex's sandbox. `get_session` and the launch
   and fork answers say which (`lookup`: `mcp`, `cli`, `none`), so the
-  overlord copies the needed facts into `context` for the last two. The
-  pane env gets `RLORD_SESSION_TOKEN_FILE` (a path), scrubbed with
+  overlord copies the needed facts into `context` for the last two. A
+  Claude or in-pane Codex pane's env gets `RLORD_SESSION_TOKEN_FILE` (a
+  path); OpenCode and Codex daemon-mode panes don't, since their shell
+  commands run in a shared server. The variable is scrubbed with
   `RLORD_SESSION_ID` from everything shared between sessions
   (`agents::PANE_ENV`: the daemon, a Codex daemon pane, Codex's server,
-  OpenCode's shared server, commands rlord runs). The background ends with a
-  "Looking up more" section naming the tools and the CLI form with the
-  token file's path, once the token exists.
+  OpenCode's shared server, commands rlord runs). The background ends
+  with a "Looking up more" section, once the token exists, naming the
+  tools and the CLI form with `--token-file` and `--socket` always
+  given, so it works from any shell.
 - **Bounds.** 30 calls a minute and 300 an hour per session (in memory),
   answers at most 16,000 chars, no model, agent CLI or tmux.
 - Same trust model as the rest: a process running as the user can read

@@ -557,6 +557,24 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 Not changed: version stays 1.3.0 (coordinator: feature PRs are stable
 minor releases now).
 
+### Review round 3 (PR #70)
+
+1. A failed worktree add removes only a registration at `dir` and a
+   branch that weren't there before the call (test: the user's
+   "missing but already registered" worktree survives).
+2. No `RLORD_SESSION_TOKEN_FILE` in OpenCode or Codex daemon-mode panes
+   (shared servers run their commands); architecture.md fixed.
+3. The background's CLI line always passes `--token-file` and
+   `--socket`.
+4. `pick` also takes a unique id prefix, after the exact id and name.
+5. `worktree_registered` compares paths with symlinks resolved, also for
+   a missing folder (nearest existing ancestor resolved) (test).
+6. `render_as` leaves the lookup section out when it doesn't fit with
+   the header; never over budget for it (test).
+7. `scrub_pane_env` in autostart, install and Codex's server commands.
+8. One `overlord::overlords_at`, used by `visible`, `resolve`,
+   `lookup_kind`, `wiring` and `search`.
+
 ### #65 owed items
 
 Fixed here:
@@ -584,6 +602,13 @@ Still owed:
 - The demo OpenCode stand-in embeds Python (shell-is-glue rule).
 
 ## Owed / deferred
+
+- `session_tools::visible()` is computed once per call for every tool;
+  make it lazy per tool (`session_brief` needs only links, a named ref
+  could be checked without the whole set).
+- `context::compose` can go a little over a budget barely larger than
+  the header alone (the notes heading and its notice are written even
+  with no room). Real budgets (6,000+) never hit it.
 
 - Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
   `docs/architecture.md` "Forking a session"): a fork starts through

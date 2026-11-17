@@ -47,8 +47,8 @@ fn matched_fields(s: &Session, ws: &[String]) -> Vec<&'static str> {
 
 /// The overlord's session, or one that ran in an overlord's folder (the
 /// retired front desk of a two-session overlord).
-fn is_overlords(s: &Session, dirs: &[String]) -> bool {
-    crate::overlord::is_overlord_role(&s.role) || dirs.contains(&s.project_path)
+fn is_overlords(s: &Session) -> bool {
+    crate::overlord::overlords_at(&s.role, &s.project_path)
 }
 
 pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
@@ -129,7 +129,7 @@ pub(crate) fn search_in(
     // A session that ran in an overlord's folder (the retired front desk)
     // is searched only when named: then its own transcripts are what was
     // asked for.
-    let dropped = |s: &Session| !named && is_overlords(s, &own_dirs);
+    let dropped = |s: &Session| !named && is_overlords(s);
     for (i, s) in sessions.iter().enumerate() {
         if dropped(s) {
             // (Its folder is skipped whole, above: no need to look its
@@ -137,7 +137,7 @@ pub(crate) fn search_in(
             continue;
         }
         let ps = summary::transcripts_of(d, s);
-        if named && ps.is_empty() && is_overlords(s, &own_dirs) {
+        if named && ps.is_empty() && is_overlords(s) {
             bail!("{} has no transcript left on disk to search", s.name);
         }
         for p in &ps {

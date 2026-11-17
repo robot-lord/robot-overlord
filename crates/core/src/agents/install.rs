@@ -302,10 +302,7 @@ fn login_shell_off(var: Option<&str>) -> bool {
 /// Run `shell -lc script` and take the last line it prints as a path.
 fn shell_answer(shell: &str, script: &str, limit: std::time::Duration) -> Option<PathBuf> {
     use std::io::Read;
-    let mut child = std::process::Command::new(shell)
-        .args(["-lc", script])
-        .env_remove("RLORD_SESSION_ID")
-        .env_remove("RLORD_SESSION_TOKEN_FILE")
+    let mut child = super::scrub_pane_env(std::process::Command::new(shell).args(["-lc", script]))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -359,10 +356,7 @@ pub fn version(bin: &Path) -> Option<String> {
     if let Some(known) = version_seen(bin, modified) {
         return known;
     }
-    let mut child = std::process::Command::new(bin)
-        .arg("--version")
-        .env_remove("RLORD_SESSION_ID")
-        .env_remove("RLORD_SESSION_TOKEN_FILE")
+    let mut child = super::scrub_pane_env(std::process::Command::new(bin).arg("--version"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

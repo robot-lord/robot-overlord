@@ -351,7 +351,11 @@ pub fn render_as(
     }
     // How to look more up (`session_tools::lookup_section`) goes last; its
     // room is kept first.
-    let tail = lookup.unwrap_or("");
+    // (Left out when the header and it don't fit together: never over
+    // budget.)
+    let tail = lookup
+        .filter(|t| header.chars().count() + t.chars().count() <= budget)
+        .unwrap_or("");
     let mut out = compose(
         header,
         rows,
