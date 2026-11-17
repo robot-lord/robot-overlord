@@ -484,29 +484,43 @@ hooks and `discover` keep the stored status to themselves.
 ### Background work (`daemon/src/background.rs`)
 
 "Waiting on background work" is not a stored status either: it is laid
-over `idle` (your turn) as `background: N` on the row, shown `◔ bg N`
-(the list), `bg N` (`rlord ls`), status `background` with
-`background_tasks` (`list_sessions`), filtered by `status:bg`. A
-`waiting_input` session never gets it.
+over `idle` (your turn) as `background_tasks: N` (and `background_work`,
+what and since when) on the row, shown `◔ bg N` (the list), `bg N`
+(`rlord ls`), status `background` (`list_sessions`, `get_session`),
+filtered by `status:bg`. A `waiting_input` session never gets it, and a
+usage limit is drawn over it. Status filters match the status a row
+shows: `status:turn` leaves out the background and limited rows,
+`status:bg` the limited ones.
 
+- **Only subagents set it.** An async Agent or a skill forked into the
+  background means the session's work goes on. A background shell (`Bash`
+  with `run_in_background`) is often a dev server or a watcher that never
+  ends, so it never changes the status: rows carry it as
+  `background_shells` and the details say "2 background shells".
 - **Detection** (`agents::background`, Claude Code only; `Tracker::advance`
   is where another agent's adapter goes). A launch is a `user` line whose
-  structured `toolUseResult` names the work: `backgroundTaskId` (a `Bash`
-  with `run_in_background`, or one moved to the background at its
-  timeout), or `agentId` with `isAsync: true` / `status:
-  "async_launched"` (an async Agent) or `background: true` (a skill
-  forked into the background). A finish is a later `user` line (string
-  content, `origin.kind: "task-notification"`) holding
-  `<task-notification>` with `<task-id>` and `<status>` `completed`,
-  `failed`, `killed` or `stopped`. An id can notify more than once (a
-  resumed agent): one not open is ignored. The tool result's text is
-  never parsed. Seen on Claude Code 2.1.3xx.
+  structured `toolUseResult` names the work: `agentId` with `isAsync:
+  true` / `status: "async_launched"` (Agent) or `background: true` (a
+  forked skill); `backgroundTaskId` (a shell, also one moved to the
+  background at its timeout). A finish is a later `user` line with
+  `origin.kind: "task-notification"` holding `<task-notification>` with
+  `<task-id>` and `<status>` `completed`, `failed`, `killed` or
+  `stopped`. An id can notify more than once (a resumed agent): one not
+  open is ignored. The tool result's text is never parsed.
 - **Read**: a 5s tick reads only what each live session's transcript
-  appended since its byte offset (whole lines, at most 4 MB a tick); the
-  first look starts at the last 4 MB. Counts are kept in memory only.
-- **Stale guard**: a transcript unchanged for `STALE_MS` (30 min) shows
-  your turn again, so a lost notification (the agent restarted with work
-  running) can't leave a session stuck.
+  appended since its byte offset (whole lines, at most 4 MB a tick; a
+  longer line is skipped unparsed); the first look starts at the last
+  4 MB, and a new inode or a shorter file starts over. The read state is
+  copied out and read without a lock; the rows read only what the last
+  tick decided to show, and a change to that (going stale included)
+  pushes to the list. Not `transcript_stats`' cursor: that one reads all
+  that's unread at once and keeps usage totals.
+- **Stale guard**: when nothing was written for `STALE_MS` (30 min), it
+  shows your turn again, so a lost notification (the agent restarted with
+  work running) can't leave a session stuck. "Written" is the newest
+  mtime of the transcript and of each open subagent's `outputFile` and
+  sidechain transcript (at most 5 of them stat'ed), since subagents write
+  there, not in the main transcript.
 
 ## Transcript store (raw conversation data)
 

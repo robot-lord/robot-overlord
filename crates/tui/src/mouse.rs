@@ -299,14 +299,18 @@ impl App {
     pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
         // Over a session row in the list: its status in words, in a popup.
         let row = match (&self.mode, self.hits.at(x, y)) {
-            (Mode::Normal, Some(Hit::Row(i))) => Some((i, x, y)),
+            (Mode::Normal, Some(Hit::Row(i))) => self
+                .sessions
+                .get(i)
+                .and_then(|s| s["id"].as_str())
+                .map(|id| (id.to_string(), x, y)),
             _ => None,
         };
-        if row.map(|r| r.0) != self.hover_row.map(|r| r.0) {
-            self.hover_row = row;
+        let changed = row.as_ref().map(|r| &r.0) != self.hover_row.as_ref().map(|r| &r.0);
+        self.hover_row = row;
+        if changed {
             return true;
         }
-        self.hover_row = row;
         match (&mut self.mode, self.hits.at(x, y)) {
             (Mode::Menu(m), Some(Hit::Pick(i))) if i < m.items.len() && m.sel != i => {
                 m.sel = i;

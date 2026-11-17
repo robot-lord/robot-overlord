@@ -628,12 +628,7 @@ impl Daemon {
                 background::annotate(self, &mut rows);
                 limits::annotate(self, &mut rows);
                 if let Some((taken, others)) = &limited_filter {
-                    rows.retain(|r| {
-                        taken.iter().any(|t| !r[t.row_key()].is_null())
-                            || r["status"]
-                                .as_str()
-                                .is_some_and(|s| others.iter().any(|o| o == s))
-                    });
+                    rows.retain(|r| shown_status_matches(r, taken, others));
                 }
                 usage::list(self, &params, &mut rows);
                 Ok(Value::Array(rows))
@@ -1303,24 +1298,40 @@ impl Overlay {
             _ => None,
         }
     }
+}
 
-    /// The row field the annotation sets.
-    fn row_key(self) -> &'static str {
-        match self {
-            Overlay::Limited => "limit",
-            Overlay::Background => "background",
-        }
+/// The status a row shows: a usage limit over anything, then background
+/// work over your turn, else the stored status.
+fn shown_status(r: &Value) -> &str {
+    if !r["limit"].is_null() {
+        "limited"
+    } else if !r["background_tasks"].is_null() {
+        "background"
+    } else {
+        r["status"].as_str().unwrap_or("")
     }
 }
 
-/// A `session.list` query's `status` naming `limited` or `background`:
-/// take the status filter out of the query (the DB doesn't store them)
-/// and return those named plus the other statuses, to be matched after
-/// annotating.
+/// Whether a row's shown status is one of those a filter asked for.
+fn shown_status_matches(r: &Value, taken: &[Overlay], others: &[String]) -> bool {
+    let s = shown_status(r);
+    match Overlay::of(s) {
+        Some(o) => taken.contains(&o),
+        None => others.iter().any(|o| o == s),
+    }
+}
+
+/// A `session.list` query's `status` filter, to be matched on the status
+/// each row shows after annotating (`shown_status_matches`): the overlay
+/// statuses named (`limited`, `background`) and the stored ones. With an
+/// overlay named, the filter is taken out of the DB query (the DB doesn't
+/// store them).
 fn take_limited(params: &mut Value) -> Option<(Vec<Overlay>, Vec<String>)> {
     let st = params.get("status")?.as_array()?;
     let taken: Vec<Overlay> = st.iter().filter_map(|v| Overlay::of(v.as_str()?)).collect();
-    if taken.is_empty() {
+    // (Any status filter is matched again after annotating: `status:turn`
+    // must leave out the rows shown as background or limited.)
+    if st.is_empty() {
         return None;
     }
     let others = st
@@ -1329,13 +1340,36 @@ fn take_limited(params: &mut Value) -> Option<(Vec<Overlay>, Vec<String>)> {
         .filter(|s| Overlay::of(s).is_none())
         .map(str::to_string)
         .collect();
-    params["status"] = json!([]);
+    // Only stored statuses asked for: the DB narrows them first.
+    if !taken.is_empty() {
+        params["status"] = json!([]);
+    }
     Some((taken, others))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filters_match_the_status_shown() {
+        let idle = json!({"status": "idle"});
+        let bg = json!({"status": "idle", "background_tasks": 2});
+        let limited_bg =
+            json!({"status": "idle", "background_tasks": 2, "limit": {"until": "3pm"}});
+        let turn = (vec![], vec!["idle".to_string()]);
+        let bgf = (vec![Overlay::Background], vec![]);
+        let lim = (vec![Overlay::Limited], vec![]);
+        let m = |r: &Value, f: &(Vec<Overlay>, Vec<String>)| shown_status_matches(r, &f.0, &f.1);
+        assert!(m(&idle, &turn));
+        // status:turn leaves out the rows shown as background or limited.
+        assert!(!m(&bg, &turn));
+        assert!(!m(&limited_bg, &turn));
+        // status:bg: not when a limit is drawn over it.
+        assert!(m(&bg, &bgf));
+        assert!(!m(&limited_bg, &bgf));
+        assert!(m(&limited_bg, &lim));
+    }
 
     #[test]
     fn status_limited_is_taken_out_of_the_db_query() {
@@ -1351,8 +1385,13 @@ mod tests {
             Some((vec![Overlay::Background, Overlay::Limited], vec![]))
         );
         let mut p = json!({"status": ["idle"]});
-        assert_eq!(take_limited(&mut p), None);
+        assert_eq!(
+            take_limited(&mut p),
+            Some((vec![], vec!["idle".to_string()]))
+        );
         assert_eq!(p["status"], json!(["idle"]));
+        let mut p = json!({});
+        assert_eq!(take_limited(&mut p), None);
         // Nothing limited: the list is empty, not every session.
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         d.db()

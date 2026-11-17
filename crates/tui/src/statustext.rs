@@ -13,7 +13,7 @@ pub const LEGEND: &[(&str, &str)] = &[
         "blocked on a permission prompt or a question",
     ),
     ("○ your turn", "finished: the next prompt is yours"),
-    ("◔ bg N", "turn over, N background tasks still running"),
+    ("◔ bg N", "turn over, N background subagents still running"),
     (
         "◷ till …",
         "stopped on a usage limit until then (↻: resumes)",
@@ -50,8 +50,8 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             format!("Stopped on a usage limit until {until}.{resume}")
         };
     }
-    if let Some(n) = s["background"].as_u64() {
-        let tasks: Vec<&Value> = s["background_tasks"]
+    if let Some(n) = s["background_tasks"].as_u64() {
+        let tasks: Vec<&Value> = s["background_work"]
             .as_array()
             .map(|a| a.iter().collect())
             .unwrap_or_default();
@@ -106,9 +106,38 @@ pub fn remote_sentence(s: &Value) -> Option<String> {
     })
 }
 
+/// Background shells (dev servers, watchers) still running, if any:
+/// information, never a status.
+pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
+    let sh = &s["background_shells"];
+    let n = sh["count"].as_u64().filter(|n| *n > 0)?;
+    let tasks: Vec<&Value> = sh["tasks"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let mut out = format!("{n} background shell{}", if n == 1 { "" } else { "s" });
+    let items: Vec<String> = tasks
+        .iter()
+        .filter_map(|t| {
+            let label = t["label"].as_str()?;
+            Some(match t["started_at"].as_i64().filter(|t| *t > 0) {
+                Some(at) => format!("{label} ({} ago)", ago(at, now)),
+                None => label.to_string(),
+            })
+        })
+        .collect();
+    if !items.is_empty() {
+        out.push_str(": ");
+        out.push_str(&items.join(", "));
+    }
+    out.push('.');
+    Some(out)
+}
+
 /// Everything the row's symbols say, one sentence per line.
 pub fn describe(s: &Value, now: i64) -> Vec<String> {
     let mut v = vec![status_sentence(s, now)];
+    v.extend(shells_sentence(s, now));
     v.extend(remote_sentence(s));
     v
 }
@@ -186,7 +215,7 @@ mod tests {
 
     #[test]
     fn background_work_with_labels_and_age() {
-        let s = json!({"status": "idle", "background": 2, "background_tasks": [
+        let s = json!({"status": "idle", "background_tasks": 2, "background_work": [
             {"label": "Run tests", "started_at": 60_000},
             {"label": "Review PR", "started_at": 120_000}]});
         assert_eq!(
@@ -194,13 +223,13 @@ mod tests {
             "Waiting on 2 background tasks: Run tests, Review PR, started 4m ago. \
              Its turn is over; it goes on when they finish."
         );
-        let s = json!({"status": "idle", "background": 1});
+        let s = json!({"status": "idle", "background_tasks": 1});
         assert!(status_sentence(&s, 0).starts_with("Waiting on 1 background task."));
     }
 
     #[test]
     fn limit_wins_and_remote_is_spelled_out() {
-        let s = json!({"status": "idle", "background": 1,
+        let s = json!({"status": "idle", "background_tasks": 1,
             "limit": {"until": "3:00pm", "resume": true},
             "remote": {"state": "on"}});
         assert_eq!(
@@ -216,6 +245,20 @@ mod tests {
             "Remote Control failed (⇄, red): not logged in."
         );
         assert_eq!(remote_sentence(&json!({})), None);
+    }
+
+    #[test]
+    fn shells_are_information_not_status() {
+        let s = json!({"status": "idle", "background_shells": {"count": 2, "tasks": [
+            {"label": "Dev server", "started_at": 0},
+            {"label": "Watch tests", "started_at": 60_000}]}});
+        assert_eq!(
+            describe(&s, 120_000),
+            [
+                "Your turn: it finished, the next prompt is yours.",
+                "2 background shells: Dev server, Watch tests (1m ago).",
+            ]
+        );
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background (its turn is over but background work it started still runs, `background_tasks` of them, `background_labels` says what: the user is waiting on the agent; it carries on by itself when they finish); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background (its turn is over but background work it started still runs, `background_tasks` subagents, `background_labels` says what: the user is waiting on the agent; it carries on by itself when they finish. Background shells (dev servers, watchers) don't change the status: `background_shells` lists them); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
                 "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:bg (waiting on background work) status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
@@ -343,6 +343,28 @@ fn session_ref(args: &Value) -> Result<String> {
         .context("missing 'session'")
 }
 
+/// Background work, as list_sessions and get_session show it. Its turn
+/// over while subagents it started still run: status `background`, with
+/// `background_tasks` (how many) and `background_labels` (what). Background
+/// shells never change the status: `background_shells` lists them.
+fn background_status(s: &Value, row: &mut Value) {
+    if let Some(n) = s["background_tasks"].as_u64() {
+        row["status"] = json!("background");
+        row["background_tasks"] = json!(n);
+        row["background_labels"] = s["background_work"].as_array().map_or(json!([]), |t| {
+            t.iter().map(|t| t["label"].clone()).collect()
+        });
+    }
+    if let Some(n) = s["background_shells"]["count"].as_u64() {
+        row["background_shells"] = json!({
+            "count": n,
+            "labels": s["background_shells"]["tasks"]
+                .as_array()
+                .map_or(json!([]), |t| t.iter().map(|t| t["label"].clone()).collect::<Value>()),
+        });
+    }
+}
+
 /// The compact row the overlord sees per session.
 fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
@@ -381,15 +403,7 @@ fn summarize(s: &Value) -> Value {
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
     }
-    // Its turn over while background work still runs: the user waits on
-    // the agent, not the other way round.
-    if let Some(n) = s["background"].as_u64() {
-        row["status"] = json!("background");
-        row["background_tasks"] = json!(n);
-        row["background_labels"] = s["background_tasks"].as_array().map_or(json!([]), |t| {
-            t.iter().map(|t| t["label"].clone()).collect()
-        });
-    }
+    background_status(s, &mut row);
     // Stopped on a usage limit: that, rather than the status under it.
     if !s["limit"].is_null() {
         row["status"] = json!("limited");
@@ -642,6 +656,15 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
+            // The status as list_sessions shows it.
+            let annotated = s.clone();
+            background_status(&annotated, &mut s);
+            if !annotated["limit"].is_null() {
+                s["status"] = json!("limited");
+            }
+            if let Some(o) = s.as_object_mut() {
+                o.remove("background_work");
+            }
             // Right after rlord starts, sub-agent data may still be loading.
             if d.warm.is_loading(id.as_str().unwrap_or("")) {
                 s["subagents_loading"] = json!(true);

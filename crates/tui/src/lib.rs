@@ -321,9 +321,12 @@ struct App {
     /// The last event was pointer motion that changed nothing: no need to
     /// draw again for it (motion arrives in floods).
     idle_motion: bool,
-    /// The list row under the pointer, and where the pointer is: its
-    /// status in words shows in a popup there (`statustext`).
-    hover_row: Option<(usize, u16, u16)>,
+    /// The session whose list row is under the pointer (by id), and where
+    /// the pointer is: its status in words shows in a popup there
+    /// (`statustext`). Cleared by anything but pointer motion (a key, the
+    /// wheel, a click, focus loss) and by a list refresh, which can move
+    /// rows under a pointer that stays put.
+    hover_row: Option<(String, u16, u16)>,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -845,7 +848,11 @@ impl App {
                 tick = tick.min(due.saturating_duration_since(Instant::now()));
             }
             if event::poll(tick)? {
-                let quit = match event::read()? {
+                let ev = event::read()?;
+                if !matches!(&ev, Event::Mouse(m) if m.kind == event::MouseEventKind::Moved) {
+                    self.hover_row = None;
+                }
+                let quit = match ev {
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
                         self.handle_key(k, terminal)?
                     }
@@ -866,6 +873,7 @@ impl App {
             }
             if pushed {
                 self.dirty = true;
+                self.hover_row = None;
             }
             if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
             {
@@ -1545,10 +1553,11 @@ impl App {
     /// The popup over the list row under the pointer: its status, and every
     /// symbol on the row, in words.
     fn draw_hover(&self, f: &mut Frame) {
-        let Some((i, x, y)) = self.hover_row else {
+        let Some((id, x, y)) = &self.hover_row else {
             return;
         };
-        let Some(s) = self.sessions.get(i) else {
+        let (x, y) = (*x, *y);
+        let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
         let lines = statustext::describe(s, rlord_core::types::now_ms());
@@ -2776,12 +2785,12 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// limit and until when (`limit`, from the daemon's `limits`). `full`:
 /// in words (the details pane); otherwise what fits the list's column.
 /// `↻`: a resume is scheduled for when it resets. Its turn over while
-/// background work still runs (`background`, from the daemon's
+/// subagents it started still run (`background_tasks`, from the daemon's
 /// `background`): that, in place of "your turn".
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let Some(until) = l["until"].as_str() else {
-        if let Some(n) = s["background"].as_u64() {
+        if let Some(n) = s["background_tasks"].as_u64() {
             return theme::background_chip(n, full);
         }
         return theme::status_chip(s["status"].as_str().unwrap_or("-"));

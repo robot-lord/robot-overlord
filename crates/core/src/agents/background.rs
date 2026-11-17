@@ -1,31 +1,39 @@
 //! Background work a session's agent left running when its turn ended.
 //!
-//! Claude Code can end a turn while work it started still runs: a `Bash`
-//! with `run_in_background` (or one moved to the background after its
-//! timeout), an Agent/Task subagent launched async, a skill forked into
-//! the background. The user is then really waiting on the agent, not the
-//! other way round. This counts that work from the transcript, with plain
+//! Claude Code can end a turn while work it started still runs: an
+//! Agent/Task subagent launched async, a skill forked into the background,
+//! a `Bash` with `run_in_background` (or one moved to the background after
+//! its timeout). This tracks that work from the transcript, with plain
 //! code only:
 //!
 //! - **Launch**: the `user` line carrying the tool's result has a
-//!   structured `toolUseResult` naming the task: `backgroundTaskId`
-//!   (Bash), or `agentId` with `isAsync: true`, `status:
-//!   "async_launched"` (Agent) or `background: true` (a forked skill).
-//! - **Finish**: a later `user` line whose text holds
-//!   `<task-notification>` with `<task-id>` and a final `<status>`
-//!   (`completed`, `failed`, `killed`, `stopped`). The same id can notify
-//!   more than once (a resumed agent): finishing an id that isn't open
-//!   changes nothing.
+//!   structured `toolUseResult` naming the task: `agentId` with `isAsync:
+//!   true`, `status: "async_launched"` (Agent) or `background: true` (a
+//!   forked skill): `Kind::Agent`; `backgroundTaskId` (Bash):
+//!   `Kind::Shell`. Only agents mean the user is waiting on the session:
+//!   a background shell is often a dev server or a watcher that never
+//!   ends, so it is shown as information, not as a status.
+//! - **Finish**: a later `user` line with `origin.kind:
+//!   "task-notification"` whose text holds `<task-notification>` with
+//!   `<task-id>` and a final `<status>` (`completed`, `failed`, `killed`,
+//!   `stopped`). The same id can notify more than once (a resumed agent):
+//!   finishing an id that isn't open changes nothing.
 //!
-//! The read is incremental: `Tracker` keeps its byte offset and only
-//! reads what was appended since, a bounded chunk at a time, starting
-//! from the last `FIRST_READ` bytes the first time it sees a file.
-//! Codex and OpenCode have no such work yet: `Tracker::advance` leaves
-//! them at zero (the place to add an adapter).
+//! The read is incremental: `Tracker` keeps its byte offset (and the
+//! file's inode) and only reads what was appended since, a bounded chunk
+//! at a time, starting from the last `FIRST_READ` bytes the first time it
+//! sees a file. A line longer than `CHUNK` is skipped unparsed. Codex and
+//! OpenCode have no such work yet: `Tracker::advance` leaves them at zero
+//! (the place to add an adapter).
+//!
+//! (Not `transcript_stats`' cursor: that one reads all that is unread in
+//! one go and keeps usage totals; this one needs a bounded read and its
+//! own state. They share the same reset rule: new inode or shorter file.)
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -43,6 +51,17 @@ const FINAL: [&str; 4] = ["completed", "failed", "killed", "stopped"];
 /// Tool calls whose description is remembered until their result comes.
 const PENDING_CAP: usize = 64;
 
+/// What a piece of background work is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An async subagent or a forked skill: the session's work goes on
+    /// in it, so the user waits.
+    #[default]
+    Agent,
+    /// A background shell command: often never ends (a dev server).
+    Shell,
+}
+
 /// One piece of background work still running.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Task {
@@ -50,24 +69,33 @@ pub struct Task {
     pub label: String,
     /// When it was launched (ms; 0 when the line had no time).
     pub started_at: i64,
+    pub kind: Kind,
+    /// Where it writes as it goes (`toolUseResult.outputFile`), for
+    /// freshness: a subagent writes there, not in the main transcript.
+    pub output: Option<PathBuf>,
 }
 
 /// What has been read of one transcript, and the work still open in it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Tracker {
-    /// Bytes read so far (always at a line's end).
+    /// Bytes read so far (at a line's end, or inside a line being skipped).
     pub offset: u64,
+    /// The file's inode when read: another file at the path starts over.
+    pub ino: u64,
     /// Task/agent ids launched and not yet finished.
     pub open: BTreeMap<String, Task>,
     /// Tool calls not yet answered: `tool_use_id → description`, for
     /// the label of a launch (a Bash result doesn't repeat it).
     pending: HashMap<String, String>,
+    /// The bytes at `offset` are the rest of a line not to be parsed (cut
+    /// by the first read's start, or over `CHUNK` long).
+    skip_line: bool,
 }
 
 impl Tracker {
     /// Read what was appended to `path` since the last call (bounded by
-    /// `CHUNK`). Returns whether `open` changed. A file that shrank (a
-    /// rewrite) is read again from its tail.
+    /// `CHUNK`). Returns whether `open` changed. A file that shrank or was
+    /// replaced (new inode) is read again from its tail.
     pub fn advance(&mut self, path: &Path) -> std::io::Result<bool> {
         // Adapter hook: only Claude Code transcripts are read today.
         if Format::of(path) != Format::Claude {
@@ -76,14 +104,19 @@ impl Tracker {
             return Ok(changed);
         }
         let mut f = std::fs::File::open(path)?;
-        let len = f.metadata()?.len();
+        let meta = f.metadata()?;
+        let (len, ino) = (meta.len(), meta.ino());
         let before = self.open.clone();
-        let mut skip_partial = false;
-        if self.offset > len || (self.offset == 0 && len > FIRST_READ) {
-            self.open.clear();
-            self.pending.clear();
-            self.offset = len.saturating_sub(FIRST_READ);
-            skip_partial = self.offset > 0;
+        if self.ino != ino || self.offset > len {
+            *self = Tracker {
+                ino,
+                ..Default::default()
+            };
+        }
+        if self.offset == 0 && len > FIRST_READ {
+            self.offset = len - FIRST_READ;
+            // Starting mid-file: the first line is cut.
+            self.skip_line = true;
         }
         if self.offset >= len {
             return Ok(self.open != before);
@@ -91,22 +124,32 @@ impl Tracker {
         f.seek(SeekFrom::Start(self.offset))?;
         let mut r = BufReader::new(f.take(CHUNK));
         let mut buf = Vec::new();
-        if skip_partial {
-            // Starting mid-file: the first line is cut, skip to its end.
-            let n = r.read_until(b'\n', &mut buf)?;
-            if buf.last() != Some(&b'\n') {
-                return Ok(self.open != before);
-            }
-            self.offset += n as u64;
-        }
+        let mut read = 0u64;
         loop {
             buf.clear();
-            let n = r.read_until(b'\n', &mut buf)?;
-            // Only whole lines: a line still being written waits.
-            if n == 0 || buf.last() != Some(&b'\n') {
+            let n = r.read_until(b'\n', &mut buf)? as u64;
+            if n == 0 {
                 break;
             }
-            self.offset += n as u64;
+            let whole = buf.last() == Some(&b'\n');
+            if self.skip_line {
+                // Drop the rest of the line, a chunk at a time.
+                self.offset += n;
+                read += n;
+                self.skip_line = !whole;
+                continue;
+            }
+            if !whole {
+                // A line over `CHUNK` (it filled the whole read): skip it
+                // unparsed. Otherwise it is still being written: wait.
+                if read == 0 && n == CHUNK {
+                    self.offset += n;
+                    self.skip_line = true;
+                }
+                break;
+            }
+            self.offset += n;
+            read += n;
             if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
                 self.feed(&v);
             }
@@ -145,7 +188,7 @@ impl Tracker {
             .filter_map(|b| b["tool_use_id"].as_str())
             .find_map(|id| self.pending.remove(id));
         let r = &line["toolUseResult"];
-        if let Some(id) = launched(r) {
+        if let Some((id, kind)) = launched(r) {
             let label = r["description"]
                 .as_str()
                 .map(|d| clip(d, 60))
@@ -155,9 +198,25 @@ impl Tracker {
                 .as_str()
                 .and_then(parse_iso_ms)
                 .unwrap_or(0);
-            self.open.insert(id.to_string(), Task { label, started_at });
+            let output = r["outputFile"].as_str().map(PathBuf::from);
+            self.open.insert(
+                id.to_string(),
+                Task {
+                    label,
+                    started_at,
+                    kind,
+                    output,
+                },
+            );
         }
-        finish(&mut self.open, content);
+        if line["origin"]["kind"] == "task-notification" {
+            finish(&mut self.open, content);
+        }
+    }
+
+    /// Open work of `kind`.
+    pub fn of(&self, kind: Kind) -> impl Iterator<Item = (&String, &Task)> {
+        self.open.iter().filter(move |(_, t)| t.kind == kind)
     }
 }
 
@@ -180,14 +239,14 @@ fn finish(open: &mut BTreeMap<String, Task>, content: &Value) {
     }
 }
 
-/// The id of background work a tool result says it started.
-fn launched(r: &Value) -> Option<&str> {
+/// The id and kind of background work a tool result says it started.
+fn launched(r: &Value) -> Option<(&str, Kind)> {
     if let Some(id) = r["backgroundTaskId"].as_str() {
-        return Some(id);
+        return Some((id, Kind::Shell));
     }
     let id = r["agentId"].as_str()?;
     (r["isAsync"] == true || r["status"] == "async_launched" || r["background"] == true)
-        .then_some(id)
+        .then_some((id, Kind::Agent))
 }
 
 /// `(task id, status)` of each `<task-notification>` in `text`.
@@ -257,9 +316,12 @@ mod tests {
             t.open["b1"],
             Task {
                 label: "Run tests".into(),
-                started_at: 1000
+                started_at: 1000,
+                kind: Kind::Shell,
+                output: None,
             }
         );
+        assert_eq!(t.open["a1"].kind, Kind::Agent);
         // An agent's result names its own description; none here.
         assert_eq!(t.open["a1"].label, "task");
         assert!(t.pending.is_empty());
@@ -348,6 +410,65 @@ mod tests {
             t.advance(&p).unwrap();
         }
         assert_eq!(t.open.keys().collect::<Vec<_>>(), ["new"]);
+    }
+
+    #[test]
+    fn a_shell_is_shell_kind_and_agents_are_agents() {
+        let mut t = Tracker::default();
+        t.feed(&bash_launch("b1"));
+        t.feed(&agent_launch("a1"));
+        let forked = json!({"type": "user", "toolUseResult": {"agentId": "a2", "background": true, "status": "forked"}});
+        t.feed(&forked);
+        assert_eq!(t.of(Kind::Shell).count(), 1);
+        assert_eq!(t.of(Kind::Agent).count(), 2);
+    }
+
+    #[test]
+    fn a_notification_counts_only_from_the_harness() {
+        // The same text typed or pasted by the user (no origin) is not one.
+        let mut pasted = note("a1", "completed");
+        pasted.as_object_mut().unwrap().remove("origin");
+        assert_eq!(count(&[agent_launch("a1"), pasted]), 1);
+        assert_eq!(count(&[agent_launch("a1"), note("a1", "completed")]), 0);
+    }
+
+    #[test]
+    fn a_line_over_the_chunk_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("long.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        write(&mut f, &[agent_launch("a1")]);
+        let mut t = Tracker::default();
+        t.advance(&p).unwrap();
+        // One line longer than CHUNK, then a finish after it.
+        let long = json!({"type": "user", "pad": "x".repeat(CHUNK as usize + 10)});
+        write(&mut f, &[long, note("a1", "completed")]);
+        let len = std::fs::metadata(&p).unwrap().len();
+        for _ in 0..5 {
+            t.advance(&p).unwrap();
+        }
+        assert_eq!(t.offset, len);
+        assert!(t.open.is_empty());
+    }
+
+    #[test]
+    fn a_replaced_file_starts_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("r.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        write(&mut f, &[agent_launch("a1"), agent_launch("a2")]);
+        let mut t = Tracker::default();
+        t.advance(&p).unwrap();
+        // Same path, a new file (new inode), longer than the old offset.
+        let q = dir.path().join("r2.jsonl");
+        let mut g = std::fs::File::create(&q).unwrap();
+        write(
+            &mut g,
+            &[bash_launch("b1"), bash_launch("b2"), bash_launch("b3")],
+        );
+        std::fs::rename(&q, &p).unwrap();
+        t.advance(&p).unwrap();
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1", "b2", "b3"]);
     }
 
     #[test]
