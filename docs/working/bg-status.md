@@ -67,7 +67,7 @@ file). PR #68.
   of the session's `session_start` events. Storing the start kind in its
   own column (or a distinct event kind for `startup`) would make the
   lookup index-only.
-- **Codex and OpenCode adapters.** `Tracker::advance` is the hook. Neither
+- **Codex and OpenCode adapters.** `Tracker::advance_within` is the hook. Neither
   agent has a known background-task record yet.
 - **Needs-you reason.** The popup and details say "blocked on a permission
   prompt or a question". rlord doesn't store which; the hook payload

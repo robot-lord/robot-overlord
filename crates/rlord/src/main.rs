@@ -67,8 +67,9 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// Filter by status (comma-separated: working, needs-you, your-turn,
-        /// stopped, error, starting; the stored names waiting_input and idle
-        /// work too)
+        /// bg (waiting on background work), limited (stopped on a usage
+        /// limit), stopped, error, starting; the stored names waiting_input
+        /// and idle work too)
         #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// Filter by tag

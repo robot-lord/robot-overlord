@@ -7,7 +7,7 @@
 //! every field is optional and anything unreadable is skipped, never fatal.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
@@ -452,11 +452,7 @@ fn process_commands() -> String {
         .join("\n")
 }
 
-fn ms_epoch(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::timefmt::ms_epoch;
 
 #[cfg(test)]
 mod tests {

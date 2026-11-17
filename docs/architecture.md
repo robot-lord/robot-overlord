@@ -507,7 +507,7 @@ drawn over (`shown_status_matches`).
   ends, so it never changes the status. Rows carry it as `async_shells`,
   and the details say "2 background shells".
 - **Detection** (`agents::background`, Claude Code only;
-  `Tracker::advance` is where another agent's adapter goes).
+  `Tracker::advance_within` is where another agent's adapter goes).
   - A launch is a `user` line whose structured `toolUseResult` names the
     work: `agentId` with `isAsync: true` / `status: "async_launched"` (an
     Agent) or `background: true` (a forked skill), or `backgroundTaskId`

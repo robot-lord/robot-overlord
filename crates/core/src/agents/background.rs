@@ -32,7 +32,7 @@
 //! file's inode) and only reads what was appended since, a bounded chunk
 //! at a time, starting from the last `FIRST_READ` bytes the first time it
 //! sees a file. A line longer than `CHUNK` is skipped unparsed. Codex and
-//! OpenCode have no such work yet: `Tracker::advance` leaves them at zero
+//! OpenCode have no such work yet: `Tracker::advance_within` leaves them at zero
 //! (the place to add an adapter).
 //!
 //! (Not `transcript_stats`' cursor: that one reads all that is unread in
@@ -115,6 +115,10 @@ pub struct Tracker {
     since: i64,
     /// The bytes from `offset` to the end are a line still being written.
     pub partial: bool,
+    /// When the session last switched conversations in its process (its
+    /// latest `SessionStart`, from the caller): with the new file's birth,
+    /// the switch time below which a new file's launches are old.
+    pub switch_hint: i64,
 }
 
 impl Tracker {
@@ -140,6 +144,7 @@ impl Tracker {
     ) -> std::io::Result<u64> {
         // Adapter hook: only Claude Code transcripts are read today.
         let (len, ino) = (meta.len(), meta.ino());
+        self.partial = false;
         if Format::of(path) != Format::Claude {
             self.open.clear();
             (self.offset, self.ino) = (len, ino);
@@ -156,11 +161,15 @@ impl Tracker {
             // (Launches dated before the switch belong to that file's past:
             // an in-process `/resume` to an older conversation. A `/clear`'s
             // new file has none.)
+            // (When the switch happened, not when it was noticed: the
+            // session's `SessionStart`, or the new file's birth.)
             let since = if self.ino != 0 {
-                crate::types::now_ms()
+                let born = meta.created().map(crate::timefmt::ms_epoch).unwrap_or(0);
+                self.switch_hint.max(born)
             } else {
                 0
             };
+            let hint = self.switch_hint;
             let open = std::mem::take(&mut self.open);
             let closed = std::mem::take(&mut self.closed);
             *self = Tracker {
@@ -168,6 +177,7 @@ impl Tracker {
                 open,
                 closed,
                 since,
+                switch_hint: hint,
                 ..Default::default()
             };
         }
@@ -190,7 +200,6 @@ impl Tracker {
         let mut r = BufReader::new(f.take(limit));
         let mut buf = Vec::new();
         let mut read = 0u64;
-        self.partial = false;
         loop {
             buf.clear();
             let n = r.read_until(b'\n', &mut buf)? as u64;
@@ -315,7 +324,7 @@ impl Tracker {
         let resumed = r["resumedAgentId"]
             .as_str()
             .or(r["revivedAgentId"].as_str());
-        if let Some(id) = resumed.filter(|_| r["success"] == true) {
+        if let Some(id) = resumed.filter(|_| r["success"] == true && !old) {
             let before = self
                 .closed
                 .iter()
@@ -809,6 +818,52 @@ mod tests {
         t.advance(&a).unwrap();
         t.advance(&b).unwrap();
         assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a1", "new"]);
+    }
+
+    /// `ms` as the transcript writes it (UTC, `...T...Z`).
+    fn iso(ms: i64) -> String {
+        let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+        // Civil date from days since the epoch (H. Hinnant's algorithm).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+            rem / 3_600_000,
+            rem / 60_000 % 60,
+            rem / 1000 % 60,
+            rem % 1000
+        )
+    }
+
+    #[test]
+    fn a_launch_after_a_clear_counts_before_the_scan_sees_it() {
+        assert_eq!(iso(1_789_158_047_939), "2026-09-11T20:20:47.939Z");
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::fs::write(&a, format!("{}\n", agent_launch("a1"))).unwrap();
+        let mut t = Tracker::default();
+        t.advance(&a).unwrap();
+        // `/clear`: a new file; a launch in it, written before the next
+        // scan.
+        std::fs::write(&b, "").unwrap();
+        let switched = crate::types::now_ms();
+        t.switch_hint = switched;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A launch just after the switch, written before the scan.
+        let mut launch = agent_launch("a2");
+        launch["timestamp"] = json!(iso(switched + 10));
+        std::fs::write(&b, format!("{launch}\n")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        t.advance(&b).unwrap();
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a1", "a2"]);
     }
 
     #[test]

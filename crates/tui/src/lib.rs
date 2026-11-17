@@ -1604,6 +1604,7 @@ impl App {
         let r = hover_rect(area, x, y, w, h);
         f.render_widget(ratatui::widgets::Clear, r);
         f.render_widget(p, r);
+        self.hits.add(r, mouse::Hit::Popup);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -2782,7 +2783,12 @@ fn usage_details(u: &Value) -> String {
 /// Whether the hovered session `id` is still the list row `hit` (what is
 /// under the pointer now).
 fn hover_still_there(hit: Option<mouse::Hit>, sessions: &[Value], id: &str) -> bool {
-    matches!(hit, Some(mouse::Hit::Row(i)) if sessions.get(i).is_some_and(|s| s["id"] == id))
+    match hit {
+        // (The pointer on the popup itself: it stays.)
+        Some(mouse::Hit::Popup) => true,
+        Some(mouse::Hit::Row(i)) => sessions.get(i).is_some_and(|s| s["id"] == id),
+        _ => false,
+    }
 }
 
 /// The details panel's height under the preview, in a right column

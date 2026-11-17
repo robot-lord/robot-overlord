@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -98,8 +98,7 @@ fn mtime_ms(p: &Path) -> Option<i64> {
 }
 
 fn meta_mtime_ms(m: &std::fs::Metadata) -> Option<i64> {
-    let t = m.modified().ok()?;
-    Some(t.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64)
+    m.modified().ok().map(rlord_core::timefmt::ms_epoch)
 }
 
 /// When the session last wrote anything: its transcript, or the output of
@@ -131,7 +130,10 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
     use std::os::unix::fs::MetadataExt;
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
-        return shown(&s.tracker, 0, 0, now);
+        // (The transcript can't be seen: its subagents' own files still
+        // tell whether they run.)
+        let agents = last_write(0, &s.tracker);
+        return shown(&s.tracker, agents, 0, now);
     };
     let main = meta_mtime_ms(&meta).unwrap_or(0);
     let stamp = (meta.len(), meta.ino(), main);
@@ -142,7 +144,9 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
             *budget = budget.saturating_sub(n);
             // (All read, or all but a line still being written: that
             // line's end changes the file, and is read then.)
-            if s.tracker.offset == meta.len() || s.tracker.partial {
+            // (Nothing read of a file that grew: the budget ran out; not
+            // saved.)
+            if s.tracker.offset == meta.len() || (s.tracker.partial && n > 0) {
                 s.stamp = stamp;
             }
         }
@@ -192,23 +196,13 @@ fn shown(t: &Tracker, agents_write: i64, main_write: i64, now: i64) -> Shown {
     }
 }
 
-/// Whether a session's background state is kept: running, or stopped
-/// within `STOP_GRACE_MS` (a `/clear`).
-fn kept(l: &LiveTranscript, now: i64) -> bool {
-    !l.stopped || now - l.changed_at < STOP_GRACE_MS
-}
-
 /// Read what every running session's transcript appended since the last
 /// look (the overlords too: one can wait on its own subagent).
 fn scan(d: &Daemon) -> Result<()> {
     // (Ids, paths, start times and statuses only, under the DB lock.)
     let now = now_ms();
-    let sources: Vec<LiveTranscript> = d
-        .db()
-        .live_transcripts()?
-        .into_iter()
-        .filter(|l| kept(l, now))
-        .collect();
+    // Running, or stopped within `STOP_GRACE_MS` (a `/clear`).
+    let sources: Vec<LiveTranscript> = d.db().live_transcripts(now - STOP_GRACE_MS)?;
     // Only this thread locks `seen` (`annotate` reads `shown`), so it is
     // held for the whole scan.
     let mut seen = d.background.seen.lock().expect("background mutex");
@@ -227,6 +221,7 @@ fn scan(d: &Daemon) -> Result<()> {
     let n = sources.len().max(1);
     for l in sources.iter().cycle().skip(start % n).take(sources.len()) {
         let s = seen.entry(l.id.clone()).or_default();
+        s.tracker.switch_hint = l.switched_at;
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
         let sh = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
@@ -571,27 +566,6 @@ mod tests {
         let mut rows = [json!({"id": "s1", "status": "idle"})];
         annotate(&d, &mut rows);
         assert_eq!(rows[0]["async_tasks"], 1);
-        // Stopped past the grace: dropped.
-        assert!(kept(
-            &LiveTranscript {
-                id: "s1".into(),
-                path: String::new(),
-                started_at: 0,
-                stopped: true,
-                changed_at: 0,
-            },
-            STOP_GRACE_MS - 1
-        ));
-        assert!(!kept(
-            &LiveTranscript {
-                id: "s1".into(),
-                path: String::new(),
-                started_at: 0,
-                stopped: true,
-                changed_at: 0,
-            },
-            STOP_GRACE_MS
-        ));
     }
 
     #[test]

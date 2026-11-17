@@ -247,6 +247,9 @@ pub struct LiveTranscript {
     pub stopped: bool,
     /// Its last status change (ms).
     pub changed_at: i64,
+    /// Its latest `SessionStart` of any kind (ms; 0: none): when it last
+    /// switched conversations, a `/clear` or `/resume` included.
+    pub switched_at: i64,
 }
 
 impl Db {
@@ -1630,7 +1633,8 @@ impl Db {
     /// the tasks (a new process is certain only when rlord resumed it);
     /// not `clear` or `compact`. Cheap: ids, paths and look-ups on
     /// `idx_events_session_kind`.
-    pub fn live_transcripts(&self) -> Result<Vec<LiveTranscript>> {
+    /// Stopped or failed ones only if that was after `stopped_after` (ms).
+    pub fn live_transcripts(&self, stopped_after: i64) -> Result<Vec<LiveTranscript>> {
         let mut st = self.conn.prepare(
             "SELECT s.id, t.source_path, \
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
@@ -1638,17 +1642,21 @@ impl Db {
                                                 'restarted', 'reforked') \
                                    OR (e.kind = 'session_start' AND \
                                        json_extract(e.payload, '$.start') = 'startup'))), 0) \
-             , s.status IN ('stopped', 'error'), COALESCE(s.last_state_change_at, 0) \
+             , s.status IN ('stopped', 'error'), COALESCE(s.last_state_change_at, 0), \
+             COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
+                       AND e.kind = 'session_start'), 0) \
              FROM sessions s JOIN transcripts t ON t.session_id = s.id \
-             WHERE s.archived_at IS NULL",
+             WHERE s.archived_at IS NULL AND (s.status NOT IN ('stopped', 'error') \
+                   OR COALESCE(s.last_state_change_at, 0) > ?1)",
         )?;
-        let rows = st.query_map([], |r| {
+        let rows = st.query_map([stopped_after], |r| {
             Ok(LiveTranscript {
                 id: r.get(0)?,
                 path: r.get(1)?,
                 started_at: r.get(2)?,
                 stopped: r.get(3)?,
                 changed_at: r.get(4)?,
+                switched_at: r.get(5)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2534,14 +2542,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         mk(&db, "01aaa", "a");
         db.upsert_transcript_source("01aaa", "/t/a.jsonl").unwrap();
-        // Stopped: listed as such, with since when.
+        // Stopped: listed only within the grace given.
         db.set_status("01aaa", Status::Stopped, 7).unwrap();
-        let l = &db.live_transcripts().unwrap()[0];
+        let l = &db.live_transcripts(6).unwrap()[0];
         assert!(l.stopped);
         assert_eq!(l.changed_at, 7);
+        assert!(db.live_transcripts(7).unwrap().is_empty());
         db.set_status("01aaa", Status::Idle, 8).unwrap();
-        assert!(!db.live_transcripts().unwrap()[0].stopped);
-        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 0);
+        assert!(!db.live_transcripts(i64::MAX).unwrap()[0].stopped);
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 0);
         db.insert_event("01aaa", 100, "restarted", "{}").unwrap();
         db.insert_event(
             "01aaa",
@@ -2568,11 +2577,13 @@ mod tests {
         .unwrap();
         db.insert_event("01aaa", 400, "session_start", r#"{"hook":"SessionStart"}"#)
             .unwrap();
-        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 200);
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 200);
+        // Any SessionStart is a switch of conversation.
+        assert_eq!(db.live_transcripts(0).unwrap()[0].switched_at, 400);
         db.insert_event("01aaa", 500, "reforked", "{}").unwrap();
-        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 500);
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 500);
         // A fork starts a process of its own.
         db.insert_event("01aaa", 600, "forked", "{}").unwrap();
-        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 600);
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 600);
     }
 }

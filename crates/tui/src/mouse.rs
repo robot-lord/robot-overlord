@@ -50,6 +50,9 @@ pub(crate) enum Hit {
     Pick(usize),
     /// A modal's body, and everything around it.
     Inside,
+    /// The hover popup over the list: covers the rows under it (a click
+    /// there does nothing; the pointer on it keeps it open).
+    Popup,
     Outside,
 }
 
@@ -299,6 +302,8 @@ impl App {
     pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
         // Over a session row in the list: its status in words, in a popup.
         let row = match (&self.mode, self.hits.at(x, y)) {
+            // On the popup itself: it stays.
+            (Mode::Normal, Some(Hit::Popup)) => return false,
             (Mode::Normal, Some(Hit::Row(i))) => self
                 .sessions
                 .get(i)
