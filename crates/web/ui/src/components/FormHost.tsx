@@ -1,6 +1,7 @@
 // The form open over the page (store.form), and the banner for one the
 // overlord opened while the user was typing in another.
 
+import { NewSession } from "../forms/NewSession";
 import type { Store } from "../store";
 import { formOf } from "../ui";
 import { Modal } from "./Modal";
@@ -42,7 +43,11 @@ export function FormHost({ store }: { store: Store }) {
           </button>
         </div>
       )}
-      {form && (
+      {form && (form.kind === "describe" || form.kind === "confirm") && (
+        <NewSession store={store} kind="describe" cmd={form.cmd} />
+      )}
+      {form?.kind === "manual" && <NewSession store={store} kind="manual" cmd={form.cmd} />}
+      {form && !["describe", "confirm", "manual"].includes(form.kind) && (
         <Modal title={NAMES[form.kind] ?? form.kind} onClose={close}>
           <p class="hint">This form isn't in the web UI yet.</p>
         </Modal>

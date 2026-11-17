@@ -531,3 +531,145 @@ textarea {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
+
+/* Forms. */
+.new {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+.form {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 12px;
+  align-items: start;
+  margin-top: 8px;
+}
+.form .field,
+.form .hints {
+  display: contents;
+}
+.form .field-name {
+  color: var(--dim);
+  padding-top: 4px;
+}
+.form .field-value {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.form .wide .field-name,
+.form .hints-note,
+.form .background,
+.form .blocker,
+.form .err,
+.form .buttons {
+  grid-column: 1 / -1;
+}
+.form .wide textarea {
+  grid-column: 1 / -1;
+}
+.form input[type="text"],
+.form textarea,
+.form select,
+.picker input {
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font: inherit;
+}
+.form .pick {
+  text-align: left;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.owner {
+  display: block;
+  font-size: 11px;
+}
+.owner-yours {
+  color: var(--ok);
+}
+.owner-overlords {
+  color: var(--accent);
+}
+.owner-default {
+  color: var(--dim);
+}
+.note {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg);
+}
+.small {
+  font-size: 12px;
+}
+.link {
+  background: none;
+  border: 0;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.readonly {
+  white-space: pre-wrap;
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  max-height: 160px;
+  overflow: auto;
+}
+.blocker {
+  color: var(--warn);
+}
+.blocker code {
+  display: block;
+  color: var(--fg);
+}
+.buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.primary {
+  border-color: var(--accent);
+}
+.picker {
+  flex-basis: 100%;
+}
+.choices {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.choices button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--fg);
+  padding: 4px 8px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choices button.on,
+.choices button:hover {
+  background: var(--line);
+}

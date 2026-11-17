@@ -11,6 +11,7 @@ import { usageFigure } from "../components/usage";
 import type { Overlord, Row, Snapshot } from "../proto";
 import { href, type Route } from "../route";
 import { SORTS, type Store, type View } from "../store";
+import type { FormKind } from "../ui";
 
 /** "Claude Code" for "claude", from the overlord's roster. */
 function agentLabels(s: Snapshot | null): Map<string, string> {
@@ -25,6 +26,23 @@ export function List({ store, route }: { store: Store; route: Route }) {
   const selected = route.kind === "session" ? route.id : store.selected.value;
   return (
     <div class="list">
+      <div class="new">
+        <button
+          type="button"
+          title="describe it; the overlord sets it up (n)"
+          onClick={() => open(store, "describe")}
+        >
+          + New session
+        </button>
+        <button
+          type="button"
+          class="dim"
+          title="pick every field yourself (N)"
+          onClick={() => open(store, "manual")}
+        >
+          Manual
+        </button>
+      </div>
       <Controls store={store} view={view} />
       {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}
       {snap?.overlord && <Tell store={store} />}
@@ -36,6 +54,12 @@ export function List({ store, route }: { store: Store; route: Route }) {
       )}
     </div>
   );
+}
+
+/** Open a form of the user's own (not over one they are typing in). */
+export function open(store: Store, kind: FormKind): void {
+  if (store.form.value?.touched) return;
+  store.form.value = { kind, cmd: null, touched: false };
 }
 
 function Controls({ store, view }: { store: Store; view: View }) {

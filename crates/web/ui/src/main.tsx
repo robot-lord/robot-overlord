@@ -11,7 +11,7 @@ import type { UiCmd } from "./proto";
 import { followHash, href, parse, route } from "./route";
 import { listView, Store } from "./store";
 import { decide, Reporter } from "./ui";
-import { List } from "./views/List";
+import { List, open as openForm } from "./views/List";
 import { Overlord } from "./views/Overlord";
 import { Session } from "./views/Session";
 import "./app.css";
@@ -86,24 +86,40 @@ const control = token
           .catch(() => {});
       },
       changed: (rev) => store.changed(rev),
-      ui: onUi,
+      ui: (cmd) => {
+        onUi(cmd);
+        // "Got it": the daemon won't hand it to another page.
+        control?.request("page.report", {}).catch(() => {});
+      },
     })
   : null;
 if (!token) store.conn.value = "no_token";
 
 /** What this page shows, to the daemon (only what changed). */
 function report(): void {
-  // (Not a dependency: on connecting, hello reports everything.)
-  if (store.conn.peek() !== "open") return;
-  reporter.shown({
+  // (Read first: the effect follows what it read. The connection isn't
+  // followed: on connecting, hello reports everything.)
+  const shown = {
     route: route.value,
     view: listView(store.view.value),
     visible: document.visibilityState === "visible",
     form: store.form.value?.kind ?? null,
-  });
+  };
+  if (store.conn.peek() === "open") reporter.shown(shown);
 }
 effect(report);
 document.addEventListener("visibilitychange", report);
+// The list's keys: n (describe a new session), N (manual). Never while
+// typing in a field or a pane, or with a form open.
+document.addEventListener("keydown", (e) => {
+  const t = e.target instanceof HTMLElement ? e.target : null;
+  if (e.metaKey || e.ctrlKey || e.altKey || store.form.value) return;
+  if (t?.closest("input, textarea, select, [contenteditable], .pane")) return;
+  if (e.key === "n") openForm(store, "describe");
+  else if (e.key === "N") openForm(store, "manual");
+  else return;
+  e.preventDefault();
+});
 for (const ev of ["pointerdown", "keydown", "wheel"] as const) {
   document.addEventListener(ev, () => reporter.input(), { capture: true, passive: true });
 }

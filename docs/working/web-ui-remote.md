@@ -717,6 +717,31 @@ Decided 2026-11-17 (user):
     and a browser with no saved view starts from `view.default`. Rows
     show the usage figure in the list's measure. The form host shows a
     placeholder until steps 8 and 9.
+  - Step 8 done (`ui/src/forms/{hints.ts,NewSession.tsx}`,
+    `components/Picker.tsx`, the list's "+ New session" and "Manual",
+    keys `n` / `N`): `hints.ts` is the TUI's rules (`fresh`, `setAgent`,
+    `picked`, `described`, `owner`, `setLocation`, `typedBase`, `request`,
+    `launch`, `prefill`, `prefillConfirm`, `agentBlocker`), Vitest-tested
+    against the daemon's fixtures (labels, the confirm round trip, a plain
+    folder, a proposal launched by its id). The describe form sends
+    `overlord.new_session` and goes to the overlord; the manual form sends
+    `session.new` and goes to the new session; a failure keeps the form.
+    Each hint shows whose it is (yours, the overlord's, default) and
+    "changed" when the overlord changed it; a reopened form's note sits on
+    top and Send reads "Confirm". The repo picker lists the finder's
+    repos (asking again while the first scan runs), and takes a typed path
+    as a repo or a plain folder (the daemon checks it at launch).
+    Found on the way, fixed in its own commit: `page.pending` handed a
+    command to a reloaded page even when the old page had acted on it;
+    any call from the addressed page now clears it, and the page answers
+    each command with an empty `page.report`. Also fixed: the page's
+    report effect returned before reading its signals while connecting,
+    so it never ran again.
+    Checked headless (Chromium and WebKit, demo `rlord-demo-s2`, port
+    47841): `propose_session` from the stand-in opens the proposal with
+    the overlord's note read-only; Launch starts the session, the page
+    goes to it, and its background holds the note (from the daemon's
+    proposal store).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
