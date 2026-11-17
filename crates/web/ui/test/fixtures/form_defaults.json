@@ -1,0 +1,79 @@
+{
+  "agent": "claude",
+  "agents": [
+    {
+      "hooks": true,
+      "install": {
+        "alternatives": [],
+        "command": "curl -fsSL https://claude.ai/install.sh | bash",
+        "docs": "https://code.claude.com/docs/en/setup",
+        "via": "install script"
+      },
+      "installed": false,
+      "label": "Claude Code",
+      "model": "opus",
+      "models": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "name": "claude",
+      "supported": true,
+      "too_old": null
+    },
+    {
+      "hooks": true,
+      "install": {
+        "alternatives": [],
+        "command": "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        "docs": "https://github.com/openai/codex#readme",
+        "via": "install script"
+      },
+      "installed": false,
+      "label": "Codex",
+      "model": "",
+      "models": [],
+      "name": "codex",
+      "supported": true,
+      "too_old": null
+    },
+    {
+      "hooks": false,
+      "install": {
+        "alternatives": [],
+        "command": "curl -fsSL https://opencode.ai/v2/install | bash",
+        "docs": "https://opencode.ai/docs/",
+        "via": "install script"
+      },
+      "installed": false,
+      "label": "OpenCode",
+      "model": "",
+      "models": [],
+      "name": "opencode",
+      "supported": true,
+      "too_old": null
+    }
+  ],
+  "base": "latest",
+  "claude_tui": "default",
+  "code_dir": "",
+  "codex_daemon": false,
+  "codex_model": "",
+  "default_repo": "",
+  "model": "opus",
+  "models": [
+    "opus",
+    "sonnet",
+    "haiku"
+  ],
+  "opencode_model": "",
+  "repo_roots": [],
+  "repo_scan_depth": 3,
+  "scan_note": "no code folder yet: the finder scans ~ until setup is done (confirm_setup)",
+  "scan_roots": [
+    "/scratch/home"
+  ],
+  "setup_needed": true,
+  "workspace": true,
+  "workspace_dir": ".worktrees"
+}

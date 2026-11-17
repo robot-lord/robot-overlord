@@ -676,6 +676,24 @@ Decided 2026-11-17 (user):
       code folder, keys), not for `set_list_view` or `show_list`.
     - `set_list_view` on the web sends `set_view`, then `show_list` unless
       `show: false`, and updates the page's view in the daemon at once.
+  - Step 5 done (`web.rs`): ops `form.defaults`, `form.repos`,
+    `form.setup` (status and suggestion in one answer), `form.setup_save`,
+    `overlord.new_session` (a `project` becomes the form's wire shape,
+    `folder_request`), `overlord.setup_request`, `session.new` (`launch`:
+    a `proposal` id brings the stored `context` and `related`, and
+    `by_overlord`), `session.fork`. Argument filtering moved into
+    `filtered` and is unit-tested per op (the "never" column dropped).
+    Fixtures written by `web_api.rs` `the_forms_ops_and_fixtures`
+    (`RLORD_UPDATE_FIXTURES=1`): `form_defaults.json`, `form_repos.json`,
+    `form_setup.json` and `ui_cmds.json` (one of each command), with the
+    scratch folder written as `/scratch`. Choices within the plan:
+    - `form.setup_save` also passes `allow_home`: the plan's table left it
+      out, but without it the form could never save a confirmed home
+      folder (`save_call`'s home rule).
+    - The look-ups (`form.defaults`, `form.repos`, `form.setup`) don't
+      count as use of the page; the saves and launches do.
+    - `web_api.rs` now points `HOME` at its scratch folder (the repo
+      finder and the suggestion look there).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

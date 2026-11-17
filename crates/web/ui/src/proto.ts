@@ -51,6 +51,14 @@ export const OPS = [
   "page.pending",
   "view.default",
   "keys.list",
+  "form.defaults",
+  "form.repos",
+  "form.setup",
+  "form.setup_save",
+  "overlord.new_session",
+  "overlord.setup_request",
+  "session.new",
+  "session.fork",
 ] as const;
 
 export type Op = (typeof OPS)[number];

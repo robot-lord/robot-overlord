@@ -1,0 +1,102 @@
+{
+  "confirm_new_session": {
+    "cmd": "confirm_new_session",
+    "prefill": {
+      "agent": "codex",
+      "base": "main",
+      "changed": [
+        "agent"
+      ],
+      "chosen": [],
+      "description": "d",
+      "model": "",
+      "note": "n",
+      "prefer": "local",
+      "project": "/tmp",
+      "resolved": [
+        "repo",
+        "agent",
+        "model",
+        "base",
+        "tags"
+      ],
+      "tags": [
+        "web"
+      ],
+      "workspace": false
+    }
+  },
+  "goto": {
+    "cmd": "goto",
+    "id": "alpha",
+    "overlord": false
+  },
+  "keys": {
+    "cmd": "keys",
+    "row": "keys.quit"
+  },
+  "new_session": {
+    "cmd": "new_session",
+    "prefill": {
+      "agent": "claude",
+      "base": "main",
+      "branch": "b",
+      "context": "c",
+      "model": "opus",
+      "name": "n",
+      "prefer": "local",
+      "project": "/tmp",
+      "prompt": "p",
+      "proposal": "p1",
+      "related": [
+        "alpha"
+      ],
+      "related_names": [
+        "alpha"
+      ],
+      "workspace": false
+    }
+  },
+  "notice": {
+    "cmd": "notice",
+    "text": "the overlord opened a new-session form in the terminal"
+  },
+  "set_view": {
+    "cmd": "set_view",
+    "select": "alpha",
+    "view": {
+      "archived": "live",
+      "group": null,
+      "query": "tag:web",
+      "reverse": false,
+      "sort": "updated",
+      "tab": "sessions",
+      "usage": null
+    }
+  },
+  "setup": {
+    "cmd": "setup",
+    "prefill": {
+      "changed": [
+        "code_dir"
+      ],
+      "code_dir": "/tmp",
+      "description": "d",
+      "note": "n",
+      "repo_roots": [
+        "/tmp"
+      ]
+    },
+    "status": {
+      "code_dir": "/scratch/home/code",
+      "done": true,
+      "needed": false,
+      "repo_roots": [],
+      "roots_default": "leave",
+      "skipped": false
+    }
+  },
+  "show_list": {
+    "cmd": "show_list"
+  }
+}

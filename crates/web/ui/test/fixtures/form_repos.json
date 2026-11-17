@@ -1,0 +1,17 @@
+{
+  "code_dir": "",
+  "depth": 3,
+  "repos": [
+    {
+      "default": false,
+      "last_used_at": null,
+      "path": "/scratch/home/src/demo"
+    }
+  ],
+  "roots": [
+    "/scratch/home"
+  ],
+  "scanning": false,
+  "skipped": [],
+  "skipped_more": 0
+}

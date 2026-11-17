@@ -1,0 +1,25 @@
+{
+  "status": {
+    "code_dir": "",
+    "done": false,
+    "needed": true,
+    "repo_roots": [],
+    "roots_default": "leave",
+    "skipped": false
+  },
+  "suggest": {
+    "alternatives": [],
+    "code_dir": "",
+    "done": false,
+    "needed": true,
+    "roots": {
+      "configured": [],
+      "effective": [
+        "/scratch/home"
+      ]
+    },
+    "roots_default": "leave",
+    "sources": {},
+    "suggestion": null
+  }
+}

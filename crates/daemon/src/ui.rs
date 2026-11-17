@@ -720,6 +720,19 @@ fn keep_proposal(d: &Daemon, background: Value) -> String {
     id
 }
 
+/// The background (`context`, `related`) kept for proposal `id`.
+pub(crate) fn proposal(d: &Daemon, id: &str) -> Result<Value> {
+    d.proposals
+        .lock()
+        .expect("ui mutex")
+        .iter()
+        .find(|(i, _)| i == id)
+        .map(|(_, v)| v.clone())
+        .with_context(|| {
+            format!("unknown proposal '{id}': it is too old (ask the overlord to propose it again)")
+        })
+}
+
 /// Send form command `cmd` to the user's screen: on the terminal the list
 /// is shown too (the TUI opens it there); on a page the command opens it.
 /// The other screen gets a notice naming the form.
@@ -1086,6 +1099,27 @@ pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
 #[cfg(test)]
 mod target_tests {
     use super::*;
+
+    /// Proposals are kept, the newest 8, and an unknown id is refused.
+    #[test]
+    fn the_proposal_store() {
+        let d = Daemon::new(
+            rlord_core::db::Db::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        let ids: Vec<String> = (0..10)
+            .map(|i| keep_proposal(&d, json!({"context": format!("c{i}")})))
+            .collect();
+        assert_eq!(ids[0], "p1");
+        assert_eq!(proposal(&d, &ids[9]).unwrap()["context"], "c9");
+        assert_eq!(proposal(&d, &ids[2]).unwrap()["context"], "c2");
+        assert!(proposal(&d, &ids[1]).is_err());
+        assert!(proposal(&d, "nope")
+            .unwrap_err()
+            .to_string()
+            .contains("too old"));
+        assert_eq!(d.proposals.lock().unwrap().len(), PROPOSALS);
+    }
 
     fn pages(p: &[(&str, Option<i64>, u64)]) -> Vec<(String, Option<i64>, u64)> {
         p.iter().map(|(i, a, s)| (i.to_string(), *a, *s)).collect()

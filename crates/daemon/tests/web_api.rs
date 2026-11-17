@@ -39,6 +39,9 @@ fn env() -> &'static Path {
         std::env::set_var("XDG_DATA_HOME", dir.join("data"));
         std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
         std::env::set_var("XDG_RUNTIME_DIR", dir.join("run"));
+        // (The repo finder and the code-folder suggestion look in $HOME.)
+        std::env::set_var("HOME", dir.join("home"));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
         dir
     })
 }
@@ -157,14 +160,11 @@ fn web_call_reaches_its_ops_and_nothing_else() {
         "ui.state",
         "tmux.reload",
         "setup.apply",
-        "session.new",
-        "session.fork",
         "session.send",
         "session.context_add",
         "session.group",
         "tag.rename",
         "tag.order",
-        "overlord.new_session",
         "overlord.set_model",
         "limits.resume",
         "remote.set",
@@ -879,4 +879,163 @@ fn snapshot_takes_query_and_the_default_view() {
         (&v["sort"], &v["tab"]),
         (&json!("updated"), &json!("sessions"))
     );
+}
+
+/// `crates/web/ui/test/fixtures/<name>.json`: written from `got` with
+/// `RLORD_UPDATE_FIXTURES=1`, else `got` must have its shape. The page's
+/// types are checked against these files (`fixture.test.ts`).
+fn fixture(name: &str, got: &Value) {
+    let path = PathBuf::from(FIXTURE).with_file_name(format!("{name}.json"));
+    if std::env::var("RLORD_UPDATE_FIXTURES").as_deref() == Ok("1") {
+        // (This machine's scratch folder: not in a committed file.)
+        let text = serde_json::to_string_pretty(got)
+            .unwrap()
+            .replace(env().to_str().unwrap(), "/scratch");
+        std::fs::write(&path, text + "\n").unwrap();
+    }
+    let want: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("fixture {}", path.display())),
+    )
+    .unwrap();
+    let diff = shape_diff(got, &want, name);
+    assert!(
+        diff.is_empty(),
+        "{name} changed shape: update crates/web/ui/src/proto.ts, then \
+         RLORD_UPDATE_FIXTURES=1 cargo test -p robot-overlord-daemon --test web_api\n{}",
+        diff.join("\n")
+    );
+}
+
+/// The forms' ops: each reaches its function with only its arguments,
+/// and their answers (and one of each UI command) are the page's
+/// fixtures.
+#[test]
+fn the_forms_ops_and_fixtures() {
+    let r = start();
+    let res = |o: &str, args: Value| {
+        let got = op(&r.sock, o, args);
+        assert!(got["error"].is_null(), "{o}: {got}");
+        got["result"].clone()
+    };
+    let defaults = res("form.defaults", json!({"no_listing": false}));
+    assert!(
+        defaults["agents"].is_object() || defaults["agents"].is_array(),
+        "{defaults}"
+    );
+    fixture("form_defaults", &defaults);
+    // A repo for the finder to find (a folder with `.git`: no git here).
+    std::fs::create_dir_all(env().join("home/src/demo/.git")).unwrap();
+    let mut repos = res("form.repos", json!({}));
+    let began = Instant::now();
+    while repos["repos"].as_array().is_none_or(Vec::is_empty)
+        && began.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+        repos = res("form.repos", json!({}));
+    }
+    assert!(repos["repos"][0]["path"].is_string(), "{repos}");
+    fixture("form_repos", &repos);
+    let setup = res("form.setup", json!({"launch_dir": "/etc"}));
+    assert!(setup["status"]["needed"].is_boolean(), "{setup}");
+    assert!(setup["suggest"].is_object(), "{setup}");
+    fixture("form_setup", &setup);
+
+    // form.setup_save: `skip` isn't the browser's (dropped, so this asks
+    // for a folder); a folder is saved to config.toml (a scratch one).
+    let e = method_error(&op(&r.sock, "form.setup_save", json!({"skip": true})));
+    assert!(e.contains("code_dir"), "{e}");
+    let code = env().join("home").join("code");
+    let e = method_error(&op(
+        &r.sock,
+        "form.setup_save",
+        json!({"code_dir": code.to_str().unwrap()}),
+    ));
+    assert!(e.contains("create it?"), "{e}");
+    let saved = res(
+        "form.setup_save",
+        json!({"code_dir": code.to_str().unwrap(), "roots": "follow", "create": true}),
+    );
+    assert_eq!(saved["created"], true, "{saved}");
+    assert!(code.is_dir());
+    let cfg = std::fs::read_to_string(saved["config"].as_str().unwrap()).unwrap();
+    assert!(cfg.contains("code_dir"), "{cfg}");
+
+    // The launches and the requests reach their methods (no tmux or
+    // overlord here: they fail there, not at the allow-list).
+    for (o, args) in [
+        (
+            "session.new",
+            json!({"project": "/tmp", "name": "n", "agent": "claude"}),
+        ),
+        ("session.fork", json!({"ref": "alpha"})),
+        (
+            "overlord.new_session",
+            json!({"description": "a thing", "project": "/tmp"}),
+        ),
+        (
+            "overlord.setup_request",
+            json!({"description": "my code is in ~/src"}),
+        ),
+    ] {
+        method_error(&op(&r.sock, o, args));
+    }
+    // A proposal the daemon doesn't have is refused before anything starts.
+    let e = method_error(&op(
+        &r.sock,
+        "session.new",
+        json!({"project": "/tmp", "proposal": "p99"}),
+    ));
+    assert!(e.contains("too old"), "{e}");
+
+    // One of each UI command, as a page gets them.
+    let mut stream = WebStream::open(&r.sock);
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    let mut cmds = serde_json::Map::new();
+    let mut take = |stream: &mut WebStream, want: &str| {
+        let c = stream.next_ui();
+        assert_eq!(c["cmd"]["cmd"], want, "{c}");
+        cmds.insert(want.to_string(), c["cmd"].clone());
+    };
+    tool(&r.sock, "show_list", json!({}));
+    take(&mut stream, "show_list");
+    tool(
+        &r.sock,
+        "set_list_view",
+        json!({"query": "tag:web", "select": "alpha", "show": false}),
+    );
+    take(&mut stream, "set_view");
+    tool(
+        &r.sock,
+        "propose_session",
+        json!({"project": "/tmp", "name": "n", "agent": "claude", "model": "opus", "branch": "b",
+               "prompt": "p", "context": "c", "related": ["alpha"], "workspace": false,
+               "base": "main", "prefer": "local"}),
+    );
+    take(&mut stream, "new_session");
+    tool(
+        &r.sock,
+        "confirm_new_session",
+        json!({"description": "d", "project": "/tmp", "agent": "codex", "model": "", "workspace": false,
+               "tags": ["web"], "base": "main", "prefer": "local", "changed": ["agent"], "note": "n"}),
+    );
+    take(&mut stream, "confirm_new_session");
+    tool(
+        &r.sock,
+        "confirm_setup",
+        json!({"code_dir": "/tmp", "repo_roots": ["/tmp"], "description": "d", "changed": ["code_dir"], "note": "n"}),
+    );
+    take(&mut stream, "setup");
+    tool(&r.sock, "open_keys", json!({"key": "keys.quit"}));
+    take(&mut stream, "keys");
+    // goto (the session isn't running and can't be started here, so the
+    // command is written as goto_session sends it) and the notice.
+    cmds.insert(
+        "goto".into(),
+        json!({"cmd": "goto", "id": "alpha", "overlord": false}),
+    );
+    cmds.insert(
+        "notice".into(),
+        json!({"cmd": "notice", "text": "the overlord opened a new-session form in the terminal"}),
+    );
+    fixture("ui_cmds", &Value::Object(cmds));
 }

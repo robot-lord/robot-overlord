@@ -122,6 +122,72 @@ pub const OPS: &[Op] = &[
     op("view.default", "", &[]),
     // The key screen, read-only (keys change only in a terminal).
     op("keys.list", "keys.list", &[]),
+    // The forms' look-ups: agents, models and defaults; the repo finder;
+    // the code folder as set now and rlord's suggestion.
+    op("form.defaults", "session.defaults", &[]),
+    op("form.repos", "repo.find", &[]),
+    op("form.setup", "", &[]),
+    // The code-folder form's save: what the user confirmed there.
+    op(
+        "form.setup_save",
+        "",
+        &["code_dir", "roots", "create", "allow_home"],
+    ),
+    // The describe-a-session form: a request to the overlord.
+    op(
+        "overlord.new_session",
+        "overlord.new_session",
+        &[
+            "description",
+            "repo",
+            "project",
+            "agent",
+            "model",
+            "workspace",
+            "base",
+            "prefer",
+            "tags",
+            "chosen",
+            "resolved",
+            "confirmed",
+        ],
+    ),
+    // The code-folder form with a description: a request to the overlord.
+    op(
+        "overlord.setup_request",
+        "overlord.setup_request",
+        &[
+            "description",
+            "code_dir",
+            "code_dir_source",
+            "roots",
+            "roots_source",
+        ],
+    ),
+    // The manual form's launch. The overlord's background for a session it
+    // proposed comes from the daemon (`proposal`), never from the page.
+    op(
+        "session.new",
+        "",
+        &[
+            "repo",
+            "project",
+            "name",
+            "branch",
+            "agent",
+            "model",
+            "workspace",
+            "prompt",
+            "base",
+            "prefer",
+            "proposal",
+        ],
+    ),
+    op(
+        "session.fork",
+        "session.fork",
+        &["ref", "prompt", "name", "workspace"],
+    ),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
@@ -134,6 +200,9 @@ const PASSIVE: &[&str] = &[
     "page.pending",
     "view.default",
     "keys.list",
+    "form.defaults",
+    "form.repos",
+    "form.setup",
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
@@ -178,21 +247,20 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
         return Err(NotAllowed(op.to_string()).into());
     }
-    let mut args = serde_json::Map::new();
-    if let Some(given) = params["args"].as_object() {
-        for k in found.args {
-            if let Some(v) = given.get(*k) {
-                args.insert((*k).to_string(), v.clone());
-            }
-        }
-    }
-    let args = Value::Object(args);
+    let args = filtered(found, &params["args"]);
     match op {
         "snapshot" => snapshot(d, &args),
         "session.resume" => resume(d, &args),
         "page.report" => d.web_ui().report(page, &args),
         "page.pending" => Ok(pending(d)),
         "view.default" => crate::ui::default_view(d),
+        "form.setup" => Ok(json!({
+            "status": crate::setup::status(d)?,
+            "suggest": crate::setup::suggest(d, &json!({}))?,
+        })),
+        "form.setup_save" => crate::setup::apply(d, &args),
+        "overlord.new_session" => d.rpc(found.method, folder_request(args)),
+        "session.new" => launch(d, args),
         // A session the list doesn't show: labelled as rows are.
         "session.get" => d.rpc(found.method, args).map(|mut s| {
             label(&mut s);
@@ -217,6 +285,59 @@ fn resume(d: &Daemon, args: &Value) -> Result<Value> {
     let s = crate::ui::ensure_running(d, methods::p_str(args, "ref")?)?;
     crate::codex_daemon::sync_gate(&d.db());
     Ok(serde_json::to_value(s)?)
+}
+
+/// Only the arguments `op` passes on (any others are dropped).
+fn filtered(op: &Op, given: &Value) -> Value {
+    let mut args = serde_json::Map::new();
+    if let Some(given) = given.as_object() {
+        for k in op.args {
+            if let Some(v) = given.get(*k) {
+                args.insert((*k).to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(args)
+}
+
+/// Op `overlord.new_session`: a plain folder (`project`) goes as the TUI's
+/// form sends one: `repo: "<path> (plain folder, not a repo)"`, no
+/// worktree.
+fn folder_request(mut args: Value) -> Value {
+    let folder = args
+        .as_object_mut()
+        .and_then(|o| o.remove("project"))
+        .and_then(|p| p.as_str().map(str::to_string))
+        .filter(|p| !p.trim().is_empty());
+    if let Some(f) = folder.filter(|_| args["repo"].as_str().is_none_or(str::is_empty)) {
+        args["repo"] = json!(format!("{} (plain folder, not a repo)", f.trim()));
+        args["workspace"] = json!(false);
+    }
+    args
+}
+
+/// Op `session.new`: the manual form's launch. With `proposal` (a session
+/// the overlord proposed), the overlord's background and related sessions
+/// come from the daemon's copy, and the session is told the overlord
+/// launched it.
+fn launch(d: &Daemon, args: Value) -> Result<Value> {
+    d.rpc("session.new", launch_params(d, args)?)
+}
+
+/// `launch`'s parameters for `session.new`.
+fn launch_params(d: &Daemon, mut args: Value) -> Result<Value> {
+    let id = args
+        .as_object_mut()
+        .and_then(|o| o.remove("proposal"))
+        .and_then(|p| p.as_str().map(str::to_string))
+        .filter(|p| !p.is_empty());
+    if let Some(id) = id {
+        let kept = crate::ui::proposal(d, &id)?;
+        args["context"] = kept["context"].clone();
+        args["related"] = kept["related"].clone();
+        args["by_overlord"] = json!(true);
+    }
+    Ok(args)
 }
 
 /// Op `snapshot {view, rev}`: everything the list draws, in one answer.
@@ -936,6 +1057,69 @@ mod tests {
                 assert!(!o.op.starts_with(f), "{}", o.op);
             }
         }
+    }
+
+    fn op_named(name: &str) -> &'static Op {
+        OPS.iter().find(|o| o.op == name).unwrap()
+    }
+
+    /// A browser can't set what only trusted callers set: the overlord's
+    /// background, its role, extra agent arguments; those come from the
+    /// daemon's copy of the proposal.
+    #[test]
+    fn a_launch_takes_only_the_forms_fields() {
+        let d = Daemon::new(
+            rlord_core::db::Db::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        let got = filtered(
+            op_named("session.new"),
+            &json!({"repo": "/r", "name": "n", "extra_args": ["--danger"], "role": "overlord",
+                    "by_overlord": true, "context": "mine", "related": ["x"],
+                    "tmux_name": "t", "hooks_work": true, "remote_control": true}),
+        );
+        assert_eq!(got, json!({"repo": "/r", "name": "n"}));
+        assert_eq!(launch_params(&d, got.clone()).unwrap(), got);
+        // A proposal's background is the daemon's.
+        d.proposals.lock().unwrap().push_back((
+            "p1".into(),
+            json!({"context": "the overlord's", "related": ["a1"]}),
+        ));
+        let p = launch_params(&d, json!({"repo": "/r", "proposal": "p1"})).unwrap();
+        assert_eq!(
+            p,
+            json!({"repo": "/r", "context": "the overlord's", "related": ["a1"], "by_overlord": true})
+        );
+        assert!(launch_params(&d, json!({"proposal": "p9"})).is_err());
+        let f = filtered(
+            op_named("session.fork"),
+            &json!({"ref": "a", "prompt": "p", "context": "c", "related": ["b"], "model": "m",
+                    "branch": "b", "description": "d", "workspace": true}),
+        );
+        assert_eq!(f, json!({"ref": "a", "prompt": "p", "workspace": true}));
+        let s = filtered(
+            op_named("form.setup_save"),
+            &json!({"code_dir": "/c", "skip": true, "roots": "follow"}),
+        );
+        assert_eq!(s, json!({"code_dir": "/c", "roots": "follow"}));
+        let r = filtered(
+            op_named("overlord.new_session"),
+            &json!({"description": "d", "request_id": "r1"}),
+        );
+        assert_eq!(r, json!({"description": "d"}));
+    }
+
+    /// A plain folder goes to the overlord as the TUI's form sends one.
+    #[test]
+    fn a_folder_request_has_the_forms_wire_shape() {
+        assert_eq!(
+            folder_request(json!({"description": "d", "project": "/tmp/x", "workspace": true})),
+            json!({"description": "d", "repo": "/tmp/x (plain folder, not a repo)", "workspace": false})
+        );
+        assert_eq!(
+            folder_request(json!({"repo": "/r", "workspace": true})),
+            json!({"repo": "/r", "workspace": true})
+        );
     }
 
     #[test]
