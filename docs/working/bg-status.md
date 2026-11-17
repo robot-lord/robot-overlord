@@ -21,8 +21,13 @@ file). PR #68.
 - Row fields are `async_tasks` / `async_labels` / `async_shells`, not
   `background_*`: `background` is the session's context. The overlord sees
   the status as `background work`.
-- The hooks' `SubagentStop` closes an agent the tracker still holds open
-  (round 6), so the `⚙` count and `bg` don't disagree.
+- Removed in round 9: the round-6 cross-check, where the hooks'
+  `SubagentStop` closed open agents. `subagents.finished_at` is partly
+  guessed (`warm.rs`, `close_open_subagents` when a session stops), so it
+  closed tasks that were still running. The `⚙` count and `bg` can still
+  disagree.
+- Round 9: a stopped session keeps its state for 15 s, because `/clear`
+  fires `SessionEnd` (stopped) in the same process.
 - `/clear` (a new transcript, same process) carries the open work over.
 - Status filters: the overlays and your turn match the shown status;
   `stopped`, `working`, `error` and the rest match the stored one.
@@ -50,8 +55,18 @@ file). PR #68.
 
 - **Hooks-first redesign.** Take the subagent count from the `subagents`
   table (the hooks) and read the transcript only for forked skills, shells
-  and labels. Today the transcript is primary and the hooks only close
-  agents they saw finish.
+  and labels. Caveat: `subagents.finished_at` is partly guessed today
+  (`warm.rs` backfills it, and `close_open_subagents` sets it when a
+  session stops). It can't close tasks until only real `SubagentStop`
+  hooks set it (or the guessed values are marked).
+- **`claude -c` / `--resume` outside rlord.** That sends `SessionStart`
+  `resume`, which isn't counted as a new process, so the old tasks stay
+  until the stale guard hides them. A sure sign of a new process would
+  fix it (the pane's pid changing).
+- **`json_extract` in `live_transcripts`.** Each tick reads the payload
+  of the session's `session_start` events. Storing the start kind in its
+  own column (or a distinct event kind for `startup`) would make the
+  lookup index-only.
 - **Codex and OpenCode adapters.** `Tracker::advance` is the hook. Neither
   agent has a known background-task record yet.
 - **Needs-you reason.** The popup and details say "blocked on a permission

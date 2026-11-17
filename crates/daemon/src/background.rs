@@ -15,9 +15,12 @@
 //! not forgotten: a later notification still closes them, and they show
 //! again if their files change. Shells are hidden the same way once the
 //! transcript itself has been quiet that long (they are only information). Work is forgotten only
-//! when the session stops or its agent process starts again (rlord's
-//! resume, restart or refork, or the agent's own `SessionStart` hook for a
-//! startup or resume: its tasks died with the old process).
+//! when the session has been stopped past a short grace (a `/clear` stops
+//! it for a moment, in the same process) or its agent process starts again:
+//! rlord's resume, restart or refork, or the agent's own `SessionStart`
+//! hook with source `startup`. Not `resume`, which an in-process `/resume`
+//! sends too (a `claude -c` outside rlord is missed: owed). Its tasks died
+//! with the old process.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +31,8 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use rlord_core::agents::background::{Kind, Task, Tracker};
+use rlord_core::agents::claude;
+use rlord_core::db::LiveTranscript;
 use rlord_core::types::now_ms;
 
 use crate::Daemon;
@@ -40,6 +45,10 @@ pub const STALE_MS: i64 = 30 * 60_000;
 const STAT_CAP: usize = 5;
 /// Tasks listed per row.
 const LIST_CAP: usize = 5;
+/// A session stopped (or failed) this long has its state dropped. Shorter:
+/// kept, since a `/clear` stops a session for a moment (its `SessionEnd`)
+/// in the same process, and its tasks go on.
+const STOP_GRACE_MS: i64 = 15_000;
 /// Bytes read per tick across all sessions; the rest waits for the next
 /// tick (first looks at many large transcripts after a daemon start).
 const TICK_BUDGET: u64 = 16 << 20;
@@ -82,8 +91,12 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
-pub(crate) fn mtime_ms(p: &Path) -> Option<i64> {
-    let t = std::fs::metadata(p).ok()?.modified().ok()?;
+fn mtime_ms(p: &Path) -> Option<i64> {
+    meta_mtime_ms(&std::fs::metadata(p).ok()?)
+}
+
+fn meta_mtime_ms(m: &std::fs::Metadata) -> Option<i64> {
+    let t = m.modified().ok()?;
     Some(t.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64)
 }
 
@@ -100,7 +113,7 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
     for (id, task) in agents.into_iter().take(STAT_CAP) {
         let mut files: Vec<PathBuf> = task.output.iter().cloned().collect();
         if let Some(side) = &task.side {
-            files.push(side.join(format!("agent-{id}.jsonl")));
+            files.push(claude::subagent_transcript(side, id));
         }
         for f in files {
             newest = newest.max(mtime_ms(&f).unwrap_or(0));
@@ -118,11 +131,7 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
     let Ok(meta) = std::fs::metadata(path) else {
         return shown(&s.tracker, 0, 0, now);
     };
-    let main = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64);
+    let main = meta_mtime_ms(&meta).unwrap_or(0);
     let stamp = (meta.len(), meta.ino(), main);
     // (Saved only once the whole file is read, a skipped long line
     // included, and the read didn't fail: else read on next tick.)
@@ -146,20 +155,6 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
         main
     };
     shown(t, agents, main, now)
-}
-
-/// The hooks' sub-agent records as a cross-check: an agent the tracker
-/// still holds open whose `SubagentStop` came after it was (re)started is
-/// closed (`finished`: `(agent id, finished_at)` from the DB).
-fn closed_by_hooks(t: &mut Tracker, finished: &[(String, i64)]) {
-    for (id, at) in finished {
-        if t.open
-            .get(id)
-            .is_some_and(|task| task.kind == Kind::Agent && *at >= task.started_at)
-        {
-            t.close(id);
-        }
-    }
 }
 
 /// What a tracker shows at `now`: its subagents while the session wrote
@@ -193,39 +188,39 @@ fn shown(t: &Tracker, agents_write: i64, main_write: i64, now: i64) -> Shown {
     }
 }
 
+/// Whether a session's background state is kept: running, or stopped
+/// within `STOP_GRACE_MS` (a `/clear`).
+fn kept(l: &LiveTranscript, now: i64) -> bool {
+    !l.stopped || now - l.changed_at < STOP_GRACE_MS
+}
+
 /// Read what every running session's transcript appended since the last
 /// look (the overlords too: one can wait on its own subagent).
 fn scan(d: &Daemon) -> Result<()> {
-    // (Ids, paths and start times only, under the DB lock.)
-    let sources = d.db().running_transcripts()?;
+    // (Ids, paths, start times and statuses only, under the DB lock.)
+    let now = now_ms();
+    let sources: Vec<LiveTranscript> = d
+        .db()
+        .live_transcripts()?
+        .into_iter()
+        .filter(|l| kept(l, now))
+        .collect();
     // Only this thread locks `seen` (`annotate` reads `shown`), so it is
     // held for the whole scan.
     let mut seen = d.background.seen.lock().expect("background mutex");
-    let now = now_ms();
     let mut after = HashMap::new();
-    let running: HashSet<&str> = sources.iter().map(|(id, _, _)| id.as_str()).collect();
-    // Not running (stopped, failed, archived): nothing of theirs runs.
+    let running: HashSet<&str> = sources.iter().map(|l| l.id.as_str()).collect();
+    // Stopped past the grace, failed or archived: nothing of theirs runs.
     // (Resumed later, the work found again is older than the resume.)
     seen.retain(|id, _| running.contains(id.as_str()));
     let mut budget = TICK_BUDGET;
-    for (id, path, started_at) in &sources {
-        let s = seen.entry(id.clone()).or_default();
+    for l in &sources {
+        let s = seen.entry(l.id.clone()).or_default();
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
-        // Sub-agents the hooks saw finish (only while some are open).
-        let ids: Vec<&str> = s
-            .tracker
-            .of(Kind::Agent)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        if !ids.is_empty() {
-            if let Ok(done) = d.db().finished_subagents(id, &ids) {
-                closed_by_hooks(&mut s.tracker, &done);
-            }
-        }
-        let sh = refresh(s, Path::new(path), *started_at, now, &mut budget);
+        let sh = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
         if sh != Shown::default() {
-            after.insert(id.clone(), sh);
+            after.insert(l.id.clone(), sh);
         }
     }
     drop(seen);
@@ -440,21 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn the_hooks_close_what_they_saw_finish() {
-        let mut launch = agent("a1");
-        launch["timestamp"] = json!("1970-01-01T00:00:10.000Z");
-        let mut t = tracker(&[launch, agent("a2"), shell("b1")]);
-        // A stop from before a resume (10s) doesn't count; a2's does.
-        closed_by_hooks(
-            &mut t,
-            &[("a1".into(), 5_000), ("a2".into(), 1), ("b1".into(), 1)],
-        );
-        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a1", "b1"]);
-        closed_by_hooks(&mut t, &[("a1".into(), 20_000)]);
-        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1"]);
-    }
-
-    #[test]
     fn a_subagents_output_keeps_it_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("s1.jsonl");
@@ -533,6 +513,49 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_stop_keeps_the_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        let d = daemon(&path);
+        std::fs::write(&path, format!("{}\n", agent("a1"))).unwrap();
+        scan(&d).unwrap();
+        // `/clear`: SessionEnd stops it for a moment, SessionStart(clear)
+        // brings it back. Same process: the agent is still open.
+        d.db()
+            .set_status("s1", rlord_core::types::Status::Stopped, now_ms())
+            .unwrap();
+        scan(&d).unwrap();
+        d.db()
+            .set_status("s1", rlord_core::types::Status::Idle, now_ms())
+            .unwrap();
+        scan(&d).unwrap();
+        let mut rows = [json!({"id": "s1", "status": "idle"})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["async_tasks"], 1);
+        // Stopped past the grace: dropped.
+        assert!(kept(
+            &LiveTranscript {
+                id: "s1".into(),
+                path: String::new(),
+                started_at: 0,
+                stopped: true,
+                changed_at: 0,
+            },
+            STOP_GRACE_MS - 1
+        ));
+        assert!(!kept(
+            &LiveTranscript {
+                id: "s1".into(),
+                path: String::new(),
+                started_at: 0,
+                stopped: true,
+                changed_at: 0,
+            },
+            STOP_GRACE_MS
+        ));
+    }
+
+    #[test]
     fn a_stopped_session_shows_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s1.jsonl");
@@ -543,7 +566,11 @@ mod tests {
         annotate(&d, &mut rows);
         assert_eq!(rows[0]["async_tasks"], 1);
         d.db()
-            .set_status("s1", rlord_core::types::Status::Stopped, now_ms())
+            .set_status(
+                "s1",
+                rlord_core::types::Status::Stopped,
+                now_ms() - STOP_GRACE_MS,
+            )
             .unwrap();
         scan(&d).unwrap();
         annotate(&d, &mut rows);

@@ -503,6 +503,11 @@ pub fn subagents_dir(transcript_path: &str) -> PathBuf {
     p.with_file_name(stem).join("subagents")
 }
 
+/// A sub-agent's own transcript in a `subagents_dir`.
+pub fn subagent_transcript(dir: &Path, agent_id: &str) -> PathBuf {
+    dir.join(format!("agent-{agent_id}.jsonl"))
+}
+
 /// A sub-agent whose transcript hasn't been written for this long has
 /// stopped, whatever its meta file says.
 const AGENT_QUIET: std::time::Duration = std::time::Duration::from_secs(60 * 60);
@@ -564,7 +569,7 @@ pub fn scan_subagents_read(
         else {
             continue;
         };
-        let jsonl = dir.join(format!("agent-{id}.jsonl"));
+        let jsonl = subagent_transcript(&dir, id);
         let read = transcript_stats(&jsonl);
         let counted = read.is_some();
         let stats = read.unwrap_or_default();

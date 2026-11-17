@@ -624,10 +624,7 @@ impl Daemon {
                     row["loading"] = json!(loading.contains(&id));
                     row["summarizing"] = json!(summarizing.contains(&id));
                 }
-                remote::annotate(self, &mut rows);
-                background::annotate(self, &mut rows);
-                limits::annotate(self, &mut rows);
-                set_shown_status(&mut rows);
+                annotate_status(self, &mut rows, true);
                 if let Some((taken, others)) = &status_filter {
                     rows.retain(|r| shown_status_matches(r, taken, others));
                 }
@@ -636,10 +633,7 @@ impl Daemon {
             }
             ("session.get", Ok(row)) => {
                 let mut rows = [row];
-                remote::annotate(self, &mut rows);
-                background::annotate(self, &mut rows);
-                limits::annotate(self, &mut rows);
-                set_shown_status(&mut rows);
+                annotate_status(self, &mut rows, true);
                 usage::annotate(self, &mut rows, true);
                 let [row] = rows;
                 Ok(row)
@@ -747,9 +741,7 @@ impl Daemon {
                     // Stopped on a usage limit: the row and the overlay say
                     // so (the user may switch to another agent's).
                     let mut rows = [v];
-                    background::annotate(self, &mut rows);
-                    limits::annotate(self, &mut rows);
-                    set_shown_status(&mut rows);
+                    annotate_status(self, &mut rows, false);
                     let [v] = rows;
                     v
                 })
@@ -1304,9 +1296,22 @@ impl Overlay {
     }
 }
 
+/// What every place that shows sessions lays over their rows: Remote
+/// Control (`remote`, where it applies), background work, usage limits,
+/// then `shown_status` from those. Not under the DB lock (the annotations
+/// take it).
+pub(crate) fn annotate_status(d: &Daemon, rows: &mut [Value], remote: bool) {
+    if remote {
+        remote::annotate(d, rows);
+    }
+    background::annotate(d, rows);
+    limits::annotate(d, rows);
+    set_shown_status(rows);
+}
+
 /// Set each row's `shown_status` once, after the annotations: what the
 /// list, `rlord ls`, the overlord and the filters all go by.
-pub(crate) fn set_shown_status(rows: &mut [Value]) {
+fn set_shown_status(rows: &mut [Value]) {
     for r in rows {
         r["shown_status"] = json!(shown_status(r));
     }
@@ -1347,10 +1352,11 @@ fn shown_status_matches(r: &Value, taken: &[Overlay], others: &[String]) -> bool
 
 /// A `session.list` query's `status` filter, split into the overlay
 /// statuses it names (`limited`, `background`) and the stored ones, to be
-/// matched on each row's `shown_status` after annotating
-/// (`shown_status_matches`). With an overlay named, the filter is taken
-/// out of the DB query (the DB doesn't store them); with stored ones only,
-/// it stays there to narrow the rows first. None: no status filter.
+/// matched after annotating (`shown_status_matches`: overlays and your
+/// turn by the shown status, the other stored statuses by the stored one).
+/// With an overlay named, the filter is taken out of the DB query (the DB
+/// doesn't store them); with stored ones only, it stays there to narrow
+/// the rows first. None: no status filter.
 fn take_status_filter(params: &mut Value) -> Option<(Vec<Overlay>, Vec<String>)> {
     let st = params.get("status")?.as_array()?;
     let taken: Vec<Overlay> = st.iter().filter_map(|v| Overlay::of(v.as_str()?)).collect();

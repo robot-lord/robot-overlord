@@ -235,6 +235,20 @@ pub struct Db {
     conn: Connection,
 }
 
+/// A live session's transcript, for background-work tracking
+/// (`Db::live_transcripts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTranscript {
+    pub id: String,
+    pub path: String,
+    /// When its agent process last started (ms; 0: never seen).
+    pub started_at: i64,
+    /// Stopped or failed.
+    pub stopped: bool,
+    /// Its last status change (ms).
+    pub changed_at: i64,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         // rlord's data folder and its DB are the user's alone (SQLite gives
@@ -1603,8 +1617,9 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Live sessions whose agent is running (not stopped or failed), the
-    /// overlords included, each with its transcript and when its agent
+    /// Live (unarchived) sessions with a transcript, the overlords included:
+    /// whether they are stopped or failed and since when (the caller allows
+    /// a grace: a `/clear` stops a session for a moment), and when its agent
     /// process last started (0: never seen): rlord starting it again (a
     /// `resumed` / `restarted` / `reforked` event), or the agent's own
     /// `SessionStart` hook with `start` `startup`, always a new process,
@@ -1613,34 +1628,25 @@ impl Db {
     /// the tasks (a new process is certain only when rlord resumed it);
     /// not `clear` or `compact`. Cheap: ids, paths and look-ups on
     /// `idx_events_session_kind`.
-    pub fn running_transcripts(&self) -> Result<Vec<(String, String, i64)>> {
+    pub fn live_transcripts(&self) -> Result<Vec<LiveTranscript>> {
         let mut st = self.conn.prepare(
             "SELECT s.id, t.source_path, \
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
                               AND (e.kind IN ('resumed', 'restarted', 'reforked') \
                                    OR (e.kind = 'session_start' AND \
                                        json_extract(e.payload, '$.start') = 'startup'))), 0) \
+             , s.status IN ('stopped', 'error'), COALESCE(s.last_state_change_at, 0) \
              FROM sessions s JOIN transcripts t ON t.session_id = s.id \
-             WHERE s.archived_at IS NULL AND s.status NOT IN ('stopped', 'error')",
+             WHERE s.archived_at IS NULL",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    }
-
-    /// Of these sub-agent ids of a session, those the hooks saw finish
-    /// (`SubagentStop`), with when: `(agent id, finished_at)`.
-    pub fn finished_subagents(&self, session_id: &str, ids: &[&str]) -> Result<Vec<(String, i64)>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let marks = vec!["?"; ids.len()].join(",");
-        let mut st = self.conn.prepare(&format!(
-            "SELECT agent_id, finished_at FROM subagents \
-             WHERE session_id = ? AND finished_at IS NOT NULL AND agent_id IN ({marks})"
-        ))?;
-        let params = std::iter::once(session_id).chain(ids.iter().copied());
-        let rows = st.query_map(rusqlite::params_from_iter(params), |r| {
-            Ok((r.get(0)?, r.get(1)?))
+        let rows = st.query_map([], |r| {
+            Ok(LiveTranscript {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                started_at: r.get(2)?,
+                stopped: r.get(3)?,
+                changed_at: r.get(4)?,
+            })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -2521,15 +2527,18 @@ mod tests {
     }
 
     #[test]
-    fn running_transcripts_know_when_the_agent_last_started() {
+    fn live_transcripts_know_when_the_agent_last_started() {
         let db = Db::open_in_memory().unwrap();
         mk(&db, "01aaa", "a");
         db.upsert_transcript_source("01aaa", "/t/a.jsonl").unwrap();
-        // Stopped: not listed.
-        db.set_status("01aaa", Status::Stopped, 1).unwrap();
-        assert!(db.running_transcripts().unwrap().is_empty());
-        db.set_status("01aaa", Status::Idle, 1).unwrap();
-        assert_eq!(db.running_transcripts().unwrap()[0].2, 0);
+        // Stopped: listed as such, with since when.
+        db.set_status("01aaa", Status::Stopped, 7).unwrap();
+        let l = &db.live_transcripts().unwrap()[0];
+        assert!(l.stopped);
+        assert_eq!(l.changed_at, 7);
+        db.set_status("01aaa", Status::Idle, 8).unwrap();
+        assert!(!db.live_transcripts().unwrap()[0].stopped);
+        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 0);
         db.insert_event("01aaa", 100, "restarted", "{}").unwrap();
         db.insert_event(
             "01aaa",
@@ -2556,8 +2565,8 @@ mod tests {
         .unwrap();
         db.insert_event("01aaa", 400, "session_start", r#"{"hook":"SessionStart"}"#)
             .unwrap();
-        assert_eq!(db.running_transcripts().unwrap()[0].2, 200);
+        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 200);
         db.insert_event("01aaa", 500, "reforked", "{}").unwrap();
-        assert_eq!(db.running_transcripts().unwrap()[0].2, 500);
+        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 500);
     }
 }

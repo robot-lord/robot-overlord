@@ -1844,8 +1844,9 @@ fn hook_emit_in(
             };
             let mut detail = crate::own::with_source(json!({"hook": event}), source);
             // How the agent started (`startup`, `resume`, `clear`,
-            // `compact`): a new process (startup, resume) ended the old
-            // one's background work (`background.rs`).
+            // `compact`). Only `startup` is sure to be a new process,
+            // which ended the old one's background work (`background.rs`;
+            // an in-process `/resume` sends `resume` too).
             if event == "SessionStart" {
                 if let Some(how) = payload["source"].as_str() {
                     detail["start"] = json!(how);

@@ -161,7 +161,7 @@ impl Tracker {
                 ..Default::default()
             };
         }
-        self.side = Some(path.with_extension("").join("subagents"));
+        self.side = Some(super::claude::subagents_dir(&path.to_string_lossy()));
         let mut f = std::fs::File::open(path)?;
         if self.offset == 0 && len > FIRST_READ {
             self.offset = len - FIRST_READ;

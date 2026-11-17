@@ -487,7 +487,7 @@ hooks and `discover` keep the stored status to themselves.
 over `idle` (your turn) as `async_tasks: N` on the row (with
 `async_work`: what and since when). It shows as `◔ bg N` in the list,
 `bg N` in `rlord ls`, and status `background work` (with `async_labels`)
-in `list_sessions`, `get_session`, `read_screen` and `triage`. `status:bg` filters
+in `list_sessions`, `get_session`, `read_screen` and `triage`, with a usage limit's `limited_until`, `limit_reset` and `resume_scheduled` (`mcp::status_fields`). Every row goes through `annotate_status` (remote where it applies, background work, limits, `shown_status`). `status:bg` filters
 it. A `waiting_input` session never gets it, and a usage limit is drawn
 over it. The daemon decides the precedence once and sets `shown_status`
 on each row (limited, else `background`, else the stored status). The
@@ -528,15 +528,11 @@ drawn over (`shown_status_matches`).
     {message: "Successfully stopped task: …", task_id}`); the older
     `KillShell` result has `shell_id`. The tool result's text is never
     parsed.
-- **Cross-check with the hooks.** The sub-agent hooks (`subagents`
-  rows, the `⚙` count) also see agents finish. A `SubagentStop` recorded
-  after an open agent was (re)started closes it in the tracker too, so the
-  two never disagree about a finished agent. The tracker still covers what
-  the hooks don't: forked skills, shells and labels.
-- **Which sessions.** Live ones whose agent runs (not stopped or failed),
-  the overlords included. `Db::running_transcripts` returns ids, paths
-  and the last start of each agent process, using
-  `idx_events_session_kind`. A start is either:
+- **Which sessions.** Live ones whose agent runs, the overlords
+  included, plus those stopped or failed less than 15 s ago: a `/clear`
+  stops a session for a moment (`SessionEnd`) in the same process, and its
+  tasks go on. `Db::live_transcripts` returns ids, paths, statuses and the
+  last start of each agent process, using `idx_events_session_kind`. A start is either:
   - a `resumed`, `restarted` or `reforked` event, or
   - a `session_start` hook event whose `start` is `startup` (recorded
     from the hook's `source`): always a new process, so this also catches
@@ -547,7 +543,8 @@ drawn over (`shown_status_matches`).
 
   Open work is forgotten in only these ways besides a finish or a stop
   call:
-  - the session stops (its state is dropped);
+  - the session has been stopped for more than 15 s, or is archived (its
+    state is dropped);
   - its agent process starts again (work launched before the start is
     forgotten, since its tasks died with the old process; so is work with
     no launch time, which can't be placed after the start).

@@ -354,7 +354,7 @@ fn labels(tasks: &Value) -> Value {
 /// the annotated session `s`): `async_tasks` (how many subagents run
 /// while its turn is over) with `async_labels` (what), and
 /// `async_shells` (`{count, labels}`, information only).
-pub(crate) fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
+fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
     if let Some(n) = s["async_tasks"].as_u64() {
         out.push(("async_tasks", json!(n)));
@@ -369,10 +369,45 @@ pub(crate) fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
     out
 }
 
+/// The status fields every overlord tool gives a session (from its
+/// annotated row `s`): `status` in words, background work
+/// (`background_fields`), and a usage limit (`limited_until`,
+/// `limit_reset`: its reset time just passed, `resume_scheduled`).
+fn status_fields(s: &Value) -> Vec<(&'static str, Value)> {
+    let mut out = vec![("status", status_word(s))];
+    out.extend(background_fields(s));
+    if !s["limit"].is_null() {
+        out.push(("limited_until", s["limit"]["until"].clone()));
+        out.push(("limit_reset", s["limit"]["reset"].clone()));
+        out.push(("resume_scheduled", s["limit"]["resume"].clone()));
+    }
+    out
+}
+
+/// An annotated row as the overlord gets it (`get_session`, `triage`):
+/// the `status_fields` in place of the raw annotations.
+pub(crate) fn overlord_status(s: &mut Value) {
+    let fields = status_fields(s);
+    if let Some(o) = s.as_object_mut() {
+        for k in [
+            "shown_status",
+            "async_tasks",
+            "async_work",
+            "async_shells",
+            "limit",
+        ] {
+            o.remove(k);
+        }
+    }
+    for (k, v) in fields {
+        s[k] = v;
+    }
+}
+
 /// The status as the overlord sees it: the daemon's `shown_status`
 /// (`background` and `limited` as they are, the rest in the words people
 /// see: working, needs you, your turn, stopped).
-pub(crate) fn status_word(s: &Value) -> Value {
+fn status_word(s: &Value) -> Value {
     match s["shown_status"]
         .as_str()
         .or(s["status"].as_str())
@@ -391,7 +426,7 @@ fn summarize(s: &Value) -> Value {
         "id": s["id"], "name": s["name"],
         // As people see it: working, needs you, your turn, stopped,
         // background, limited.
-        "status": status_word(s),
+
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         "tags": s["tags"], "description": s["description"],
@@ -423,15 +458,8 @@ fn summarize(s: &Value) -> Value {
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
     }
-    for (k, v) in background_fields(s) {
+    for (k, v) in status_fields(s) {
         row[k] = v;
-    }
-    // Stopped on a usage limit.
-    if !s["limit"].is_null() {
-        row["limited_until"] = s["limit"]["until"].clone();
-        // (Its reset time has passed: back in a minute.)
-        row["limit_reset"] = s["limit"]["reset"].clone();
-        row["resume_scheduled"] = s["limit"]["resume"].clone();
     }
     // Archived: what it did (get_session has it all).
     if !s["archived_at"].is_null() {
@@ -678,13 +706,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
             // The status as list_sessions shows it.
-            s["status"] = status_word(&s);
-            for (k, v) in background_fields(&s) {
-                s[k] = v;
-            }
-            if let Some(o) = s.as_object_mut() {
-                o.remove("async_work");
-            }
+            overlord_status(&mut s);
             // Right after rlord starts, sub-agent data may still be loading.
             if d.warm.is_loading(id.as_str().unwrap_or("")) {
                 s["subagents_loading"] = json!(true);
