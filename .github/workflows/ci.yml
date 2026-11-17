@@ -43,6 +43,28 @@ jobs:
       - run: cargo test --workspace
         env:
           RLORD_TMUX_TESTS: "1"
+  # The web plugin's page (crates/web/ui, TypeScript): its pinned Node
+  # tools, installed with `npm ci --ignore-scripts`, then rlord-web's tests
+  # against the built page rather than the placeholder. Node is needed here
+  # only; `check` builds rlord-web with the placeholder page.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/web/ui/.node-version
+          package-manager-cache: false
+      # The toolchain, components and targets in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo xtask web install
+      # Types (tsc), lint (oxlint, type-aware), format (biome), unit tests (vitest).
+      - run: cargo xtask web check
+      - run: cargo xtask web build
+      - run: cargo test -p robot-overlord-web
+        env:
+          RLORD_WEB_REQUIRE_ASSETS: "1"
   # Known-vulnerable dependencies (RustSec advisories) fail the build.
   advisories:
     runs-on: ubuntu-latest

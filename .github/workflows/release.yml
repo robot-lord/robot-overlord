@@ -72,6 +72,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: target/debug/xtask release-preflight
 
+  # The web plugin's page, built once here so Node stays off the jobs that
+  # compile the binaries, and every target embeds identical bytes. Pinned
+  # tools, lockfile integrity, no install scripts, no cache. (The build jobs
+  # take it with the plugin's tarball; until then it is only built and
+  # checked.)
+  web-assets:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: crates/web/ui/.node-version
+          package-manager-cache: false
+      # The toolchain, components and targets in rust-toolchain.toml (for xtask).
+      - run: rustup toolchain install
+      - run: cargo xtask web install
+      - run: cargo xtask web check
+      - run: cargo xtask web build
+      # Not dist-*: the release job merges those into the release's files.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-page
+          path: crates/web/ui/dist
+          if-no-files-found: error
+
   build-macos:
     needs: preflight
     if: needs.preflight.outputs.skip != 'true'
@@ -136,7 +166,7 @@ jobs:
       - run: scripts/smoke-linux.sh dist ubuntu:22.04 ubuntu:24.04 debian:12 fedora:41 amazonlinux:2023
 
   release:
-    needs: [preflight, build-macos, build-linux, smoke-linux]
+    needs: [preflight, web-assets, build-macos, build-linux, smoke-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write # the GitHub Release

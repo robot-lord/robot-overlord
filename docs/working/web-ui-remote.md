@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–7 built; steps 8–14 not started)
+**Status:** in progress (slice 1: steps 1–8 built; steps 9–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -288,6 +288,43 @@ Decided 2026-11-17 (user):
   and came back in the stream; closing left no view session. Stopping
   the demo stopped the plugin with its daemon. A real browser is still
   step 10's by-hand pass.
+
+- Step 8 done (`crates/web/ui/`, `xtask/src/web.rs`, `ci.yml`,
+  `release.yml`, `scripts/demo/demo.sh`): every version in the stack
+  table re-read from the npm registry on the day and all unchanged
+  (`typescript` 7.0.2, `vite` 8.3.8, `oxlint` 1.94.0, `oxlint-tsgolint`
+  7.0.2007, `@biomejs/biome` 2.6.8, `preact` 11.2.0, `@preact/signals`
+  2.11.4, `@xterm/xterm` 6.0.0, `@xterm/addon-fit` 0.11.0,
+  `@xterm/addon-webgl` 0.19.0, `vitest` 5.1.0); Node 26.13.1 in
+  `.node-version` (current LTS). `npm ci --ignore-scripts` leaves every
+  tool working: their native binaries (tsc, rolldown, oxlint, tsgolint,
+  biome) come as optional platform packages, with no install script. The
+  lockfile lists every platform's binary, so the Mac lockfile serves
+  Linux CI. `cargo xtask web install|check|build|watch` run the tools from
+  `node_modules/.bin` (never `npx`, which could fetch); `check` and `build`
+  install first when `node_modules` is older than the lockfile. CI's `web`
+  job: install, check, build, then `cargo test -p robot-overlord-web`
+  with `RLORD_WEB_REQUIRE_ASSETS=1`. Release's `web-assets` job builds and
+  uploads the page as artifact `web-page` (not `dist-*`, which the release
+  job merges into the release files); `release` needs it. The build jobs
+  don't take it yet: that wiring (`RLORD_WEB_DIST`) is step 13's.
+  `actions/setup-node` v7.1.0 pinned by commit, `package-manager-cache:
+  false`. `demo.sh --web` builds the page and the release `rlord-web` and
+  puts it beside the demo's `rlord`. Choices within the plan:
+  - The Node check wants `.node-version`'s major; another minor or patch
+    only gets a note (this Mac has 26.13.0; CI and the release job use the
+    exact one through `node-version-file`).
+  - Lint: oxlint's correctness rules as errors, suspicious as warnings
+    (`--deny-warnings` fails both), plus the type-aware promise rules
+    (`no-floating-promises`, `no-misused-promises`, `await-thenable`) and
+    `switch-exhaustiveness-check`. Off: `prefer-add-event-listener` (a
+    socket has one handler per event, set on purpose) and
+    `no-unsafe-type-assertion` (the plugin's JSON is typed by `proto.ts`).
+  - Biome formats with 2 spaces and 100 columns; its linter is off (oxlint
+    lints). The fixture is left as the Rust test writes it.
+  - `vite.config.ts`: `assetsInlineLimit: 0` (no `data:` assets), no
+    module-preload polyfill, no source maps. Vite reads `jsxImportSource`
+    from `tsconfig.json`: no JSX plugin.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

@@ -5,9 +5,13 @@
 # (scripts/demo/bin) that draw a screen and report state as the real ones
 # would (rlord's hooks; OpenCode: its session database), with no model.
 #
-#   scripts/demo/demo.sh [DIR]     # set up (DIR default: a new temp dir)
-#   source DIR/env.sh && rlord     # look around
+#   scripts/demo/demo.sh [--web] [DIR]  # set up (DIR default: a new temp dir)
+#   source DIR/env.sh && rlord          # look around
+#   source DIR/env.sh && rlord web      # with --web: the web UI
 #   scripts/demo/demo.sh --stop DIR
+#
+# --web also builds the web page and the rlord-web plugin and puts the
+# plugin beside the demo's rlord (unverified, as a checkout's build runs it).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -20,6 +24,12 @@ if [[ ${1:-} == --stop ]]; then
   tmux -L rlord-demo kill-server 2>/dev/null || true
   pkill -f "$d/bin/rlord daemon" 2>/dev/null || true
   exit 0
+fi
+
+web=
+if [[ ${1:-} == --web ]]; then
+  web=1
+  shift
 fi
 
 d=${1:-$(mktemp -d "${TMPDIR:-/tmp}/rlord-demo.XXXXXX")}
@@ -35,6 +45,10 @@ fi
 # The rlord to demo: this checkout's release build.
 (cd "$root" && cargo build --release -q -p robot-overlord)
 cp "$root/target/release/rlord" "$d/bin/rlord"
+if [[ -n $web ]]; then
+  (cd "$root" && cargo xtask web build >/dev/null && cargo build --release -q -p robot-overlord-web)
+  cp "$root/target/release/rlord-web" "$d/bin/rlord-web"
+fi
 # tmux by itself (not its whole folder, which may hold a real agent): the
 # stand-in login shell below runs rlord's own panes, the list included.
 ln -sf "$(command -v tmux)" "$d/bin/tmux"
@@ -302,5 +316,6 @@ fi
 
 echo "demo ready in $d"
 echo "  source $d/env.sh && rlord"
+if [[ -n $web ]]; then echo "  source $d/env.sh && rlord web    # or: rlord web url"; fi
 echo "  scripts/demo/screenshots.sh $d    # images into docs/images"
 echo "  scripts/demo/demo.sh --stop $d"

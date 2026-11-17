@@ -1,0 +1,44 @@
+:root {
+  --bg: #121214;
+  --panel: #1a1a1e;
+  --fg: #d8d8dc;
+  --dim: #8a8a94;
+  --line: #2c2c33;
+  --accent: #c79af2;
+  --bad: #ff8a80;
+  --ok: #8fd18f;
+  color-scheme: dark;
+}
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    14px / 1.4 system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+}
+.bar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.brand {
+  color: var(--accent);
+}
+.dim {
+  color: var(--dim);
+}
+.conn-open {
+  color: var(--ok);
+}
+.conn-closed,
+.conn-unauthorized,
+.conn-no_token {
+  color: var(--bad);
+}

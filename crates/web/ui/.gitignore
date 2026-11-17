@@ -1,0 +1,3 @@
+/node_modules
+# Built by `cargo xtask web build`; embedded in rlord-web, never committed.
+/dist
