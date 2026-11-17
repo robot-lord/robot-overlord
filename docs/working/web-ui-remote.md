@@ -694,6 +694,15 @@ Decided 2026-11-17 (user):
       count as use of the page; the saves and launches do.
     - `web_api.rs` now points `HOME` at its scratch folder (the repo
       finder and the suggestion look there).
+  - Step 6 done (`crates/web/src/{daemon,http,main}.rs`): page ids
+    `p<n>-<8 hex>`, the `hello` carries `page`, every `web.call` carries
+    the socket's own id (a `page` in the browser's frame is ignored),
+    `web.pages` on every open (before `hello`) and close, and once at
+    start with none; `Subscription::next` yields `Event::Changed` or
+    `Event::Ui {page, cmd}`, and a UI command goes to that page's socket
+    only as `{"event":"ui","cmd"}`. `web.pages` calls are serialized so
+    the daemon gets the lists in order. Test: `http.rs`
+    `pages_and_their_ui_commands`; unit test for the stream's lines.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

@@ -14,9 +14,17 @@
 //!
 //! The control socket: requests `{"id","op","args"}` are answered with
 //! `{"id","ok"}` or `{"id","error":{"code","message"}}`; events are
-//! `{"event":"hello",…}` (first) and `{"event":"changed","rev"}`.
+//! `{"event":"hello",…,"page"}` (first), `{"event":"changed","rev"}` and
+//! `{"event":"ui","cmd"}` (a UI command from the overlord, for this page
+//! only).
+//!
+//! Each control socket is a page with an id this plugin gives it
+//! (`p<n>-<8 hex>`): told to the page in `hello`, stamped on every
+//! `web.call` it makes (the browser can't choose it), and reported to the
+//! daemon with `web.pages` whenever a page opens or closes.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +63,11 @@ pub struct App {
     pub changes: broadcast::Sender<()>,
     pub controls: AtomicUsize,
     pub panes: AtomicUsize,
+    /// The open pages: id, and where its socket's messages go.
+    pages: Mutex<BTreeMap<String, mpsc::Sender<Message>>>,
+    page_seq: AtomicU64,
+    /// Held around each `web.pages`, so the daemon gets the lists in order.
+    pages_sent: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -67,7 +80,44 @@ impl App {
             changes: broadcast::channel(16).0,
             controls: AtomicUsize::new(0),
             panes: AtomicUsize::new(0),
+            pages: Mutex::new(BTreeMap::new()),
+            page_seq: AtomicU64::new(0),
+            pages_sent: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// A new page's id: `p<n>-<8 hex>`.
+    fn page_id(&self) -> String {
+        let n = self.page_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let r = rlord_core::plugin::random_hex(4).unwrap_or_else(|_| format!("{:08x}", n));
+        format!("p{n}-{r}")
+    }
+
+    fn page_ids(&self) -> Vec<String> {
+        self.pages
+            .lock()
+            .expect("pages mutex")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Tell the daemon which pages are open (the whole list).
+    pub async fn report_pages(&self) {
+        let _order = self.pages_sent.lock().await;
+        if let Err(e) = self.daemon.pages(self.page_ids()).await {
+            eprintln!("rlord-web: web.pages: {e}");
+        }
+    }
+
+    /// A UI command for page `page`: to its socket only (dropped when that
+    /// page has gone; the daemon keeps it for the next page to ask).
+    pub async fn ui(&self, page: &str, cmd: Value) {
+        let to = self.pages.lock().expect("pages mutex").get(page).cloned();
+        if let Some(to) = to {
+            let ev = json!({"event": "ui", "cmd": cmd});
+            let _ = to.send(Message::Text(ev.to_string().into())).await;
+        }
     }
 
     pub fn rev(&self) -> String {
@@ -237,11 +287,34 @@ async fn control(app: &Arc<App>, mut ws: WebSocket) {
     if !authenticate(app, &mut ws).await {
         return;
     }
+    let page = app.page_id();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(64);
+    app.pages
+        .lock()
+        .expect("pages mutex")
+        .insert(page.clone(), out_tx.clone());
+    // (Before hello: the page's first requests name a page the daemon
+    // knows.)
+    app.report_pages().await;
+    serve_page(app, ws, &page, out_tx, out_rx).await;
+    app.pages.lock().expect("pages mutex").remove(&page);
+    app.report_pages().await;
+}
+
+/// A control socket's life as page `page`, from its hello on.
+async fn serve_page(
+    app: &Arc<App>,
+    mut ws: WebSocket,
+    page: &str,
+    out_tx: mpsc::Sender<Message>,
+    mut out_rx: mpsc::Receiver<Message>,
+) {
     let hello = json!({
         "event": "hello",
         "version": env!("CARGO_PKG_VERSION"),
         "build": assets::build_id(),
         "rev": app.rev(),
+        "page": page,
     });
     if ws
         .send(Message::Text(hello.to_string().into()))
@@ -251,7 +324,6 @@ async fn control(app: &Arc<App>, mut ws: WebSocket) {
         return;
     }
     let mut changes = app.changes.subscribe();
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
     let (mut tx, mut rx) = ws.split();
     loop {
         tokio::select! {
@@ -271,9 +343,13 @@ async fn control(app: &Arc<App>, mut ws: WebSocket) {
                     };
                     let args = req.get("args").cloned().unwrap_or(json!({}));
                     // Answered in any order: each request is its own task.
-                    let (app, out) = (Arc::clone(app), out_tx.clone());
+                    let (app, out, page) = (Arc::clone(app), out_tx.clone(), page.to_string());
                     tokio::spawn(async move {
-                        let r = app.daemon.call("web.call", json!({"op": op, "args": args})).await;
+                        // (`page` is this socket's, never the browser's.)
+                        let r = app
+                            .daemon
+                            .call("web.call", json!({"op": op, "args": args, "page": page}))
+                            .await;
                         let msg = match r {
                             Ok(v) => Message::Text(json!({"id": id, "ok": v}).to_string().into()),
                             Err(e) => error(&id, browser_code(e.code), &e.message),
