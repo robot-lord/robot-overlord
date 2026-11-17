@@ -2442,7 +2442,7 @@ fn mcp_stdio(mode: McpMode, socket: Option<std::path::PathBuf>) -> Result<()> {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": if scoped { "rlord_session" } else { "rlord" },
+                "serverInfo": {"name": if scoped { rlord_daemon::session_tools::SERVER } else { "rlord" },
                                "version": env!("CARGO_PKG_VERSION")},
                 "instructions": if scoped {
                     "This session's own rlord look-ups (read-only): its brief, related sessions, and their history."
@@ -2517,7 +2517,7 @@ fn context_cli(
 ) -> Result<()> {
     let file = token_file
         .or_else(|| {
-            std::env::var_os("RLORD_SESSION_TOKEN_FILE")
+            std::env::var_os(rlord_core::agents::TOKEN_ENV)
                 .filter(|v| !v.is_empty())
                 .map(std::path::PathBuf::from)
         })

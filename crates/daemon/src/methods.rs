@@ -884,7 +884,7 @@ pub(crate) fn session_new_with(
         None => tmux_name_for(db, &name, None),
     };
     let launch_spec = spec.to_string();
-    start(
+    let started = start(
         db,
         Start {
             base: &base,
@@ -914,7 +914,12 @@ pub(crate) fn session_new_with(
                 json!({"workspace": workspace_path, "branch": branch, "base": start_base}),
             ),
         },
-    )?;
+    );
+    if let Err(e) = started {
+        // (Its token, MCP config and kv keys were made for it: gone too.)
+        crate::session_tools::forget(db, &base, &id);
+        return Err(e);
+    }
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;

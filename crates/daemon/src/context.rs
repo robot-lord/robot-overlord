@@ -356,23 +356,15 @@ pub fn render_as(
     }
     // How to look more up (`session_tools::lookup_section`) goes last; its
     // room is kept first.
-    // The rest is rendered in what the tail leaves; the tail goes on only
-    // if the whole stays within budget, else the rest gets all of it.
+    // The real content first, in the whole budget; the tail goes on only
+    // if it still fits.
+    let mut out = compose(header, rows, related, file, budget);
     if let Some(tail) = lookup {
-        let t = tail.chars().count();
-        let mut out = compose(
-            header.clone(),
-            rows,
-            related,
-            file,
-            budget.saturating_sub(t),
-        );
-        if out.chars().count() + t <= budget {
+        if out.chars().count() + tail.chars().count() <= budget {
             out.push_str(tail);
-            return out;
         }
     }
-    compose(header, rows, related, file, budget)
+    out
 }
 
 /// Whether the overlord launched session `id` with its background (kv

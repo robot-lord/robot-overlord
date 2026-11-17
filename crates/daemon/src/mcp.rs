@@ -673,9 +673,11 @@ fn new_session_params(args: &Value) -> Value {
 /// How session `id`'s agent can look things up itself
 /// (`session_tools::lookup_kind`: `mcp`, `cli` or `none`).
 fn lookup_of(d: &Daemon, id: &str) -> Value {
-    match d.db().resolve_ref(id) {
+    // (One lock: the DB mutex isn't re-entrant.)
+    let db = d.db();
+    match db.resolve_ref(id) {
         Ok(s) => json!(crate::session_tools::lookup_kind(
-            &d.db(),
+            &db,
             &rlord_core::paths::data_dir(),
             &s
         )),

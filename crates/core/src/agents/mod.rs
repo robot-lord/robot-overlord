@@ -57,7 +57,11 @@ pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 /// What marks a process as one rlord session's: its id and its look-up
 /// token file. Scrubbed from anything shared between sessions (the
 /// daemon, agent servers, commands rlord runs), wherever one is.
-pub const PANE_ENV: &[&str] = &["RLORD_SESSION_ID", "RLORD_SESSION_TOKEN_FILE"];
+pub const PANE_ENV: &[&str] = &["RLORD_SESSION_ID", TOKEN_ENV];
+
+/// The pane env var naming a session's look-up token file (a path, never
+/// the token).
+pub const TOKEN_ENV: &str = "RLORD_SESSION_TOKEN_FILE";
 
 /// `cmd` without `PANE_ENV`.
 pub fn scrub_pane_env(cmd: &mut std::process::Command) -> &mut std::process::Command {

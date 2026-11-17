@@ -41,7 +41,13 @@ use crate::Daemon;
 /// The MCP server name the session's agent sees.
 pub const SERVER: &str = "rlord_session";
 /// The pane env var naming the token file (a path, never the token).
-pub const TOKEN_ENV: &str = "RLORD_SESSION_TOKEN_FILE";
+pub use rlord_core::agents::TOKEN_ENV;
+
+/// Whether in-pane Codex sessions get the `rlord_session` MCP server
+/// (`-c mcp_servers.rlord_session.*`). Off until live check V5 shows Codex
+/// takes it in a worker: until then Codex sessions have the CLI line
+/// (`lookup` `cli`), and the overlord copies the facts they need.
+pub const CODEX_MCP: bool = false;
 
 const ANSWER_MAX: usize = 16_000;
 const PER_MINUTE: usize = 30;
@@ -53,7 +59,20 @@ fn token_key(id: &str) -> String {
 
 /// `<base>/sessions/<id>/token`.
 pub fn token_path(base: &Path, id: &str) -> PathBuf {
-    crate::context::session_dir(base, id).join("token")
+    token_in(&crate::context::session_dir(base, id))
+}
+
+/// The token file in a session's own folder `dir`.
+pub fn token_in(dir: &Path) -> PathBuf {
+    dir.join("token")
+}
+
+/// Undo what `wiring` made for a session whose launch then failed: its
+/// token (file and kv), its MCP config, its recorded look-ups.
+pub fn forget(db: &Db, base: &Path, id: &str) {
+    let _ = revoke(db, base, id);
+    let _ = std::fs::remove_file(mcp_config_path(base, id));
+    let _ = db.kv_delete(&kind_key(id));
 }
 
 /// `<base>/sessions/<id>/mcp.json` (Claude's `--mcp-config`).
@@ -233,7 +252,7 @@ pub fn wiring_args(
                 format!("--allowedTools=mcp__{SERVER}"),
             ]
         }
-        Agent::Codex if !daemon => {
+        Agent::Codex if !daemon && CODEX_MCP => {
             let q: Vec<String> = args.iter().map(|a| codex::toml_str(a)).collect();
             [
                 format!("mcp_servers.{SERVER}.command={}", codex::toml_str(bin)),
@@ -252,19 +271,20 @@ pub fn wiring_args(
 /// its tools. `dir`: its own folder (`context::session_dir`). None when it
 /// has no token yet.
 pub fn lookup_section(dir: &Path) -> Option<String> {
-    let token = dir.join("token");
+    let token = token_in(dir);
     if !token.is_file() {
         return None;
     }
+    let q = |p: &str| rlord_core::tmux::shell_quote(p);
     Some(format!(
         "\n## Looking up more\n\
          You can look up more yourself, read-only: your own brief again, \
          related sessions' descriptions, notes and summaries, and their \
          history. Use the `{SERVER}` tools if you have them; otherwise run \
          `{} context --token-file {} --socket {} help`.\n",
-        crate::methods::rlord_bin(),
-        token.display(),
-        rlord_core::paths::socket_path().display()
+        q(&crate::methods::rlord_bin()),
+        q(&token.to_string_lossy()),
+        q(&rlord_core::paths::socket_path().to_string_lossy())
     ))
 }
 
@@ -490,11 +510,61 @@ pub fn call(d: &Daemon, token: &str, name: &str, args: &Value) -> Result<Value> 
 /// An answer at most `ANSWER_MAX` chars (as JSON); a longer one comes
 /// back clipped as text.
 fn capped(v: Value) -> Value {
-    let text = serde_json::to_string(&v).unwrap_or_default();
-    if text.chars().count() <= ANSWER_MAX {
+    let size = |v: &Value| serde_json::to_string(v).map_or(0, |t| t.chars().count());
+    if size(&v) <= ANSWER_MAX {
         return v;
     }
-    json!({"clipped": true, "text": clip(&text, ANSWER_MAX - 100)})
+    // Long strings (notes, prompts, snippets) clipped shorter and shorter,
+    // then long lists halved: always valid JSON, never cut text.
+    let mut max = 4_000;
+    let mut out = v;
+    loop {
+        clip_strings(&mut out, max);
+        if size(&out) <= ANSWER_MAX - 20 {
+            break;
+        }
+        if max > 50 {
+            max /= 2;
+        } else if !halve_lists(&mut out) {
+            out = json!({});
+            break;
+        }
+    }
+    if let Value::Object(m) = &mut out {
+        m.insert("clipped".into(), json!(true));
+    }
+    out
+}
+
+fn clip_strings(v: &mut Value, max: usize) {
+    match v {
+        Value::String(s) if s.chars().count() > max => *s = clip(s, max),
+        Value::Array(a) => a.iter_mut().for_each(|x| clip_strings(x, max)),
+        Value::Object(m) => m.values_mut().for_each(|x| clip_strings(x, max)),
+        _ => {}
+    }
+}
+
+/// Halve every list longer than one; false when there was none.
+fn halve_lists(v: &mut Value) -> bool {
+    match v {
+        Value::Array(a) => {
+            let mut any = a.len() > 1;
+            a.truncate(a.len().div_ceil(2));
+            for x in a.iter_mut() {
+                any |= halve_lists(x);
+            }
+            any
+        }
+        Value::Object(m) => {
+            let mut any = false;
+            for x in m.values_mut() {
+                any |= halve_lists(x);
+            }
+            any
+        }
+        _ => false,
+    }
 }
 
 fn run(d: &Daemon, me: &Session, seen: &[Seen], name: &str, args: &Value) -> Result<Value> {
@@ -583,8 +653,8 @@ fn run(d: &Daemon, me: &Session, seen: &[Seen], name: &str, args: &Value) -> Res
         "search_history" => {
             let query = arg(args, "query").context("query is required")?;
             let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 8);
-            let mut only: HashSet<String> = seen.iter().map(|v| v.session.id.clone()).collect();
-            only.insert(me.id.clone());
+            let only: HashSet<String> = seen.iter().map(|v| v.session.id.clone()).collect();
+            // (Not itself: it has its own conversation.)
             let mut p = json!({"query": query, "limit": limit});
             if let Some(r) = arg(args, "session") {
                 p["session"] = json!(pick(me, seen, r)?.id);
@@ -815,9 +885,16 @@ mod tests {
 
     #[test]
     fn answers_are_capped() {
-        let v = capped(json!({"x": "y".repeat(40_000)}));
+        let v = capped(json!({"notes": "y".repeat(40_000), "name": "s"}));
         assert_eq!(v["clipped"], true);
-        assert!(v["text"].as_str().unwrap().chars().count() <= ANSWER_MAX);
+        assert_eq!(v["name"], "s");
+        assert!(v["notes"].as_str().unwrap().len() < 16_000);
+        let hits: Vec<Value> = (0..2_000)
+            .map(|i| json!({"line": i, "text": "z".repeat(60)}))
+            .collect();
+        let v = capped(json!({"sessions": [{"hits": hits}]}));
+        assert!(serde_json::to_string(&v).unwrap().chars().count() <= ANSWER_MAX);
+        assert!(v["sessions"][0]["hits"].as_array().unwrap().len() > 10);
         assert_eq!(capped(json!({"a": 1})), json!({"a": 1}));
     }
 
@@ -842,8 +919,11 @@ mod tests {
                 seen_at: None,
             })
             .collect();
-        let text = crate::context::render_as("s", true, &rows, &[], None, 6_000, Some(&tail));
+        // The content first; the section if it still fits.
+        let text = crate::context::render_as("s", true, &rows[..2], &[], None, 6_000, Some(&tail));
         assert!(text.ends_with(&tail));
+        let text = crate::context::render_as("s", true, &rows, &[], None, 6_000, Some(&tail));
+        assert!(!text.contains("Looking up more"));
         assert!(text.chars().count() <= 6_000, "{}", text.chars().count());
         // A budget too small for the section too: it is left out, never
         // over budget.
@@ -851,8 +931,12 @@ mod tests {
             .chars()
             .count();
         let t = tail.chars().count();
-        for (budget, fits) in [(header + t - 1, false), (header + t + 400, true)] {
-            let text = crate::context::render_as("s", true, &rows, &[], None, budget, Some(&tail));
+        let few = &rows[..1];
+        let one = crate::context::render_as("s", true, few, &[], None, 100_000, None)
+            .chars()
+            .count();
+        for (budget, fits) in [(one + t - 1, false), (one + t, true)] {
+            let text = crate::context::render_as("s", true, few, &[], None, budget, Some(&tail));
             assert_eq!(text.contains("Looking up more"), fits, "{budget}");
             assert!(text.chars().count() <= budget, "{budget}");
         }
@@ -861,6 +945,74 @@ mod tests {
             let text = crate::context::render_as("s", true, &rows, &[], None, budget, Some(&tail));
             assert!(text.chars().count() <= budget, "{budget}");
         }
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// `lookup` reaches the overlord through `mcp::call` without taking
+    /// the DB lock twice (it isn't re-entrant: a second lock hangs).
+    /// `create_session` and `fork_session` add it through the same
+    /// `lookup_of` after their launch (which needs tmux and an agent, so
+    /// isn't run here).
+    #[test]
+    fn get_session_shows_lookup_without_deadlock() {
+        let (d, b, _) = daemon("d6");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::mcp::call(
+                &d2,
+                "get_session",
+                &json!({"session": "01ME"}),
+            ));
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("get_session hung (DB lock taken twice?)")
+            .unwrap();
+        // (Its token is in the test's own folder, not the data dir.)
+        assert!(r["lookup"].is_string(), "{r}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn search_history_leaves_out_the_caller() {
+        let (d, b, token) = daemon("d7");
+        let e = call(
+            &d,
+            &token,
+            "search_history",
+            &json!({"query": "x", "session": "01ME"}),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("can see"), "{e}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_failed_launch_forgets_its_token() {
+        let b = base("forget");
+        let db = Db::open_in_memory().unwrap();
+        let folder = "/tmp/rlord-sctx-test/01G";
+        assert!(!wiring(&db, &b, "01G", Agent::Claude, "", folder, false).is_empty());
+        forget(&db, &b, "01G");
+        assert!(!token_path(&b, "01G").exists());
+        assert!(!mcp_config_path(&b, "01G").exists());
+        assert!(db.kv_get("session_token:01G").unwrap().is_none());
+        assert!(db.kv_get("session_lookup:01G").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn the_cli_line_quotes_its_paths() {
+        let b = base("quote it");
+        let db = Db::open_in_memory().unwrap();
+        mint(&db, &b, "01Q").unwrap();
+        let tail = lookup_section(&crate::context::session_dir(&b, "01Q")).unwrap();
+        let tok = token_path(&b, "01Q").to_string_lossy().into_owned();
+        assert!(
+            tail.contains(&rlord_core::tmux::shell_quote(&tok)),
+            "{tail}"
+        );
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -879,11 +1031,15 @@ mod tests {
             "--session"
         );
         let codex = wiring_args(Agent::Codex, false, "/bin/rlord", "/s", &tok, &cfg).unwrap();
-        assert_eq!(codex[0], "-c");
-        assert!(codex[1].starts_with("mcp_servers.rlord_session.command="));
-        assert!(codex
-            .iter()
-            .any(|a| a.contains("default_tools_approval_mode")));
+        if CODEX_MCP {
+            assert_eq!(codex[0], "-c");
+            assert!(codex[1].starts_with("mcp_servers.rlord_session.command="));
+            assert!(codex
+                .iter()
+                .any(|a| a.contains("default_tools_approval_mode")));
+        } else {
+            assert!(codex.is_empty());
+        }
         assert!(wiring_args(Agent::Codex, true, "/b", "/s", &tok, &cfg)
             .unwrap()
             .is_empty());
@@ -915,8 +1071,9 @@ mod tests {
         assert_eq!(lookup_kind(&db, &b, &s), "mcp");
         assert!(start(Agent::Codex, true).is_empty());
         assert_eq!(lookup_kind(&db, &b, &s), "cli");
-        assert!(!start(Agent::Codex, false).is_empty());
-        assert_eq!(lookup_kind(&db, &b, &s), "mcp");
+        assert_eq!(!start(Agent::Codex, false).is_empty(), CODEX_MCP);
+        let want = if CODEX_MCP { "mcp" } else { "cli" };
+        assert_eq!(lookup_kind(&db, &b, &s), want);
         assert!(start(Agent::OpenCode, false).is_empty());
         assert_eq!(lookup_kind(&db, &b, &s), "cli");
         // A token but no recorded start (before 1.3.0's wiring): cli.

@@ -800,10 +800,11 @@ reachable through it.
 - **Wiring**, computed at every start, never stored: Claude
   `--mcp-config=<data>/sessions/<id>/mcp.json` and
   `--allowedTools=mcp__rlord_session` (`=` form: both take several
-  values and the first prompt may follow); Codex in its pane `-c
-  mcp_servers.rlord_session.*` with approval `approve`; Codex on its
-  background server and OpenCode none: they have only the CLI, which
-  isn't relied on inside Codex's sandbox. `get_session` and the launch
+  values and the first prompt may follow). Codex: none for now
+  (`session_tools::CODEX_MCP` is off until live check V5; the code for
+  `-c mcp_servers.rlord_session.*` is there behind it). Codex and
+  OpenCode have only the CLI, which isn't relied on inside Codex's
+  sandbox. `get_session` and the launch
   and fork answers say which (`lookup`: `mcp` only when the last start's
   wiring produced flags, kv `session_lookup:<id>`; else `cli`, or `none`
   without a token), so the

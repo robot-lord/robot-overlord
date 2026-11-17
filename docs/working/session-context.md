@@ -499,7 +499,10 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 - [x] `overlord.md` (link rather than copy), `docs/architecture.md` (MCP
   server: three modes).
 - Live check V5 (Codex `-c mcp_servers.rlord_session` in a worker): not
-  run.
+  run. Until it passes, Codex sessions aren't wired
+  (`session_tools::CODEX_MCP = false`, review round 5): they get
+  `lookup` `cli` and the overlord copies the facts they need. Owed: run
+  V5, then turn the flag on.
 
 ### Decisions made in PR 2 (beyond the plan)
 
@@ -594,6 +597,26 @@ minor releases now).
 8. `is_overlords` gone; `overlords_at` imported at the top; fork test
    block un-nested.
 
+### Review round 5 (PR #70)
+
+1. Deadlock: `mcp::lookup_of` took the DB lock twice (`get_session`,
+   `create_session`, `fork_session`); one lock now. Test calls
+   `get_session` through `mcp::call` with a timeout (create and fork
+   launch an agent in tmux, so aren't run in tests; they share
+   `lookup_of`). No other double lock found in this PR's code.
+2. `search_history` leaves out the calling session (test).
+3. `capped` clips long strings, then halves long lists: valid JSON,
+   never cut text (test).
+4. A launch that fails in `session_new_with` removes its token, MCP
+   config and kv keys (`session_tools::forget`, test).
+5. `tmux_cmd` runs `scrub_pane_env`.
+6. The CLI line shell-quotes its paths (test).
+7. `render_as`: the content gets the whole budget; the lookup section is
+   added only if it still fits.
+8. Codex MCP wiring off (`CODEX_MCP`), see V5 above.
+9. `TOKEN_ENV` in core beside `PANE_ENV`; `main.rs` uses it and
+   `SERVER`; `lookup_section` uses `token_in`.
+
 ### #65 owed items
 
 Fixed here:
@@ -628,6 +651,8 @@ Still owed:
 - Token resolve scans every `session_token:*` row: add a reverse key
   for an O(1) look-up.
 - Cache `methods::rlord_bin()` (resolved at every start and render).
+- `search_in` reloads every session and `visible()` loads them all
+  again: share one load per call.
 
 - Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
   `docs/architecture.md` "Forking a session"): a fork starts through
