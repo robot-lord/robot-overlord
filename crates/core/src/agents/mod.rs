@@ -54,6 +54,19 @@ use transcript::Format;
 /// (`opencode::overlord_config`).
 pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 
+/// What marks a process as one rlord session's: its id and its look-up
+/// token file. Scrubbed from anything shared between sessions (the
+/// daemon, agent servers, commands rlord runs), wherever one is.
+pub const PANE_ENV: &[&str] = &["RLORD_SESSION_ID", "RLORD_SESSION_TOKEN_FILE"];
+
+/// `cmd` without `PANE_ENV`.
+pub fn scrub_pane_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for k in PANE_ENV {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 /// rlord's MCP tools that type into sessions (now or later): with
 /// `[overlord] confirm_sends` each asks the user first, on every agent.
 pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit"];

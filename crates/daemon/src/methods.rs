@@ -551,6 +551,7 @@ fn program_at(agent: Agent, argv: &mut [String], at: Option<std::path::PathBuf>)
 /// its hooks run in the daemon and go by thread, and a daemon the TUI
 /// starts from this pane would hand the variable to every thread's hooks.
 fn pane_env(
+    base: &std::path::Path,
     session_id: &str,
     program: Option<&std::path::Path>,
     daemon: bool,
@@ -560,7 +561,7 @@ fn pane_env(
         env.push(("RLORD_SESSION_ID".to_string(), session_id.to_string()));
         // Where its look-up token is (`rlord context`): a path, never the
         // token itself.
-        let token = crate::session_tools::token_path(&paths::data_dir(), session_id);
+        let token = crate::session_tools::token_path(base, session_id);
         if token.is_file() {
             env.push((
                 crate::session_tools::TOKEN_ENV.to_string(),
@@ -591,14 +592,15 @@ pub fn launched_args_key(id: &str) -> String {
 
 /// The command a session's pane runs (see `pane_env`).
 fn pane_cmd(
+    base: &std::path::Path,
     session_id: &str,
     program: Option<&std::path::Path>,
     daemon: bool,
     argv: &[String],
 ) -> String {
-    let env = pane_env(session_id, program, daemon);
+    let env = pane_env(base, session_id, program, daemon);
     if daemon {
-        tmux::pane_command_unsetting(&["RLORD_SESSION_ID"], &env, argv)
+        tmux::pane_command_unsetting(rlord_core::agents::PANE_ENV, &env, argv)
     } else {
         tmux::pane_command(&env, argv)
     }
@@ -833,9 +835,10 @@ pub(crate) fn session_new_with(
     // carries no flag or pointer naming it.
     // Its own read-only look-ups, computed at every start and never
     // stored (the token first: its background names it).
-    let own_tools = crate::session_tools::wiring(db, &base, &id, agent, &role, daemon);
+    let own_tools =
+        crate::session_tools::wiring(db, &base, &id, agent, &role, &project_path, daemon);
     let file_ok = delivery.is_some() && {
-        let text = context::launch_file_text_rows(db, &id, &name, &[], &rows, now_ms());
+        let text = context::launch_file_text_rows(db, &base, &id, &name, &[], &rows, now_ms());
         match context::write_file(&base, &id, &text) {
             Ok(_) => true,
             Err(e) => {
@@ -859,6 +862,7 @@ pub(crate) fn session_new_with(
     start(
         db,
         Start {
+            base: &base,
             id: &id,
             name: &name,
             agent,
@@ -910,6 +914,8 @@ pub(crate) struct Background<'a> {
 
 /// What a new session and a fork have decided before the pane starts.
 pub(crate) struct Start<'a> {
+    /// rlord's data folder (its session files).
+    pub base: &'a std::path::Path,
     pub id: &'a str,
     pub name: &'a str,
     pub agent: Agent,
@@ -989,7 +995,7 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
         }
     }
 
-    let cmd = pane_cmd(id, program.as_deref(), s.daemon, argv);
+    let cmd = pane_cmd(s.base, id, program.as_deref(), s.daemon, argv);
     note_launch(db, id, argv)?;
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
@@ -1250,6 +1256,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &s.id,
         agent,
         &s.role,
+        &s.project_path,
         s.codex_daemon,
     ));
     let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
@@ -1308,7 +1315,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let deferred = agent.deferred(model.as_deref()).filter(|_| !resumed);
     hold(db, &s.id, deferred.as_ref())?;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, &argv);
+    let cmd = pane_cmd(&base, &s.id, program.as_deref(), s.codex_daemon, &argv);
     note_launch(db, &s.id, &argv)?;
     // A re-fork binds its new thread as at the fork: the key that says so
     // is written before the pane starts, so it can't be lost after.
@@ -1451,7 +1458,13 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, argv);
+    let cmd = pane_cmd(
+        &paths::data_dir(),
+        &s.id,
+        program.as_deref(),
+        s.codex_daemon,
+        argv,
+    );
     note_launch(db, &s.id, argv)?;
     let now = now_ms();
     if tmux::has_session(&tmux_name) {
@@ -2409,25 +2422,44 @@ mod tests {
             path_with(Some(program), "").as_deref(),
             Some("/home/a/.nvm/versions/node/v22/bin")
         );
-        let env = pane_env("01s", Some(program), false);
+        let none = std::path::Path::new("/nonexistent-rlord-base");
+        let env = pane_env(none, "01s", Some(program), false);
         assert_eq!(env[0], ("RLORD_SESSION_ID".to_string(), "01s".to_string()));
         assert_eq!(env[1].0, "PATH");
         assert!(env[1].1.starts_with("/home/a/.nvm/versions/node/v22/bin"));
-        assert_eq!(pane_env("01s", None, false).len(), 1);
+        assert_eq!(pane_env(none, "01s", None, false).len(), 1);
+    }
+
+    /// A pane names its look-up token file (a path) once it has one; a
+    /// Codex daemon pane never (its env would reach every thread).
+    #[test]
+    fn a_pane_names_its_token_file() {
+        let base = std::env::temp_dir().join(format!("rlord-paneenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::open_in_memory().unwrap();
+        let tok = crate::session_tools::mint(&db, &base, "01s").unwrap();
+        let env = pane_env(&base, "01s", None, false);
+        assert!(env.contains(&(
+            "RLORD_SESSION_TOKEN_FILE".to_string(),
+            tok.to_string_lossy().into_owned()
+        )));
+        assert!(pane_env(&base, "01s", None, true).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A pane on Codex's daemon names no session: a daemon its TUI starts
     /// would pass the name to every thread's hooks.
     #[test]
     fn a_daemon_pane_names_no_session() {
-        assert!(pane_env("01s", None, true).is_empty());
+        let none = std::path::Path::new("/nonexistent-rlord-base");
+        assert!(pane_env(none, "01s", None, true).is_empty());
         let argv = ["codex".to_string()];
         assert_eq!(
-            pane_cmd("01s", None, true, &argv),
-            "exec env -u RLORD_SESSION_ID codex"
+            pane_cmd(none, "01s", None, true, &argv),
+            "exec env -u RLORD_SESSION_ID -u RLORD_SESSION_TOKEN_FILE codex"
         );
         assert_eq!(
-            pane_cmd("01s", None, false, &argv),
+            pane_cmd(none, "01s", None, false, &argv),
             "exec env RLORD_SESSION_ID=01s codex"
         );
     }

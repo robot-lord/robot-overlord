@@ -122,15 +122,29 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
     };
     if let Err(e) = made {
         // git makes a new branch before its folder: a failure after that
-        // leaves the branch behind. Removed (it is ours, and `branch -D`
-        // refuses one checked out anywhere).
+        // leaves the branch behind (and maybe this worktree, registered).
+        // Only what this call made is removed: this worktree if git
+        // registered it, then the branch (`branch -D` refuses one checked
+        // out anywhere). No repo-wide prune.
         if !exists && branch_exists(repo, branch) {
-            let _ = git(&["-C", repo, "worktree", "prune"]);
+            if worktree_registered(repo, dir) {
+                let _ = git(&["-C", repo, "worktree", "remove", "--force", &dir_s]);
+            }
             let _ = git(&["-C", repo, "branch", "-D", branch]);
         }
         return Err(e);
     }
     Ok(())
+}
+
+/// Whether `repo` lists a worktree at `dir`.
+fn worktree_registered(repo: &str, dir: &Path) -> bool {
+    let real = std::fs::canonicalize(dir).ok();
+    git(&["-C", repo, "worktree", "list", "--porcelain"]).is_ok_and(|out| {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|w| Path::new(w) == dir || real.as_deref() == Some(Path::new(w)))
+    })
 }
 
 /// The commit checked out in the folder `dir` (its HEAD).

@@ -747,13 +747,22 @@ fn related_of(db: &Db, rows: &[ContextRow]) -> Vec<Related> {
 /// be stored at `at`. Launched by the overlord: the worker header.
 pub fn launch_file_text(
     db: &Db,
+    base: &Path,
     id: &str,
     name: &str,
     notes: &[String],
     links: &[String],
     at: i64,
 ) -> String {
-    launch_file_text_rows(db, id, name, &[], &rows_from(notes, links, "overlord"), at)
+    launch_file_text_rows(
+        db,
+        base,
+        id,
+        name,
+        &[],
+        &rows_from(notes, links, "overlord"),
+        at,
+    )
 }
 
 /// Of `rows`, those a new session's `store_rows` will store after
@@ -779,6 +788,7 @@ pub fn kept_rows<'a>(
 /// stored (`kept_rows`).
 pub fn launch_file_text_rows(
     db: &Db,
+    base: &Path,
     id: &str,
     name: &str,
     copied: &[ContextRow],
@@ -802,7 +812,7 @@ pub fn launch_file_text_rows(
             ..r
         })
         .collect();
-    let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), id);
+    let lookup = crate::session_tools::lookup_section(&session_dir(base, id));
     render_as(
         name,
         true,
@@ -815,8 +825,8 @@ pub fn launch_file_text_rows(
 }
 
 /// The session's whole background for its file; None when it has none.
-pub fn file_text(db: &Db, s: &Session) -> Result<Option<String>> {
-    file_text_with(db, s, None)
+pub fn file_text(db: &Db, base: &Path, s: &Session) -> Result<Option<String>> {
+    file_text_with(db, base, s, None)
 }
 
 /// A note as it is about to be rewritten (`source`, new body and time):
@@ -829,7 +839,12 @@ pub struct Renewed<'a> {
 
 /// `file_text`, with the notes from `renewed.source` shown as they will be
 /// (stored only once the start that carries them is under way).
-pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result<Option<String>> {
+pub fn file_text_with(
+    db: &Db,
+    base: &Path,
+    s: &Session,
+    renewed: Option<&Renewed>,
+) -> Result<Option<String>> {
     if !has_background(db, &s.id)? {
         return Ok(None);
     }
@@ -844,7 +859,7 @@ pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result
             row.seen_at = None;
         }
     }
-    let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), &s.id);
+    let lookup = crate::session_tools::lookup_section(&session_dir(base, &s.id));
     Ok(Some(render_as(
         &s.name,
         launched_with_it(db, &s.id)?,
@@ -870,7 +885,7 @@ pub fn refresh_file_with(
     s: &Session,
     renewed: Option<&Renewed>,
 ) -> Result<Option<PathBuf>> {
-    match file_text_with(db, s, renewed)? {
+    match file_text_with(db, base, s, renewed)? {
         Some(text) => Ok(Some(write_file(base, &s.id, &text)?)),
         None => Ok(None),
     }
@@ -1040,10 +1055,11 @@ pub fn hook_reply_from(
         return Ok(None);
     }
     // (The file is named only if it is there: its write may have failed.)
+    let dir = file.parent();
     let file = Some(file).filter(|f| f.is_file());
     let text = if full {
         let worker = launched_with_it(db, &s.id)?;
-        let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), &s.id);
+        let lookup = dir.and_then(crate::session_tools::lookup_section);
         render_as(
             &s.name,
             worker,
@@ -1759,11 +1775,24 @@ mod tests {
         session(&db, "b", "beta", "");
         let notes = vec!["use staging".to_string()];
         let links = vec!["b".to_string()];
-        let before = launch_file_text(&db, "01X", "alpha", &notes, &links, 60_000);
+        let before = launch_file_text(
+            &db,
+            std::path::Path::new("/nonexistent-rlord-base"),
+            "01X",
+            "alpha",
+            &notes,
+            &links,
+            60_000,
+        );
         turn_on(&db, "a").unwrap();
         store(&db, "a", &notes, &links, 60_000).unwrap();
         let s = db.resolve_ref("a").unwrap();
-        assert_eq!(file_text(&db, &s).unwrap().unwrap(), before);
+        assert_eq!(
+            file_text(&db, std::path::Path::new("/nonexistent-rlord-base"), &s)
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -1804,7 +1833,9 @@ mod tests {
         store(&db, "a", &["use staging".into()], &[], 1).unwrap();
         let f = Path::new("/f");
         let text_of = |db: &Db| {
-            let file = file_text(db, &s).unwrap().unwrap();
+            let file = file_text(db, std::path::Path::new("/nonexistent-rlord-base"), &s)
+                .unwrap()
+                .unwrap();
             let r = hook_reply(db, &s, Agent::Claude, "SessionStart", Some("c"), f)
                 .unwrap()
                 .unwrap();
@@ -1928,9 +1959,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         session(&db, "a", "alpha", "");
         let s = db.resolve_ref("a").unwrap();
-        assert_eq!(file_text(&db, &s).unwrap(), None);
+        assert_eq!(
+            file_text(&db, std::path::Path::new("/nonexistent-rlord-base"), &s).unwrap(),
+            None
+        );
         turn_on(&db, "a").unwrap();
-        let text = file_text(&db, &s).unwrap().unwrap();
+        let text = file_text(&db, std::path::Path::new("/nonexistent-rlord-base"), &s)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("You are the session the user asked for"));
         assert!(!text.contains("## Notes"));
         let r = hook_reply(

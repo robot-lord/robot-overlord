@@ -129,10 +129,31 @@ pub fn resolve(db: &Db, token: &str) -> Result<Session> {
 
 /// An overlord, or a session that ran in an overlord's folder.
 fn is_overlords(s: &Session) -> bool {
-    crate::overlord::is_overlord_role(&s.role)
+    overlords_at(&s.role, &s.project_path)
+}
+
+/// `is_overlords` for a session's role and folder.
+fn overlords_at(role: &str, folder: &str) -> bool {
+    crate::overlord::is_overlord_role(role)
         || crate::overlord::dirs()
             .iter()
-            .any(|d| d.to_string_lossy() == s.project_path)
+            .any(|d| d.to_string_lossy() == folder)
+}
+
+/// How session `s`'s agent can look things up: `mcp` (the
+/// `rlord_session` tools, wired at its start), `cli` (`rlord context`
+/// only: Codex on its background server, OpenCode; not to be relied on
+/// inside Codex's sandbox), `none` (an overlord, or no token yet: its
+/// next start makes one).
+pub fn lookup_kind(base: &Path, s: &Session) -> &'static str {
+    if overlords_at(&s.role, &s.project_path) || !token_path(base, &s.id).is_file() {
+        return "none";
+    }
+    match Agent::parse(&s.agent) {
+        Some(Agent::Claude) => "mcp",
+        Some(Agent::Codex) if !s.codex_daemon => "mcp",
+        _ => "cli",
+    }
 }
 
 /// The flags that give session `id` its tools at a start, and make its
@@ -148,9 +169,10 @@ pub fn wiring(
     id: &str,
     agent: Agent,
     role: &str,
+    folder: &str,
     daemon: bool,
 ) -> Vec<String> {
-    if crate::overlord::is_overlord_role(role) {
+    if overlords_at(role, folder) {
         return Vec::new();
     }
     let token = match mint(db, base, id) {
@@ -228,9 +250,10 @@ pub fn wiring_args(
 }
 
 /// The "Looking up more" section of a session's background: how to call
-/// its tools. None when it has no token yet.
-pub fn lookup_section(base: &Path, id: &str) -> Option<String> {
-    let token = token_path(base, id);
+/// its tools. `dir`: its own folder (`context::session_dir`). None when it
+/// has no token yet.
+pub fn lookup_section(dir: &Path) -> Option<String> {
+    let token = dir.join("token");
     if !token.is_file() {
         return None;
     }
@@ -305,6 +328,7 @@ pub fn tools() -> Value {
              "Read a related session's conversation: its end, or around a line from search_history.",
              json!({"session": s(session),
                     "line": n("A hit's line; omit for the end of the conversation"),
+                    "transcript": s("A hit's transcript, when search_history names one (an older conversation of that session)"),
                     "before": n("Messages before the line (default 6)"),
                     "after": n("Messages after it (default 14)")}), &["session"]),
     ])
@@ -371,18 +395,34 @@ pub fn visible(db: &Db, me: &Session) -> Result<Vec<Seen>> {
     Ok(out)
 }
 
-/// A session `me` can see, by ref (itself included).
-fn pick(db: &Db, me: &Session, r: &str) -> Result<Session> {
-    let not = || anyhow::anyhow!("no such session among those this one can see");
-    let s = db.resolve_ref(r.trim()).map_err(|_| not())?;
-    if s.id == me.id {
+/// A session `me` can see, by ref (itself included), resolved only among
+/// them: its id, else its exact name, else a unique name prefix.
+fn pick<'a>(me: &'a Session, seen: &'a [Seen], r: &str) -> Result<&'a Session> {
+    let r = r.trim();
+    let all: Vec<&Session> = std::iter::once(me)
+        .chain(seen.iter().map(|v| &v.session))
+        .collect();
+    if let Some(s) = all.iter().find(|s| s.id == r) {
         return Ok(s);
     }
-    visible(db, me)?
-        .into_iter()
-        .find(|v| v.session.id == s.id)
-        .map(|v| v.session)
-        .ok_or_else(not)
+    if let Some(s) = all.iter().find(|s| s.name == r) {
+        return Ok(s);
+    }
+    let pre: Vec<&&Session> = all
+        .iter()
+        .filter(|s| !r.is_empty() && s.name.starts_with(r))
+        .collect();
+    match pre.as_slice() {
+        [s] => Ok(s),
+        [] => bail!("no such session among those this one can see"),
+        many => bail!(
+            "'{r}' could be any of {}: give more of the name",
+            many.iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn arg<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
@@ -428,7 +468,9 @@ pub fn call(d: &Daemon, token: &str, name: &str, args: &Value) -> Result<Value> 
     }
     admit(&me.id, Instant::now())?;
     tracing::info!(session = %me.id, tool = name, "session tool call");
-    let v = run(d, &me, name, args)?;
+    // (Worked out once per call.)
+    let seen = visible(&d.db(), &me)?;
+    let v = run(d, &me, &seen, name, args)?;
     Ok(capped(v))
 }
 
@@ -442,22 +484,18 @@ fn capped(v: Value) -> Value {
     json!({"clipped": true, "text": clip(&text, ANSWER_MAX - 100)})
 }
 
-fn run(d: &Daemon, me: &Session, name: &str, args: &Value) -> Result<Value> {
+fn run(d: &Daemon, me: &Session, seen: &[Seen], name: &str, args: &Value) -> Result<Value> {
     match name {
         "session_brief" => {
-            let (rows, related) = {
-                let db = d.db();
-                let rows = db.context_rows(&me.id)?;
-                let related: Vec<Value> = visible(&db, me)?
-                    .iter()
-                    .filter(|v| v.rank == 0)
-                    .map(|v| {
-                        json!({"name": v.session.name, "id": v.session.id,
-                                    "status": status_of(&v.session)})
-                    })
-                    .collect();
-                (rows, related)
-            };
+            let rows = d.db().context_rows(&me.id)?;
+            let related: Vec<Value> = seen
+                .iter()
+                .filter(|v| v.rank == 0)
+                .map(|v| {
+                    json!({"name": v.session.name, "id": v.session.id,
+                           "status": status_of(&v.session)})
+                })
+                .collect();
             let notes: Vec<String> = rows
                 .iter()
                 .filter(|r| r.kind == "note")
@@ -482,7 +520,6 @@ fn run(d: &Daemon, me: &Session, name: &str, args: &Value) -> Result<Value> {
                 .split_whitespace()
                 .map(str::to_lowercase)
                 .collect();
-            let seen = visible(&d.db(), me)?;
             let rows: Vec<Value> = seen
                 .iter()
                 .filter(|v| {
@@ -514,18 +551,18 @@ fn run(d: &Daemon, me: &Session, name: &str, args: &Value) -> Result<Value> {
         }
         "session_summary" => {
             let r = arg(args, "session").context("session is required")?;
-            let s = pick(&d.db(), me, r)?;
-            let ex = crate::summary::transcript_of(d, &s)
+            let s = pick(me, seen, r)?;
+            let ex = crate::summary::transcript_of(d, s)
                 .map(|p| transcript_excerpts(&p))
                 .unwrap_or_default();
             let c = |t: Option<String>| t.map(|t| clip(&t, 500));
             Ok(json!({
-                "name": s.name, "id": s.id, "agent": s.agent, "status": status_of(&s),
+                "name": s.name, "id": s.id, "agent": s.agent, "status": status_of(s),
                 "folder": s.project_path, "branch": s.branch,
                 "description": s.description,
                 "notes": clip(&s.notes, 2_000),
                 "summary": clip(&s.summary, 3_000),
-                "first_prompt": c(first_prompt(d, &s)),
+                "first_prompt": c(first_prompt(d, s)),
                 "last_prompt": c(ex.last_prompt),
                 "last_reply": c(ex.last_reply),
             }))
@@ -533,26 +570,27 @@ fn run(d: &Daemon, me: &Session, name: &str, args: &Value) -> Result<Value> {
         "search_history" => {
             let query = arg(args, "query").context("query is required")?;
             let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, 8);
-            let mut only: HashSet<String> = visible(&d.db(), me)?
-                .into_iter()
-                .map(|v| v.session.id)
-                .collect();
+            let mut only: HashSet<String> = seen.iter().map(|v| v.session.id.clone()).collect();
             only.insert(me.id.clone());
             let mut p = json!({"query": query, "limit": limit});
             if let Some(r) = arg(args, "session") {
-                p["session"] = json!(pick(&d.db(), me, r)?.id);
+                p["session"] = json!(pick(me, seen, r)?.id);
             }
             let mut v = crate::search::search_in(d, &p, Some(&only))?;
             v["note"] = json!(
-                "read_history with a session and a hit's line reads the conversation around it"
+                "read_history with a session and a hit's line (and its transcript, when it names one) reads the conversation around it"
             );
             Ok(v)
         }
         "read_history" => {
             let r = arg(args, "session").context("session is required")?;
-            let s = pick(&d.db(), me, r)?;
-            // (No `transcript`: only a session's current conversation.)
+            let s = pick(me, seen, r)?;
+            // A hit in an older transcript (before a `/clear`) names it:
+            // `read_with` takes only one of that session's own.
             let mut p = json!({"session": s.id});
+            if let Some(t) = arg(args, "transcript") {
+                p["transcript"] = json!(t);
+            }
             for k in ["line", "before", "after"] {
                 if let Some(n) = args.get(k).and_then(Value::as_u64) {
                     p[k] = json!(n);
@@ -594,7 +632,7 @@ mod tests {
         b
     }
 
-    fn daemon() -> (std::sync::Arc<Daemon>, PathBuf, String) {
+    fn daemon(tag: &str) -> (std::sync::Arc<Daemon>, PathBuf, String) {
         let db = Db::open_in_memory().unwrap();
         add(&db, "01ME", Some("/r/one"), "");
         add(&db, "01SAMEREPO", Some("/r/one"), "");
@@ -607,7 +645,7 @@ mod tests {
         db.add_tag("01ME", "web").unwrap();
         db.add_tag("01TAGGED", "web").unwrap();
         db.set_notes("01STRANGER", "secret plans").unwrap();
-        let b = base("d");
+        let b = base(tag);
         let path = mint(&db, &b, "01ME").unwrap();
         let token = std::fs::read_to_string(path).unwrap();
         (Daemon::new(db, Config::default()), b, token)
@@ -658,7 +696,7 @@ mod tests {
 
     #[test]
     fn the_visible_set_is_linked_same_repo_and_same_group_never_overlords() {
-        let (d, b, _) = daemon();
+        let (d, b, _) = daemon("d1");
         let me = d.db().resolve_ref("01ME").unwrap();
         let seen: Vec<(String, &str)> = visible(&d.db(), &me)
             .unwrap()
@@ -678,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_session_cannot_read_an_unrelated_one() {
-        let (d, b, token) = daemon();
+        let (d, b, token) = daemon("d2");
         for (tool, args) in [
             ("session_summary", json!({"session": "01STRANGER"})),
             ("read_history", json!({"session": "01STRANGER"})),
@@ -710,7 +748,7 @@ mod tests {
 
     #[test]
     fn overlord_tools_and_the_transcript_argument_are_not_reachable() {
-        let (d, b, token) = daemon();
+        let (d, b, token) = daemon("d3");
         for t in [
             "send_to_session",
             "create_session",
@@ -734,7 +772,7 @@ mod tests {
                 "{n}"
             );
         }
-        // A transcript path is ignored: only the session's own.
+        // A transcript path that isn't the session's own is refused.
         let e = call(
             &d,
             &token,
@@ -742,7 +780,7 @@ mod tests {
             &json!({"session": "01LINKED", "transcript": "/etc/passwd"}),
         )
         .unwrap_err();
-        assert!(e.to_string().contains("no transcript"), "{e}");
+        assert!(e.to_string().contains("isn't this session's"), "{e}");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -771,9 +809,10 @@ mod tests {
         let b = base("look");
         let db = Db::open_in_memory().unwrap();
         add(&db, "01L", None, "");
-        assert!(lookup_section(&b, "01L").is_none());
+        let dir = crate::context::session_dir(&b, "01L");
+        assert!(lookup_section(&dir).is_none());
         mint(&db, &b, "01L").unwrap();
-        let tail = lookup_section(&b, "01L").unwrap();
+        let tail = lookup_section(&dir).unwrap();
         assert!(tail.contains("rlord_session") && tail.contains("context --token-file"));
         let rows: Vec<rlord_core::db::ContextRow> = (0..50)
             .map(|i| rlord_core::db::ContextRow {
@@ -819,8 +858,110 @@ mod tests {
             .is_empty());
         // Overlords: nothing, and no token.
         let db = Db::open_in_memory().unwrap();
-        assert!(wiring(&db, &b, "01O", Agent::Claude, "overlord", false).is_empty());
+        assert!(wiring(&db, &b, "01O", Agent::Claude, "overlord", "/x", false).is_empty());
         assert!(!token_path(&b, "01O").exists());
+        // A session in an overlord's folder: the same.
+        let folder = crate::overlord::dirs()[0].to_string_lossy().into_owned();
+        assert!(wiring(&db, &b, "01F", Agent::Claude, "", &folder, false).is_empty());
+        assert!(!token_path(&b, "01F").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn lookup_kind_says_mcp_cli_or_none() {
+        let b = base("kind");
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "01K", None, "");
+        let s = db.resolve_ref("01K").unwrap();
+        assert_eq!(lookup_kind(&b, &s), "none");
+        mint(&db, &b, "01K").unwrap();
+        assert_eq!(lookup_kind(&b, &s), "mcp");
+        let codex_daemon = Session {
+            agent: "codex".into(),
+            codex_daemon: true,
+            ..s.clone()
+        };
+        assert_eq!(lookup_kind(&b, &codex_daemon), "cli");
+        let opencode = Session {
+            agent: "opencode".into(),
+            ..s.clone()
+        };
+        assert_eq!(lookup_kind(&b, &opencode), "cli");
+        let codex = Session {
+            agent: "codex".into(),
+            ..s
+        };
+        assert_eq!(lookup_kind(&b, &codex), "mcp");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn refs_resolve_only_among_the_visible() {
+        let (d, b, _) = daemon("d4");
+        let me = d.db().resolve_ref("01ME").unwrap();
+        let seen = visible(&d.db(), &me).unwrap();
+        assert_eq!(pick(&me, &seen, "01LINKED").unwrap().id, "01LINKED");
+        assert_eq!(pick(&me, &seen, "01ME").unwrap().id, "01ME");
+        // A unique prefix of a visible name; one that is ambiguous, or
+        // names only sessions outside the set, is refused.
+        assert_eq!(pick(&me, &seen, "01LIN").unwrap().id, "01LINKED");
+        // (01STRANGER is not visible: no clash.)
+        assert_eq!(pick(&me, &seen, "01S").unwrap().id, "01SAMEREPO");
+        assert_eq!(pick(&me, &seen, "01SA").unwrap().id, "01SAMEREPO");
+        assert!(pick(&me, &seen, "01ST").is_err());
+        assert!(pick(&me, &seen, "01OV").is_err());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// A hit in a session's older conversation (before a `/clear`) names
+    /// its transcript: read_history reads it; a file that isn't one of
+    /// that session's is refused.
+    #[test]
+    fn read_history_reads_a_hit_before_a_clear() {
+        let (d, b, token) = daemon("d5");
+        let dir = b.join("projects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |text: &str| {
+            json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                   "message": {"role": "user", "content": text}})
+            .to_string()
+                + "\n"
+        };
+        let old = dir.join("conv-old.jsonl");
+        let new = dir.join("conv-new.jsonl");
+        std::fs::write(&old, line("the zebracorn plan")).unwrap();
+        std::fs::write(&new, line("after the clear")).unwrap();
+        {
+            let db = d.db();
+            db.upsert_transcript_source("01LINKED", &new.to_string_lossy())
+                .unwrap();
+            db.insert_event(
+                "01LINKED",
+                5,
+                "fresh_conversation",
+                &json!({"from": "conv-old", "to": "conv-new", "reason": "clear"}).to_string(),
+            )
+            .unwrap();
+        }
+        let hits = call(&d, &token, "search_history", &json!({"query": "zebracorn"})).unwrap();
+        let hit = &hits["sessions"][0]["hits"][0];
+        let t = hit["transcript"].as_str().expect("names the older transcript");
+        let r = call(
+            &d,
+            &token,
+            "read_history",
+            &json!({"session": "01LINKED", "transcript": t, "line": hit["line"]}),
+        )
+        .unwrap();
+        assert!(r.to_string().contains("zebracorn"), "{r}");
+        let e = call(
+            &d,
+            &token,
+            "read_history",
+            &json!({"session": "01LINKED", "transcript": "/etc/passwd"}),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("isn't this session's"), "{e}");
         let _ = std::fs::remove_dir_all(&b);
     }
 }

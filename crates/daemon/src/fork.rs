@@ -715,8 +715,8 @@ pub(crate) fn finish(
     let mode = context::delivery(agent, made.hooks);
     let bg_file = context::file_path(base, id);
     // Its own look-ups (the token first: its background names it).
-    let own_tools = crate::session_tools::wiring(db, base, id, agent, "", false);
-    let text = context::launch_file_text_rows(db, id, &name, &copied, &add, now);
+    let own_tools = crate::session_tools::wiring(db, base, id, agent, "", &project, false);
+    let text = context::launch_file_text_rows(db, base, id, &name, &copied, &add, now);
     let carried = match context::write_file(base, id, &text) {
         Ok(_) => Some(mode),
         Err(e) => {
@@ -735,6 +735,7 @@ pub(crate) fn finish(
     methods::start(
         db,
         Start {
+            base,
             id,
             name: &name,
             agent,
@@ -1387,7 +1388,15 @@ mod tests {
             .filter(|r| !except.contains(&r.id))
             .cloned()
             .collect();
-        let text = context::launch_file_text_rows(&db, "01F", "n-p-fork", &copied, &add, 50);
+        let text = context::launch_file_text_rows(
+            &db,
+            std::path::Path::new("/nonexistent-rlord-base"),
+            "01F",
+            "n-p-fork",
+            &copied,
+            &add,
+            50,
+        );
         assert!(!text.contains("\"g\""), "{text}");
         assert!(text.contains("Forked from session"), "{text}");
         assert!(text.contains("use the staging DB"), "{text}");
@@ -1461,7 +1470,15 @@ mod tests {
             .chain(add.iter().map(|r| (r.kind.to_string(), r.body.clone())))
             .collect();
         assert_eq!(stored, shown);
-        let text = context::launch_file_text_rows(&db, "01F", "f", &copied, &add, 50);
+        let text = context::launch_file_text_rows(
+            &db,
+            std::path::Path::new("/nonexistent-rlord-base"),
+            "01F",
+            "f",
+            &copied,
+            &add,
+            50,
+        );
         assert_eq!(text.matches("use the staging DB").count(), 1, "{text}");
     }
 
@@ -1683,9 +1700,14 @@ mod tests {
             body: &body,
             at,
         };
-        let text = context::file_text_with(&db, &f, Some(&renewed))
-            .unwrap()
-            .unwrap();
+        let text = context::file_text_with(
+            &db,
+            std::path::Path::new("/nonexistent-rlord-base"),
+            &f,
+            Some(&renewed),
+        )
+        .unwrap()
+        .unwrap();
         assert!(text.contains(&body) && !text.contains(&old));
         let before = db.context_rows("f").unwrap();
         assert_eq!(

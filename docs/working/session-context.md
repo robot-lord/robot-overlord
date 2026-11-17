@@ -522,9 +522,8 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
   before 1.3.0 gets no section (and no tools) until its next start; the
   plan's "minted when context is first rendered" isn't done: rendering
   stays free of writes.
-- **`read_history`** reads the session's current conversation only (no
-  `transcript`), so a `search_history` hit in an older transcript (it
-  names one) can't be read through these tools.
+- **`read_history`** takes a hit's `transcript` (review round 2), and
+  `search::read_with` refuses any file that isn't that session's.
 - **`session_brief`'s first prompt**: kv `bind_prompt`, else the launch
   spec's `prompt`, else the transcript's first prompt. Includes
   `forked_from` (owed from forks).
@@ -532,11 +531,38 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
   the kv row and file stay until the id is reused (never) or archived.
   Harmless (no session row resolves it).
 
+### Review round 2 (PR #70)
+
+1. `read_history` passes a hit's `transcript` through (test: a hit
+   before a `/clear`; a foreign path refused).
+2. `RLORD_SESSION_TOKEN_FILE` is scrubbed wherever `RLORD_SESSION_ID`
+   is (`agents::PANE_ENV` / `scrub_pane_env`): the Codex-daemon pane's
+   unset list, autostart, `process::run`, OpenCode's shared-server
+   environment and `run_bounded`, Codex's server commands, install's
+   probes (tests: pane command, OpenCode config).
+3. `rlord context`: only `line`, `before`, `after`, `limit` are numbers.
+4. Refs resolve only within the visible set: id, exact name, unique
+   name prefix (test).
+5. A failed worktree add removes only its own worktree (`worktree remove
+   --force` if git registered it) and the branch; no repo-wide prune.
+6. `lookup` (`mcp` / `cli` / `none`, `session_tools::lookup_kind`) in
+   `get_session` and the create and fork answers. `overlord.md`: link
+   for `mcp`; for `cli` / `none` also copy the few facts needed into
+   `context`. The CLI isn't relied on inside Codex's sandbox.
+7. `wiring` refuses an overlord's folder too, before making a token.
+8. `base` is passed to `lookup_section` (now the session folder),
+   `pane_env`, the file renderers (`Start.base`); no `data_dir()` there.
+9. `visible()` once per call, passed down.
+
+Not changed: version stays 1.3.0 (coordinator: feature PRs are stable
+minor releases now).
+
 ### #65 owed items
 
 Fixed here:
 - A failed `git worktree add -b` no longer leaves the branch behind
-  (`git::worktree_add`: `worktree prune`, `branch -D`; test).
+  (`git::worktree_add`: its own worktree removed if registered, then
+  `branch -D`; test).
 - Claude's `conversation_on_disk` also checks where Claude files the id
   when the stored `transcript_source` is stale.
 - Cleanups: `FORK_MINTS_ID` and `FORK_ELSEWHERE` removed (their reasons

@@ -2540,18 +2540,25 @@ fn context_cli(
     Ok(())
 }
 
-/// `key=value` pairs as a tool's arguments (whole numbers as numbers).
+/// `key=value` pairs as a tool's arguments. Only the count arguments
+/// (`line`, `before`, `after`, `limit`) are numbers; everything else (a
+/// session named `2024`, a query) stays a string.
 fn context_args(args: &[String]) -> Result<Value> {
     let mut m = serde_json::Map::new();
     for a in args {
         let (k, v) = a
             .split_once('=')
             .with_context(|| format!("'{a}': arguments are key=value"))?;
-        let v = match v.parse::<u64>() {
-            Ok(n) => json!(n),
-            Err(_) => json!(v),
+        let k = k.trim();
+        let v = if matches!(k, "line" | "before" | "after" | "limit") {
+            json!(v
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{k}: a whole number"))?)
+        } else {
+            json!(v)
         };
-        m.insert(k.trim().to_string(), v);
+        m.insert(k.to_string(), v);
     }
     Ok(Value::Object(m))
 }
@@ -2587,8 +2594,10 @@ mod context_cli_tests {
 
     #[test]
     fn context_arguments_parse() {
-        let v = context_args(&["session=web".into(), "limit=3".into()]).unwrap();
-        assert_eq!(v, json!({"session": "web", "limit": 3}));
+        let v =
+            context_args(&["session=2024".into(), "limit=3".into(), "query=42".into()]).unwrap();
+        assert_eq!(v, json!({"session": "2024", "limit": 3, "query": "42"}));
+        assert!(context_args(&["line=x".into()]).is_err());
         assert!(context_args(&["oops".into()]).is_err());
     }
 

@@ -792,15 +792,23 @@ reachable through it.
   background links either way, its fork parent and forks); sessions in
   the same repo; sessions sharing a tag. Archived ones count; overlords,
   and sessions that ran in an overlord's folder, never do. Search runs
-  only over that set (`search::search_in`), never outside rlord;
-  `read_history` takes no transcript path.
+  only over that set (`search::search_in`), never outside rlord. A
+  session ref resolves only within it (id, exact name, unique name
+  prefix). `read_history` takes a hit's `transcript` (an older
+  conversation, before a `/clear`), and only one of that session's own.
 - **Wiring**, computed at every start, never stored: Claude
   `--mcp-config=<data>/sessions/<id>/mcp.json` and
   `--allowedTools=mcp__rlord_session` (`=` form: both take several
   values and the first prompt may follow); Codex in its pane `-c
   mcp_servers.rlord_session.*` with approval `approve`; Codex on its
-  background server and OpenCode none. The pane env gets
-  `RLORD_SESSION_TOKEN_FILE` (a path). The background ends with a
+  background server and OpenCode none: they have only the CLI, which
+  isn't relied on inside Codex's sandbox. `get_session` and the launch
+  and fork answers say which (`lookup`: `mcp`, `cli`, `none`), so the
+  overlord copies the needed facts into `context` for the last two. The
+  pane env gets `RLORD_SESSION_TOKEN_FILE` (a path), scrubbed with
+  `RLORD_SESSION_ID` from everything shared between sessions
+  (`agents::PANE_ENV`: the daemon, a Codex daemon pane, Codex's server,
+  OpenCode's shared server, commands rlord runs). The background ends with a
   "Looking up more" section naming the tools and the CLI form with the
   token file's path, once the token exists.
 - **Bounds.** 30 calls a minute and 300 an hour per session (in memory),

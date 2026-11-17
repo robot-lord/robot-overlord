@@ -75,7 +75,12 @@ pub fn default_socket() -> PathBuf {
 /// What a command rlord runs to manage the daemon must not carry: which
 /// rlord session or pane it was started from. A daemon started with them
 /// would hand them to every hook it runs, for every thread.
-const SCRUBBED_ENV: &[&str] = &["RLORD_SESSION_ID", "TMUX", "TMUX_PANE"];
+const SCRUBBED_ENV: &[&str] = &[
+    "RLORD_SESSION_ID",
+    "RLORD_SESSION_TOKEN_FILE",
+    "TMUX",
+    "TMUX_PANE",
+];
 
 fn daemon_cmd(program: &Path, verb: &str) -> Command {
     let mut c = Command::new(program);

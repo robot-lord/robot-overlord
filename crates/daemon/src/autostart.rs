@@ -145,6 +145,7 @@ fn spawn_detached() -> Result<Child> {
         // A client running inside an agent pane must not leak that pane's
         // identity into the daemon (and from there into every pane it opens).
         .env_remove("RLORD_SESSION_ID")
+        .env_remove("RLORD_SESSION_TOKEN_FILE")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
     // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.
