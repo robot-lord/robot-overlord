@@ -44,10 +44,20 @@ if [ -n "${RLORD_DIST:-}" ]; then
 else
   tag=${RLORD_VERSION:-}
   if [ -z "$tag" ]; then
-    fetch "https://api.github.com/repos/$repo/releases/latest" "$tmp/latest.json" ||
-      die "couldn't reach GitHub"
-    tag=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n1)
-    [ -n "$tag" ] || die "couldn't find the latest release"
+    # The newest stable release; before there is one, the newest release
+    # that has a build for this platform (development builds included).
+    if fetch "https://api.github.com/repos/$repo/releases/latest" "$tmp/latest.json"; then
+      tag=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n1)
+    fi
+    if [ -z "$tag" ]; then
+      fetch "https://api.github.com/repos/$repo/releases?per_page=50" "$tmp/all.json" ||
+        die "couldn't reach GitHub"
+      for t in $(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/all.json"); do
+        if grep -q "rlord-$t-$target.tar.gz" "$tmp/all.json"; then tag=$t; break; fi
+      done
+      [ -n "$tag" ] || die "no release has a $target build"
+      echo "no stable release yet: installing development build $tag"
+    fi
   fi
   base="https://github.com/$repo/releases/download/$tag"
   fetch "$base/rlord-$tag-$target.tar.gz" "$tmp/rlord-$tag-$target.tar.gz" ||
