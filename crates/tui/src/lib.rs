@@ -234,6 +234,11 @@ struct App {
     preview_rich: Option<Text<'static>>,
     /// Sub-agents of the selected session (refreshed with the preview).
     agents: Vec<Value>,
+    /// Names of the selected session's forks, live or archived (fetched
+    /// with the preview, only for a row whose `fork_count` says it has any).
+    forks: Vec<String>,
+    /// Which row (and fork count) `forks` was loaded for.
+    forks_for: Option<(String, u64)>,
     status_line: String,
     dirty: bool,
     last_preview: Instant,
@@ -342,6 +347,8 @@ impl App {
             preview_text: String::new(),
             preview_rich: None,
             agents: Vec::new(),
+            forks: Vec::new(),
+            forks_for: None,
             status_line: String::new(),
             dirty: true,
             last_preview: Instant::now() - Duration::from_secs(10),
@@ -642,6 +649,35 @@ impl App {
         self.preview_due = Some(Instant::now() + PREVIEW_SETTLE);
     }
 
+    /// The selected row's fork names, for the details pane: its row carries
+    /// only counts (`fork_count`), so the list comes from `session.get`,
+    /// with the preview once the highlight settles, and only again when
+    /// the row or its count changes. None to fetch for a row with no forks.
+    fn load_forks(&mut self, s: &Value) {
+        let id = s["id"].as_str().unwrap_or("").to_string();
+        let count = s["fork_count"].as_u64().unwrap_or(0);
+        if self.forks_for.as_ref() == Some(&(id.clone(), count)) {
+            return;
+        }
+        self.forks = if count == 0 {
+            Vec::new()
+        } else {
+            client_call(&paths::socket_path(), "session.get", json!({"ref": id}))
+                .map(|v| fork_names(&v))
+                .unwrap_or_default()
+        };
+        self.forks_for = Some((id, count));
+    }
+
+    /// `forks`, if they were loaded for row `s` as it is now.
+    fn loaded_forks(&self, s: &Value) -> Option<&[String]> {
+        let key = (
+            s["id"].as_str().unwrap_or("").to_string(),
+            s["fork_count"].as_u64().unwrap_or(0),
+        );
+        (self.forks_for.as_ref() == Some(&key)).then_some(self.forks.as_slice())
+    }
+
     fn refresh_preview(&mut self) {
         self.last_preview = Instant::now();
         self.preview_due = None;
@@ -660,6 +696,8 @@ impl App {
         let Some(s) = self.selected().cloned() else {
             self.preview_text.clear();
             self.agents.clear();
+            self.forks.clear();
+            self.forks_for = None;
             return;
         };
         // The overlord's conversations, while its row is selected: loaded
@@ -684,6 +722,7 @@ impl App {
         .ok()
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
+        self.load_forks(&s);
         self.preview_rich = None;
         self.preview_text = match self.preview {
             // One of the overlord's earlier conversations, not its pane.
@@ -2066,13 +2105,12 @@ impl App {
                 ),
             ]));
         }
-        // (Its row carries them all, live or archived, whatever the list
-        // shows.)
-        let forks = fork_names(s);
-        if !forks.is_empty() {
+        // Its forks, live or archived, whatever the list shows: their names
+        // once loaded for this row (`load_forks`), its count till then.
+        if let Some(line) = forks_line(s, self.loaded_forks(s)) {
             lines.push(Line::from(vec![
                 key("forks"),
-                Span::styled(forks.join(", "), theme::muted()),
+                Span::styled(line, theme::muted()),
             ]));
         }
         // On Codex's shared background server: the turn outlives the pane.
@@ -2603,7 +2641,23 @@ fn updated_at(s: &Value) -> Option<i64> {
     .max()
 }
 
-/// The names of a session row's `forks` (`Session::forks`).
+/// The details pane's forks line for row `s`: the names when loaded for it
+/// (`loaded`), else how many it has (`fork_count`); None with none.
+fn forks_line(s: &Value, loaded: Option<&[String]>) -> Option<String> {
+    let count = s["fork_count"].as_u64().unwrap_or(0);
+    if count == 0 {
+        return None;
+    }
+    Some(match loaded {
+        Some(names) if !names.is_empty() => names.join(", "),
+        _ => format!(
+            "{count} ({} live)",
+            s["live_fork_count"].as_u64().unwrap_or(0)
+        ),
+    })
+}
+
+/// The names of a session's `forks` (`Session::forks`, from `session.get`).
 fn fork_names(v: &Value) -> Vec<String> {
     v["forks"]
         .as_array()
@@ -3376,14 +3430,44 @@ mod tests {
         v.iter().map(|(_, l)| l.to_string()).collect()
     }
 
-    /// The details' forks line comes from the row (archived forks too),
-    /// not from what the list shows.
+    /// A list row carries only fork counts; the details' forks line shows
+    /// the names `session.get` gave for that very row (archived forks too,
+    /// whatever the list shows), its count till then, and nothing (no
+    /// fetch) for a row with none.
     #[test]
-    fn fork_names_come_from_the_row() {
-        let row = json!({"forks": [{"id": "01a", "name": "api-fork"},
-                                   {"id": "01b", "name": "api-fork-2"}]});
-        assert_eq!(fork_names(&row), ["api-fork", "api-fork-2"]);
+    fn the_forks_line_names_them_once_loaded_for_the_row() {
+        let full = json!({"forks": [{"id": "01a", "name": "api-fork"},
+                                    {"id": "01b", "name": "api-fork-2"}]});
+        assert_eq!(fork_names(&full), ["api-fork", "api-fork-2"]);
         assert!(fork_names(&json!({})).is_empty());
+        let row = json!({"id": "01p", "fork_count": 2, "live_fork_count": 1});
+        assert_eq!(forks_line(&row, None).as_deref(), Some("2 (1 live)"));
+        let names = fork_names(&full);
+        assert_eq!(
+            forks_line(&row, Some(&names)).as_deref(),
+            Some("api-fork, api-fork-2")
+        );
+        assert_eq!(forks_line(&json!({"id": "x"}), None), None);
+
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        // Loaded for this row and count: shown; another row, or a new
+        // count (a fork made since): not, till loaded again.
+        app.forks = names.clone();
+        app.forks_for = Some(("01p".into(), 2));
+        assert_eq!(app.loaded_forks(&row), Some(names.as_slice()));
+        let more = json!({"id": "01p", "fork_count": 3, "live_fork_count": 2});
+        assert_eq!(app.loaded_forks(&more), None);
+        assert_eq!(
+            app.loaded_forks(&json!({"id": "01q", "fork_count": 2})),
+            None
+        );
+        // A row with none: nothing asked of the daemon.
+        let none = json!({"id": "01q", "fork_count": 0});
+        app.load_forks(&none);
+        assert!(app.forks.is_empty());
+        assert_eq!(app.forks_for, Some(("01q".into(), 0)));
     }
 
     #[test]

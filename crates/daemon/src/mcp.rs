@@ -361,14 +361,9 @@ fn summarize(s: &Value) -> Value {
     if let Some(from) = s["forked_from"].as_str() {
         row["forked_from"] = json!({"id": from, "name": s["forked_from_name"]});
     }
-    // How many live sessions were forked from it (get_session lists them
-    // all, archived ones too).
-    let live_forks = s["forks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|f| f["archived"] != true)
-        .count();
+    // How many live sessions were forked from it (the row's count;
+    // get_session lists them all, archived ones too).
+    let live_forks = s["live_fork_count"].as_u64().unwrap_or(0);
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
     }
@@ -894,15 +889,16 @@ mod tests {
     fn a_row_counts_its_live_forks() {
         let s = json!({"id": "01p", "name": "api", "status": "idle", "archived_at": null,
                        "forked_from": "01g", "forked_from_name": "base",
-                       "forks": [{"id": "01a", "name": "a", "archived": false},
-                                 {"id": "01b", "name": "b", "archived": true}]});
+                       "fork_count": 2, "live_fork_count": 1});
         let row = summarize(&s);
         assert_eq!(row["live_forks"], 1);
         assert!(row.get("forks").is_none());
         assert_eq!(row["forked_from"], json!({"id": "01g", "name": "base"}));
-        assert!(summarize(&json!({"id": "x", "forks": []}))
-            .get("live_forks")
-            .is_none());
+        assert!(
+            summarize(&json!({"id": "x", "fork_count": 1, "live_fork_count": 0}))
+                .get("live_forks")
+                .is_none()
+        );
     }
 
     /// Every tool, classified. A new tool must be placed here: read-only

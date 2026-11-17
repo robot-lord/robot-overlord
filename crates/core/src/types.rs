@@ -106,8 +106,15 @@ pub struct Session {
     pub forked_from: Option<String>,
     #[serde(default)]
     pub forked_from_name: Option<String>,
-    /// The sessions forked from it (live or archived), oldest first.
+    /// How many sessions were forked from it (live or archived), and how
+    /// many of them aren't archived: on every listed row (`Db::sessions`).
     #[serde(default)]
+    pub fork_count: usize,
+    #[serde(default)]
+    pub live_fork_count: usize,
+    /// The sessions forked from it (live or archived), oldest first: only
+    /// for one session (`session.get`), never on list rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forks: Vec<ForkRef>,
 }
 

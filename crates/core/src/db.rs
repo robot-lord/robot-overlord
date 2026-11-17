@@ -564,7 +564,7 @@ impl Db {
         let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), row_to_session)?;
         let mut sessions: Vec<Session> = rows.collect::<std::result::Result<_, _>>()?;
         self.attach_tags(&mut sessions)?;
-        self.attach_forks(&mut sessions)?;
+        self.attach_fork_counts(&mut sessions)?;
         self.attach_agent_counts(&mut sessions)?;
         Ok(sessions)
     }
@@ -596,9 +596,36 @@ impl Db {
         Ok(())
     }
 
-    /// Fill in these sessions' forks (one query, over the forks of these
-    /// sessions only: the index on `forked_from`). Where rows are shown
-    /// (`sessions`, `session.get`), not on every lookup (`resolve_ref`).
+    /// Fill in how many forks each of these sessions has, live and in all
+    /// (one grouped query over the forks of these sessions only: the index
+    /// on `forked_from`). For list rows (`sessions`): counts, not the list.
+    fn attach_fork_counts(&self, sessions: &mut [Session]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT forked_from, COUNT(*), COUNT(*) - COUNT(archived_at) FROM sessions \
+             WHERE forked_from IN (SELECT value FROM json_each(?1)) \
+             GROUP BY forked_from",
+        )?;
+        let counts: std::collections::HashMap<String, (usize, usize)> = stmt
+            .query_map([serde_json::to_string(&ids)?], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, i64>(1)? as usize, r.get::<_, i64>(2)? as usize),
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        for s in sessions {
+            (s.fork_count, s.live_fork_count) = counts.get(&s.id).copied().unwrap_or((0, 0));
+        }
+        Ok(())
+    }
+
+    /// Fill in these sessions' forks, and their counts (one query, over the
+    /// forks of these sessions only). For one session shown in full
+    /// (`session.get`), not on list rows or every lookup (`resolve_ref`).
     pub fn attach_forks(&self, sessions: &mut [Session]) -> Result<()> {
         if sessions.is_empty() {
             return Ok(());
@@ -626,9 +653,9 @@ impl Db {
             by_parent.entry(parent).or_default().push(fork);
         }
         for s in sessions {
-            if let Some(f) = by_parent.remove(&s.id) {
-                s.forks = f;
-            }
+            s.forks = by_parent.remove(&s.id).unwrap_or_default();
+            s.fork_count = s.forks.len();
+            s.live_fork_count = s.forks.iter().filter(|f| !f.archived).count();
         }
         Ok(())
     }
@@ -1652,6 +1679,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         forked_from: r.get(26)?,
         forked_from_name: r.get(27)?,
         forks: Vec::new(),
+        fork_count: 0,
+        live_fork_count: 0,
     })
 }
 
@@ -2027,23 +2056,23 @@ mod tests {
             name: format!("n-{id}"),
             archived,
         };
-        // Not on a plain lookup (every hook makes one): where rows are shown.
+        // Not on a plain lookup (every hook makes one): for one session
+        // shown in full, with its counts.
         assert!(p.forks.is_empty());
         db.set_archived("g", Some(5)).unwrap();
         let mut one = [p];
         db.attach_forks(&mut one).unwrap();
         assert_eq!(one[0].forks, [fork("f", false), fork("g", true)]);
-        // In the list too.
+        assert_eq!((one[0].fork_count, one[0].live_fork_count), (2, 1));
+        // A list row: the counts only, never the list.
         let listed = db.sessions(&SessionQuery::default()).unwrap();
         let p_row = listed.iter().find(|s| s.id == "p").unwrap();
-        assert_eq!(p_row.forks, [fork("f", false), fork("g", true)]);
+        assert_eq!((p_row.fork_count, p_row.live_fork_count), (2, 1));
+        assert!(p_row.forks.is_empty());
+        assert!(serde_json::to_value(p_row).unwrap().get("forks").is_none());
         db.set_archived("g", None).unwrap();
-        assert!(listed
-            .iter()
-            .find(|s| s.id == "x")
-            .unwrap()
-            .forks
-            .is_empty());
+        let x = listed.iter().find(|s| s.id == "x").unwrap();
+        assert_eq!((x.fork_count, x.live_fork_count), (0, 0));
         // Listed with its parent's name too.
         let listed = db
             .sessions(&SessionQuery::default())
