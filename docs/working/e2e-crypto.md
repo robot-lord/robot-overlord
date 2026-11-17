@@ -1083,14 +1083,23 @@ review covers the exact version shipped.
 
 Still owed: phone benchmark runs, Firefox, the relay's signed challenge.
 
-## Decision: compression (user, 2026-11-17)
+## Compression: provisional, still to explore (2026-11-17)
 
-Compress-then-encrypt leaks plaintext through ciphertext size
+**Not settled.** This is a starting position to keep compression from being
+bolted on carelessly, not a decision. The user doubts the threat below is
+realistic here: for a size side channel to work, an attacker must both
+inject chosen text into a pane's output repeatedly and watch the matching
+frame sizes at the relay, and it isn't clear that pathway exists for this
+use case. Explore that before treating any of the rules below as fixed.
+
+The concern, for reference: Compress-then-encrypt leaks plaintext through ciphertext size
 (CRIME/BREACH): when a frame mixes a secret with attacker-influenced text,
 the compressed size tells how well a guess matched. Pane output is that
 mix (an agent prints a token or `.env` beside text from a web page or a
 file someone else wrote), and the relay sees every frame's size. Padding
 to 32-byte multiples blurs the signal; it doesn't remove it.
+
+Starting position, open to change after the exploration:
 
 - **Live pane stream: not compressed in v1.** Terminal output is small and
   the host already coalesces it (16 KiB frames).
@@ -1105,7 +1114,9 @@ to 32-byte multiples blurs the signal; it doesn't remove it.
   (permessage-deflate, TLS compression): ciphertext doesn't compress, and
   it must stay off so nothing compresses plaintext outside the core.
 
-Open: measure on real pane output (lz4 and zstd, before and after padding)
+To explore: whether the attack pathway is realistic for rlord (who can
+inject text into a pane, who can see frame sizes, how often); then measure
+on real pane output (lz4 and zstd, before and after padding)
 in the relay slice. If live streams turn out to need compression, only for
 content that can't hold secrets, or with a fresh compression context per
 frame, and only after the cryptographer's review.
