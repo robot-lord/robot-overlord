@@ -161,6 +161,14 @@ done, in this order (decided with the user, 2026-11-12):
          the overlord on any of the three agents, session background,
          forking, fresh repo code and signed builds.
        - [ ] By hand, by the user: the item 9 macOS fresh install.
+       - [ ] Not yet placed before or after 1.0 (the user decides): a
+         "waiting on background work" status. Today a session whose
+         agent stopped while background shells or subagents still run
+         shows "your turn". Count the launched background tasks in the
+         transcript against their completion notifications, with
+         Subagent hooks as a faster signal and plain code only. Fall back
+         to "your turn" when the transcript stops growing. Claude
+         first; Codex and OpenCode later.
 11. [ ] 1.0.0 stable.
 
 After 1.0:
