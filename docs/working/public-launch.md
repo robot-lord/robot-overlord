@@ -149,9 +149,10 @@ done, in this order (decided with the user, 2026-11-12):
        - [ ] `cargo xtask fresh-install`: its "newest stable from GitHub,
          upgraded in place" run needs a stable release, and there won't be
          one. Upgrade from the newest release instead.
-       - [ ] Sign stable releases in CI (`docs/working/signing.md`), or
-         1.0.0 ships ad-hoc and macOS asks again for folder access on
-         every update.
+       - [x] Sign stable releases in CI (#67). Still owed by the
+         maintainer: the one-time secret and environment setup in
+         `docs/working/signing.md`, then a dry run, or 1.0.0's release
+         run fails.
        - [ ] Session context PRs 2–4 (`docs/working/session-context.md`).
          They change how prompts and messages reach sessions, so settle
          them before calling it stable. They include the #64/#65
