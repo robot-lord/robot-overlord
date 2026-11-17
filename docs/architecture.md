@@ -1450,7 +1450,8 @@ add`); reading and inserting under it, through `methods::start`, the tail
 
 Until then a restart forks again (kv `fork_pending`, `fork::pending`,
 written with the row before the pane starts, as is `bind_fork`), logged
-as `reforked` with its new branch point. Its file is written with the
+as `reforked` with its new branch point, and sent the words it was
+first given again (`spec["prompt"]`, `fork::restart_prompt`). Its file is written with the
 fork's note renewed in memory (`fork::renewed_note`,
 `context::refresh_file_with`; shared folder or own worktree as recorded
 at the fork, kv `fork_folder`), and a Codex fork's `bind_fork` is
@@ -1499,7 +1500,9 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 - **Name.** Given, or `<parent>-fork`, `-fork-2`… chosen under the first
   lock (after every read that can fail) and reserved while the fork is
   made (kv `fork_name:<name>`, ten minutes at most), so two forks at once
-  never pick the same one. A worktree's branch follows it. Checked again
+  never pick the same one (by `fork`, not `want_in`, which only reads).
+  A worktree's branch follows it, so a worktree fork's default also
+  skips a name whose branch or worktree folder git already has. Checked again
   before the worktree is made and under the last lock: taken meanwhile by
   another session, a worktree fork stops cleanly; any other picks the
   next free name.
@@ -1529,7 +1532,8 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   a session named in `related`. A fork always has background
   (`context_on`); its delivery is worked out afresh, as for a launch.
   Its file, written before the rows are stored, shows only what will be
-  stored (`context::kept_rows`: what `context_add` would skip, it skips).
+  stored (`fork::rows` drops, through `context::kept_rows`, what `context_add`
+  would skip).
   Nothing is added to the parent.
 - **Lineage**: `sessions.forked_from` (migration 0011); rows carry
   `forked_from_name`. List rows (`session.list`) carry counts only
@@ -1551,7 +1555,9 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 - **Warnings** (`warnings` in the answer, by plain code, of the parent as
   read when the fork starts): a working
   parent (the copy ends at its last finished step), a shared folder with
-  a live parent, a context window at or over 70%, uncommitted changes
+  a live parent, a context window at or over 70% (as the list knows it:
+  `usage::annotate` with `single` false, never a full transcript read;
+  unknown says nothing), uncommitted changes
   left behind by a new worktree.
 - **Binding a Codex fork.** Its first message is its parent's, so the
   prompt rule can't pick its thread. kv `bind_fork:<id>` holds the

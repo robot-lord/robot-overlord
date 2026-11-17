@@ -748,9 +748,12 @@ pub fn launch_file_text(
 /// skips a link already there and a note the same as one not handed over
 /// yet, and in a new session nothing is handed over yet. So its file,
 /// rendered before the rows are stored, shows exactly what is stored.
-pub fn kept_rows(copied: &[ContextRow], rows: Vec<NewRow>) -> Vec<NewRow> {
+pub fn kept_rows<'a>(
+    copied: impl IntoIterator<Item = &'a ContextRow>,
+    rows: Vec<NewRow>,
+) -> Vec<NewRow> {
     let mut seen: std::collections::HashSet<(String, String)> = copied
-        .iter()
+        .into_iter()
         .map(|r| (r.kind.clone(), r.body.clone()))
         .collect();
     rows.into_iter()
@@ -759,8 +762,8 @@ pub fn kept_rows(copied: &[ContextRow], rows: Vec<NewRow>) -> Vec<NewRow> {
 }
 
 /// `launch_file_text` for rows copied from another session (`copied`, as
-/// they are stored there) followed by new ones (as `kept_rows` keeps
-/// them).
+/// they are stored there) followed by new ones, already as they will be
+/// stored (`kept_rows`).
 pub fn launch_file_text_rows(
     db: &Db,
     name: &str,
@@ -771,18 +774,14 @@ pub fn launch_file_text_rows(
     let rows: Vec<ContextRow> = copied
         .iter()
         .cloned()
-        .chain(
-            kept_rows(copied, rows.to_vec())
-                .into_iter()
-                .map(|r| ContextRow {
-                    id: 0,
-                    at,
-                    kind: r.kind.to_string(),
-                    body: r.body.clone(),
-                    source: r.source.to_string(),
-                    seen_at: None,
-                }),
-        )
+        .chain(rows.iter().map(|r| ContextRow {
+            id: 0,
+            at,
+            kind: r.kind.to_string(),
+            body: r.body.clone(),
+            source: r.source.to_string(),
+            seen_at: None,
+        }))
         .enumerate()
         .map(|(i, r)| ContextRow {
             id: i as i64 + 1,

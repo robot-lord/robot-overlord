@@ -128,14 +128,15 @@ impl Drop for Reserved<'_> {
     }
 }
 
-/// `want`, and its default name reserved for this fork until it is done
+/// `want_in`, and its default name reserved for this fork until it is done
 /// (`Reserved` releases it), chosen and reserved under one lock so two
 /// forks at once never pick the same one. A name asked for isn't
 /// reserved.
 fn want_reserved<'a>(d: &'a Daemon, params: &Value) -> Result<(Want, Reserved<'a>)> {
+    let workspace_dir = d.config().session.workspace_dir.clone();
     let want = {
         let db = d.db();
-        let want = want(&db, params)?;
+        let want = want_in(&db, params, &workspace_dir)?;
         if want.auto_name {
             db.kv_set(&reserve_key(&want.name), &now_ms().to_string())?;
         }
@@ -165,9 +166,11 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
         hooks: context::hooks_work(want.agent),
         ..Default::default()
     };
-    // (Read as `session.get` reads it.)
+    // The parent's context window, as the list knows it (`single` false:
+    // what rlord has read, plus a bounded read of what was appended; never
+    // a transcript it hasn't read yet). Unknown: no warning.
     let mut rows = [serde_json::to_value(&want.parent)?];
-    crate::usage::annotate(d, &mut rows, true);
+    crate::usage::annotate(d, &mut rows, false);
     made.context_pct = rows[0]["usage"]["context_pct"].as_u64();
     if want.agent == Agent::OpenCode {
         made.opencode_id = Some(opencode_fork(
@@ -338,8 +341,10 @@ fn opencode_run(
 }
 
 /// Read the parent and check the fork can be made (what is refused:
-/// "Forking a session" in docs/architecture.md).
-pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
+/// "Forking a session" in docs/architecture.md). `workspace_dir`: where
+/// new worktrees go (`[session] workspace_dir`), for a worktree fork's
+/// default name.
+pub(crate) fn want_in(db: &Db, params: &Value, workspace_dir: &str) -> Result<Want> {
     let p_opt = |k: &str| {
         params[k]
             .as_str()
@@ -388,29 +393,31 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
         .filter(|r| db.resolve_ref(r).map_or(true, |s| s.id != parent.id))
         .collect();
     let (note, related) = context::check(db, p_opt("context").as_deref(), &refs, None)?;
-    let asked = p_opt("name");
-    let auto_name = asked.is_none();
-    let name = asked.unwrap_or_else(|| default_name(db, &parent.name));
     let wants_worktree = params["workspace"] == true;
     // (As `rlord fork --branch` needs `--worktree`.)
     if p_opt("branch").is_some() && !wants_worktree {
         bail!("a branch is for a new worktree: ask for the worktree too, or leave the branch out");
     }
-    if wants_worktree {
-        if !agent.forks_elsewhere() {
-            bail!(
-                "{} can't fork into a new worktree: its fork stays in its parent's folder. \
-                 Fork it in the same folder",
-                agent.label()
-            );
-        }
-        if parent.repo_path.is_none() {
-            bail!(
-                "{} isn't in a git repo: fork it in the same folder",
-                parent.name
-            );
-        }
+    // (Not in a git repo: refused by `plan_worktree`.)
+    if wants_worktree && !agent.forks_elsewhere() {
+        bail!(
+            "{} can't fork into a new worktree: its fork stays in its parent's folder. \
+             Fork it in the same folder",
+            agent.label()
+        );
     }
+    let asked = p_opt("name");
+    let auto_name = asked.is_none();
+    // A worktree fork's branch and folder are named after it (unless a
+    // branch is asked for): the default skips names git already has.
+    let git = match (
+        &parent.repo_path,
+        wants_worktree && p_opt("branch").is_none(),
+    ) {
+        (Some(repo), true) => Some((repo.as_str(), workspace_dir)),
+        _ => None,
+    };
+    let name = asked.unwrap_or_else(|| default_name(db, &parent.name, git));
     Ok(Want {
         agent,
         conversation,
@@ -430,10 +437,18 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
 }
 
 /// `<parent>-fork`, `-fork-2`, …: the first name no session has and no
-/// fork in the making reserved.
-fn default_name(db: &Db, parent: &str) -> String {
+/// fork in the making reserved; with `git` (a worktree fork: the repo and
+/// where worktrees go), none whose branch or worktree folder exists.
+fn default_name(db: &Db, parent: &str, git: Option<(&str, &str)>) -> String {
     let now = now_ms();
-    names::fork_name(parent, |n| name_unavailable(db, n, now))
+    names::fork_name(parent, |n| {
+        name_unavailable(db, n, now)
+            || git.is_some_and(|(repo, dir)| {
+                let branch = git::sanitize_branch(n);
+                git::workspace_path(repo, dir, &branch).exists()
+                    || git::branch_exists(repo, &branch)
+            })
+    })
 }
 
 /// What to say about the fork, by plain code: a live parent shares its
@@ -497,12 +512,19 @@ pub(crate) fn rows(
         &want.related,
         "overlord",
     ));
-    // Links already copied aren't added again.
+    // Only what will be stored, once, here (`context::kept_rows`): a link
+    // already copied, or a note the same as a copied one or an earlier
+    // new one, isn't added again; so the file written before the rows are
+    // stored shows exactly what is stored. (The parent's own fork note is
+    // never copied: not counted. The links cut below are never ones these
+    // rows add: those are the parent and `related`, never cut.)
+    let add = context::kept_rows(
+        parent_rows
+            .iter()
+            .filter(|r| !(r.kind == "note" && r.source == "fork")),
+        add,
+    );
     let copied_links: Vec<&ContextRow> = parent_rows.iter().filter(|r| r.kind == "link").collect();
-    let mut seen: std::collections::HashSet<String> =
-        copied_links.iter().map(|c| c.body.clone()).collect();
-    // (`insert` is false for a link already there: dropped.)
-    add.retain(|r| r.kind != "link" || seen.insert(r.body.clone()));
     let new_links = add.iter().filter(|r| r.kind == "link").count();
     let over = (copied_links.len() + new_links).saturating_sub(context::LINKS_MAX);
     let except = parent_rows
@@ -602,7 +624,7 @@ pub(crate) fn finish(
     let name = match (want.auto_name && db.name_taken(&want.name)?, &want.worktree) {
         (false, _) => want.name.clone(),
         (true, Some(_)) => bail!("{} was taken meanwhile: fork again", want.name),
-        (true, None) => default_name(db, &parent.name),
+        (true, None) => default_name(db, &parent.name, None),
     };
     let agent = want.agent;
     let now = now_ms();
@@ -632,9 +654,6 @@ pub(crate) fn finish(
         .filter(|r| !except.contains(&r.id))
         .cloned()
         .collect();
-    // Only what will be stored (`kept_rows`): its file, written before the
-    // rows are, shows exactly what the database will hold.
-    let add = context::kept_rows(&copied, add);
     // A fork always has background: at least its note and link.
     let mode = context::delivery(agent, made.hooks);
     let bg_file = context::file_path(base, id);
@@ -708,7 +727,8 @@ pub(crate) fn finish(
 }
 
 /// What a fork takes from its parent besides its conversation (group,
-/// tags, description; not its notes), and how its conversation is found.
+/// tags, description; not its notes), once its pane is up (how its
+/// conversation is found is written with its row: `fork_keys`).
 pub(crate) fn after_start(db: &Db, want: &Want, parent: &Session, id: &str) -> Result<()> {
     if !parent.group_path.is_empty() {
         db.set_group(id, &parent.group_path)?;
@@ -860,6 +880,26 @@ pub(crate) fn conversation_on_disk(db: &Db, s: &Session) -> Result<bool> {
     })
 }
 
+/// A restart's first prompt. A fork made again (`refork`: its
+/// conversation was never written) gets what it was first given, as at
+/// the fork: its own words (`spec["prompt"]`), with the pointer in Pointer
+/// mode (`context::launch_prompt`). Any other start of a new conversation
+/// gets the pointer again in Pointer mode (`context::restart_prompt`).
+pub(crate) fn restart_prompt(
+    spec: &Value,
+    refork: bool,
+    carried: Option<context::Delivery>,
+    resumed: bool,
+    file: &std::path::Path,
+) -> Option<String> {
+    if refork {
+        let words = spec["prompt"].as_str().filter(|p| !p.trim().is_empty());
+        context::launch_prompt(words, carried, file)
+    } else {
+        context::restart_prompt(carried, resumed, file)
+    }
+}
+
 /// The command that forks again for a restart of a fork that never
 /// materialized (`pending`): Claude under the fork's own id, Codex anew.
 pub(crate) fn refork_argv(
@@ -992,6 +1032,31 @@ mod tests {
         // Not asked for: none.
         let w = want(&db, &json!({"ref": "top"})).unwrap();
         assert_eq!(plan_worktree(&w, &cfg).unwrap(), None);
+        // The default name skips one whose branch git has, or whose
+        // worktree folder is there: a worktree fork's only.
+        git(&["branch", "sub-fork"]);
+        assert_eq!(plan("sub").branch, "sub-fork-2");
+        std::fs::create_dir_all(git::workspace_path(
+            r,
+            &cfg.session.workspace_dir,
+            "sub-fork-2",
+        ))
+        .unwrap();
+        assert_eq!(plan("sub").branch, "sub-fork-3");
+        let same = want(&db, &json!({"ref": "sub"})).unwrap();
+        assert_eq!(same.name, "sub-fork");
+        // A branch asked for: the name needn't avoid git's.
+        let named = want(
+            &db,
+            &json!({"ref": "sub", "workspace": true, "branch": "b"}),
+        )
+        .unwrap();
+        assert_eq!(named.name, "sub-fork");
+    }
+
+    /// `want_in` with the default place for worktrees.
+    fn want(db: &Db, params: &Value) -> Result<Want> {
+        want_in(db, params, &Config::default().session.workspace_dir)
     }
 
     fn err(db: &Db, params: Value) -> String {
@@ -1042,7 +1107,12 @@ mod tests {
         mk(&db, "oc", "opencode", Some("ses_1"), here, "");
         assert!(err(&db, json!({"ref": "oc", "workspace": true})).contains("same folder"));
         mk(&db, "c", "codex", Some("t-c"), here, "");
-        assert!(err(&db, json!({"ref": "c", "workspace": true})).contains("git repo"));
+        // Not in a git repo: refused once, by `plan_worktree`.
+        let w = want(&db, &json!({"ref": "c", "workspace": true})).unwrap();
+        let e = plan_worktree(&w, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("git repo"), "{e}");
         // A branch without a worktree: refused, as the CLI does.
         assert!(err(&db, json!({"ref": "c", "branch": "b"})).contains("new worktree"));
         // The overlord is no related session.
@@ -1253,23 +1323,29 @@ mod tests {
             .unwrap();
         db.context_add("p", 2, "link", "x", "overlord").unwrap();
         db.context_mark_all_seen("p", 3).unwrap();
-        let copied = db.context_rows("p").unwrap();
-        let new = |kind, body: &str| NewRow {
-            kind,
+        // The overlord's note and link are already the parent's.
+        let w = want(
+            &db,
+            &json!({"ref": "p", "context": "use the staging DB", "related": ["x"]}),
+        )
+        .unwrap();
+        let parent_rows = db.context_rows("p").unwrap();
+        let (except, add) = rows(&w, &parent_rows, &ForkFolder::Shared, 40);
+        let got: Vec<(&str, &str)> = add.iter().map(|r| (r.kind, r.source)).collect();
+        assert_eq!(got, [("note", "fork"), ("link", "fork")]);
+        // (`kept_rows` keeps a note once, however often offered.)
+        let again = |body: &str| NewRow {
+            kind: "note",
             body: body.into(),
             source: "overlord",
         };
-        let add = vec![
-            new("note", "use the staging DB"),
-            new("note", "and a queue"),
-            new("note", "and a queue"),
-            new("link", "x"),
-        ];
-        let kept = context::kept_rows(&copied, add.clone());
-        assert_eq!(kept, [new("note", "and a queue")]);
-        // Stored as at the start (every new row offered): the same.
+        assert_eq!(
+            context::kept_rows(&[], vec![again("a"), again("a")]),
+            [again("a")]
+        );
+        // Stored as at the start: what the file shows.
         mk(&db, "f", "claude", Some("c-f"), here, "");
-        db.context_copy("p", "f", &[]).unwrap();
+        db.context_copy("p", "f", &except).unwrap();
         context::store_rows(&db, "f", &add, 50).unwrap();
         let stored: Vec<(String, String)> = db
             .context_rows("f")
@@ -1277,14 +1353,18 @@ mod tests {
             .into_iter()
             .map(|r| (r.kind, r.body))
             .collect();
+        let copied: Vec<ContextRow> = parent_rows
+            .iter()
+            .filter(|r| !except.contains(&r.id))
+            .cloned()
+            .collect();
         let shown: Vec<(String, String)> = copied
             .iter()
             .map(|r| (r.kind.clone(), r.body.clone()))
-            .chain(kept.iter().map(|r| (r.kind.to_string(), r.body.clone())))
+            .chain(add.iter().map(|r| (r.kind.to_string(), r.body.clone())))
             .collect();
         assert_eq!(stored, shown);
         let text = context::launch_file_text_rows(&db, "f", &copied, &add, 50);
-        assert_eq!(text.matches("and a queue").count(), 1, "{text}");
         assert_eq!(text.matches("use the staging DB").count(), 1, "{text}");
     }
 
@@ -1440,6 +1520,40 @@ mod tests {
             Some("c-new")
         );
         assert_eq!(db.kv_get(&methods::bind_fork_key("cl")).unwrap(), None);
+    }
+
+    /// A fork made again at a restart is sent the words it was first
+    /// given (with the pointer in Pointer mode); a restart that isn't a
+    /// re-fork only ever sends the pointer again.
+    #[test]
+    fn a_refork_sends_its_first_prompt_again() {
+        use context::Delivery;
+        let file = std::path::Path::new("/d/sessions/f/background.md");
+        let spec = json!({"agent": "codex", "prompt": "try the queue fix"});
+        let first =
+            |spec: &Value, refork, carried| restart_prompt(spec, refork, carried, false, file);
+        assert_eq!(
+            first(&spec, true, Some(Delivery::Hook)).as_deref(),
+            Some("try the queue fix")
+        );
+        assert_eq!(
+            first(&spec, true, None).as_deref(),
+            Some("try the queue fix")
+        );
+        let with = first(&spec, true, Some(Delivery::Pointer)).unwrap();
+        assert!(
+            with.starts_with("try the queue fix") && with.contains("background.md"),
+            "{with}"
+        );
+        // No words at the fork: none now (the pointer alone in its mode).
+        let idle = json!({"agent": "codex", "prompt": null});
+        assert_eq!(first(&idle, true, Some(Delivery::Hook)), None);
+        assert!(first(&idle, true, Some(Delivery::Pointer)).is_some());
+        // Not a re-fork: never its first words again.
+        assert_eq!(first(&spec, false, Some(Delivery::Hook)), None);
+        assert!(!first(&spec, false, Some(Delivery::Pointer))
+            .unwrap()
+            .contains("try the queue fix"));
     }
 
     /// A fork made again at a restart: its own note names the new branch

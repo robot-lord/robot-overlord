@@ -1159,11 +1159,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     }
     let carried = mode.filter(|d| *d == context::Delivery::Hook || bg_file.is_file());
     argv.extend(context::launch_args(carried, &bg_file));
-    // A Pointer-mode session starting a new conversation: the pointer
-    // again, as its first prompt; its conversation is then bound by that
+    // A new conversation's first prompt: a Pointer-mode session starting
+    // one gets the pointer again; a re-forked fork whose conversation was
+    // never written, its own first words too, as at the fork
+    // (`fork::restart_prompt`). Its conversation is then bound by that
     // prompt, from now.
-    let pointer = context::restart_prompt(carried, resumed, &bg_file);
-    if let Some(p) = &pointer {
+    let first = crate::fork::restart_prompt(&spec, refork.is_some(), carried, resumed, &bg_file);
+    // (What it hands over: the pointer.)
+    let pointer_sent = first.is_some() && carried == Some(context::Delivery::Pointer);
+    if let Some(p) = &first {
         agent.add_first_prompt(&mut argv, p);
     }
     let program = pane_program(agent, &mut argv);
@@ -1202,7 +1206,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         );
         tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
     }
-    if let Some(p) = &pointer {
+    if let Some(p) = &first {
         logged(
             "noting the first prompt",
             note_first_prompt(db, &s.id, agent, Some(p), now),
@@ -1228,8 +1232,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.
     // (A resume without a pointer, or a stale file, carries nothing new.)
-    let fresh =
-        pointer.is_some() || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
+    let fresh = pointer_sent || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
     if fresh {
         logged(
             "marking its background seen",

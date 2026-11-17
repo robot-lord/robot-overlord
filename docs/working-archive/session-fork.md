@@ -25,6 +25,16 @@ history (`docs/working/session-fork.md`, removed 2026-11-16).
 - **Fork at an earlier message**: OpenCode's fork call takes `before`
   (a message id), Codex's `thread/fork` `lastTurnId`.
 - **Cross-agent fork**: the seeded fallback above, onto another agent.
+- **Several hookless Codex forks at once in one folder** (deferred at
+  the last review; each case needs that, and the first hook rebinds
+  correctly):
+  - forks of one parent matched by creation time
+    (`discover::pick_thread`) can swap threads until their first hooks
+    rebind them;
+  - `tracked` (threads already taken) is read once per `discover` pass:
+    a thread bound elsewhere during the pass isn't seen until the next;
+  - the 15s grace for an unreadable rollout can let an ordinary session
+    take a slow fork's thread.
 
 ## Open questions
 
