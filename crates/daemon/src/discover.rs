@@ -284,6 +284,7 @@ fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
         others,
         w.fork.as_deref(),
         &rollout_fork,
+        now_ms(),
     ) else {
         return Ok(false);
     };
@@ -302,9 +303,15 @@ pub(crate) fn bind_now(db: &Db, s: &Session) -> Result<bool> {
         return Ok(false); // (a fork: left to `bind`, outside the lock)
     }
     let candidates = untracked_threads(s, w.since, &w.tracked);
-    match pick_thread(&candidates, w.prompt.as_deref(), false, None, &|_| {
-        Some(None)
-    }) {
+    let not_forked = |_: &codex::Thread| Some(None);
+    match pick_thread(
+        &candidates,
+        w.prompt.as_deref(),
+        false,
+        None,
+        &not_forked,
+        now_ms(),
+    ) {
         Some(t) => record_bind(db, s, t),
         None => Ok(false),
     }
@@ -417,24 +424,24 @@ fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
 ///
 /// `forked_from` reads a thread's rollout (`rollout_fork`): every
 /// candidate's for a fork, else only the one left. A rollout that can't
-/// be read yet (None) means wait, never "not a fork".
+/// be read yet (None): for a fork, that candidate is skipped; for any
+/// other session, wait `UNREAD_GRACE_MS` after the thread was indexed,
+/// then take it (as before forks: never unbound for ever).
 fn pick_thread<'a>(
     candidates: &'a [codex::Thread],
     prompt: Option<&str>,
     others_waiting: bool,
     fork: Option<&str>,
     forked_from: &dyn Fn(&codex::Thread) -> Option<Option<String>>,
+    now: i64,
 ) -> Option<&'a codex::Thread> {
     if let Some(parent) = fork {
-        // Every candidate's rollout must say: one not readable yet may be
-        // the fork too (wait).
-        let mut found = Vec::new();
-        for t in candidates {
-            match forked_from(t)? {
-                Some(p) if p == parent => found.push(t),
-                _ => {}
-            }
-        }
+        // The thread whose rollout names the parent. One not readable yet
+        // is skipped (it can't be told apart yet); two that name it: wait.
+        let found: Vec<&codex::Thread> = candidates
+            .iter()
+            .filter(|t| forked_from(t).flatten().as_deref() == Some(parent))
+            .collect();
         return match found.as_slice() {
             [one] => Some(*one),
             _ => None,
@@ -455,13 +462,22 @@ fn pick_thread<'a>(
         None if others_waiting => Vec::new(),
         None => candidates.iter().collect(),
     };
-    // Narrowed to one: taken only when its rollout says it is no fork (one
-    // not readable yet: wait).
+    // Narrowed to one: not a fork (a user fork binds by `bind_fork`, never
+    // here). A rollout not readable yet: wait a moment, then take it, as
+    // before forks (an ordinary session must not stay unbound).
     match fit.as_slice() {
-        [one] => forked_from(one)?.is_none().then_some(*one),
+        [one] => match forked_from(one) {
+            Some(None) => Some(*one),
+            Some(Some(_)) => None,
+            None => (now - one.created_at_ms >= UNREAD_GRACE_MS).then_some(*one),
+        },
         _ => None,
     }
 }
+
+/// How long after a thread is indexed binding waits for its rollout's
+/// first line, before taking it as no fork.
+const UNREAD_GRACE_MS: i64 = 15_000;
 
 /// Read a session's status from its transcript (incrementally).
 ///
@@ -617,8 +633,14 @@ mod tests {
     #[test]
     fn a_fork_binds_only_the_thread_forked_from_its_parent() {
         let read = std::cell::RefCell::new(Vec::new());
+        // (The test's threads were indexed at 1: a moment ago.)
+        let pick_at =
+            |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>, now| {
+                pick_thread(c, prompt, others, fork, &|t| rollouts(&read, t), now)
+                    .map(|t| t.id.clone())
+            };
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>| {
-            pick_thread(c, prompt, others, fork, &|t| rollouts(&read, t)).map(|t| t.id.clone())
+            pick_at(c, prompt, others, fork, 2)
         };
         // (A fork's first message is its parent's.)
         let mut c = vec![
@@ -633,9 +655,17 @@ mod tests {
             Some("f1")
         );
         assert_eq!(pick(&c, None, false, Some("parent")).as_deref(), Some("f1"));
-        // A rollout not readable yet may be the fork too: wait.
+        // A rollout not readable yet is skipped: the one that names the
+        // parent binds; none readable that does: wait.
         let unread = [thread("f1", "x"), thread("u1", "x")];
-        assert_eq!(pick(&unread, None, false, Some("parent")), None);
+        assert_eq!(
+            pick(&unread, None, false, Some("parent")).as_deref(),
+            Some("f1")
+        );
+        assert_eq!(
+            pick(&[thread("u1", "x")], None, false, Some("parent")),
+            None
+        );
         // Two forks of the same parent: neither (the hooks will say).
         c.push(thread("f2", "fix the login test"));
         assert_eq!(pick(&c, None, false, Some("parent")), None);
@@ -648,9 +678,14 @@ mod tests {
             pick(&only_forks, Some("fix the login test"), false, None),
             None
         );
-        // Nor one whose rollout can't be read yet (wait, not "no fork").
+        // One whose rollout can't be read yet: wait a moment, then take
+        // it (an ordinary session never stays unbound).
         let unread = [thread("u1", "fix it")];
         assert_eq!(pick(&unread, Some("fix it"), false, None), None);
+        assert_eq!(
+            pick_at(&unread, Some("fix it"), false, None, 1 + UNREAD_GRACE_MS).as_deref(),
+            Some("u1")
+        );
         // Its own (and a fork with another first message): taken, reading
         // only the rollout of the one left.
         let mixed = [thread("own", "fix it"), thread("f2", "speed it up")];
@@ -739,7 +774,7 @@ mod tests {
     #[test]
     fn a_thread_is_bound_only_when_it_is_clearly_the_sessions() {
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool| {
-            pick_thread(c, prompt, others, None, &|_| Some(None)).map(|t| t.id.clone())
+            pick_thread(c, prompt, others, None, &|_| Some(None), 2).map(|t| t.id.clone())
         };
         let one = [thread("a", "fix the login test")];
         // Launched with that prompt: it's the one, even with a sibling waiting.

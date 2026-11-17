@@ -137,8 +137,7 @@ enum Command {
         /// Display name (default: <original>-fork)
         #[arg(long)]
         name: Option<String>,
-        /// Another model (default: the fork goes on with the model its
-        /// conversation has)
+        /// Another model than the original's (default: the original's)
         #[arg(long)]
         model: Option<String>,
         /// Work in a new worktree branched from the original's last commit

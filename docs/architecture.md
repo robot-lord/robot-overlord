@@ -1448,8 +1448,11 @@ add`); reading and inserting under it, through `methods::start`, the tail
 
 Until then a restart forks again (kv `fork_pending`, `fork::pending`,
 written with the row before the pane starts, as is `bind_fork`), logged
-as `reforked` with its new branch point; once that pane is up the
-fork's note gets the new time (`fork::renote`), and a Codex fork drops
+as `reforked` with its new branch point. Before its file is written and
+its pane starts, the fork's note gets the new time, unseen
+(`fork::renote`; shared folder or own worktree as recorded at the fork,
+kv `fork_folder`), and the start marks seen only what it hands the
+agent; once the pane is up a Codex fork drops
 the thread bound before and is bound anew by `bind_fork`
 (`fork::reforked`). The key goes once a hook or Codex's index names the
 fork's own transcript and it is on disk (`fork::conversation_seen`), or
@@ -1471,7 +1474,7 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
 
 - **Folder.** The parent's (`project_path`, its worktree, repo, branch),
   or with `workspace` a new worktree branched from the parent's `HEAD`
-  (`git::worktree_add_from`), the fork working in the parent's subfolder
+  (`git::worktree_add` with a start commit), the fork working in the parent's subfolder
   of it (`fork::plan_worktree`, which asks git outside the lock; a repo
   with nothing committed is refused: "nothing committed yet"). A
   subfolder that isn't committed isn't there: refused, the worktree
@@ -1504,9 +1507,11 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   Remote Control), group, tags, description (or the one given), and the
   parent's `session_context` rows with `at` and `source` (not which hook
   answer carried them), but not the parent's own fork note (a fork of a
-  fork gets its own). Its model is the one asked for, else none: no
-  `--model`, so the conversation goes on with the model it has (at the
-  fork and at every resume). The rows are copied unseen: the fork's own
+  fork gets its own). Its model is the one asked for, else the parent's
+  launch spec model, stored in the fork's spec and passed as `--model`
+  at the fork and every resume (`claude --resume` and `codex fork` don't
+  restore a conversation's model); an OpenCode fork has its parent's
+  already, and only a model asked for is set. The rows are copied unseen: the fork's own
   delivery mode hands them over, as for a launch (whatever the parent's
   conversation already had). Not notes (the user's own, per session), pin,
   summary, usage, Remote Control's name, `codex_host`, role. It adds a
@@ -1537,10 +1542,13 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   prompt rule can't pick its thread. kv `bind_fork:<id>` holds the
   parent's thread: `discover::pick_thread` then takes only a thread whose
   rollout's first `session_meta` says `forked_from_id` is that one
-  (`codex::rollout_forked_from`; every candidate must say, one not
-  readable yet means wait). Any other waiting session takes the one
-  thread its rules narrow to only if that rollout says it is no fork (one
-  not readable yet: wait, never "not a fork"); no other rollout is read.
+  (`codex::rollout_forked_from`; a candidate whose first line can't be
+  read yet is skipped, never a reason to wait while another names the
+  parent). Any other waiting session takes the one thread its rules
+  narrow to if that rollout says it is no fork, never if it says it is
+  one; one not readable yet is taken 15 seconds after the thread was
+  indexed (`UNREAD_GRACE_MS`), as before forks, so no session stays
+  unbound. No other rollout is read.
   An answer is remembered per thread once its first line is complete.
   The overlord's `bind_now`, under the DB lock, reads none: the overlord
   is never forked, and no fork runs in its folder. A Codex fork runs no

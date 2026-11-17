@@ -683,7 +683,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             let branch = p_opt("branch").unwrap_or_else(|| git::sanitize_branch(&name));
             let dir = git::workspace_path(repo, &cfg.session.workspace_dir, &branch);
             git::ensure_excluded(repo, &cfg.session.workspace_dir)?;
-            git::worktree_add(repo, &branch, &dir)?;
+            git::worktree_add(repo, &branch, &dir, None)?;
             let dir = dir.to_string_lossy().into_owned();
             (dir.clone(), Some(dir), Some(branch))
         }
@@ -1095,8 +1095,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .map(str::to_string);
     // A fork whose conversation was never made (its agent never got that
     // far) forks again rather than resume, from its parent's conversation
-    // as it is now (its note says so once its pane is up, below).
+    // as it is now: its note says so (unseen) before its file is written
+    // and the pane starts; what the start hands over is marked below.
     let refork = crate::fork::pending(db, &s)?;
+    if refork.is_some() {
+        crate::fork::renote(db, &s, now_ms())?;
+    }
     // Its background as it was launched with, its file rewritten first
     // (related sessions' status, a rename: as they are now).
     // Best effort: a file that can't be written never stops the restart;
@@ -1180,12 +1184,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         note_first_prompt(db, &s.id, agent, None, now)?;
     }
     if let Some(parent) = &refork {
-        // Forked again (the pane is up): its note names the new branch
-        // point, in its file too (best effort, as at any start).
-        crate::fork::renote(db, &s, now)?;
-        if let Err(e) = context::refresh_file(db, &base, &s) {
-            tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
-        }
         crate::fork::reforked(db, &s, parent)?;
     }
     // Only what this start carried fresh counts as handed over: the

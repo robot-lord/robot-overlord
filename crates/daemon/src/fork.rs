@@ -173,7 +173,7 @@ pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
         }
         made.uncommitted = git::has_changes(&want.parent.project_path) == Some(true);
         git::ensure_excluded(&w.repo, &cfg.session.workspace_dir)?;
-        git::worktree_add_from(&w.repo, &w.branch, &w.dir, &w.start)?;
+        git::worktree_add(&w.repo, &w.branch, &w.dir, Some(&w.start))?;
         // (A subfolder that isn't committed isn't in the new worktree.)
         if !w.project.is_dir() {
             discard(w);
@@ -365,13 +365,13 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
     let spec: Value = serde_json::from_str(&db.launch_spec(&parent.id)?).unwrap_or(json!({}));
     // (Checked as for a new session: the parent's own links are copied,
     // and the oldest of them dropped past the cap: `rows`.)
-    let (note, mut related) = context::check(
-        db,
-        p_opt("context").as_deref(),
-        &methods::ref_list(params, "related"),
-        None,
-    )?;
-    related.retain(|r| *r != parent.id);
+    // (The parent itself is linked anyway: left out before the check, so
+    // it never counts towards `RELATED_MAX`.)
+    let refs: Vec<String> = methods::ref_list(params, "related")
+        .into_iter()
+        .filter(|r| db.resolve_ref(r).map_or(true, |s| s.id != parent.id))
+        .collect();
+    let (note, related) = context::check(db, p_opt("context").as_deref(), &refs, None)?;
     let asked = p_opt("name");
     let auto_name = asked.is_none();
     let name = asked.unwrap_or_else(|| default_name(db, &parent.name));
@@ -508,8 +508,9 @@ pub(crate) fn rows(
 /// The fork's launch spec: the parent's, without what is per session
 /// (Remote Control's name and when it was turned on, Codex's daemon
 /// host), keeping a Remote Control the user turned off. Its model is the
-/// one asked for, else none: the conversation keeps the one it has (at
-/// the fork and at every resume), as the parent's own did.
+/// one asked for, else the parent's: `claude --resume` and `codex fork`
+/// don't restore a conversation's model, so it is passed at the fork and
+/// at every resume, as for the parent.
 fn spec_of(want: &Want) -> Value {
     let mut spec = want.spec.clone();
     // The parent's Remote Control was on: the fork's is off, explicitly.
@@ -528,7 +529,9 @@ fn spec_of(want: &Want) -> Value {
     }
     spec["agent"] = json!(want.agent.name());
     spec["prompt"] = json!(want.prompt);
-    spec["model"] = json!(want.model);
+    if let Some(m) = &want.model {
+        spec["model"] = json!(m);
+    }
     spec
 }
 
@@ -541,12 +544,15 @@ pub(crate) fn launch(
     first: Option<&str>,
     args: &[String],
 ) -> Result<Launch> {
-    // (No model asked for: none passed, the conversation keeps its own.)
+    // No model asked for: the parent's (Claude's `--resume`, `codex fork`
+    // don't restore it). OpenCode's fork has its parent's already: only a
+    // model asked for is set (`open_fork`).
+    let spec_model = want.spec["model"].as_str().filter(|m| !m.is_empty());
     match want.agent.fork(
         &want.conversation,
         project,
         first,
-        want.model.as_deref(),
+        want.model.as_deref().or(spec_model),
         args,
     ) {
         Fork::Native(l) => Ok(l),
@@ -699,10 +705,21 @@ pub(crate) fn after_start(db: &Db, want: &Want, parent: &Session, id: &str) -> R
     Ok(())
 }
 
-/// How fork `id`'s conversation is found and made again: written with its
-/// row, before its pane starts (`Start::kv`).
+/// kv key: where a fork works, as made: `worktree` (one of its own) or
+/// `shared` (its parent's folder). Its note says so again at a re-fork.
+pub(crate) fn folder_key(id: &str) -> String {
+    format!("fork_folder:{id}")
+}
+
+/// How fork `id`'s conversation is found and made again, and where it
+/// works: written with its row, before its pane starts (`Start::kv`).
 pub(crate) fn fork_keys(want: &Want, id: &str) -> Vec<(String, String)> {
-    let mut kv = Vec::new();
+    let folder = if want.worktree.is_some() {
+        "worktree"
+    } else {
+        "shared"
+    };
+    let mut kv = vec![(folder_key(id), folder.to_string())];
     if !want.agent.mints_id() {
         // Its thread is the one forked from the parent's (`bind_fork`).
         kv.push((methods::bind_fork_key(id), want.conversation.clone()));
@@ -765,23 +782,24 @@ pub(crate) fn conversation_seen(db: &Db, id: &str, transcript: &str) -> Result<(
 }
 
 /// A fork made again at a restart branches from its parent's conversation
-/// as it is now: its own note says so, with the new time (not handed over
-/// yet). Before the restart writes its background file.
+/// as it is now: its own note says so, with the new time, unseen. Called
+/// before the restart writes its background file and starts the pane; the
+/// restart marks seen only what that start hands the agent. Where it
+/// works is what the fork recorded when it was made (`folder_key`), not a
+/// comparison with its parent as it is now.
 pub(crate) fn renote(db: &Db, s: &Session, at: i64) -> Result<()> {
     let Some(pid) = s.forked_from.as_deref() else {
         return Ok(());
     };
-    let parent = db.resolve_ref(pid).ok();
-    let name = parent
-        .as_ref()
-        .map(|p| p.name.clone())
+    let name = db
+        .resolve_ref(pid)
+        .ok()
+        .map(|p| p.name)
         .or_else(|| s.forked_from_name.clone())
         .unwrap_or_else(|| pid.to_string());
-    let shared = parent
-        .as_ref()
-        .is_some_and(|p| p.project_path == s.project_path);
+    let own_worktree = db.kv_get(&folder_key(&s.id))?.as_deref() == Some("worktree");
     let folder = match (&s.workspace_path, &s.branch) {
-        (Some(w), Some(b)) if !shared => ForkFolder::Worktree(w.clone(), b.clone()),
+        (Some(w), Some(b)) if own_worktree => ForkFolder::Worktree(w.clone(), b.clone()),
         _ => ForkFolder::Shared,
     };
     db.context_renote(
@@ -1025,9 +1043,9 @@ mod tests {
         // Never on: nothing said.
         w.spec["remote_control"] = Value::Null;
         assert!(spec_of(&w)["remote_control_off"].is_null());
-        // No model asked for: none (the conversation keeps its own).
+        // No model asked for: the parent's (stored, passed at each start).
         w.model = None;
-        assert!(spec_of(&w)["model"].is_null());
+        assert_eq!(spec_of(&w)["model"], "m-1");
 
         // Warnings, by plain code.
         let mut w = want(&db, &json!({"ref": "p"})).unwrap();
@@ -1077,6 +1095,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w.related, ["x", "r00"], "not the parent itself");
+        // The parent never counts towards `RELATED_MAX`: eight others and
+        // the parent (by name) are accepted.
+        let eight: Vec<String> = (1..=8).map(|i| format!("r{i:02}")).collect();
+        let mut refs = eight.clone();
+        refs.push("n-p".into());
+        let w8 = want(&db, &json!({"ref": "p", "related": refs})).unwrap();
+        assert_eq!(w8.related, eight);
+        db.kv_delete(&reserve_key(&w8.name)).unwrap();
         let parent_rows = db.context_rows("p").unwrap();
         let (except, add) = rows(&w, &parent_rows, &ForkFolder::Shared, 1_800_000_000_000);
         // Its note and its link to the parent first, then the overlord's
@@ -1240,9 +1266,9 @@ mod tests {
             assert_eq!(&l.argv[4..6], ["--session-id", new.as_str()]);
             assert!(l.transcript.unwrap().ends_with(format!("{new}.jsonl")));
         }
-        // No model asked for: none passed (the conversation keeps its
-        // own, not the parent's launch model), and no Remote Control.
-        assert!(!l.argv.iter().any(|a| a == "--model"));
+        // No model asked for: the parent's (`--resume` doesn't restore
+        // it), and no Remote Control.
+        assert!(l.argv.windows(2).any(|a| a == ["--model", "m-1"]));
         let w = want(&db, &json!({"ref": "cl", "model": "opus"})).unwrap();
         let l = launch(&w, &Made::default(), here, None, &args(&w)).unwrap();
         assert!(l.argv.windows(2).any(|a| a == ["--model", "opus"]));
@@ -1324,6 +1350,32 @@ mod tests {
         );
         // Not a fork: nothing to renew.
         renote(&db, &db.resolve_ref("p").unwrap(), at).unwrap();
+        // Where it works is what it recorded when made: both of these are
+        // in a worktree, only one made it.
+        for (id, folder) in [("own", "worktree"), ("inherited", "shared")] {
+            db.insert_session(&NewSession {
+                id,
+                name: id,
+                agent: "codex",
+                agent_session: None,
+                project_path: "/r/.worktrees/x",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: Some("/r"),
+                workspace_path: Some("/r/.worktrees/x"),
+                branch: Some("x"),
+                role: "",
+            })
+            .unwrap();
+            db.set_forked_from(id, "p").unwrap();
+            db.kv_set(&folder_key(id), folder).unwrap();
+            db.context_add(id, 0, "note", "old", "fork").unwrap();
+            renote(&db, &db.resolve_ref(id).unwrap(), at).unwrap();
+        }
+        let note = |id: &str| db.context_rows(id).unwrap()[0].body.clone();
+        assert!(note("own").contains("own worktree, /r/.worktrees/x (branch x)"));
+        assert!(note("inherited").contains("same folder"));
     }
 
     /// A fork that never started leaves nothing behind outside the
@@ -1367,7 +1419,7 @@ mod tests {
             project: repo.join(".worktrees/p-fork"),
             start: git::head_commit(r).unwrap(),
         };
-        git::worktree_add_from(r, &wt.branch, &wt.dir, &wt.start).unwrap();
+        git::worktree_add(r, &wt.branch, &wt.dir, Some(&wt.start)).unwrap();
         w.worktree = Some(wt.clone());
         let base = dir.path().join("data");
         context::write_file(&base, "01new", "background").unwrap();

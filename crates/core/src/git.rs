@@ -86,40 +86,28 @@ pub fn workspace_path(repo: &str, workspace_dir: &str, branch: &str) -> PathBuf 
         .join(workspace_dirname(branch))
 }
 
-/// Create the worktree: a new branch off the repo's HEAD, or a checkout of
-/// `branch` if it already exists. Errors if git refuses (e.g. the branch is
-/// checked out elsewhere).
-pub fn worktree_add(repo: &str, branch: &str, dir: &Path) -> Result<()> {
+/// Create the worktree at `dir` on `branch`. With no `start`: a new branch
+/// off the repo's HEAD, or a checkout of `branch` if it already exists.
+/// With `start` (a fork's: its parent's last commit): a new branch started
+/// there, and an existing branch is refused. Errors if git refuses (e.g.
+/// the branch is checked out elsewhere), or the folder exists.
+pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -> Result<()> {
     if dir.exists() {
         bail!("workspace directory already exists: {}", dir.display());
     }
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let dir_s = dir.to_string_lossy();
-    if branch_exists(repo, branch) {
-        git(&["-C", repo, "worktree", "add", &dir_s, branch])?;
-    } else {
-        git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?;
-    }
-    Ok(())
-}
-
-/// Create the worktree on a new branch `branch` started at commit `start`
-/// (a fork's: its parent's last commit). Refuses an existing branch or
-/// folder.
-pub fn worktree_add_from(repo: &str, branch: &str, dir: &Path, start: &str) -> Result<()> {
-    if dir.exists() {
-        bail!("workspace directory already exists: {}", dir.display());
-    }
-    if branch_exists(repo, branch) {
+    let exists = branch_exists(repo, branch);
+    if exists && start.is_some() {
         bail!("branch {branch} already exists");
     }
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let dir_s = dir.to_string_lossy();
-    git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s, start])?;
+    match (exists, start) {
+        (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch])?,
+        (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?,
+        (false, Some(s)) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s, s])?,
+    };
     Ok(())
 }
 
@@ -143,7 +131,7 @@ pub fn has_changes(dir: &str) -> Option<bool> {
     .map(|out| !out.is_empty())
 }
 
-/// Undo `worktree_add_from`: remove the worktree at `dir` (with whatever is
+/// Undo a fork's `worktree_add`: remove the worktree at `dir` (with whatever is
 /// in it) and its branch `branch`. For a worktree rlord just made and
 /// nothing ran in yet.
 pub fn worktree_discard(repo: &str, branch: &str, dir: &Path) -> Result<()> {
@@ -460,16 +448,16 @@ mod tests {
         git(&["-C", r, "add", "f.txt"]).unwrap();
         assert_eq!(has_changes(r), Some(true));
         let wt = repo.join(".worktrees").join("x-fork");
-        worktree_add_from(r, "x-fork", &wt, &first).unwrap();
+        worktree_add(r, "x-fork", &wt, Some(&first)).unwrap();
         let w = wt.to_str().unwrap();
         assert_eq!(head_commit(w).unwrap(), first);
         // Nothing uncommitted was carried over.
         assert_eq!(has_changes(w), Some(false));
         assert!(!wt.join("f.txt").exists());
         // The branch and the folder are taken now.
-        let e = worktree_add_from(r, "x-fork", &repo.join("other"), &first).unwrap_err();
+        let e = worktree_add(r, "x-fork", &repo.join("other"), Some(&first)).unwrap_err();
         assert!(e.to_string().contains("already exists"), "{e}");
-        assert!(worktree_add_from(r, "y-fork", &wt, &first).is_err());
+        assert!(worktree_add(r, "y-fork", &wt, Some(&first)).is_err());
         assert_eq!(
             has_changes(&dir.path().join("none").to_string_lossy()),
             None
@@ -722,7 +710,7 @@ mod tests {
 
         let ws = workspace_path(r, ".worktrees", "feature/one");
         assert!(ws.ends_with(".worktrees/feature-one"));
-        worktree_add(r, "feature/one", &ws).unwrap();
+        worktree_add(r, "feature/one", &ws, None).unwrap();
         assert!(ws.join(".git").exists());
         // A worktree resolves back to the main repo root.
         assert_eq!(
@@ -735,9 +723,9 @@ mod tests {
         assert_eq!(ex.matches("/.worktrees/").count(), 1);
         assert!(git(&["-C", r, "status", "--porcelain"]).unwrap().is_empty());
         // Existing dir is refused, existing branch is checked out.
-        assert!(worktree_add(r, "feature/one", &ws).is_err());
+        assert!(worktree_add(r, "feature/one", &ws, None).is_err());
         let ws2 = workspace_path(r, ".worktrees", "feature/two");
         git(&["-C", r, "branch", "feature/two"]).unwrap();
-        worktree_add(r, "feature/two", &ws2).unwrap();
+        worktree_add(r, "feature/two", &ws2, None).unwrap();
     }
 }

@@ -800,9 +800,12 @@ impl Daemon {
                 if let Ok(v) = &r {
                     self.changed();
                     self.bind_nav_keys();
-                    // A new tmux session starts on rlord's defaults.
                     if let Some(id) = v["id"].as_str() {
+                        // A new tmux session starts on rlord's defaults.
                         profile::sync_ref(self, id);
+                        // Its copied history: loaded in the background, as
+                        // for an import.
+                        warm::enqueue_ref(self, id);
                     }
                 }
                 r
