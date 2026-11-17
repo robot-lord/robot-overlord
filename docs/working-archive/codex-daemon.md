@@ -109,6 +109,34 @@ scratch folder deleted.
   `~/.codex` is off until the home folder is trusted. It comes from the
   daemon's working folder (`$HOME`), not the session's; harmless.
 
+## Live check: daemon restart mid-turn (2026-11-16)
+
+Road to 1.0 item 7's second check, on rlord 0.23.0-dev.29 (built from
+main), codex-cli and daemon 0.169.0, macOS. Same setup as above (scratch
+rlord, own `CODEX_HOME`, `codex_daemon = true`), no hooks installed (the
+session bound from the thread index). Each turn ran `sleep N && echo`;
+`codex app-server daemon restart` run against the scratch `CODEX_HOME`.
+
+- `restart` blocks about 60s while a turn runs, then kills the old
+  daemon. The rollout gets `turn_aborted` (`interrupted`) and, at the
+  same millisecond, a new `task_started` with no new user message: the
+  new daemon resumes the turn by itself, no client attached. Its tool
+  processes are gone (`write_stdin failed: Unknown process id`), so the
+  model ran the command again.
+- Pane up: the TUI showed "■ Conversation interrupted", then "Working"
+  again, then the answer. rlord: "working", then "your turn".
+- Pane gone (tmux session killed mid-turn): `pane_gone_turn_running`,
+  "working" through the restart and the resumed turn, then `session_end`
+  ("stopped") about 1s after `task_complete`. A turn that ended inside
+  the 60s wait just completed; rlord stopped it the same way.
+- `notLoaded` never showed: the restarted daemon keeps the thread
+  loaded. rlord's reading of the resumed turn as running is right, since
+  it really runs (and costs a turn's tokens again).
+- Side note: on macOS a scratch rlord's auto-started daemon logs to
+  `~/Library/Logs/rlordd.log` whatever the XDG dirs; a failed start
+  (socket path over `SUN_LEN`) wrote there. Keep scratch socket paths
+  short (`/tmp/...`).
+
 ## After launch (owed, daemon mode)
 
 The checks that keep Road to 1.0 item 7 open are listed there

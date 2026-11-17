@@ -286,6 +286,27 @@ git worktree at `<repo>/.worktrees/<branch>` (the dir is
 `workspace_dir`, excluded via `.git/info/exclude`, never touching your
 `.gitignore`). Set `default_repo` and the form opens on it.
 
+**A new branch starts from the latest default branch**: rlord fetches it
+(waiting a few seconds at most) and starts the session's branch at its
+newest commit, not at whatever your main checkout has. Offline, it uses
+the last fetched commit and the session's background says it may be
+behind. An existing branch is checked out as it is, and a session in a
+plain folder runs where you left things. `base = "head"` under
+`[session]` goes back to starting at the main checkout's `HEAD`, with no
+fetch. For one session, the forms' **base** hint (default: your `[session]
+base`) takes a branch to build on (`feature/x`, or `origin/feature/x`
+for the remote's) or `head`. rlord never moves your `origin/*` refs: its
+fetches go to its own refs (`refs/rlord/latest/…`).
+
+**The overlord reads the latest code too.** Before it (or a subagent)
+reads or answers anything about a repo's code, it calls `repo_latest`,
+which keeps one read-only checkout per repo at
+`<repo>/.worktrees/.rlord-latest`, moved to the newest commit of the
+branch asked for (detached; anything edited there is thrown away). From
+a shell: `rlord latest [REPO] [--ref B]` prints its path and commit;
+`rlord latest --list` shows them, `rlord latest --prune [REPO]` (or `--all`) removes
+them (unused ones go by themselves after 30 days).
+
 In the TUI, `n` asks the **overlord** to launch a session. Write what you
 want, as long as you like, and adjust the defaults (repo, or "let the
 overlord pick"; model; worktree; tags, prefilled with the group you're
@@ -900,8 +921,8 @@ rlord update v0.18.0         # a specific one
 Homebrew updates the usual way (`brew upgrade rlord`). For a `.deb` or
 `.rpm`, install the newer release's package the same way you installed
 the first. `rlord update` says so for those instead of installing a second
-copy in `~/.local/bin`. Development builds (`X.Y.Z-dev.N`, macOS only) come out between
-stable releases; to get them, set in `~/.config/robot-overlord/config.toml`:
+copy in `~/.local/bin`. Development builds (`X.Y.Z-dev.N`, macOS only) of work not ready yet
+sometimes come out between stable releases; to get them, set in `~/.config/robot-overlord/config.toml`:
 
 ```toml
 [update]

@@ -106,11 +106,13 @@ Every PR bumps `[workspace.package] version` in `Cargo.toml` (and commits
 `Cargo.lock`); `cargo xtask check-version-bump` enforces it (CI, and
 `.githooks/pre-push` once you `git config core.hooksPath .githooks`).
 
-- **Development builds** `X.Y.Z-dev.N`: what ordinary PRs bump to (the next
-  version with `-dev.1`, then `-dev.2`, …). Released for macOS only, as GitHub
-  pre-releases; `[update] channel = "dev"` installs them.
-- **Stable releases** `X.Y.Z`: a PR that drops the suffix. Released for every
-  platform, with the Homebrew formula and crates.io.
+- **Stable releases** `X.Y.Z`: what a tested PR bumps to. A feature bumps
+  the minor (`1.0.0` → `1.1.0`), a fix the patch (`1.1.0` → `1.1.1`).
+  Released for every platform, with the Homebrew formula and crates.io.
+- **Development builds** `X.Y.Z-dev.N`: optional, for work that isn't ready
+  yet: a pre-release of the next version (`1.2.0-dev.1`, then `-dev.2`, …).
+  Released for macOS only, as GitHub pre-releases; `[update] channel =
+  "dev"` installs them.
 
 After a PR merges, release from the merged `main`:
 
@@ -127,7 +129,22 @@ after the checks, so rehearse that with a manual dry run of the workflow
 (below).
 
 - **Dev builds** are built on the maintainer's Apple Silicon Mac and uploaded
-  as a pre-release.
+  as a pre-release. `build-release macos` signs with the keychain's
+  "Developer ID Application" identity, by its hash (secure timestamp,
+  identifier `com.robot-lord.rlord`), so macOS keeps privacy grants such as
+  folder access across updates. The web plugin (`rlord-web`) is signed
+  the same way, identifier `com.robot-lord.rlord-web`, before its hash is
+  compiled into `rlord`. Without an identity it refuses outside CI.
+  `RLORD_SIGN_IDENTITY` picks an identity by name or hash, or `-` signs
+  ad-hoc on purpose. Stable releases are signed the same way in CI:
+  release.yml's macOS job runs in the `release` environment, imports the
+  `MACOS_SIGN_P12` / `MACOS_SIGN_P12_PASSWORD` secrets into a throwaway
+  keychain, and checks the Developer ID signature of both shipped
+  binaries (`rlord` and `rlord-web`). In CI
+  without an identity, a publishing run (`RLORD_RELEASE=1`) fails; a
+  release dry run, or a dev version elsewhere in CI, signs ad-hoc with a
+  warning. Not notarized and no hardened runtime: `get.sh` downloads with
+  curl, which sets no quarantine flag.
 - **Stable releases** are built in GitHub Actions
   (`.github/workflows/release.yml`), so anyone can see how the binaries were
   made. `cargo xtask release` pushes the `vX.Y.Z` tag, which starts the workflow. A

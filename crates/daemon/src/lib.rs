@@ -15,6 +15,7 @@ pub mod own;
 pub mod profile;
 pub mod recall;
 pub mod remote;
+pub mod repo_latest;
 mod repo_scan;
 pub mod rpc;
 pub mod search;
@@ -49,6 +50,10 @@ pub struct Daemon {
     config: std::sync::RwLock<Arc<Config>>,
     /// The repo finder's background disk scan (`repo_scan.rs`).
     repo_scan: repo_scan::Scanner,
+    /// This daemon, for work that outlives a call (a late fetch result).
+    pub(crate) me: std::sync::Weak<Daemon>,
+    /// `repo_latest`: fetches, per-repo locks (`repo_latest.rs`).
+    pub(crate) latest: repo_latest::Latest,
     /// Push stream to subscribers, one JSON line per message:
     /// `{"notify":"changed"}` — coarse tick, refetch what you display;
     /// `{"notify":"ui","cmd":{...}}` — a UI command for the TUI (set_view,
@@ -98,10 +103,12 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(db: Db, config: Config) -> Arc<Self> {
         let (notify, _) = tokio::sync::broadcast::channel(64);
-        Arc::new(Daemon {
+        Arc::new_cyclic(|me| Daemon {
+            me: me.clone(),
             db: Mutex::new(db),
             config: std::sync::RwLock::new(Arc::new(config)),
             repo_scan: repo_scan::Scanner::default(),
+            latest: Default::default(),
             notify,
             ui_view: Mutex::new(Value::Null),
             pending_ui: Mutex::new(None),
@@ -272,6 +279,10 @@ impl Daemon {
     /// DB state against the live tmux server.
     pub fn startup(&self) -> Result<()> {
         methods::set_claude_tui(&self.config());
+        // (Said once, here.)
+        if let Some(why) = self.config().session.base_problem() {
+            tracing::warn!("{why}: change it in config.toml");
+        }
         let db = self.db.lock().expect("db mutex poisoned");
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
@@ -569,6 +580,19 @@ impl Daemon {
                 params["interrupt"] = codex_daemon::interrupt(&s).to_json();
             }
         }
+        // Where a new session's branch starts (it may fetch: seconds):
+        // worked out here, never under the DB lock, and never taken from
+        // the caller.
+        // (A launch that will be refused anyway waits on no fetch; its
+        // checks run once, here, and `session_new` takes their result.)
+        let mut prechecked = None;
+        if method == "session.new" {
+            prechecked = Some(
+                methods::precheck_new(&self.db(), &self.config(), &params)
+                    .map_err(MethodError::Internal)?,
+            );
+            repo_latest::set_launch_base(self, &mut params).map_err(MethodError::Internal)?;
+        }
         // Whether rlord's hooks work for the agent (it reads the agent's
         // settings files): asked here, never under the DB lock.
         match method {
@@ -610,7 +634,9 @@ impl Daemon {
         let db = self.db.lock().expect("db mutex poisoned");
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
-            "session.new" => methods::session_new(&db, &self.config(), &params),
+            "session.new" => {
+                methods::session_new_with(&db, &self.config(), &params, prechecked.take())
+            }
             "repo.list" => methods::repo_list(&db, &self.config()),
             "repo.find" => {
                 let (found, roots, cfg) = scanned.expect("scanned for repo.find");
@@ -861,6 +887,11 @@ impl Daemon {
                 overlord::style(&self.db(), &self.config());
                 Ok(json!({"styled": true}))
             }
+            // (Fetches and moves a tree: per-repo lock, no DB lock held;
+            // locks.rs.)
+            "repo.latest" => repo_latest::latest_rpc(self, params.clone()),
+            "repo.latest_list" => repo_latest::list_rpc(self),
+            "repo.latest_prune" => repo_latest::prune_rpc(self, params.clone()),
             "session.import_scan" => import::scan(self, params),
             // (Its own locking: OpenCode's fork call, the hooks check and
             // `git worktree add` run without the DB lock.)

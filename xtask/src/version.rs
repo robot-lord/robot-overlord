@@ -95,8 +95,9 @@ impl Version {
         })
     }
 
-    /// A development build (any pre-release suffix): macOS only, a GitHub
-    /// pre-release, never on crates.io or in the Homebrew tap.
+    /// A development build (any pre-release suffix; optional, for work
+    /// that isn't ready): macOS only, a GitHub pre-release, never on
+    /// crates.io or in the Homebrew tap.
     pub fn is_dev(&self) -> bool {
         self.pre.is_some()
     }

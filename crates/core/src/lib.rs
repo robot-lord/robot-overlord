@@ -8,6 +8,7 @@ pub mod groups;
 pub mod history;
 pub mod import;
 pub mod keys;
+pub mod latest;
 pub mod models;
 pub mod names;
 pub mod paths;

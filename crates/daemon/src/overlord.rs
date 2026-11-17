@@ -1083,6 +1083,22 @@ mod tests {
         );
     }
 
+    /// Repo questions go through `repo_latest` (the routing table and its
+    /// own section); the metadata subagents never read a repo.
+    #[test]
+    fn repo_reading_goes_through_repo_latest() {
+        let table = INSTRUCTIONS
+            .split("## How to route a request")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .unwrap();
+        assert!(table.contains("| A question about a repo's code | `repo_latest`"));
+        assert!(INSTRUCTIONS.contains("\n## Reading a repo\n"));
+        for (name, text) in SUBAGENTS {
+            assert!(!text.contains("repo_latest"), "{name} lists repo_latest");
+        }
+    }
+
     /// The instructions name no tool that doesn't exist (a removed tool
     /// left behind makes the overlord call it), and nothing of the old
     /// two-session overlord.

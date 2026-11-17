@@ -688,6 +688,119 @@ apart from the overlord's notes (`context`) and related sessions
 background". `fork_session` calls `session.fork` (see "Forking a
 session"); session rows carry `forked_from`.
 
+#### The latest code (`repo_latest`)
+
+The user's checkouts are often behind, on another branch, or mid-edit.
+`repo_latest` (RPC `repo.latest`, CLI `rlord latest`) hands the overlord
+the newest committed code of a repo, as plain code (`core/src/latest.rs`
+for git, `daemon/src/repo_latest.rs` for state and locks). Its time
+limits, waits and retry windows are constants in those two files.
+
+- **One tree per repo**, in the repo's own `.worktrees` (never
+  `[session] workspace_dir`, which may point outside the repo where
+  sibling repos' trees would collide): a detached worktree named
+  `.rlord-latest`, moved to whichever ref is asked for. No session
+  folder can have that name (`sanitize_branch` trims leading dots; git
+  refuses a branch component starting with one). The user chose the
+  repo over rlord's data dir: a copy of their code outside the repo
+  looks wrong. Callers learn of a move from `ref` and `commit` in every
+  answer.
+- **rlord only ever touches its own tree.** It moves or removes a tree
+  only when rlord recorded it at that path (or adopts it: git's own
+  entry at the expected path, named and detached, so rlord's by
+  construction) and, seen from inside, it is that worktree, detached.
+  A session's worktree is always on a branch, so it never passes. A
+  branch checked out in rlord's recorded tree is detached again; one in
+  an unrecorded tree is refused. A folder git doesn't know is replaced
+  only if it is recognizably a leftover of rlord's; a tree whose repo
+  was moved with it is repaired by git. Edits in the tree are discarded
+  on a move; the answer says how many.
+- **Tree work runs in the background.** Adding or moving the tree (it
+  can take minutes) is a job on its own thread under the repo's move
+  lock; the call waits a bounded time and otherwise answers
+  `tree: "preparing"` with no path. A job's result goes only to the
+  calls waiting on it: a later call runs its own, so no old result or
+  old error is handed back. At most one re-add per call, and no call
+  repeats itself.
+- **Paths as git has them.** The tree's path is resolved the way git
+  reports worktree paths (a symlinked `.worktrees` is followed; in a
+  guarded folder git is asked, nothing is statted), so rlord's path and
+  git's always match.
+- **Done means done.** A move counts as complete only once it succeeds
+  (the record's commit is cleared before and set after), so a checkout
+  killed partway is redone, never trusted. Only a verifiably broken tree
+  is rebuilt; a lock or a time limit is an error that leaves it as it
+  is. The tree's path is fixed, so there are no trees at old paths to
+  track.
+- **Which repo.** Identity is the common git dir (records and locks are
+  keyed by it). rlord works from git's main worktree, or a bare repo's
+  folder; with `--separate-git-dir` it takes the checkout it was asked
+  from, and from a linked worktree of such a repo it asks for the main
+  checkout's path. It works on older git, leaving out flags it lacks.
+- **Private refs only.** A fetch brings the one branch into
+  `refs/rlord/latest/<remote>/<branch>` and never moves the user's
+  `refs/remotes/*` (a background fetch that moved `origin/x` would
+  weaken their `--force-with-lease` and change their `git status`). A
+  private ref nested with the target is deleted first; long-unused ones
+  are dropped, exactly by remote and branch.
+- **Which commit.** The remote's side is rlord's private ref when this
+  call just fetched it (even behind the user's own `origin/<b>`: a
+  force-push back to an older commit), else the newer of the two. The default branch (no `ref`), a launch's base, and
+  any `<remote>/<b>` are the remote's commit even when the local branch
+  is ahead (a warning says how far); `<remote>/<b>` never falls back to
+  a local branch. A plain named `ref` is the newer of local and remote;
+  diverged, both sides come back and the overlord asks the user, then
+  passes `prefer`. Commits that can't be compared are no divergence (a
+  warning, the remote's). A named branch not here yet says why (still
+  fetching, offline, failed), not that it doesn't exist.
+- **Default branch and remote.** `origin`, else the only remote, else
+  none (the local branch; `upstream` is owed). The default branch comes
+  from the remote's HEAD as the repo knows it, rlord's record, the
+  remote asked (recorded, and a failure backed off), then
+  `main`/`master`. The tool may show the checkout's own branch when none
+  of those answers, never as the default; a launch never uses it and
+  starts at HEAD instead, saying why. A default branch the remote no
+  longer has is asked of the remote again. A launch's `prefer` counts
+  only with a named `base`. rlord never runs `remote set-head`.
+- **Never hang, never prompt.** Every git call has a time limit that
+  kills its process group, no terminal or askpass prompt, ssh in batch
+  mode (the user's own ssh command kept), no hooks, no auto gc, no
+  submodules; LFS files stay pointers. Branch names never reach git as
+  options.
+- **Fetch cost.** A recent success is reused (`cached`, never while the
+  private ref is missing). A fetch runs on its own thread, one per
+  (repo, remote, branch); callers wait a bounded time and otherwise go
+  on with the last known commit (`running`), and the fetch's thread
+  records its own success. A launch's whole wait is capped, longer only
+  for a named base that is still on its first fetch. A failure is the
+  answer again for a while (shorter for a named branch). Only a hard
+  limit kills a fetch: a slow first fetch killed early would never
+  finish.
+- **Locks.** Resolving takes no lock (one fetch per key; records change
+  field by field in one DB hold). One lock per repo is held while its
+  tree is moved or removed, so a launch's base never waits on a tree.
+  The DB is taken briefly under that lock, never the reverse
+  (`locks.rs`).
+- **Records and cleanup.** One kv key per repo (`repo_latest:<common git
+  dir>`). A sweep after start and then daily works from those records
+  only, never scanning for repos: it drops the record of a repo that is
+  gone, removes long-unused trees (keeping refs and cache) and drops
+  long-unfetched private refs. `rlord latest --prune [REPO]` (the current folder's repo by
+  default, every one with `--all`) removes trees, refs and record now,
+  and says what it left in place and why (in a guarded folder with git
+  alone); `--list` shows them.
+- **macOS privacy.** In a repo inside a folder macOS guards (and not
+  under a scan root) rlord reads no file itself and stats nothing
+  unprompted: only git runs there (it acts on the user's repo, which
+  their agent already uses), a warning says so, and the sweep skips it.
+- **Never touched:** the user's checkouts, local branches,
+  `refs/remotes/*`, index, stash, uncommitted work, config and hooks.
+  `local` in the answer reports, read-only, where the branch is checked
+  out and, for a named `ref`, how many files are uncommitted there.
+- A folder that is not a git repo is answered as it is (`git: false`).
+  `repo_latest` is a mutating tool (it fetches and moves a tree), so a
+  plain `rlord mcp` session can't call it.
+
 Tools (v1, the original design):
 - `list_sessions(filter?, sort?, usage?)` — same query object as the CLI;
   returns meta-context (status, timestamps, tags, usage, pending-message
@@ -747,13 +860,14 @@ update`, `rlord web install`) run `curl` or `gh` from a compiled-in script.
 (`rlord-web-v<ver>-<target>.tar.gz`: the binary, both licenses and the
 bundled npm packages' `THIRD-PARTY-LICENSES.md`), never in the rlord
 tarball, the packages, Homebrew or crates.io. The release build makes
-`rlord-web` first, signs it (macOS, ad hoc), hashes it, then builds `rlord`
-with that SHA-256 compiled in (`RLORD_WEB_SHA256`, read by
+`rlord-web` first, signs it on macOS (the same Developer ID as `rlord`,
+identifier `com.robot-lord.rlord-web`), hashes the signed file, then
+builds `rlord` with that SHA-256 compiled in (`RLORD_WEB_SHA256`, read by
 `plugin::COMPILED_SHA256`), and checks the new `rlord` installs the new
 plugin (`xtask/src/build.rs`). Nothing may touch the plugin after it is
-hashed. So the trust root is the `rlord` the user already runs: no signing
-key, and a swapped asset or a tampered `SHA256SUMS` can't produce a plugin
-it will run.
+hashed. So the trust root is the `rlord` the user already runs: the check
+needs no signature, and a swapped asset or a tampered `SHA256SUMS` can't
+produce a plugin it will run.
 
 - `rlord web install` (`crates/rlord/src/web_install.rs`) downloads the
   tarball and `SHA256SUMS` (`web-install.sh`: `gh` when logged in, else
@@ -1427,6 +1541,41 @@ daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
 `branch`; the model is kept in `launch_spec` so restarts resume with the same
 `--model`.
 
+A **new branch starts from the latest default branch**, fetched.
+`Daemon::call` works the start out before the DB lock
+(`repo_latest::set_launch_base`, the same fetch and pick rule as
+`repo_latest`, with its wait capped) and puts it in
+`params["base_resolved"]`, always overwriting what a caller sent. The
+location it worked out (`methods::new_location`) goes along as
+`params["location_resolved"]` (also never a caller's), so `session_new`
+doesn't work it out again; it carries the branch name too
+(`new_location` has the one rule for it). `session.new`'s cheap checks
+(`methods::precheck_new`: the background's limits, the agent installed,
+Remote Control possible) run before any of this, so a launch that will
+be refused waits on no fetch; `session_new` runs the same function, the
+one set of checks. The manual form (`N`) sends `session.new` from a
+thread of its own, one launch at a time, and reopens with the error if
+it fails. Editing its Base clears a `prefer` that came with a proposal. The
+worktree is then `git worktree add --no-track -b <branch> <dir> <commit>`
+(`--no-track`: a private ref never becomes the upstream). An existing
+branch is checked out as it is. `[session] base = "head"` starts it at the main
+checkout's `HEAD`, with no fetch; `create_session`'s `base` names a branch (or
+`<remote>/<branch>`) to build on, or `"head"`; with `prefer` (`local`,
+`remote`), the side the user chose when that branch had diverged. It is also a hint on the
+`n` form, carried through the request, `confirm_new_session` and
+`propose_session` like the other hints. Left alone, the form shows and
+sends the configured `base` marked as a default, so it never overrides
+`[session] base`; only the user's pick or a confirmed change does. A
+`confirm_new_session` that leaves `base` out keeps it as the request
+sent it (with its `prefer`); only `""` puts it back to the configured
+default. No remote, offline, a
+failed fetch or no default branch fall back (to the last known commit,
+or to `HEAD`) and never refuse the launch; only a named `base` that has
+diverged or doesn't exist does, with both sides in the error. The
+`launched` event and `session.new`'s answer carry `base`. A session in an
+existing folder (`workspace: false`, `project`) is never fetched into or
+moved.
+
 ### Session background
 
 `session.new` takes three inputs, kept apart: `prompt`, the user's words
@@ -1439,7 +1588,13 @@ adds more later. A
 session the overlord launched (`create_session` sets `by_overlord`, as
 does the manual form when it was `propose_session`'s) has a background
 even with no notes (kv `context_on:<id>`), since the header carries the
-"you are the session the user asked for" line. The prompt is taken as
+"you are the session the user asked for" line. Such a session whose
+branch started from the latest code gets one more row first, `source =
+'base'`, written by plain code: which commit (`origin/main at abc1234`,
+its subject and age) and whether it was fetched just now or as last
+fetched (offline, still running: "it may be behind"). One that started
+at the main checkout's HEAD instead gets that row too, saying so and why
+(`[session] base = "head"`, asked for, or the latest couldn't be found). The prompt is taken as
 given: `overlord.md` is compiled in and rewritten at every overlord
 start, so no overlord sends the old combined prompt.
 

@@ -10,9 +10,19 @@
 //! that has only a ref resolves it with a short DB hold, lets go, takes
 //! this, then takes the DB again. `send`'s `TYPING` comes after all three
 //! and is never held while taking any of them.
+//!
+//! The same lock keyed by a repo's common git dir (`KeyLocks`) is held by
+//! `repo_latest` while it moves or removes that repo's tree (resolving
+//! and fetching take no lock, so a launch's base never waits on it).
+//! Order: that lock, then the DB, briefly. Never take it while holding
+//! the DB: `repo.latest*` and `session.new`'s base are worked out before
+//! the DB lock is taken (`Daemon::call`).
 
 use std::collections::HashSet;
 use std::sync::{Condvar, Mutex};
+
+/// Locks keyed by any string (`SessionLocks` by session id; this by repo).
+pub type KeyLocks = SessionLocks;
 
 #[derive(Default)]
 pub struct SessionLocks {

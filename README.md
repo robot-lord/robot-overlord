@@ -10,6 +10,8 @@
 OpenCode) running in tmux, in one list you can sort, search and organize,
 and gives you an **overlord**: an AI session that drives rlord for you.
 
+Website: [robot-overlord.app](https://robot-overlord.app)
+
 [Install](#install) · [How it works](#how-it-works) · [User guide](docs/guide.md) · [Contributing](CONTRIBUTING.md)
 
 <img src="docs/images/overlord.png" alt="The overlord, open over the session list" width="900">

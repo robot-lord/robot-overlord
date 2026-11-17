@@ -567,6 +567,13 @@ Decided 2026-11-17 (user):
   removed. This doc and `e2e-crypto.md` stay in progress (the relay and
   the phone app are the rest of the effort). Not done: the optional `:web`
   list command.
+- Merged main (1.0.0 signing, 1.1.0 fresh repo code). feat/web-ui is now
+  a long-running feature branch at `1.2.0-dev.1`. The plugin goes through
+  main's `sign()` (Developer ID, identifier `com.robot-lord.rlord-web`)
+  before it is hashed; `build-macos` in `release.yml` runs in the
+  `release` environment with the keychain import and `RLORD_RELEASE`,
+  takes `web-page` through `RLORD_WEB_DIST`, and "Verify signature"
+  checks both binaries.
 - Owed from slice 1 (by hand, in a real browser): Option as Meta and the
   browser-kept keys on a real keyboard, the wheel and copy, IME, two tabs
   at once, the TUI overlay open alongside, WebGL context loss
@@ -657,8 +664,9 @@ registry, crates.io and nodejs.org on 2026-11-17, not from memory.
   `PATH`: nobody runs it by hand. The same place for every install method
   (get.sh, Homebrew, deb, rpm), since the plugin is per user.
 - **Verification: the hash of the plugin is compiled into `rlord`.** The
-  release build makes `rlord-web` first, signs it (macOS ad-hoc), takes
-  the SHA-256 of the executable and builds `rlord` with
+  release build makes `rlord-web` first, signs it (macOS: the same
+  Developer ID as `rlord` since the merge of main's signing, identifier
+  `com.robot-lord.rlord-web`), takes the SHA-256 of the signed executable and builds `rlord` with
   `RLORD_WEB_SHA256=<hex>` (`option_env!` in `core/src/plugin.rs`; `rlord`
   is built per target, so one hash each). The trust root is the `rlord`
   the user already runs: a swapped release asset, a tampered

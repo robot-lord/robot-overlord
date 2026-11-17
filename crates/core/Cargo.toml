@@ -28,6 +28,11 @@ grep-matcher = "0.1"
 libc.workspace = true
 # The web plugin's hash check (plugin.rs); not network code.
 sha2 = "0.10"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Temp git repos for other crates' tests (`latest::testing`).
+test-util = ["dep:tempfile"]

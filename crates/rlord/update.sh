@@ -86,6 +86,14 @@ if [[ -z $tag ]]; then
     fi
     if [[ -z $tag ]] || newer "$t" "$tag"; then tag=$t; fi
   done < <(releases)
+  # No stable release yet: the newest development build (macOS only).
+  if [[ -z $tag && $channel == stable && $target == *apple-darwin ]]; then
+    while read -r t pre; do
+      [[ -z $t ]] && continue
+      if [[ -z $tag ]] || newer "$t" "$tag"; then tag=$t; fi
+    done < <(releases)
+    [[ -n $tag ]] && echo "(no stable release yet: using development build $tag)"
+  fi
   [[ -n $tag ]] || { echo "couldn't find a release of $repo" >&2; exit 1; }
 fi
 

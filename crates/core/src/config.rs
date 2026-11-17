@@ -421,6 +421,10 @@ pub struct SessionDefaults {
     pub workspace: bool,
     /// Directory (relative to the repo root) that holds session worktrees.
     pub workspace_dir: String,
+    /// Where a new session's new branch starts: "latest" (the default
+    /// branch's newest commit, fetched; `latest.rs`) or "head" (the main
+    /// checkout's HEAD, no fetch).
+    pub base: String,
     /// Repo preselected in the new-session form. Empty = the current directory.
     pub default_repo: String,
     /// Where the user's repos live and new ones are created. Empty = not
@@ -452,6 +456,7 @@ impl Default for SessionDefaults {
             opencode_model: String::new(),
             workspace: true,
             workspace_dir: ".worktrees".into(),
+            base: "latest".into(),
             default_repo: String::new(),
             code_dir: String::new(),
             repo_roots: Vec::new(),
@@ -463,6 +468,23 @@ impl Default for SessionDefaults {
 }
 
 impl SessionDefaults {
+    /// `base = "head"`: new branches start at the main checkout's HEAD,
+    /// with no fetch. Anything else is "latest".
+    pub fn base_is_head(&self) -> bool {
+        self.base.trim().eq_ignore_ascii_case("head")
+    }
+
+    /// Why `base` isn't one rlord knows ("latest" or "head"; taken as
+    /// "latest"), if it isn't.
+    pub fn base_problem(&self) -> Option<String> {
+        let b = self.base.trim();
+        (!b.eq_ignore_ascii_case("latest") && !b.eq_ignore_ascii_case("head")).then(|| {
+            format!(
+                "[session] base = {b:?} is neither \"latest\" nor \"head\": taken as \"latest\""
+            )
+        })
+    }
+
     /// The default model for sessions of `agent` ("" = the agent's own).
     pub fn model_for(&self, agent: crate::agents::Agent) -> &str {
         match agent {
@@ -1005,6 +1027,9 @@ opencode_model = ""             # OpenCode's model, as provider/model; "" =
                                 # its default (the picker: `opencode models`)
 workspace = true                # each session gets its own git worktree...
 workspace_dir = ".worktrees"    # ...under <repo>/.worktrees/<branch>
+base = "latest"                 # a new branch starts at the default branch's
+                                # newest commit, fetched; "head": at the main
+                                # checkout's HEAD, no fetch
 default_repo = ""               # e.g. "~/src/myrepo"; "" = current directory
 code_dir = ""                   # where your repos live and new ones go, e.g.
                                 # "~/code" (`rlord setup` suggests one)
@@ -1193,6 +1218,15 @@ mod tests {
         assert_eq!(c.preview_refresh_ms, 500);
         assert!(c.session.workspace);
         assert_eq!(c.session.workspace_dir, ".worktrees");
+        assert_eq!(c.session.base, "latest");
+        assert!(!c.session.base_is_head());
+        assert_eq!(c.session.base_problem(), None);
+        let mut s = c.session.clone();
+        s.base = "Head".into();
+        assert!(s.base_is_head() && s.base_problem().is_none());
+        s.base = "lastest".into();
+        assert!(!s.base_is_head());
+        assert!(s.base_problem().unwrap().contains("lastest"));
         assert_eq!(c.overlord.model, "opus");
         assert_eq!(c.overlord.effort, "medium");
         assert_eq!(c.overlord.fresh_after_mins, 60);

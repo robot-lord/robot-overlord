@@ -157,6 +157,32 @@ enum Command {
     },
     /// List git repos rlord has used, most recent first
     Repos,
+    /// The latest committed code of a repo, in rlord's read-only tree
+    /// (`<repo>/.worktrees/.rlord-latest`): fetches the branch, moves the
+    /// tree to its newest commit, prints the path and commit. Anything
+    /// edited in the tree is thrown away when it moves.
+    Latest {
+        /// The repo, or any folder in it (default: the current folder)
+        repo: Option<String>,
+        /// A branch (default: the default branch); <remote>/<branch> for the remote's
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// After a "diverged" answer: the side to use (local or remote)
+        #[arg(long)]
+        prefer: Option<String>,
+        /// List the trees rlord keeps
+        #[arg(long, conflicts_with_all = ["git_ref", "prefer", "prune"])]
+        list: bool,
+        /// Remove the tree and rlord's private refs of REPO (default: the
+        /// current folder's repo)
+        #[arg(long, conflicts_with_all = ["git_ref", "prefer"])]
+        prune: bool,
+        /// With --prune: every repo rlord keeps a tree or refs for
+        #[arg(long, requires = "prune", conflicts_with = "repo")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Set your code folder: where your repos live and new ones go (the
     /// repo finder scans it). Without PATH, rlord suggests one from the
     /// projects it has seen and asks.
@@ -1021,6 +1047,18 @@ fn main() -> Result<()> {
                 );
             }
             Ok(())
+        }
+        Command::Latest {
+            repo,
+            git_ref,
+            prefer,
+            list,
+            prune,
+            all,
+            json,
+        } => {
+            let prune = prune.then_some(all);
+            latest_cmd(repo, git_ref, prefer, list, prune, json).map(drop)
         }
         Command::Attach { r#ref } => {
             let s = call("session.get", json!({"ref": r#ref}))?;
@@ -2101,6 +2139,133 @@ fn print_web_status(st: &Value) {
     }
 }
 
+/// `repo.latest_prune`'s params for `rlord latest --prune [REPO] [--all]`:
+/// REPO (made absolute against `cwd`, `absolute_folder`), else the
+/// current folder's repo; every repo only with `--all`.
+fn prune_params(repo: Option<String>, all: bool, cwd: &std::path::Path) -> Result<Value> {
+    if all {
+        return Ok(json!({"all": true}));
+    }
+    let p = absolute_folder(repo.as_deref().unwrap_or("."), cwd)?;
+    Ok(json!({"repo": p}))
+}
+
+/// `rlord latest`: one RPC each (`repo.latest`, `_list`, `_prune`).
+/// `prune`: Some(all) for `--prune`.
+fn latest_cmd(
+    repo: Option<String>,
+    git_ref: Option<String>,
+    prefer: Option<String>,
+    list: bool,
+    prune: Option<bool>,
+    json: bool,
+) -> Result<Value> {
+    let cwd = std::env::current_dir()?;
+    let v = if list {
+        call("repo.latest_list", json!({}))?
+    } else if let Some(all) = prune {
+        call("repo.latest_prune", prune_params(repo.clone(), all, &cwd)?)?
+    } else {
+        let repo = absolute_folder(repo.as_deref().unwrap_or("."), &cwd)?;
+        call(
+            "repo.latest",
+            json!({"repo": repo, "ref": git_ref, "prefer": prefer}),
+        )?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(v);
+    }
+    let short = |c: &Value| {
+        c.as_str()
+            .map(rlord_core::latest::short)
+            .unwrap_or("-")
+            .to_string()
+    };
+    if list {
+        for t in v["trees"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            println!(
+                "{:<6} {:<20} {}  {}",
+                rel_age(t["used_at"].as_i64()),
+                t["ref"].as_str().unwrap_or("-"),
+                short(&t["commit"]),
+                t["path"].as_str().or(t["repo"].as_str()).unwrap_or("?")
+            );
+        }
+    } else if prune.is_some() {
+        for r in v["removed"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            println!("removed {}", r.as_str().unwrap_or("?"));
+        }
+        for l in v["left"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            println!(
+                "left {} ({})",
+                l["path"].as_str().unwrap_or("?"),
+                l["why"].as_str().unwrap_or("")
+            );
+        }
+        for f in v["failed"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            eprintln!(
+                "{}: {}",
+                f["repo"].as_str().unwrap_or("?"),
+                f["error"].as_str().unwrap_or("")
+            );
+        }
+        if v["failed"].as_array().is_some_and(|f| !f.is_empty()) {
+            anyhow::bail!("some trees could not be removed");
+        }
+    } else if v["git"] == false {
+        println!("{} (not a git repo)", v["path"].as_str().unwrap_or("?"));
+    } else if v["tree"] == "preparing" {
+        eprintln!(
+            "rlord's tree for {} is still being made: run this again shortly",
+            v["repo"].as_str().unwrap_or("the repo")
+        );
+        anyhow::bail!("the tree isn't ready yet");
+    } else if v["diverged"] == true {
+        let side = |s: &Value| {
+            format!(
+                "{} {} ({} ahead)",
+                short(&s["commit"]),
+                s["subject"].as_str().unwrap_or(""),
+                s["ahead"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or("?".into())
+            )
+        };
+        println!("{} has diverged:", v["ref"].as_str().unwrap_or("?"));
+        println!("  local:  {}", side(&v["local"]));
+        println!("  remote: {}", side(&v["remote_side"]));
+        println!("pass --prefer local or --prefer remote");
+    } else {
+        println!("{}", v["path"].as_str().unwrap_or("?"));
+        println!(
+            "{} at {} ({}) {}; fetch: {}",
+            v["ref"].as_str().unwrap_or("?"),
+            short(&v["commit"]),
+            v["source"].as_str().unwrap_or("?"),
+            v["subject"].as_str().unwrap_or(""),
+            v["fetch"].as_str().unwrap_or("?")
+        );
+    }
+    for w in v["warnings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        eprintln!("warning: {}", w.as_str().unwrap_or(""));
+    }
+    Ok(v)
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -2160,6 +2325,8 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::summary::start(&daemon);
         // Restart an idle overlord on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
+        // Remove rlord's read-only trees of repos that are gone or unused.
+        rlord_daemon::repo_latest::start_sweeper(&daemon);
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
         rlord_daemon::discover::start(&daemon);
@@ -2726,6 +2893,19 @@ fn lineage_lines(s: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latest_prune_is_the_current_repo_unless_all() {
+        use serde_json::json;
+        let cwd = std::path::Path::new("/w/app/sub");
+        let p =
+            |r: Option<&str>, all| super::prune_params(r.map(str::to_string), all, cwd).unwrap();
+        assert_eq!(p(None, false), json!({"repo": "/w/app/sub"}));
+        assert_eq!(p(Some("../other"), false), json!({"repo": "/w/app/other"}));
+        assert_eq!(p(Some("/r/"), false), json!({"repo": "/r"}));
+        assert_eq!(p(None, true), json!({"all": true}));
+        assert!(super::prune_params(Some("/".into()), false, cwd).is_err());
+    }
+
     use super::*;
     use std::path::Path;
 

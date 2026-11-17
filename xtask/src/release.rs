@@ -4,8 +4,8 @@
 //! The version in Cargo.toml decides the kind of release:
 //!
 //! - `X.Y.Z-dev.N`, a development build: built here on the maintainer's
-//!   Apple Silicon Mac, macOS only, a GitHub pre-release. What ordinary PRs
-//!   ship; `[update] channel = "dev"` installs them.
+//!   Apple Silicon Mac, macOS only, a GitHub pre-release, for work that isn't ready yet;
+//!   `[update] channel = "dev"` installs them.
 //! - `X.Y.Z`, a stable release: built in GitHub Actions
 //!   (.github/workflows/release.yml). This pushes the tag, waits for the
 //!   run, checks the release assets against the CI-made SHA256SUMS and

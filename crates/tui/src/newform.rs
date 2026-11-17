@@ -2,7 +2,7 @@
 //!
 //! - `n` — **describe it to the overlord**: what the session should do (as
 //!   long as you like, including instructions for the overlord), plus
-//!   optional hints (repo, agent, model, worktree, tags). The description wins over
+//!   optional hints (repo, agent, model, worktree, base, tags). The description wins over
 //!   the hints. Sent as a `[rlord new-session request]` message; the overlord
 //!   names the session, writes its prompt and launches it, or, when the
 //!   description contradicts a hint, reopens this form with the hints
@@ -25,10 +25,18 @@ pub(crate) enum Field {
     Model,
     Workspace,
     Branch,
+    /// Where a new branch starts: "" is the latest default branch.
+    Base,
     Prompt,
     Tags,
     Launch,
 }
+
+/// A manual launch on its way: its answer, and the form it came from.
+pub(crate) type LaunchSend = (
+    mpsc::Receiver<std::result::Result<Value, String>>,
+    Box<NewForm>,
+);
 
 /// Which form: the overlord request (`n`) or the manual launch (`N`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,23 +45,25 @@ pub(crate) enum FormKind {
     Manual,
 }
 
-const OVERLORD_FIELDS: [Field; 7] = [
+const OVERLORD_FIELDS: [Field; 8] = [
     Field::Prompt,
     Field::Repo,
     Field::Agent,
     Field::Model,
     Field::Workspace,
+    Field::Base,
     Field::Tags,
     Field::Launch,
 ];
 
-const FIELDS: [Field; 8] = [
+const FIELDS: [Field; 9] = [
     Field::Repo,
     Field::Name,
     Field::Agent,
     Field::Model,
     Field::Workspace,
     Field::Branch,
+    Field::Base,
     Field::Prompt,
     Field::Launch,
 ];
@@ -62,7 +72,7 @@ impl Field {
     fn is_text(self) -> bool {
         matches!(
             self,
-            Field::Name | Field::Branch | Field::Prompt | Field::Tags
+            Field::Name | Field::Branch | Field::Base | Field::Prompt | Field::Tags
         )
     }
     fn label(self, kind: FormKind) -> &'static str {
@@ -74,11 +84,21 @@ impl Field {
             Field::Workspace if kind == FormKind::Overlord => "Worktree",
             Field::Workspace => "Workspace",
             Field::Branch => "Branch",
+            Field::Base => "Base",
             Field::Prompt if kind == FormKind::Overlord => "What should this session do?",
             Field::Prompt => "Prompt",
             Field::Tags => "Tags",
             Field::Launch => "",
         }
+    }
+}
+
+/// How a `base` value reads on the forms.
+fn base_label(base: &str) -> &str {
+    match base {
+        "latest" => "latest default branch",
+        "head" => "the main checkout's HEAD",
+        b => b,
     }
 }
 
@@ -252,6 +272,15 @@ pub(crate) struct NewForm {
     workspace: bool,
     branch: String,
     branch_touched: bool,
+    /// Where a new branch starts: "" (the default) is the latest default
+    /// branch; a branch, `<remote>/<branch>`, or "head".
+    base: String,
+    /// With a proposed `base` that had diverged: the side the user chose
+    /// (`local`, `remote`), carried to the launch.
+    prefer: String,
+    /// `[session] base` as configured ("latest" or "head"): what an
+    /// empty `base` means, shown and sent as the default.
+    default_base: String,
     prompt: String,
     /// Overlord form: space-separated groups for the new session.
     tags: String,
@@ -263,6 +292,7 @@ pub(crate) struct NewForm {
     agent_chosen: bool,
     model_chosen: bool,
     workspace_chosen: bool,
+    base_chosen: bool,
     tags_chosen: bool,
     /// The worktree default, restored when a plain folder (no worktree)
     /// gives way to a repo again...
@@ -326,6 +356,12 @@ impl NewForm {
         }
         if let Some(w) = p["workspace"].as_bool() {
             self.workspace = w && matches!(self.location, Location::Repo(_));
+        }
+        if let Some(b) = get("base") {
+            self.base = b;
+        }
+        if let Some(p) = get("prefer") {
+            self.prefer = p;
         }
         if let Some(pr) = get("prompt") {
             self.prompt = pr;
@@ -412,6 +448,13 @@ impl NewForm {
         if let Some(w) = p["workspace"].as_bool() {
             self.workspace = w && !matches!(self.location, Location::Folder(_));
         }
+        // (The configured default is shown as such, not as a pick; a side
+        // comes only with a base.)
+        self.prefer = get("prefer").unwrap_or_default();
+        let default = self.default_base.clone();
+        self.base = get("base")
+            .filter(|b| !b.eq_ignore_ascii_case(&default))
+            .unwrap_or_default();
         // Only the tags it sent: not the group tab the form opened on.
         self.tags.clear();
         if let Some(t) = p["tags"].as_array() {
@@ -424,7 +467,7 @@ impl NewForm {
         // Whose each hint is, as rlord worked it out from the request it
         // last delivered: `chosen` the user's, `resolved` the overlord's,
         // the rest defaults.
-        let keys = ["repo", "agent", "model", "worktree", "tags"];
+        let keys = ["repo", "agent", "model", "worktree", "base", "tags"];
         let list = |name: &str| -> Vec<&'static str> {
             keys.into_iter()
                 .filter(|k| {
@@ -439,6 +482,7 @@ impl NewForm {
         self.agent_chosen = chosen.contains(&"agent");
         self.model_chosen = chosen.contains(&"model");
         self.workspace_chosen = chosen.contains(&"worktree");
+        self.base_chosen = chosen.contains(&"base");
         self.tags_chosen = chosen.contains(&"tags");
         self.resolved = list("resolved");
         self.reopened = true;
@@ -578,7 +622,32 @@ impl NewForm {
             .to_string()
     }
 
-    /// The user picked a hint (`repo` / `agent` / `model` / `worktree` / `tags`). On a fresh form
+    /// The base the user (or the overlord) typed, when it can count: a
+    /// worktree on, not a plain folder.
+    fn typed_base(&self) -> Option<&str> {
+        let b = self.base.trim();
+        (!b.is_empty() && self.workspace && !matches!(self.location, Location::Folder(_)))
+            .then_some(b)
+    }
+
+    /// A key typed in the Base field: a character added, or (None) the
+    /// last one taken away. A side chosen for the old base (`prefer`)
+    /// isn't for the new one: cleared.
+    fn edit_base(&mut self, c: Option<char>) {
+        let changed = match c {
+            Some(c) => {
+                self.base.push(c);
+                true
+            }
+            None => self.base.pop().is_some(),
+        };
+        if changed {
+            self.prefer.clear();
+        }
+        self.mark_picked("base", changed);
+    }
+
+    /// The user picked a hint (`repo` / `agent` / `model` / `worktree` / `base` / `tags`). On a fresh form
     /// any pick is theirs (pinning the default counts); on a form the
     /// overlord reopened only a real change is, and it drops the overlord's
     /// label and confirmation.
@@ -590,6 +659,7 @@ impl NewForm {
                 "model" => self.model_chosen = true,
                 "tags" => self.tags_chosen = true,
                 "worktree" => self.workspace_chosen = true,
+                "base" => self.base_chosen = true,
                 _ => debug_assert!(false, "unknown hint {key}"),
             }
         }
@@ -710,6 +780,12 @@ impl App {
             before_folder: None,
             branch: String::new(),
             branch_touched: false,
+            base: String::new(),
+            prefer: String::new(),
+            default_base: match defaults["base"].as_str().map(str::trim) {
+                Some(b) if b.eq_ignore_ascii_case("head") => "head".into(),
+                _ => "latest".into(),
+            },
             prompt: String::new(),
             tags,
             repos,
@@ -718,6 +794,7 @@ impl App {
             agent_chosen: false,
             model_chosen: false,
             workspace_chosen: false,
+            base_chosen: false,
             // Opened from a group: joining it is the user's choice.
             tags_chosen: from_group,
             resolved: Vec::new(),
@@ -1014,6 +1091,7 @@ impl App {
                     let removed = f.tags.pop().is_some();
                     f.mark_picked("tags", removed);
                 }
+                Field::Base => f.edit_base(None),
                 _ => {}
             },
             KeyCode::Char(c) if field.is_text() && !k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1036,6 +1114,7 @@ impl App {
                         f.tags.push(c);
                         f.mark_picked("tags", true);
                     }
+                    Field::Base => f.edit_base(Some(c)),
                     _ => {}
                 }
             }
@@ -1183,6 +1262,7 @@ impl App {
             ("agent", f.agent_chosen),
             ("model", f.model_chosen),
             ("worktree", f.workspace_chosen),
+            ("base", f.base_chosen),
             ("tags", f.tags_chosen && !f.tags.trim().is_empty()),
         ]
         .into_iter()
@@ -1193,6 +1273,10 @@ impl App {
             "agent": f.agent,
             "model": f.model,
             "workspace": f.workspace,
+            // Empty: the configured default, sent as one (not chosen), so
+            // it never overrides `[session] base`.
+            "base": f.typed_base().unwrap_or(f.default_base.as_str()),
+            "prefer": if f.typed_base().is_none() || f.prefer.is_empty() { None } else { Some(f.prefer.as_str()) },
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
             // The overlord's resolved values the user left as they were.
@@ -1246,6 +1330,9 @@ impl App {
             "model": f.model,
             "workspace": f.workspace,
             "branch": if f.branch.trim().is_empty() { None } else { Some(f.branch.trim()) },
+            // (A base only for a new branch in a worktree.)
+            "base": f.typed_base(),
+            "prefer": if f.prefer.is_empty() || f.typed_base().is_none() { None } else { Some(f.prefer.as_str()) },
         });
         match &f.location {
             Location::Repo(p) => params["repo"] = json!(p),
@@ -1258,25 +1345,75 @@ impl App {
                 return Ok(Some(f));
             }
         }
-        match client_call(&paths::socket_path(), "session.new", params) {
-            Ok(v) => {
-                self.status_line = match v["workspace_path"].as_str() {
-                    Some(ws) => format!(
-                        "launched {} in {}",
-                        v["name"].as_str().unwrap_or("?"),
-                        ws.replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1)
-                    ),
-                    None => format!("launched {}", v["name"].as_str().unwrap_or("?")),
-                };
-                self.dirty = true;
-                self.table.select(Some(0));
-                Ok(None)
+        // One at a time: a second waits for the first's answer.
+        if self.launch_send.is_some() {
+            f.error = Some("a launch is still on its way: try again in a moment".into());
+            return Ok(Some(f));
+        }
+        // Off this thread: the launch may wait on a fetch (its base).
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = client_call(&paths::socket_path(), "session.new", params)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(r);
+        });
+        self.status_line = "launching…".into();
+        self.launch_send = Some((rx, f));
+        Ok(None)
+    }
+
+    /// The manual launch's answer, once it has come (the event loop asks
+    /// on each pass): said in the status line; on failure the form comes
+    /// back with the error, once nothing else is open. True when the
+    /// screen changed.
+    pub(crate) fn poll_launch(&mut self) -> bool {
+        if let Some((rx, _)) = &self.launch_send {
+            let r = match rx.try_recv() {
+                Ok(r) => r,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => Err("the launch was lost".into()),
+            };
+            let (_, mut f) = self.launch_send.take().expect("checked");
+            match r {
+                Ok(v) => {
+                    self.status_line = match v["workspace_path"].as_str() {
+                        Some(ws) => format!(
+                            "launched {} in {}",
+                            v["name"].as_str().unwrap_or("?"),
+                            ws.replacen(&std::env::var("HOME").unwrap_or_default(), "~", 1)
+                        ),
+                        None => format!("launched {}", v["name"].as_str().unwrap_or("?")),
+                    };
+                    // (Selected once the list has it, as a fork is.)
+                    self.pending_select = v["id"].as_str().map(str::to_string);
+                }
+                Err(e) => {
+                    self.status_line = format!("not launched: {e}");
+                    match &mut self.launch_retry {
+                        // One already waiting to reopen: it stays (the
+                        // first), and says both errors.
+                        Some(first) => {
+                            let was = first.error.take().unwrap_or_default();
+                            first.error = Some(format!("{was}; then: {e}"));
+                        }
+                        None => {
+                            f.error = Some(e);
+                            self.launch_retry = Some(f);
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                f.error = Some(format!("{e:#}"));
-                Ok(Some(f))
+            // (The status line changed: redrawn, and reopened below if
+            // nothing else is open.)
+            if !(self.launch_retry.is_some() && matches!(self.mode, Mode::Normal)) {
+                return true;
             }
         }
+        if self.launch_retry.is_some() && matches!(self.mode, Mode::Normal) {
+            self.mode = Mode::NewSession(self.launch_retry.take().expect("checked"));
+            return true;
+        }
+        false
     }
 
     pub(crate) fn draw_form(&self, f: &mut Frame, form: &NewForm) {
@@ -1419,6 +1556,18 @@ impl App {
                         "(from name)".into()
                     } else {
                         form.branch.clone()
+                    }
+                }
+                Field::Base => {
+                    if !form.workspace || matches!(form.location, Location::Folder(_)) {
+                        "-".into()
+                    } else if form.base.is_empty() && !focused {
+                        format!("{} (default)", base_label(&form.default_base))
+                    } else {
+                        match form.prefer.as_str() {
+                            "" => form.base.clone(),
+                            p => format!("{} ({p} side)", form.base),
+                        }
                     }
                 }
                 Field::Prompt => form.prompt.clone(),
@@ -1726,6 +1875,19 @@ fn draw_describe_form(
         },
         form.workspace_chosen,
     ));
+    let base_focused = focus(Field::Base);
+    let base = match (&form.location, form.workspace) {
+        (Location::Folder(_), _) | (_, false) => "n/a (no worktree)".to_string(),
+        _ if form.base.is_empty() && !base_focused => base_label(&form.default_base).to_string(),
+        _ => format!("{}{}", form.base, if base_focused { "▏" } else { "" }),
+    };
+    lines.push(hint(
+        lines.len(),
+        Field::Base,
+        "base",
+        base,
+        form.base_chosen,
+    ));
     let tags_focused = focus(Field::Tags);
     let tags = if form.tags.is_empty() && !tags_focused {
         "overlord picks".to_string()
@@ -1926,6 +2088,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{s:?} missing:\n{out}"))
         };
         assert!(at("What should this session do?") < at("Optional hints"));
+        // The base hint: shown with its default, after the worktree.
+        assert!(at("worktree") < at("latest default branch"), "{out}");
         assert!(out.contains("your description wins"));
         assert!(out.contains("Send to overlord"));
         assert!(!out.contains("Request"));
@@ -1956,6 +2120,134 @@ mod tests {
         assert!(f.model_chosen && !f.repo_chosen && !f.workspace_chosen);
         assert_eq!(f.resolved, ["repo"]);
         assert_eq!(f.model, "", "reset to the agent default");
+        assert!(f.base.is_empty() && !f.base_chosen);
+        // A base the user picked comes back as theirs; "latest" is the
+        // default, shown as such.
+        f.prefill_confirm(&json!({"description": "x", "base": "feat", "chosen": ["base"]}));
+        assert_eq!((f.base.as_str(), f.base_chosen), ("feat", true));
+        f.prefill_confirm(&json!({"description": "x", "base": "latest", "resolved": ["base"]}));
+        assert_eq!((f.base.as_str(), f.base_chosen), ("", false));
+        assert_eq!(f.resolved, ["base"]);
+    }
+
+    /// A launch's answer redraws; a second failure keeps the first form
+    /// waiting to reopen and says both errors.
+    #[test]
+    fn launch_answers_redraw_and_keep_the_first_failure() {
+        /// A fresh manual form, whatever is open left as it is.
+        fn form_of(app: &mut App) -> Box<NewForm> {
+            let open = std::mem::replace(&mut app.mode, Mode::Normal);
+            app.open_new_form(FormKind::Manual);
+            match std::mem::replace(&mut app.mode, open) {
+                Mode::NewSession(f) => f,
+                _ => panic!("no form"),
+            }
+        }
+        fn answer(app: &mut App, r: std::result::Result<Value, String>) {
+            let f = form_of(app);
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(r).unwrap();
+            app.launch_send = Some((rx, f));
+        }
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        // Something else open: a failure waits to reopen.
+        let busy = form_of(&mut app);
+        app.mode = Mode::NewSession(busy);
+        answer(&mut app, Err("one".into()));
+        assert!(app.poll_launch());
+        answer(&mut app, Err("two".into()));
+        assert!(app.poll_launch());
+        let waiting = app.launch_retry.as_ref().unwrap();
+        assert_eq!(waiting.error.as_deref(), Some("one; then: two"));
+        assert!(app.status_line.contains("two"));
+        // A success: redrawn too, and selected.
+        answer(&mut app, Ok(json!({"id": "x1", "name": "n"})));
+        assert!(app.poll_launch());
+        assert_eq!(app.pending_select.as_deref(), Some("x1"));
+    }
+
+    /// A typed base counts only with a worktree in a repo.
+    #[test]
+    fn a_typed_base_needs_a_worktree() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.open_new_form(FormKind::Manual);
+        let mut f = match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        };
+        f.location = Location::Repo("/r".into());
+        f.workspace = true;
+        f.base = "feat".into();
+        assert_eq!(f.typed_base(), Some("feat"));
+        f.workspace = false;
+        assert_eq!(f.typed_base(), None);
+        f.workspace = true;
+        f.location = Location::Folder("/d".into());
+        assert_eq!(f.typed_base(), None);
+    }
+
+    /// A side chosen for a proposed base goes when the base is edited.
+    #[test]
+    fn editing_the_base_clears_its_side() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.open_new_form(FormKind::Manual);
+        let mut f = match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        };
+        f.prefill(&json!({"repo": "/r", "base": "feat", "prefer": "local"}));
+        assert_eq!(f.prefer, "local");
+        f.edit_base(Some('x'));
+        assert!(f.prefer.is_empty() && f.base == "featx");
+        // One launch at a time: a second, while the first is on its way,
+        // is refused with the form kept (the first's answer isn't lost).
+        let (_tx2, rx2) = std::sync::mpsc::channel();
+        app.open_new_form(FormKind::Manual);
+        let first = match std::mem::replace(&mut app.mode, Mode::Normal) {
+            Mode::NewSession(f) => f,
+            _ => panic!("no form"),
+        };
+        app.launch_send = Some((rx2, first));
+        let kept = app.submit_manual(f).unwrap().expect("kept open");
+        assert!(kept.error.as_deref().unwrap().contains("still on its way"));
+        assert!(app.launch_send.is_some());
+    }
+
+    /// `[session] base = "head"`: the form shows and sends it as the
+    /// default, never as a pick, so it can't override the config; an
+    /// explicit "latest" is a real choice.
+    #[test]
+    fn the_base_hint_defaults_to_the_config() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        let mut f = form(&mut app);
+        f.default_base = "head".into();
+        f.prompt = "x".into();
+        let out = render(&app, &f);
+        assert!(out.contains("the main checkout's HEAD"), "{out}");
+        assert!(!out.contains("latest default branch"), "{out}");
+        // What the request carries: the default, not chosen.
+        let msg = rlord_daemon::ask::format_request(&json!({
+            "description": "x", "base": f.default_base, "chosen": [],
+        }))
+        .unwrap();
+        assert!(
+            msg.contains("- base: the main checkout's HEAD (default)\n"),
+            "{msg}"
+        );
+        // Reopened with the default sent back: still the default.
+        f.prefill_confirm(&json!({"description": "x", "base": "head"}));
+        assert!(f.base.is_empty() && !f.base_chosen);
+        // An explicit "latest" over a "head" config stays a value.
+        f.prefill_confirm(&json!({"description": "x", "base": "latest", "chosen": ["base"]}));
+        assert_eq!((f.base.as_str(), f.base_chosen), ("latest", true));
     }
 
     #[test]

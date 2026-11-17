@@ -599,7 +599,16 @@ fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
     db.kv_set(&launched_args_key(id), &serde_json::to_string(argv)?)
 }
 
-pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+/// A new session's location (`new_location`): the repo's main root, if it
+/// is in one; the folder it runs in; and its branch when the params name
+/// it (`branch`, else from `name`; None: from a generated name).
+pub(crate) type Location = (Option<String>, String, Option<String>);
+
+/// Where a new session lives: an explicit repo, an explicit plain folder,
+/// or the configured default repo, and its branch name (the one rule for
+/// it). Shared with `repo_latest::set_launch_base`, which reads
+/// `session.new`'s params before the DB lock.
+pub(crate) fn new_location(cfg: &Config, params: &Value) -> Result<Location> {
     let p_opt = |k: &str| {
         params
             .get(k)
@@ -608,46 +617,9 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
             .filter(|v| !v.is_empty())
             .map(String::from)
     };
-    let agent = agent_param(cfg, params)?;
-    // Internal-only knobs (the overlord uses them; the MCP surface never
-    // forwards them): adapter flags that must survive restarts, a role, and a
-    // fixed tmux name.
-    let extra_args = str_list(params, "extra_args");
-    let role = p_opt("role").unwrap_or_default();
-    // Not installed: say how to get it, rather than fail in the pane.
-    if let Some(why) = install::missing(agent) {
-        bail!("{why}");
-    }
-    let remote_control = params["remote_control"].as_bool().unwrap_or(false);
-    if remote_control && !agent.has_remote_control() {
-        bail!(
-            "Remote Control is a Claude Code feature; {} has none",
-            agent.label()
-        );
-    }
-    // Each agent has its own models: the default is that agent's.
-    let model = p_opt("model").or_else(|| {
-        let m = cfg.session.model_for(agent).trim();
-        (!m.is_empty()).then(|| m.to_string())
-    });
-    // The user's words, and the overlord's notes and related sessions
-    // apart from them (checked: too long, refused for the overlord to
-    // shorten).
-    let prompt = p_opt("prompt");
-    let (note, links) = context::check(
-        db,
-        p_opt("context").as_deref(),
-        &ref_list(params, "related"),
-        None,
-    )?;
-    let notes: Vec<String> = note.into_iter().collect();
-    // Launched by the overlord (`create_session`, or its proposal the user
-    // launched): its background says so even with no notes.
-    let background = context::needs_background(params);
-
-    // Where the session lives: an explicit repo, an explicit plain folder,
-    // or the configured default repo.
-    let (repo, project): (Option<String>, String) = if let Some(r) = p_opt("repo") {
+    // The one rule for a session's branch name.
+    let branch = p_opt("branch").or_else(|| p_opt("name").map(|n| git::sanitize_branch(&n)));
+    let (repo, project) = if let Some(r) = p_opt("repo") {
         let r = expand_tilde(&r);
         let root =
             git::main_repo_root(&r).with_context(|| format!("{r} is not a git repository"))?;
@@ -662,6 +634,128 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         (Some(root.clone()), root)
     } else {
         bail!("no repo or project given and no default_repo configured");
+    };
+    Ok((repo, project, branch))
+}
+
+/// `session.new`'s cheap checks (the agent is installed, Remote Control
+/// is possible, the background is within its limits), run before its base
+/// is worked out (which may fetch), so a launch that will be refused
+/// waits on nothing. `Daemon::call` runs them once and hands the result to
+/// `session_new_with`; a direct `session_new` runs them itself.
+pub(crate) fn precheck_new(db: &Db, cfg: &Config, params: &Value) -> Result<Prechecked> {
+    let context = params["context"]
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    // (Too long: refused for the overlord to shorten.)
+    let (note, links) = context::check(db, context, &ref_list(params, "related"), None)?;
+    let agent = agent_param(cfg, params)?;
+    if let Some(why) = install::missing(agent) {
+        bail!("{why}");
+    }
+    if params["remote_control"].as_bool() == Some(true) && !agent.has_remote_control() {
+        bail!(
+            "Remote Control is a Claude Code feature; {} has none",
+            agent.label()
+        );
+    }
+    Ok(Prechecked { agent, note, links })
+}
+
+/// What `precheck_new` checked and `session_new` goes on with.
+#[derive(Debug)]
+pub(crate) struct Prechecked {
+    pub agent: Agent,
+    /// The overlord's note, checked.
+    pub note: Option<String>,
+    /// Related sessions, checked (their ids).
+    pub links: Vec<String>,
+}
+
+/// A new session's worktree at `dir`: an existing `branch` checked out as
+/// it is; a new one started at `base_resolved`'s commit (no upstream), or
+/// at the main checkout's HEAD when it has none. Returns the base used
+/// (null: none to speak of).
+pub(crate) fn new_worktree(
+    repo: &str,
+    branch: &str,
+    dir: &std::path::Path,
+    base_resolved: &Value,
+) -> Result<Value> {
+    // (`git::worktree_add` asks once whether the branch exists. A base
+    // is only worked out for a new branch, `launch_base`; one that
+    // appeared since is refused with a start, which a retry gets past.)
+    let start = base_resolved["commit"].as_str();
+    git::worktree_add(repo, branch, dir, start)?;
+    if start.is_some() {
+        return Ok(base_resolved.clone());
+    }
+    if base_resolved["head"] != true {
+        return Ok(Value::Null);
+    }
+    // Started at the main checkout's HEAD: which commit, for its note.
+    let mut v = base_resolved.clone();
+    let env = rlord_core::latest::GitEnv::default();
+    v["commit"] = json!(rlord_core::latest::commit_of(&env, dir, "HEAD"));
+    Ok(v)
+}
+
+pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
+    session_new_with(db, cfg, params, None)
+}
+
+/// `session_new` with `precheck_new` already run (`Daemon::call` runs it
+/// before the base); None: run here.
+pub(crate) fn session_new_with(
+    db: &Db,
+    cfg: &Config,
+    params: &Value,
+    prechecked: Option<Prechecked>,
+) -> Result<Value> {
+    let p_opt = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(String::from)
+    };
+    // The checks a launch makes before anything else (also run before
+    // its base, `Daemon::call`): the agent is installed (else how to get
+    // it, rather than fail in the pane), Remote Control is possible, the
+    // overlord's notes and related sessions are within their limits.
+    let Prechecked { agent, note, links } = match prechecked {
+        Some(p) => p,
+        None => precheck_new(db, cfg, params)?,
+    };
+    // Internal-only knobs (the overlord uses them; the MCP surface never
+    // forwards them): adapter flags that must survive restarts, a role, and a
+    // fixed tmux name.
+    let extra_args = str_list(params, "extra_args");
+    let role = p_opt("role").unwrap_or_default();
+    let remote_control = params["remote_control"].as_bool().unwrap_or(false);
+    // Each agent has its own models: the default is that agent's.
+    let model = p_opt("model").or_else(|| {
+        let m = cfg.session.model_for(agent).trim();
+        (!m.is_empty()).then(|| m.to_string())
+    });
+    // The user's words; the overlord's notes and related sessions apart
+    // from them (checked above).
+    let prompt = p_opt("prompt");
+    let notes: Vec<String> = note.into_iter().collect();
+    // Launched by the overlord (`create_session`, or its proposal the user
+    // launched): its background says so even with no notes.
+    let background = context::needs_background(params);
+
+    // (Worked out before the DB lock, `repo_latest::set_launch_base`; a
+    // direct call works it out here.)
+    let (repo, project, loc_branch) = match params["location_resolved"]["project"].as_str() {
+        Some(project) => {
+            let field = |k: &str| params["location_resolved"][k].as_str().map(str::to_string);
+            (field("repo"), project.to_string(), field("branch"))
+        }
+        None => new_location(cfg, params)?,
     };
 
     let id = new_id();
@@ -678,17 +772,32 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
         .get("workspace")
         .and_then(Value::as_bool)
         .unwrap_or(cfg.session.workspace);
+    // A new branch starts where `Daemon::call` worked out before the DB
+    // lock (`base_resolved`, from `repo_latest::launch_base`): the latest
+    // default branch, a named `base`, or the main checkout's HEAD.
+    let mut start_base = Value::Null;
     let (project_path, workspace_path, branch) = match (&repo, want_ws) {
         (Some(repo), true) => {
-            let branch = p_opt("branch").unwrap_or_else(|| git::sanitize_branch(&name));
+            let branch = loc_branch.unwrap_or_else(|| git::sanitize_branch(&name));
             let dir = git::workspace_path(repo, &cfg.session.workspace_dir, &branch);
             git::ensure_excluded(repo, &cfg.session.workspace_dir)?;
-            git::worktree_add(repo, &branch, &dir, None)?;
+            start_base = new_worktree(repo, &branch, &dir, &params["base_resolved"])?;
             let dir = dir.to_string_lossy().into_owned();
             (dir.clone(), Some(dir), Some(branch))
         }
         _ => (project, None, None),
     };
+    // Its background's rows: where its branch started (`source =
+    // 'base'`, plain code) first, then the overlord's notes and links.
+    let rows: Vec<context::NewRow> = crate::repo_latest::base_note(&start_base, now_ms())
+        .map(|body| context::NewRow {
+            kind: "note",
+            body,
+            source: "base",
+        })
+        .into_iter()
+        .chain(context::rows_from(&notes, &links, "overlord"))
+        .collect();
 
     // Remote Control from the start (the caller checked it's available).
     let remote = remote_control.then(|| crate::remote::remote_name(&name, &role));
@@ -714,7 +823,7 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
     // file that can't be written never stops the launch; the launch then
     // carries no flag or pointer naming it.
     let file_ok = delivery.is_some() && {
-        let text = context::launch_file_text(db, &name, &notes, &links, now_ms());
+        let text = context::launch_file_text_rows(db, &name, &[], &rows, now_ms());
         match context::write_file(&base, &id, &text) {
             Ok(_) => true,
             Err(e) => {
@@ -756,18 +865,22 @@ pub fn session_new(db: &Db, cfg: &Config, params: &Value) -> Result<Value> {
                 mode,
                 carried,
                 copy_from: None,
-                rows: context::rows_from(&notes, &links, "overlord"),
+                rows: rows.clone(),
             }),
             event: (
                 "launched",
-                json!({"workspace": workspace_path, "branch": branch}),
+                json!({"workspace": workspace_path, "branch": branch, "base": start_base}),
             ),
         },
     )?;
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
-    Ok(serde_json::to_value(s)?)
+    let mut v = serde_json::to_value(s)?;
+    if !start_base.is_null() {
+        v["base"] = start_base;
+    }
+    Ok(v)
 }
 
 /// A new session's background, as `start` stores it: how it reaches the

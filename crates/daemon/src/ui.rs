@@ -452,7 +452,8 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
 pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     let mut prefill = Map::new();
     for k in [
-        "repo", "project", "name", "branch", "agent", "model", "prompt", "context",
+        "repo", "project", "name", "branch", "agent", "model", "prompt", "context", "base",
+        "prefer",
     ] {
         if let Some(v) = params
             .get(k)
@@ -511,12 +512,38 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))
 }
 
+/// A `base` the overlord leaves out is unchanged: the one the request
+/// sent (with its side), if any. `""` is the configured default.
+fn keep_base(prefill: &mut Map<String, Value>, params: &Value, prev: &Value) {
+    if !params["base"].is_null() {
+        return;
+    }
+    let sent = |k: &str| {
+        prev[k]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let Some(b) = sent("base") else {
+        return;
+    };
+    prefill.insert("base".into(), json!(b));
+    if !prefill.contains_key("prefer") {
+        if let Some(p) = sent("prefer") {
+            prefill.insert("prefer".into(), json!(p));
+        }
+    }
+}
+
 /// Which hints on a reopened form are the user's own picks and which the
 /// overlord's, worked out by rlord from the request the form answers (its
 /// hint values and labels), never relayed by the model. A hint the overlord
 /// leaves out is a default again. The TUI shows the result as is: `chosen` (the user's), `resolved` (the
 /// overlord's), anything else is a default.
-fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
+/// `default_base`: the configured `[session] base` ("latest" or "head"),
+/// what a missing base means.
+fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value, default_base: &str) {
     use crate::ask::in_list;
     const FOLDER: &str = " (plain folder, not a repo)";
     let folder = prefill.contains_key("project") && !prefill.contains_key("repo");
@@ -529,6 +556,7 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
             }),
             "agent" => prefill.get("agent").cloned(),
             "model" => prefill.get("model").cloned(),
+            "base" => prefill.get("base").cloned(),
             // A plain folder has no worktree to pick.
             "worktree" => prefill.get("workspace").cloned().filter(|_| !folder),
             _ => prefill.get("tags").cloned(),
@@ -555,6 +583,16 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
                     json!(rlord_core::git::main_repo_root(r).unwrap_or_else(|| r.to_string()))
                 }
             },
+            // (Missing or "" is the configured default; "latest" and
+            // "head" in any case.)
+            ("base", Value::String(b)) if b.trim().is_empty() => json!(default_base),
+            ("base", Value::String(b))
+                if b.trim().eq_ignore_ascii_case("latest")
+                    || b.trim().eq_ignore_ascii_case("head") =>
+            {
+                json!(b.trim().to_ascii_lowercase())
+            }
+            ("base", Value::Null) => json!(default_base),
             ("tags", Value::Array(a)) => {
                 let mut t: Vec<String> = a
                     .iter()
@@ -573,11 +611,12 @@ fn apply_provenance(prefill: &mut Map<String, Value>, prev: &Value) {
     let prev_value = |k: &str| match k {
         "worktree" if prev_folder => None,
         "worktree" => norm(k, prev.get("workspace")),
+        "base" => norm(k, Some(prev.get("base").unwrap_or(&Value::Null))),
         _ => norm(k, prev.get(k)),
     };
     let mut chosen = Vec::new();
     let mut resolved = Vec::new();
-    for k in ["repo", "agent", "model", "worktree", "tags"] {
+    for k in ["repo", "agent", "model", "worktree", "base", "tags"] {
         let Some(v) = value(k) else { continue };
         let changed = prefill
             .get("changed")
@@ -606,7 +645,9 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         .context("missing 'description' (the user's, verbatim)")?;
     let mut prefill = Map::new();
     prefill.insert("description".into(), json!(description));
-    for k in ["repo", "project", "agent", "model", "note"] {
+    for k in [
+        "repo", "project", "agent", "model", "base", "prefer", "note",
+    ] {
         if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
             let v = if matches!(k, "repo" | "project") {
                 expand_tilde(v)
@@ -651,7 +692,13 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         }
         None => Value::Null,
     };
-    apply_provenance(&mut prefill, &provenance);
+    keep_base(&mut prefill, params, &provenance);
+    let default_base = if d.config().session.base_is_head() {
+        "head"
+    } else {
+        "latest"
+    };
+    apply_provenance(&mut prefill, &provenance, default_base);
     // The overlord is now waiting on the user (its fresh start waits too).
     d.db()
         .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;
@@ -714,7 +761,7 @@ mod provenance_tests {
 
     fn run(prefill: Value, prev: Value) -> Value {
         let mut m = prefill.as_object().unwrap().clone();
-        apply_provenance(&mut m, &prev);
+        apply_provenance(&mut m, &prev, "latest");
         Value::Object(m)
     }
 
@@ -753,6 +800,62 @@ mod provenance_tests {
         );
         assert_eq!(p["chosen"], json!([]));
         assert_eq!(p["resolved"], json!(["repo"]));
+    }
+
+    /// The base hint: the user's pick stays theirs while it holds; "" and
+    /// "latest" are the same default.
+    #[test]
+    fn base_labels() {
+        let prev = json!({"chosen": ["base"], "base": "feat"});
+        let p = run(json!({"base": "feat", "changed": []}), prev.clone());
+        assert_eq!(p["chosen"], json!(["base"]));
+        let p = run(json!({"base": "main", "changed": ["base"]}), prev.clone());
+        assert_eq!(p["resolved"], json!(["base"]));
+        // Sent as "" (none here): back to the default, no one's pick.
+        let p = run(json!({"changed": []}), prev);
+        assert!(p.get("base").is_none());
+        assert_eq!((&p["chosen"], &p["resolved"]), (&json!([]), &json!([])));
+        let p = run(
+            json!({"base": "latest", "changed": []}),
+            json!({"base": ""}),
+        );
+        assert_eq!((&p["chosen"], &p["resolved"]), (&json!([]), &json!([])));
+    }
+
+    /// A missing base is the configured default: with `[session] base =
+    /// "head"`, "latest" is a change and "head" is not.
+    #[test]
+    fn a_missing_base_is_the_configured_default() {
+        let mut m = json!({"base": "latest", "changed": []})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_provenance(&mut m, &json!({}), "head");
+        assert_eq!(m["resolved"], json!(["base"]));
+        let mut m = json!({"base": "HEAD", "changed": []})
+            .as_object()
+            .unwrap()
+            .clone();
+        apply_provenance(&mut m, &json!({}), "head");
+        assert_eq!((&m["chosen"], &m["resolved"]), (&json!([]), &json!([])));
+    }
+
+    /// A base the overlord leaves out stays as the user sent it (with its
+    /// side), and stays theirs; "" is the default.
+    #[test]
+    fn a_base_left_out_is_kept() {
+        let prev = json!({"chosen": ["base"], "base": "feat", "prefer": "local"});
+        let mut m = Map::new();
+        keep_base(&mut m, &json!({"description": "d"}), &prev);
+        assert_eq!(
+            (&m["base"], &m["prefer"]),
+            (&json!("feat"), &json!("local"))
+        );
+        apply_provenance(&mut m, &prev, "latest");
+        assert_eq!(m["chosen"], json!(["base"]));
+        let mut m = Map::new();
+        keep_base(&mut m, &json!({"base": ""}), &prev);
+        assert!(m.get("base").is_none());
     }
 }
 
