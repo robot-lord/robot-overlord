@@ -89,8 +89,9 @@ impl App {
     }
 
     /// The Content-Security-Policy. `style-src 'unsafe-inline'` only
-    /// because xterm.js makes `<style>` elements at run time; scripts
-    /// stay strict.
+    /// because xterm.js makes `<style>` elements at run time (6.0 still
+    /// does, with either renderer, and takes no nonce); scripts stay
+    /// strict.
     pub fn csp(&self) -> String {
         format!(
             "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \

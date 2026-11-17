@@ -7,6 +7,8 @@ import { tick } from "./components/time";
 import { followHash, parse, route } from "./route";
 import { Store } from "./store";
 import { List } from "./views/List";
+import { Overlord } from "./views/Overlord";
+import { Session } from "./views/Session";
 import "./app.css";
 
 function safeStorage(): Storage | null {
@@ -72,7 +74,13 @@ function App() {
           <List store={store} route={r} />
         </aside>
         <main class="main">
-          <p class="hint">Pick the overlord or a session.</p>
+          {r.kind === "list" || !token ? (
+            <p class="hint">Pick the overlord or a session.</p>
+          ) : r.kind === "overlord" ? (
+            <Overlord store={store} token={token} />
+          ) : (
+            <Session key={r.id} store={store} id={r.id} token={token} />
+          )}
         </main>
       </div>
     </div>

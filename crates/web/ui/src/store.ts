@@ -187,6 +187,17 @@ export class Store {
     }
   }
 
+  /** Ask the daemon (an op on its allow-list); fails when not connected. */
+  request<T = unknown>(op: string, args: object = {}): Promise<T> {
+    if (!this.api) return Promise.reject(new Error("not connected"));
+    return this.api.request<T>(op, args);
+  }
+
+  /** "Claude Code" for "claude", from the overlord's roster. */
+  agentLabel(agent: string): string {
+    return this.snapshot.value?.overlord?.overlords.find((o) => o.agent === agent)?.label ?? agent;
+  }
+
   /** A row by id, from the current snapshot. */
   row(id: string): Row | undefined {
     return this.snapshot.value?.rows.find((r) => r.id === id);

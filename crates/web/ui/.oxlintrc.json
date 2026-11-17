@@ -26,7 +26,8 @@
         "allow": ["**/*.css"]
       }
     ],
-    "typescript/no-unsafe-type-assertion": "off"
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/consistent-return": "off"
   },
   "ignorePatterns": ["dist/**", "node_modules/**"]
 }

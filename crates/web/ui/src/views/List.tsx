@@ -22,7 +22,7 @@ export function List({ store, route }: { store: Store; route: Route }) {
   return (
     <div class="list">
       <Controls store={store} view={view} />
-      <OverlordRow o={snap?.overlord ?? null} labels={labels} active={route.kind === "overlord"} />
+      {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}
       {view.tab === "groups" && snap && <Groups store={store} snap={snap} />}
       {snap ? (
         <Rows rows={store.rows.value} labels={labels} selected={selected} view={view} />

@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–9 built; steps 10–14 not started)
+**Status:** in progress (slice 1: steps 1–10 built; steps 11–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -354,6 +354,59 @@ Decided 2026-11-17 (user):
   - Checked in headless Chromium and WebKit (Playwright 1.65.1, outside
     the repo) against `demo.sh --web`: nine demo rows and the overlord
     row, no console errors or CSP reports.
+- Step 10 done (`ui/src/pane.ts`, `components/Pane.tsx`,
+  `views/{Overlord,Session}.tsx`): the overlord's and a session's views,
+  each a header and one pane. `PaneSocket` (no xterm.js; Vitest-tested
+  with a fake socket and screen) sends the token and `open` at the
+  terminal's size, resets the screen at `opened`, sends input as binary
+  and `resize` on fit, and closes with `close` first. `not_running` and
+  `not_found` stop it; a lost socket or `ended` retries with the control
+  socket's backoff; 4401 stops it for good. A hidden tab closes the pane
+  3 s after (`HIDE_CLOSE_MS`) and reopens it when shown. The view retries
+  a stopped pane when its row's status changes, and reopens the overlord's
+  when the snapshot's overlord id differs from the one `opened` named
+  (following a switch). xterm.js 6: `macOptionIsMeta`,
+  `macOptionClickForcesSelection`, `scrollback: 0` (tmux keeps history),
+  WebGL with the DOM renderer when there is no context or it is lost.
+  Choices within the plan:
+  - A stopped overlord offers "Start it" (`overlord.ensure`, already on
+    the allow-list); no overlord yet says to run rlord in a terminal (the
+    web doesn't set one up). A session's Resume is shown but disabled until
+    step 11 puts its op on the allow-list.
+  - The roster is shown (agent chips with status); switching is action 7,
+    step 11.
+  - A session not in the list's view (archived, filtered) is fetched with
+    `session.get`.
+- Step 10's browser pass (2026-11-17, Playwright 1.65.1 headless, outside
+  the repo, against `demo.sh --web`): Chromium (WebGL), Chromium with
+  WebGL off (DOM renderer) and WebKit (WebGL) all draw the overlord's
+  pane; typing reaches its tmux pane (checked with `capture-pane` on
+  `rlord-demo`); a session's pane opens; no console errors, no CSP
+  reports. Chromium also: following `rlord overlord switch codex` and back
+  (the pane reopens on the other overlord, one view session each time);
+  a stopped session shows Resume and its pane comes back on `rlord
+  restart`; a stopped overlord's Start works; a hidden tab leaves no view
+  session and reopens when shown; `rlord web stop` then `start`
+  reconnects the control socket and the pane; at 390 px wide the list and
+  the pane show one at a time.
+  - **`style-src 'unsafe-inline'` stays.** Served with `style-src 'self'`
+    (the header rewritten in the test), every browser reports
+    `style-src-elem` violations: xterm.js 6 still makes `<style>` elements
+    (one with WebGL, three with the DOM renderer) and has no nonce option.
+  - Found and fixed on the way: the list drew a "not set up" overlord row
+    before the first snapshot; the pane's note sat under xterm.js's
+    canvases, so its buttons couldn't be clicked.
+  - A page served through Playwright's `route.fulfill` trips Chromium's
+    Local Network Access check on its websockets
+    (`ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`); the real page, served
+    by the plugin, doesn't. Only the strict-CSP test needed the flag that
+    turns the check off.
+  - Not covered headless (still owed by hand): Option as Meta and the
+    browser-kept keys on a real keyboard, the wheel and copy, IME, two
+    tabs at once, the TUI overlay open alongside, WebGL context loss
+    mid-session.
+  - The page is 486 kB of script (128 kB gzipped), nearly all xterm.js
+    and its WebGL addon.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

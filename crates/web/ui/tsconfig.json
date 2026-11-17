@@ -12,6 +12,7 @@
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
     "noImplicitOverride": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
