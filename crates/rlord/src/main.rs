@@ -2015,7 +2015,7 @@ fn web_cmd(cmd: Option<WebCmd>) -> Result<()> {
         None => {
             web_install::ensure_installed()?;
             let url = web_url()?;
-            if !open_in_browser(&url) {
+            if !rlord_core::plugin::open_in_browser(&url) {
                 println!("{url}");
             }
             Ok(())
@@ -2083,27 +2083,7 @@ fn web_url() -> Result<String> {
     let port = st["port"]
         .as_u64()
         .context("the web plugin is running but reported no port")?;
-    let token_path = rlord_core::plugin::token_path();
-    let token = std::fs::read_to_string(&token_path)
-        .with_context(|| format!("reading the web token ({})", token_path.display()))?;
-    Ok(format!("http://127.0.0.1:{port}/#t={}", token.trim()))
-}
-
-/// Open `url` in the user's browser (`open` on macOS, `xdg-open`
-/// elsewhere). False when that didn't work.
-fn open_in_browser(url: &str) -> bool {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    std::process::Command::new(opener)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    rlord_core::plugin::page_url(port)
 }
 
 fn print_web_status(st: &Value) {

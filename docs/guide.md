@@ -703,6 +703,8 @@ rlord web new-token  # a new link: the old one stops working, open pages disconn
 rlord web remove     # delete the plugin and its token
 ```
 
+In the list, `:web` opens it too, once it's installed.
+
 - **Installing** downloads the plugin for your rlord's version from the
   same GitHub release (`gh` when it's logged in, else `curl`) and checks it
   against a SHA-256 built into rlord: rlord only ever runs the exact

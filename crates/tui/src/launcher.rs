@@ -32,6 +32,8 @@ enum Cmd {
     ResumeAfterLimit,
     /// Call off the selected session's scheduled resume.
     CancelResume,
+    /// Open the web UI in the browser (as `rlord web`, once installed).
+    Web,
 }
 
 /// (name, what it does, command)
@@ -89,6 +91,7 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
         Cmd::CancelResume,
     ),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
+    ("web", "open the web UI in your browser", Cmd::Web),
     (
         "archive",
         "archive the selected session (asks first)",
@@ -267,6 +270,7 @@ impl App {
             Cmd::Switch(agent) => self.switch_overlord(agent),
             Cmd::ResumeAfterLimit => self.resume_after_limit(),
             Cmd::CancelResume => self.cancel_resume(),
+            Cmd::Web => self.open_web(),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(
@@ -283,6 +287,40 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// `:web`: start the web plugin if needed and open its page, as
+    /// `rlord web` does. Installing it stays with `rlord web`, which asks
+    /// first.
+    fn open_web(&mut self) {
+        let Some(st) = self.call("web.status", json!({})) else {
+            return;
+        };
+        let st = if st["state"] == "running" {
+            st
+        } else if st["installed"] != true {
+            let why = st["problem"]
+                .as_str()
+                .unwrap_or("the web plugin is not installed");
+            self.status_line = format!("web UI: {why} (run `rlord web` to install it)");
+            return;
+        } else {
+            match self.call("web.start", json!({})) {
+                Some(st) => st,
+                None => return,
+            }
+        };
+        let Some(port) = st["port"].as_u64() else {
+            self.status_line = "web UI: running but reported no port (`rlord web status`)".into();
+            return;
+        };
+        self.status_line = match rlord_core::plugin::page_url(port) {
+            Ok(url) if rlord_core::plugin::open_in_browser(&url) => {
+                "web UI opened in your browser".into()
+            }
+            Ok(url) => format!("web UI: {url}"),
+            Err(e) => format!("web UI: {e:#}"),
+        };
     }
 
     pub(crate) fn draw_launcher(&self, f: &mut Frame, l: &Launcher) {
@@ -509,6 +547,7 @@ mod tests {
         };
         assert_eq!(names("keys")[0], "keys");
         assert_eq!(names("so cr"), ["sort created"]);
+        assert_eq!(names("web")[0], "web");
         assert_eq!(names("new")[..2], ["new", "new manual"]);
         assert!(names("zzz").is_empty());
         assert_eq!(names("").len(), COMMANDS.len());
