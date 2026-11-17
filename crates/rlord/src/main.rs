@@ -391,12 +391,33 @@ enum Command {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// The web UI (an opt-in plugin, on 127.0.0.1 only): with no
+    /// subcommand, start it and open it in the browser
+    Web {
+        #[command(subcommand)]
+        cmd: Option<WebCmd>,
+    },
     /// The overlord overlay itself (runs inside the tmux popup)
     #[command(hide = true)]
     Overlay {
         #[arg(long)]
         token: Option<u64>,
     },
+}
+
+#[derive(Subcommand)]
+enum WebCmd {
+    /// Start it if needed and print its URL (with the token: keep it private)
+    Url,
+    /// Installed or not, running or not, its port, why not
+    Status,
+    /// Start it (for this daemon run; `[web] enabled = true` starts it
+    /// with the daemon)
+    Start,
+    /// Stop it (open pages lose their connection)
+    Stop,
+    /// A new token: the old URL stops working and open pages disconnect
+    NewToken,
 }
 
 #[derive(Subcommand)]
@@ -600,6 +621,7 @@ fn main() -> Result<()> {
         } => update(tag, force, channel),
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
         Command::Overlay { token } => rlord_tui::run_overlay(token),
+        Command::Web { cmd } => web_cmd(cmd),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
                 nav_overlord()
@@ -1926,6 +1948,122 @@ fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
     rlord_core::config::absolute_dir(&abs)
 }
 
+/// `rlord web …`: the plugin runs under the daemon; this only asks it.
+fn web_cmd(cmd: Option<WebCmd>) -> Result<()> {
+    match cmd {
+        None => {
+            let url = web_url()?;
+            if !open_in_browser(&url) {
+                println!("{url}");
+            }
+            Ok(())
+        }
+        Some(WebCmd::Url) => {
+            println!("{}", web_url()?);
+            Ok(())
+        }
+        Some(WebCmd::Status) => {
+            print_web_status(&call("web.status", json!({}))?);
+            Ok(())
+        }
+        Some(WebCmd::Start) => {
+            let st = call("web.start", json!({}))?;
+            print_web_status(&st);
+            Ok(())
+        }
+        Some(WebCmd::Stop) => {
+            call("web.stop", json!({}))?;
+            println!("rlord web: stopped");
+            Ok(())
+        }
+        Some(WebCmd::NewToken) => {
+            call("web.rotate", json!({}))?;
+            println!("rlord web: new token; open pages were disconnected");
+            println!("{}", web_url()?);
+            Ok(())
+        }
+    }
+}
+
+/// Start the plugin if needed; its URL with the token (in the fragment,
+/// which the browser never sends anywhere).
+fn web_url() -> Result<String> {
+    let st = call("web.status", json!({}))?;
+    let st = if st["state"] == "running" {
+        st
+    } else {
+        if st["installed"] != true {
+            anyhow::bail!(
+                "{}",
+                st["problem"]
+                    .as_str()
+                    .unwrap_or("the web plugin is not installed")
+            );
+        }
+        call("web.start", json!({}))?
+    };
+    let port = st["port"]
+        .as_u64()
+        .context("the web plugin is running but reported no port")?;
+    let token_path = rlord_core::plugin::token_path();
+    let token = std::fs::read_to_string(&token_path)
+        .with_context(|| format!("reading the web token ({})", token_path.display()))?;
+    Ok(format!("http://127.0.0.1:{port}/#t={}", token.trim()))
+}
+
+/// Open `url` in the user's browser (`open` on macOS, `xdg-open`
+/// elsewhere). False when that didn't work.
+fn open_in_browser(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn print_web_status(st: &Value) {
+    let s = |k: &str| st[k].as_str().unwrap_or("").to_string();
+    if st["installed"] == true {
+        let checked = if st["verified"] == true {
+            "verified"
+        } else {
+            "unverified: a build without a plugin hash"
+        };
+        println!("plugin:  {} ({checked})", s("path"));
+    } else {
+        println!("plugin:  not usable: {}", s("problem"));
+    }
+    let mut state = s("state");
+    if let Some(pid) = st["pid"].as_u64() {
+        state += &format!(" (pid {pid})");
+    }
+    println!("state:   {state}");
+    if let Some(port) = st["port"].as_u64() {
+        println!("address: http://127.0.0.1:{port}/  (`rlord web url` for the link)");
+    }
+    println!(
+        "enabled: {}",
+        if st["enabled"] == true {
+            "yes (starts with the daemon)"
+        } else {
+            "no (`rlord web` starts it for this daemon run)"
+        }
+    );
+    if !s("why").is_empty() {
+        println!("why:     {}", s("why"));
+    }
+    if !s("last_error").is_empty() {
+        println!("last:    {}", s("last_error"));
+    }
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -1997,16 +2135,21 @@ fn run_daemon() -> Result<()> {
         // before the first launch needs it.
         std::thread::spawn(rlord_core::agents::install::warm);
         let listener = Daemon::bind(&paths::socket_path())?;
+        // The web plugin, with `[web] enabled` (it says hello on the socket
+        // just bound).
+        rlord_daemon::web::start_if_enabled(&daemon);
         let pidfile = paths::pid_path();
         std::fs::write(&pidfile, std::process::id().to_string())?;
         tracing::info!(socket = %paths::socket_path().display(), db = %paths::db_path().display(), pid = std::process::id(), "rlordd starting");
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let r = tokio::select! {
-            r = daemon.serve(listener) => r,
+            r = daemon.clone().serve(listener) => r,
             _ = tokio::signal::ctrl_c() => Ok(()),
             _ = term.recv() => Ok(()),
         };
         tracing::info!("shutting down");
+        // (Blocking: SIGTERM, then SIGKILL after 2 s.)
+        daemon.web().stop();
         let _ = std::fs::remove_file(&pidfile);
         r
     });

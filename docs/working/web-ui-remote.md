@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–4 built; steps 5–14 not started)
+**Status:** in progress (slice 1: steps 1–5 built; steps 6–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -158,6 +158,30 @@ Decided 2026-11-17 (user):
   - Typed errors: `web::Incompatible` and `web::NotAllowed`, mapped to
     their RPC codes in `dispatch` by downcast.
   - The `web.subscribe` ack carries the current `rev`.
+- Step 5 done (`daemon/src/web.rs` `Web`, `lib.rs`, `rlord/src/main.rs`):
+  the daemon spawns `<plugin> serve` (output appended to `web.log`), waits
+  up to 5 s for its hello, restarts it with backoff (1 s doubling to
+  60 s, given up after five failures in a row), doesn't retry exit codes
+  3 and 4, and stops it with SIGTERM then SIGKILL after 2 s (`web.stop`,
+  and at daemon exit in `run_daemon`). `web.status`, `web.start`,
+  `web.stop`, `web.rotate`; `[web] enabled` starts it right after the
+  socket is bound. `rlord web` (start and open the browser, else print
+  the URL), `url`, `status`, `start`, `stop`, `new-token`. Tests:
+  `crates/daemon/tests/web_supervise.rs`, whose stand-in is a shell
+  script running that test binary's own `standin` test in a mode.
+  Choices within the plan:
+  - A hello counts only from the process the daemon started (by pid); a
+    hello from any other process is answered but changes nothing.
+  - The failure count resets on an explicit start and after a run of
+    60 s or more, not on hello (a plugin that says hello and then dies
+    would otherwise retry every second forever).
+  - With a compiled-in hash, `RLORD_WEB_BIN` and a plugin beside the
+    executable are ignored (only the installed, matching plugin runs).
+    Tests swap the expected hash with `Web::set_expected_hash`
+    (in-process only, not reachable over the socket).
+  - Until step 12, `rlord web` with no plugin fails naming
+    `rlord web install` (which doesn't exist yet); the opt-in prompt is
+    step 12's.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

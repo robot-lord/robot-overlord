@@ -91,6 +91,8 @@ pub struct Daemon {
     boot_id: String,
     /// Bumped by every `changed()`: the second half of `rev`.
     changes: std::sync::atomic::AtomicU64,
+    /// The web plugin, when it runs (web.rs).
+    web: Arc<web::Web>,
 }
 
 impl Daemon {
@@ -117,6 +119,7 @@ impl Daemon {
             boot_id: rlord_core::plugin::random_hex(6)
                 .unwrap_or_else(|_| format!("{:x}", std::process::id())),
             changes: std::sync::atomic::AtomicU64::new(0),
+            web: Default::default(),
         })
     }
 
@@ -149,6 +152,11 @@ impl Daemon {
     pub(crate) fn changed(&self) {
         self.changes.fetch_add(1, Ordering::SeqCst);
         let _ = self.notify.send(r#"{"notify":"changed"}"#.to_string());
+    }
+
+    /// The web plugin's supervisor.
+    pub fn web(&self) -> &Arc<web::Web> {
+        &self.web
     }
 
     /// The state's revision, `"<boot id>-<n>"`: moves on every change and
@@ -956,6 +964,10 @@ impl Daemon {
             "web.hello" => web::hello(self, params),
             "web.call" => web::call(self, params),
             "web.pane_target" => web::pane_target(self, params),
+            "web.status" => web::status(self),
+            "web.start" => web::start(self),
+            "web.stop" => web::stop(self),
+            "web.rotate" => web::rotate(self),
             "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
             "mcp.call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
