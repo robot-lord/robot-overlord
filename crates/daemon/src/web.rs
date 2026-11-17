@@ -118,12 +118,23 @@ pub const OPS: &[Op] = &[
     ),
     // A UI command that never reached its page (asked on connecting).
     op("page.pending", "", &[]),
+    // The list view a page with none of its own starts from.
+    op("view.default", "", &[]),
+    // The key screen, read-only (keys change only in a terminal).
+    op("keys.list", "keys.list", &[]),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
 /// and reports a page makes by itself): every other op moves the page's
 /// last use (`ui::target`). A `page.report` counts only with `input`.
-const PASSIVE: &[&str] = &["snapshot", "session.get", "page.report", "page.pending"];
+const PASSIVE: &[&str] = &[
+    "snapshot",
+    "session.get",
+    "page.report",
+    "page.pending",
+    "view.default",
+    "keys.list",
+];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
 const FORBIDDEN: &[&str] = &[
@@ -181,6 +192,7 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
         "session.resume" => resume(d, &args),
         "page.report" => d.web_ui().report(page, &args),
         "page.pending" => Ok(pending(d)),
+        "view.default" => crate::ui::default_view(d),
         // A session the list doesn't show: labelled as rows are.
         "session.get" => d.rpc(found.method, args).map(|mut s| {
             label(&mut s);
@@ -208,8 +220,9 @@ fn resume(d: &Daemon, args: &Value) -> Result<Value> {
 }
 
 /// Op `snapshot {view, rev}`: everything the list draws, in one answer.
-/// `view` is a `session.list` query, whose `search` may hold the TUI's
-/// filter tokens (`search_tokens`); a `rev` that is still current gets
+/// `view` is a `session.list` query, whose `query` (or `search`) is the
+/// filter box's text, with the TUI's tokens (`search_tokens`), and whose
+/// `usage` picks the usage measure; a `rev` that is still current gets
 /// `{"unchanged": true}`. Grouping and labels are worked out here: the
 /// page only draws.
 pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
@@ -224,11 +237,19 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
         v @ Value::Object(_) => v.clone(),
         _ => bail!("view must be a session.list query (an object)"),
     };
-    if let Some(text) = view
-        .get("search")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    {
+    // The filter text: `query` (the TUI's view shape, as `set_list_view`
+    // sends it), else `search`.
+    let text = ["query", "search"]
+        .iter()
+        .find_map(|k| view.get(*k).and_then(Value::as_str).map(str::to_string));
+    if let Some(o) = view.as_object_mut() {
+        o.remove("query");
+        // No measure: the user's sticky one (or config `usage`).
+        if o.get("usage").is_some_and(Value::is_null) {
+            o.remove("usage");
+        }
+    }
+    if let Some(text) = text {
         search_tokens(&mut view, &text);
     }
     // (The overlord is `overlord`, never one of the rows.)
@@ -425,6 +446,10 @@ impl WebUi {
 
     pub fn page(&self, id: &str) -> Option<&Page> {
         self.pages.iter().find(|p| p.id == id)
+    }
+
+    pub fn page_mut(&mut self, id: &str) -> Option<&mut Page> {
+        self.pages.iter_mut().find(|p| p.id == id)
     }
 
     /// Op `page.report {route, view, visible, form, input}` from page

@@ -189,6 +189,21 @@ pub fn target(d: &Daemon) -> Target {
     }
 }
 
+/// The error when there is no screen to show anything on.
+fn no_screen() -> anyhow::Error {
+    anyhow::anyhow!(
+        "the user has no rlord screen open: they need to run `rlord` in a terminal, or open the web UI (`rlord web`)"
+    )
+}
+
+/// What a surface is called in notices.
+fn where_(t: &Target) -> &'static str {
+    match t {
+        Target::Web(_) => "in the web UI",
+        _ => "in the terminal",
+    }
+}
+
 /// The id of the most recently used open page, if any.
 pub(crate) fn latest_page(d: &Daemon) -> Option<String> {
     page_uses(d)
@@ -333,6 +348,14 @@ fn switch_user_to(tmux_session: &str) -> Result<bool> {
     }
     tmux::switch_client_of(&c.name, tmux_session)?;
     Ok(false)
+}
+
+/// Switch terminal `c` to `tmux_session` (the client `target` chose).
+fn switch_to(c: &tmux::Client, tmux_session: &str) -> Result<()> {
+    if c.session != tmux_session {
+        tmux::switch_client_of(&c.name, tmux_session)?;
+    }
+    Ok(())
 }
 
 /// Close the overlord overlay wherever it is open.
@@ -506,26 +529,63 @@ fn ensure_home() -> Result<String> {
     Ok(HOME_SESSION.to_string())
 }
 
+/// `show_list` (the overlord's): the list on the user's screen.
 pub fn show_list(d: &Daemon) -> Result<Value> {
-    let home = ensure_home()?;
-    hide_overlord(d);
-    switch_user_to(&home)?;
-    Ok(json!({"shown": "session_list"}))
+    let t = target(d);
+    show_list_on(d, &t)?;
+    Ok(json!({"shown": "session_list", "on": t.name()}))
 }
 
+/// Show the list on `t`: the terminal goes to the TUI (hiding the
+/// overlay); a page is sent `show_list`.
+fn show_list_on(d: &Daemon, t: &Target) -> Result<()> {
+    match t {
+        Target::Terminal(c) => {
+            let home = ensure_home()?;
+            hide_overlord(d);
+            switch_to(c, &home)
+        }
+        Target::Web(_) => {
+            d.ui_cmd_to(t, json!({"cmd": "show_list"}));
+            Ok(())
+        }
+        Target::None => Err(no_screen()),
+    }
+}
+
+/// `goto_session`: the session on the user's screen, resumed first if it
+/// is stopped.
 pub fn goto(d: &Daemon, params: &Value) -> Result<Value> {
-    let s = ensure_running(d, methods::p_str(params, "ref")?)?;
+    let r = methods::p_str(params, "ref")?;
+    let to = target(d);
+    if to == Target::None {
+        return Err(no_screen());
+    }
+    let s = ensure_running(d, r)?;
     let t = s
         .tmux_session
         .as_deref()
         .context("session has no tmux session")?;
-    if overlord::is_overlord_role(&s.role) {
-        // Full screen: hand the window's size back from any overlay.
-        let _ = tmux::auto_size_window(t);
+    let is_overlord = overlord::is_overlord_role(&s.role);
+    match &to {
+        Target::Terminal(c) => {
+            if is_overlord {
+                // Full screen: hand the window's size back from any overlay.
+                let _ = tmux::auto_size_window(t);
+            }
+            hide_overlord(d);
+            switch_to(c, t)?;
+        }
+        _ => d.ui_cmd_to(
+            &to,
+            json!({"cmd": "goto", "id": s.id, "overlord": is_overlord}),
+        ),
     }
-    hide_overlord(d);
-    switch_user_to(t)?;
-    Ok(json!({"switched_to": {"id": s.id, "name": s.name}}))
+    d.notice_others(
+        &to,
+        &format!("the overlord showed {} {}", s.name, where_(&to)),
+    );
+    Ok(json!({"switched_to": {"id": s.id, "name": s.name}, "on": to.name()}))
 }
 
 /// Make sure session `r` runs: an overlord is ensured, a stopped session
@@ -559,13 +619,11 @@ pub fn ensure_running(d: &Daemon, r: &str) -> Result<rlord_core::types::Session>
     Ok(s)
 }
 
-/// Set (and optionally save as default) the TUI list view; show it unless
-/// `show: false`.
+/// Set (and optionally save as default) the list view on the user's
+/// screen (the TUI's, or a page's); show it unless `show: false`.
 pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
-    let mut view = d.ui_view.lock().expect("ui mutex").clone();
-    if view.is_null() {
-        view = default_view(d)?;
-    }
+    let to = target(d);
+    let mut view = current_view(d, &to)?;
     let obj = view.as_object_mut().context("bad view state")?;
     if let Some(q) = params.get("query").and_then(Value::as_str) {
         obj.insert("query".into(), json!(q.trim()));
@@ -621,15 +679,68 @@ pub fn set_view(d: &Daemon, params: &Value) -> Result<Value> {
         }
         d.db().kv_set(DEFAULT_VIEW_KEY, &saved.to_string())?;
     }
-    *d.ui_view.lock().expect("ui mutex") = view.clone();
-    d.ui_cmd(Value::Object(cmd));
+    match &to {
+        Target::Web(id) => {
+            if let Some(p) = d.web_ui().page_mut(id) {
+                p.view = view.clone();
+            }
+            d.ui_cmd_to(&to, Value::Object(cmd));
+        }
+        // (No screen: kept for the next TUI, as before.)
+        _ => {
+            *d.ui_view.lock().expect("ui mutex") = view.clone();
+            d.ui_cmd(Value::Object(cmd));
+        }
+    }
     let shown = if params.get("show").and_then(Value::as_bool).unwrap_or(true) {
-        show_list(d)?;
+        show_list_on(d, &to)?;
         true
     } else {
         false
     };
-    Ok(json!({"view": view, "shown": shown}))
+    Ok(json!({"view": view, "shown": shown, "on": to.name()}))
+}
+
+/// The proposals `propose_session` made, newest last (at most this many):
+/// the overlord's background for each, which a page's launch refers to by
+/// id and never sends itself.
+const PROPOSALS: usize = 8;
+
+/// Keep a proposal's background; its id.
+fn keep_proposal(d: &Daemon, background: Value) -> String {
+    let mut p = d.proposals.lock().expect("ui mutex");
+    let n = p.back().map_or(0, |(id, _)| {
+        id.trim_start_matches('p').parse::<u64>().unwrap_or(0)
+    });
+    let id = format!("p{}", n + 1);
+    p.push_back((id.clone(), background));
+    while p.len() > PROPOSALS {
+        p.pop_front();
+    }
+    id
+}
+
+/// Send form command `cmd` to the user's screen: on the terminal the list
+/// is shown too (the TUI opens it there); on a page the command opens it.
+/// The other screen gets a notice naming the form.
+fn open_form(d: &Daemon, to: &Target, cmd: Value, form: &str) -> Result<()> {
+    if *to == Target::None {
+        return Err(no_screen());
+    }
+    d.ui_cmd_to(to, cmd);
+    show_form(d, to, form)
+}
+
+/// After a form's command went to `to`: on the terminal, show the list
+/// (where the TUI opens it); tell the other screen.
+pub(crate) fn show_form(d: &Daemon, to: &Target, form: &str) -> Result<()> {
+    match to {
+        Target::None => return Err(no_screen()),
+        Target::Terminal(_) => show_list_on(d, to)?,
+        Target::Web(_) => {}
+    }
+    d.notice_others(to, &format!("the overlord opened {form} {}", where_(to)));
+    Ok(())
 }
 
 /// Open the new-session form pre-filled, on the list, for the user to confirm.
@@ -691,9 +802,24 @@ pub fn propose_session(d: &Daemon, params: &Value) -> Result<Value> {
         let c = crate::context::clean(c);
         prefill.insert("context".into(), json!(c));
     }
-    d.ui_cmd(json!({"cmd": "new_session", "prefill": prefill}));
-    show_list(d)?;
-    Ok(json!({"proposed": prefill, "note": "the form is open on the user's screen for review"}))
+    let to = target(d);
+    if to == Target::None {
+        return Err(no_screen());
+    }
+    // A page sends back only this id: the background stays here.
+    let id = keep_proposal(
+        d,
+        json!({"context": prefill.get("context"), "related": prefill.get("related")}),
+    );
+    prefill.insert("proposal".into(), json!(id));
+    open_form(
+        d,
+        &to,
+        json!({"cmd": "new_session", "prefill": prefill}),
+        "a new-session form",
+    )?;
+    Ok(json!({"proposed": prefill, "on": to.name(),
+              "note": "the form is open on the user's screen for review"}))
 }
 
 /// A `base` the overlord leaves out is unchanged: the one the request
@@ -883,12 +1009,20 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         "latest"
     };
     apply_provenance(&mut prefill, &provenance, default_base);
+    let to = target(d);
+    if to == Target::None {
+        return Err(no_screen());
+    }
     // The overlord is now waiting on the user (its fresh start waits too).
     d.db()
         .kv_set("confirm_pending", &rlord_core::types::now_ms().to_string())?;
-    d.ui_cmd(json!({"cmd": "confirm_new_session", "prefill": prefill}));
-    show_list(d)?;
-    Ok(json!({"shown": prefill,
+    open_form(
+        d,
+        &to,
+        json!({"cmd": "confirm_new_session", "prefill": prefill}),
+        "your new-session form",
+    )?;
+    Ok(json!({"shown": prefill, "on": to.name(),
               "note": "the form is open on the user's screen; nothing is launched until they send it back (confirmed: yes)"}))
 }
 
@@ -926,17 +1060,27 @@ pub fn keys_list(d: &Daemon) -> Result<Value> {
     }))
 }
 
-/// Open the key screen in the list (at one key, if given) and show it.
+/// Open the key screen (at one key, if given) and show it. Keys are
+/// changed only in a terminal (the screen tests that a key reaches rlord
+/// there), so it goes to the terminal whenever one is attached; with only
+/// a web page, the page shows the keys read-only.
 pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
     let row = params.get("key").and_then(Value::as_str).unwrap_or("");
     if !row.is_empty() && rlord_core::keys::slot(row).is_none() {
         bail!("unknown key id '{row}' (see keys_list)");
     }
-    d.ui_cmd(json!({"cmd": "keys", "row": row}));
-    show_list(d)?;
-    Ok(
-        json!({"shown": "key screen", "note": "the user presses the new key there; it's tested and saved to config.toml when they confirm"}),
-    )
+    let clients = tmux::list_clients();
+    let home = tmux::home();
+    let to = match tmux::user_client(&clients, home.as_deref()) {
+        Some(c) => Target::Terminal(c.clone()),
+        None => target(d),
+    };
+    open_form(d, &to, json!({"cmd": "keys", "row": row}), "the key screen")?;
+    let note = match to {
+        Target::Web(_) => "the web UI shows the keys read-only: changing one needs a terminal (the user runs `rlord` and opens the key screen there)",
+        _ => "the user presses the new key there; it's tested and saved to config.toml when they confirm",
+    };
+    Ok(json!({"shown": "key screen", "on": to.name(), "note": note}))
 }
 
 #[cfg(test)]

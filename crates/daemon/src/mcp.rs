@@ -808,7 +808,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 // The session exists either way; a failed switch is a note,
                 // not a failed launch.
                 match d.rpc("ui.goto", json!({"ref": s["id"]})) {
-                    Ok(_) => out["user_switched_to_it"] = json!(true),
+                    Ok(g) => {
+                        out["user_switched_to_it"] = json!(true);
+                        out["on"] = g["on"].clone();
+                    }
                     Err(e) => out["switch_failed"] = json!(format!("{e:#}")),
                 }
             }
@@ -838,7 +841,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The fork exists either way; a failed switch is a note.
                 match d.rpc("ui.goto", json!({"ref": s["id"]})) {
-                    Ok(_) => out["user_switched_to_it"] = json!(true),
+                    Ok(g) => {
+                        out["user_switched_to_it"] = json!(true);
+                        out["on"] = g["on"].clone();
+                    }
                     Err(e) => out["switch_failed"] = json!(format!("{e:#}")),
                 }
             }

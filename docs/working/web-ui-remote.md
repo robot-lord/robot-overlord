@@ -650,6 +650,32 @@ Decided 2026-11-17 (user):
       (a reload, a reconnect): a page that got it never sees it twice.
     - `notice_others` sends to the terminal's TUI (when one runs) or the
       most recently used page; notices are never parked.
+  - Step 4 done (`ui.rs`, `setup.rs`, `mcp.rs`, `web.rs`): `show_list`,
+    `goto`, `set_view`, `propose_session`, `confirm_new_session`,
+    `setup::confirm` and `keys_open` pick the target once and pass it
+    down (`show_list_on`, `open_form`, `show_form`, `switch_to`); every
+    answer has `on`, and `create_session` / `fork_session` with `go` pass
+    it on. No screen: they fail naming `rlord` in a terminal and `rlord
+    web`. `snapshot`'s view takes `query` (before `search`) and `usage`;
+    ops `view.default` and `keys.list`. The proposal store
+    (`Daemon::proposals`, last 8, ids `p<n>`): `propose_session` keeps
+    `context` and `related` there and the prefill carries `proposal`.
+    Tests: `web_api.rs` `the_overlords_ui_tools_land_on_a_page`,
+    `snapshot_takes_query_and_the_default_view`; gated `web_tmux.rs`
+    `the_surface_used_last_gets_the_command` (terminal and page both
+    present, each in turn the later; `ui_target = "web"`). Choices within
+    the plan and the user's answers:
+    - **Key screen (answer 2): read-only in the page.** `open_keys` goes
+      to the terminal whenever one is attached, whatever the target
+      (keys change only there); with only a page, the page is sent `keys
+      {row}` and shows them read-only (`keys.list`, now a passive op), and
+      the answer's note says changing one needs a terminal.
+    - `goto` checks for a screen before resuming the session (no point
+      starting what can't be shown).
+    - Notices go out for `goto` and the forms (new session, confirm,
+      code folder, keys), not for `set_list_view` or `show_list`.
+    - `set_list_view` on the web sends `set_view`, then `show_list` unless
+      `show: false`, and updates the page's view in the daemon at once.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

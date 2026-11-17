@@ -642,3 +642,241 @@ fn pages_go_with_the_plugin() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// The overlord's tool call, as `rlord mcp --overlord` makes it.
+fn tool(sock: &Path, name: &str, args: Value) -> Value {
+    raw(
+        sock,
+        "mcp.call",
+        json!({"name": name, "arguments": args, "overlord": true}),
+    )
+}
+
+/// The plugin's `web.subscribe` stream: its UI lines, read as they come.
+struct WebStream {
+    lines: std::io::Lines<BufReader<UnixStream>>,
+    _w: UnixStream,
+}
+
+impl WebStream {
+    fn open(sock: &Path) -> WebStream {
+        let s = UnixStream::connect(sock).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+        let mut lines = BufReader::new(s).lines();
+        lines.next().unwrap().unwrap();
+        WebStream { lines, _w: w }
+    }
+
+    /// The next UI command (changes skipped).
+    fn next_ui(&mut self) -> Value {
+        loop {
+            let l = self.lines.next().expect("open").expect("a line in time");
+            let v: Value = serde_json::from_str(&l).unwrap();
+            if v["notify"] == "ui" {
+                return v;
+            }
+        }
+    }
+}
+
+/// With only a web page open (no tmux here), the overlord's UI tools land
+/// on it: each puts its command, addressed to the page, on the plugin's
+/// stream and says `on: "web"`. With no page either, they fail naming
+/// both ways in.
+#[test]
+fn the_overlords_ui_tools_land_on_a_page() {
+    let r = start();
+    for (name, args) in [
+        ("show_list", json!({})),
+        ("set_list_view", json!({"query": "tag:web"})),
+        ("propose_session", json!({"name": "x", "prompt": "p"})),
+        ("goto_session", json!({"session": "alpha"})),
+        (
+            "confirm_new_session",
+            json!({"description": "d", "changed": [], "note": "n"}),
+        ),
+        ("confirm_setup", json!({"code_dir": "/tmp"})),
+        ("open_keys", json!({})),
+    ] {
+        let got = tool(&r.sock, name, args);
+        let e = method_error(&got);
+        assert!(
+            e.contains("rlord web") && e.contains("terminal"),
+            "{name}: {e}"
+        );
+    }
+    let mut stream = WebStream::open(&r.sock);
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    let on_web = |got: &Value, name: &str| {
+        assert!(got["error"].is_null(), "{name}: {got}");
+        let t = got["result"].clone();
+        assert_eq!(t["on"], "web", "{name}: {t}");
+        t
+    };
+    on_web(&tool(&r.sock, "show_list", json!({})), "show_list");
+    let c = stream.next_ui();
+    assert_eq!(
+        (&c["page"], &c["cmd"]),
+        (&json!("p1-aaaa"), &json!({"cmd": "show_list"}))
+    );
+
+    // set_list_view starts from the page's view and leaves the TUI's alone.
+    op_from(
+        &r.sock,
+        "p1-aaaa",
+        "page.report",
+        json!({"view": {"sort": "name", "tab": "groups"}}),
+    );
+    let t = on_web(
+        &tool(
+            &r.sock,
+            "set_list_view",
+            json!({"query": "tag:web", "select": "beta"}),
+        ),
+        "set_list_view",
+    );
+    assert_eq!(
+        (&t["view"]["sort"], &t["view"]["tab"]),
+        (&json!("name"), &json!("groups"))
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["cmd"], "set_view");
+    assert_eq!(c["cmd"]["view"]["query"], "tag:web");
+    assert_eq!(c["cmd"]["select"], "beta");
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "show_list");
+    let s = ui_state(&r.sock);
+    assert_eq!(s["current_view"]["query"], "tag:web");
+    // ... show: false sends the view only.
+    tool(
+        &r.sock,
+        "set_list_view",
+        json!({"sort": "state", "show": false}),
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["view"]["sort"], "state");
+    tool(&r.sock, "show_list", json!({}));
+    assert_eq!(stream.next_ui()["cmd"]["cmd"], "show_list");
+
+    // propose_session: the form, with the background kept back by id.
+    let t = on_web(
+        &tool(
+            &r.sock,
+            "propose_session",
+            json!({"name": "x", "prompt": "do it", "context": "the overlord's note", "related": ["alpha"]}),
+        ),
+        "propose_session",
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["cmd"], "new_session");
+    assert_eq!(c["cmd"]["prefill"]["prompt"], "do it");
+    assert_eq!(c["cmd"]["prefill"]["related_names"], json!(["alpha"]));
+    let id = c["cmd"]["prefill"]["proposal"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(t["proposed"]["proposal"], id.as_str());
+
+    let t = on_web(
+        &tool(
+            &r.sock,
+            "confirm_new_session",
+            json!({"description": "a web thing", "agent": "codex", "changed": ["agent"],
+                   "note": "codex, as you said"}),
+        ),
+        "confirm_new_session",
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["cmd"], "confirm_new_session");
+    assert_eq!(c["cmd"]["prefill"], t["shown"]);
+    assert_eq!(c["cmd"]["prefill"]["resolved"], json!(["agent"]));
+
+    on_web(
+        &tool(
+            &r.sock,
+            "confirm_setup",
+            json!({"code_dir": "/tmp", "note": "n"}),
+        ),
+        "confirm_setup",
+    );
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"]["cmd"], "setup");
+    assert!(
+        c["cmd"]["prefill"]["code_dir"]
+            .as_str()
+            .unwrap()
+            .ends_with("tmp"),
+        "{c}"
+    );
+    assert!(c["cmd"]["status"].is_object());
+
+    // The key screen: read-only in the page, and the answer says so.
+    let t = on_web(
+        &tool(&r.sock, "open_keys", json!({"key": "keys.quit"})),
+        "open_keys",
+    );
+    assert!(t["note"].as_str().unwrap().contains("read-only"), "{t}");
+    let c = stream.next_ui();
+    assert_eq!(c["cmd"], json!({"cmd": "keys", "row": "keys.quit"}));
+    // A page can read the keys.
+    let k = op_from(&r.sock, "p1-aaaa", "keys.list", json!({}));
+    assert!(
+        k["result"]["keys"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "{k}"
+    );
+
+    // get_ui_state names the screen.
+    let t = tool(&r.sock, "get_ui_state", json!({}))["result"].clone();
+    assert_eq!(t["target"], "web");
+    assert_eq!(t["web"]["open"], true);
+}
+
+/// The filter box's text, sent as `query` (the TUI's view shape), filters
+/// as `list_sessions` does; the page's own default view comes from the
+/// daemon.
+#[test]
+fn snapshot_takes_query_and_the_default_view() {
+    let r = start();
+    let ids = |view: Value| -> Vec<String> {
+        let s = op(&r.sock, "snapshot", json!({"view": view}))["result"].clone();
+        let mut v: Vec<String> = s["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{s}"))
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    let listed = |q: &str| -> Vec<String> {
+        let got = tool(&r.sock, "list_sessions", json!({"query": q}))["result"].clone();
+        let rows = got
+            .as_array()
+            .cloned()
+            .or_else(|| got["sessions"].as_array().cloned())
+            .unwrap_or_else(|| panic!("{got}"));
+        let mut v: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r["id"].as_str().map(str::to_string))
+            .collect();
+        v.sort();
+        v
+    };
+    for q in [
+        "tag:web status:starting",
+        "tag:wip",
+        "tag:web status:turn",
+        "gamma",
+    ] {
+        assert_eq!(ids(json!({"query": q, "usage": null})), listed(q), "{q}");
+    }
+    assert_eq!(ids(json!({"query": "tag:wip"})), ["beta"]);
+    let v = op(&r.sock, "view.default", json!({}))["result"].clone();
+    assert_eq!(
+        (&v["sort"], &v["tab"]),
+        (&json!("updated"), &json!("sessions"))
+    );
+}

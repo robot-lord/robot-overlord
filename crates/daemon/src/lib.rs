@@ -107,6 +107,9 @@ pub struct Daemon {
     changes: std::sync::atomic::AtomicU64,
     /// The web plugin, when it runs (web.rs).
     web: Arc<web::Web>,
+    /// `propose_session`'s proposals: id and the overlord's background
+    /// (ui.rs `keep_proposal`).
+    pub(crate) proposals: Mutex<std::collections::VecDeque<(String, Value)>>,
     /// The open web pages and what each shows (web.rs `WebUi`).
     web_ui: Mutex<web::WebUi>,
     /// Open `web.subscribe` streams (the plugin's; a restarted plugin's
@@ -144,6 +147,7 @@ impl Daemon {
             changes: std::sync::atomic::AtomicU64::new(0),
             web: Default::default(),
             web_ui: Default::default(),
+            proposals: Default::default(),
             web_subscribers: AtomicUsize::new(0),
         })
     }
@@ -253,7 +257,6 @@ impl Daemon {
     /// one web page. A web command is also parked, for the next page that
     /// asks, in case it never reaches its page (`page.pending`). Nowhere:
     /// nothing is sent.
-    #[allow(dead_code)] // (the tools take it in the next step)
     pub(crate) fn ui_cmd_to(&self, to: &ui::Target, cmd: Value) {
         match to {
             ui::Target::Terminal(_) => self.ui_cmd(cmd),
@@ -272,7 +275,6 @@ impl Daemon {
     /// that are there now: the terminal's TUI, or the most recently used
     /// web page. So a command landing on the screen the user isn't
     /// looking at doesn't go unseen.
-    #[allow(dead_code)] // (the tools take it in the next step)
     pub(crate) fn notice_others(&self, to: &ui::Target, text: &str) {
         let cmd = json!({"cmd": "notice", "text": text});
         match to {

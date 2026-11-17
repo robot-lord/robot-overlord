@@ -49,6 +49,8 @@ export const OPS = [
   "overlord.switch",
   "page.report",
   "page.pending",
+  "view.default",
+  "keys.list",
 ] as const;
 
 export type Op = (typeof OPS)[number];

@@ -297,16 +297,25 @@ fn suggestion_value_with(s: &Suggestion, cfg: &Config, needed: bool, look: &Look
 /// save. The user's confirm there saves it (`setup.apply`). Cheap: the
 /// form loads rlord's own suggestion (for ←/→) in the background.
 pub(crate) fn confirm(d: &Daemon, params: &Value) -> Result<Value> {
+    let to = crate::ui::target(d);
+    if to == crate::ui::Target::None {
+        crate::ui::show_form(d, &to, "")?;
+    }
     let st = status(d)?;
-    let r = queue_confirm(d, params, st)?;
-    crate::ui::show_list(d)?;
+    let r = queue_confirm(d, params, st, &to)?;
+    crate::ui::show_form(d, &to, "the code-folder form")?;
     Ok(r)
 }
 
 /// `confirm` up to showing the list: check the proposal and push the
-/// form's UI command, with `status` (`setup.status`) for what is
+/// form's UI command to `to`, with `status` (`setup.status`) for what is
 /// configured now.
-fn queue_confirm(d: &Daemon, params: &Value, status: Value) -> Result<Value> {
+fn queue_confirm(
+    d: &Daemon,
+    params: &Value,
+    status: Value,
+    to: &crate::ui::Target,
+) -> Result<Value> {
     let mut prefill = serde_json::Map::new();
     if let Some(c) = params["code_dir"].as_str().filter(|c| !c.trim().is_empty()) {
         prefill.insert("code_dir".into(), json!(absolute_dir(c)?));
@@ -330,8 +339,11 @@ fn queue_confirm(d: &Daemon, params: &Value, status: Value) -> Result<Value> {
         prefill.insert("changed".into(), json!(c));
     }
     let prefill = Value::Object(prefill);
-    d.ui_cmd(json!({"cmd": "setup", "prefill": prefill, "status": status}));
-    Ok(json!({"shown": prefill,
+    d.ui_cmd_to(
+        to,
+        json!({"cmd": "setup", "prefill": prefill, "status": status}),
+    );
+    Ok(json!({"shown": prefill, "on": to.name(),
               "note": "the form is open on the user's screen; rlord saves it when they confirm"}))
 }
 
@@ -675,6 +687,11 @@ mod tests {
     #[test]
     fn confirm_queues_the_form_with_the_proposal() {
         let d = daemon();
+        let term = crate::ui::Target::Terminal(rlord_core::tmux::Client {
+            name: "/dev/ttys001".into(),
+            session: "rlord".into(),
+            activity: 0,
+        });
         let sugg = json!({"suggestion": null, "roots": {"configured": []}});
         let r = queue_confirm(
             &d,
@@ -682,6 +699,7 @@ mod tests {
                     "description": "both", "changed": ["repo_roots"], "note": "Both",
                     "bogus": 1}),
             sugg.clone(),
+            &term,
         )
         .unwrap();
         assert_eq!(r["shown"]["repo_roots"], json!(["/h/ko", "/h/proj"]));
@@ -696,19 +714,20 @@ mod tests {
             "no suggestion in the MCP call"
         );
         // Relative paths and `/` are refused, saying what to pass.
-        let e = queue_confirm(&d, &json!({"code_dir": "ko"}), sugg.clone()).unwrap_err();
+        let e = queue_confirm(&d, &json!({"code_dir": "ko"}), sugg.clone(), &term).unwrap_err();
         assert!(e.to_string().contains("full path"), "{e}");
-        assert!(queue_confirm(&d, &json!({"code_dir": "/"}), sugg.clone()).is_err());
-        assert!(queue_confirm(&d, &json!({"repo_roots": ["x"]}), sugg.clone()).is_err());
+        assert!(queue_confirm(&d, &json!({"code_dir": "/"}), sugg.clone(), &term).is_err());
+        assert!(queue_confirm(&d, &json!({"repo_roots": ["x"]}), sugg.clone(), &term).is_err());
         // `[]` is passed on (only the code folder); omitted stays omitted.
         let r = queue_confirm(
             &d,
             &json!({"code_dir": "/h/ko", "repo_roots": []}),
             sugg.clone(),
+            &term,
         )
         .unwrap();
         assert_eq!(r["shown"]["repo_roots"], json!([]));
-        let r = queue_confirm(&d, &json!({"code_dir": "/h/ko/"}), sugg).unwrap();
+        let r = queue_confirm(&d, &json!({"code_dir": "/h/ko/"}), sugg, &term).unwrap();
         assert!(r["shown"].get("repo_roots").is_none());
         assert_eq!(r["shown"]["code_dir"], "/h/ko");
     }
