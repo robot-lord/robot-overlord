@@ -1233,14 +1233,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     if fresh {
         logged(
             "marking its background seen",
-            db.context_mark_all_seen(&s.id, now).map_err(Into::into),
+            db.context_mark_all_seen(&s.id, now),
         );
     }
     logged(
         "setting its status",
-        db.set_status(&s.id, Status::Starting, now)
-            .map(|_| ())
-            .map_err(Into::into),
+        db.set_status(&s.id, Status::Starting, now).map(|_| ()),
     );
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
@@ -1267,8 +1265,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             }
             .to_string(),
         )
-        .map(|_| ())
-        .map_err(Into::into),
+        .map(|_| ()),
     );
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
