@@ -189,33 +189,38 @@ impl App {
     }
 
     /// A fork sent from the form has an answer: the new session selected,
-    /// or the form again with what went wrong. Returns whether to redraw.
+    /// or the form again with what went wrong (the user's text and all),
+    /// kept until nothing else is open. Returns whether to redraw.
     pub(crate) fn poll_fork(&mut self) -> bool {
-        let Some((rx, _)) = &self.fork_send else {
-            return false;
-        };
-        let r = match rx.try_recv() {
-            Ok(r) => r,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => Err("the request was lost".into()),
-        };
-        let (_, mut f) = self.fork_send.take().expect("checked");
-        match r {
-            Ok(v) => {
-                self.status_line = fork_status(&v);
-                // The new session, wherever the list puts it.
-                self.pending_select = v["id"].as_str().map(str::to_string);
-            }
-            Err(e) => {
-                self.status_line = format!("{} wasn't forked", f.parent_name);
-                f.error = Some(e);
-                // (Over whatever is open meanwhile only when nothing is.)
-                if matches!(self.mode, Mode::Normal) {
-                    self.mode = Mode::Fork(f);
+        let mut changed = false;
+        if let Some((rx, _)) = &self.fork_send {
+            let r = match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("the request was lost".into())),
+            };
+            if let Some(r) = r {
+                let (_, mut f) = self.fork_send.take().expect("checked");
+                match r {
+                    Ok(v) => {
+                        self.status_line = fork_status(&v);
+                        // The new session, wherever the list puts it.
+                        self.pending_select = v["id"].as_str().map(str::to_string);
+                    }
+                    Err(e) => {
+                        self.status_line = format!("{} wasn't forked", f.parent_name);
+                        f.error = Some(e);
+                        self.fork_retry = Some(f);
+                    }
                 }
+                changed = true;
             }
         }
-        true
+        if self.fork_retry.is_some() && matches!(self.mode, Mode::Normal) {
+            self.mode = Mode::Fork(self.fork_retry.take().expect("checked"));
+            changed = true;
+        }
+        changed
     }
 
     pub(crate) fn draw_fork_form(&self, f: &mut Frame, s: &ForkForm) {
@@ -487,6 +492,30 @@ mod tests {
             panic!("form not reopened")
         };
         assert_eq!(f.error.as_deref(), Some("api's folder is gone"));
+        // A failure while something else is open: the form (the user's
+        // prompt and all) waits, and comes back once nothing is.
+        app.mode = Mode::Normal;
+        let (tx, answer) = mpsc::channel();
+        let mut typed = form();
+        typed.prompt = "try the other fix".into();
+        app.fork_send = Some((answer, typed));
+        app.mode = Mode::Fork(form());
+        tx.send(Err("timed out".into())).unwrap();
+        assert!(app.poll_fork());
+        let Mode::Fork(open) = &app.mode else {
+            panic!("the other form went")
+        };
+        assert!(open.prompt.is_empty() && open.error.is_none());
+        assert!(app.fork_retry.is_some(), "kept");
+        assert!(!app.poll_fork(), "still something open");
+        app.mode = Mode::Normal;
+        assert!(app.poll_fork());
+        let Mode::Fork(f) = &app.mode else {
+            panic!("form not reopened")
+        };
+        assert_eq!(f.prompt, "try the other fix");
+        assert_eq!(f.error.as_deref(), Some("timed out"));
+        assert!(app.fork_retry.is_none());
     }
 
     #[test]

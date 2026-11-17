@@ -293,6 +293,8 @@ struct App {
     /// A fork on its way (`session.fork` off the UI thread), and its form,
     /// reopened with the error if it fails (`poll_fork`).
     fork_send: Option<forkform::ForkSend>,
+    /// That form with its error, to reopen once nothing else is open.
+    fork_retry: Option<Box<forkform::ForkForm>>,
     /// The sent form's (first run, overlay after), for the overlord's
     /// answer (`open_setup_from`).
     setup_reply_flags: Option<(bool, bool)>,
@@ -363,6 +365,7 @@ impl App {
             setup_send: None,
             setup_retry: None,
             fork_send: None,
+            fork_retry: None,
             setup_reply_flags: None,
             saved_sel: None,
             reported_view: Value::Null,
