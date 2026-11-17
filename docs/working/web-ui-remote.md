@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–3 built; steps 4–14 not started)
+**Status:** in progress (slice 1: steps 1–4 built; steps 5–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -139,6 +139,25 @@ Decided 2026-11-17 (user):
   "no network code in `rlord`" is true of HTTP servers, websockets, TLS
   and network-client crates, not of TCP itself; step 14's docs should
   say so.
+- Step 4 done (`daemon/src/web.rs`, `lib.rs`): `web.hello`, `web.call`
+  (ops `snapshot`, `session.get`, `overlord.ensure`; anything else gets
+  RPC code `plugin::RPC_ERR_NOT_ALLOWED`, and no op may name a forbidden
+  family), `web.subscribe` (one push loop with `events.subscribe`,
+  `Daemon::push_loop`), `web.pane_target`; `rev` is
+  `<boot id>-<changes>` from `Daemon::changed()`. `group_list` and
+  friends moved to `rlord_core::groups`; `ui::ensure_running` came out of
+  `ui::goto` (not yet an op: Resume is step 11's). Fixture
+  `crates/web/ui/test/fixtures/snapshot.json`, checked by
+  `crates/daemon/tests/web_api.rs` (regenerate with
+  `RLORD_UPDATE_FIXTURES=1`). Choices within the plan:
+  - Snapshot: `{rev, rows, groups: [{tag, label, count, favourite}],
+    overlord, statuses: [{status, label}]}`; every row (and the overlord
+    and its roster entries) gets `status_label`. `overlord` is
+    `overlord.get` as is (its `overlords` is the roster), null before
+    setup. The view is forced to `include_overlord: false`.
+  - Typed errors: `web::Incompatible` and `web::NotAllowed`, mapped to
+    their RPC codes in `dispatch` by downcast.
+  - The `web.subscribe` ack carries the current `rev`.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

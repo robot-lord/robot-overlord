@@ -26,6 +26,8 @@ pub const EXIT_PORT_IN_USE: i32 = 4;
 
 /// The daemon's RPC error code for a `web.hello` with another protocol.
 pub const RPC_ERR_INCOMPATIBLE: i32 = -32010;
+/// The daemon's RPC error code for a `web.call` op that isn't on its list.
+pub const RPC_ERR_NOT_ALLOWED: i32 = -32011;
 
 /// The SHA-256 (hex) of the plugin this `rlord` was released with, set by
 /// the release build (`RLORD_WEB_SHA256`). None in a checkout's build or a

@@ -25,6 +25,7 @@ pub mod triage;
 pub mod ui;
 pub mod usage;
 pub mod warm;
+pub mod web;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,11 @@ pub struct Daemon {
     /// (it runs tmux and the install checks; the TUI asks on every
     /// refresh).
     roster: Mutex<Option<(std::time::Instant, String, Value)>>,
+    /// Random per daemon start: the first half of `rev`, so a revision
+    /// never repeats across a restart.
+    boot_id: String,
+    /// Bumped by every `changed()`: the second half of `rev`.
+    changes: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
@@ -108,6 +114,9 @@ impl Daemon {
             limits: Default::default(),
             roster: Mutex::new(None),
             fork_flags: Default::default(),
+            boot_id: rlord_core::plugin::random_hex(6)
+                .unwrap_or_else(|_| format!("{:x}", std::process::id())),
+            changes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -138,7 +147,14 @@ impl Daemon {
     }
 
     pub(crate) fn changed(&self) {
+        self.changes.fetch_add(1, Ordering::SeqCst);
         let _ = self.notify.send(r#"{"notify":"changed"}"#.to_string());
+    }
+
+    /// The state's revision, `"<boot id>-<n>"`: moves on every change and
+    /// never repeats across a restart (the web UI's "anything new?").
+    pub fn rev(&self) -> String {
+        format!("{}-{}", self.boot_id, self.changes.load(Ordering::SeqCst))
     }
 
     /// Hold the overlord's session (`sessions`), if there is one: around
@@ -361,38 +377,24 @@ impl Daemon {
             // A subscription takes over the connection: ack, then push a
             // notify line on every change until the client hangs up.
             if let Ok(req) = serde_json::from_str::<Request>(&line) {
-                if req.method == "events.subscribe" {
-                    let ack = Response::ok(req.id, json!({"subscribed": true}));
-                    let mut out = serde_json::to_vec(&ack)?;
-                    out.push(b'\n');
-                    write_half.write_all(&out).await?;
-                    let mut rx = self.notify.subscribe();
+                let kind = match req.method.as_str() {
                     // TUIs identify themselves so the daemon knows whether a
                     // UI command has anyone to land on.
-                    let is_tui = req.params.get("client").and_then(Value::as_str) == Some("tui");
-                    if is_tui {
-                        self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
-                    }
-                    let r = loop {
-                        let line = match rx.recv().await {
-                            Ok(line) => line,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                r#"{"notify":"changed"}"#.to_string()
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break Ok(()),
-                        };
-                        if write_half
-                            .write_all(format!("{line}\n").as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            break Ok(()); // client gone
-                        }
+                    "events.subscribe" => Some(Push::Events {
+                        tui: req.params.get("client").and_then(Value::as_str) == Some("tui"),
+                    }),
+                    "web.subscribe" => Some(Push::Web),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    let ack = match kind {
+                        Push::Web => json!({"subscribed": true, "rev": self.rev()}),
+                        Push::Events { .. } => json!({"subscribed": true}),
                     };
-                    if is_tui {
-                        self.tui_subscribers.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    return r;
+                    let mut out = serde_json::to_vec(&Response::ok(req.id, ack))?;
+                    out.push(b'\n');
+                    write_half.write_all(&out).await?;
+                    return self.push_loop(write_half, kind).await;
                 }
             }
             let resp = match serde_json::from_str::<Request>(&line) {
@@ -411,6 +413,55 @@ impl Daemon {
         Ok(())
     }
 
+    /// A subscription's push stream, until the client hangs up or the
+    /// daemon goes. `events.subscribe` gets every notify line as sent;
+    /// `web.subscribe` only `{"notify":"changed","rev"}`, at most one per
+    /// 100 ms (the changes in between folded into it), and no UI commands.
+    /// A lagged receiver counts as a change.
+    async fn push_loop(&self, mut w: tokio::net::unix::OwnedWriteHalf, kind: Push) -> Result<()> {
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+        const WEB_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+        const CHANGED: &str = r#"{"notify":"changed"}"#;
+        let mut rx = self.notify.subscribe();
+        let tui = matches!(kind, Push::Events { tui: true });
+        if tui {
+            self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut last_web: Option<std::time::Instant> = None;
+        let r = loop {
+            let mut line = match rx.recv().await {
+                Ok(line) => line,
+                Err(RecvError::Lagged(_)) => CHANGED.to_string(),
+                Err(RecvError::Closed) => break Ok(()),
+            };
+            if let Push::Web = kind {
+                if line != CHANGED {
+                    continue; // a UI command: not for the web in this slice
+                }
+                if let Some(at) = last_web {
+                    let wait = WEB_EVERY.saturating_sub(at.elapsed());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                // Whatever came meanwhile is in this one.
+                while !matches!(
+                    rx.try_recv(),
+                    Err(TryRecvError::Empty | TryRecvError::Closed)
+                ) {}
+                line = json!({"notify": "changed", "rev": self.rev()}).to_string();
+                last_web = Some(std::time::Instant::now());
+            }
+            if w.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                break Ok(()); // client gone
+            }
+        };
+        if tui {
+            self.tui_subscribers.fetch_sub(1, Ordering::SeqCst);
+        }
+        r
+    }
+
     fn dispatch(&self, req: Request) -> Response {
         let id = req.id;
         match self.call(&req.method, req.params) {
@@ -422,7 +473,14 @@ impl Daemon {
             ),
             Err(MethodError::Internal(e)) => {
                 tracing::warn!(method = %req.method, error = %e, "method failed");
-                Response::err(id, rpc::ERR_INTERNAL, e.to_string())
+                let code = if e.downcast_ref::<web::Incompatible>().is_some() {
+                    rlord_core::plugin::RPC_ERR_INCOMPATIBLE
+                } else if e.downcast_ref::<web::NotAllowed>().is_some() {
+                    rlord_core::plugin::RPC_ERR_NOT_ALLOWED
+                } else {
+                    rpc::ERR_INTERNAL
+                };
+                Response::err(id, code, e.to_string())
             }
         }
     }
@@ -893,6 +951,11 @@ impl Daemon {
             "ui.propose_session" => ui::propose_session(self, params),
             // Without `overlord: true` (`rlord mcp --overlord`) the server
             // is read-only: only `mcp::READ_ONLY_TOOLS`, listed and callable.
+            // The web plugin (web.rs). Never reachable from MCP or from a
+            // browser's `web.call`.
+            "web.hello" => web::hello(self, params),
+            "web.call" => web::call(self, params),
+            "web.pane_target" => web::pane_target(self, params),
             "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
             "mcp.call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -912,6 +975,15 @@ impl Daemon {
         };
         Some(r)
     }
+}
+
+/// What a subscription's push stream carries (`Daemon::push_loop`).
+#[derive(Clone, Copy)]
+enum Push {
+    /// `events.subscribe`: every notify line; a TUI is counted.
+    Events { tui: bool },
+    /// `web.subscribe`: coalesced `changed` with the `rev`.
+    Web,
 }
 
 enum MethodError {
