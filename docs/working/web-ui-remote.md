@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–8 built; steps 9–14 not started)
+**Status:** in progress (slice 1: steps 1–9 built; steps 10–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -325,6 +325,35 @@ Decided 2026-11-17 (user):
   - `vite.config.ts`: `assetsInlineLimit: 0` (no `data:` assets), no
     module-preload polyfill, no source maps. Vite reads `jsxImportSource`
     from `tsconfig.json`: no JSX plugin.
+- Step 9 done (`ui/src/{proto,api,store,route,main}.ts(x)`,
+  `views/List.tsx`, `components/`): the list with the overlord on top,
+  Sessions and Groups tabs, filter (the query's free-text `search`,
+  200 ms after typing), sort (the six `SortMode`s) with reverse,
+  live/archived/both; status, name, agent, tags, description, last update,
+  pin and usage-limit marks. The view is kept in `localStorage`. A
+  `changed` is debounced 100 ms; `snapshot` passes the shown `rev` only
+  when the query is the one that snapshot answers; one request at a time,
+  with one more for whatever came in meanwhile; an answer for a view that
+  has since changed is dropped. `test/fixture.test.ts` holds `proto.ts`
+  to the fixture by `tsc`: the fixture must fit the types (strings
+  widened, as JSON imports type them) and have exactly their required
+  keys; it found the overlord's `limit`. Vitest: `api`, `store`, routes,
+  times. Choices within the plan:
+  - The Groups tab draws the picked group's rows from the snapshot's rows
+    (as the TUI does, `in_group`); the daemon still makes the groups and
+    their order. Untagged is the group with tag `""`.
+  - The filter is free text only: `session.list`'s `search`. The TUI's
+    `tag:` / `status:` tokens are parsed in Rust (`apply_search_text`) and
+    not reachable through `snapshot`; worth adding to `snapshot` later if
+    wanted.
+  - Agent names ("Claude Code") come from the overlord's roster labels.
+  - Hash routes `#/`, `#/overlord`, `#/s/<id>`; wide screens (900 px and
+    up) show the list beside the main pane, narrow ones one at a time.
+  - The build id: the first `hello` sets it; a later `hello` with another
+    reloads the page.
+  - Checked in headless Chromium and WebKit (Playwright 1.65.1, outside
+    the repo) against `demo.sh --web`: nine demo rows and the overlord
+    row, no console errors or CSP reports.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

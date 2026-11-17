@@ -1,31 +1,13 @@
-// The page: mount and connect. (Views come with the list and pane steps.)
-import { signal } from "@preact/signals";
+// The page: the token, the control socket, the store, and the routes.
+// Wide screens show the list beside the pane; narrow ones one at a time.
+
 import { render } from "preact";
-import { type ConnState, Control, takeToken, wsUrl } from "./api";
+import { Control, takeToken, wsUrl } from "./api";
+import { tick } from "./components/time";
+import { followHash, parse, route } from "./route";
+import { Store } from "./store";
+import { List } from "./views/List";
 import "./app.css";
-
-const state = signal<ConnState | "no_token">("connecting");
-const version = signal("");
-let build: string | null = null;
-
-const token = takeToken(location, safeStorage(), (u) => history.replaceState(null, "", u));
-if (token) {
-  const control = new Control(wsUrl("/ws"), token, {
-    state: (s) => {
-      state.value = s;
-    },
-    hello: (h) => {
-      // A page from another build reloads (the plugin was updated).
-      if (build !== null && build !== h.build) location.reload();
-      build = h.build;
-      version.value = h.version;
-    },
-    changed: () => {},
-  });
-  window.addEventListener("pagehide", () => control.stop());
-} else {
-  state.value = "no_token";
-}
 
 function safeStorage(): Storage | null {
   try {
@@ -35,7 +17,35 @@ function safeStorage(): Storage | null {
   }
 }
 
-const words: Record<ConnState | "no_token", string> = {
+const storage = safeStorage();
+const store = new Store(storage);
+let build: string | null = null;
+let version = "";
+
+const token = takeToken(location, storage, (u) => history.replaceState(null, "", u));
+// (After the token: the fragment was `#t=…` until then.)
+route.value = parse(location.hash);
+followHash();
+tick();
+
+const control = token
+  ? new Control(wsUrl("/ws"), token, {
+      state: (s) => {
+        store.conn.value = s;
+      },
+      hello: (h) => {
+        // A page from another build reloads (the plugin was updated).
+        if (build !== null && build !== h.build) location.reload();
+        build = h.build;
+        version = h.version;
+        if (control) store.connected(control);
+      },
+      changed: (rev) => store.changed(rev),
+    })
+  : null;
+if (!token) store.conn.value = "no_token";
+
+const words: Record<string, string> = {
   connecting: "connecting…",
   open: "connected",
   closed: "disconnected, retrying…",
@@ -44,12 +54,28 @@ const words: Record<ConnState | "no_token", string> = {
 };
 
 function App() {
+  const r = route.value;
+  const conn = store.conn.value;
   return (
-    <header class="bar">
-      <b class="brand">rlord</b>
-      <span class={`conn conn-${state.value}`}>{words[state.value]}</span>
-      {version.value && <span class="dim">{version.value}</span>}
-    </header>
+    <div class={`app at-${r.kind}`}>
+      <header class="bar">
+        <a class="brand" href="#/">
+          rlord
+        </a>
+        <span class={`conn conn-${conn}`} title={version ? `rlord-web ${version}` : undefined}>
+          {words[conn]}
+        </span>
+        {store.error.value && conn === "open" && <span class="err">{store.error.value}</span>}
+      </header>
+      <div class="body">
+        <aside class="side">
+          <List store={store} route={r} />
+        </aside>
+        <main class="main">
+          <p class="hint">Pick the overlord or a session.</p>
+        </main>
+      </div>
+    </div>
   );
 }
 
