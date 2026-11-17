@@ -476,17 +476,26 @@ pub struct ForkFlags {
 const FLAGS_MAX: usize = 4096;
 
 impl ForkFlags {
-    /// Thread `t`'s answer (`codex::rollout_forked_from` through `read`;
-    /// None: can't be told yet, asked again next time, not remembered).
+    /// Thread `t`'s answer at `now`, its first line read through `read`
+    /// (`codex::rollout_first_line`). None: can't be told yet, asked again
+    /// next time, not remembered. A first line that is complete but never
+    /// readable (over the cap, not JSON) is taken as no fork once the
+    /// thread is `UNREAD_GRACE_MS` old, and remembered: not read again on
+    /// every pass.
     fn of(
         &mut self,
         t: &codex::Thread,
-        read: impl Fn(&std::path::Path) -> Option<Option<String>>,
+        now: i64,
+        read: impl Fn(&std::path::Path) -> codex::FirstLine,
     ) -> Option<Option<String>> {
         if let Some(known) = self.seen.get(&t.id) {
             return Some(known.clone());
         }
-        let forked = read(std::path::Path::new(&t.rollout_path))?;
+        let forked = match read(std::path::Path::new(&t.rollout_path)) {
+            codex::FirstLine::Says(from) => from,
+            codex::FirstLine::Unreadable if now - t.created_at_ms >= UNREAD_GRACE_MS => None,
+            codex::FirstLine::Unreadable | codex::FirstLine::NotYet => return None,
+        };
         while self.order.len() >= FLAGS_MAX {
             if let Some(old) = self.order.pop_front() {
                 self.seen.remove(&old);
@@ -502,12 +511,21 @@ impl ForkFlags {
 /// daemon's remembered answers (`ForkFlags`).
 fn rollout_fork(d: &Daemon, t: &codex::Thread) -> Option<Option<String>> {
     let mut flags = d.fork_flags.lock().unwrap_or_else(|e| e.into_inner());
-    flags.of(t, codex::rollout_forked_from)
+    flags.of(t, now_ms(), codex::rollout_first_line)
 }
 
 fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
     // A hook may have bound it meanwhile.
     if db.resolve_ref(&s.id)?.agent_session.is_some() {
+        return Ok(false);
+    }
+    // Another session has the thread (bound since the threads taken were
+    // read, by a hook or earlier in the pass): never two sessions on one.
+    // (Checked here, under the lock, whatever the caller read before.)
+    if db
+        .session_by_agent_session(&t.id)?
+        .is_some_and(|o| o.id != s.id)
+    {
         return Ok(false);
     }
     // rlord's own attribution ("minted"), until a hook confirms it.
@@ -607,10 +625,12 @@ fn pick_thread<'a>(
     // after a moment, as before forks (an ordinary session must not stay
     // unbound).
     match fit.as_slice() {
+        // No rlord fork waiting here: nothing it could be but this
+        // session's (or the user's own fork): its rollout isn't read.
+        [one] if awaited.is_empty() => Some(*one),
         [one] => match forked_from(one) {
             Some(None) => Some(*one),
             Some(Some(parent)) => (!awaited.contains(&parent)).then_some(*one),
-            None if awaited.is_empty() => Some(*one),
             None => (now - one.created_at_ms >= UNREAD_GRACE_MS).then_some(*one),
         },
         _ => None,
@@ -846,10 +866,15 @@ mod tests {
         // No rlord fork waiting here: the user's own fork, and an unread
         // rollout, are taken at once.
         awaited.borrow_mut().clear();
+        read.borrow_mut().clear();
         assert_eq!(pick(&only_forks, None, false, None).as_deref(), Some("f1"));
         assert_eq!(
             pick(&unread, Some("fix it"), false, None).as_deref(),
             Some("u1")
+        );
+        assert!(
+            read.borrow().is_empty(),
+            "no rlord fork waiting: no rollout read"
         );
         awaited.borrow_mut().push("parent".into());
         // Its own (and a fork with another first message): taken, reading
@@ -885,9 +910,9 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let read = |p: &std::path::Path| {
             reads.set(reads.get() + 1);
-            codex::rollout_forked_from(p)
+            codex::rollout_first_line(p)
         };
-        assert_eq!(flags.of(&t, read), None, "not there yet");
+        assert_eq!(flags.of(&t, 2, read), None, "not there yet");
         let meta = |from: &str| {
             format!(
                 "{}\n",
@@ -896,24 +921,38 @@ mod tests {
         };
         let line = meta("t-parent");
         std::fs::write(&path, &line[..line.len() - 5]).unwrap();
-        assert_eq!(flags.of(&t, read), None, "half written");
+        assert_eq!(flags.of(&t, 2, read), None, "half written");
         std::fs::write(&path, &line).unwrap();
-        assert_eq!(flags.of(&t, read), Some(Some("t-parent".into())));
+        assert_eq!(flags.of(&t, 2, read), Some(Some("t-parent".into())));
         // Changed on disk (it never is): the remembered answer stands, and
         // the file isn't read again.
         std::fs::write(&path, meta("t-other")).unwrap();
         let before = reads.get();
-        assert_eq!(flags.of(&t, read), Some(Some("t-parent".into())));
+        assert_eq!(flags.of(&t, 2, read), Some(Some("t-parent".into())));
         assert_eq!(reads.get(), before);
+
+        // A complete first line that can never be read (not JSON, or over
+        // the cap): asked again only within the grace, then no fork, and
+        // not read again.
+        let junk = dir.path().join("rollout-junk.jsonl");
+        std::fs::write(&junk, "not json\n{}\n").unwrap();
+        let mut j = thread("t-junk", "x");
+        j.rollout_path = junk.to_string_lossy().into_owned();
+        assert_eq!(flags.of(&j, 2, read), None, "within the grace");
+        let late = j.created_at_ms + UNREAD_GRACE_MS;
+        assert_eq!(flags.of(&j, late, read), Some(None));
+        let before = reads.get();
+        assert_eq!(flags.of(&j, late + 60_000, read), Some(None));
+        assert_eq!(reads.get(), before, "remembered");
     }
 
     /// Past its bound the oldest answers go, not all of them.
     #[test]
     fn fork_flags_forget_the_oldest_first() {
         let mut flags = ForkFlags::default();
-        let none = |_: &std::path::Path| Some(None);
+        let none = |_: &std::path::Path| codex::FirstLine::Says(None);
         for i in 0..=FLAGS_MAX {
-            flags.of(&thread(&format!("t{i}"), "x"), none);
+            flags.of(&thread(&format!("t{i}"), "x"), 2, none);
         }
         assert_eq!(flags.seen.len(), FLAGS_MAX);
         assert!(!flags.seen.contains_key("t0"), "the oldest went");
@@ -1064,6 +1103,29 @@ mod tests {
             .into_owned();
         assert!(record_bind(&db, &db.resolve_ref("b").unwrap(), &t).unwrap());
         assert!(db.kv_get(&crate::fork::pending_key("b")).unwrap().is_some());
+        // A thread another session has (bound after the caller read which
+        // threads were taken): never bound to a second one.
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "c",
+            name: "c",
+            agent: "codex",
+            agent_session: None,
+            project_path: "/src/app",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        assert!(!record_bind(&db, &db.resolve_ref("c").unwrap(), &t).unwrap());
+        assert_eq!(db.resolve_ref("c").unwrap().agent_session, None);
+        assert_eq!(
+            db.resolve_ref("b").unwrap().agent_session.as_deref(),
+            Some("tb")
+        );
     }
 
     #[test]

@@ -565,25 +565,60 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
 
 /// What a rollout's first line (its `session_meta`) says it was forked
 /// from: `Some(Some(thread))` a fork of that thread, `Some(None)` not a
-/// fork, `None` can't be told yet (no file, or no complete first line:
-/// it is still being written; ask again). Only the first line counts: a
-/// fork's history copied after it may hold other threads' meta. A first
-/// line is read whole (up to 4 MB: it carries the instructions).
+/// fork, `None` can't be told (`rollout_first_line`: not yet, or never).
+/// Only the first line counts: a fork's history copied after it may hold
+/// other threads' meta.
 pub fn rollout_forked_from(path: &Path) -> Option<Option<String>> {
+    match rollout_first_line(path) {
+        FirstLine::Says(from) => Some(from),
+        FirstLine::NotYet | FirstLine::Unreadable => None,
+    }
+}
+
+/// A rollout's first line, as `rollout_first_line` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstLine {
+    /// Complete: what it was forked from (None: not a fork).
+    Says(Option<String>),
+    /// No file, or no complete first line yet: it is still being written.
+    NotYet,
+    /// Complete but never readable: longer than `FIRST_LINE_MAX`, or not
+    /// JSON. Reading it again won't help.
+    Unreadable,
+}
+
+/// How much of a rollout's first line is read (it carries the
+/// instructions).
+pub const FIRST_LINE_MAX: u64 = 4 << 20;
+
+/// Read a rollout's first line whole, up to `FIRST_LINE_MAX`.
+pub fn rollout_first_line(path: &Path) -> FirstLine {
     use std::io::{BufRead, Read};
-    let f = std::fs::File::open(path).ok()?;
+    let Ok(f) = std::fs::File::open(path) else {
+        return FirstLine::NotYet;
+    };
     let mut line = Vec::new();
-    std::io::BufReader::new(f.take(4 << 20))
+    if std::io::BufReader::new(f.take(FIRST_LINE_MAX))
         .read_until(b'\n', &mut line)
-        .ok()?;
+        .is_err()
+    {
+        return FirstLine::NotYet;
+    }
     if line.last() != Some(&b'\n') {
-        return None;
+        // No newline in the whole cap: a line longer than it, for good.
+        return if line.len() as u64 >= FIRST_LINE_MAX {
+            FirstLine::Unreadable
+        } else {
+            FirstLine::NotYet
+        };
     }
-    let v: Value = serde_json::from_slice(&line).ok()?;
+    let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+        return FirstLine::Unreadable;
+    };
     if v["type"] != "session_meta" {
-        return Some(None);
+        return FirstLine::Says(None);
     }
-    Some(
+    FirstLine::Says(
         v["payload"]["forked_from_id"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -1673,6 +1708,24 @@ mod fork_tests {
         assert_eq!(
             rollout_forked_from(&write("other.jsonl", "{\"type\":\"event_msg\"}\n")),
             Some(None)
+        );
+        // Not yet, or never: a line still being written can still be
+        // read; one that isn't JSON, or is longer than the cap, can't.
+        assert_eq!(
+            rollout_first_line(&dir.path().join("unended.jsonl")),
+            FirstLine::NotYet
+        );
+        assert_eq!(
+            rollout_first_line(&dir.path().join("junk.jsonl")),
+            FirstLine::Unreadable
+        );
+        let huge = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"instructions\":\"{}\"}}}}\n",
+            "z".repeat(FIRST_LINE_MAX as usize)
+        );
+        assert_eq!(
+            rollout_first_line(&write("huge.jsonl", &huge)),
+            FirstLine::Unreadable
         );
     }
 }
