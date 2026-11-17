@@ -487,7 +487,7 @@ hooks and `discover` keep the stored status to themselves.
 over `idle` (your turn) as `async_tasks: N` on the row (with
 `async_work`: what and since when). It shows as `◔ bg N` in the list,
 `bg N` in `rlord ls`, and status `background work` (with `async_labels`)
-in `list_sessions`, `get_session` and `read_screen`. `status:bg` filters
+in `list_sessions`, `get_session`, `read_screen` and `triage`. `status:bg` filters
 it. A `waiting_input` session never gets it, and a usage limit is drawn
 over it. The daemon decides the precedence once and sets `shown_status`
 on each row (limited, else `background`, else the stored status). The
@@ -545,12 +545,14 @@ drawn over (`shown_status_matches`).
   call:
   - the session stops (its state is dropped);
   - its agent process starts again (work launched before the start is
-    forgotten, since its tasks died with the old process).
+    forgotten, since its tasks died with the old process; so is work with
+    no launch time, which can't be placed after the start).
 
   A `/clear` moves the session to a new transcript in the same process,
   and the open work carries over to it.
 - **Read.** A 5s tick takes one stat of each transcript. If its length,
-  inode and mtime are unchanged, nothing is opened, and the subagents'
+  inode and mtime are unchanged since a read that reached the end of the
+  file (a skipped long line included) and didn't fail, nothing is opened, and the subagents'
   own files are stat'ed only while some are open. Otherwise it reads what
   was appended since its byte offset: whole lines only, at most 4 MB a
   tick, and a longer line is skipped unparsed. A cheap substring check
@@ -566,8 +568,9 @@ drawn over (`shown_status_matches`).
   subagents are hidden from the status and it shows your turn again, so a
   lost notification (the agent restarted with work running) can't leave
   a session stuck. "Written" is the newest mtime of the transcript and of
-  each open subagent's `outputFile` and sidechain transcript (the 5 most
-  recently started are stat'ed), since subagents write there, not in the
+  each open subagent's `outputFile` and sidechain transcript (in the
+  `subagents` folder of the transcript it was launched in, kept across a
+  `/clear`; the 5 most recently started are stat'ed), since subagents write there, not in the
   main transcript. Hidden work stays open: a late notification still
   closes it, and it shows again once its files change. Shells are hidden
   the same way once the transcript itself has been quiet that long.

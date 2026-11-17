@@ -32,6 +32,10 @@ file). PR #68.
   removed from Claude Code: the installed version's own help says "the
   TaskOutput tool was removed", and no transcript here has a TaskOutput
   call to take a shape from.
+- Round 7: the file stamp is saved only once the whole file was read
+  without an error. A task with no launch time is dropped on a restart.
+  Each agent keeps the sidechain folder it was launched next to. Lists cap
+  at 5 with "+N more". `triage` speaks the same status words.
 - The stale guard (30 min) hides work; it never forgets it. Work is
   forgotten on a stop, or when a new agent process starts (an rlord
   resume, restart or refork event, or a `SessionStart` hook with source

@@ -92,6 +92,9 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
         if !labels.is_empty() {
             out.push_str(": ");
             out.push_str(&labels.join(", "));
+            if n as usize > labels.len() {
+                out.push_str(&format!(", +{} more", n as usize - labels.len()));
+            }
         }
         if let Some(t) = oldest {
             out.push_str(&format!(", started {} ago", ago(t, now)));
@@ -157,6 +160,9 @@ pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
     if !items.is_empty() {
         out.push_str(": ");
         out.push_str(&items.join(", "));
+        if n as usize > items.len() {
+            out.push_str(&format!(", +{} more", n as usize - items.len()));
+        }
     }
     out.push('.');
     Some(out)
@@ -254,6 +260,18 @@ mod tests {
             "Remote Control failed (⇄, red): not logged in."
         );
         assert_eq!(remote_sentence(&json!({})), None);
+    }
+
+    #[test]
+    fn more_than_listed_says_how_many_more() {
+        let tasks: Vec<Value> = (0..5)
+            .map(|i| json!({"label": format!("t{i}"), "started_at": 0}))
+            .collect();
+        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 7,
+            "async_work": tasks.clone(), "async_shells": {"count": 6, "tasks": tasks}});
+        let d = describe(&s, 0);
+        assert!(d[0].contains("t4, +2 more."), "{}", d[0]);
+        assert!(d[1].ends_with("t4, +1 more."), "{}", d[1]);
     }
 
     #[test]

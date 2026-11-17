@@ -44,10 +44,9 @@ const LIST_CAP: usize = 5;
 /// One live session's transcript as last read.
 #[derive(Default, Clone)]
 struct Seen {
-    path: String,
     tracker: Tracker,
-    /// The file's (len, inode, mtime ms) at the last read: unchanged, it
-    /// isn't opened.
+    /// The file's (len, inode, mtime ms) once all of it was read:
+    /// unchanged, it isn't opened.
     stamp: (u64, u64, i64),
 }
 
@@ -88,16 +87,18 @@ pub(crate) fn mtime_ms(p: &Path) -> Option<i64> {
 /// When the session last wrote anything: its transcript, or the output of
 /// one of its open subagents (they write there, not in the transcript):
 /// each one's `outputFile` and its sidechain transcript
-/// (`<session>/subagents/agent-<id>.jsonl`). At most `STAT_CAP` of them,
-/// the most recently started first.
-fn last_write(path: &Path, main: i64, t: &Tracker) -> i64 {
-    let side = path.with_extension("").join("subagents");
+/// (`agent-<id>.jsonl` in the `subagents` folder of the transcript it was
+/// launched in, which a `/clear` leaves behind). At most `STAT_CAP` of
+/// them, the most recently started first.
+fn last_write(main: i64, t: &Tracker) -> i64 {
     let mut newest = main;
     let mut agents: Vec<_> = t.of(Kind::Agent).collect();
     agents.sort_by_key(|(_, t)| std::cmp::Reverse(t.started_at));
     for (id, task) in agents.into_iter().take(STAT_CAP) {
         let mut files: Vec<PathBuf> = task.output.iter().cloned().collect();
-        files.push(side.join(format!("agent-{id}.jsonl")));
+        if let Some(side) = &task.side {
+            files.push(side.join(format!("agent-{id}.jsonl")));
+        }
         for f in files {
             newest = newest.max(mtime_ms(&f).unwrap_or(0));
         }
@@ -120,18 +121,22 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64) -> Shown {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_millis() as i64);
     let stamp = (meta.len(), meta.ino(), main);
-    if stamp != s.stamp {
-        let _ = s.tracker.advance_with(path, &meta);
+    // (Saved only once the whole file is read, a skipped long line
+    // included, and the read didn't fail: else read on next tick.)
+    if stamp != s.stamp
+        && s.tracker.advance_with(path, &meta).is_ok()
+        && s.tracker.offset == meta.len()
+    {
         s.stamp = stamp;
     }
     let t = &mut s.tracker;
+    // A task with no launch time can't be placed after the start: dropped.
     if started_at > 0 {
-        t.open
-            .retain(|_, task| task.started_at == 0 || task.started_at >= started_at);
+        t.open.retain(|_, task| task.started_at >= started_at);
     }
     // (The subagents' own files only while some are open.)
     let agents = if t.of(Kind::Agent).next().is_some() {
-        last_write(path, main, t)
+        last_write(main, t)
     } else {
         main
     };
@@ -200,8 +205,7 @@ fn scan(d: &Daemon) -> Result<()> {
     for (id, path, started_at) in &sources {
         let s = seen.entry(id.clone()).or_default();
         // (A new path, after a `/clear`: the tracker notices the new file
-        // and carries the open work over.)
-        s.path.clone_from(path);
+        // by its inode and carries the open work over.)
         // Sub-agents the hooks saw finish (only while some are open).
         let ids: Vec<&str> = s
             .tracker
@@ -324,6 +328,57 @@ mod tests {
     }
 
     #[test]
+    fn the_stamp_waits_for_the_whole_file() {
+        use rlord_core::agents::background::CHUNK;
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        let mut f = std::fs::File::create(&main).unwrap();
+        writeln!(f, "{}", agent("a1")).unwrap();
+        let long = json!({"type": "user", "pad": "x".repeat(CHUNK as usize + 10)});
+        let done = json!({"type": "attachment", "attachment": {"type": "queued_command",
+            "commandMode": "task-notification",
+            "prompt": "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>"}});
+        writeln!(f, "{long}\n{done}").unwrap();
+        drop(f);
+        let mut s = Seen::default();
+        let now = now_ms();
+        // More than one tick's read: the file is unchanged in between, yet
+        // each tick goes on reading until the end.
+        for _ in 0..5 {
+            refresh(&mut s, &main, 0, now);
+        }
+        assert!(s.tracker.open.is_empty());
+        assert_eq!(s.stamp.0, std::fs::metadata(&main).unwrap().len());
+    }
+
+    #[test]
+    fn a_task_with_no_time_goes_on_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        std::fs::write(&main, format!("{}\n", agent("a1"))).unwrap();
+        let mut s = Seen::default();
+        assert_eq!(refresh(&mut s, &main, 0, now_ms()).agent_count, 1);
+        assert_eq!(refresh(&mut s, &main, 1, now_ms()), Shown::default());
+    }
+
+    #[test]
+    fn a_carried_agent_keeps_its_sidechain_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("s1.jsonl");
+        let new = dir.path().join("s2.jsonl");
+        std::fs::write(&old, format!("{}\n", agent("a1"))).unwrap();
+        std::fs::write(&new, "").unwrap();
+        let side = dir.path().join("s1").join("subagents");
+        std::fs::create_dir_all(&side).unwrap();
+        std::fs::write(side.join("agent-a1.jsonl"), "").unwrap();
+        let mut s = Seen::default();
+        refresh(&mut s, &old, 0, now_ms());
+        refresh(&mut s, &new, 0, now_ms());
+        // Both transcripts quiet; the subagent's own file is what's fresh.
+        assert!(now_ms() - last_write(0, &s.tracker) < STALE_MS);
+    }
+
+    #[test]
     fn a_clear_carries_the_work_to_the_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("s1.jsonl");
@@ -371,7 +426,7 @@ mod tests {
             .unwrap();
         assert!(now_ms() - mtime_ms(&main).unwrap() >= STALE_MS);
         let main_at = mtime_ms(&main).unwrap();
-        assert!(now_ms() - last_write(&main, main_at, &t) < STALE_MS);
+        assert!(now_ms() - last_write(main_at, &t) < STALE_MS);
     }
 
     fn daemon(path: &Path) -> Arc<Daemon> {

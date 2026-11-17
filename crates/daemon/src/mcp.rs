@@ -372,7 +372,7 @@ fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
 /// The status as the overlord sees it: the daemon's `shown_status`
 /// (`background` and `limited` as they are, the rest in the words people
 /// see: working, needs you, your turn, stopped).
-fn status_word(s: &Value) -> Value {
+pub(crate) fn status_word(s: &Value) -> Value {
     match s["shown_status"]
         .as_str()
         .or(s["status"].as_str())

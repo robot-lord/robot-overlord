@@ -82,6 +82,10 @@ pub struct Task {
     /// Where it writes as it goes (`toolUseResult.outputFile`), for
     /// freshness: a subagent writes there, not in the main transcript.
     pub output: Option<PathBuf>,
+    /// Its sidechain transcripts' folder (`<transcript>/subagents`), from
+    /// the transcript it was launched in: kept when a `/clear` carries it
+    /// over to another file.
+    pub side: Option<PathBuf>,
 }
 
 /// What has been read of one transcript, and the work still open in it.
@@ -99,12 +103,16 @@ pub struct Tracker {
     /// The bytes at `offset` are the rest of a line not to be parsed (cut
     /// by the first read's start, or over `CHUNK` long).
     skip_line: bool,
+    /// The sidechain folder of the transcript being read, for launches.
+    side: Option<PathBuf>,
 }
 
 impl Tracker {
     /// Read what was appended to `path` since the last call (bounded by
-    /// `CHUNK`). A file that shrank or was replaced (new inode) is read
-    /// again from its tail.
+    /// `CHUNK`). A file that shrank or was
+    /// replaced (new inode) is read again from its tail. (Tests; the
+    /// daemon has the metadata already: `advance_with`.)
+    #[cfg(test)]
     pub fn advance(&mut self, path: &Path) -> std::io::Result<()> {
         let meta = std::fs::metadata(path)?;
         self.advance_with(path, &meta)
@@ -114,19 +122,20 @@ impl Tracker {
     /// tick): nothing is opened when nothing was appended.
     pub fn advance_with(&mut self, path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
         // Adapter hook: only Claude Code transcripts are read today.
+        let (len, ino) = (meta.len(), meta.ino());
         if Format::of(path) != Format::Claude {
             self.open.clear();
+            (self.offset, self.ino) = (len, ino);
             return Ok(());
         }
-        let (len, ino) = (meta.len(), meta.ino());
         if self.ino == ino && self.offset == len {
             return Ok(());
         }
         if self.ino != ino || self.offset > len {
             // Another file (a `/clear` moves the session to a new one, in
             // the same process) or a rewrite: read it afresh, but the open
-            // work carries over. A new process is what ends it (`forget_open`,
-            // by the caller).
+            // work carries over. A new process is what ends it (the
+            // daemon drops work launched before the agent's last start).
             let open = std::mem::take(&mut self.open);
             *self = Tracker {
                 ino,
@@ -134,6 +143,7 @@ impl Tracker {
                 ..Default::default()
             };
         }
+        self.side = Some(path.with_extension("").join("subagents"));
         let mut f = std::fs::File::open(path)?;
         if self.offset == 0 && len > FIRST_READ {
             self.offset = len - FIRST_READ;
@@ -184,13 +194,6 @@ impl Tracker {
             }
         }
         Ok(())
-    }
-
-    /// Forget the open work (it went stale, or the agent was started
-    /// again: its tasks died with the old process). The read position
-    /// stays, so it isn't found again.
-    pub fn forget_open(&mut self) {
-        self.open.clear();
     }
 
     /// Apply one transcript line to the open background work.
@@ -250,6 +253,7 @@ impl Tracker {
                     started_at,
                     kind,
                     output,
+                    side: self.side.clone(),
                 },
             );
         }
@@ -331,9 +335,12 @@ const NEEDLES: [&[u8]; 4] = [
 ];
 
 fn worth_parsing(line: &[u8]) -> bool {
-    NEEDLES
+    use memchr::memmem::Finder;
+    static FINDERS: std::sync::OnceLock<Vec<Finder<'static>>> = std::sync::OnceLock::new();
+    FINDERS
+        .get_or_init(|| NEEDLES.iter().map(|n| Finder::new(*n)).collect())
         .iter()
-        .any(|n| line.windows(n.len()).any(|w| w == *n))
+        .any(|f| f.find(line).is_some())
 }
 
 /// The id and kind of background work a tool result says it started.
@@ -416,6 +423,7 @@ mod tests {
                 started_at: 1000,
                 kind: Kind::Shell,
                 output: None,
+                side: None,
             }
         );
         assert_eq!(t.open["a1"].kind, Kind::Agent);
@@ -649,22 +657,6 @@ mod tests {
         ));
         let call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t"}]}}"#;
         assert!(worth_parsing(call.as_bytes()));
-    }
-
-    #[test]
-    fn forgetting_keeps_the_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f.jsonl");
-        let mut f = std::fs::File::create(&p).unwrap();
-        write(&mut f, &[agent_launch("a1")]);
-        let mut t = Tracker::default();
-        t.advance(&p).unwrap();
-        t.forget_open();
-        t.advance(&p).unwrap();
-        assert!(t.open.is_empty());
-        write(&mut f, &[agent_launch("a2")]);
-        t.advance(&p).unwrap();
-        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a2"]);
     }
 
     /// The ids read from a file whose last line, a launch of `b`, is

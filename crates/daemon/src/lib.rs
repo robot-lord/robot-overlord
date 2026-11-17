@@ -1306,7 +1306,7 @@ impl Overlay {
 
 /// Set each row's `shown_status` once, after the annotations: what the
 /// list, `rlord ls`, the overlord and the filters all go by.
-fn set_shown_status(rows: &mut [Value]) {
+pub(crate) fn set_shown_status(rows: &mut [Value]) {
     for r in rows {
         r["shown_status"] = json!(shown_status(r));
     }

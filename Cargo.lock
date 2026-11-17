@@ -1494,6 +1494,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "libc",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

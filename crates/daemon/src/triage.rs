@@ -72,6 +72,21 @@ pub fn triage(d: &crate::Daemon, params: &Value) -> Result<Value> {
         let db = d.db();
         collect(&db, params)?
     };
+    // The status as every other overlord tool says it (after the DB lock:
+    // the annotations take it).
+    if let Some(rows) = out["sessions"].as_array_mut() {
+        crate::background::annotate(d, rows);
+        crate::limits::annotate(d, rows);
+        crate::set_shown_status(rows);
+        for r in rows.iter_mut() {
+            r["status"] = crate::mcp::status_word(r);
+            if let Some(o) = r.as_object_mut() {
+                for k in ["shown_status", "async_work", "limit"] {
+                    o.remove(k);
+                }
+            }
+        }
+    }
     fill_excerpts(&mut out, &sources);
     Ok(out)
 }
