@@ -68,6 +68,15 @@ base work now is in `docs/architecture.md` ("The latest code
 - **Prune vs a running fetch**: prune can delete a private ref while a
   fetch for it is running; the fetch writes the ref again afterwards
   (and `forget` keeps a running slot).
+- **`ls_failed` within one call**: a failed `ls-remote` is remembered
+  for later calls, but the same call can ask again (the named path).
+- **The user's `git status` outside the deadline**: the tree's status
+  runs on the checkout's time limit, not the call's.
+- **A dead `!mine_fresh` arm** in the remote-side choice.
+- **"fetched just now" with no `fetched_at`**: the answer can say so
+  without a time.
+- **Base n/a keypress**: a key on the `n` form's Base hint while it is
+  n/a marks it chosen.
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored

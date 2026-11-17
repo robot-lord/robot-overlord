@@ -37,6 +37,9 @@ pub const LS_REMOTE: Duration = Duration::from_secs(8);
 pub const HARD_LIMIT: Duration = Duration::from_secs(300);
 /// What `run` keeps of each stream.
 const CLIP: usize = 64 * 1024;
+/// What a listing that must be whole keeps of stdout (`worktree list`):
+/// more is an error, not a partial list.
+const LIST_CLIP: usize = 4 * 1024 * 1024;
 /// The tree's folder name, under the repo's workspace dir. It starts with
 /// a dot: no session's folder can have it (`git::sanitize_branch` trims
 /// leading dots, and git refuses a branch component that starts with
@@ -104,6 +107,8 @@ pub struct Output {
     pub ok: bool,
     pub stdout: String,
     pub stderr: String,
+    /// stdout was cut at its cap.
+    pub clipped: bool,
 }
 
 impl Output {
@@ -116,6 +121,17 @@ impl Output {
 /// start or runs past `limit` (it and what it started are killed); a
 /// failed command is `ok: false`.
 pub fn run(env: &GitEnv, dir: &Path, args: &[&str], limit: Duration) -> Result<Output> {
+    run_capped(env, dir, args, limit, CLIP)
+}
+
+/// `run`, keeping up to `cap` bytes of stdout.
+fn run_capped(
+    env: &GitEnv,
+    dir: &Path,
+    args: &[&str],
+    limit: Duration,
+    cap: usize,
+) -> Result<Output> {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
@@ -141,7 +157,7 @@ pub fn run(env: &GitEnv, dir: &Path, args: &[&str], limit: Duration) -> Result<O
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = cmd.spawn().context("running git (is git installed?)")?;
-    let streams = Streams::start(child.stdout.take(), child.stderr.take());
+    let streams = Streams::start(child.stdout.take(), child.stderr.take(), cap);
     // Waited on in its own thread; this one blocks on its answer, at most
     // `limit`.
     let pid = child.id() as i32;
@@ -165,30 +181,39 @@ pub fn run(env: &GitEnv, dir: &Path, args: &[&str], limit: Duration) -> Result<O
             );
         }
     };
-    let (stdout, stderr) = streams.finish();
+    let (stdout, stderr, clipped) = streams.finish();
     Ok(Output {
         ok: status.success(),
         stdout,
         stderr,
+        clipped,
     })
 }
 
-/// stdout and stderr, each read on its own thread and clipped at `CLIP`
-/// (the rest is read and dropped, so git never blocks on a full pipe).
+/// stdout and stderr, each read on its own thread and clipped (stdout at
+/// the call's cap, stderr at `CLIP`; the rest is read and dropped, so git
+/// never blocks on a full pipe).
 struct Streams {
     out: Arc<Mutex<Vec<u8>>>,
     err: Arc<Mutex<Vec<u8>>>,
+    /// Bytes of stdout dropped.
+    out_dropped: Arc<std::sync::atomic::AtomicBool>,
     done: mpsc::Receiver<()>,
 }
 
 impl Streams {
-    fn start<A, B>(out: Option<A>, err: Option<B>) -> Streams
+    fn start<A, B>(out: Option<A>, err: Option<B>, cap: usize) -> Streams
     where
         A: Read + Send + 'static,
         B: Read + Send + 'static,
     {
         let (tx, done) = mpsc::channel();
-        fn read_into<R: Read>(r: Option<R>, buf: &Mutex<Vec<u8>>) {
+        fn read_into<R: Read>(
+            r: Option<R>,
+            buf: &Mutex<Vec<u8>>,
+            cap: usize,
+            dropped: &std::sync::atomic::AtomicBool,
+        ) {
             let Some(mut r) = r else {
                 return;
             };
@@ -198,23 +223,27 @@ impl Streams {
                     break;
                 }
                 let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
-                let room = CLIP.saturating_sub(b.len()).min(n);
+                let room = cap.saturating_sub(b.len()).min(n);
+                if room < n {
+                    dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 b.extend_from_slice(&chunk[..room]);
             }
         }
         let s = Streams {
             out: Arc::default(),
             err: Arc::default(),
+            out_dropped: Arc::default(),
             done,
         };
-        let (b, t) = (s.out.clone(), tx.clone());
+        let (b, t, f) = (s.out.clone(), tx.clone(), s.out_dropped.clone());
         std::thread::spawn(move || {
-            read_into(out, &b);
+            read_into(out, &b, cap, &f);
             let _ = t.send(());
         });
         let b = s.err.clone();
         std::thread::spawn(move || {
-            read_into(err, &b);
+            read_into(err, &b, CLIP, &std::sync::atomic::AtomicBool::default());
             let _ = tx.send(());
         });
         s
@@ -223,7 +252,7 @@ impl Streams {
     /// What was read. Waits at most a second, for both streams together,
     /// for their end: a process git left behind (an ssh master) may hold
     /// one open.
-    fn finish(self) -> (String, String) {
+    fn finish(self) -> (String, String, bool) {
         let deadline = Instant::now() + Duration::from_secs(1);
         for _ in 0..2 {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -234,7 +263,8 @@ impl Streams {
         let text = |b: &Mutex<Vec<u8>>| {
             String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
         };
-        (text(&self.out), text(&self.err))
+        let dropped = self.out_dropped.load(std::sync::atomic::Ordering::Relaxed);
+        (text(&self.out), text(&self.err), dropped)
     }
 }
 
@@ -717,14 +747,27 @@ pub fn locate(env: &GitEnv, path: &Path) -> Result<Located> {
     }))
 }
 
-/// `git worktree list --porcelain`, parsed.
+/// `git worktree list --porcelain`, parsed. A list too long to read
+/// whole is an error, never a partial list.
 pub fn worktree_list(env: &GitEnv, repo: &Path) -> Result<Vec<Entry>> {
-    Ok(parse_worktrees(&git(
+    worktree_list_capped(env, repo, LIST_CLIP)
+}
+
+fn worktree_list_capped(env: &GitEnv, repo: &Path, cap: usize) -> Result<Vec<Entry>> {
+    let o = run_capped(
         env,
         repo,
         &["worktree", "list", "--porcelain"],
         PLUMBING,
-    )?))
+        cap,
+    )?;
+    if !o.ok {
+        bail!("git worktree failed: {}", first_line(&o.stderr));
+    }
+    if o.clipped {
+        bail!("git worktree list printed more than {cap} bytes: not read");
+    }
+    Ok(parse_worktrees(&o.stdout))
 }
 
 /// The remote to fetch from: `origin`, else the only one. None with why.
@@ -783,10 +826,10 @@ pub enum DefaultFrom {
 pub enum AskRemote {
     /// Before guessing `main`/`master`, at most this long (the tool).
     First(Duration),
-    /// A launch: after `main`/`master`, at most this long (zero: not at
-    /// all), and never the checkout's current branch (whatever the user
-    /// last checked out is no default branch: the caller falls back to
-    /// HEAD and says so).
+    /// A launch: before guessing `main`/`master`, at most this long
+    /// (zero: not at all), and never the checkout's current branch
+    /// (whatever the user last checked out is no default branch: the
+    /// caller falls back to HEAD and says so).
     Launch(Duration),
     /// Never (it failed a moment ago).
     Never,
@@ -836,7 +879,7 @@ pub fn default_branch(
         *failed = b.is_none();
         b
     };
-    if let AskRemote::First(limit) = ask {
+    if let AskRemote::First(limit) | AskRemote::Launch(limit) = ask {
         if let Some(b) = ask_remote(limit) {
             return Ok((b, DefaultFrom::LsRemote));
         }
@@ -850,11 +893,8 @@ pub fn default_branch(
             return Ok((b.to_string(), DefaultFrom::Guess));
         }
     }
-    if let AskRemote::Launch(limit) = ask {
-        return match ask_remote(limit) {
-            Some(b) => Ok((b, DefaultFrom::LsRemote)),
-            None => bail!("can't tell the default branch without asking the remote"),
-        };
+    if let AskRemote::Launch(_) = ask {
+        bail!("can't tell the default branch: the remote didn't say, and no main or master");
     }
     let current = run(
         env,
@@ -1337,6 +1377,8 @@ pub fn tree_move(
     // detached again (only once it is verifiably that worktree), not
     // refused forever. Unrecorded, or not itself: `may_touch` refuses.
     let detached;
+    // Edits to tracked files `checkout --force` throws away, counted first.
+    let mut forced = 0;
     let entry = if recorded == Some(dir)
         && dir.file_name().and_then(|n| n.to_str()) == Some(TREE_NAME)
         && entry.branch.is_some()
@@ -1344,6 +1386,14 @@ pub fn tree_move(
         && !entry.prunable
         && inspect(env, repo, dir)?.is_some()
     {
+        forced = git(
+            env,
+            dir,
+            &["status", "--porcelain", "--untracked-files=no"],
+            CHECKOUT,
+        )?
+        .lines()
+        .count() as u32;
         git(
             env,
             dir,
@@ -1417,6 +1467,7 @@ pub fn tree_move(
         if dirty.is_empty() {
             return Ok(Moved {
                 unchanged: true,
+                discarded: forced,
                 ..Moved::default()
             });
         }
@@ -1433,7 +1484,7 @@ pub fn tree_move(
     in_tree(&["checkout", "--quiet", "--detach", "--force", commit])?;
     in_tree(&["clean", "-fdxq"])?;
     Ok(Moved {
-        discarded: dirty.lines().count() as u32,
+        discarded: forced + dirty.lines().count() as u32,
         ..Moved::default()
     })
 }
@@ -2050,6 +2101,52 @@ mod tests {
         assert_eq!(locate(&env, &plain).unwrap(), Located::NotGit);
     }
 
+    /// origin/HEAD unset, nothing recorded, the remote's default `develop`
+    /// and an old `master` here: a launch asks the remote and gets
+    /// `develop`; it guesses `master` only with no budget or no answer.
+    #[test]
+    fn a_launch_asks_the_remote_before_guessing() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let e = &r.env;
+        r.g(&r.remote, &["branch", "develop", "main"]);
+        r.g(&r.remote, &["symbolic-ref", "HEAD", "refs/heads/develop"]);
+        r.g(&r.remote, &["branch", "-D", "main"]);
+        r.g(c, &["branch", "-m", "main", "master"]);
+        r.g(c, &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
+        r.g(c, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let db = |ask| {
+            let mut failed = false;
+            let (b, from) =
+                default_branch(e, e, c, Some("origin"), None, false, ask, &mut failed).unwrap();
+            (b, from, failed)
+        };
+        assert_eq!(
+            db(AskRemote::Launch(LS_REMOTE)),
+            ("develop".into(), DefaultFrom::LsRemote, false)
+        );
+        assert_eq!(
+            db(AskRemote::Launch(Duration::ZERO)),
+            ("master".into(), DefaultFrom::Guess, false)
+        );
+        std::fs::rename(&r.remote, r.root().join("gone.git")).unwrap();
+        assert_eq!(
+            db(AskRemote::Launch(LS_REMOTE)),
+            ("master".into(), DefaultFrom::Guess, true)
+        );
+    }
+
+    #[test]
+    fn a_worktree_list_past_its_cap_is_an_error() {
+        let r = Repos::new();
+        let c = &r.clone;
+        assert!(!worktree_list_capped(&r.env, c, LIST_CLIP)
+            .unwrap()
+            .is_empty());
+        let e = worktree_list_capped(&r.env, c, 10).unwrap_err().to_string();
+        assert!(e.contains("more than 10 bytes"), "{e}");
+    }
+
     #[test]
     fn default_branch_is_found_in_order() {
         let r = Repos::new();
@@ -2076,10 +2173,10 @@ mod tests {
             db(c, Some("origin"), None, false, first),
             ("main".into(), DefaultFrom::LsRemote, false)
         );
-        // A launch asks the remote only when nothing local answers.
+        // A launch asks the remote before guessing too.
         assert_eq!(
             db(c, Some("origin"), None, false, AskRemote::Launch(LS_REMOTE)),
-            ("main".into(), DefaultFrom::Guess, false)
+            ("main".into(), DefaultFrom::LsRemote, false)
         );
         // Renamed on the remote: origin/HEAD is stale, skipped.
         r.g(&r.remote, &["branch", "-m", "main", "trunk"]);
@@ -2462,7 +2559,14 @@ mod tests {
         let rec = Some(dir.as_path());
         let e = entry(&r, &repo, &dir).unwrap();
         assert!(tree_remove(&r.env, &repo, &dir, rec, &e, true).is_err());
-        tree_move(&r.env, &repo, &dir, &newer, rec, None, &e, true).unwrap();
+        // An edit to a tracked file, thrown away by the detach: counted
+        // (with the untracked work.txt).
+        std::fs::write(dir.join("f.txt"), "one").unwrap();
+        r.g(&dir, &["add", "f.txt"]);
+        let s2 = r.commit(&dir, "f");
+        std::fs::write(dir.join("f.txt"), "edited").unwrap();
+        let m = tree_move(&r.env, &repo, &dir, &newer, rec, None, &e, true).unwrap();
+        assert_eq!(m.discarded, 2, "{m:?}");
         assert_eq!(r.g(&dir, &["rev-parse", "HEAD"]), newer);
         assert!(
             !run(&r.env, &dir, &["symbolic-ref", "-q", "HEAD"], PLUMBING)
@@ -2470,7 +2574,7 @@ mod tests {
                 .ok
         );
         // (The branch is still there, at its commit.)
-        assert_eq!(r.g(c, &["rev-parse", "s2"]), head);
+        assert_eq!(r.g(c, &["rev-parse", "s2"]), s2);
         // A detached worktree rlord didn't record: left too.
         let dir = c.join(".other").join(TREE_NAME);
         r.g(

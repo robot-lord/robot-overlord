@@ -966,9 +966,9 @@ fn resolve(
     Ok((found, learned))
 }
 
-/// How the default branch may ask the remote: the tool before guessing;
-/// a launch after `main`/`master`, within its deadline, and never by the
-/// checkout's branch; nobody within `LS_RETRY_MS` of a failure.
+/// How the default branch may ask the remote: before guessing
+/// `main`/`master` (a launch within its deadline, and never by the
+/// checkout's branch); nobody within `LS_RETRY_MS` of a failure.
 fn ask(want: &Want, snap: &Rec, now: i64) -> latest::AskRemote {
     let failed = now - snap.ls_failed_at < LS_RETRY_MS;
     match (want.launch, failed) {
@@ -1330,6 +1330,10 @@ fn drop_old_refs(
 /// Put `launch_base`'s answer in `session.new`'s params, over whatever a
 /// caller put there.
 pub fn set_launch_base(d: &Daemon, params: &mut Value) -> Result<()> {
+    // (None given is no params.)
+    if params.is_null() {
+        *params = json!({});
+    }
     if !params.is_object() {
         bail!("session.new takes an object of params");
     }
@@ -3144,6 +3148,9 @@ mod tests {
         for mut p in [json!([1, 2]), json!("x"), json!(3)] {
             assert!(set_launch_base(&d, &mut p).is_err());
         }
+        let mut p = Value::Null;
+        set_launch_base(&d, &mut p).unwrap();
+        assert!(p.is_object(), "{p}");
     }
 
     /// After a force-push back to an older commit, rlord's just-fetched
