@@ -1128,6 +1128,9 @@ fn drop_old_refs(
 /// Put `launch_base`'s answer in `session.new`'s params, over whatever a
 /// caller put there.
 pub fn set_launch_base(d: &Daemon, params: &mut Value) -> Result<()> {
+    if !params.is_object() {
+        bail!("session.new takes an object of params");
+    }
     params["base_resolved"] = Value::Null;
     params["location_resolved"] = Value::Null;
     // (Worked out once, here: `session_new` takes it as is.)
@@ -1364,14 +1367,16 @@ pub fn prune_rpc(d: &Daemon, params: Value) -> Result<Value> {
             keys.push((key, r.root.to_string_lossy().into_owned()));
         }
     }
-    let (mut removed, mut failed) = (Vec::new(), Vec::new());
+    let (mut removed, mut left, mut failed) = (Vec::new(), Vec::new(), Vec::new());
     for (key, root) in keys {
         match remove(d, &key, &root, Remove::All) {
-            Ok(()) => removed.push(json!(root)),
+            Ok(None) => removed.push(json!(root)),
+            Ok(Some(path)) => left.push(json!({"repo": root, "path": path,
+                "why": "not rlord's tree as git sees it: left in place"})),
             Err(e) => failed.push(json!({"repo": root, "error": format!("{e:#}")})),
         }
     }
-    Ok(json!({"removed": removed, "failed": failed}))
+    Ok(json!({"removed": removed, "left": left, "failed": failed}))
 }
 
 fn root_of(key: &str, rec: &Rec) -> String {
@@ -1400,13 +1405,13 @@ enum Remove {
 /// record read and written there, so a live call can't interleave. A
 /// repo that is gone: its record only. An old tree that still can't be
 /// removed stays recorded.
-fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<()> {
+fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<String>> {
     let _move = d.latest.moves.lock(key);
     let rec = record(d, key);
     let env = d.latest.env();
     let gone = |d: &Daemon| {
         update(d, key, |_| false);
-        Ok(())
+        Ok(None)
     };
     let repo = match latest::locate(&env, Path::new(root)) {
         Ok(Located::Repo(r)) => r,
@@ -1467,10 +1472,14 @@ fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<()> {
             true
         });
     }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+    if let Some(e) = first_err {
+        return Err(e);
     }
+    // A folder still at the tree's path that wasn't rlord's to remove (not
+    // recorded, not adoptable): said, with its path, never "removed".
+    let left_in_place = (what == Remove::All && matches!(live.try_exists(), Ok(true)))
+        .then(|| live.to_string_lossy().into_owned());
+    Ok(left_in_place)
 }
 
 /// The daily sweep, from the records only: a repo that is gone loses its
@@ -1509,7 +1518,7 @@ pub fn sweep(d: &Daemon) -> Value {
                 Remove::OldTrees
             };
             match remove(d, &key, &root, what) {
-                Ok(()) => trees.push(root),
+                Ok(_) => trees.push(root),
                 Err(e) => tracing::warn!(repo = root, error = %e, "removing rlord's tree"),
             }
         }
@@ -2925,6 +2934,35 @@ mod tests {
             ),
             newer
         );
+    }
+
+    /// Prune with a folder at the tree's path that isn't rlord's (on a
+    /// branch, unrecorded): left in place, said with its path, not
+    /// "removed".
+    #[test]
+    fn prune_says_what_it_left_in_place() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        let c = &r.clone;
+        let path = c.join(".worktrees/.rlord-latest");
+        r.g(
+            c,
+            &["worktree", "add", "-q", "-b", "s", path.to_str().unwrap()],
+        );
+        let p = prune_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(p["removed"], json!([]), "{p}");
+        assert_eq!(p["left"][0]["path"], json!(path), "{p}");
+        assert!(path.exists());
+    }
+
+    /// `session.new` params that aren't an object: an error, no panic.
+    #[test]
+    fn launch_base_refuses_params_that_are_not_an_object() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        for mut p in [json!([1, 2]), json!("x"), json!(3)] {
+            assert!(set_launch_base(&d, &mut p).is_err());
+        }
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

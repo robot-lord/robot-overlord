@@ -1380,11 +1380,23 @@ impl App {
                 }
                 Err(e) => {
                     self.status_line = format!("not launched: {e}");
-                    f.error = Some(e);
-                    self.launch_retry = Some(f);
+                    match &mut self.launch_retry {
+                        // One already waiting to reopen: it stays (the
+                        // first), and says both errors.
+                        Some(first) => {
+                            let was = first.error.take().unwrap_or_default();
+                            first.error = Some(format!("{was}; then: {e}"));
+                        }
+                        None => {
+                            f.error = Some(e);
+                            self.launch_retry = Some(f);
+                        }
+                    }
                 }
             }
-            if self.launch_retry.is_none() {
+            // (The status line changed: redrawn, and reopened below if
+            // nothing else is open.)
+            if !(self.launch_retry.is_some() && matches!(self.mode, Mode::Normal)) {
                 return true;
             }
         }
@@ -2107,6 +2119,44 @@ mod tests {
         f.prefill_confirm(&json!({"description": "x", "base": "latest", "resolved": ["base"]}));
         assert_eq!((f.base.as_str(), f.base_chosen), ("", false));
         assert_eq!(f.resolved, ["base"]);
+    }
+
+    /// A launch's answer redraws; a second failure keeps the first form
+    /// waiting to reopen and says both errors.
+    #[test]
+    fn launch_answers_redraw_and_keep_the_first_failure() {
+        /// A fresh manual form, whatever is open left as it is.
+        fn form_of(app: &mut App) -> Box<NewForm> {
+            let open = std::mem::replace(&mut app.mode, Mode::Normal);
+            app.open_new_form(FormKind::Manual);
+            match std::mem::replace(&mut app.mode, open) {
+                Mode::NewSession(f) => f,
+                _ => panic!("no form"),
+            }
+        }
+        fn answer(app: &mut App, r: std::result::Result<Value, String>) {
+            let f = form_of(app);
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(r).unwrap();
+            app.launch_send = Some((rx, f));
+        }
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        // Something else open: a failure waits to reopen.
+        let busy = form_of(&mut app);
+        app.mode = Mode::NewSession(busy);
+        answer(&mut app, Err("one".into()));
+        assert!(app.poll_launch());
+        answer(&mut app, Err("two".into()));
+        assert!(app.poll_launch());
+        let waiting = app.launch_retry.as_ref().unwrap();
+        assert_eq!(waiting.error.as_deref(), Some("one; then: two"));
+        assert!(app.status_line.contains("two"));
+        // A success: redrawn too, and selected.
+        answer(&mut app, Ok(json!({"id": "x1", "name": "n"})));
+        assert!(app.poll_launch());
+        assert_eq!(app.pending_select.as_deref(), Some("x1"));
     }
 
     /// A side chosen for a proposed base goes when the base is edited.

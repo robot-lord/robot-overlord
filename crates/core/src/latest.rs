@@ -29,7 +29,7 @@ use anyhow::{bail, Context, Result};
 /// Local plumbing (rev-parse, status, update-ref).
 pub const PLUMBING: Duration = Duration::from_secs(10);
 /// A checkout or `worktree add` (a partial clone may fetch blobs).
-pub const CHECKOUT: Duration = Duration::from_secs(120);
+pub const CHECKOUT: Duration = Duration::from_secs(600);
 /// `ls-remote` for the default branch.
 pub const LS_REMOTE: Duration = Duration::from_secs(8);
 /// A fetch is killed only past this: a slow first fetch killed early would

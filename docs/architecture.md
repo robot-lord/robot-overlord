@@ -688,184 +688,98 @@ session"); session rows carry `forked_from`.
 
 The user's checkouts are often behind, on another branch, or mid-edit.
 `repo_latest` (RPC `repo.latest`, CLI `rlord latest`) hands the overlord
-the newest committed code of a repo, as plain code (`core/src/latest.rs` for git,
-`daemon/src/repo_latest.rs` for state and locks).
+the newest committed code of a repo, as plain code (`core/src/latest.rs`
+for git, `daemon/src/repo_latest.rs` for state and locks). Its time
+limits, waits and retry windows are constants in those two files.
 
-- **One tree per repo**, always `<repo>/.worktrees/.rlord-latest`: a
-  detached `git worktree`, excluded like the session worktrees, moved to
-  whichever ref is asked for. It ignores `[session] workspace_dir`, which
-  may point outside the repo, where sibling repos' trees would collide.
-  The leading dot keeps it apart from sessions: `sanitize_branch` trims
-  leading dots and git refuses a branch component that starts with one,
-  so no session's folder can have that name. A bare repo's tree sits in
-  the bare repo's folder, with no exclude line. The user chose the repo
-  over rlord's data dir: a copy of their code outside the repo looks
-  wrong. Callers learn of a move from the `ref` and `commit` in every
-  answer; a subagent is told to ask again (or check `rev-parse HEAD`)
-  before relying on it later.
-- **Moving it** is only ever `git checkout --detach --force <commit>` and
-  `git clean -fdx`, run inside the tree. Before rlord moves or removes
-  (`worktree remove --force`) anything, two checks must pass.
-  `latest::may_touch`: the path is the tree rlord recorded, and git's
-  own entry for it (`worktree list`) is a detached worktree with the
-  tree's name. A session's worktree is always on a branch, so it never
-  passes. Then from inside, `rev-parse` must show its own top level, a
-  git dir under the repo's `worktrees/` and a detached HEAD (a folder
-  whose `.git` file is broken would otherwise let git find the user's
-  checkout). A worktree with no record is adopted (recorded, then moved)
-  only when git's own entry is at the tree's expected path, named
-  `.rlord-latest` and detached: no session can make that, so it is
-  rlord's by construction (a kv reset, the other daemon's). Anything on
-  a branch, at another path, or not registered is left alone with an
-  error saying so; prune applies the same rule. Edits in the tree are
-  discarded; the answer says how many. A move counts as done only once
-  it succeeds: the record's `commit` is cleared before an add or move
-  and set after, and nothing is skipped ("HEAD is already there") unless
-  that commit is on record, since a checkout killed partway can leave
-  HEAD at the commit with files missing. Its folder gone (git calls it
-  prunable): added again over its registration (`worktree add --force`,
-  git only, so it works in a guarded repo too). Verifiably not itself from
-  inside (a broken `.git` file): removed and added again; a git error
-  there (a time limit) leaves it as it is. A branch checked out in the
-  recorded `.rlord-latest` (rlord's by name and record) is detached
-  again with `checkout --detach --force`, once it is verifiably that
-  worktree; unrecorded with a branch, it is refused. An add cut off
-  partway (registered, maybe locked "initializing", files missing, not
-  recorded) is adopted on the next call and completed by a forced
-  checkout. A folder at the path that git has no
-  worktree for is replaced only when it is recognizably a leftover
-  rlord tree (empty, or a `.git` file pointing into this repo's
-  `worktrees/`) and rlord may touch files there; else an error names
-  it. One whose `.git` names `worktrees/-rlord-latest` in another place
-  (the repo was moved with it) is put right with `git worktree repair`,
-  then moved as usual. "Prunable" with the folder still there (its
-  `.git` gone) is removed and made again, not force-added over. A lock or a time limit (its `status` gets the checkout's 120 s) is
-  an error, and the tree is left as it is. A tree at an earlier path that can't be
-  removed stays in the record (`old_trees`); the sweep and prune try
-  again, never at the live tree's path. A live tree the sweep or prune
-  can't remove stays recorded as the tree, with the error
-  (`remove_error`). The tree is recorded only once it has been added.
+- **One tree per repo**, in the repo's own `.worktrees` (never
+  `[session] workspace_dir`, which may point outside the repo where
+  sibling repos' trees would collide): a detached worktree named
+  `.rlord-latest`, moved to whichever ref is asked for. No session
+  folder can have that name (`sanitize_branch` trims leading dots; git
+  refuses a branch component starting with one). The user chose the
+  repo over rlord's data dir: a copy of their code outside the repo
+  looks wrong. Callers learn of a move from `ref` and `commit` in every
+  answer.
+- **rlord only ever touches its own tree.** It moves or removes a tree
+  only when rlord recorded it at that path (or adopts it: git's own
+  entry at the expected path, named and detached, so rlord's by
+  construction) and, seen from inside, it is that worktree, detached.
+  A session's worktree is always on a branch, so it never passes. A
+  branch checked out in rlord's recorded tree is detached again; one in
+  an unrecorded tree is refused. A folder git doesn't know is replaced
+  only if it is recognizably a leftover of rlord's; a tree whose repo
+  was moved with it is repaired by git. Edits in the tree are discarded
+  on a move; the answer says how many.
+- **Done means done.** A move counts as complete only once it succeeds
+  (the record's commit is cleared before and set after), so a checkout
+  killed partway is redone, never trusted. Only a verifiably broken tree
+  is rebuilt; a lock or a time limit is an error that leaves it as it
+  is. A tree that can't be removed stays in the record and is retried.
 - **Which repo.** Identity is the common git dir (records and locks are
-  keyed by it). rlord works from git's first `worktree list` entry: the
-  main checkout, or a bare repo's folder; from a linked worktree of a
-  bare repo, that is the bare repo. With `--separate-git-dir`, git names
-  the main worktree by its git dir, so the checkout is taken from
-  `--show-toplevel` when asked from it. From a linked worktree of such a
-  repo, the main checkout can't be known, and an error asks for its
-  path. No `--path-format` (git 2.31): a relative common dir is made
-  absolute by asking git from it (`--absolute-git-dir`). The git version
-  is asked once: before 2.29 the fetch goes without
-  `--no-write-fetch-head` (FETCH_HEAD is written), before 2.24 without
-  `--end-of-options`.
-- **Fetch into private refs.** `git fetch --no-tags --no-write-fetch-head
-  --refmap= <remote> +refs/heads/<b>:refs/rlord/latest/<remote>/<b>`.
-  `--refmap=` keeps git from also moving `refs/remotes/<remote>/<b>`: a
-  background fetch that moved `origin/x` would weaken the user's
-  `--force-with-lease` and change what their `git status` says. Only the
-  one branch is fetched; an old private ref nested with the target (`a`
-  for `a/b`, or the other way round) is deleted first. Private refs not
-  fetched for 14 days are dropped on the repo's next use.
-- **Which commit.** For branch `b`, local `L` and remote `R`. `R` is the
-  newer of rlord's private ref and the user's own `refs/remotes/<remote>/b`
-  (their own fetch may be newer): theirs when it descends from rlord's,
-  rlord's when it is ahead; when the two diverged, rlord's if fetched
-  within the minute, else theirs. Theirs is said in a warning. The default branch (no `ref`): `R` whenever it exists, even
-  when `L` is ahead (the user asked for "the latest main"; a
-  `local_ahead` warning says how far), and a launch's base the same; so
-  is a `ref` written `<remote>/<b>` (or `prefer: remote`; a
-  `prefer: local` with it is ignored, with a warning). A plain named
-  `ref`: whichever exists; if both, the one ahead (`rev-list
-  --left-right --count`); diverged, no move and both sides back so the
-  overlord asks the user (`prefer` then). A named branch that isn't
-  here and whose fetch is still running, offline or failed says that
-  ("still fetching feat from origin: try again shortly"), not that it
-  doesn't exist; a launch waits on such a first fetch up to 20 s in all
-  before saying so. `<remote>/<b>` never falls back to a local `b`: the
-  remote without it is "origin has no branch b". A shallow clone that
-  looks diverged says so. When the two can't be compared at all (a
-  missing object), that is no divergence: an `unknown` warning, the
-  remote's commit (the local one with `prefer: local`), never a refused
-  launch.
-- **Default branch and remote.** `origin`, else the only remote, else none
-  (the local branch, a warning; an `upstream` remote is owed). Default
-  branch: `refs/remotes/<remote>/HEAD`, rlord's record (under a day), `git
-  ls-remote --symref` (recorded), `main`/`master`, the main checkout's
-  branch (the tool only, shown as `default_branch: false` with a
-  `no_default_branch` warning: never presented as the default). A launch goes: the remote's HEAD as the repo
-  knows it, rlord's record, `main`/`master`, then the remote asked within
-  its 4 s; never the checkout's current branch (whatever the user last
-  checked out is no default branch): failing those, it starts at HEAD
-  and its note says why. Any call's `ls-remote` answer is recorded, and
-  so is its failure, even when the launch then falls back. A failed
-  `ls-remote` isn't tried again for 5 minutes. Never `remote set-head`. A
-  default branch the remote no longer has (renamed) is asked of the
-  remote again, whatever found it (not within 5 minutes of a failed
-  ask); a launch still without one starts at HEAD, never at the
-  checkout's branch. A launch's `prefer` counts only with a named
-  `base`.
-- **Never hang, never prompt.** Every call goes through `latest::run`: a
-  time limit (10 s plumbing, 120 s checkout, 8 s `ls-remote`, 300 s
-  fetch) that kills git's process group, no terminal or askpass prompt,
-  ssh in batch mode with a connect timeout (the user's own ssh command
-  kept), `core.hooksPath=/dev/null`, no auto gc or maintenance, no
-  submodules, LFS left as pointers. Branch names never reach git as
-  options (`check-ref-format`, `--end-of-options`). `run` blocks on
-  the child in a waiting thread, with the limit as its timeout.
-- **Fetch cost.** A success under a minute old is reused (`cached`). A
-  fetch runs on its own thread; the tool waits 8 s, then goes on with the
-  last known commit (`running`). A launch waits 4 s in all, across
-  `ls-remote`, the fetch and any retry. The fetch's thread records its
-  success in the repo's record itself, even with nobody waiting. A
-  failure (offline, failed, missing) is the answer again for 2 minutes,
-  with no new try (a named branch's, 10 s: a launch's base or the tool's
-  `ref` may have just been pushed). `cached` is never the answer while the private ref
-  is missing (it is fetched), and a repo's fetches are forgotten when
-  rlord deletes its private refs. The next call picks the
-  result up if it finished under a minute ago; an older one is dropped
-  and the fetch runs again. Every caller still waiting when it finishes
-  gets its outcome. One fetch per (repo, remote, branch); only the 300 s limit
-  kills one, since a slow first fetch killed early would never finish.
-- **Locks.** Resolving (fetch, pick) takes no lock: fetches are one per
-  key, and records are changed field by field in one DB hold, so callers
-  never undo each other's fields. One lock per repo (`KeyLocks`, keyed by
-  the common git dir) is held while its tree is moved or removed. Moves
-  for one repo queue; other repos don't wait. A launch's base only
-  resolves, so it never waits on a tree. The DB is taken briefly under
-  that lock, never the reverse; `repo.latest*` run outside the DB lock
-  like `history.search` (`locks.rs`).
-- **Records and cleanup.** One kv key per repo, `repo_latest:<common git
-  dir>`: where rlord works from, the tree (and `old_trees`), its ref and
-  commit, when the repo was last used (the tool or a launch) and when
-  the tree was, the recorded default branch and the last failed
-  `ls-remote`, and when each branch was last fetched. A sweep shortly
-  after start and daily works from those records only (it never scans
-  for repos). A repo in a guarded folder is skipped first, unstatted.
-  It drops the record of a repo that is gone (its common git dir not
-  found; any other error keeps it). It removes
-  trees unused for 30 days and any `old_trees` (with the checks above),
-  keeping the record, its refs and its cache. A record with no tree is
-  kept. `rlord latest --prune [REPO]` (default: the current folder's repo;
-  `--all`: every one) removes the trees, the refs and the
-  record now; `--list` shows them. Both clear the record under the
-  repo's move lock, in the same step as the removal.
-- **macOS privacy.** In a repo inside a folder macOS guards
-  (`privacy::Guard`) and not under a scan root, rlord reads no file
-  itself: only git runs there (it acts on the user's repo, which their
-  agent already uses), a `guarded_folder` warning says so, the exclude
-  line isn't written (a note asks for it if git doesn't ignore the tree),
-  and the unprompted sweep skips the repo.
+  keyed by it). rlord works from git's main worktree, or a bare repo's
+  folder; with `--separate-git-dir` it takes the checkout it was asked
+  from, and from a linked worktree of such a repo it asks for the main
+  checkout's path. It works on older git, leaving out flags it lacks.
+- **Private refs only.** A fetch brings the one branch into
+  `refs/rlord/latest/<remote>/<branch>` and never moves the user's
+  `refs/remotes/*` (a background fetch that moved `origin/x` would
+  weaken their `--force-with-lease` and change their `git status`). A
+  private ref nested with the target is deleted first; long-unused ones
+  are dropped, exactly by remote and branch.
+- **Which commit.** The remote's side is the newer of rlord's private
+  ref and the user's own `origin/<b>` (when they diverged, rlord's only
+  if just fetched). The default branch (no `ref`), a launch's base, and
+  any `<remote>/<b>` are the remote's commit even when the local branch
+  is ahead (a warning says how far); `<remote>/<b>` never falls back to
+  a local branch. A plain named `ref` is the newer of local and remote;
+  diverged, both sides come back and the overlord asks the user, then
+  passes `prefer`. Commits that can't be compared are no divergence (a
+  warning, the remote's). A named branch not here yet says why (still
+  fetching, offline, failed), not that it doesn't exist.
+- **Default branch and remote.** `origin`, else the only remote, else
+  none (the local branch; `upstream` is owed). The default branch comes
+  from the remote's HEAD as the repo knows it, rlord's record, the
+  remote asked (recorded, and a failure backed off), then
+  `main`/`master`. The tool may show the checkout's own branch when none
+  of those answers, never as the default; a launch never uses it and
+  starts at HEAD instead, saying why. A default branch the remote no
+  longer has is asked of the remote again. A launch's `prefer` counts
+  only with a named `base`. rlord never runs `remote set-head`.
+- **Never hang, never prompt.** Every git call has a time limit that
+  kills its process group, no terminal or askpass prompt, ssh in batch
+  mode (the user's own ssh command kept), no hooks, no auto gc, no
+  submodules; LFS files stay pointers. Branch names never reach git as
+  options.
+- **Fetch cost.** A recent success is reused (`cached`, never while the
+  private ref is missing). A fetch runs on its own thread, one per
+  (repo, remote, branch); callers wait a bounded time and otherwise go
+  on with the last known commit (`running`), and the fetch's thread
+  records its own success. A launch's whole wait is capped, longer only
+  for a named base that is still on its first fetch. A failure is the
+  answer again for a while (shorter for a named branch). Only a hard
+  limit kills a fetch: a slow first fetch killed early would never
+  finish.
+- **Locks.** Resolving takes no lock (one fetch per key; records change
+  field by field in one DB hold). One lock per repo is held while its
+  tree is moved or removed, so a launch's base never waits on a tree.
+  The DB is taken briefly under that lock, never the reverse
+  (`locks.rs`).
+- **Records and cleanup.** One kv key per repo (`repo_latest:<common git
+  dir>`). A sweep after start and then daily works from those records
+  only, never scanning for repos: it drops the record of a repo that is
+  gone, removes long-unused trees (keeping refs and cache) and retries
+  old ones. `rlord latest --prune [REPO]` (the current folder's repo by
+  default, every one with `--all`) removes trees, refs and record now,
+  and says what it left in place; `--list` shows them.
+- **macOS privacy.** In a repo inside a folder macOS guards (and not
+  under a scan root) rlord reads no file itself and stats nothing
+  unprompted: only git runs there (it acts on the user's repo, which
+  their agent already uses), a warning says so, and the sweep skips it.
 - **Never touched:** the user's checkouts, local branches,
   `refs/remotes/*`, index, stash, uncommitted work, config and hooks.
   `local` in the answer reports, read-only, where the branch is checked
-  out and, for a named `ref` only, how many files are uncommitted there
-  (`GIT_OPTIONAL_LOCKS=0`). When the tree's HEAD is already the (recorded,
-  completed) commit, one `git status` runs in it and nothing else unless
-  it is dirty (then the edits are discarded as on a move); the
-  checkout's warnings (LFS, submodules, sparse), worked out once per
-  move, come from the record. Checkout and clean run only once the tree
-  is, seen from inside, that worktree with a detached HEAD; a folder is
-  deleted (when git can't remove it) only on the same check, or when it
-  is a leftover of rlord's.
+  out and, for a named `ref`, how many files are uncommitted there.
 - A folder that is not a git repo is answered as it is (`git: false`).
   `repo_latest` is a mutating tool (it fetches and moves a tree), so a
   plain `rlord mcp` session can't call it.
@@ -1487,7 +1401,7 @@ daemon creates `git worktree add -b <branch> <repo>/.worktrees/<dirname>`
 A **new branch starts from the latest default branch**, fetched.
 `Daemon::call` works the start out before the DB lock
 (`repo_latest::set_launch_base`, the same fetch and pick rule as
-`repo_latest`, waiting at most 4 s in all) and puts it in
+`repo_latest`, with its wait capped) and puts it in
 `params["base_resolved"]`, always overwriting what a caller sent. The
 location it worked out (`methods::new_location`) goes along as
 `params["location_resolved"]` (also never a caller's), so `session_new`

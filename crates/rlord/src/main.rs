@@ -2040,6 +2040,13 @@ fn latest_cmd(
         {
             println!("removed {}", r.as_str().unwrap_or("?"));
         }
+        for l in v["left"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            println!(
+                "left {} ({})",
+                l["path"].as_str().unwrap_or("?"),
+                l["why"].as_str().unwrap_or("")
+            );
+        }
         for f in v["failed"]
             .as_array()
             .map(Vec::as_slice)
