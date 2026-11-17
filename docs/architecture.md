@@ -1006,9 +1006,10 @@ daemon, the always-installed side, so a bug in the plugin can't reach a
 method the web was never given. It is not a boundary against a local
 process, which can call the socket itself. `snapshot {view, rev}` is the
 list in one answer (rows for a `session.list` query, groups, labels, the
-overlord and its roster); the view's `search` is the filter box's text,
-parsed by the daemon with the TUI's `SessionQuery::apply_search_text`
-(`tag:`, `status:`, …), so the page never parses it; `rev` is `<boot id>-<changes>`, and a current
+overlord and its roster); the view's `query` (or `search`) is the filter
+box's text, parsed by the daemon with the TUI's
+`SessionQuery::apply_search_text` (`tag:`, `status:`, …), so the page
+never parses it, and its `usage` picks the usage measure; `rev` is `<boot id>-<changes>`, and a current
 `rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
 most every 100 ms. `web.pane_target` names a pane's tmux session and
 starts nothing. Adding an op: put it on `OPS` with its arguments, add it to
@@ -1058,9 +1059,66 @@ fixture (`test/fixtures/snapshot.json`, checked by `web_api.rs`) and the
 ops list. The release workflow builds the page once in its own job
 (`web-assets`) and hands it to the build jobs as `RLORD_WEB_DIST`.
 
-The overlord knows nothing of the web UI: a web-only user's `goto` or
-`show_list` fails as it does with no terminal attached. Remote access (an
-end-to-end encrypted relay, a phone app) is planned in
+**The web as a UI target.** The overlord's UI tools (`goto_session`,
+`show_list`, `set_list_view`, `propose_session`, `confirm_new_session`,
+`confirm_setup`, `open_keys`, `go` on a launch) land on one *surface*:
+the user's terminal (a tmux client) or one web page (a browser tab's
+control socket).
+
+- *Which one* (`ui::target`, on the pure `ui::pick`): the surface the user
+  last did something on. A terminal's last use is tmux's
+  `client_activity` of `user_client` (it moves on input only, never on
+  output or a resize; whole seconds). A page's is the daemon's clock at
+  its last user-driven op (every op but the look-ups in `web::PASSIVE`),
+  its last `page.report` with `input` (the page sends one on pointer or
+  key input, at most every 5 s), or the last key typed into the pane it
+  shows (`view_clients`). Compared in whole seconds; a tie or an unknown
+  goes to the terminal; among pages the latest, then the newest. `[web]
+  ui_target = "terminal" | "web"` prefers one whenever it is there. No
+  surface: the tools fail naming both ways in. Each tool picks once and
+  passes the choice down, every answer says where (`on`), and the other
+  surface gets a one-line `notice` for navigation and forms. When the web
+  is the target nothing touches the terminal (no overlay to hide, no
+  switch). `open_keys` prefers a terminal whatever the target (keys change
+  only there); with only a page, the page shows them read-only.
+- *Pages.* The plugin names each control socket (`p<n>-<8 hex>`), tells
+  the page in `hello`, stamps the id on every `web.call` (the browser
+  can't choose it) and reports the open pages with `web.pages` (the
+  whole list, on every open and close, and none at start). Each page
+  reports what it shows with op `page.report {route, view, visible, form,
+  input}` (`web::WebUi`; its view in the TUI's shape, `ui::normalize_view`).
+  `ui.state` has `target`, `web` (the most recent page) and `current_view`
+  from the target. Pages go when the last `web.subscribe` stream ends.
+- *Addressed commands.* `Daemon::ui_cmd_to` sends `{"notify":"ui",
+  "to":"terminal"|"web", "page"?, "cmd"}` on the broadcast. The TUI
+  ignores `to: "web"`; `web.subscribe` passes the web's on as
+  `{"notify":"ui","page","cmd"}`, never folded into or dropped by the
+  coalescing of `changed`; the plugin sends each to its page only as
+  `{"event":"ui","cmd"}`. Each surface has one parked slot (30 s): the
+  terminal's for the next TUI (`ui.pending`), the web's for the next page
+  (op `page.pending`), handed over only when the page it was for closed
+  without saying anything after it (each page answers a command with an
+  empty `page.report`). The page's commands (`ui.ts`): `goto`,
+  `show_list`, `set_view`, `new_session`, `confirm_new_session`, `setup`,
+  `keys`, `notice`; a form command never replaces a form the user typed
+  into (a banner offers it).
+- *Hand-answered ops.* `ui.*` and `setup.*` stay forbidden families: the
+  forms' ops that need them are answered in `web.rs` with their
+  arguments picked one by one (`form.setup`, `form.setup_save`,
+  `view.default`, `page.*`). `session.new` and `session.fork` take the
+  forms' fields only; a session the overlord proposed is launched by its
+  proposal id, and the daemon adds the overlord's background (`context`,
+  `related`, launched by the overlord) from its *proposal store* (the
+  last 8 `propose_session`s, `Daemon::proposals`), so a browser can't
+  write text a session is told is the overlord's. `overlord.new_session`
+  turns a plain `project` into the TUI form's wire shape. The forms'
+  rules are the TUI's (`newform.rs`, `setupform.rs`), repeated in
+  `ui/src/forms/hints.ts` and `setup.ts` and held to the daemon by
+  fixtures (`ui_cmds.json`, `form_*.json`, written by `web_api.rs`);
+  drift shows as a wrong label, never a wrong launch, since the daemon
+  checks every launch argument again.
+
+Remote access (an end-to-end encrypted relay, a phone app) is planned in
 `docs/working/web-ui-remote.md` and `docs/working/e2e-crypto.md`.
 
 ## rlord's private tmux server (2026-11-10)

@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1, the local web UI, is built; slice 2, the web as a UI target, is being built; then the relay and the phone app)
+**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; next: the relay and the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -802,6 +802,30 @@ Decided 2026-11-17 (user):
     input, so its terminal's input queue fills after a few requests (the
     pass restarts it before each); what it was typed is read with
     `pipe-pane` (its screen redraws).
+  - Step 12 done: `docs/architecture.md` "Web UI" ("The web as a UI
+    target": surfaces and the target rule, pages and `page.report`,
+    addressed `ui` lines and the parked slots, the hand-answered ops and
+    the proposal store; `snapshot`'s `query` and `usage`), `docs/guide.md`
+    (the forms, keys read-only, "the screen you used last", `[web]
+    ui_target`), `SECURITY.md` (the page launches and forks directly and
+    saves the code folder), the config template (`ui_target`). CLAUDE.md's
+    browser-op rule still holds as written.
+- Owed after slice 2 (carried over from slice 1, plus slice 2's own):
+  - By hand in a real browser: Option as Meta and the browser-kept keys
+    on a real keyboard, the wheel and copy, IME, the TUI overlay open
+    alongside, WebGL context loss mid-session; slice 2's forms with a real
+    keyboard (Tab order, Enter in the pickers), and the target rule with
+    a person moving between a real terminal and the browser.
+  - The release dry run's macOS half (signing, `Verify signature` on both
+    binaries) and the `release` job's asset check, from `main` (or with
+    `feature/*` let into the `release` environment: the user's call).
+  - Not headless-checked: the code-folder form's "Use the home folder
+    anyway" path (unit-tested in `forms.test.ts`; the demo can't point at
+    a real home safely), and a usage limit's display (unit tests only).
+  - The overlord's "no overlord yet" error from `overlord.new_session`
+    still names `Alt-O` and the manual form's `N` (`ask::send`); in the
+    page the form shows it as is. Worth a web-neutral wording later.
+  - The relay and the phone app (the rest of this effort).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -1501,7 +1525,9 @@ form, and web-input reporting over IPC.
 
 ## Slice 2 plan: the web as a UI target
 
-Planned 2026-11-17 (Fable planning agent). Nothing here is built. Goal: a
+Planned 2026-11-17 (Fable planning agent). Built on `feat/web-ui-2`
+(steps 1 to 12; see "Progress" for what each did and the choices made).
+Goal: a
 user with only the web UI open can use everything the overlord does that
 targets "the user's terminal" today: `goto_session`, `show_list`,
 `set_list_view`, `get_ui_state`, `propose_session`, `confirm_new_session`,
