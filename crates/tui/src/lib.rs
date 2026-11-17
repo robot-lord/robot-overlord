@@ -2697,10 +2697,15 @@ fn usage_details(u: &Value) -> String {
 /// A session's status, or in its place that it is stopped on a usage
 /// limit and until when (`limit`, from the daemon's `limits`). `full`:
 /// in words (the details pane); otherwise what fits the list's column.
-/// `↻`: a resume is scheduled for when it resets.
+/// `↻`: a resume is scheduled for when it resets. Its turn over while
+/// background work still runs (`background`, from the daemon's
+/// `background`): that, in place of "your turn".
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let Some(until) = l["until"].as_str() else {
+        if let Some(n) = s["background"].as_u64() {
+            return theme::background_chip(n, full);
+        }
         return theme::status_chip(s["status"].as_str().unwrap_or("-"));
     };
     let resume = if l["resume"] == true { " ↻" } else { "" };

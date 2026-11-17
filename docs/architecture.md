@@ -481,6 +481,33 @@ hooks and `discover` keep the stored status to themselves.
   it out of the DB query and keeps the annotated rows with a `limit`
   (or any other status asked for alongside it).
 
+### Background work (`daemon/src/background.rs`)
+
+"Waiting on background work" is not a stored status either: it is laid
+over `idle` (your turn) as `background: N` on the row, shown `◔ bg N`
+(the list), `bg N` (`rlord ls`), status `background` with
+`background_tasks` (`list_sessions`), filtered by `status:bg`. A
+`waiting_input` session never gets it.
+
+- **Detection** (`agents::background`, Claude Code only; `Tracker::advance`
+  is where another agent's adapter goes). A launch is a `user` line whose
+  structured `toolUseResult` names the work: `backgroundTaskId` (a `Bash`
+  with `run_in_background`, or one moved to the background at its
+  timeout), or `agentId` with `isAsync: true` / `status:
+  "async_launched"` (an async Agent) or `background: true` (a skill
+  forked into the background). A finish is a later `user` line (string
+  content, `origin.kind: "task-notification"`) holding
+  `<task-notification>` with `<task-id>` and `<status>` `completed`,
+  `failed`, `killed` or `stopped`. An id can notify more than once (a
+  resumed agent): one not open is ignored. The tool result's text is
+  never parsed. Seen on Claude Code 2.1.3xx.
+- **Read**: a 5s tick reads only what each live session's transcript
+  appended since its byte offset (whole lines, at most 4 MB a tick); the
+  first look starts at the last 4 MB. Counts are kept in memory only.
+- **Stale guard**: a transcript unchanged for `STALE_MS` (30 min) shows
+  your turn again, so a lost notification (the agent restarted with work
+  running) can't leave a session stuck.
+
 ## Transcript store (raw conversation data)
 
 Both target CLIs already persist **complete structured transcripts as local

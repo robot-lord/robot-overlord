@@ -224,6 +224,8 @@ pub fn normalize_status(s: &str) -> String {
         | "blocked" => "waiting_input".to_string(),
         "your-turn" | "yourturn" | "turn" | "yours" => "idle".to_string(),
         "run" | "busy" => "working".to_string(),
+        // Not stored: laid over `idle` by the daemon (background.rs).
+        "bg" | "background" | "waiting-background" => "background".to_string(),
         other => other.to_string(),
     }
 }
@@ -2387,6 +2389,7 @@ mod tests {
             ("turn", "idle"),
             ("idle", "idle"),
             ("working", "working"),
+            ("bg", "background"),
         ] {
             assert_eq!(normalize_status(word), stored, "{word}");
         }

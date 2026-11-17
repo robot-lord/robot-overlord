@@ -449,6 +449,7 @@ impl App {
             head("Status"),
             row("needs you".into(), "blocked on a prompt or question"),
             row("your turn".into(), "finished: the next prompt is yours"),
+            row("◔ bg N".into(), "turn over, background work still running"),
         ];
         // Side by side when wide, else stacked (both heights).
         let wide = f.area().width >= 84;

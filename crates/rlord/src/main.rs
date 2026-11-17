@@ -56,7 +56,7 @@ enum Command {
     },
     /// List sessions. QUERY uses the search syntax: free words match
     /// name/project/group/tag; `status:needs` (needs you) `status:turn` (your
-    /// turn) `tag:wip` `proj:x` `agent:x`
+    /// turn) `status:bg` (waiting on background work) `tag:wip` `proj:x` `agent:x`
     /// `group:x` `sort:user` set filters.
     Ls {
         query: Vec<String>,
@@ -2158,6 +2158,8 @@ fn run_daemon() -> Result<()> {
         // Messages for sessions, held until their turn is over.
         rlord_daemon::send::start(&daemon);
         rlord_daemon::limits::start(&daemon);
+        // Turns over while background work still runs (background.rs).
+        rlord_daemon::background::start(&daemon);
         // OpenCode sessions: status from its background server's events.
         rlord_daemon::opencode::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
@@ -2628,7 +2630,10 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             match s["limit"]["until"].as_str() {
                 Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
                 Some(until) => truncate(&format!("till {until}"), 16),
-                None => rlord_core::types::Status::label_of(get("status")).to_string(),
+                None => match s["background"].as_u64() {
+                    Some(n) => format!("bg {n}"),
+                    None => rlord_core::types::Status::label_of(get("status")).to_string(),
+                },
             },
             rel_age(
                 [

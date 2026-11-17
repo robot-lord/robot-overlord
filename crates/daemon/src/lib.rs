@@ -1,5 +1,6 @@
 pub mod ask;
 pub mod autostart;
+pub mod background;
 pub mod codex_daemon;
 pub mod context;
 pub mod discover;
@@ -86,6 +87,8 @@ pub struct Daemon {
     pub(crate) summaries: summary::Summaries,
     /// Sessions stopped on a usage limit (limits.rs).
     pub(crate) limits: limits::Limits,
+    /// Background work still running at a turn's end (background.rs).
+    pub(crate) background: background::Background,
     /// The last `overlord::roster`, keyed by the rows it was built from
     /// (it runs tmux and the install checks; the TUI asks on every
     /// refresh).
@@ -113,6 +116,7 @@ impl Daemon {
             remote: Default::default(),
             summaries: Default::default(),
             limits: Default::default(),
+            background: Default::default(),
             roster: Mutex::new(None),
             fork_flags: Default::default(),
         })
@@ -549,9 +553,10 @@ impl Daemon {
             }
             _ => {}
         }
-        // `status:limited`: not a stored status (`limits.rs`), so it is
-        // taken out of the query and matched on the annotated rows; any
-        // other statuses asked for alongside it still count (either one).
+        // `status:limited` and `status:background`: not stored statuses
+        // (`limits.rs`, `background.rs`), so they are taken out of the
+        // query and matched on the annotated rows; any other statuses
+        // asked for alongside still count (any one).
         let limited_filter = (method == "session.list")
             .then(|| take_limited(&mut params))
             .flatten();
@@ -620,10 +625,11 @@ impl Daemon {
                     row["summarizing"] = json!(summarizing.contains(&id));
                 }
                 remote::annotate(self, &mut rows);
+                background::annotate(self, &mut rows);
                 limits::annotate(self, &mut rows);
-                if let Some(others) = &limited_filter {
+                if let Some((taken, others)) = &limited_filter {
                     rows.retain(|r| {
-                        !r["limit"].is_null()
+                        taken.iter().any(|t| !r[t.row_key()].is_null())
                             || r["status"]
                                 .as_str()
                                 .is_some_and(|s| others.iter().any(|o| o == s))
@@ -635,6 +641,7 @@ impl Daemon {
             ("session.get", Ok(row)) => {
                 let mut rows = [row];
                 remote::annotate(self, &mut rows);
+                background::annotate(self, &mut rows);
                 limits::annotate(self, &mut rows);
                 usage::annotate(self, &mut rows, true);
                 let [row] = rows;
@@ -1281,22 +1288,49 @@ fn drain_spool() -> Result<Vec<Value>> {
     Ok(events)
 }
 
-/// A `session.list` query's `status` naming `limited`: take that status
-/// filter out of the query (the DB doesn't store it) and return the other
-/// statuses it named, to be matched with it after annotating.
-fn take_limited(params: &mut Value) -> Option<Vec<String>> {
+/// A status that isn't stored but laid over rows after the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    Limited,
+    Background,
+}
+
+impl Overlay {
+    fn of(s: &str) -> Option<Overlay> {
+        match s {
+            "limited" => Some(Overlay::Limited),
+            "background" => Some(Overlay::Background),
+            _ => None,
+        }
+    }
+
+    /// The row field the annotation sets.
+    fn row_key(self) -> &'static str {
+        match self {
+            Overlay::Limited => "limit",
+            Overlay::Background => "background",
+        }
+    }
+}
+
+/// A `session.list` query's `status` naming `limited` or `background`:
+/// take the status filter out of the query (the DB doesn't store them)
+/// and return those named plus the other statuses, to be matched after
+/// annotating.
+fn take_limited(params: &mut Value) -> Option<(Vec<Overlay>, Vec<String>)> {
     let st = params.get("status")?.as_array()?;
-    if !st.iter().any(|v| v == "limited") {
+    let taken: Vec<Overlay> = st.iter().filter_map(|v| Overlay::of(v.as_str()?)).collect();
+    if taken.is_empty() {
         return None;
     }
     let others = st
         .iter()
         .filter_map(Value::as_str)
-        .filter(|s| *s != "limited")
+        .filter(|s| Overlay::of(s).is_none())
         .map(str::to_string)
         .collect();
     params["status"] = json!([]);
-    Some(others)
+    Some((taken, others))
 }
 
 #[cfg(test)]
@@ -1308,9 +1342,14 @@ mod tests {
         let mut p = json!({"status": ["limited", "waiting_input"]});
         assert_eq!(
             take_limited(&mut p),
-            Some(vec!["waiting_input".to_string()])
+            Some((vec![Overlay::Limited], vec!["waiting_input".to_string()]))
         );
         assert_eq!(p["status"], json!([]));
+        let mut p = json!({"status": ["background", "limited"]});
+        assert_eq!(
+            take_limited(&mut p),
+            Some((vec![Overlay::Background, Overlay::Limited], vec![]))
+        );
         let mut p = json!({"status": ["idle"]});
         assert_eq!(take_limited(&mut p), None);
         assert_eq!(p["status"], json!(["idle"]));

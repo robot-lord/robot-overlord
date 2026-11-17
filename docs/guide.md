@@ -805,8 +805,10 @@ import`, your own `mouse` setting applies in agent sessions.
 
 A session's status means one thing: **working**; **needs you** (blocked
 mid-turn on a permission prompt or a question, until you answer); **your
-turn** (it finished; the next prompt is yours); **stopped**. Filter with
-`status:needs`, `status:turn`, `status:working`. (A session stopped on a
+turn** (it finished; the next prompt is yours); **◔ bg N** (Claude Code
+only: its turn is over but N background tasks it started, background
+commands or subagents, still run, so you are waiting on it); **stopped**.
+Filter with `status:needs`, `status:turn`, `status:bg`, `status:working`. (A session stopped on a
 usage limit shows that instead, and `status:limited` lists those: see
 "Usage limits".) Run `rlord install-hooks`
 again after updating rlord: "needs you" clearing when the agent moves on

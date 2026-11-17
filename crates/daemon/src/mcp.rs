@@ -92,9 +92,9 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background (its turn is over but background work it started still runs, `background_tasks` of them: the user is waiting on the agent; it carries on by itself when they finish); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
-                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
+                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:bg (waiting on background work) status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
                 "sort": sort.clone(),
                 "usage": usage,
@@ -380,6 +380,12 @@ fn summarize(s: &Value) -> Value {
     let live_forks = s["live_fork_count"].as_u64().unwrap_or(0);
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
+    }
+    // Its turn over while background work still runs: the user waits on
+    // the agent, not the other way round.
+    if let Some(n) = s["background"].as_u64() {
+        row["status"] = json!("background");
+        row["background_tasks"] = json!(n);
     }
     // Stopped on a usage limit: that, rather than the status under it.
     if !s["limit"].is_null() {

@@ -24,6 +24,7 @@
 //!   both are read through `transcript::Line`; OpenCode keeps a database,
 //!   and answers those same functions from it.
 
+pub mod background;
 pub mod claude;
 pub mod codex;
 pub mod codex_gate;

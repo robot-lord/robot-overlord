@@ -174,6 +174,20 @@ pub fn status_chip(status: &str) -> Span<'static> {
     Span::styled(format!("{glyph} {label}"), Style::default().fg(color))
 }
 
+/// A session whose turn is over while `n` background tasks it started
+/// still run: the user is waiting on the agent. `full`: in words.
+pub fn background_chip(n: u64, full: bool) -> Span<'static> {
+    let text = if full {
+        format!(
+            "◔ waiting on {n} background task{}",
+            if n == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("◔ bg {n}")
+    };
+    Span::styled(text, Style::default().fg(accent()))
+}
+
 /// A stable color per tag, so a group reads the same everywhere.
 pub fn tag_color(tag: &str) -> Color {
     let palette = palette().tag_colors();
