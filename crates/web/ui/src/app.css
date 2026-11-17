@@ -220,9 +220,6 @@ a.row:hover {
   white-space: nowrap;
   min-width: 0;
 }
-.limit {
-  color: var(--warn);
-}
 .pin {
   color: var(--accent);
   margin-right: 4px;
@@ -281,6 +278,24 @@ a.row:hover {
 .st-error .dot {
   background: var(--bad);
 }
+/* Laid over a status (the daemon's shown_status), as the TUI colours
+   them: a usage limit as needing you, background work in the accent. */
+.st-limited {
+  color: var(--warn);
+}
+.st-limited .dot {
+  background: transparent;
+  border: 2px solid var(--warn);
+  box-sizing: border-box;
+}
+.st-background {
+  color: var(--accent);
+}
+.st-background .dot {
+  background: linear-gradient(90deg, var(--accent) 50%, transparent 50%);
+  border: 1px solid var(--accent);
+  box-sizing: border-box;
+}
 .st-stopped .dot,
 .st-none .dot {
   background: transparent;
@@ -307,7 +322,8 @@ a.row:hover {
   font-size: 15px;
   margin: 0;
 }
-.desc-line {
+.desc-line,
+.work-line {
   flex-basis: 100%;
   margin: 0;
   color: var(--dim);

@@ -155,6 +155,11 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     match op {
         "snapshot" => snapshot(d, &args),
         "session.resume" => resume(d, &args),
+        // A session the list doesn't show: labelled as rows are.
+        "session.get" => d.rpc(found.method, args).map(|mut s| {
+            label(&mut s);
+            s
+        }),
         _ => d.rpc(found.method, args),
     }
 }

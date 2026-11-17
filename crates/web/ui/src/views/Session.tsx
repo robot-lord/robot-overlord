@@ -4,7 +4,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ResumeButton, RunnerNote, SessionActions, useRunner } from "../components/Actions";
 import { Pane } from "../components/Pane";
-import { Status } from "../components/Status";
+import { Status, Work } from "../components/Status";
 import type { Row, SessionBase } from "../proto";
 import type { Store } from "../store";
 
@@ -56,7 +56,7 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
       <header class="view-head">
         <Back />
         <h1>{s.name}</h1>
-        <Status status={s.status} label={s.status_label} />
+        <Status s={s} full />
         <span class="dim">{store.agentLabel(s.agent)}</span>
         {s.model && <span class="dim">{s.model}</span>}
         {s.branch && <span class="dim">⎇ {s.branch}</span>}
@@ -64,6 +64,7 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
           <span class="tag">#{t}</span>
         ))}
         {s.description && <p class="desc-line">{s.description}</p>}
+        <Work s={s} />
       </header>
       <SessionActions s={s} r={act} />
       <Pane

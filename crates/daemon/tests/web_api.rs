@@ -132,6 +132,9 @@ fn web_call_reaches_its_ops_and_nothing_else() {
     // An op on the list reaches the real method.
     let got = op(&r.sock, "session.get", json!({"ref": "alpha"}));
     assert_eq!(got["result"]["id"], "alpha", "{got}");
+    // ... labelled as a row is, with the status the list shows.
+    assert_eq!(got["result"]["status_label"], "starting", "{got}");
+    assert_eq!(got["result"]["shown_status"], "starting", "{got}");
     // A method error comes back as one.
     let got = op(&r.sock, "session.get", json!({"ref": "nosuch"}));
     assert!(got["error"]["message"].is_string(), "{got}");

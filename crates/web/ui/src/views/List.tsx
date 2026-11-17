@@ -127,7 +127,7 @@ function OverlordRow({
   }
   return (
     <a class={`row overlord${active ? " selected" : ""}`} href={href({ kind: "overlord" })}>
-      <Status status={o.status} label={o.status_label} />
+      <Status s={o} at={now.value} />
       <span class="name">overlord</span>
       <span class="agent">{labels.get(o.agent) ?? o.agent}</span>
     </a>
@@ -183,7 +183,7 @@ function Rows({
             class={`row${r.id === selected ? " selected" : ""}${r.archived_at ? " archived" : ""}`}
             href={href({ kind: "session", id: r.id })}
           >
-            <Status status={r.status} label={r.status_label} />
+            <Status s={r} at={at} />
             <span class="name">
               {r.pinned && (
                 <span class="pin" title="pinned">
@@ -196,13 +196,8 @@ function Rows({
             <span class="when" title={new Date(lastUpdate(r)).toLocaleString()}>
               {ago(lastUpdate(r), at)}
             </span>
-            {(r.tags.length > 0 || r.description || r.limit) && (
+            {(r.tags.length > 0 || r.description) && (
               <span class="more">
-                {r.limit && (
-                  <span class="limit">
-                    {r.limit.reset ? "limit reset" : `limit until ${r.limit.until}`}
-                  </span>
-                )}
                 {r.tags.map((t) => (
                   <span class="tag">#{t}</span>
                 ))}
