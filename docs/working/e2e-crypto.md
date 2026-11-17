@@ -1092,7 +1092,7 @@ inject chosen text into a pane's output repeatedly and watch the matching
 frame sizes at the relay, and it isn't clear that pathway exists for this
 use case. Explore that before treating any of the rules below as fixed.
 
-The concern, for reference: Compress-then-encrypt leaks plaintext through ciphertext size
+The concern, for reference: compress-then-encrypt leaks plaintext through ciphertext size
 (CRIME/BREACH): when a frame mixes a secret with attacker-influenced text,
 the compressed size tells how well a guess matched. Pane output is that
 mix (an agent prints a token or `.env` beside text from a web page or a
