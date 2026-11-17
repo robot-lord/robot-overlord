@@ -13,6 +13,11 @@
 //!   most one per 100 ms (`Daemon::push_loop`).
 //! - `web.pane_target {target}`: which tmux session a pane shows. Starts
 //!   nothing.
+//! - `web.pages {pages}`: the pages (control sockets) open now, by the
+//!   page id the plugin gave each. `web.call` carries the id of the page
+//!   that asked (`page`), never set by the browser. The daemon keeps what
+//!   each page shows (`WebUi`), so the overlord's UI commands can land on
+//!   a page (`ui::target`).
 //!
 //! The daemon also runs the plugin, as a child process (`Web`): started by
 //! `web.start` (`rlord web`) or at daemon start with `[web] enabled`,
@@ -105,7 +110,18 @@ pub const OPS: &[Op] = &[
     op("session.pin", "session.pin", &["ref", "pinned"]),
     // Make another agent's overlord the active one.
     op("overlord.switch", "overlord.switch", &["agent"]),
+    // What the page shows (answered here; see `WebUi`).
+    op(
+        "page.report",
+        "",
+        &["route", "view", "visible", "form", "input"],
+    ),
 ];
+
+/// Ops that don't count as the user doing something on the page (look-ups
+/// and reports a page makes by itself): every other op moves the page's
+/// last use (`ui::target`). A `page.report` counts only with `input`.
+const PASSIVE: &[&str] = &["snapshot", "session.get", "page.report"];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
 const FORBIDDEN: &[&str] = &[
@@ -135,12 +151,17 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"protocol": plugin::WEB_PROTOCOL, "version": env!("CARGO_PKG_VERSION")}))
 }
 
-/// `web.call {op, args}`: one browser request.
+/// `web.call {op, args, page}`: one browser request, from the page with
+/// that id (the plugin's, never the browser's).
 pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     let op = params["op"].as_str().unwrap_or("");
     let Some(found) = OPS.iter().find(|o| o.op == op) else {
         return Err(NotAllowed(op.to_string()).into());
     };
+    let page = params["page"].as_str().unwrap_or("");
+    if !PASSIVE.contains(&op) {
+        d.web_ui().used(page);
+    }
     if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
         return Err(NotAllowed(op.to_string()).into());
     }
@@ -156,6 +177,7 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     match op {
         "snapshot" => snapshot(d, &args),
         "session.resume" => resume(d, &args),
+        "page.report" => d.web_ui().report(page, &args),
         // A session the list doesn't show: labelled as rows are.
         "session.get" => d.rpc(found.method, args).map(|mut s| {
             label(&mut s);
@@ -324,6 +346,149 @@ pub fn pane_target(d: &Daemon, params: &Value) -> Result<Value> {
         "tmux_session": s.tmux_session,
         "running": running,
     }))
+}
+
+// ---- the pages (what each open web page shows) ----
+
+/// At most this many pages are kept (the plugin's control-socket limit).
+const MAX_PAGES: usize = 16;
+
+/// The open web pages, as the plugin and the pages report them: the web's
+/// side of "which screen is the user on" (`ui::target`, `ui.state`).
+#[derive(Default)]
+pub struct WebUi {
+    pages: Vec<Page>,
+}
+
+/// One open page (a browser tab's control socket).
+#[derive(Clone, Debug, Default)]
+pub struct Page {
+    /// The plugin's id for it (`p<n>-<8 hex>`).
+    pub id: String,
+    /// `{kind: "list" | "overlord" | "session", id?}`.
+    pub route: Value,
+    /// Its list view, in the TUI's shape (`ui::normalize_view`); null
+    /// before it reports one.
+    pub view: Value,
+    pub visible: bool,
+    /// The form open on it, if any.
+    pub form: Option<String>,
+    /// When the user last did something on it (the daemon's clock, ms).
+    pub last_input: Option<i64>,
+    /// Order of arrival: among pages never used, the newest wins.
+    pub seq: u64,
+}
+
+/// The forms a page may say it has open.
+const FORMS: &[&str] = &["describe", "confirm", "manual", "fork", "setup", "keys"];
+
+impl WebUi {
+    /// `web.pages`: the pages open now. New ones are added, missing ones
+    /// dropped; the others keep what they reported.
+    pub fn set_pages(&mut self, ids: &[String]) {
+        self.pages.retain(|p| ids.contains(&p.id));
+        let mut seq = self.pages.iter().map(|p| p.seq).max().unwrap_or(0);
+        for id in ids {
+            if self.pages.len() >= MAX_PAGES {
+                break;
+            }
+            if !id.is_empty() && !self.pages.iter().any(|p| &p.id == id) {
+                seq += 1;
+                self.pages.push(Page {
+                    id: clip(id, 40),
+                    route: json!({"kind": "list"}),
+                    seq,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    /// The plugin is gone: so are its pages.
+    pub fn clear(&mut self) {
+        self.pages.clear();
+    }
+
+    /// Page `id` was used now. (An unknown id changes nothing.)
+    pub fn used(&mut self, id: &str) {
+        if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
+            p.last_input = Some(rlord_core::types::now_ms());
+        }
+    }
+
+    pub fn pages(&self) -> &[Page] {
+        &self.pages
+    }
+
+    pub fn page(&self, id: &str) -> Option<&Page> {
+        self.pages.iter().find(|p| p.id == id)
+    }
+
+    /// Op `page.report {route, view, visible, form, input}` from page
+    /// `id`: what it shows now. Only the fields given change; `input:
+    /// true` stamps its last use with the daemon's clock.
+    fn report_fields(&mut self, id: &str, args: &Value) -> Result<()> {
+        let Some(p) = self.pages.iter_mut().find(|p| p.id == id) else {
+            bail!("this page isn't open (reload it)");
+        };
+        if let Some(r) = args.get("route").filter(|r| !r.is_null()) {
+            let kind = r["kind"].as_str().unwrap_or("");
+            if !matches!(kind, "list" | "overlord" | "session") {
+                bail!("route kind must be list, overlord or session");
+            }
+            let mut route = json!({"kind": kind});
+            if let Some(i) = r["id"].as_str().filter(|_| kind == "session") {
+                route["id"] = json!(clip(i, 80));
+            }
+            p.route = route;
+        }
+        if let Some(v) = args.get("view").filter(|v| v.is_object()) {
+            p.view = crate::ui::normalize_view(v);
+        }
+        if let Some(v) = args.get("visible").and_then(Value::as_bool) {
+            p.visible = v;
+        }
+        match args.get("form") {
+            None => {}
+            Some(Value::Null) => p.form = None,
+            Some(f) => {
+                let f = f.as_str().unwrap_or("");
+                if !FORMS.contains(&f) {
+                    bail!("form must be one of {} or null", FORMS.join(", "));
+                }
+                p.form = Some(f.to_string());
+            }
+        }
+        if args["input"] == true {
+            p.last_input = Some(rlord_core::types::now_ms());
+        }
+        Ok(())
+    }
+
+    fn report(&mut self, id: &str, args: &Value) -> Result<Value> {
+        self.report_fields(id, args)?;
+        Ok(json!({"ok": true}))
+    }
+}
+
+/// `s` cut to at most `n` characters.
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// `web.pages {pages: [ids]}`: the plugin's open pages, the whole list
+/// each time (so a lost call heals on the next).
+pub fn pages(d: &Daemon, params: &Value) -> Result<Value> {
+    let ids: Vec<String> = params["pages"]
+        .as_array()
+        .context("pages must be a list of page ids")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let mut w = d.web_ui();
+    w.set_pages(&ids);
+    Ok(json!({"pages": w.pages().len()}))
 }
 
 // ---- running the plugin ----

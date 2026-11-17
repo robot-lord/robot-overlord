@@ -101,6 +101,11 @@ pub struct Daemon {
     changes: std::sync::atomic::AtomicU64,
     /// The web plugin, when it runs (web.rs).
     web: Arc<web::Web>,
+    /// The open web pages and what each shows (web.rs `WebUi`).
+    web_ui: Mutex<web::WebUi>,
+    /// Open `web.subscribe` streams (the plugin's; a restarted plugin's
+    /// may overlap the old one's briefly). The pages go with the last.
+    web_subscribers: AtomicUsize,
 }
 
 impl Daemon {
@@ -131,6 +136,8 @@ impl Daemon {
                 .unwrap_or_else(|_| format!("{:x}", std::process::id())),
             changes: std::sync::atomic::AtomicU64::new(0),
             web: Default::default(),
+            web_ui: Default::default(),
+            web_subscribers: AtomicUsize::new(0),
         })
     }
 
@@ -168,6 +175,11 @@ impl Daemon {
     /// The web plugin's supervisor.
     pub fn web(&self) -> &Arc<web::Web> {
         &self.web
+    }
+
+    /// The open web pages.
+    pub(crate) fn web_ui(&self) -> MutexGuard<'_, web::WebUi> {
+        self.web_ui.lock().expect("web ui mutex")
     }
 
     /// The state's revision, `"<boot id>-<n>"`: moves on every change and
@@ -450,6 +462,9 @@ impl Daemon {
         if tui {
             self.tui_subscribers.fetch_add(1, Ordering::SeqCst);
         }
+        if let Push::Web = kind {
+            self.web_subscribers.fetch_add(1, Ordering::SeqCst);
+        }
         let mut last_web: Option<std::time::Instant> = None;
         let r = loop {
             let mut line = match rx.recv().await {
@@ -481,6 +496,13 @@ impl Daemon {
         };
         if tui {
             self.tui_subscribers.fetch_sub(1, Ordering::SeqCst);
+        }
+        // The plugin is gone, and its pages with it (unless a restarted
+        // plugin's stream is already up: it reports its own).
+        if let Push::Web = kind {
+            if self.web_subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
+                self.web_ui().clear();
+            }
         }
         r
     }
@@ -993,6 +1015,7 @@ impl Daemon {
             "web.hello" => web::hello(self, params),
             "web.call" => web::call(self, params),
             "web.pane_target" => web::pane_target(self, params),
+            "web.pages" => web::pages(self, params),
             "web.status" => web::status(self),
             "web.start" => web::start(self),
             "web.stop" => web::stop(self),

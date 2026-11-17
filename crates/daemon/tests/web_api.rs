@@ -516,3 +516,129 @@ fn pane_target_finds_the_pane_and_starts_nothing() {
         "starting"
     );
 }
+
+/// A browser request from page `page` (the plugin stamps the id).
+fn op_from(sock: &Path, page: &str, op: &str, args: Value) -> Value {
+    raw(
+        sock,
+        "web.call",
+        json!({"op": op, "args": args, "page": page}),
+    )
+}
+
+fn ui_state(sock: &Path) -> Value {
+    ok(sock, "ui.state", json!({}))
+}
+
+/// Slice 2: the plugin names the open pages, each reports what it shows,
+/// and with no terminal (no tmux here) the page is where UI commands go.
+#[test]
+fn pages_register_report_and_drop() {
+    let r = start();
+    // No page, no terminal.
+    let s = ui_state(&r.sock);
+    assert_eq!((&s["target"], &s["web"]), (&json!("none"), &Value::Null));
+    ok(
+        &r.sock,
+        "web.pages",
+        json!({"pages": ["p1-aaaa", "p2-bbbb"]}),
+    );
+    let s = ui_state(&r.sock);
+    assert_eq!(s["target"], "web");
+    // Neither used yet: the newest.
+    assert_eq!(s["web"]["pages"], 2);
+    assert_eq!(s["web"]["showing"]["kind"], "session_list");
+    // p1 reports a session, its view and a form, with input: it is the
+    // most recent now.
+    let rep = op_from(
+        &r.sock,
+        "p1-aaaa",
+        "page.report",
+        json!({"route": {"kind": "session", "id": "alpha"},
+               "view": {"query": "tag:web", "sort": "name"},
+               "visible": true, "form": "manual", "input": true,
+               // Not the browser's to set: dropped.
+               "page": "p2-bbbb", "last_input": 1}),
+    );
+    assert!(rep["error"].is_null(), "{rep}");
+    let s = ui_state(&r.sock);
+    assert_eq!(
+        s["web"]["showing"],
+        json!({"kind": "session", "id": "alpha", "name": "alpha"})
+    );
+    assert_eq!(
+        (&s["web"]["visible"], &s["web"]["form"]),
+        (&json!(true), &json!("manual"))
+    );
+    assert_eq!(s["current_view"]["query"], "tag:web");
+    assert_eq!(s["current_view"]["sort"], "name");
+    assert_eq!(s["current_view"]["tab"], "sessions");
+    // A bad route or form is refused; a page that isn't open can't report.
+    let bad = op_from(
+        &r.sock,
+        "p1-aaaa",
+        "page.report",
+        json!({"route": {"kind": "admin"}}),
+    );
+    assert!(bad["error"].is_object(), "{bad}");
+    let bad = op_from(
+        &r.sock,
+        "p1-aaaa",
+        "page.report",
+        json!({"form": "anything"}),
+    );
+    assert!(bad["error"].is_object(), "{bad}");
+    let bad = op_from(&r.sock, "p9-zzzz", "page.report", json!({"visible": true}));
+    assert!(bad["error"].is_object(), "{bad}");
+    // A user-driven op from p2 makes it the most recent (a second later:
+    // whole seconds); a look-up doesn't.
+    std::thread::sleep(Duration::from_millis(1100));
+    op_from(&r.sock, "p2-bbbb", "snapshot", json!({}));
+    assert_eq!(ui_state(&r.sock)["web"]["form"], "manual");
+    op_from(
+        &r.sock,
+        "p2-bbbb",
+        "session.pin",
+        json!({"ref": "gamma", "pinned": true}),
+    );
+    let s = ui_state(&r.sock);
+    assert_eq!(
+        (&s["web"]["showing"]["kind"], &s["web"]["form"]),
+        (&json!("session_list"), &Value::Null)
+    );
+    // p2 closes: p1 again. Then both.
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    assert_eq!(ui_state(&r.sock)["web"]["form"], "manual");
+    ok(&r.sock, "web.pages", json!({"pages": []}));
+    assert_eq!(ui_state(&r.sock)["target"], "none");
+}
+
+/// The pages go when the plugin's `web.subscribe` stream does.
+#[test]
+fn pages_go_with_the_plugin() {
+    let r = start();
+    let s = UnixStream::connect(&r.sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+    let mut lines = BufReader::new(s).lines();
+    lines.next().unwrap().unwrap();
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    assert_eq!(ui_state(&r.sock)["target"], "web");
+    drop(lines);
+    drop(w);
+    // (The daemon finds the stream gone on its next write.)
+    let start = Instant::now();
+    loop {
+        ok(
+            &r.sock,
+            "session.describe",
+            json!({"ref": "alpha", "description": "x"}),
+        );
+        if ui_state(&r.sock)["target"] == "none" {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "pages kept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

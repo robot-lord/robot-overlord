@@ -13,7 +13,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use rlord_core::config::expand_tilde;
+use rlord_core::config::{expand_tilde, UiTarget};
 use rlord_core::db::{ArchivedMode, SessionQuery, SortMode};
 use rlord_core::tmux;
 use rlord_core::types::Status;
@@ -28,8 +28,8 @@ const USAGE_KEY: &str = "ui_usage";
 /// tmux session created to host the TUI when none is running.
 const HOME_SESSION: &str = "rlord";
 
-/// The view shape shared with the TUI.
-fn normalize_view(v: &Value) -> Value {
+/// The view shape shared with the TUI (and the web pages' reports).
+pub(crate) fn normalize_view(v: &Value) -> Value {
     json!({
         "query": v.get("query").and_then(Value::as_str).unwrap_or(""),
         "sort": v.get("sort").and_then(Value::as_str).unwrap_or("updated"),
@@ -104,8 +104,171 @@ pub fn usage(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"usage": usage_pref(d).map(UsageMetric::label)}))
 }
 
+// ---- which screen a UI command lands on ----
+//
+// A surface is somewhere the user looks at rlord: the terminal (a tmux
+// client, with or without the TUI) or a web page. A command goes to one of
+// them: the one the user did something on last (`[web] ui_target` can
+// prefer one). The others get a one-line notice.
+
+/// Where a UI command goes, chosen once per tool call (`target`) so the
+/// command and anything that brings it to the front agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The user's terminal (this tmux client).
+    Terminal(tmux::Client),
+    /// The web page with this id.
+    Web(String),
+    /// Nowhere to show anything.
+    None,
+}
+
+impl Target {
+    /// `"terminal"`, `"web"` or `"none"`: the `on` in tool answers.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Target::Terminal(_) => "terminal",
+            Target::Web(_) => "web",
+            Target::None => "none",
+        }
+    }
+}
+
+/// What `pick` chose (`Web` names an entry of its `pages`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Picked<'a> {
+    Terminal,
+    Web(&'a str),
+    None,
+}
+
+/// The surface a command goes to. `terminal`: the user's terminal's last
+/// input, epoch seconds (None: no terminal attached). `pages`: each open
+/// page's id, its last use in ms (None: never used) and its order of
+/// arrival. With `Auto`, the later use wins, compared in whole seconds
+/// (tmux's resolution); a tie or an unknown goes to the terminal. Among
+/// pages, the latest use, then the newest. A preference (`Terminal`,
+/// `Web`) wins whenever its surface is there.
+pub(crate) fn pick<'a>(
+    terminal: Option<i64>,
+    pages: &'a [(String, Option<i64>, u64)],
+    pref: UiTarget,
+) -> Picked<'a> {
+    let page = pages.iter().max_by_key(|(_, at, seq)| (*at, *seq));
+    match (terminal, page) {
+        (None, None) => Picked::None,
+        (Some(_), None) => Picked::Terminal,
+        (None, Some(p)) => Picked::Web(&p.0),
+        (Some(t), Some(p)) => match pref {
+            UiTarget::Terminal => Picked::Terminal,
+            UiTarget::Web => Picked::Web(&p.0),
+            UiTarget::Auto => match p.1 {
+                Some(ms) if ms.div_euclid(1000) > t => Picked::Web(&p.0),
+                _ => Picked::Terminal,
+            },
+        },
+    }
+}
+
+/// The screen the overlord's next UI command lands on (see `pick`).
+pub fn target(d: &Daemon) -> Target {
+    let clients = tmux::list_clients();
+    let home = tmux::home();
+    let user = tmux::user_client(&clients, home.as_deref()).cloned();
+    let pages = page_uses(d);
+    let pref = d.config().web.ui_target;
+    let picked = match pick(user.as_ref().map(|c| c.activity), &pages, pref) {
+        Picked::Terminal => None,
+        Picked::Web(id) => Some(Target::Web(id.to_string())),
+        Picked::None => Some(Target::None),
+    };
+    match (picked, user) {
+        (Some(t), _) => t,
+        (None, Some(c)) => Target::Terminal(c),
+        (None, None) => Target::None,
+    }
+}
+
+/// Each open page's last use: its own (an op, a report of input) or the
+/// last key typed into the pane it shows (a browser's tmux client).
+fn page_uses(d: &Daemon) -> Vec<(String, Option<i64>, u64)> {
+    let pages = d.web_ui().pages().to_vec();
+    let mut panes: std::collections::HashMap<String, Option<i64>> = Default::default();
+    pages
+        .into_iter()
+        .map(|p| {
+            let pane = pane_of(d, &p.route).and_then(|t| {
+                *panes.entry(t.clone()).or_insert_with(|| {
+                    tmux::view_clients(&t)
+                        .iter()
+                        .map(|c| c.activity * 1000)
+                        .max()
+                })
+            });
+            let at = match (p.last_input, pane) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            (p.id, at, p.seq)
+        })
+        .collect()
+}
+
+/// The tmux session a page's route shows, if it shows a pane.
+fn pane_of(d: &Daemon, route: &Value) -> Option<String> {
+    let db = d.db();
+    let s = match route["kind"].as_str()? {
+        "overlord" => overlord::session(&db).ok().flatten()?,
+        "session" => db.resolve_ref(route["id"].as_str()?).ok()?,
+        _ => return None,
+    };
+    s.tmux_session
+}
+
+/// The web part of `ui.state`: the most recently used page (null: none).
+fn web_state(d: &Daemon, target: &Target) -> Value {
+    let uses = page_uses(d);
+    let w = d.web_ui();
+    let id = match target {
+        Target::Web(id) => Some(id.as_str()),
+        _ => uses
+            .iter()
+            .max_by_key(|(_, at, seq)| (*at, *seq))
+            .map(|p| p.0.as_str()),
+    };
+    let Some(p) = id.and_then(|id| w.page(id)).cloned() else {
+        return Value::Null;
+    };
+    let open = w.pages().len();
+    drop(w);
+    let kind = p.route["kind"].as_str().unwrap_or("list");
+    let showing = match kind {
+        "session" | "overlord" => {
+            let db = d.db();
+            let s = if kind == "overlord" {
+                overlord::session(&db).ok().flatten()
+            } else {
+                p.route["id"].as_str().and_then(|i| db.resolve_ref(i).ok())
+            };
+            match s {
+                Some(s) => json!({"kind": kind, "id": s.id, "name": s.name}),
+                None => json!({"kind": kind}),
+            }
+        }
+        _ => json!({"kind": "session_list"}),
+    };
+    json!({
+        "open": open > 0,
+        "pages": open,
+        "showing": showing,
+        "visible": p.visible,
+        "form": p.form,
+    })
+}
+
 /// What the user is looking at right now.
 pub fn state(d: &Daemon) -> Result<Value> {
+    let target = target(d);
     let clients = tmux::list_clients();
     let home = tmux::home().filter(|h| tmux::has_session(h));
     let user = tmux::user_client(&clients, home.as_deref()).cloned();
@@ -128,13 +291,29 @@ pub fn state(d: &Daemon) -> Result<Value> {
             }
         }
     };
+    let web = web_state(d, &target);
     Ok(json!({
+        "target": target.name(),
         "terminal": terminal,
+        "web": web,
         "tui_running": d.tui_count() > 0,
         "overlord_overlay_open": d.overlay.lock().expect("ui mutex").is_some(),
-        "current_view": normalize_view(&d.ui_view.lock().expect("ui mutex")),
+        "current_view": current_view(d, &target)?,
         "default_view": default_view(d)?,
     }))
+}
+
+/// The list view on `target`: a page's as it reported it, else the TUI's
+/// (either: the default view until one is reported).
+fn current_view(d: &Daemon, target: &Target) -> Result<Value> {
+    let v = match target {
+        Target::Web(id) => d.web_ui().page(id).map(|p| p.view.clone()),
+        _ => Some(d.ui_view.lock().expect("ui mutex").clone()),
+    };
+    match v.filter(|v| !v.is_null()) {
+        Some(v) => Ok(normalize_view(&v)),
+        None => default_view(d),
+    }
 }
 
 /// Switch the user's terminal to `tmux_session`. Returns whether the user
@@ -753,6 +932,48 @@ pub fn keys_open(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(
         json!({"shown": "key screen", "note": "the user presses the new key there; it's tested and saved to config.toml when they confirm"}),
     )
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    fn pages(p: &[(&str, Option<i64>, u64)]) -> Vec<(String, Option<i64>, u64)> {
+        p.iter().map(|(i, a, s)| (i.to_string(), *a, *s)).collect()
+    }
+
+    #[test]
+    fn the_surface_used_last_wins() {
+        use Picked::{Terminal, Web};
+        let auto = UiTarget::Auto;
+        // Nothing, one surface, the other.
+        assert_eq!(pick(None, &[], auto), Picked::None);
+        assert_eq!(pick(Some(100), &[], auto), Terminal);
+        let one = pages(&[("p1", None, 1)]);
+        assert_eq!(pick(None, &one, auto), Web("p1"));
+        // Both: the later, in whole seconds; a tie or a page never used
+        // goes to the terminal.
+        assert_eq!(pick(Some(100), &one, auto), Terminal);
+        let used = pages(&[("p1", Some(101_000), 1)]);
+        assert_eq!(pick(Some(100), &used, auto), Web("p1"));
+        let tie = pages(&[("p1", Some(100_900), 1)]);
+        assert_eq!(pick(Some(100), &tie, auto), Terminal);
+        assert_eq!(pick(Some(102), &used, auto), Terminal);
+        // Several pages: the latest use, then the newest.
+        let several = pages(&[
+            ("p1", Some(105_000), 1),
+            ("p2", Some(103_000), 2),
+            ("p3", None, 3),
+        ]);
+        assert_eq!(pick(Some(100), &several, auto), Web("p1"));
+        let unused = pages(&[("p1", None, 1), ("p2", None, 2)]);
+        assert_eq!(pick(None, &unused, auto), Web("p2"));
+        // A preference wins while its surface is there.
+        assert_eq!(pick(Some(100), &used, UiTarget::Terminal), Terminal);
+        assert_eq!(pick(Some(200), &one, UiTarget::Web), Web("p1"));
+        assert_eq!(pick(None, &one, UiTarget::Terminal), Web("p1"));
+        assert_eq!(pick(Some(1), &[], UiTarget::Web), Terminal);
+    }
 }
 
 #[cfg(test)]

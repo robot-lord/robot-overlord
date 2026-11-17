@@ -618,6 +618,26 @@ Decided 2026-11-17 (user):
     prints for 3 s keeps its `client_activity`; a resize doesn't move it
     either; a key press moves it to now. Resolution: one second (epoch
     seconds). No fallback needed.
+  - Step 2 done (`ui.rs` `Target`, `pick`, `target`; `web.rs` `WebUi`,
+    `web.pages`, op `page.report`; `config.rs` `[web] ui_target`):
+    `pick(terminal_s, pages, pref)` is pure and unit-tested; `target`
+    feeds it the user's terminal (`user_client`'s activity) and each page's
+    last use (a user-driven op, a `page.report` with `input`, or the last
+    key typed into the pane it shows, from `view_clients`). `ui.state`
+    has `target`, `web` and `current_view` from the target. Choices within
+    the plan:
+    - `ui_target = "terminal" | "web"` is a preference, not a lock: with
+      only the other surface present, that one gets the command (so a
+      web-only user isn't refused because of a config line).
+    - Pages never used rank by arrival (the newest wins among them).
+    - The pages are dropped when the last `web.subscribe` stream ends
+      (counted, since a restarted plugin's stream can overlap the old
+      one's); the plugin is to send `web.pages {pages: []}` at its start
+      so a crashed plugin's pages go at once.
+    - Look-ups that don't count as use: `snapshot`, `session.get`,
+      `page.report` (unless `input`); later steps add their own.
+    - `page.report`'s `form` is one of `describe`, `confirm`, `manual`,
+      `fork`, `setup`, `keys` or null.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
