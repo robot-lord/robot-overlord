@@ -578,6 +578,39 @@ Decided 2026-11-17 (user):
   browser-kept keys on a real keyboard, the wheel and copy, IME, two tabs
   at once, the TUI overlay open alongside, WebGL context loss
   mid-session; a dry run of `release.yml` before the next stable release.
+- Slice 1 follow-ups (`feat/web-ui-2`, into `feature/web`, 1.3.0-dev.2):
+  - **Release dry run** (`release.yml`, `workflow_dispatch` on
+    `feature/web`, `dry_run` on, run 44185921608): preflight (warnings
+    only: not on main, not stable, ref vs version), `web-assets`,
+    `build-linux` and `smoke-linux` (both arches, five distros, each with
+    `rlord web install --from` and `(verified)`) passed. `build-macos` was
+    refused before it started: the `release` environment's deployment
+    branch policy allows only `main` and `v*` tags, so `feature/web` can't
+    use it, and `release` was skipped. Not worked around. Owed: the macOS
+    half (signing, `Verify signature` on both binaries) and the `release`
+    job's asset check, from `main` (or with `feature/*` let into the
+    environment, the user's call).
+  - The page draws `shown_status` as the TUI does (`components/Status.tsx`
+    `shown`, after `state_chip`): "till 14:05" / "limited until 14:05"
+    (↻, "· resumes then", the reset), "bg N" / "waiting on N background
+    tasks"; pane headers name the work and background shells
+    (`statustext.rs`'s sentences), list rows carry them in the status's
+    tooltip. The row's separate limit tag is gone. `session.get` through
+    `web.call` now gets `status_label` (a session the list doesn't show
+    read "not started").
+  - The filter box takes the TUI's tokens: `snapshot` runs the view's
+    `search` through `SessionQuery::apply_search_text` (`search_tokens`),
+    so `tag:`, `status:` (`bg`, `limited`, `turn` included), `agent:`,
+    `proj:`, `group:` and `sort:` work; the page parses nothing.
+  - `:web` in the list (`launcher.rs`): starts the plugin if needed and
+    opens the page; not installed: says to run `rlord web`. `page_url` and
+    `open_in_browser` moved to `core/src/plugin.rs` for both callers.
+  - Checked in headless Chromium (Playwright 1.65.1, outside the repo)
+    against a second demo (socket `rlord-demo-f2`, port 47831) with
+    background work written into a transcript: "bg 1" and its tooltip,
+    the header lines, every filter token; `:web` driven in the demo's TUI
+    with a stand-in `open`. A usage limit is checked by unit tests only
+    (the demo can't make one).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
