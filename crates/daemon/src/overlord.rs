@@ -124,6 +124,13 @@ fn dir_for(db: &Db, agent: Agent) -> Result<PathBuf> {
 
 /// Every folder an overlord has run in or may: its conversations there
 /// are its own (full of searches), never search results.
+/// An overlord (`role`), or a session that ran in an overlord's folder
+/// (the retired front desk): never a worker's related session, never
+/// given look-ups. The one test (`search`, `session_tools`).
+pub fn overlords_at(role: &str, folder: &str) -> bool {
+    is_overlord_role(role) || dirs().iter().any(|d| d.to_string_lossy() == folder)
+}
+
 pub fn dirs() -> Vec<PathBuf> {
     let mut v = vec![default_dir(), paths::data_dir().join(OLD_MASTERMIND)];
     v.extend(Agent::ALL.into_iter().map(agent_dir));

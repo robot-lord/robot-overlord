@@ -110,21 +110,6 @@ pub fn resume_argv(
     Ok(argv)
 }
 
-/// Whether a user fork's new conversation id can be chosen by rlord:
-/// `--resume <parent> --fork-session --session-id <new>` starts the fork
-/// on `<new>`, its hooks report `<new>`, and its transcript is written
-/// under `<new>` from its first message on (not before: until then a
-/// restart forks again, `daemon::fork::pending`). Live check F1, Claude
-/// Code 2.1.326. False: the fork's id is bound from its first hook.
-pub const FORK_MINTS_ID: bool = true;
-
-/// Whether a user fork can start in another worktree of the parent's repo:
-/// `--resume <parent>` from there (its top, or the parent's subfolder of
-/// it) still finds the parent's conversation, and the fork's transcript
-/// goes under the new folder (live checks F2, F2b, Claude Code 2.1.326). There, a new worktree of a repo Claude already
-/// trusted started without its folder-trust question.
-pub const FORK_ELSEWHERE: bool = true;
-
 /// A user fork of conversation `parent` (a new session that starts from a
 /// copy of it; the parent is untouched): `claude --resume <parent>
 /// --fork-session [--session-id <new>] [--model m] <extra…> [prompt]`.

@@ -210,6 +210,8 @@ fn tmux_cmd() -> Command {
         }
     });
     let mut c = Command::new("tmux");
+    // A server started from here never keeps a pane's rlord identity.
+    crate::agents::scrub_pane_env(&mut c);
     // Inside rlord's server, TMUX tells tmux which client/pane "current"
     // means; anywhere else it would point at the user's own tmux.
     if !inside_rlord() {

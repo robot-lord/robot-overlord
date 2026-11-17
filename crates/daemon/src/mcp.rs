@@ -670,6 +670,21 @@ fn new_session_params(args: &Value) -> Value {
     Value::Object(p)
 }
 
+/// How session `id`'s agent can look things up itself
+/// (`session_tools::lookup_kind`: `mcp`, `cli` or `none`).
+fn lookup_of(d: &Daemon, id: &str) -> Value {
+    // (One lock: the DB mutex isn't re-entrant.)
+    let db = d.db();
+    match db.resolve_ref(id) {
+        Ok(s) => json!(crate::session_tools::lookup_kind(
+            &db,
+            &rlord_core::paths::data_dir(),
+            &s
+        )),
+        Err(_) => Value::Null,
+    }
+}
+
 pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
     match name {
         "list_sessions" => {
@@ -702,6 +717,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
+            s["lookup"] = lookup_of(d, id.as_str().unwrap_or(""));
             // The status as list_sessions shows it.
             overlord_status(&mut s);
             // Right after rlord starts, sub-agent data may still be loading.
@@ -796,6 +812,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             let s = d.rpc("session.new", params)?;
             let mut out = summarize(&s);
+            out["lookup"] = lookup_of(d, s["id"].as_str().unwrap_or(""));
             if !s["base"].is_null() {
                 out["base"] = shape_base(&s["base"]);
             }
@@ -834,6 +851,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             let s = d.rpc("session.fork", params)?;
             let mut out = summarize(&s);
+            out["lookup"] = lookup_of(d, s["id"].as_str().unwrap_or(""));
             out["warnings"] = s["warnings"].clone();
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The fork exists either way; a failed switch is a note.

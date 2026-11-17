@@ -74,13 +74,15 @@ pub fn default_socket() -> PathBuf {
 
 /// What a command rlord runs to manage the daemon must not carry: which
 /// rlord session or pane it was started from. A daemon started with them
-/// would hand them to every hook it runs, for every thread.
-const SCRUBBED_ENV: &[&str] = &["RLORD_SESSION_ID", "TMUX", "TMUX_PANE"];
+/// would hand them to every hook it runs, for every thread: the pane's
+/// rlord identity (`PANE_ENV`) and its tmux.
+const SCRUBBED_TMUX: &[&str] = &["TMUX", "TMUX_PANE"];
 
 fn daemon_cmd(program: &Path, verb: &str) -> Command {
     let mut c = Command::new(program);
     c.args(["app-server", "daemon", verb]);
-    for v in SCRUBBED_ENV {
+    super::scrub_pane_env(&mut c);
+    for v in SCRUBBED_TMUX {
         c.env_remove(v);
     }
     // Codex's own folder first on PATH, as a pane has it: a Codex that

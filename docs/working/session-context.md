@@ -108,8 +108,9 @@ by code (`context::frame_message`).
 ## The four PRs
 
 1. **0.23.0-dev.28: store, separation, background** (this one).
-2. Pull: token, `session_tools.rs`, `sctx.*`, `rlord mcp --session`,
-   `rlord context`, `spec_args` wiring, pane env.
+2. **1.3.0: pull** (shipped in this order after 1.2.0): token,
+   `session_tools.rs`, `sctx.*`, `rlord mcp --session`, `rlord context`,
+   wiring at every start, pane env.
 3. Prompts off argv: V1/V4, `FirstPrompt`, stdin file, `Deferred.prompt`,
    kv `first_prompt`, `first_prompt_next`, `discover` change, argv secrecy
    tests.
@@ -473,18 +474,194 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 8. `RELATED_MAX` counts distinct resolved sessions, without the session
    itself (test).
 
+## PR 2 progress (1.3.0)
+
+- [x] Token (`session_tools::mint` / `revoke` / `resolve`): 32 bytes
+  from `/dev/urandom`, hex; kv `session_token:<id>` and 0600
+  `<data>/sessions/<id>/token`; kept across restarts, removed on
+  archive, made again at the next start. Constant-time compare.
+  Overlords (and sessions in an overlord's folder) get none and are
+  refused; archived sessions are refused.
+- [x] `session_tools.rs`: `session_brief`, `related_sessions`,
+  `session_summary`, `search_history`, `read_history`, with the plan's
+  limits; rate limit 30/min, 300/h in memory; answers capped at 16,000
+  chars (a longer one comes back clipped as text).
+- [x] `search::search_in` (id filter, nothing outside rlord) and
+  `search::read_with` (budget); only `session_tools` calls them.
+- [x] RPC `sctx.tools {token}` / `sctx.call {token, name, arguments}`,
+  a dispatch of its own in `call_ui`.
+- [x] `rlord mcp --session --token-file <p> [--socket]` (server
+  `rlord_session`, conflicts with `--overlord`, never autostarts) and
+  `rlord context [--token-file] [--socket] <tool|help> key=value…`.
+- [x] Wiring per agent at every start; pane env `RLORD_SESSION_TOKEN_FILE`
+  (not for Codex daemon mode).
+- [x] Background "Looking up more" section.
+- [x] `overlord.md` (link rather than copy), `docs/architecture.md` (MCP
+  server: three modes).
+- Live check V5 (Codex `-c mcp_servers.rlord_session` in a worker): not
+  run. Until it passes, Codex sessions aren't wired
+  (`session_tools::CODEX_MCP = false`, review round 5): they get
+  `lookup` `cli` and the overlord copies the facts they need. Owed: run
+  V5, then turn the flag on.
+
+### Decisions made in PR 2 (beyond the plan)
+
+- **Wiring not inside `spec_args`.** `spec_args(agent, spec)` has no
+  session id, and the token must exist before the background file is
+  rendered. `session_tools::wiring(db, base, id, agent, role, daemon)`
+  is called next to `spec_args` at the three starts (`session_new`,
+  `session_restart`, `fork::finish`), before the file is written.
+  Same effect as the plan: computed at every start, never stored in
+  `extra_args`, so old sessions get it at their next restart.
+  `session_fresh` (overlords only) gets none.
+- **Claude flags in `=` form** (`--mcp-config=<p>`,
+  `--allowedTools=mcp__rlord_session`): both are variadic, and the
+  first prompt may follow.
+- **Visible "linked"** = background links either way (it links them, or
+  they link it), its fork parent and its forks. "Same group" = a shared
+  tag. Sessions that ran in an overlord's folder are left out like
+  overlords.
+- **Lookup section only once the token exists.** A session started
+  before 1.3.0 gets no section (and no tools) until its next start; the
+  plan's "minted when context is first rendered" isn't done: rendering
+  stays free of writes.
+- **`read_history`** takes a hit's `transcript` (review round 2), and
+  `search::read_with` refuses any file that isn't that session's.
+- **`session_brief`'s first prompt**: kv `bind_prompt`, else the launch
+  spec's `prompt`, else the transcript's first prompt. Includes
+  `forked_from` (owed from forks).
+- **Token not minted for a launch that fails** after `wiring`: no undo;
+  the kv row and file stay until the id is reused (never) or archived.
+  Harmless (no session row resolves it).
+
+### Review round 2 (PR #70)
+
+1. `read_history` passes a hit's `transcript` through (test: a hit
+   before a `/clear`; a foreign path refused).
+2. `RLORD_SESSION_TOKEN_FILE` is scrubbed wherever `RLORD_SESSION_ID`
+   is (`agents::PANE_ENV` / `scrub_pane_env`): the Codex-daemon pane's
+   unset list, autostart, `process::run`, OpenCode's shared-server
+   environment and `run_bounded`, Codex's server commands, install's
+   probes (tests: pane command, OpenCode config).
+3. `rlord context`: only `line`, `before`, `after`, `limit` are numbers.
+4. Refs resolve only within the visible set: id, exact name, unique
+   name prefix (test).
+5. A failed worktree add removes only its own worktree (`worktree remove
+   --force` if git registered it) and the branch; no repo-wide prune.
+6. `lookup` (`mcp` / `cli` / `none`, `session_tools::lookup_kind`) in
+   `get_session` and the create and fork answers. `overlord.md`: link
+   for `mcp`; for `cli` / `none` also copy the few facts needed into
+   `context`. The CLI isn't relied on inside Codex's sandbox.
+7. `wiring` refuses an overlord's folder too, before making a token.
+8. `base` is passed to `lookup_section` (now the session folder),
+   `pane_env`, the file renderers (`Start.base`); no `data_dir()` there.
+9. `visible()` once per call, passed down.
+
+Not changed: version stays 1.3.0 (coordinator: feature PRs are stable
+minor releases now).
+
+### Review round 3 (PR #70)
+
+1. A failed worktree add removes only a registration at `dir` and a
+   branch that weren't there before the call (test: the user's
+   "missing but already registered" worktree survives).
+2. No `RLORD_SESSION_TOKEN_FILE` in OpenCode or Codex daemon-mode panes
+   (shared servers run their commands); architecture.md fixed.
+3. The background's CLI line always passes `--token-file` and
+   `--socket`.
+4. `pick` also takes a unique id prefix, after the exact id and name.
+5. `worktree_registered` compares paths with symlinks resolved, also for
+   a missing folder (nearest existing ancestor resolved) (test).
+6. `render_as` leaves the lookup section out when it doesn't fit with
+   the header; never over budget for it (test).
+7. `scrub_pane_env` in autostart, install and Codex's server commands.
+8. One `overlord::overlords_at`, used by `visible`, `resolve`,
+   `lookup_kind`, `wiring` and `search`.
+
+### Review round 4 (PR #70)
+
+1. Every pane unsets the `PANE_ENV` names it isn't given (`env -u`);
+   `rlord daemon` drops them from its own environment at start
+   (`scrub_own_env`) (tests).
+2. `lookup` is `mcp` only when the last start's wiring produced flags
+   (kv `session_lookup:<id>`), else `cli` (test).
+3. `render_as` renders the rest, then adds the lookup section only if
+   the whole stays in budget; `compose` leaves out a notes section that
+   can't fit. Test over every budget from the header up.
+4. `rlord mcp --token-file` requires `--session`.
+5. The rate limiter is per `Daemon` (`session_tools::Limiter`), drops
+   idle ids; tests use their own.
+6. `methods::start_args` (spec args plus wiring) for every start path:
+   new, restart, fork, fresh. (`limits` resumes through restart.)
+7. Token bytes from two v4 uuids.
+8. `is_overlords` gone; `overlords_at` imported at the top; fork test
+   block un-nested.
+
+### Review round 5 (PR #70)
+
+1. Deadlock: `mcp::lookup_of` took the DB lock twice (`get_session`,
+   `create_session`, `fork_session`); one lock now. Test calls
+   `get_session` through `mcp::call` with a timeout (create and fork
+   launch an agent in tmux, so aren't run in tests; they share
+   `lookup_of`). No other double lock found in this PR's code.
+2. `search_history` leaves out the calling session (test).
+3. `capped` clips long strings, then halves long lists: valid JSON,
+   never cut text (test).
+4. A launch that fails in `session_new_with` removes its token, MCP
+   config and kv keys (`session_tools::forget`, test).
+5. `tmux_cmd` runs `scrub_pane_env`.
+6. The CLI line shell-quotes its paths (test).
+7. `render_as`: the content gets the whole budget; the lookup section is
+   added only if it still fits.
+8. Codex MCP wiring off (`CODEX_MCP`), see V5 above.
+9. `TOKEN_ENV` in core beside `PANE_ENV`; `main.rs` uses it and
+   `SERVER`; `lookup_section` uses `token_in`.
+
+### #65 owed items
+
+Fixed here:
+- A failed `git worktree add -b` no longer leaves the branch behind
+  (`git::worktree_add`: its own worktree removed if registered, then
+  `branch -D`; test).
+- Claude's `conversation_on_disk` also checks where Claude files the id
+  when the stored `transcript_source` is stale.
+- Cleanups: `FORK_MINTS_ID` and `FORK_ELSEWHERE` removed (their reasons
+  moved to `Agent::fork` / `forks_elsewhere`); `rollout_forked_from` is
+  now a test helper over `rollout_first_line`.
+
+Still owed:
+- Binding: several hookless Codex forks of one parent can bind each
+  other's thread (oldest-first match, the `mine` filter does nothing);
+  `Whose::Bind` skips `record_bind`'s duplicate check; a waiting fork
+  can take the thread of a hand-made `codex fork` in the same folder.
+  Binding logic, needs its own careful change and tests.
+- An auto-named worktree fork with an explicit branch is refused when
+  the default name is taken meanwhile.
+- TUI `load_forks`: cache keyed on (id, count), so a fork rename doesn't
+  refresh it; and its `session.get` blocks the UI thread.
+- `related` refs resolved twice in `fork::want` (filter, then
+  `context::check`).
+- The demo OpenCode stand-in embeds Python (shell-is-glue rule).
+
 ## Owed / deferred
+
+- `session_tools::visible()` is computed once per call for every tool;
+  make it lazy per tool (`session_brief` needs only links, a named ref
+  could be checked without the whole set).
+- Token resolve scans every `session_token:*` row: add a reverse key
+  for an O(1) look-up.
+- Cache `methods::rlord_bin()` (resolved at every start and render).
+- `search_in` reloads every session and `visible()` loads them all
+  again: share one load per call.
 
 - Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
   `docs/architecture.md` "Forking a session"): a fork starts through
   `methods::start` like a new session, so change that one path.
-  - PR 2 (pull): the wiring is computed in `spec_args`, which the fork
-    path uses too, so a fork gets its token and tools with no extra work;
-    its visible set includes the parent (a linked session).
-    `session_brief` should say `forked_from`. Codex's `-c
-    mcp_servers.rlord_session.*` needs the pane: a fork is always in the
-    pane. Then build the seeded fallback for agents with no native fork
-    on it (`docs/working-archive/session-fork.md`).
+  - PR 2 (done): a fork gets its token and tools at its start; its
+    parent and forks are linked in the visible set; `session_brief`
+    says `forked_from`. Still owed: the seeded fallback for agents with
+    no native fork, built on these tools
+    (`docs/working-archive/session-fork.md`).
   - PR 3 (prompts off argv): apply `FirstPrompt` in `methods::start`, so
     a fork's prompt leaves argv with everyone's: Claude's stdin file with
     `--resume … --fork-session` (extend V1 to that argv), Codex's pointer
