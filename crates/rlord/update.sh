@@ -16,8 +16,8 @@
 # the first install you don't need the checkout. Uses the GitHub CLI when
 # it's logged in (needed while the repo is private), else plain curl.
 # --force reinstalls the same version and replaces a dev symlink at
-# ~/.local/bin/rlord. After installing a new version it runs `rlord reset`
-# if rlord is running.
+# ~/.local/bin/rlord. After installing a new version it updates the web
+# plugin if one is installed, and runs `rlord reset` if rlord is running.
 set -euo pipefail
 repo=robot-lord/robot-overlord
 force=()
@@ -143,6 +143,12 @@ tar -xzf "$d/$asset" -C "$d"
 installer=("$d"/rlord-*/install.sh)
 # ${a[@]+...}: an empty array under `set -u` is an error in macOS's bash 3.2.
 "${installer[0]}" ${force[@]+"${force[@]}"}
+
+# The web plugin, if the user opted in: the one for the new version (the
+# old one no longer matches the new rlord's hash, so it wouldn't start).
+# Silent when it was never installed.
+"$dest" web install --if-installed ||
+  echo "rlord is updated, but its web plugin isn't: run \`rlord web install\`" >&2
 
 # A new version was installed: if rlord is running, reset it onto the new
 # binary (daemon, list and tmux config). Agent sessions keep running.

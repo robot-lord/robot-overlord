@@ -799,6 +799,21 @@ impl Config {
         write_config(&path, &set_in(&text, section, field, value)?)
     }
 
+    /// Set `[section] field` to a boolean, keeping the rest of the file as
+    /// written.
+    pub fn set_bool(section: &str, field: &str, value: bool) -> Result<()> {
+        let path = paths::config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        write_config(
+            &path,
+            &set_value_of(&text, section, field, toml_edit::Value::from(value))?,
+        )
+    }
+
     /// Save the overlord's agent, model and effort (the setup dialog's
     /// choice) under `[overlord]`, keeping the rest of the file as written.
     /// Keys from the two-session overlord (`mastermind_model`,
@@ -922,6 +937,11 @@ fn set_code_dir_in(text: &str, code_dir: &str, roots: &RootsEdit) -> Result<Stri
 
 /// `text` with `[section] field = value` set (see `Config::set_value`).
 fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String> {
+    set_value_of(text, section, field, toml_edit::Value::from(value))
+}
+
+/// `text` with `[section] field` set to a TOML value.
+fn set_value_of(text: &str, section: &str, field: &str, value: toml_edit::Value) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", paths::config_path().display()))?;
@@ -935,7 +955,7 @@ fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String>
     let table = doc[section]
         .as_table_mut()
         .with_context(|| format!("[{section}] isn't a table"))?;
-    set_value_in(table, field, toml_edit::Value::from(value));
+    set_value_in(table, field, value);
     let out = doc.to_string();
     toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
     Ok(out)
@@ -1102,6 +1122,16 @@ resume_message = "continue"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bool_is_written_as_one() {
+        let t = "[web]\nenabled = true   # mine\nport = 47900\n";
+        let out = set_value_of(t, "web", "enabled", toml_edit::Value::from(false)).unwrap();
+        assert_eq!(out, "[web]\nenabled = false   # mine\nport = 47900\n");
+        let c: Config = toml::from_str(&out).unwrap();
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 47900);
+    }
 
     #[test]
     fn set_in_keeps_the_file_as_written() {

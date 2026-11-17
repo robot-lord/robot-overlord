@@ -10,6 +10,8 @@ use rlord_core::timefmt::{fmt_ts, rel_age};
 use rlord_core::{paths, tmux};
 use rlord_daemon::{autostart, client_call, methods, spool_hook_event, Daemon};
 
+mod web_install;
+
 #[derive(Parser)]
 #[command(
     name = "rlord",
@@ -418,6 +420,24 @@ enum WebCmd {
     Stop,
     /// A new token: the old URL stops working and open pages disconnect
     NewToken,
+    /// Download and install the plugin for this rlord's version (asks
+    /// first); checked against the hash built into rlord
+    Install {
+        /// Don't ask
+        #[arg(long)]
+        yes: bool,
+        /// Only update a plugin that is already installed; silent
+        /// otherwise (update.sh runs this)
+        #[arg(long)]
+        if_installed: bool,
+        /// Take the release files (the tarball and SHA256SUMS) from this
+        /// folder instead of downloading them; still checked
+        #[arg(long, value_name = "DIR")]
+        from: Option<std::path::PathBuf>,
+    },
+    /// Stop the plugin, delete it and its token, and turn `[web] enabled`
+    /// off
+    Remove,
 }
 
 #[derive(Subcommand)]
@@ -1952,6 +1972,7 @@ fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
 fn web_cmd(cmd: Option<WebCmd>) -> Result<()> {
     match cmd {
         None => {
+            web_install::ensure_installed()?;
             let url = web_url()?;
             if !open_in_browser(&url) {
                 println!("{url}");
@@ -1982,6 +2003,22 @@ fn web_cmd(cmd: Option<WebCmd>) -> Result<()> {
             println!("{}", web_url()?);
             Ok(())
         }
+        Some(WebCmd::Install {
+            yes,
+            if_installed,
+            from,
+        }) => {
+            let from = match from {
+                Some(d) => Some(std::path::absolute(&d)?),
+                None => None,
+            };
+            web_install::install(&web_install::Install {
+                yes,
+                if_installed,
+                from,
+            })
+        }
+        Some(WebCmd::Remove) => web_install::remove(),
     }
 }
 

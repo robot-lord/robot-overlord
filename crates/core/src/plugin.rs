@@ -34,6 +34,41 @@ pub const RPC_ERR_NOT_ALLOWED: i32 = -32011;
 /// crates.io install: those never download a plugin.
 pub const COMPILED_SHA256: Option<&str> = option_env!("RLORD_WEB_SHA256");
 
+/// The hash `rlord web install` checks a download against:
+/// `COMPILED_SHA256`. A debug build also takes `RLORD_TEST_WEB_SHA256`, so
+/// the install tests can run a checkout's `rlord` (which has no hash)
+/// against a plugin they made; a release build never reads it.
+pub fn install_hash() -> Option<String> {
+    if cfg!(debug_assertions) {
+        if let Some(h) = std::env::var("RLORD_TEST_WEB_SHA256")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+        {
+            return Some(h.trim().to_lowercase());
+        }
+    }
+    COMPILED_SHA256.map(str::to_string)
+}
+
+/// The release target this machine's plugin is built for, as the release
+/// names it (`xtask/src/version.rs`; `get.sh` and `update.sh` map it the
+/// same way). None: no release plugin for this platform.
+pub fn release_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
+/// `rlord-web-v<version>-<target>`: the plugin's tarball without
+/// `.tar.gz`, and its top-level folder (`Version::web_tarball_stem` in
+/// xtask makes the same name).
+pub fn tarball_stem(version: &str, target: &str) -> String {
+    format!("{BIN_NAME}-v{version}-{target}")
+}
+
 /// Where rlord keeps plugins: `<data dir>/plugins` (0700).
 pub fn plugins_dir() -> PathBuf {
     paths::data_dir().join("plugins")
@@ -193,6 +228,14 @@ mod tests {
         assert_eq!(
             verify(&t.path().join("missing"), abc),
             Err(PluginError::NotInstalled)
+        );
+    }
+
+    #[test]
+    fn tarball_names_match_the_release() {
+        assert_eq!(
+            tarball_stem("0.23.0", "aarch64-apple-darwin"),
+            "rlord-web-v0.23.0-aarch64-apple-darwin"
         );
     }
 

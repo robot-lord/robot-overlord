@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–11 built; steps 12–14 not started)
+**Status:** in progress (slice 1: steps 1–12 built; steps 13–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -449,6 +449,42 @@ Decided 2026-11-17 (user):
     `capture-pane`), switch to Codex and back, the narrow layout. Checked
     against the database: name, description, notes, tags. No console
     errors beyond Chromium's WebGL performance notes.
+
+- Step 12 done (`crates/rlord/src/web_install.rs`, `web-install.sh`,
+  `update.sh`, `core/src/plugin.rs`, `config.rs`): `rlord web install
+  [--yes] [--if-installed] [--from DIR]` and `rlord web remove`; `rlord
+  web` with no plugin asks `[y/N]` on a terminal, else fails naming
+  `rlord web install --yes`, before it asks the daemon anything.
+  `update.sh` runs `rlord web install --if-installed` with the new rlord
+  after installing it and before the reset. Tests:
+  `crates/rlord/tests/web_install.rs` (PATH holds only `tar`, `gzip` and
+  `bash`, so nothing can download). Choices within the plan:
+  - **The script only downloads** (`web-install.sh VERSION TARGET DIR`:
+    the tarball and `SHA256SUMS` by `gh` or `curl`, and `gh attestation
+    verify` for a stable release when `gh` is logged in; a failed
+    attestation stops the install). Checking the tarball against
+    `SHA256SUMS`, unpacking (`tar`) and `plugin::verify` are in Rust.
+    `--from` copies the two files from DIR and runs no script.
+  - Unpacked in `<plugins>/.install-<random>` (removed afterwards), so the
+    last step is one rename into `<plugins>/rlord-web` (0755; folder
+    0700).
+  - **Tests need an expected hash a checkout's rlord doesn't have**: a
+    debug build takes `RLORD_TEST_WEB_SHA256` (`plugin::install_hash`; a
+    release build never reads it). Only the CLI reads it; the daemon still
+    uses the compiled-in hash only.
+  - A build with no hash (checkout, crates.io) refuses `install` and says
+    how a checkout finds its plugin; with `--if-installed` it does nothing.
+  - `install` of a plugin that already matches says so and stops;
+    `--if-installed` replaces a non-matching one without asking (the user
+    opted in already) and is silent when there is none.
+  - `remove` asks only a running daemon to stop the plugin (it doesn't
+    start one), deletes the plugin and `web.token`, and writes
+    `[web] enabled = false` only when it was true (`Config::set_bool`).
+  - Found on the way: a test running a no-hash `rlord web` found the
+    `target/debug/rlord-web` beside it and started a daemon; the tests now
+    point `RLORD_WEB_BIN` at a missing file.
+  - Not tested: the download itself (no network in tests); first real
+    check is the release dry run.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

@@ -1682,6 +1682,7 @@ dependencies = [
  "robot-overlord-daemon",
  "robot-overlord-tui",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
