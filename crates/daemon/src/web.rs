@@ -244,6 +244,9 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     if !PASSIVE.contains(&op) {
         d.web_ui().used(page);
     }
+    // Anything from the page a command was for: it is alive and has it
+    // (the page says so after each command), so it isn't handed on.
+    arrived(d, page);
     if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
         return Err(NotAllowed(op.to_string()).into());
     }
@@ -623,9 +626,18 @@ impl WebUi {
 /// How long a UI command waits for a page (`page.pending`).
 const PENDING_FOR: Duration = Duration::from_secs(30);
 
+/// A call from `page`: the parked command for it, if any, has arrived.
+fn arrived(d: &Daemon, page: &str) {
+    let mut slot = d.pending_web.lock().expect("ui mutex");
+    if slot.as_ref().is_some_and(|(_, p, _)| p == page) {
+        *slot = None;
+    }
+}
+
 /// Op `page.pending`: the last UI command for a web page, once, if it is
-/// under 30 s old and its page has closed since (so it may never have
-/// arrived: a reload, a reconnect). Null otherwise.
+/// under 30 s old, its page never said anything after it, and that page
+/// has closed since (so it may never have arrived: a reload, a reconnect).
+/// Null otherwise.
 fn pending(d: &Daemon) -> Value {
     let mut slot = d.pending_web.lock().expect("ui mutex");
     let lost = slot

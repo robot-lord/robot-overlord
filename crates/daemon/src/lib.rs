@@ -1665,6 +1665,16 @@ mod tests {
         assert_eq!(d.rpc("ui.pending", json!({})).unwrap(), Value::Null);
         assert_eq!(pending(&d), json!({"cmd": "show_list"}));
         assert_eq!(pending(&d), Value::Null);
+        // A page that said something after it had it: not handed on when
+        // it closes.
+        d.ui_cmd_to(&ui::Target::Web("p2-bb".into()), json!({"cmd": "goto"}));
+        d.rpc(
+            "web.call",
+            json!({"op": "page.report", "page": "p2-bb", "args": {}}),
+        )
+        .unwrap();
+        d.web_ui().set_pages(&["p3-cc".to_string()]);
+        assert_eq!(pending(&d), Value::Null);
         // The terminal's parked command stays the terminal's.
         d.ui_cmd(json!({"cmd": "keys"}));
         assert_eq!(pending(&d), Value::Null);
