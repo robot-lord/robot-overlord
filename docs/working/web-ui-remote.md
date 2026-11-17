@@ -99,6 +99,27 @@ Decided 2026-11-17 (user):
   PTY in the test is plain `openpty` via `libc`, no PTY crate. Found on
   the way: tmux exits with its last session, so a test (or the sweep) can't
   rely on bindings or window ids surviving a moment with no sessions.
+- Step 2 done (`core/src/tmux.rs`, `daemon/src/send.rs`,
+  `daemon/src/overlord.rs`): `VIEW_PREFIX`, `WEB_TABLE`, `view_command`
+  (checks the target exists, then one attached invocation),
+  `bind_web_table` (root's pane mouse bindings), `view_shows` (window-id
+  check), `sweep_views`; `list_clients` drops view clients; `kill_session`
+  kills the target's views first (found by session group, so a renamed
+  target still finds them). Every session-ending path goes through
+  `kill_session` (stop, archive, the overlord migration) or kills the
+  server (`rlord reset --hard`). Gated test `view_helpers`, also on tmux
+  3.2a and 3.4. Differences from the plan:
+  - `user_active` counts a browser through tmux itself, not a registry
+    of web input: `tmux::view_clients(t)` returns the view clients of
+    `t`'s group as clients of `t`, with tmux's `client_activity`. That
+    works whichever process runs the bridge (see the placement change
+    above), with no new IPC.
+  - The overlord's idle fresh start (`overlord.rs`, "someone is looking
+    at it") also counts a browser's view, for the same reason the
+    terminal check exists.
+  - Owed to the bridge: call `bind_web_table` before attaching a view
+    (root changes on reload and goes with the server), and
+    `sweep_views` on its start. Neither is called by the daemon.
 
 ## Slice 1 plan: local web UI
 

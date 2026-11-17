@@ -78,6 +78,15 @@ struct PtyClient {
 impl PtyClient {
     /// `tmux <args>` (on the scratch server) in a fresh PTY.
     fn spawn(args: &[&str], cols: u16, rows: u16) -> PtyClient {
+        let mut cmd = tmux::command();
+        cmd.env_remove("TMUX")
+            .env("TERM", "xterm-256color")
+            .args(args);
+        PtyClient::run(cmd, cols, rows)
+    }
+
+    /// `cmd` in a fresh PTY, as its controlling terminal.
+    fn run(mut cmd: std::process::Command, cols: u16, rows: u16) -> PtyClient {
         use std::os::fd::FromRawFd;
         use std::os::unix::process::CommandExt;
         let (mut m, mut s) = (0, 0);
@@ -103,11 +112,7 @@ impl PtyClient {
         // Safety: freshly opened, owned here.
         let (master, slave) =
             unsafe { (std::fs::File::from_raw_fd(m), std::fs::File::from_raw_fd(s)) };
-        let mut cmd = tmux::command();
-        cmd.env_remove("TMUX")
-            .env("TERM", "xterm-256color")
-            .args(args)
-            .stdin(slave.try_clone().unwrap())
+        cmd.stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
         // Safety: only async-signal-safe calls between fork and exec. The
@@ -309,7 +314,8 @@ fn view_session_behaviours() {
     //    session links it (so rlord must kill view sessions too).
     let mut c = attach_view(target, "webview-2", 80, 24);
     let windows = || tx(&["list-windows", "-a", "-F", "#{window_id} #{pane_dead}"]);
-    tmux::kill_session(target).unwrap();
+    // (Plain `kill-session`: `tmux::kill_session` kills the views too.)
+    tx_ok(&["kill-session", "-t", &format!("={target}")]).unwrap();
     assert!(!tmux::has_session(target));
     assert!(
         windows().lines().any(|l| l == format!("{target_window} 0")),
@@ -383,6 +389,93 @@ fn view_session_behaviours() {
         tx(&["show-options", "-gqv", "@web_fired"]) == "yes"
     });
     plain.close();
+
+    tx(&["kill-server"]);
+}
+
+/// Step 2: rlord's view-session helpers, and what they change elsewhere
+/// (`list_clients`, `view_clients`, `kill_session`, the sweep).
+#[test]
+fn view_helpers() {
+    let Some(_g) = setup() else { return };
+    let target = "rlord_webhelp";
+    tmux::new_session(target, "/tmp", "cat").unwrap();
+    // Refused: a missing target (it would make a shell), a non-view name.
+    let e = tmux::view_command("rlord_nosuch", "webview-9").unwrap_err();
+    assert!(e.to_string().contains("not running"), "{e}");
+    assert!(tmux::view_command(target, "rlord_other").is_err());
+
+    // The web table: root's pane mouse bindings, no keyboard keys; the
+    // same again when remade.
+    tmux::bind_web_table().unwrap();
+    let keys = tmux::bindings(tmux::WEB_TABLE);
+    assert!(keys.iter().any(|(k, _)| k == "MouseDown1Pane"), "{keys:?}");
+    assert!(keys.iter().any(|(k, _)| k == "WheelUpPane"), "{keys:?}");
+    assert!(keys.iter().all(|(k, _)| k.ends_with("Pane")), "{keys:?}");
+    tmux::bind_web_table().unwrap();
+    assert_eq!(tmux::bindings(tmux::WEB_TABLE), keys);
+
+    let mut c = PtyClient::run(tmux::view_command(target, "webview-1").unwrap(), 80, 24);
+    wait_for("the view's client", || {
+        tx(&["list-clients", "-F", "#{session_name}"]) == "webview-1"
+    });
+    wait_for("the view's options", || {
+        tx(&[
+            "show-options",
+            "-v",
+            "-t",
+            "=webview-1:",
+            "destroy-unattached",
+        ]) == "on"
+    });
+    assert!(tmux::view_shows("webview-1", target));
+    assert!(!tmux::view_shows("webview-1", "rlord_nosuch"));
+    assert_eq!(
+        tx(&["show-options", "-v", "-t", "=webview-1:", "key-table"]),
+        tmux::WEB_TABLE
+    );
+    // The browser is never the user's terminal...
+    assert!(tmux::list_clients().is_empty());
+    // ...but counts as a recent client of the target once typed in.
+    c.send(b"typed in the browser");
+    wait_for("the keys in the pane", || {
+        tmux::capture_pane(target)
+            .unwrap()
+            .contains("typed in the browser")
+    });
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let v = tmux::view_clients(target);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert_eq!(v[0].session, target);
+    assert!(now_s - v[0].activity <= 2, "{v:?}");
+    assert!(tmux::view_clients("rlord_nosuch").is_empty());
+
+    // Killing the target kills its views (found by group, so after a
+    // rename too), and the browser's client exits.
+    tmux::rename_session(target, "rlord_webhelp2").unwrap();
+    assert_eq!(tmux::view_clients("rlord_webhelp2").len(), 1);
+    tmux::kill_session("rlord_webhelp2").unwrap();
+    assert!(!tmux::has_session("webview-1"));
+    wait_for("the view's client to exit", || c.exited());
+    c.close();
+
+    // The sweep: a view with no client goes, nothing else does.
+    tmux::new_session(target, "/tmp", "sleep 30").unwrap();
+    tx_ok(&[
+        "new-session",
+        "-d",
+        "-t",
+        &format!("={target}"),
+        "-s",
+        "webview-7",
+    ])
+    .unwrap();
+    assert_eq!(tmux::sweep_views(), vec!["webview-7".to_string()]);
+    assert!(tmux::has_session(target));
+    assert!(tmux::sweep_views().is_empty());
 
     tx(&["kill-server"]);
 }
