@@ -617,20 +617,40 @@ fn resolve(
         fetched_at = Some(now);
     }
     let local = latest::commit_of(&env, root, &format!("refs/heads/{branch}"));
+    // The remote's side: rlord's private ref or the user's own
+    // `refs/remotes/<r>/<b>` (their own fetch may be newer), whichever is.
     let mut remote_commit = None;
     if let (Some(r), false) = (&remote, fetch == Fetch::Missing) {
-        remote_commit = latest::commit_of(&env, root, &latest::private_ref(r, &branch));
-        if remote_commit.is_none() {
-            // Never fetched by rlord yet: the user's own last fetch.
-            let theirs = format!("refs/remotes/{r}/{branch}");
-            remote_commit = latest::commit_of(&env, root, &theirs);
-            if remote_commit.is_some() {
-                fetched_at = latest::reflog_time(&env, root, &theirs);
-                warnings.push(format!(
-                    "not_fetched: {r}/{branch} as you last fetched it; rlord's fetch: {}",
-                    fetch.id()
-                ));
-            }
+        let mine = latest::commit_of(&env, root, &latest::private_ref(r, &branch));
+        let theirs_ref = format!("refs/remotes/{r}/{branch}");
+        let theirs = latest::commit_of(&env, root, &theirs_ref);
+        let fresh_ms = d.latest.timing().fresh.as_millis() as i64;
+        let mine_fresh = fetched_at.is_some_and(|t| now - t < fresh_ms);
+        let use_theirs = match (&mine, &theirs) {
+            (None, Some(_)) => true,
+            (Some(m), Some(t)) if m != t => match latest::relation(&env, root, m, t) {
+                // (`relation(mine, theirs)`: "behind" is theirs newer.)
+                latest::Relation::LocalBehind(_) => true,
+                latest::Relation::LocalAhead(_) | latest::Relation::Same => false,
+                // Diverged or not comparable: rlord's when just fetched.
+                _ => !mine_fresh,
+            },
+            _ => false,
+        };
+        if use_theirs {
+            remote_commit = theirs;
+            fetched_at = latest::reflog_time(&env, root, &theirs_ref);
+            let why = if mine.is_some() {
+                "newer than rlord's"
+            } else {
+                "not fetched by rlord yet"
+            };
+            warnings.push(format!(
+                "theirs: {r}/{branch} as you last fetched it ({why}); rlord's fetch: {}",
+                fetch.id()
+            ));
+        } else {
+            remote_commit = mine;
         }
     }
     if fetch == Fetch::Missing {
@@ -683,7 +703,7 @@ fn resolve(
     if rel == latest::Relation::Unknown && local.is_some() && remote_commit.is_some() {
         warnings.push(format!(
             "unknown: couldn't compare the local {branch} with the remote's; using the {}",
-            if want.prefer == Some(Prefer::Local) {
+            if prefer == Some(Prefer::Local) {
                 "local one"
             } else {
                 "remote's"
@@ -729,7 +749,7 @@ fn resolve(
             ..
         },
         true,
-    ) = (&pick, want.prefer.is_none())
+    ) = (&pick, prefer.is_none())
     {
         warnings.push(format!(
             "diverged: the local {branch} and {}'s have diverged; using the {}",
@@ -943,16 +963,21 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
                 f.warnings
                     .push("adopted: rlord's tree had no record here; it does now".into());
             }
-            if latest::may_touch(recorded.as_deref(), &dir, e).is_ok() {
+            // A branch checked out in rlord's recorded tree: it is detached
+            // and moved, so nothing on record counts as completed (an
+            // interrupted move is never trusted later).
+            let had_branch = e.branch.is_some() && recorded.as_deref() == Some(dir.as_path());
+            if had_branch || latest::may_touch(recorded.as_deref(), &dir, e).is_ok() {
                 in_progress();
             }
+            let complete = complete.as_deref().filter(|_| !had_branch);
             let m = latest::tree_move(
                 &env,
                 &repo,
                 &dir,
                 &commit,
                 recorded.as_deref(),
-                complete.as_deref(),
+                complete,
                 e,
                 f.fs_ok,
             )?;
@@ -2741,6 +2766,27 @@ mod tests {
         let v = call(&d, c, json!({"ref": "origin/feat", "prefer": "local"}));
         assert_eq!(v["commit"], theirs.as_str(), "{v}");
         assert!(v["warnings"].to_string().contains("prefer_ignored"), "{v}");
+    }
+
+    /// rlord's private ref is stale and the user's own `origin/main` is
+    /// newer (they fetched since, rlord can't now): the newer one.
+    #[test]
+    fn the_users_newer_remote_ref_wins_over_a_stale_private_one() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        let first = call(&d, c, json!({}))["commit"].clone();
+        let newer = r.push_remote("main", "newer");
+        r.g(c, &["fetch", "-q", "origin"]);
+        std::fs::rename(&r.remote, r.root().join("gone.git")).unwrap();
+        let d = again(&r, &d);
+        let v = call(&d, c, json!({}));
+        assert_ne!(v["commit"], first);
+        assert_eq!(v["commit"], newer.as_str(), "{v}");
+        assert!(
+            v["warnings"].to_string().contains("as you last fetched it"),
+            "{v}"
+        );
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

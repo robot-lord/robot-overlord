@@ -763,9 +763,11 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   one branch is fetched; an old private ref nested with the target (`a`
   for `a/b`, or the other way round) is deleted first. Private refs not
   fetched for 14 days are dropped on the repo's next use.
-- **Which commit.** For branch `b`, local `L` and fetched `R` (or, never
-  fetched by rlord, the user's `refs/remotes/<remote>/b`, with a
-  warning). The default branch (no `ref`): `R` whenever it exists, even
+- **Which commit.** For branch `b`, local `L` and remote `R`. `R` is the
+  newer of rlord's private ref and the user's own `refs/remotes/<remote>/b`
+  (their own fetch may be newer): theirs when it descends from rlord's,
+  rlord's when it is ahead; when the two diverged, rlord's if fetched
+  within the minute, else theirs. Theirs is said in a warning. The default branch (no `ref`): `R` whenever it exists, even
   when `L` is ahead (the user asked for "the latest main"; a
   `local_ahead` warning says how far), and a launch's base the same; so
   is a `ref` written `<remote>/<b>` (or `prefer: remote`; a

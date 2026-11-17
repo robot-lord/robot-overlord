@@ -86,7 +86,7 @@ pub fn tools() -> Value {
     });
     new_session_props["prefer"] = json!({"type": "string", "enum": ["local", "remote"],
         "description": "Only with `base`, after a launch refused because that branch's local and remote sides have diverged: the side the user chose"});
-    new_session_props["base"] = s("Where a new branch starts. Omit or \"latest\": the latest default branch, fetched (unless the user's config says \"head\"). A branch name, or <remote>/<branch> for the remote's: its newest commit, to build on it (refused if the local and remote branch have diverged: ask the user, then pass `prefer`). \"head\": whatever the repo's main checkout has now. Ignored when `branch` already exists or there is no worktree. The answer's `base` says which commit was used.");
+    new_session_props["base"] = s("Where a new branch starts. Omit: the user's configured default ([session] base: the latest default branch, or \"head\"). \"latest\": the latest default branch, fetched, whatever the config says. A branch name, or <remote>/<branch> for the remote's: its newest commit, to build on it (refused if the local and remote branch have diverged: ask the user, then pass `prefer`). \"head\": whatever the repo's main checkout has now. Ignored when `branch` already exists or there is no worktree. The answer's `base` says which commit was used.");
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
