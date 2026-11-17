@@ -1082,3 +1082,30 @@ one exists, else consider a reviewed `main` commit; the cryptographer
 review covers the exact version shipped.
 
 Still owed: phone benchmark runs, Firefox, the relay's signed challenge.
+
+## Decision: compression (user, 2026-11-17)
+
+Compress-then-encrypt leaks plaintext through ciphertext size
+(CRIME/BREACH): when a frame mixes a secret with attacker-influenced text,
+the compressed size tells how well a guess matched. Pane output is that
+mix (an agent prints a token or `.env` beside text from a web page or a
+file someone else wrote), and the relay sees every frame's size. Padding
+to 32-byte multiples blurs the signal; it doesn't remove it.
+
+- **Live pane stream: not compressed in v1.** Terminal output is small and
+  the host already coalesces it (16 KiB frames).
+- **Mailbox and state (snapshots, overlord chat): compressed**, then padded
+  to the Padmé buckets. The daemon makes this content; a snapshot's `rev`
+  already keeps repeats off the wire.
+- **Where:** compress then encrypt, both inside the shared core
+  (`crates/e2e`), so `rlord-web` (native) and the browser/phone (WASM) use
+  the same code. A pure-Rust codec keeps the WASM build simple
+  (`lz4_flex` both ways; `ruzstd` decodes only, its encoder is C zstd).
+- **Never transport-level compression** on the relay link
+  (permessage-deflate, TLS compression): ciphertext doesn't compress, and
+  it must stay off so nothing compresses plaintext outside the core.
+
+Open: measure on real pane output (lz4 and zstd, before and after padding)
+in the relay slice. If live streams turn out to need compression, only for
+content that can't hold secrets, or with a fresh compression context per
+frame, and only after the cryptographer's review.
