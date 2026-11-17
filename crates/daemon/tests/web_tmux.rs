@@ -480,3 +480,60 @@ fn view_helpers() {
 
     tx(&["kill-server"]);
 }
+
+/// Slice 2, step 1: a client's `client_activity` (what `tmux::Client`'s
+/// `activity` reads) moves when the client types and not when its pane
+/// prints, so "the surface the user used last" can rest on it. Its
+/// resolution is one second (epoch seconds).
+#[test]
+fn client_activity_is_input_not_output() {
+    let Some(_g) = setup() else { return };
+    let target = "rlord_webactivity";
+    // A pane that keeps printing (as an agent or the TUI redrawing does).
+    tmux::new_session(target, "/tmp", "while :; do date +%s%N; sleep 0.05; done").unwrap();
+    let mut c = PtyClient::spawn(&["attach-session", "-t", &format!("={target}")], 80, 24);
+    wait_for("the client", || {
+        tx(&["list-clients", "-F", "#{session_name}"]) == target
+    });
+    let activity = || -> i64 {
+        tx(&["list-clients", "-F", "#{client_activity}"])
+            .parse()
+            .unwrap()
+    };
+    let drawn = |c: &PtyClient| c.out.lock().unwrap().len();
+    let before = activity();
+    let bytes = drawn(&c);
+    // Output for a few seconds: drawn to the client, activity unchanged.
+    std::thread::sleep(Duration::from_millis(3200));
+    assert!(drawn(&c) > bytes + 1000, "the pane wasn't printing");
+    assert_eq!(activity(), before, "output moved client_activity");
+    // A resize (a browser view fitting itself) isn't input either.
+    let ws = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // Safety: TIOCSWINSZ on the PTY master this test owns.
+    unsafe {
+        use std::os::fd::AsRawFd;
+        libc::ioctl(c.master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
+    }
+    wait_for("the resize", || {
+        tx(&["list-clients", "-F", "#{client_width}"]) == "100"
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(activity(), before, "a resize moved client_activity");
+    // A key press moves it to now.
+    c.send(b"x");
+    let now_s = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    wait_for("the key press to count", || activity() > before);
+    assert!(now_s() - activity() <= 1, "{} vs {}", activity(), now_s());
+    c.close();
+    tx(&["kill-server"]);
+}

@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1, the local web UI, is built: steps 1–14; next: the relay and the phone app)
+**Status:** in progress (slice 1, the local web UI, is built; slice 2, the web as a UI target, is being built; then the relay and the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -611,6 +611,13 @@ Decided 2026-11-17 (user):
     the header lines, every filter token; `:web` driven in the demo's TUI
     with a stand-in `open`. A usage limit is checked by unit tests only
     (the demo can't make one).
+- Slice 2 (the web as a UI target; `feat/web-ui-2`, 1.3.0-dev.3), per
+  the plan below and the user's answers:
+  - Step 1 done, the gate passed (`web_tmux.rs`
+    `client_activity_is_input_not_output`, tmux 3.8): a client whose pane
+    prints for 3 s keeps its `client_activity`; a resize doesn't move it
+    either; a key press moves it to now. Resolution: one second (epoch
+    seconds). No fallback needed.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
