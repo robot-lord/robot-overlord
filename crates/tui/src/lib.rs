@@ -327,6 +327,9 @@ struct App {
     /// wheel, a click, focus loss) and by a list refresh, which can move
     /// rows under a pointer that stays put.
     hover_row: Option<(String, u16, u16)>,
+    /// The list was refreshed since the pointer last moved: drop the
+    /// popup if its session is no longer the row under the pointer.
+    hover_stale: bool,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -395,6 +398,7 @@ impl App {
             last_click: None,
             idle_motion: false,
             hover_row: None,
+            hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
             preview_len: 0,
@@ -841,6 +845,17 @@ impl App {
             // (Pointer motion that changed nothing: the screen is as drawn.)
             if refreshed || !std::mem::take(&mut self.idle_motion) {
                 terminal.draw(|f| self.draw(f))?;
+                // Refreshed under a pointer that stayed put: keep the popup
+                // only if its session is still the row there (the hit
+                // map is the one just drawn).
+                if std::mem::take(&mut self.hover_stale) {
+                    let keep = self.hover_row.as_ref().is_some_and(|(id, x, y)| {
+                        hover_still_there(self.hits.at(*x, *y), &self.sessions, id)
+                    });
+                    if !keep && self.hover_row.take().is_some() {
+                        terminal.draw(|f| self.draw(f))?;
+                    }
+                }
             }
 
             let mut tick = Duration::from_millis(self.config.preview_refresh_ms.clamp(50, 250));
@@ -873,7 +888,7 @@ impl App {
             }
             if pushed {
                 self.dirty = true;
-                self.hover_row = None;
+                self.hover_stale = true;
             }
             if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
             {
@@ -2755,6 +2770,12 @@ fn usage_details(u: &Value) -> String {
         u.turns,
         compact(u.tokens)
     )
+}
+
+/// Whether the hovered session `id` is still the list row `hit` (what is
+/// under the pointer now).
+fn hover_still_there(hit: Option<mouse::Hit>, sessions: &[Value], id: &str) -> bool {
+    matches!(hit, Some(mouse::Hit::Row(i)) if sessions.get(i).is_some_and(|s| s["id"] == id))
 }
 
 /// The details panel's height under the preview, in a right column

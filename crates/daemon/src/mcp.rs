@@ -677,9 +677,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
             // The status as list_sessions shows it.
-            if let Some(st) = s["shown_status"].as_str().map(str::to_string) {
-                s["status"] = json!(st);
-            }
+            s["status"] = status_word(&s);
             for (k, v) in background_fields(&s) {
                 s[k] = v;
             }

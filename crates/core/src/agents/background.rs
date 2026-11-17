@@ -13,11 +13,16 @@
 //!   `Kind::Shell`. Only agents mean the user is waiting on the session:
 //!   a background shell is often a dev server or a watcher that never
 //!   ends, so it is shown as information, not as a status.
-//! - **Finish**: a later `user` line with `origin.kind:
-//!   "task-notification"` whose text holds `<task-notification>` with
-//!   `<task-id>` and a final `<status>` (`completed`, `failed`, `killed`,
-//!   `stopped`). The same id can notify more than once (a resumed agent):
+//! - **Finish**: a later line written by the harness (never text a user
+//!   typed) holding `<task-notification>` with `<task-id>` and a final
+//!   `<status>` (`completed`, `failed`, `killed`, `stopped`). It comes in
+//!   three shapes: most often an `attachment` line (`attachment: {type:
+//!   "queued_command", commandMode: "task-notification", prompt}`), or a
+//!   `queue-operation` line (`content`), or a `user` line with `origin.kind:
+//!   "task-notification"` (`message.content`). The same id can notify more than once (a resumed agent):
 //!   finishing an id that isn't open changes nothing. A successful
+//!   `SendMessage` that resumes an agent (`toolUseResult: {success: true,
+//!   resumedAgentId | revivedAgentId}`) opens it again. A successful
 //!   `TaskStop` (or the older `KillShell`) finishes it too: its
 //!   `toolUseResult` is `{message: "Successfully stopped task: …",
 //!   task_id}` (`shell_id` for `KillShell`).
@@ -172,6 +177,21 @@ impl Tracker {
     /// Apply one transcript line to the open background work.
     pub fn feed(&mut self, line: &Value) {
         let content = &line["message"]["content"];
+        // Notifications the harness queued for the agent.
+        match line["type"].as_str() {
+            Some("attachment") => {
+                let a = &line["attachment"];
+                if a["type"] == "queued_command" && a["commandMode"] == "task-notification" {
+                    finish(&mut self.open, &a["prompt"]);
+                }
+                return;
+            }
+            Some("queue-operation") => {
+                finish(&mut self.open, &line["content"]);
+                return;
+            }
+            _ => {}
+        }
         if line["type"] == "assistant" {
             for b in content.as_array().into_iter().flatten() {
                 if b["type"] == "tool_use" {
@@ -226,6 +246,22 @@ impl Tracker {
         }
         if let Some(id) = stopped(r, content) {
             self.open.remove(id);
+        }
+        // An agent resumed by a message: running again.
+        let resumed = r["resumedAgentId"]
+            .as_str()
+            .or(r["revivedAgentId"].as_str());
+        if let Some(id) = resumed.filter(|_| r["success"] == true) {
+            let started_at = line["timestamp"]
+                .as_str()
+                .and_then(parse_iso_ms)
+                .unwrap_or(0);
+            let task = self.open.entry(id.to_string()).or_insert_with(|| Task {
+                label: "resumed agent".into(),
+                kind: Kind::Agent,
+                ..Default::default()
+            });
+            task.started_at = started_at;
         }
     }
 
@@ -500,6 +536,40 @@ mod tests {
         std::fs::rename(&q, &p).unwrap();
         t.advance(&p).unwrap();
         assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1", "b2", "b3"]);
+    }
+
+    #[test]
+    fn queued_notifications_finish_too() {
+        let text = |id: &str| {
+            format!("<task-notification>\n<task-id>{id}</task-id>\n<status>completed</status>\n</task-notification>")
+        };
+        let attachment = json!({"type": "attachment", "attachment": {"type": "queued_command",
+            "commandMode": "task-notification", "prompt": text("a1"),
+            "origin": {"kind": "task-notification", "producer": "session-task"}}});
+        let queued =
+            json!({"type": "queue-operation", "operation": "enqueue", "content": text("a2")});
+        assert_eq!(count(&[agent_launch("a1"), attachment]), 0);
+        assert_eq!(count(&[agent_launch("a2"), queued]), 0);
+        // Another kind of queued command (the user's own prompt) isn't one.
+        let typed = json!({"type": "attachment", "attachment": {"type": "queued_command",
+            "commandMode": "prompt", "prompt": text("a3")}});
+        assert_eq!(count(&[agent_launch("a3"), typed]), 1);
+    }
+
+    #[test]
+    fn a_resumed_agent_is_open_again() {
+        let resumed = json!({"type": "user", "timestamp": "1970-01-01T00:00:05.000Z",
+            "toolUseResult": {"success": true, "message": "Resuming agent a1",
+            "resumedAgentId": "a1", "revivedAgentId": "a1"}});
+        let mut t = Tracker::default();
+        for l in [agent_launch("a1"), note("a1", "completed"), resumed] {
+            t.feed(&l);
+        }
+        assert_eq!(t.open["a1"].kind, Kind::Agent);
+        assert_eq!(t.open["a1"].started_at, 5000);
+        let failed =
+            json!({"type": "user", "toolUseResult": {"success": false, "resumedAgentId": "a2"}});
+        assert_eq!(count(&[failed]), 0);
     }
 
     #[test]

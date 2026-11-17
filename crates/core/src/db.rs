@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_rlord_msg.sql"),
     include_str!("../migrations/0010_session_context.sql"),
     include_str!("../migrations/0011_forked_from.sql"),
+    include_str!("../migrations/0012_events_kind.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -1602,16 +1603,16 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// These sessions' transcript files (session id, path).
     /// Live sessions whose agent is running (not stopped or failed), the
     /// overlords included, each with its transcript and when rlord last
-    /// started its agent again (the latest `resumed` / `restarted` event;
-    /// 0: never). Cheap: ids, paths and one indexed look-up each.
+    /// started its agent again (the latest `resumed` / `restarted` /
+    /// `reforked` event; 0: never). Cheap: ids, paths and one look-up each
+    /// on `idx_events_session_kind`.
     pub fn running_transcripts(&self) -> Result<Vec<(String, String, i64)>> {
         let mut st = self.conn.prepare(
             "SELECT s.id, t.source_path, \
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
-                              AND e.kind IN ('resumed', 'restarted')), 0) \
+                              AND e.kind IN ('resumed', 'restarted', 'reforked')), 0) \
              FROM sessions s JOIN transcripts t ON t.session_id = s.id \
              WHERE s.archived_at IS NULL AND s.status NOT IN ('stopped', 'error')",
         )?;
@@ -1619,6 +1620,7 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// These sessions' transcript files (session id, path).
     pub fn transcript_sources_for(&self, ids: &[&str]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         for chunk in ids.chunks(500) {
@@ -1964,7 +1966,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
         for table in [
             "sessions",
             "tags",
@@ -2205,7 +2207,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
 
     #[test]

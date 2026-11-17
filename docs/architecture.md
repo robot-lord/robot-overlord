@@ -504,31 +504,39 @@ background and limited rows, `status:bg` the limited ones.
   structured `toolUseResult` names the work: `agentId` with `isAsync:
   true` / `status: "async_launched"` (Agent) or `background: true` (a
   forked skill); `backgroundTaskId` (a shell, also one moved to the
-  background at its timeout). A finish is a later `user` line with
-  `origin.kind: "task-notification"` holding `<task-notification>` with
+  background at its timeout). A finish is a later line the harness wrote
+  (never text a user typed) holding `<task-notification>` with
   `<task-id>` and `<status>` `completed`, `failed`, `killed` or
-  `stopped`. An id can notify more than once (a resumed agent): one not
-  open is ignored. A successful `TaskStop` finishes it too
+  `stopped`. Most are `attachment` lines (`attachment: {type:
+  "queued_command", commandMode: "task-notification", prompt}`); some
+  are `queue-operation` lines (`content`) or `user` lines with
+  `origin.kind: "task-notification"`. An id can notify more than once (a
+  resumed agent): one not open is ignored. A successful `SendMessage`
+  that resumes an agent (`toolUseResult: {success: true, resumedAgentId,
+  revivedAgentId}`) opens it again. A successful `TaskStop` finishes it too
   (`toolUseResult: {message: "Successfully stopped task: …", task_id}`;
   the older `KillShell` has `shell_id`). The tool result's text is never
   parsed.
 - **Which sessions**: live ones whose agent runs (not stopped or failed),
   the overlords included (`Db::running_transcripts`: ids, paths and the
-  last `resumed`/`restarted` event, one indexed look-up each). A session
-  that stops has its open work forgotten, keeping its read position, and
-  work launched before rlord last started its agent again is dropped:
-  its tasks died with the old process.
+  last `resumed`/`restarted`/`reforked` event, one look-up each on
+  `idx_events_session_kind`). A session that stops has its state
+  dropped, and work launched before rlord last started its agent again
+  is forgotten: its tasks died with the old process. Those are the only
+  ways open work is forgotten, apart from a finish or a stop.
 - **Read**: a 5s tick reads only what each live session's transcript
   appended since its byte offset (whole lines, at most 4 MB a tick; a
   longer line is skipped unparsed); the first look starts at the last
   4 MB (skipping its first line unless the byte before it is a newline),
-  and a new inode or a shorter file starts over. The read state is
-  copied out and read without a lock; the rows read only what the last
+  and a new inode or a shorter file starts over. The read state is only
+  touched by the scan thread; the rows read only what the last
   tick decided to show, and a change to that (going stale included)
   pushes to the list. Not `transcript_stats`' cursor: that one reads all
   that's unread at once and keeps usage totals.
-- **Stale guard**: when nothing was written for `STALE_MS` (30 min), the
-  open work is dropped and it shows your turn again, so a lost notification (the agent restarted with
+- **Stale guard**: when nothing was written for `STALE_MS` (30 min), its
+  subagents are hidden from the status and it shows your turn again (they
+  stay open: a late notification still closes them, and they show again
+  once their files change; shells never go stale), so a lost notification (the agent restarted with
   work running) can't leave a session stuck. "Written" is the newest
   mtime of the transcript and of each open subagent's `outputFile` and
   sidechain transcript (the 5 most recently started stat'ed), since subagents write

@@ -10,9 +10,13 @@
 //! as `background_shells`, for information.
 //!
 //! **Stale guard**: when neither the transcript nor any open subagent's
-//! output has changed for `STALE_MS`, the work is no longer believed, so a
-//! notification that never came (the agent was restarted, a task died
-//! with it) can't leave a session stuck.
+//! output has changed for `STALE_MS`, its subagents are hidden from the
+//! status (a notification that never came can't leave a session stuck),
+//! not forgotten: a later notification still closes them, and they show
+//! again if their files change. Shells never go stale: they stay listed
+//! until a finish, a kill or the session stopping. Work is forgotten only
+//! when the session stops or rlord starts its agent again (resume,
+//! restart, refork: its tasks died with the old process).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -97,24 +101,28 @@ fn last_write(path: &Path, t: &Tracker) -> i64 {
     newest
 }
 
-/// Bring a tracker up to date: read what was appended, drop the work
+/// Bring a tracker up to date: read what was appended and drop the work
 /// launched before the agent was last started again (`started_at`: its
-/// tasks died with the old process), and drop everything once nothing was
-/// written for `STALE_MS`. Returns what it shows.
+/// tasks died with the old process). Returns what it shows at `now`.
 fn refresh(t: &mut Tracker, path: &Path, started_at: i64, now: i64) -> Shown {
     let _ = t.advance(path);
     if started_at > 0 {
         t.open
             .retain(|_, task| task.started_at == 0 || task.started_at >= started_at);
     }
-    if !t.open.is_empty() && now - last_write(path, t) >= STALE_MS {
-        t.forget_open();
-    }
-    shown(t)
+    let last = if t.of(Kind::Agent).next().is_some() {
+        last_write(path, t)
+    } else {
+        0
+    };
+    shown(t, last, now)
 }
 
-/// What a tracker shows.
-fn shown(t: &Tracker) -> Shown {
+/// What a tracker shows at `now`, the session having last written at
+/// `last_write`: its subagents only while that is within `STALE_MS`, its
+/// shells always.
+fn shown(t: &Tracker, last_write: i64, now: i64) -> Shown {
+    let stale = now - last_write >= STALE_MS;
     let list = |kind| {
         let mut v: Vec<Task> = t.of(kind).map(|(_, t)| t.clone()).collect();
         v.sort_by_key(|t| t.started_at);
@@ -122,7 +130,11 @@ fn shown(t: &Tracker) -> Shown {
         v.truncate(LIST_CAP);
         (v, n)
     };
-    let (agents, agent_count) = list(Kind::Agent);
+    let (agents, agent_count) = if stale {
+        (Vec::new(), 0)
+    } else {
+        list(Kind::Agent)
+    };
     let (shells, shell_count) = list(Kind::Shell);
     Shown {
         agents,
@@ -137,20 +149,15 @@ fn shown(t: &Tracker) -> Shown {
 fn scan(d: &Daemon) -> Result<()> {
     // (Ids, paths and start times only, under the DB lock.)
     let sources = d.db().running_transcripts()?;
-    // Copy the read state out: the reads happen unlocked (only this
-    // thread writes it back).
-    let mut seen: HashMap<String, Seen> =
-        d.background.seen.lock().expect("background mutex").clone();
+    // Only this thread locks `seen` (`annotate` reads `shown`), so it is
+    // held for the whole scan.
+    let mut seen = d.background.seen.lock().expect("background mutex");
     let now = now_ms();
     let mut after = HashMap::new();
     let running: HashSet<&str> = sources.iter().map(|(id, _, _)| id.as_str()).collect();
     // Not running (stopped, failed, archived): nothing of theirs runs.
-    // The read position is kept, so a resume doesn't find it all again.
-    for (id, s) in seen.iter_mut() {
-        if !running.contains(id.as_str()) {
-            s.tracker.forget_open();
-        }
-    }
+    // (Resumed later, the work found again is older than the resume.)
+    seen.retain(|id, _| running.contains(id.as_str()));
     for (id, path, started_at) in &sources {
         let s = seen.entry(id.clone()).or_default();
         if s.path != *path {
@@ -164,7 +171,7 @@ fn scan(d: &Daemon) -> Result<()> {
             after.insert(id.clone(), sh);
         }
     }
-    *d.background.seen.lock().expect("background mutex") = seen;
+    drop(seen);
     // Compared with what was shown: going stale is a change too.
     let changed = {
         let mut shown = d.background.shown.lock().expect("background mutex");
@@ -230,15 +237,26 @@ mod tests {
     fn stale_work_is_not_shown() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("s1.jsonl");
-        std::fs::write(&main, format!("{}\n", agent("a1"))).unwrap();
+        std::fs::write(&main, format!("{}\n{}\n", agent("a1"), shell("b1"))).unwrap();
         let mut t = Tracker::default();
         let now = now_ms();
         assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
-        // Nothing written for the stale time: dropped, back to "your turn".
-        assert_eq!(refresh(&mut t, &main, 0, now + STALE_MS), Shown::default());
-        assert!(t.open.is_empty());
-        // ...and not found again.
-        assert_eq!(refresh(&mut t, &main, 0, now), Shown::default());
+        // Nothing written for the stale time: the agent is hidden, back to
+        // "your turn"; the shell still listed.
+        let later = refresh(&mut t, &main, 0, now + STALE_MS);
+        assert_eq!(later.agent_count, 0);
+        assert_eq!(later.shell_count, 1);
+        // Not forgotten: shown again once it writes (here: `now` again).
+        assert_eq!(t.open.len(), 2);
+        assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
+        // A late notification still closes it.
+        let done = json!({"type": "attachment", "attachment": {"type": "queued_command",
+            "commandMode": "task-notification",
+            "prompt": "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>"}});
+        let mut f = std::fs::File::options().append(true).open(&main).unwrap();
+        writeln!(f, "{done}").unwrap();
+        refresh(&mut t, &main, 0, now + STALE_MS);
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1"]);
     }
 
     #[test]

@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_keeps_the_popup_only_over_its_row() {
+        use crate::hover_still_there;
+        use crate::mouse::Hit;
+        let rows = [json!({"id": "a"}), json!({"id": "b"})];
+        assert!(hover_still_there(Some(Hit::Row(1)), &rows, "b"));
+        // Reordered: another session under the pointer now.
+        assert!(!hover_still_there(Some(Hit::Row(0)), &rows, "b"));
+        // Gone from the list, or no row there.
+        assert!(!hover_still_there(Some(Hit::Row(1)), &rows[..1], "b"));
+        assert!(!hover_still_there(None, &rows, "b"));
+    }
+
+    #[test]
     fn details_layout_and_popup_place() {
         use crate::{details_split, hover_rect};
         use ratatui::layout::Rect;
