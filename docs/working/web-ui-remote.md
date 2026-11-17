@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–2 built; steps 3–14 replanned for the plugin shape, not started)
+**Status:** in progress (slice 1: steps 1–3 built; steps 4–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -124,6 +124,21 @@ Decided 2026-11-17 (user):
   hash compiled into `rlord`; TypeScript 7, Vite 8, Preact 11 and
   xterm.js 6. Steps 3 to 14 below replace the old 3 to 12; eight open
   questions wait for the user.
+- Step 3 done: `crates/web` (`rlord-web --version`; `serve` says
+  `web.hello` and waits for the daemon to go), in `members` only;
+  `core/src/plugin.rs` (`WEB_PROTOCOL`, exit codes 3 and 4, the
+  incompatible-protocol RPC code, paths, `verify`, `locate`,
+  `random_hex`; `sha2`); `[web] enabled/port` in `config.rs` (the config
+  template waits for step 14); `cargo xtask check-deps`, run by CI's
+  `check` job and at the start of `build-release`. Deviation: the source
+  check found a TCP client already in `rlord`:
+  `core/src/agents/opencode_service.rs`, the OpenCode adapter's HTTP
+  client for OpenCode's own background server (the local address its
+  `service.json` names). It is exempt by file in `ALLOWED_FILES`, with
+  that reason; any other file naming a TCP or UDP socket type fails. So
+  "no network code in `rlord`" is true of HTTP servers, websockets, TLS
+  and network-client crates, not of TCP itself; step 14's docs should
+  say so.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

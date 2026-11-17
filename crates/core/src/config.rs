@@ -654,6 +654,32 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub update: UpdateConfig,
     pub limits: LimitsConfig,
+    pub web: WebConfig,
+}
+
+/// The opt-in web UI (the `rlord-web` plugin). Read by the daemon, which
+/// starts the plugin, and by the plugin, which listens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Start the plugin when the daemon starts (else the first `rlord web`
+    /// starts it for that daemon run). Installing doesn't set it.
+    pub enabled: bool,
+    /// Its port, on 127.0.0.1 only; 0 = any free port. Fixed by default:
+    /// the browser keeps the token per origin, and the origin includes the
+    /// port.
+    pub port: u16,
+}
+
+pub const DEFAULT_WEB_PORT: u16 = 47811;
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            enabled: false,
+            port: DEFAULT_WEB_PORT,
+        }
+    }
 }
 
 /// Sessions stopped by a usage limit.
@@ -739,6 +765,7 @@ impl Default for Config {
             archive: ArchiveConfig::default(),
             update: UpdateConfig::default(),
             limits: LimitsConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }
@@ -1136,6 +1163,19 @@ mod tests {
         assert_eq!(c.keys.overlord, "M-o");
         assert_eq!(c.session.code_dir, "");
         assert!(c.session.scan_roots().is_empty());
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 47811);
+    }
+
+    #[test]
+    fn web_section_reads_and_defaults() {
+        let c: Config = toml::from_str("[web]\nenabled = true\n").unwrap();
+        assert!(c.web.enabled);
+        assert_eq!(c.web.port, DEFAULT_WEB_PORT);
+        let c: Config = toml::from_str("[web]\nport = 0\n").unwrap();
+        assert!(!c.web.enabled);
+        assert_eq!(c.web.port, 0);
+        assert!(toml::from_str::<Config>("[web]\nport = 70000\n").is_err());
     }
 
     #[test]

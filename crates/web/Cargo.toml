@@ -1,0 +1,24 @@
+# The opt-in web UI plugin, `rlord-web`: the HTTP server, websockets, PTY
+# bridge and embedded page. A separate executable so the `rlord` binary has
+# no network code (`cargo xtask check-deps` holds it to that). Never
+# published, never in the rlord tarball or packages
+# (docs/working/web-ui-remote.md).
+[package]
+name = "robot-overlord-web"
+description = "rlord's opt-in web UI plugin (rlord-web). Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "rlord-web"
+path = "src/main.rs"
+
+[dependencies]
+rlord-core = { package = "robot-overlord-core", path = "../core" }
+anyhow.workspace = true
+serde_json.workspace = true

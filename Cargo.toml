@@ -1,8 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord", "xtask"]
-# Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask out;
-# `--workspace` includes it (CI uses it).
+members = [
+    "crates/core",
+    "crates/daemon",
+    "crates/tui",
+    "crates/rlord",
+    "crates/web",
+    "xtask",
+]
+# Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask and
+# the web plugin (`rlord-web`, opt-in, never in the rlord binary) out;
+# `--workspace` includes them (CI uses it).
 default-members = ["crates/core", "crates/daemon", "crates/tui", "crates/rlord"]
 
 [workspace.package]

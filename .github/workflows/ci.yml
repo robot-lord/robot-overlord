@@ -37,6 +37,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # No HTTP, websocket or TLS code in the rlord binary: the opt-in web
+      # plugin (crates/web) holds it.
+      - run: cargo xtask check-deps
       - run: cargo test --workspace
         env:
           RLORD_TMUX_TESTS: "1"

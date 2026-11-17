@@ -1497,6 +1497,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "toml",
@@ -1532,6 +1533,15 @@ dependencies = [
  "robot-overlord-daemon",
  "serde_json",
  "unicode-width",
+]
+
+[[package]]
+name = "robot-overlord-web"
+version = "0.23.0-dev.30"
+dependencies = [
+ "anyhow",
+ "robot-overlord-core",
+ "serde_json",
 ]
 
 [[package]]

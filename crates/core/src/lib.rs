@@ -10,6 +10,7 @@ pub mod keys;
 pub mod models;
 pub mod names;
 pub mod paths;
+pub mod plugin;
 pub mod privacy;
 pub mod private;
 pub mod process;

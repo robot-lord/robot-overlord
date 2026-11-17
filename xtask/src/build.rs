@@ -47,6 +47,8 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
     std::fs::create_dir_all(dist).with_context(|| format!("creating {}", dist.display()))?;
     let dist = dist.canonicalize()?;
     let ver = version::current()?;
+    // No network code in the rlord binary (the web plugin holds it).
+    crate::check_deps::check()?;
     let stage = TempDir::new_in(Path::new("target"), "pack")?;
     let target_dir = target_dir()?;
 
