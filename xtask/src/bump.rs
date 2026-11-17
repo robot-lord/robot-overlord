@@ -1,8 +1,10 @@
 //! `cargo xtask check-version-bump [BASE] [REV]` (defaults: origin/main,
 //! HEAD): fail unless REV bumps `[workspace.package] version` above BASE's
 //! and Cargo.lock agrees. Every PR merged to main ships a release (see
-//! CLAUDE.md), so every PR must bump the version: a development build
-//! (X.Y.Z-dev.N, the usual) or a stable release (X.Y.Z).
+//! CLAUDE.md), so every PR must bump the version: a stable release (the
+//! usual: X.Y+1.0 for a feature, X.Y.Z+1 for a fix) or, for work that
+//! isn't ready, a development build of the next version (X.Y.Z-dev.N).
+//! Any semver increase passes: which part to bump is the PR's call.
 //!
 //! Used by CI (pull requests) and .githooks/pre-push.
 
@@ -44,8 +46,8 @@ fn check(base_ver: &str, new_ver: &str, lock_ver: Option<&str>, base: &str) -> R
         bail!(
             "version-bump: Cargo.toml version is {new}; {base} has {old}.\n\
              Every PR ships a release, so bump [workspace.package] version in Cargo.toml\n\
-             and commit Cargo.lock too: usually the next development build (0.18.0-dev.1,\n\
-             then -dev.2, …), or X.Y.Z for a stable release."
+             and commit Cargo.lock too: the minor for a feature (1.0.0 -> 1.1.0), the patch\n\
+             for a fix (1.1.0 -> 1.1.1), or X.Y.Z-dev.N for work that isn't ready."
         );
     }
     if lock_ver != Some(new_ver) {
@@ -70,6 +72,13 @@ mod tests {
             ("0.23.0-dev.8", "0.23.0"),
             ("0.23.0", "0.23.1-dev.1"),
             ("0.23.0", "1.0.0"),
+            // After 1.0: a feature, a fix, a dev build of either, a major.
+            ("1.0.0", "1.1.0"),
+            ("1.1.0", "1.1.1"),
+            ("1.1.1", "1.2.0-dev.1"),
+            ("1.2.0-dev.1", "1.2.0-dev.2"),
+            ("1.2.0-dev.2", "1.2.0"),
+            ("1.2.0", "2.0.0"),
         ] {
             let line = check(old, new, Some(new), "origin/main").unwrap();
             assert_eq!(line, format!("version-bump: {old} -> {new}"));
@@ -83,6 +92,8 @@ mod tests {
             ("0.23.0-dev.10", "0.23.0-dev.9"),
             ("0.23.0", "0.23.0-dev.9"),
             ("0.23.1", "0.23.0"),
+            ("1.1.0", "1.1.0-dev.3"),
+            ("1.1.1", "1.1.0"),
         ] {
             let err = check(old, new, Some(new), "origin/main").unwrap_err();
             assert!(err.to_string().contains("origin/main has"), "{err}");
