@@ -128,6 +128,9 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
 /// tasks died with the old process). Returns what it shows at `now`.
 fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Shown {
     use std::os::unix::fs::MetadataExt;
+    // A new process (after a restart in rlord): what ran before is gone,
+    // even before its new transcript exists.
+    drop_before(&mut s.tracker, started_at);
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
         // (The transcript can't be seen: its subagents' own files still
@@ -144,18 +147,17 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
             *budget = budget.saturating_sub(n);
             // (All read, or all but a line still being written: that
             // line's end changes the file, and is read then.)
-            // (Nothing read of a file that grew: the budget ran out; not
-            // saved.)
-            if s.tracker.offset == meta.len() || (s.tracker.partial && n > 0) {
+            // (`partial`: the rest of the file is one line still being
+            // written. Nothing read of a file that grew otherwise: the
+            // budget ran out; not saved.)
+            if s.tracker.offset == meta.len() || s.tracker.partial {
                 s.stamp = stamp;
             }
         }
     }
     let t = &mut s.tracker;
-    // A task with no launch time can't be placed after the start: dropped.
-    if started_at > 0 {
-        t.open.retain(|_, task| task.started_at >= started_at);
-    }
+    // (What the read just found, launched before the start, goes too.)
+    drop_before(t, started_at);
     // (The subagents' own files only while some are open.)
     let agents = if t.of(Kind::Agent).next().is_some() {
         last_write(main, t)
@@ -163,6 +165,15 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
         main
     };
     shown(t, agents, main, now)
+}
+
+/// Drop the work launched before the agent process last started
+/// (`started_at`; 0: unknown). A task with no launch time can't be placed
+/// after the start: dropped too.
+fn drop_before(t: &mut Tracker, started_at: i64) {
+    if started_at > 0 {
+        t.open.retain(|_, task| task.started_at >= started_at);
+    }
 }
 
 /// What a tracker shows at `now`: its subagents while the session wrote
@@ -417,6 +428,24 @@ mod tests {
             refresh(&mut s, &main, forked, now_ms(), &mut all()),
             Shown::default()
         );
+    }
+
+    #[test]
+    fn a_restart_drops_agents_before_the_new_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        let mut launch = agent("a1");
+        launch["timestamp"] = json!("2026-01-01T00:00:00.000Z");
+        std::fs::write(&main, format!("{launch}\n")).unwrap();
+        let mut s = Seen::default();
+        refresh(&mut s, &main, 0, now_ms(), &mut all());
+        assert_eq!(s.tracker.open.len(), 1);
+        // Restarted: the old file is gone, the new one not there yet.
+        std::fs::remove_file(&main).unwrap();
+        let restarted =
+            rlord_core::agents::transcript::parse_iso_ms("2026-01-02T00:00:00.000Z").unwrap();
+        refresh(&mut s, &main, restarted, now_ms(), &mut all());
+        assert!(s.tracker.open.is_empty());
     }
 
     #[test]

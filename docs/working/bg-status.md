@@ -53,6 +53,14 @@ file). PR #68.
 
 ## Owed
 
+- **Reconcile with `scan_subagents_read`.** Its rules for which
+  sub-agents run differ from the tracker's. Bring them together, or say
+  why they differ.
+- **`hover_still_there`.** It rechecks the popup at the stored pointer
+  position, which may be stale once rows move under a still pointer.
+- **Popup height.** `theme::wrapped_rows` approximates ratatui's own
+  wrapping; a long word or a wide character can leave the popup one row
+  short.
 - **Hooks-first redesign.** Take the subagent count from the `subagents`
   table (the hooks) and read the transcript only for forked skills, shells
   and labels. Caveat: `subagents.finished_at` is partly guessed today

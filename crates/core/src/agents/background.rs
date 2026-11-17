@@ -342,9 +342,9 @@ impl Tracker {
         }
     }
 
-    /// Close an open task (finished, stopped, or seen finished by the
-    /// hooks). An agent is remembered a while, for a resume.
-    pub fn close(&mut self, id: &str) {
+    /// Close an open task (its final notification, or a successful stop).
+    /// An agent is remembered a while, for a resume.
+    fn close(&mut self, id: &str) {
         if let Some(t) = self.open.remove(id) {
             if t.kind == Kind::Agent {
                 if self.closed.len() >= CLOSED_CAP {
@@ -403,10 +403,18 @@ fn stopped<'a>(r: &'a Value, content: &Value) -> Option<&'a str> {
 
 /// Words one of the lines `Tracker::feed` acts on must hold: a cheap
 /// check before the full JSON parse.
-const NEEDLES: [&[u8]; 4] = [
-    b"toolUseResult",
-    b"task-notification",
+/// (Launches, finishes, resumes, stops, and the tool calls whose labels
+/// launches take. `pending` drops unanswered calls by its cap, so other
+/// tool results needn't be parsed.)
+const NEEDLES: [&[u8]; 9] = [
+    b"backgroundTaskId",
+    b"async_launched",
+    br#""isAsync":true"#,
+    br#""background":true"#,
     b"resumedAgentId",
+    b"Successfully stopped",
+    b"Successfully killed",
+    b"task-notification",
     br#""type":"tool_use""#,
 ];
 
@@ -607,9 +615,10 @@ mod tests {
         // The oldest went first.
         assert_eq!(t.pending.len(), PENDING_CAP);
         assert_eq!(t.pending.front().unwrap().0, "t3");
-        // Any result for a call (not just a launch) drops it.
+        // A launch's result takes its call's entry.
         t.feed(&json!({"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "t5", "content": "ok"}]}}));
+            {"type": "tool_result", "tool_use_id": "t5", "content": "ok"}]},
+            "toolUseResult": {"backgroundTaskId": "b5"}}));
         assert!(!t.pending.iter().any(|(id, _)| id == "t5"));
     }
 
