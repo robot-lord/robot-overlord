@@ -777,6 +777,31 @@ Decided 2026-11-17 (user):
     terminal, or the web UI if they used it last)" and "(in a terminal,
     hides your overlay)". No tool added or removed; `READ_ONLY_TOOLS`
     and `MUTATING` unchanged.
+  - Step 11 done: headless pass (Playwright 1.65.1, outside the repo)
+    in Chromium and WebKit against a second demo (`RLORD_DEMO_SOCKET=
+    rlord-demo-s2`, `/tmp/rwd/s2`, `[web] port = 47841`), the overlord
+    stood in for by raw `mcp.call` requests on the demo's socket, and a
+    terminal stood in for by a tmux client on a PTY on the demo's socket.
+    17 checks, all passing in both browsers: with only the page,
+    `get_ui_state` says `web` and what the page shows; `goto_session`
+    moves the page; `set_list_view` fills the filter box, filters and
+    highlights the row; `propose_session` opens the proposal with the
+    overlord's notes, Launch starts it with its background; the describe
+    form's request reaches the overlord's pane, `confirm_new_session`
+    (with that request's id) reopens it with the agent marked "overlord's
+    · changed" and the note, and Confirm sends it back `confirmed: yes`;
+    a form the user typed into stays while the overlord's proposal waits
+    behind the banner; with two tabs only the one used last moves; with a
+    terminal too, the one typed in last gets `goto_session` (the other
+    keeps its place; the page shows the notice), and `ui_target =
+    "terminal"` (config reloaded) sends `show_list` to the terminal though
+    the page was used last; at 390 px wide the form fits with no sideways
+    scroll; no console errors. Found and fixed: the parked-form banner sat
+    under the dialog's backdrop, so "open it now" couldn't be clicked.
+    Test-harness notes: the demo's stand-in overlord never reads its
+    input, so its terminal's input queue fills after a few requests (the
+    pass restarts it before each); what it was typed is read with
+    `pipe-pane` (its screen redraws).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

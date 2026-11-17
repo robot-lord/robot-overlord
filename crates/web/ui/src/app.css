@@ -498,7 +498,10 @@ textarea {
   font-size: 20px;
   cursor: pointer;
 }
+/* (Above an open dialog: it is about the dialog.) */
 .banner {
+  position: relative;
+  z-index: 25;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
