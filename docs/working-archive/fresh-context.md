@@ -1,7 +1,7 @@
 # Fresh repo code: what is still owed
 
 Residue of `docs/working/fresh-context.md` (in git history), reconciled
-2026-11-16 with 0.23.0-dev.30. How `repo_latest` and a new session's
+2026-11-17 with 1.1.0. How `repo_latest` and a new session's
 base work now is in `docs/architecture.md` ("The latest code
 (`repo_latest`)", "Session creation", "Session background") and
 `docs/guide.md` ("Creating sessions").
