@@ -11,6 +11,7 @@ import {
   type ErrorCode,
   type Hello,
   type Op,
+  type UiCmd,
 } from "./proto";
 
 /** What the page needs of a WebSocket (a fake in tests). */
@@ -84,6 +85,8 @@ export interface ControlEvents {
   state(s: ConnState): void;
   hello(h: Hello): void;
   changed(rev: string): void;
+  /** A UI command from the overlord, for this page. */
+  ui?(cmd: UiCmd): void;
 }
 
 /** Retry waits: from FIRST, doubling up to LAST. */
@@ -170,6 +173,8 @@ export class Control {
         this.on.hello(m);
       } else if (m.event === "changed") {
         this.on.changed(m.rev);
+      } else if (m.event === "ui") {
+        this.on.ui?.(m.cmd);
       }
       return;
     }

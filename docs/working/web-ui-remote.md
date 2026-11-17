@@ -703,6 +703,20 @@ Decided 2026-11-17 (user):
     only as `{"event":"ui","cmd"}`. `web.pages` calls are serialized so
     the daemon gets the lists in order. Test: `http.rs`
     `pages_and_their_ui_commands`; unit test for the stream's lines.
+  - Step 7 done (`ui/src/{proto,api,store,ui,main}.ts(x)`,
+    `components/{Toast,Modal,FormHost,usage}`, `views/List.tsx`):
+    `UiCmd` and the forms' answer types in `proto.ts`, held to the
+    daemon's fixtures by `fixture.test.ts`; `ui.ts` `decide` (pure: goto,
+    show_list, set_view, notice, and a form command that opens, or is
+    parked behind a banner when the open form was typed into) and
+    `Reporter` (`page.report`: only what changed, everything again after
+    a reconnect, input at most every 5 s from pointer, key and wheel
+    events); `page.pending` on every hello. The store maps between the
+    page's view and the daemon's (`viewOf`, `listView`), sends the filter
+    as `query` with the usage measure, highlights `set_view`'s `select`,
+    and a browser with no saved view starts from `view.default`. Rows
+    show the usage figure in the list's measure. The form host shows a
+    placeholder until steps 8 and 9.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

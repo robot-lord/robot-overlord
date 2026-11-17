@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import { type Shown, shown, workLines } from "../src/components/Status";
+import { compact, usageFigure } from "../src/components/usage";
 
 const base: Shown = { status: "idle", status_label: "your turn", shown_status: "idle" };
 const limit = { resets_at: 0, until: "14:05", reset: false, kind: null, resume: false };
@@ -68,5 +69,19 @@ describe("workLines", () => {
   it("says nothing without background work", () => {
     expect(workLines(base, at)).toEqual([]);
     expect(workLines({ ...base, async_shells: { count: 0, tasks: [] } }, at)).toEqual([]);
+  });
+});
+
+describe("the usage figure", () => {
+  const u = { turns: 3, tokens: 123_456, context: 84_000, window: 200_000, context_pct: 42 };
+  it("shows the list's measure", () => {
+    expect(usageFigure({ usage: u, usage_metric: "turns" })).toEqual(["3", "3 turns"]);
+    expect(usageFigure({ usage: u, usage_metric: "tokens" })?.[0]).toBe("123k");
+    expect(usageFigure({ usage: u, usage_metric: "context" })?.[0]).toBe("42%");
+    expect(usageFigure({ usage: { ...u, context_pct: null }, usage_metric: "context" })).toBeNull();
+    expect(usageFigure({ usage: null, usage_metric: "turns" })).toBeNull();
+    expect(compact(999)).toBe("999");
+    expect(compact(1500)).toBe("1.5k");
+    expect(compact(2_500_000)).toBe("2.5M");
   });
 });

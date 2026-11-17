@@ -1,11 +1,16 @@
 // The page: the token, the control socket, the store, and the routes.
 // Wide screens show the list beside the pane; narrow ones one at a time.
 
+import { effect } from "@preact/signals";
 import { render } from "preact";
 import { Control, takeToken, wsUrl } from "./api";
+import { FormHost } from "./components/FormHost";
+import { Toast } from "./components/Toast";
 import { tick } from "./components/time";
-import { followHash, parse, route } from "./route";
-import { Store } from "./store";
+import type { UiCmd } from "./proto";
+import { followHash, href, parse, route } from "./route";
+import { listView, Store } from "./store";
+import { decide, Reporter } from "./ui";
 import { List } from "./views/List";
 import { Overlord } from "./views/Overlord";
 import { Session } from "./views/Session";
@@ -20,7 +25,7 @@ function safeStorage(): Storage | null {
 }
 
 const storage = safeStorage();
-const store = new Store(storage);
+const store = new Store(storage, { defaultView: true });
 let build: string | null = null;
 let version = "";
 
@@ -29,6 +34,35 @@ const token = takeToken(location, storage, (u) => history.replaceState(null, "",
 route.value = parse(location.hash);
 followHash();
 tick();
+
+/** Carry out an overlord's UI command (`ui.ts` decides). */
+function onUi(cmd: UiCmd): void {
+  for (const e of decide(cmd, store.form.value)) {
+    switch (e.do) {
+      case "route":
+        if (e.closeForm) store.form.value = null;
+        location.hash = href(e.to);
+        break;
+      case "view":
+        store.applyView(e.view, e.select);
+        break;
+      case "open":
+        store.parked.value = null;
+        store.form.value = e.form;
+        break;
+      case "park":
+        store.parked.value = e.cmd;
+        break;
+      case "toast":
+        store.toast.value = e.text;
+        break;
+    }
+  }
+}
+
+const reporter = new Reporter((args) => {
+  if (control) control.request("page.report", args).catch(() => {});
+});
 
 const control = token
   ? new Control(wsUrl("/ws"), token, {
@@ -40,12 +74,39 @@ const control = token
         if (build !== null && build !== h.build) location.reload();
         build = h.build;
         version = h.version;
-        if (control) store.connected(control);
+        if (!control) return;
+        store.connected(control);
+        // A new page id: tell the daemon everything again, and take any
+        // command that was meant for this page before it reconnected.
+        reporter.reset();
+        report();
+        control
+          .request<UiCmd | null>("page.pending")
+          .then((c) => c && onUi(c))
+          .catch(() => {});
       },
       changed: (rev) => store.changed(rev),
+      ui: onUi,
     })
   : null;
 if (!token) store.conn.value = "no_token";
+
+/** What this page shows, to the daemon (only what changed). */
+function report(): void {
+  // (Not a dependency: on connecting, hello reports everything.)
+  if (store.conn.peek() !== "open") return;
+  reporter.shown({
+    route: route.value,
+    view: listView(store.view.value),
+    visible: document.visibilityState === "visible",
+    form: store.form.value?.kind ?? null,
+  });
+}
+effect(report);
+document.addEventListener("visibilitychange", report);
+for (const ev of ["pointerdown", "keydown", "wheel"] as const) {
+  document.addEventListener(ev, () => reporter.input(), { capture: true, passive: true });
+}
 
 const words: Record<string, string> = {
   connecting: "connecting…",
@@ -69,6 +130,8 @@ function App() {
         </span>
         {store.error.value && conn === "open" && <span class="err">{store.error.value}</span>}
       </header>
+      <FormHost store={store} />
+      <Toast store={store} />
       <div class="body">
         <aside class="side">
           <List store={store} route={r} />

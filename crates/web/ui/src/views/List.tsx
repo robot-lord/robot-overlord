@@ -3,9 +3,11 @@
 // live/archived. The daemon sorts and groups; this draws.
 
 import { useSignal, useSignalEffect } from "@preact/signals";
+import { useEffect } from "preact/hooks";
 import { Tell } from "../components/Actions";
 import { now, ago, lastUpdate } from "../components/time";
 import { Status } from "../components/Status";
+import { usageFigure } from "../components/usage";
 import type { Overlord, Row, Snapshot } from "../proto";
 import { href, type Route } from "../route";
 import { SORTS, type Store, type View } from "../store";
@@ -19,7 +21,8 @@ export function List({ store, route }: { store: Store; route: Route }) {
   const snap = store.snapshot.value;
   const view = store.view.value;
   const labels = agentLabels(snap);
-  const selected = route.kind === "session" ? route.id : null;
+  // The open session, else the row the overlord asked to highlight.
+  const selected = route.kind === "session" ? route.id : store.selected.value;
   return (
     <div class="list">
       <Controls store={store} view={view} />
@@ -40,9 +43,14 @@ function Controls({ store, view }: { store: Store; view: View }) {
   const text = useSignal(view.search);
   useSignalEffect(() => {
     const t = text.value;
+    if (t === store.view.peek().search) return;
     const id = setTimeout(() => store.setView({ search: t }), 200);
     return () => clearTimeout(id);
   });
+  // A view set from elsewhere (the overlord, the default) shows its filter.
+  useEffect(() => {
+    if (text.peek() !== view.search) text.value = view.search;
+  }, [view.search]);
   return (
     <div class="controls">
       <div class="tabs" role="tablist">
@@ -161,6 +169,17 @@ function Groups({ store, snap }: { store: Store; snap: Snapshot }) {
   );
 }
 
+function UsageFigure({ r }: { r: Row }) {
+  const f = usageFigure(r);
+  if (!f) return null;
+  return (
+    <span class="usage" title={f[1]}>
+      {" · "}
+      {f[0]}
+    </span>
+  );
+}
+
 function Rows({
   rows,
   labels,
@@ -193,7 +212,10 @@ function Rows({
               )}
               {r.name}
             </span>
-            <span class="agent">{labels.get(r.agent) ?? r.agent}</span>
+            <span class="agent">
+              {labels.get(r.agent) ?? r.agent}
+              <UsageFigure r={r} />
+            </span>
             <span class="when" title={new Date(lastUpdate(r)).toLocaleString()}>
               {ago(lastUpdate(r), at)}
             </span>
