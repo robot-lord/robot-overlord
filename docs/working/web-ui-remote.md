@@ -1,4 +1,4 @@
-**Status:** in progress (spec; nothing built past the spike)
+**Status:** in progress (slice 1 steps 1–2 being built; server placement being redesigned)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -86,7 +86,19 @@ Decided 2026-11-17 (user):
 ## Progress
 
 - Spike: local PTY bridge works (`web-ui-spike.md`, `spikes/web-ui/`).
-- Slice 1 planned (see below). Plan by a Fable planning agent; not built.
+- Slice 1 planned (see below). Plan by a Fable planning agent.
+- 2026-11-17, user: the web server will not live in the daemon. It becomes
+  a separate opt-in executable (a plugin, downloaded only on opt-in); the
+  main `rlord` binary keeps a thin `rlord web` command and no HTTP,
+  websocket or network code. The plan below still puts it in the daemon
+  (steps 3 to 12) and needs revising before those steps. Steps 1 and 2
+  (tmux and `send.rs`, in core/daemon) stand.
+- Step 1 done: the view session holds on tmux 3.8 (macOS), 3.2a (Ubuntu
+  22.04) and 3.4 (Ubuntu 24.04, CI's). All seven behaviours pass
+  (`crates/daemon/tests/web_tmux.rs`, gated, socket `rlord-test-web`). The
+  PTY in the test is plain `openpty` via `libc`, no PTY crate. Found on
+  the way: tmux exits with its last session, so a test (or the sweep) can't
+  rely on bindings or window ids surviving a moment with no sessions.
 
 ## Slice 1 plan: local web UI
 
@@ -413,3 +425,24 @@ regenerates `Cargo.lock`.
 5. Latest active view sets the size.
 6. Delete `spikes/web-ui/` and fold the spike doc in at step 12 (default).
 7. `:web` last and optional (default).
+
+### Changes from the user after planning (2026-11-17); slice 1 plan needs revising
+
+- **Web server is an opt-in plugin, not part of the daemon.** Main `rlord`
+  keeps only a thin `rlord web` command section with no HTTP, websocket or
+  network code. Opting in downloads a separate `rlord-web` executable;
+  the point is that a user who doesn't opt in has nothing that could send
+  sessions over the network. The plugin talks to the daemon over its Unix
+  socket (needs `snapshot`, a streaming subscribe, web-input reporting,
+  a protocol version handshake). tmux-side helpers (view sessions,
+  `list_clients` filter, `kill_session`) stay in core/daemon.
+- **Server side all Rust.** No JavaScript server.
+- **Client in TypeScript**, not plain JavaScript. Build compiles it to
+  the embedded assets; tooling choice (and how type-checking runs in CI)
+  to be planned.
+- **Most modern web stack available.** The re-plan must research the
+  current (late 2026) state rather than assume: TypeScript's native
+  compiler (TS 7 / `tsgo`), Rolldown/Vite or oxc for building, oxlint or
+  Biome for lint/format, the current xterm.js major, and whether a light
+  UI framework (signals-based) beats hand-written DOM. Pick the newest
+  stable choices, pinned, with reasons.

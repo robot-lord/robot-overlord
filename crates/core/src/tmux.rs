@@ -255,6 +255,17 @@ fn run(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The id (`@n`) of the window a session is showing.
+pub fn current_window_id(session: &str) -> Result<String> {
+    run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{}:", exact(session)),
+        "#{window_id}",
+    ])
+}
+
 /// Rename a tmux session in place (attached clients stay attached).
 pub fn rename_session(old: &str, new: &str) -> Result<()> {
     run(&["rename-session", "-t", &exact(old), new])?;
