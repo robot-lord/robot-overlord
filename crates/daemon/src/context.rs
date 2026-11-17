@@ -774,10 +774,34 @@ pub fn launch_file_text_rows(
 
 /// The session's whole background for its file; None when it has none.
 pub fn file_text(db: &Db, s: &Session) -> Result<Option<String>> {
+    file_text_with(db, s, None)
+}
+
+/// A note as it is about to be rewritten (`source`, new body and time):
+/// rendered in place of the stored one before the change is stored.
+pub struct Renewed<'a> {
+    pub source: &'a str,
+    pub body: &'a str,
+    pub at: i64,
+}
+
+/// `file_text`, with the notes from `renewed.source` shown as they will be
+/// (stored only once the start that carries them is under way).
+pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result<Option<String>> {
     if !has_background(db, &s.id)? {
         return Ok(None);
     }
-    let rows = db.context_rows(&s.id)?;
+    let mut rows = db.context_rows(&s.id)?;
+    if let Some(r) = renewed {
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.kind == "note" && row.source == r.source)
+        {
+            row.body = r.body.to_string();
+            row.at = r.at;
+            row.seen_at = None;
+        }
+    }
     Ok(Some(render_as(
         &s.name,
         launched_with_it(db, &s.id)?,
@@ -791,7 +815,18 @@ pub fn file_text(db: &Db, s: &Session) -> Result<Option<String>> {
 /// Rewrite the session's background file from its rows (nothing when it
 /// has no background). Returns the file.
 pub fn refresh_file(db: &Db, base: &Path, s: &Session) -> Result<Option<PathBuf>> {
-    match file_text(db, s)? {
+    refresh_file_with(db, base, s, None)
+}
+
+/// `refresh_file`, rendering a note about to be rewritten as it will be
+/// (`file_text_with`).
+pub fn refresh_file_with(
+    db: &Db,
+    base: &Path,
+    s: &Session,
+    renewed: Option<&Renewed>,
+) -> Result<Option<PathBuf>> {
+    match file_text_with(db, s, renewed)? {
         Some(text) => Ok(Some(write_file(base, &s.id, &text)?)),
         None => Ok(None),
     }

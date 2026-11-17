@@ -770,14 +770,15 @@ pub(crate) fn conversation_seen(db: &Db, id: &str, transcript: &str) -> Result<(
 }
 
 /// A fork made again at a restart branches from its parent's conversation
-/// as it is now: its own note says so, with the new time, unseen. Called
-/// before the restart writes its background file and starts the pane; the
-/// restart marks seen only what that start hands the agent. Where it
-/// works is what the fork recorded when it was made (`folder_key`), not a
-/// comparison with its parent as it is now.
-pub(crate) fn renote(db: &Db, s: &Session, at: i64) -> Result<()> {
+/// as it is now: its own note's new text (None: not a fork). Nothing is
+/// stored here: the restart renders its background file with it
+/// (`context::refresh_file_with`) before the pane starts, and stores it
+/// (`renote`) only once the pane is up, so a restart that fails leaves the
+/// database as it was. Where it works is what the fork recorded when it
+/// was made (`folder_key`), not a comparison with its parent as it is now.
+pub(crate) fn renewed_note(db: &Db, s: &Session, at: i64) -> Result<Option<String>> {
     let Some(pid) = s.forked_from.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let name = db
         .resolve_ref(pid)
@@ -790,12 +791,13 @@ pub(crate) fn renote(db: &Db, s: &Session, at: i64) -> Result<()> {
         (Some(w), Some(b)) if own_worktree => ForkFolder::Worktree(w.clone(), b.clone()),
         _ => ForkFolder::Shared,
     };
-    db.context_renote(
-        &s.id,
-        "fork",
-        &context::fork_note(&name, pid, at, &folder),
-        at,
-    )?;
+    Ok(Some(context::fork_note(&name, pid, at, &folder)))
+}
+
+/// Store a re-forked fork's note (`renewed_note`), unseen: after its pane
+/// is up. The restart then marks seen only what that start handed over.
+pub(crate) fn renote(db: &Db, s: &Session, body: &str, at: i64) -> Result<()> {
+    db.context_renote(&s.id, "fork", body, at)?;
     Ok(())
 }
 
@@ -1355,6 +1357,8 @@ mod tests {
 
     /// A fork made again at a restart: its own note names the new branch
     /// point and is handed over again; the rest of its background stays.
+    /// Its file shows the new note before anything is stored; the database
+    /// takes it only when `renote` runs (once the pane is up).
     #[test]
     fn a_refork_renews_its_note() {
         let dir = tempfile::tempdir().unwrap();
@@ -1369,19 +1373,41 @@ mod tests {
             .unwrap();
         db.context_mark_all_seen("f", 5).unwrap();
         let at = 1_800_000_000_000;
-        renote(&db, &db.resolve_ref("f").unwrap(), at).unwrap();
-        let rows = db.context_rows("f").unwrap();
+        let f = db.resolve_ref("f").unwrap();
+        let body = renewed_note(&db, &f, at).unwrap().unwrap();
         assert_eq!(
-            rows[0].body,
+            body,
             context::fork_note("n-p", "p", at, &ForkFolder::Shared)
         );
+        // Rendered in memory: the file has it, the database doesn't yet.
+        let renewed = context::Renewed {
+            source: "fork",
+            body: &body,
+            at,
+        };
+        let text = context::file_text_with(&db, &f, Some(&renewed))
+            .unwrap()
+            .unwrap();
+        assert!(text.contains(&body) && !text.contains(&old));
+        let before = db.context_rows("f").unwrap();
+        assert_eq!(
+            (before[0].body.as_str(), before[0].seen_at),
+            (old.as_str(), Some(5))
+        );
+        // The pane is up: stored, unseen.
+        renote(&db, &f, &body, at).unwrap();
+        let rows = db.context_rows("f").unwrap();
+        assert_eq!(rows[0].body, body);
         assert_eq!((rows[0].at, rows[0].seen_at), (at, None));
         assert_eq!(
             (rows[1].body.as_str(), rows[1].seen_at),
             ("use the staging DB", Some(5))
         );
         // Not a fork: nothing to renew.
-        renote(&db, &db.resolve_ref("p").unwrap(), at).unwrap();
+        assert_eq!(
+            renewed_note(&db, &db.resolve_ref("p").unwrap(), at).unwrap(),
+            None
+        );
         // Where it works is what it recorded when made: both of these are
         // in a worktree, only one made it.
         for (id, folder) in [("own", "worktree"), ("inherited", "shared")] {
@@ -1402,10 +1428,12 @@ mod tests {
             .unwrap();
             db.set_forked_from(id, "p").unwrap();
             db.kv_set(&folder_key(id), folder).unwrap();
-            db.context_add(id, 0, "note", "old", "fork").unwrap();
-            renote(&db, &db.resolve_ref(id).unwrap(), at).unwrap();
         }
-        let note = |id: &str| db.context_rows(id).unwrap()[0].body.clone();
+        let note = |id: &str| {
+            renewed_note(&db, &db.resolve_ref(id).unwrap(), at)
+                .unwrap()
+                .unwrap()
+        };
         assert!(note("own").contains("own worktree, /r/.worktrees/x (branch x)"));
         assert!(note("inherited").contains("same folder"));
     }

@@ -1095,19 +1095,27 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         .map(str::to_string);
     // A fork whose conversation was never made (its agent never got that
     // far) forks again rather than resume, from its parent's conversation
-    // as it is now: its note says so (unseen) before its file is written
-    // and the pane starts; what the start hands over is marked below.
+    // as it is now: its note says so in its file before the pane starts;
+    // the database takes the note (and the fork's other changes) only
+    // once the pane is up, so a restart that fails changes nothing.
     let refork = crate::fork::pending(db, &s)?;
-    if refork.is_some() {
-        crate::fork::renote(db, &s, now_ms())?;
-    }
+    let renewed_at = now_ms();
+    let renewed = match &refork {
+        Some(_) => crate::fork::renewed_note(db, &s, renewed_at)?,
+        None => None,
+    };
+    let renewed_note = renewed.as_deref().map(|body| context::Renewed {
+        source: "fork",
+        body,
+        at: renewed_at,
+    });
     // Its background as it was launched with, its file rewritten first
     // (related sessions' status, a rename: as they are now).
     // Best effort: a file that can't be written never stops the restart;
     // without it the start carries no flag or pointer naming it.
     let base = paths::data_dir();
     let bg_file = context::file_path(&base, &s.id);
-    let rewritten = match context::refresh_file(db, &base, &s) {
+    let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
         Ok(f) => f.is_some(),
         Err(e) => {
             tracing::warn!(session = %s.id, error = %e, "rewriting the background file");
@@ -1182,6 +1190,12 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     } else if refork.is_some() {
         // (Its thread, forked from the parent's, is one started from now.)
         note_first_prompt(db, &s.id, agent, None, now)?;
+    }
+    // The pane is up: the re-fork's note (as its file already showed it)
+    // and its new thread are stored now, before what it handed over is
+    // marked seen.
+    if let Some(body) = &renewed {
+        crate::fork::renote(db, &s, body, renewed_at)?;
     }
     if let Some(parent) = &refork {
         crate::fork::reforked(db, &s, parent)?;
