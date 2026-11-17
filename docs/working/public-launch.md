@@ -68,7 +68,7 @@ done, in this order (decided with the user, 2026-11-12):
        launch"). Not checked live: a draft held in a running OpenCode
        session through rlord, and a subagent asking for an unlisted tool
        on OpenCode.
-7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
+7. [x] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
        `docs/working-archive/codex-daemon.md`. Open until these live
@@ -88,9 +88,21 @@ done, in this order (decided with the user, 2026-11-12):
          rlord. Payloads and the bug it found (a `codex exec fork`
          `SessionStart` could bind a waiting session; fixed in
          0.23.0-dev.25): `docs/working-archive/codex-daemon.md`;
-       - [ ] a daemon restart or update mid-turn, by hand (what the session
+       - [x] a daemon restart or update mid-turn, by hand (what the session
          shows; `notLoaded` should read as not running, so it stops once
-         the pane is gone).
+         the pane is gone). Done 2026-11-16 on 0.23.0-dev.29, codex-cli
+         and daemon 0.169.0, macOS, scratch rlord and `CODEX_HOME` as
+         above (`daemon restart` only; `update` not run, nothing newer).
+         `restart` waits up to about 60s for a running turn, then
+         interrupts it (`turn_aborted`, `interrupted`), and the new daemon
+         at once starts the turn again on the same thread with no client
+         and no new prompt (the model re-ran its command). So the thread
+         stays loaded and `notLoaded` never came up; rlord was right
+         anyway: with the pane gone it stayed "working" while the
+         resumed turn ran and went "stopped" (`session_end`) within a
+         `discover` pass of `task_complete`. With the pane up, the TUI
+         showed "Conversation interrupted", then "Working" again, then
+         the answer. Details: `docs/working-archive/codex-daemon.md`.
        Linux is not a blocker (as in item 1): it is on the "After launch
        (owed, daemon mode)" list in `docs/working-archive/codex-daemon.md`.
 8. [x] Polish: clickable "more" markers, groups-tab counts, light-theme
@@ -126,10 +138,51 @@ done, in this order (decided with the user, 2026-11-12):
        will create one on claude/opus; under qemu the list can't start
        (ratatui ENOSYS: emulation only); the 0.18.1 stable tarballs
        carry those xattr warnings.
-10. [ ] 1.0.0 stable.
+10. [ ] Added 2026-11-16, before the 1.0 cut:
+       - [ ] #66 (`repo_latest`, fresh code for the overlord and new
+         sessions) and #67 (Developer ID signing, installers that fall
+         back when there is no stable release).
+       - [ ] Back-version the old stable tags (approved by the user): rename
+         `v0.2.0`…`v0.18.1` to `vX.Y.Z-dev.0`, delete the `v0.18.1`
+         release and remove the Homebrew formula. Do this after #67 is
+         released. Linux and Homebrew have no install until 1.0.0.
+       - [ ] `cargo xtask fresh-install`: its "newest stable from GitHub,
+         upgraded in place" run needs a stable release, and there won't be
+         one. Upgrade from the newest release instead.
+       - [x] Sign stable releases in CI (#67). Still owed by the
+         maintainer: the one-time secret and environment setup in
+         `docs/working/signing.md`, then a dry run, or 1.0.0's release
+         run fails.
+       - [ ] Session context PRs 2–4 (`docs/working/session-context.md`).
+         They change how prompts and messages reach sessions, so settle
+         them before calling it stable. They include the #64/#65
+         leftovers and the accumulating pending message.
+       - [ ] Website copy pass (`robot-lord/website`): bring every page up
+         to date with what shipped since it was last written. That covers
+         the overlord on any of the three agents, session background,
+         forking, fresh repo code and signed builds.
+       - [ ] By hand, by the user: the item 9 macOS fresh install.
+       - [ ] Not yet placed before or after 1.0 (the user decides): a
+         "waiting on background work" status. Today a session whose
+         agent stopped while background shells or subagents still run
+         shows "your turn". Count the launched background tasks in the
+         transcript against their completion notifications, with
+         Subagent hooks as a faster signal and plain code only. Fall back
+         to "your turn" when the transcript stops growing. Claude
+         first; Codex and OpenCode later.
+11. [ ] 1.0.0 stable.
 
-After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as
-repo secrets (to do later, not part of the CI release builds step).
+After 1.0:
+- 1.x features: an overlord that switches agent when it hits a usage limit,
+  and `[limits] auto_resume`, with a must-choose prompt when it isn't set.
+- An AUR package, and the Homebrew tap and crates.io tokens as repo secrets
+  (to do later, not part of the CI release builds step).
+- **Versioning changes at 1.0 (user, 2026-11-16).** A dev build no longer
+  claims the next minor version. Every dev build is a pre-release of the
+  next patch (after `1.0.0`: `1.0.1-dev.N`), and the stable cut picks
+  `1.0.1` or `1.1.0` to fit what changed. At the cut, update CLAUDE.md
+  ("Releases"), CONTRIBUTING.md, `xtask/src/version.rs` and
+  `check-version-bump` to match. Until then the 0.x scheme stays.
 
 ## Before flipping it public
 
