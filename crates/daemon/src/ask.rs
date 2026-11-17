@@ -203,7 +203,7 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
             "at": rlord_core::types::now_ms(),
             "chosen": params["chosen"], "resolved": params["resolved"],
             "repo": params["repo"], "agent": params["agent"], "model": params["model"],
-            "workspace": params["workspace"], "tags": params["tags"],
+            "workspace": params["workspace"], "tags": params["tags"], "base": params["base"],
         })),
     )?;
     let r = match send(d, &text) {
@@ -287,6 +287,17 @@ pub fn format_request(p: &Value) -> Result<String> {
         if wt { "yes" } else { "no" },
         source("worktree")
     );
+    // Where a new branch starts. Not sent (an older form): the config's.
+    m += &match get("base") {
+        Some(b) if b.eq_ignore_ascii_case("latest") => {
+            format!("- base: latest default branch ({})\n", source("base"))
+        }
+        Some(b) if b.eq_ignore_ascii_case("head") => {
+            format!("- base: the main checkout's HEAD ({})\n", source("base"))
+        }
+        Some(b) => format!("- base: {b} ({})\n", source("base")),
+        None => "- base: (the configured default)\n".to_string(),
+    };
     m += &if tags.is_empty() {
         "- tags: (you choose)\n".to_string()
     } else {
@@ -450,5 +461,18 @@ mod tests {
         );
         let c = format_request(&json!({"description": "x", "confirmed": true})).unwrap();
         assert!(c.contains("confirmed: yes\n") && c.contains("- repo: (you choose"));
+        // Where its branch starts: the config's unless the user said.
+        assert!(c.contains("- base: (the configured default)\n"), "{c}");
+        let b = format_request(&json!({"description": "x", "base": "feat",
+                                        "chosen": ["base"]}))
+        .unwrap();
+        assert!(b.contains("- base: feat (picked by the user)\n"), "{b}");
+        let b = format_request(&json!({"description": "x", "base": "latest",
+                                        "chosen": ["base"]}))
+        .unwrap();
+        assert!(
+            b.contains("- base: latest default branch (picked by the user)\n"),
+            "{b}"
+        );
     }
 }

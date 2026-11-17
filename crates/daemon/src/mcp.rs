@@ -71,7 +71,7 @@ pub fn tools() -> Value {
                       "description": "updated = last message (from the user, the agent, or one you sent it; a resume or status flip alone does not count); user = the user's own last prompt; state = last status change (started, stopped, finished, needs you); shown to the user as last message / last prompt / status change; usage = most used first, by the usage measure (see `usage`)"});
     let usage = json!({"type": "string", "enum": ["turns", "tokens", "context"],
                        "description": "The usage measure: turns (prompts the user typed), tokens (taken in new or written), context (% of the context window in use). Default: the user's configured one."});
-    let new_session_props = json!({
+    let mut new_session_props = json!({
         "repo": s("Git repo path to work in (see find_repos). Omit to use the configured default repo."),
         "project": s("Plain folder instead of a repo (no worktree)"),
         "name": s("Short display name; also derives the branch"),
@@ -84,6 +84,9 @@ pub fn tools() -> Value {
         "related": {"type": "array", "items": {"type": "string"},
                     "description": "Sessions this work builds on (id, id prefix or name; at most 8, and 16 per session in all): listed in its background with their folder, status and description. Not the overlord."},
     });
+    new_session_props["prefer"] = json!({"type": "string", "enum": ["local", "remote"],
+        "description": "Only with `base`, after a launch refused because that branch's local and remote sides have diverged: the side the user chose"});
+    new_session_props["base"] = s("Where a new branch starts. Omit or \"latest\": the latest default branch, fetched (unless the user's config says \"head\"). A branch name, or <remote>/<branch> for the remote's: its newest commit, to build on it (refused if the local and remote branch have diverged: ask the user, then pass `prefer`). \"head\": whatever the repo's main checkout has now. Ignored when `branch` already exists or there is no worktree. The answer's `base` says which commit was used.");
     let mut create_props = new_session_props.clone();
     create_props["go"] = b("Switch the user's terminal to the new session (default false)");
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
@@ -160,6 +163,14 @@ pub fn tools() -> Value {
         tool("find_repos",
             "Find git repos to launch sessions in: known repos (most recent first, default marked) plus repos discovered on disk. `scanning: true` means the first disk scan of the roots is still running, so only known repos are listed: ask again shortly if the repo isn't there. `skipped`: folders the scan stayed out of (a macOS privacy prompt, another disk): a repo in one is found by its path, not by scanning.",
             json!({"query": s("Words that must appear in the path")}), &[]),
+        tool("repo_latest",
+            "The latest committed code of a repo, in a read-only folder rlord keeps in the repo (`<repo>/.worktrees/.rlord-latest`, a detached checkout; never the user's own, never a session's). Plain code, no AI: fetches the one branch (cached for a minute; offline is reported, not an error), then moves that folder: with no `ref`, to the default branch's commit as the remote has it, even when the local branch is ahead (a `local_ahead` warning says so); for `ref`, to whichever of the local and remote branch is ahead. One folder per repo: a call for another ref moves it, so whoever reads it should check `commit` (or `git -C <path> rev-parse HEAD`). Anything edited in it is thrown away on the next move. `diverged`: both sides are returned and nothing moves; ask the user, then pass `prefer`. Answers with `path` (read there), `ref`, `commit`, `moved` (from where, how many commits), `fetch` (fetched; cached; running: ask again shortly; offline; failed; missing: not on the remote; no_remote), `local` (the user's branch: ahead/behind, where it is checked out, how many files are uncommitted there) and `warnings`. A folder that is not a git repo comes back as it is. Name the commit when you answer (\"on main at abc1234\"). Uncommitted work is only in the user's or a session's own folder (`local` says where and, for a `ref`, how much): ask that session, and read its folder only when the user asks about what it hasn't committed. A session in an existing folder (no worktree) is never updated by rlord: to give it the latest code to read, put this `path` and `commit` in its `context`. Pass on a warning that changes the answer, in a few words (\"offline: as of the last fetch\").",
+            json!({
+                "repo": s("Repo path (see find_repos), or any folder inside it"),
+                "ref": s("A branch name, e.g. a session's `branch`; <remote>/<branch> for the remote's. Omit for the default branch"),
+                "prefer": {"type": "string", "enum": ["local", "remote"],
+                           "description": "Only after a `diverged` answer: the side the user chose"},
+            }), &["repo"]),
         tool("get_session_defaults",
             "The defaults new sessions get (agent, model, model choices, workspace, default repo), `code_dir` (the folder the user keeps repos in and where new ones go; \"\" = not set yet, see confirm_setup), `repo_roots` as the user configured them, `scan_roots` (what the repo finder scans right now: a readout, never pass it to confirm_setup as repo_roots), and under `agents` each agent rlord can run: whether it's installed, its default model and its model choices.",
             json!({}), &[]),
@@ -198,7 +209,8 @@ pub fn tools() -> Value {
                 "model": s("Model as you would launch it (\"\" for the agent default)"),
                 "workspace": b("Own git worktree"),
                 "tags": {"type": "array", "items": {"type": "string"}},
-                "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "agent", "model", "worktree", "tags"]},
+                "base": s("Where its new branch would start, as you would launch it: \"latest\" (the latest default branch), a branch or <remote>/<branch> to build on, or \"head\" (omit: what the user sent)"),
+                "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "agent", "model", "worktree", "base", "tags"]},
                             "description": "Hints you changed from what the user sent"},
                 "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),
             }), &["description", "changed", "note"]),
@@ -458,6 +470,73 @@ fn shape_find_repos(r: &Value, query: &str) -> Value {
     out
 }
 
+/// A full commit id, short.
+fn short_commit(v: &Value) -> Value {
+    match v.as_str() {
+        Some(c) => json!(rlord_core::latest::short(c)),
+        None => v.clone(),
+    }
+}
+
+/// Drop nulls, empty strings, lists and objects, all the way down.
+fn prune_empty(v: &mut Value) {
+    if let Value::Object(m) = v {
+        for x in m.values_mut() {
+            prune_empty(x);
+        }
+        m.retain(|_, x| {
+            !(x.is_null()
+                || x.as_array().is_some_and(Vec::is_empty)
+                || x.as_object().is_some_and(Map::is_empty)
+                || x.as_str() == Some(""))
+        });
+    }
+}
+
+/// `*_at` times as ages (`committed_at` → `committed: "2h ago"`) and
+/// commits short, in one level of `v`.
+fn ages_and_commits(v: &mut Value) {
+    let Value::Object(m) = v else {
+        return;
+    };
+    for (k, out) in [("committed_at", "committed"), ("fetched_at", "fetched")] {
+        if let Some(t) = m.remove(k).and_then(|t| t.as_i64()) {
+            m.insert(out.into(), json!(format!("{} ago", rel_age(Some(t)))));
+        }
+    }
+    for k in ["commit", "from"] {
+        if let Some(c) = m.get(k).map(short_commit) {
+            m.insert(k.into(), c);
+        }
+    }
+}
+
+/// What `repo_latest` hands the overlord from `repo.latest`: short
+/// commits, ages, nothing empty.
+fn shape_repo_latest(r: &Value) -> Value {
+    let mut v = r.clone();
+    ages_and_commits(&mut v);
+    for k in ["moved", "local", "remote_side"] {
+        if let Some(x) = v.get_mut(k) {
+            ages_and_commits(x);
+        }
+    }
+    // (The RPC's name for the remote side: `remote` is the remote's name.)
+    if let Some(side) = v.as_object_mut().and_then(|m| m.remove("remote_side")) {
+        v["remote_branch"] = side;
+    }
+    prune_empty(&mut v);
+    v
+}
+
+/// A launch's `base` for the overlord.
+fn shape_base(b: &Value) -> Value {
+    let mut v = b.clone();
+    ages_and_commits(&mut v);
+    prune_empty(&mut v);
+    v
+}
+
 fn params_wants_remote(args: &Value) -> bool {
     args.get("remote_control").and_then(Value::as_bool) == Some(true)
 }
@@ -466,7 +545,8 @@ fn params_wants_remote(args: &Value) -> bool {
 fn new_session_params(args: &Value) -> Value {
     let mut p = Map::new();
     for k in [
-        "repo", "project", "name", "branch", "agent", "model", "prompt", "context",
+        "repo", "project", "name", "branch", "agent", "model", "prompt", "context", "base",
+        "prefer",
     ] {
         if let Some(v) = arg_str(args, k) {
             p.insert(k.into(), json!(v));
@@ -560,6 +640,14 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let r = d.rpc("repo.find", json!({}))?;
             Ok(shape_find_repos(&r, arg_str(args, "query").unwrap_or("")))
         }
+        "repo_latest" => {
+            let r = d.rpc(
+                "repo.latest",
+                json!({"repo": arg_str(args, "repo").context("missing repo")?,
+                       "ref": arg_str(args, "ref"), "prefer": arg_str(args, "prefer")}),
+            )?;
+            Ok(shape_repo_latest(&r))
+        }
         // (Asked before most launches: not the moment to run a command
         // for a model list. The form and `list_agents` do.)
         "get_session_defaults" => d.rpc("session.defaults", json!({"no_listing": true})),
@@ -617,6 +705,9 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             let s = d.rpc("session.new", params)?;
             let mut out = summarize(&s);
+            if !s["base"].is_null() {
+                out["base"] = shape_base(&s["base"]);
+            }
             if let Some(n) = remote_note {
                 out["remote"] = n;
             } else if params_wants_remote(args) {
@@ -928,7 +1019,42 @@ mod tests {
         "send_to_session",
         "resume_after_limit",
         "session_action",
+        // (Fetches, and moves rlord's tree in the repo.)
+        "repo_latest",
     ];
+
+    #[test]
+    fn repo_latest_is_shaped_for_the_overlord() {
+        let now = rlord_core::types::now_ms();
+        let r = json!({
+            "repo": "/r", "git": true, "path": "/r/.worktrees/.rlord-latest", "ref": "main",
+            "default_branch": true, "remote": "origin", "commit": "abcdef1234567890",
+            "subject": "Fix", "committed_at": now - 7_200_000, "source": "remote",
+            "fetch": "fetched", "fetched_at": now,
+            "moved": {"from": "9f8e7d6c5b4a", "commits": 14},
+            "local": {"ahead": 0, "behind": 3, "checked_out_at": "/r", "uncommitted": null},
+            "warnings": [],
+        });
+        let v = shape_repo_latest(&r);
+        assert_eq!(v["commit"], "abcdef1");
+        assert_eq!(v["committed"], "2h ago");
+        assert_eq!(v["fetched"], "0s ago");
+        assert_eq!(v["moved"], json!({"from": "9f8e7d6", "commits": 14}));
+        assert!(v.get("warnings").is_none() && v.get("committed_at").is_none());
+        assert!(v["local"].get("uncommitted").is_none());
+        // Diverged: both sides, short.
+        let r = json!({"git": true, "ref": "x", "remote": "origin", "diverged": true,
+                       "local": {"commit": "1111111111", "ahead": 2},
+                       "remote_side": {"commit": "2222222222", "ahead": 5}, "hint": "ask"});
+        let v = shape_repo_latest(&r);
+        assert_eq!(v["local"]["commit"], "1111111");
+        assert_eq!(v["remote_branch"], json!({"commit": "2222222", "ahead": 5}));
+        assert_eq!(v["remote"], "origin");
+        assert_eq!(
+            shape_base(&json!({"commit": "abcdef1234", "label": "origin/main", "warnings": []})),
+            json!({"commit": "abcdef1", "label": "origin/main"})
+        );
+    }
 
     #[test]
     fn find_repos_reports_skipped_folders_and_no_roots() {
@@ -957,10 +1083,13 @@ mod tests {
             "prompt": "fix it", "context": "repo is /r", "related": ["auth", 3, " "],
             "extra_args": ["--dangerously-skip-permissions"], "role": "overlord",
             "tmux_name": "x", "by_overlord": false,
+            // (`base_resolved` only from the daemon.)
+            "base": "feat", "base_resolved": {"commit": "x"},
+            "location_resolved": {"repo": "/x", "project": "/x"},
         }));
         assert_eq!(
             p,
-            json!({"prompt": "fix it", "context": "repo is /r", "related": ["auth"]})
+            json!({"prompt": "fix it", "context": "repo is /r", "related": ["auth"], "base": "feat"})
         );
     }
 

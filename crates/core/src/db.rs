@@ -449,6 +449,15 @@ impl Db {
         Ok(())
     }
 
+    /// Every kv entry whose key starts with `prefix`, by key.
+    pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare(
+            "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+        )?;
+        let rows = st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO kv (key, value) VALUES (?1, ?2) \

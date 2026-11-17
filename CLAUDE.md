@@ -77,6 +77,9 @@ the deterministic part and hands it only what needs judgment.
   session's agent for a report, rlord works out which sessions changed since
   the overlord last reviewed them, what their meta-context is missing, and
   excerpts from their transcripts. The overlord spends tokens only on those.
+- Example: `repo_latest` (`crates/daemon/src/repo_latest.rs`). Rather than
+  have the overlord reason about which checkout is current, rlord fetches
+  the branch and hands back one read-only tree at its newest commit.
 - Signals come from data rlord already has: DB timestamps, hook events, kv
   watermarks, transcript files read directly. Don't add an AI call inside
   rlord to produce them.

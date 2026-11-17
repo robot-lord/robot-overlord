@@ -155,6 +155,28 @@ enum Command {
     },
     /// List git repos rlord has used, most recent first
     Repos,
+    /// The latest committed code of a repo, in rlord's read-only tree
+    /// (`<repo>/.worktrees/.rlord-latest`): fetches the branch, moves the
+    /// tree to its newest commit, prints the path and commit. Anything
+    /// edited in the tree is thrown away when it moves.
+    Latest {
+        /// The repo, or any folder in it (default: the current folder)
+        repo: Option<String>,
+        /// A branch (default: the default branch); <remote>/<branch> for the remote's
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// After a "diverged" answer: the side to use (local or remote)
+        #[arg(long)]
+        prefer: Option<String>,
+        /// List the trees rlord keeps
+        #[arg(long, conflicts_with_all = ["git_ref", "prefer", "prune"])]
+        list: bool,
+        /// Remove the tree and rlord's private refs: of REPO, or of every repo
+        #[arg(long, conflicts_with_all = ["git_ref", "prefer"])]
+        prune: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Set your code folder: where your repos live and new ones go (the
     /// repo finder scans it). Without PATH, rlord suggests one from the
     /// projects it has seen and asks.
@@ -980,6 +1002,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Latest {
+            repo,
+            git_ref,
+            prefer,
+            list,
+            prune,
+            json,
+        } => latest_cmd(repo, git_ref, prefer, list, prune, json).map(drop),
         Command::Attach { r#ref } => {
             let s = call("session.get", json!({"ref": r#ref}))?;
             let tmux_name = s["tmux_session"]
@@ -1926,6 +1956,117 @@ fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
     rlord_core::config::absolute_dir(&abs)
 }
 
+/// `rlord latest`: one RPC each (`repo.latest`, `_list`, `_prune`).
+fn latest_cmd(
+    repo: Option<String>,
+    git_ref: Option<String>,
+    prefer: Option<String>,
+    list: bool,
+    prune: bool,
+    json: bool,
+) -> Result<Value> {
+    let abs = |r: String| -> Result<String> {
+        let p = std::path::PathBuf::from(rlord_core::config::expand_tilde(&r));
+        Ok(if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir()?.join(p)
+        }
+        .to_string_lossy()
+        .into_owned())
+    };
+    let v = if list {
+        call("repo.latest_list", json!({}))?
+    } else if prune {
+        call(
+            "repo.latest_prune",
+            json!({"repo": repo.map(abs).transpose()?}),
+        )?
+    } else {
+        let repo = abs(repo.unwrap_or_else(|| ".".into()))?;
+        call(
+            "repo.latest",
+            json!({"repo": repo, "ref": git_ref, "prefer": prefer}),
+        )?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(v);
+    }
+    let short = |c: &Value| {
+        c.as_str()
+            .map(rlord_core::latest::short)
+            .unwrap_or("-")
+            .to_string()
+    };
+    if list {
+        for t in v["trees"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            println!(
+                "{:<6} {:<20} {}  {}",
+                rel_age(t["used_at"].as_i64()),
+                t["ref"].as_str().unwrap_or("-"),
+                short(&t["commit"]),
+                t["path"].as_str().or(t["repo"].as_str()).unwrap_or("?")
+            );
+        }
+    } else if prune {
+        for r in v["removed"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            println!("removed {}", r.as_str().unwrap_or("?"));
+        }
+        for f in v["failed"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            eprintln!(
+                "{}: {}",
+                f["repo"].as_str().unwrap_or("?"),
+                f["error"].as_str().unwrap_or("")
+            );
+        }
+    } else if v["git"] == false {
+        println!("{} (not a git repo)", v["path"].as_str().unwrap_or("?"));
+    } else if v["diverged"] == true {
+        let side = |s: &Value| {
+            format!(
+                "{} {} ({} ahead)",
+                short(&s["commit"]),
+                s["subject"].as_str().unwrap_or(""),
+                s["ahead"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or("?".into())
+            )
+        };
+        println!("{} has diverged:", v["ref"].as_str().unwrap_or("?"));
+        println!("  local:  {}", side(&v["local"]));
+        println!("  remote: {}", side(&v["remote_side"]));
+        println!("pass --prefer local or --prefer remote");
+    } else {
+        println!("{}", v["path"].as_str().unwrap_or("?"));
+        println!(
+            "{} at {} ({}) {}; fetch: {}",
+            v["ref"].as_str().unwrap_or("?"),
+            short(&v["commit"]),
+            v["source"].as_str().unwrap_or("?"),
+            v["subject"].as_str().unwrap_or(""),
+            v["fetch"].as_str().unwrap_or("?")
+        );
+    }
+    for w in v["warnings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        eprintln!("warning: {}", w.as_str().unwrap_or(""));
+    }
+    Ok(v)
+}
+
 fn call(method: &str, params: Value) -> Result<Value> {
     static ENSURED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let socket = paths::socket_path();
@@ -1985,6 +2126,8 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::summary::start(&daemon);
         // Restart an idle overlord on a fresh conversation (context hygiene).
         rlord_daemon::overlord::start_fresh_keeper(&daemon);
+        // Remove rlord's read-only trees of repos that are gone or unused.
+        rlord_daemon::repo_latest::start_sweeper(&daemon);
         rlord_daemon::remote::start(&daemon);
         // Sessions whose agent isn't reporting through hooks (Codex, untrusted).
         rlord_daemon::discover::start(&daemon);

@@ -88,8 +88,10 @@ pub fn workspace_path(repo: &str, workspace_dir: &str, branch: &str) -> PathBuf 
 
 /// Create the worktree at `dir` on `branch`. With no `start`: a new branch
 /// off the repo's HEAD, or a checkout of `branch` if it already exists.
-/// With `start` (a fork's: its parent's last commit): a new branch started
-/// there, and an existing branch is refused. Errors if git refuses (e.g.
+/// With `start` (a fork's: its parent's last commit; a new session's
+/// base, `latest.rs`): a new branch started there, with no upstream
+/// (`--no-track`: a start at a private ref never becomes it), and an
+/// existing branch is refused. Errors if git refuses (e.g.
 /// the branch is checked out elsewhere), or the folder exists.
 pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -> Result<()> {
     if dir.exists() {
@@ -106,7 +108,17 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
     match (exists, start) {
         (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch])?,
         (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?,
-        (false, Some(s)) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s, s])?,
+        (false, Some(start)) => git(&[
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            &dir_s,
+            start,
+        ])?,
     };
     Ok(())
 }
@@ -162,23 +174,19 @@ pub fn branches(repo: &str) -> std::collections::HashSet<String> {
 
 /// Whether `repo` has a local branch named `branch`.
 pub fn branch_exists(repo: &str, branch: &str) -> bool {
-    git(&[
-        "-C",
-        repo,
-        "rev-parse",
-        "--verify",
-        "--quiet",
+    crate::latest::commit_of(
+        &crate::latest::GitEnv::default(),
+        Path::new(repo),
         &format!("refs/heads/{branch}"),
-    ])
-    .is_ok()
+    )
+    .is_some()
 }
 
 /// Whether some checkout of `repo` (the main one or a worktree) has
 /// `branch` checked out; `git worktree add` refuses a second one.
 pub fn branch_checked_out(repo: &str, branch: &str) -> bool {
-    let want = format!("branch refs/heads/{branch}");
-    git(&["-C", repo, "worktree", "list", "--porcelain"])
-        .map(|out| out.lines().any(|l| l == want))
+    crate::latest::worktree_list(&crate::latest::GitEnv::default(), Path::new(repo))
+        .map(|l| l.iter().any(|e| e.branch.as_deref() == Some(branch)))
         .unwrap_or(false)
 }
 
