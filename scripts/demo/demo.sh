@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A throwaway rlord full of made-up sessions, for screenshots and trying the
 # UI. Fully separate from a real install: its own data, config and tmux
-# server (rlord-demo); "claude", "codex" and "opencode" are stand-ins
+# server (rlord-demo, or $RLORD_DEMO_SOCKET for a second demo beside
+# it); "claude", "codex" and "opencode" are stand-ins
 # (scripts/demo/bin) that draw a screen and report state as the real ones
 # would (rlord's hooks; OpenCode: its session database), with no model.
 #
@@ -21,7 +22,7 @@ if [[ ${1:-} == --stop ]]; then
   # shellcheck disable=SC1091
   source "$d/env.sh"
   rlord tmux unbind >/dev/null 2>&1 || true
-  tmux -L rlord-demo kill-server 2>/dev/null || true
+  tmux -L "$RLORD_TMUX_SOCKET" kill-server 2>/dev/null || true
   pkill -f "$d/bin/rlord daemon" 2>/dev/null || true
   exit 0
 fi
@@ -67,7 +68,7 @@ chmod +x "$d/bin/demo-shell"
 cat > "$d/env.sh" <<EOF
 export XDG_DATA_HOME=$d/data XDG_CONFIG_HOME=$d/config XDG_RUNTIME_DIR=$d/run
 export XDG_STATE_HOME=$d/state CLAUDE_CONFIG_DIR=$d/claude CODEX_HOME=$d/codex
-export RLORD_TMUX_SOCKET=rlord-demo RLORD_DEMO_DIR=$d
+export RLORD_TMUX_SOCKET=${RLORD_DEMO_SOCKET:-rlord-demo} RLORD_DEMO_DIR=$d
 # Only the stand-in agents: never ask a login shell where a real one is.
 export RLORD_NO_LOGIN_SHELL=1 SHELL=$d/bin/demo-shell
 export PATH=$d/bin:\$PATH
