@@ -217,7 +217,7 @@ pub fn tools() -> Value {
                 "description": s("Its one-line description (default: the original's)"),
                 "model": s("Another model than the original's, one of that agent's (default: the original's)"),
                 "worktree": b("Work in a new git worktree branched from the original's last commit instead of its folder (default false). Claude Code and Codex only; uncommitted changes don't come along. Only when the user asks, or the two must not touch the same files."),
-                "branch": s("The new worktree's branch (default: derived from the name)"),
+                "branch": s("The new worktree's branch, with worktree only (default: derived from the name)"),
                 "go": b("Switch the user's terminal to the fork (default false)"),
             }), &["session"]),
         tool("update_session",

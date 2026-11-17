@@ -350,17 +350,17 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
         );
     }
     // A conversation the agent never wrote (Claude writes its transcript
-    // with the first message).
-    let written = match db.transcript_source(&parent.id)? {
-        Some(t) if agent != Agent::OpenCode => std::path::Path::new(&t).exists(),
-        Some(_) => true,
-        None if agent == Agent::Claude => {
-            claude::transcript_path(&parent.project_path, &conversation).exists()
-        }
-        None => true,
-    };
-    if !written {
-        return Err(nothing());
+    // with the first message; a Codex thread with no rollout has none).
+    if !conversation_on_disk(db, &parent)? {
+        bail!(
+            "nothing to fork yet: {}'s conversation isn't on disk (no {} written yet)",
+            parent.name,
+            if agent == Agent::Codex {
+                "rollout"
+            } else {
+                "transcript"
+            }
+        );
     }
     let spec: Value = serde_json::from_str(&db.launch_spec(&parent.id)?).unwrap_or(json!({}));
     // (Checked as for a new session: the parent's own links are copied,
@@ -376,6 +376,10 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
     let auto_name = asked.is_none();
     let name = asked.unwrap_or_else(|| default_name(db, &parent.name));
     let wants_worktree = params["workspace"] == true;
+    // (As `rlord fork --branch` needs `--worktree`.)
+    if p_opt("branch").is_some() && !wants_worktree {
+        bail!("a branch is for a new worktree: ask for the worktree too, or leave the branch out");
+    }
     if wants_worktree {
         if !agent.forks_elsewhere() {
             bail!(
@@ -741,23 +745,7 @@ pub(crate) fn pending(db: &Db, s: &Session) -> Result<Option<String>> {
     let Some(v) = db.kv_get(&pending_key(&s.id))? else {
         return Ok(None);
     };
-    let exists = match Agent::parse(&s.agent) {
-        Some(Agent::Claude) => match (s.agent_session.as_deref(), db.transcript_source(&s.id)?) {
-            (None, _) => false,
-            (Some(_), Some(t)) => std::path::Path::new(&t).exists(),
-            (Some(sid), None) => claude::transcript_path(&s.project_path, sid).exists(),
-        },
-        // Bound is not enough: its rollout must be on disk, or `codex
-        // resume` finds no conversation.
-        Some(Agent::Codex) => {
-            s.agent_session.is_some()
-                && db
-                    .transcript_source(&s.id)?
-                    .is_some_and(|t| std::path::Path::new(&t).exists())
-        }
-        _ => true,
-    };
-    if exists {
+    if conversation_on_disk(db, s)? {
         db.kv_delete(&pending_key(&s.id))?;
         return Ok(None);
     }
@@ -823,6 +811,28 @@ pub(crate) fn reforked(db: &Db, s: &Session, parent: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether session `s`'s conversation is on disk: what a fork copies and a
+/// resume continues. Claude: its transcript (the one its hooks named, else
+/// where it files its id); Codex: a bound thread whose rollout is there
+/// (bound alone isn't enough: `codex resume` / `codex fork` find no
+/// conversation); OpenCode: its session (its server makes it at once).
+/// The one check, for a fork's parent (`want`) and a fork's restart
+/// (`pending`).
+pub(crate) fn conversation_on_disk(db: &Db, s: &Session) -> Result<bool> {
+    let Some(sid) = s.agent_session.as_deref() else {
+        return Ok(false);
+    };
+    let on_disk = |t: String| std::path::Path::new(&t).exists();
+    Ok(match Agent::parse(&s.agent) {
+        Some(Agent::Claude) => match db.transcript_source(&s.id)? {
+            Some(t) => on_disk(t),
+            None => claude::transcript_path(&s.project_path, sid).exists(),
+        },
+        Some(Agent::Codex) => db.transcript_source(&s.id)?.is_some_and(on_disk),
+        _ => true,
+    })
+}
+
 /// The command that forks again for a restart of a fork that never
 /// materialized (`pending`): Claude under the fork's own id, Codex anew.
 pub(crate) fn refork_argv(
@@ -870,6 +880,13 @@ mod tests {
             role,
         })
         .unwrap();
+        // A conversation is on disk (a test that wants none says so).
+        if conv.is_some() && std::path::Path::new(dir).is_dir() {
+            let t = std::path::Path::new(dir).join(format!("{id}-conversation.jsonl"));
+            std::fs::write(&t, "{}\n").unwrap();
+            db.upsert_transcript_source(id, t.to_str().unwrap())
+                .unwrap();
+        }
     }
 
     /// A worktree fork works in the parent's subfolder of the new
@@ -909,6 +926,11 @@ mod tests {
                 role: "",
             })
             .unwrap();
+            // (Its rollout, outside the repo.)
+            let t = dir.path().join(format!("{id}-rollout.jsonl"));
+            std::fs::write(&t, "{}\n").unwrap();
+            db.upsert_transcript_source(id, t.to_str().unwrap())
+                .unwrap();
         }
         let cfg = Config::default();
         let plan = |id: &str| {
@@ -969,6 +991,14 @@ mod tests {
         assert!(err(&db, json!({"ref": "b"})).contains("nothing to fork yet"));
         std::fs::write(&absent, "{}\n").unwrap();
         assert!(want(&db, &json!({"ref": "b"})).is_ok());
+        // A Codex thread bound but with no rollout on disk: said plainly.
+        mk(&db, "cx", "codex", Some("t-cx"), here, "");
+        db.upsert_transcript_source("cx", dir.path().join("none.jsonl").to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            err(&db, json!({"ref": "cx"})),
+            "nothing to fork yet: n-cx's conversation isn't on disk (no rollout written yet)"
+        );
         // A guessed id.
         mk(&db, "s", "codex", Some("t-s"), here, "");
         db.set_agent_session("s", "t-s", "scavenged").unwrap();
@@ -988,6 +1018,8 @@ mod tests {
         assert!(err(&db, json!({"ref": "oc", "workspace": true})).contains("same folder"));
         mk(&db, "c", "codex", Some("t-c"), here, "");
         assert!(err(&db, json!({"ref": "c", "workspace": true})).contains("git repo"));
+        // A branch without a worktree: refused, as the CLI does.
+        assert!(err(&db, json!({"ref": "c", "branch": "b"})).contains("new worktree"));
         // The overlord is no related session.
         assert!(err(&db, json!({"ref": "c", "related": ["o"]})).contains("overlord"));
     }

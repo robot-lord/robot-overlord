@@ -1010,8 +1010,8 @@ mod tests {
         let alone = [w("plain", None, 500), w("fa", Some("parent"), 1_000)];
         assert!(place_of(&alone, &session("plain"), 3_000).0);
         assert!(!place_of(&alone, &session("plain"), 1_000 + UNREAD_GRACE_MS).0);
-        // Another ordinary session always does.
-        assert!(place_of(&waiting, &session("plain"), 1_000_000).0 == false);
+        // Forks past the grace: no longer; another ordinary session always.
+        assert!(!place_of(&waiting, &session("plain"), 1_000_000).0);
         let two_plain = [w("plain", None, 500), w("plain2", None, 600)];
         assert!(place_of(&two_plain, &session("plain"), 1_000_000).0);
     }
