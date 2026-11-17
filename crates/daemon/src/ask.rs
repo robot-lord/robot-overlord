@@ -204,6 +204,7 @@ pub fn new_session(d: &Daemon, params: &Value) -> Result<Value> {
             "chosen": params["chosen"], "resolved": params["resolved"],
             "repo": params["repo"], "agent": params["agent"], "model": params["model"],
             "workspace": params["workspace"], "tags": params["tags"], "base": params["base"],
+            "prefer": params["prefer"],
         })),
     )?;
     let r = match send(d, &text) {

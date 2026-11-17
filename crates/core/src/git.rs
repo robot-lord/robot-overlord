@@ -201,6 +201,10 @@ pub fn ensure_excluded(repo: &str, workspace_dir: &str) -> Result<()> {
     };
     let exclude = git_dir.join("info").join("exclude");
     let line = format!("/{}/", workspace_dir.trim_matches('/'));
+    // One at a time (two launches into one repo would both add the line),
+    // and appended in one write, never rewriting what is there.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     if current.lines().any(|l| l.trim() == line) {
         return Ok(());
@@ -208,13 +212,18 @@ pub fn ensure_excluded(repo: &str, workspace_dir: &str) -> Result<()> {
     if let Some(p) = exclude.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let mut content = current;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
+    let mut add = String::new();
+    if !current.is_empty() && !current.ends_with('\n') {
+        add.push('\n');
     }
-    content.push_str(&line);
-    content.push('\n');
-    std::fs::write(&exclude, content)?;
+    add.push_str(&line);
+    add.push('\n');
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?
+        .write_all(add.as_bytes())?;
     Ok(())
 }
 
@@ -774,9 +783,16 @@ mod tests {
             std::fs::canonicalize(&repo).unwrap().to_string_lossy()
         );
         ensure_excluded(r, ".worktrees").unwrap();
-        ensure_excluded(r, ".worktrees").unwrap(); // idempotent
+        // Idempotent, and at once from many threads still one line.
+        ensure_excluded(r, ".worktrees").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| ensure_excluded(r, ".rlord-many").unwrap());
+            }
+        });
         let ex = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert_eq!(ex.matches("/.worktrees/").count(), 1);
+        assert_eq!(ex.matches("/.rlord-many/").count(), 1);
         assert!(git(&["-C", r, "status", "--porcelain"]).unwrap().is_empty());
         // Existing dir is refused, existing branch is checked out.
         assert!(worktree_add(r, "feature/one", &ws, None).is_err());

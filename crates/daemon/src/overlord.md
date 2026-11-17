@@ -211,7 +211,7 @@ something else, and don't launch what the hints say either:
 - `confirmed: no` and the description contradicts a hint: call
   `confirm_new_session` with its `request_id`, their description verbatim,
   every hint as you would launch it (one you leave out goes back to its
-  default), `changed` naming the ones you changed, and a one-line
+  default, except `base`, which stays as the user sent it: `""` resets it), `changed` naming the ones you changed, and a one-line
   `note` ("Updated to match your description: repo is myapp"). Then
   stop and reply in one line that you're waiting for them to confirm.
   Defaults the description doesn't contradict stay as they are.

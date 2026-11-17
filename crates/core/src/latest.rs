@@ -1156,7 +1156,7 @@ pub fn may_touch(recorded: Option<&Path>, dir: &Path, entry: &Entry) -> Result<(
 /// git not running) says nothing about the tree: the caller leaves it.
 fn inspect(env: &GitEnv, repo: &Repo, dir: &Path) -> Result<Option<bool>> {
     let o = run(
-        env,
+        &pinned(env, dir),
         dir,
         &[
             "rev-parse",
@@ -1179,6 +1179,17 @@ fn inspect(env: &GitEnv, repo: &Repo, dir: &Path) -> Result<Option<bool>> {
     let itself =
         Path::new(top) == dir && Path::new(gitdir).starts_with(repo.common.join("worktrees"));
     Ok(itself.then_some(head == "HEAD"))
+}
+
+/// `env` for git run inside rlord's tree `dir`: git looks for a repo in
+/// `dir` itself and never above it (`GIT_CEILING_DIRECTORIES`), so with
+/// the tree's `.git` broken or gone it fails rather than reaching the
+/// user's checkout that holds `.worktrees`.
+fn pinned(env: &GitEnv, dir: &Path) -> GitEnv {
+    match dir.parent() {
+        Some(p) => env.with("GIT_CEILING_DIRECTORIES", p.to_string_lossy().into()),
+        None => env.clone(),
+    }
 }
 
 /// `inspect`, as a check: it is that worktree, detached.
@@ -1373,6 +1384,8 @@ pub fn tree_move(
     entry: &Entry,
     fs_ok: bool,
 ) -> Result<Moved> {
+    // (Every git call inside the tree is pinned to it: `pinned`.)
+    let tenv = &pinned(env, dir);
     // rlord's by name and record, but a branch got checked out in it:
     // detached again (only once it is verifiably that worktree), not
     // refused forever. Unrecorded, or not itself: `may_touch` refuses.
@@ -1387,7 +1400,7 @@ pub fn tree_move(
         && inspect(env, repo, dir)?.is_some()
     {
         forced = git(
-            env,
+            tenv,
             dir,
             &["status", "--porcelain", "--untracked-files=no"],
             CHECKOUT,
@@ -1395,7 +1408,7 @@ pub fn tree_move(
         .lines()
         .count() as u32;
         git(
-            env,
+            tenv,
             dir,
             &["checkout", "--quiet", "--detach", "--force"],
             CHECKOUT,
@@ -1443,7 +1456,7 @@ pub fn tree_move(
         Some(true) => {}
     }
     let in_tree = |args: &[&str]| {
-        git(env, dir, args, CHECKOUT).map_err(|e| {
+        git(tenv, dir, args, CHECKOUT).map_err(|e| {
             let e = e.to_string();
             let hint = if e.contains("index.lock") {
                 " (a git command may be running there; if none is, remove its index.lock)"
@@ -1460,7 +1473,7 @@ pub fn tree_move(
     // checkout killed partway can leave HEAD at the commit with files
     // missing.
     // (A big tree's status can take a while: the checkout's time limit.)
-    let head = commit_of(env, dir, "HEAD");
+    let head = commit_of(tenv, dir, "HEAD");
     let dirty = if complete == Some(commit) && head.as_deref() == Some(commit) {
         // At the commit: one cheap status; clean, nothing to do.
         let dirty = in_tree(&["status", "--porcelain", "--untracked-files=normal"])?;
@@ -1566,9 +1579,10 @@ pub fn drop_refs(env: &GitEnv, repo: &Path) -> Result<usize> {
 /// What the tree's checkout leaves out, said as warnings (git only).
 pub fn tree_warnings(env: &GitEnv, repo: &Path, dir: &Path) -> Vec<String> {
     let mut w = Vec::new();
+    let tenv = &pinned(env, dir);
     let has = |path: &str| {
         run(
-            env,
+            tenv,
             dir,
             &["cat-file", "-e", &format!("HEAD:{path}")],
             PLUMBING,
@@ -1578,7 +1592,7 @@ pub fn tree_warnings(env: &GitEnv, repo: &Path, dir: &Path) -> Vec<String> {
     if has(".gitmodules") {
         w.push("submodules_not_checked_out: submodule folders are empty".to_string());
     }
-    let lfs = run(env, dir, &["show", "HEAD:.gitattributes"], PLUMBING)
+    let lfs = run(tenv, dir, &["show", "HEAD:.gitattributes"], PLUMBING)
         .is_ok_and(|o| o.ok && o.stdout.contains("filter=lfs"));
     if lfs {
         w.push("lfs_pointers: Git LFS files are pointers, not their content".to_string());
@@ -2584,6 +2598,48 @@ mod tests {
         let e = entry(&r, &repo, &dir).unwrap();
         assert!(tree_remove(&r.env, &repo, &dir, None, &e, true).is_err());
         assert!(dir.exists());
+    }
+
+    /// With the tree's `.git` gone, git run in the tree never reaches the
+    /// user's checkout around it: its branch, edits and untracked files
+    /// stay as they are, through a direct call and a whole move.
+    #[test]
+    fn git_in_a_broken_tree_never_reaches_the_users_checkout() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let repo = repo_of(&r, c);
+        let head = r.g(c, &["rev-parse", "HEAD"]);
+        let dir = tree_path(c);
+        tree_add(&r.env, &repo, &dir, &head, false).unwrap();
+        // The user's work: a tracked file edited, an untracked one.
+        std::fs::write(c.join("f.txt"), "one").unwrap();
+        r.g(c, &["add", "f.txt"]);
+        let mine = r.commit(c, "f");
+        std::fs::write(c.join("f.txt"), "edited").unwrap();
+        std::fs::write(c.join("new.txt"), "mine").unwrap();
+        std::fs::remove_file(dir.join(".git")).unwrap();
+        let o = run(
+            &pinned(&r.env, &dir),
+            &dir,
+            &["checkout", "--quiet", "--detach", "--force"],
+            PLUMBING,
+        )
+        .unwrap();
+        assert!(!o.ok);
+        assert!(
+            !run(&pinned(&r.env, &dir), &dir, &["clean", "-fdxq"], PLUMBING)
+                .unwrap()
+                .ok
+        );
+        let newer = r.push_remote("main", "newer");
+        fetch(&r, c, "main");
+        let e = entry(&r, &repo, &dir).unwrap();
+        let rec = Some(dir.as_path());
+        let _ = tree_move(&r.env, &repo, &dir, &newer, rec, Some(&head), &e, true);
+        assert_eq!(r.g(c, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(r.g(c, &["rev-parse", "HEAD"]), mine);
+        assert_eq!(std::fs::read_to_string(c.join("f.txt")).unwrap(), "edited");
+        assert_eq!(std::fs::read_to_string(c.join("new.txt")).unwrap(), "mine");
     }
 
     #[test]

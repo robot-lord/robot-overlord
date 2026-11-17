@@ -211,7 +211,7 @@ pub fn tools() -> Value {
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "prefer": {"type": "string", "enum": ["local", "remote"],
                            "description": "With `base`, when that branch's local and remote sides have diverged: the side the user chose"},
-                "base": s("Where its new branch would start, as you would launch it: \"latest\" (the latest default branch), a branch or <remote>/<branch> to build on, or \"head\" (omit: what the user sent)"),
+                "base": s("Where its new branch would start, as you would launch it: \"latest\" (the latest default branch), a branch or <remote>/<branch> to build on, or \"head\" (omit: what the user sent, kept; \"\": the configured default)"),
                 "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "agent", "model", "worktree", "base", "tags"]},
                             "description": "Hints you changed from what the user sent"},
                 "note": s("One line for the top of the form, e.g. \"Updated to match your description: repo is myapp\""),

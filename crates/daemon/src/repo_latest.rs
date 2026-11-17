@@ -1516,12 +1516,15 @@ pub fn base_note(base: &Value, now: i64) -> Option<String> {
         "no_remote" => format!(
             "Your branch started from {label} at {commit}{what}. The repo has no remote: this is the local branch."
         ),
+        // (Only here: there is nothing newer to be behind.)
+        "missing" => format!(
+            "Your branch started from {label} at {commit}{what}, the local branch: it isn't on the remote."
+        ),
         why => format!(
             "Your branch started from {label} at {commit}{what} as last fetched{} ({}): it may be behind.",
             fetched_at.map(|t| format!(" {}", ago(t))).unwrap_or_default(),
             match why {
                 "running" => "the fetch was still running",
-                "missing" => "not on the remote",
                 "offline" => "offline",
                 _ => "the fetch failed",
             }
@@ -2221,6 +2224,12 @@ mod tests {
             "{n}"
         );
         assert_eq!(base_note(&json!({"fetch": "fetched"}), now), None);
+        // A local-only branch: nothing to be behind.
+        let n = base_note(&b("missing", None), now).unwrap();
+        assert!(
+            n.contains("isn't on the remote") && !n.contains("behind"),
+            "{n}"
+        );
         let n = base_note(&b("offline", Some(now - 3 * 86_400_000)), now).unwrap();
         assert!(n.contains("abcdef1 (\"Fix\", committed"), "{n}");
         assert!(

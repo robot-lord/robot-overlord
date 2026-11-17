@@ -77,6 +77,15 @@ base work now is in `docs/architecture.md` ("The latest code
   without a time.
 - **Base n/a keypress**: a key on the `n` form's Base hint while it is
   n/a marks it chosen.
+- **The `!mine_fresh` diverged case**: when this call's fetch isn't
+  fresh and the private ref and the user's `refs/remotes/<r>/<b>` have
+  diverged, compare their reflog times rather than picking one.
+- **A typed launch plan** instead of passing the launch's resolved base
+  and location through JSON params.
+- **Copies to fold**: `p_opt` and the hint keys are listed in more than
+  one place.
+- **"preparing" when queued behind another ref**: the message doesn't
+  say the tree is busy with another ref's request.
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored
