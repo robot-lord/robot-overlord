@@ -99,3 +99,11 @@ file). PR #68.
   old shells may show as information.
 - **Rows read 4 MB back at most.** Work launched further back on the
   first look is missed.
+
+### Owed from the final review (1.2.0)
+- Right after a `/clear`, before the first prompt creates the new file, shells are hidden and agents rely on their own files (refresh's stat-failed branch passes main = 0).
+- A Bash call moved to the background by its timeout has no `run_in_background`, so its call line is skipped and the shell is labelled "task".
+- Shells still show during the 15 s stop grace.
+- The first wheel event over the popup is swallowed (no `drop_popup` on wheel).
+- `live_transcripts`' OR plus `json_extract` subquery may not seek the index; log a startup as its own event kind.
+- Copies of the shown-status fallback (statustext, main.rs, mcp.rs) and the task-phrase wording.
