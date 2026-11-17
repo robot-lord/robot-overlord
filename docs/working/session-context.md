@@ -108,8 +108,9 @@ by code (`context::frame_message`).
 ## The four PRs
 
 1. **0.23.0-dev.28: store, separation, background** (this one).
-2. Pull: token, `session_tools.rs`, `sctx.*`, `rlord mcp --session`,
-   `rlord context`, `spec_args` wiring, pane env.
+2. **1.3.0: pull** (shipped in this order after 1.2.0): token,
+   `session_tools.rs`, `sctx.*`, `rlord mcp --session`, `rlord context`,
+   wiring at every start, pane env.
 3. Prompts off argv: V1/V4, `FirstPrompt`, stdin file, `Deferred.prompt`,
    kv `first_prompt`, `first_prompt_next`, `discover` change, argv secrecy
    tests.
@@ -473,18 +474,99 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 8. `RELATED_MAX` counts distinct resolved sessions, without the session
    itself (test).
 
+## PR 2 progress (1.3.0)
+
+- [x] Token (`session_tools::mint` / `revoke` / `resolve`): 32 bytes
+  from `/dev/urandom`, hex; kv `session_token:<id>` and 0600
+  `<data>/sessions/<id>/token`; kept across restarts, removed on
+  archive, made again at the next start. Constant-time compare.
+  Overlords (and sessions in an overlord's folder) get none and are
+  refused; archived sessions are refused.
+- [x] `session_tools.rs`: `session_brief`, `related_sessions`,
+  `session_summary`, `search_history`, `read_history`, with the plan's
+  limits; rate limit 30/min, 300/h in memory; answers capped at 16,000
+  chars (a longer one comes back clipped as text).
+- [x] `search::search_in` (id filter, nothing outside rlord) and
+  `search::read_with` (budget); only `session_tools` calls them.
+- [x] RPC `sctx.tools {token}` / `sctx.call {token, name, arguments}`,
+  a dispatch of its own in `call_ui`.
+- [x] `rlord mcp --session --token-file <p> [--socket]` (server
+  `rlord_session`, conflicts with `--overlord`, never autostarts) and
+  `rlord context [--token-file] [--socket] <tool|help> key=value…`.
+- [x] Wiring per agent at every start; pane env `RLORD_SESSION_TOKEN_FILE`
+  (not for Codex daemon mode).
+- [x] Background "Looking up more" section.
+- [x] `overlord.md` (link rather than copy), `docs/architecture.md` (MCP
+  server: three modes).
+- Live check V5 (Codex `-c mcp_servers.rlord_session` in a worker): not
+  run.
+
+### Decisions made in PR 2 (beyond the plan)
+
+- **Wiring not inside `spec_args`.** `spec_args(agent, spec)` has no
+  session id, and the token must exist before the background file is
+  rendered. `session_tools::wiring(db, base, id, agent, role, daemon)`
+  is called next to `spec_args` at the three starts (`session_new`,
+  `session_restart`, `fork::finish`), before the file is written.
+  Same effect as the plan: computed at every start, never stored in
+  `extra_args`, so old sessions get it at their next restart.
+  `session_fresh` (overlords only) gets none.
+- **Claude flags in `=` form** (`--mcp-config=<p>`,
+  `--allowedTools=mcp__rlord_session`): both are variadic, and the
+  first prompt may follow.
+- **Visible "linked"** = background links either way (it links them, or
+  they link it), its fork parent and its forks. "Same group" = a shared
+  tag. Sessions that ran in an overlord's folder are left out like
+  overlords.
+- **Lookup section only once the token exists.** A session started
+  before 1.3.0 gets no section (and no tools) until its next start; the
+  plan's "minted when context is first rendered" isn't done: rendering
+  stays free of writes.
+- **`read_history`** reads the session's current conversation only (no
+  `transcript`), so a `search_history` hit in an older transcript (it
+  names one) can't be read through these tools.
+- **`session_brief`'s first prompt**: kv `bind_prompt`, else the launch
+  spec's `prompt`, else the transcript's first prompt. Includes
+  `forked_from` (owed from forks).
+- **Token not minted for a launch that fails** after `wiring`: no undo;
+  the kv row and file stay until the id is reused (never) or archived.
+  Harmless (no session row resolves it).
+
+### #65 owed items
+
+Fixed here:
+- A failed `git worktree add -b` no longer leaves the branch behind
+  (`git::worktree_add`: `worktree prune`, `branch -D`; test).
+- Claude's `conversation_on_disk` also checks where Claude files the id
+  when the stored `transcript_source` is stale.
+- Cleanups: `FORK_MINTS_ID` and `FORK_ELSEWHERE` removed (their reasons
+  moved to `Agent::fork` / `forks_elsewhere`); `rollout_forked_from` is
+  now a test helper over `rollout_first_line`.
+
+Still owed:
+- Binding: several hookless Codex forks of one parent can bind each
+  other's thread (oldest-first match, the `mine` filter does nothing);
+  `Whose::Bind` skips `record_bind`'s duplicate check; a waiting fork
+  can take the thread of a hand-made `codex fork` in the same folder.
+  Binding logic, needs its own careful change and tests.
+- An auto-named worktree fork with an explicit branch is refused when
+  the default name is taken meanwhile.
+- TUI `load_forks`: cache keyed on (id, count), so a fork rename doesn't
+  refresh it; and its `session.get` blocks the UI thread.
+- `related` refs resolved twice in `fork::want` (filter, then
+  `context::check`).
+- The demo OpenCode stand-in embeds Python (shell-is-glue rule).
+
 ## Owed / deferred
 
 - Forks (`session.fork`, 0.23.0-dev.29, landed between PR 1 and PR 2;
   `docs/architecture.md` "Forking a session"): a fork starts through
   `methods::start` like a new session, so change that one path.
-  - PR 2 (pull): the wiring is computed in `spec_args`, which the fork
-    path uses too, so a fork gets its token and tools with no extra work;
-    its visible set includes the parent (a linked session).
-    `session_brief` should say `forked_from`. Codex's `-c
-    mcp_servers.rlord_session.*` needs the pane: a fork is always in the
-    pane. Then build the seeded fallback for agents with no native fork
-    on it (`docs/working-archive/session-fork.md`).
+  - PR 2 (done): a fork gets its token and tools at its start; its
+    parent and forks are linked in the visible set; `session_brief`
+    says `forked_from`. Still owed: the seeded fallback for agents with
+    no native fork, built on these tools
+    (`docs/working-archive/session-fork.md`).
   - PR 3 (prompts off argv): apply `FirstPrompt` in `methods::start`, so
     a fork's prompt leaves argv with everyone's: Claude's stdin file with
     `--resume … --fork-session` (extend V1 to that argv), Codex's pointer

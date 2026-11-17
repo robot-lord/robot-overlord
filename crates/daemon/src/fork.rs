@@ -931,10 +931,12 @@ pub(crate) fn conversation_on_disk(db: &Db, s: &Session) -> Result<bool> {
     };
     let on_disk = |t: String| std::path::Path::new(&t).exists();
     Ok(match Agent::parse(&s.agent) {
-        Some(Agent::Claude) => match db.transcript_source(&s.id)? {
-            Some(t) => on_disk(t),
-            None => claude::transcript_path(&s.project_path, sid).exists(),
-        },
+        // (A stored path can be stale, e.g. recorded before symlinks were
+        // resolved: where Claude files the id counts too.)
+        Some(Agent::Claude) => {
+            db.transcript_source(&s.id)?.is_some_and(on_disk)
+                || claude::transcript_path(&s.project_path, sid).exists()
+        }
         Some(Agent::Codex) => db.transcript_source(&s.id)?.is_some_and(on_disk),
         _ => true,
     })
@@ -1546,7 +1548,7 @@ mod tests {
             ["claude", "--resume", "c-1", "--fork-session"]
         );
         assert_eq!(l.argv.last().unwrap(), "go");
-        if claude::FORK_MINTS_ID {
+        {
             let new = l.session_id.clone().unwrap();
             assert_ne!(new, "c-1");
             assert_eq!(&l.argv[4..6], ["--session-id", new.as_str()]);

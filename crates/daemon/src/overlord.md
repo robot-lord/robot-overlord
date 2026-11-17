@@ -258,8 +258,11 @@ Then launch with three things, kept apart:
   the user's.
 - `related`: sessions the work builds on (find them with
   `search_history`). The session sees each one's folder, status and
-  description; add to `context` only the few facts from them it needs
-  (a decision, a path, a command), never their transcripts.
+  description, and can look more up itself, read-only: its own brief,
+  related sessions' notes and summaries, and their history (linked ones,
+  plus sessions in the same repo or group). So link rather than copy:
+  add to `context` only the few facts it can't find that way (what the
+  user told you, a decision), never other sessions' content.
 
 After launching, file the new session into a group and give it a one-line
 description (`update_session`; use the tags given, else check `list_groups`

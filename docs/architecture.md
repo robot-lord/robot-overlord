@@ -762,7 +762,7 @@ inside the pane, it inherits `RLORD_SESSION_ID` — **caller identity is
 automatic**, so tools can default "me" and enforce policy (e.g. rate limits,
 no self-restart).
 
-Two modes. `rlord mcp` alone is read-only, for any agent session to add:
+Three modes. `rlord mcp` alone is read-only, for any agent session to add:
 the daemon lists and accepts only `mcp::READ_ONLY_TOOLS` (look-ups that
 change no session, tag, view, watermark or UI state and run no agent CLI
 or model), refuses any other call, and the shim never autostarts a
@@ -773,6 +773,41 @@ daemon treats the caller as read-only. A test makes every tool sit in
 exactly one of the read-only and mutating lists. The gate trusts the shim: it
 keeps an agent that added plain `rlord mcp` to look-ups, but it is no
 boundary against local processes, which can reach the socket anyway.
+
+The third, `rlord mcp --session --token-file <p>` (server
+`rlord_session`), is a session's own look-ups (`session_tools.rs`):
+`session_brief`, `related_sessions`, `session_summary`,
+`search_history`, `read_history`, read-only and bound to one session by
+a token. `rlord context <tool> key=value…` is the same through the
+shell. RPC `sctx.tools` / `sctx.call` take the token and nothing else
+naming a session; it is a dispatch of its own, so no overlord tool is
+reachable through it.
+
+- **Token.** 32 random bytes, hex, made at a session's first start
+  (`session_tools::wiring`, from `session.new`, `session.restart` and
+  `session.fork`) and kept across restarts: kv `session_token:<id>` and
+  the 0600 file `<data>/sessions/<id>/token`. Removed on archive; a start
+  after unarchiving makes a new one. Overlords get none and are refused.
+- **Visible set.** The session itself; sessions linked to it (its
+  background links either way, its fork parent and forks); sessions in
+  the same repo; sessions sharing a tag. Archived ones count; overlords,
+  and sessions that ran in an overlord's folder, never do. Search runs
+  only over that set (`search::search_in`), never outside rlord;
+  `read_history` takes no transcript path.
+- **Wiring**, computed at every start, never stored: Claude
+  `--mcp-config=<data>/sessions/<id>/mcp.json` and
+  `--allowedTools=mcp__rlord_session` (`=` form: both take several
+  values and the first prompt may follow); Codex in its pane `-c
+  mcp_servers.rlord_session.*` with approval `approve`; Codex on its
+  background server and OpenCode none. The pane env gets
+  `RLORD_SESSION_TOKEN_FILE` (a path). The background ends with a
+  "Looking up more" section naming the tools and the CLI form with the
+  token file's path, once the token exists.
+- **Bounds.** 30 calls a minute and 300 an hour per session (in memory),
+  answers at most 16,000 chars, no model, agent CLI or tmux.
+- Same trust model as the rest: a process running as the user can read
+  any token file. What the token gives is a read-only surface bound to
+  the worker that can't be steered into acting on other sessions.
 
 `create_session` and `propose_session` take the user's words (`prompt`)
 apart from the overlord's notes (`context`) and related sessions
@@ -1695,7 +1730,7 @@ add`); reading and inserting under it, through `methods::start`, the tail
 | | Claude Code | Codex | OpenCode |
 |---|---|---|---|
 | How | `claude --resume <parent> --fork-session --session-id <new>` | `codex fork <parent> --no-alt-screen [--model m] -c tui.resume_cwd="current" --no-daemon [prompt]` (`codex::fork_argv`) | `POST /api/session/<parent>/fork` (`{}`) on its server, else `opencode api …` run in the parent's folder (60s each); then `opencode -s <fork>` |
-| New id | minted by rlord (`claude::FORK_MINTS_ID`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
+| New id | minted by rlord (`Agent::fork`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
 | Resumed at a restart once | its transcript is on disk (from its first message) | it is bound and its rollout is on disk | at once |
 | New worktree | yes (`--resume` finds the parent from another worktree of the repo, and from a subfolder of it) | yes (`tui.resume_cwd`: below) | no: the server gives a fork its parent's folder |
 
@@ -1817,7 +1852,7 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   prompt rule can't pick its thread. kv `bind_fork:<id>` holds the
   parent's thread: `discover::pick_thread` then takes only a thread whose
   rollout's first `session_meta` says `forked_from_id` is that one
-  (`codex::rollout_forked_from`; a candidate whose first line can't be
+  (`codex::rollout_first_line`; a candidate whose first line can't be
   read yet is skipped, never a reason to wait while another names the
   parent). Several forks of one parent waiting in one folder queue
   oldest first (`discover::place_of`, by their `bind_since`): each takes

@@ -105,9 +105,9 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
         std::fs::create_dir_all(parent)?;
     }
     let dir_s = dir.to_string_lossy();
-    match (exists, start) {
-        (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch])?,
-        (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?,
+    let made = match (exists, start) {
+        (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch]),
+        (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s]),
         (false, Some(start)) => git(&[
             "-C",
             repo,
@@ -118,8 +118,18 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
             branch,
             &dir_s,
             start,
-        ])?,
+        ]),
     };
+    if let Err(e) = made {
+        // git makes a new branch before its folder: a failure after that
+        // leaves the branch behind. Removed (it is ours, and `branch -D`
+        // refuses one checked out anywhere).
+        if !exists && branch_exists(repo, branch) {
+            let _ = git(&["-C", repo, "worktree", "prune"]);
+            let _ = git(&["-C", repo, "branch", "-D", branch]);
+        }
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -494,6 +504,19 @@ mod tests {
         let e = worktree_add(r, "x-fork", &repo.join("other"), Some(&first)).unwrap_err();
         assert!(e.to_string().contains("already exists"), "{e}");
         assert!(worktree_add(r, "y-fork", &wt, Some(&first)).is_err());
+        // A failure after git made the branch (its folder can't be made)
+        // leaves no branch behind.
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // (Root writes there anyway: nothing fails, nothing to check.)
+        if std::fs::create_dir(locked.join("probe")).is_err() {
+            let e = worktree_add(r, "z-fork", &locked.join("z"), Some(&first));
+            assert!(e.is_err());
+            assert!(!branch_exists(r, "z-fork"));
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             has_changes(&dir.path().join("none").to_string_lossy()),
             None

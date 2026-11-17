@@ -127,7 +127,7 @@ pub const FORK_CWD: &str = "tui.resume_cwd=\"current\"";
 /// it; the parent is untouched): `codex fork <parent> --no-alt-screen
 /// [--model m] -c tui.resume_cwd="current" <extra…> [prompt]`. Codex
 /// assigns the new thread's id; its rollout names the parent
-/// (`rollout_forked_from`), and its folder is the one it was started in
+/// (`rollout_first_line`), and its folder is the one it was started in
 /// (`FORK_CWD`). (Not the archive summary's `codex exec fork`:
 /// `summary_argv`.)
 pub fn fork_argv(
@@ -561,18 +561,6 @@ pub fn rollout_cwd(path: &Path) -> Option<String> {
         .into_iter::<String>()
         .next()?
         .ok()
-}
-
-/// What a rollout's first line (its `session_meta`) says it was forked
-/// from: `Some(Some(thread))` a fork of that thread, `Some(None)` not a
-/// fork, `None` can't be told (`rollout_first_line`: not yet, or never).
-/// Only the first line counts: a fork's history copied after it may hold
-/// other threads' meta.
-pub fn rollout_forked_from(path: &Path) -> Option<Option<String>> {
-    match rollout_first_line(path) {
-        FirstLine::Says(from) => Some(from),
-        FirstLine::NotYet | FirstLine::Unreadable => None,
-    }
 }
 
 /// A rollout's first line, as `rollout_first_line` reads it.
@@ -1620,6 +1608,15 @@ mod tests {
 mod fork_tests {
     use super::*;
     use serde_json::json;
+
+    /// What a rollout's first line says it was forked from:
+    /// `Some(Some(thread))`, `Some(None)` not a fork, `None` can't be told.
+    fn rollout_forked_from(path: &Path) -> Option<Option<String>> {
+        match rollout_first_line(path) {
+            FirstLine::Says(from) => Some(from),
+            FirstLine::NotYet | FirstLine::Unreadable => None,
+        }
+    }
 
     #[test]
     fn a_user_fork_runs_codex_fork_with_the_sessions_flags() {

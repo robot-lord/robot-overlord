@@ -767,6 +767,31 @@ mod tests {
     }
 
     #[test]
+    fn the_background_ends_with_how_to_look_more_up_within_budget() {
+        let b = base("look");
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "01L", None, "");
+        assert!(lookup_section(&b, "01L").is_none());
+        mint(&db, &b, "01L").unwrap();
+        let tail = lookup_section(&b, "01L").unwrap();
+        assert!(tail.contains("rlord_session") && tail.contains("context --token-file"));
+        let rows: Vec<rlord_core::db::ContextRow> = (0..50)
+            .map(|i| rlord_core::db::ContextRow {
+                id: i + 1,
+                at: 1,
+                kind: "note".into(),
+                body: "n".repeat(300),
+                source: "overlord".into(),
+                seen_at: None,
+            })
+            .collect();
+        let text = crate::context::render_as("s", true, &rows, &[], None, 6_000, Some(&tail));
+        assert!(text.ends_with(&tail));
+        assert!(text.chars().count() <= 6_000, "{}", text.chars().count());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
     fn wiring_per_agent() {
         let b = base("wire");
         std::fs::create_dir_all(&b).unwrap();

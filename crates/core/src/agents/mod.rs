@@ -268,7 +268,13 @@ impl Agent {
     ) -> Fork {
         match self {
             Agent::Claude => {
-                let id = claude::FORK_MINTS_ID.then(claude::mint_session_id);
+                // rlord picks the fork's id: `--resume <parent>
+                // --fork-session --session-id <new>` starts it on `<new>`,
+                // its hooks report `<new>`, and its transcript is written
+                // under `<new>` from its first message on (not before:
+                // until then a restart forks again, `daemon::fork::pending`).
+                // Live check F1, Claude Code 2.1.326.
+                let id = Some(claude::mint_session_id());
                 Fork::Native(Launch {
                     argv: claude::fork_argv(parent, id.as_deref(), prompt, model, extra),
                     transcript: id.as_deref().map(|i| claude::transcript_path(project, i)),
@@ -314,7 +320,13 @@ impl Agent {
     /// of the same repo (live check F2).
     pub fn forks_elsewhere(self) -> bool {
         match self {
-            Agent::Claude => claude::FORK_ELSEWHERE,
+            // `--resume <parent>` from another worktree (its top, or the
+            // parent's subfolder of it) still finds the parent's
+            // conversation; the fork's transcript goes under the new
+            // folder, and a new worktree of a repo Claude already trusted
+            // starts without its folder-trust question (live checks F2,
+            // F2b, Claude Code 2.1.326).
+            Agent::Claude => true,
             Agent::Codex => true,
             Agent::OpenCode => false,
         }
