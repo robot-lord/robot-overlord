@@ -764,6 +764,19 @@ Decided 2026-11-17 (user):
     the form with its note, saving a new folder asks first, then writes
     `code_dir` to the demo's config; a fork from a session's view starts
     and the page goes to it.
+  - Step 10 done (`overlord.md`, `mcp.rs`): the intro's summon line
+    names the web UI's overlord row; a short "The user's screen"
+    paragraph (terminal or web UI, whichever used last, `on` in each
+    answer, no overlay to hide in the web UI); `get_ui_state` (`target`,
+    what the screen shows), `goto_session` and `show_list` say "the
+    user's screen"; `open_keys` "terminal only; the web UI shows them
+    read-only". `mcp.rs`: `get_ui_state` names `target` and `web`;
+    `goto_session`, `show_list`, `set_list_view`, `open_keys`,
+    `confirm_setup`, `propose_session`, `confirm_new_session` and `go` on
+    `create_session` / `fork_session` say "the user's screen (their
+    terminal, or the web UI if they used it last)" and "(in a terminal,
+    hides your overlay)". No tool added or removed; `READ_ONLY_TOOLS`
+    and `MUTATING` unchanged.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
