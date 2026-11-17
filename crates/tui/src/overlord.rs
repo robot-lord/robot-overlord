@@ -520,6 +520,12 @@ impl App {
                 self.status_line = "overlord set the view".into();
             }
             Some("overlord_setup") => self.check_overlord(),
+            // The overlord showed something on another screen (the web UI).
+            Some("notice") => {
+                if let Some(t) = cmd["text"].as_str() {
+                    self.status_line = t.to_string();
+                }
+            }
             // Never over something the user is typing into.
             Some("keys") if !matches!(self.mode, Mode::Normal | Mode::Help | Mode::Keys(_)) => {
                 self.status_line =

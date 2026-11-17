@@ -116,12 +116,14 @@ pub const OPS: &[Op] = &[
         "",
         &["route", "view", "visible", "form", "input"],
     ),
+    // A UI command that never reached its page (asked on connecting).
+    op("page.pending", "", &[]),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
 /// and reports a page makes by itself): every other op moves the page's
 /// last use (`ui::target`). A `page.report` counts only with `input`.
-const PASSIVE: &[&str] = &["snapshot", "session.get", "page.report"];
+const PASSIVE: &[&str] = &["snapshot", "session.get", "page.report", "page.pending"];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
 const FORBIDDEN: &[&str] = &[
@@ -178,6 +180,7 @@ pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
         "snapshot" => snapshot(d, &args),
         "session.resume" => resume(d, &args),
         "page.report" => d.web_ui().report(page, &args),
+        "page.pending" => Ok(pending(d)),
         // A session the list doesn't show: labelled as rows are.
         "session.get" => d.rpc(found.method, args).map(|mut s| {
             label(&mut s);
@@ -469,6 +472,23 @@ impl WebUi {
         self.report_fields(id, args)?;
         Ok(json!({"ok": true}))
     }
+}
+
+/// How long a UI command waits for a page (`page.pending`).
+const PENDING_FOR: Duration = Duration::from_secs(30);
+
+/// Op `page.pending`: the last UI command for a web page, once, if it is
+/// under 30 s old and its page has closed since (so it may never have
+/// arrived: a reload, a reconnect). Null otherwise.
+fn pending(d: &Daemon) -> Value {
+    let mut slot = d.pending_web.lock().expect("ui mutex");
+    let lost = slot
+        .as_ref()
+        .is_some_and(|(at, page, _)| at.elapsed() < PENDING_FOR && d.web_ui().page(page).is_none());
+    if !lost {
+        return Value::Null;
+    }
+    slot.take().map(|(_, _, cmd)| cmd).unwrap_or(Value::Null)
 }
 
 /// `s` cut to at most `n` characters.

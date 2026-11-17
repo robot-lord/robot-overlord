@@ -638,6 +638,18 @@ Decided 2026-11-17 (user):
       `page.report` (unless `input`); later steps add their own.
     - `page.report`'s `form` is one of `describe`, `confirm`, `manual`,
       `fork`, `setup`, `keys` or null.
+  - Step 3 done (`lib.rs` `ui_cmd_to`, `notice_others`, `pending_web`,
+    `push_loop`, `web_ui_line`; `web.rs` op `page.pending`; TUI
+    `push_of`, `notice`; `WEB_PROTOCOL` 2). Lines are `{"notify":"ui",
+    "to":"terminal"|"web", "page"?, "cmd"}`; `web.subscribe` passes the
+    web's on as `{"notify":"ui","page","cmd"}`, at once when they come
+    alone, and after the folded `changed` when they come in a burst
+    (kept, in order). Choices within the plan:
+    - The web's slot holds the last web command with its page id, and
+      `page.pending` hands it over only when that page has closed since
+      (a reload, a reconnect): a page that got it never sees it twice.
+    - `notice_others` sends to the terminal's TUI (when one runs) or the
+      most recently used page; notices are never parked.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

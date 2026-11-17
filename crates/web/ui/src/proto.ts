@@ -48,6 +48,7 @@ export const OPS = [
   "session.pin",
   "overlord.switch",
   "page.report",
+  "page.pending",
 ] as const;
 
 export type Op = (typeof OPS)[number];

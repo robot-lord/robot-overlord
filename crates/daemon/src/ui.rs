@@ -189,6 +189,14 @@ pub fn target(d: &Daemon) -> Target {
     }
 }
 
+/// The id of the most recently used open page, if any.
+pub(crate) fn latest_page(d: &Daemon) -> Option<String> {
+    page_uses(d)
+        .into_iter()
+        .max_by_key(|(_, at, seq)| (*at, *seq))
+        .map(|p| p.0)
+}
+
 /// Each open page's last use: its own (an op, a report of input) or the
 /// last key typed into the pane it shows (a browser's tmux client).
 fn page_uses(d: &Daemon) -> Vec<(String, Option<i64>, u64)> {
@@ -227,16 +235,12 @@ fn pane_of(d: &Daemon, route: &Value) -> Option<String> {
 
 /// The web part of `ui.state`: the most recently used page (null: none).
 fn web_state(d: &Daemon, target: &Target) -> Value {
-    let uses = page_uses(d);
-    let w = d.web_ui();
     let id = match target {
-        Target::Web(id) => Some(id.as_str()),
-        _ => uses
-            .iter()
-            .max_by_key(|(_, at, seq)| (*at, *seq))
-            .map(|p| p.0.as_str()),
+        Target::Web(id) => Some(id.clone()),
+        _ => latest_page(d),
     };
-    let Some(p) = id.and_then(|id| w.page(id)).cloned() else {
+    let w = d.web_ui();
+    let Some(p) = id.and_then(|id| w.page(&id)).cloned() else {
         return Value::Null;
     };
     let open = w.pages().len();
@@ -461,6 +465,7 @@ pub fn reset(d: &Daemon, params: &Value) -> Result<Value> {
         rlord_core::agents::transcript::clear_cursors();
     }
     *d.pending_ui.lock().expect("ui mutex") = None;
+    *d.pending_web.lock().expect("ui mutex") = None;
     methods::reconcile(&d.db())?;
     let _ = tmux::source_conf();
     d.bind_nav_keys();

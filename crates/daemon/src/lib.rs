@@ -57,14 +57,20 @@ pub struct Daemon {
     pub(crate) latest: repo_latest::Latest,
     /// Push stream to subscribers, one JSON line per message:
     /// `{"notify":"changed"}` — coarse tick, refetch what you display;
-    /// `{"notify":"ui","cmd":{...}}` — a UI command for the TUI (set_view,
-    /// new_session) issued by the overlord.
+    /// `{"notify":"ui","to":"terminal","cmd":{...}}` — a UI command for
+    /// the TUI (set_view, new_session) issued by the overlord;
+    /// `{"notify":"ui","to":"web","page":"<id>","cmd":{...}}` — one for a
+    /// web page (`web.subscribe` passes these on; the TUI ignores them).
     notify: tokio::sync::broadcast::Sender<String>,
     /// The TUI's current list view, as it last reported it.
     pub(crate) ui_view: Mutex<Value>,
-    /// Last UI command sent while no TUI was subscribed, replayed to the
-    /// next TUI that starts (if fresh).
+    /// Last UI command for the terminal sent while no TUI was subscribed,
+    /// replayed to the next TUI that starts (if fresh; `ui.pending`).
     pending_ui: Mutex<Option<(std::time::Instant, Value)>>,
+    /// Last UI command for a web page, and that page's id: handed to the
+    /// next page that asks (`page.pending`) when it never reached its own
+    /// (that page closed, or the plugin wasn't connected).
+    pub(crate) pending_web: Mutex<Option<(std::time::Instant, String, Value)>>,
     tui_subscribers: AtomicUsize,
     /// The terminal (tmux client) the overlord overlay is open on, and that
     /// overlay's token (so a replaced overlay's late "closed" report can't
@@ -120,6 +126,7 @@ impl Daemon {
             notify,
             ui_view: Mutex::new(Value::Null),
             pending_ui: Mutex::new(None),
+            pending_web: Mutex::new(None),
             tui_subscribers: AtomicUsize::new(0),
             overlay: Mutex::new(None),
             overlay_seq: std::sync::atomic::AtomicU64::new(1),
@@ -230,7 +237,8 @@ impl Daemon {
         Ok(json!({"reloaded": true}))
     }
 
-    /// Push a UI command to TUIs; park it for the next TUI if none is up.
+    /// Push a UI command to the terminal's TUIs; park it for the next TUI
+    /// if none is up.
     pub(crate) fn ui_cmd(&self, cmd: Value) {
         if self.tui_count() == 0 {
             *self.pending_ui.lock().expect("ui mutex") =
@@ -238,7 +246,52 @@ impl Daemon {
         }
         let _ = self
             .notify
-            .send(json!({"notify": "ui", "cmd": cmd}).to_string());
+            .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
+    }
+
+    /// Push a UI command to `to` (`ui::target`): the terminal's TUIs, or
+    /// one web page. A web command is also parked, for the next page that
+    /// asks, in case it never reaches its page (`page.pending`). Nowhere:
+    /// nothing is sent.
+    #[allow(dead_code)] // (the tools take it in the next step)
+    pub(crate) fn ui_cmd_to(&self, to: &ui::Target, cmd: Value) {
+        match to {
+            ui::Target::Terminal(_) => self.ui_cmd(cmd),
+            ui::Target::Web(page) => {
+                *self.pending_web.lock().expect("ui mutex") =
+                    Some((std::time::Instant::now(), page.clone(), cmd.clone()));
+                let _ = self.notify.send(
+                    json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
+                );
+            }
+            ui::Target::None => {}
+        }
+    }
+
+    /// A one-line notice (never parked) on the surfaces other than `to`
+    /// that are there now: the terminal's TUI, or the most recently used
+    /// web page. So a command landing on the screen the user isn't
+    /// looking at doesn't go unseen.
+    #[allow(dead_code)] // (the tools take it in the next step)
+    pub(crate) fn notice_others(&self, to: &ui::Target, text: &str) {
+        let cmd = json!({"cmd": "notice", "text": text});
+        match to {
+            ui::Target::Web(_) => {
+                if self.tui_count() > 0 {
+                    let _ = self
+                        .notify
+                        .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
+                }
+            }
+            ui::Target::Terminal(_) => {
+                if let Some(page) = ui::latest_page(self) {
+                    let _ = self.notify.send(
+                        json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string(),
+                    );
+                }
+            }
+            ui::Target::None => {}
+        }
     }
 
     /// Internal call that maps method errors to anyhow (used by the MCP layer).
@@ -450,9 +503,11 @@ impl Daemon {
 
     /// A subscription's push stream, until the client hangs up or the
     /// daemon goes. `events.subscribe` gets every notify line as sent;
-    /// `web.subscribe` only `{"notify":"changed","rev"}`, at most one per
-    /// 100 ms (the changes in between folded into it), and no UI commands.
-    /// A lagged receiver counts as a change.
+    /// `web.subscribe` gets `{"notify":"changed","rev"}`, at most one per
+    /// 100 ms (the changes in between folded into it), and the UI commands
+    /// addressed to web pages (`{"notify":"ui","page","cmd"}`), never
+    /// folded or dropped by the folding. A lagged receiver counts as a
+    /// change (and may lose a command: `page.pending` has the last one).
     async fn push_loop(&self, mut w: tokio::net::unix::OwnedWriteHalf, kind: Push) -> Result<()> {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
         const WEB_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -467,30 +522,50 @@ impl Daemon {
         }
         let mut last_web: Option<std::time::Instant> = None;
         let r = loop {
-            let mut line = match rx.recv().await {
+            let line = match rx.recv().await {
                 Ok(line) => line,
                 Err(RecvError::Lagged(_)) => CHANGED.to_string(),
                 Err(RecvError::Closed) => break Ok(()),
             };
+            let mut out = vec![line];
             if let Push::Web = kind {
-                if line != CHANGED {
-                    continue; // a UI command: not for the web in this slice
-                }
-                if let Some(at) = last_web {
-                    let wait = WEB_EVERY.saturating_sub(at.elapsed());
-                    if !wait.is_zero() {
-                        tokio::time::sleep(wait).await;
+                if out[0] != CHANGED {
+                    // A UI command: through at once if it is the web's.
+                    match web_ui_line(&out[0]) {
+                        Some(l) => out[0] = l,
+                        None => continue,
                     }
+                } else {
+                    if let Some(at) = last_web {
+                        let wait = WEB_EVERY.saturating_sub(at.elapsed());
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                    // Whatever came meanwhile: changes are folded into this
+                    // one, the web's UI commands kept (in order, after it).
+                    out = vec![String::new()];
+                    loop {
+                        match rx.try_recv() {
+                            Ok(l) if l != CHANGED => {
+                                if let Some(l) = web_ui_line(&l) {
+                                    out.push(l);
+                                }
+                            }
+                            Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                        }
+                    }
+                    out[0] = json!({"notify": "changed", "rev": self.rev()}).to_string();
+                    last_web = Some(std::time::Instant::now());
                 }
-                // Whatever came meanwhile is in this one.
-                while !matches!(
-                    rx.try_recv(),
-                    Err(TryRecvError::Empty | TryRecvError::Closed)
-                ) {}
-                line = json!({"notify": "changed", "rev": self.rev()}).to_string();
-                last_web = Some(std::time::Instant::now());
             }
-            if w.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+            let mut buf = String::new();
+            for l in out {
+                buf.push_str(&l);
+                buf.push('\n');
+            }
+            if w.write_all(buf.as_bytes()).await.is_err() {
                 break Ok(()); // client gone
             }
         };
@@ -1041,12 +1116,21 @@ impl Daemon {
     }
 }
 
+/// A broadcast line as `web.subscribe` passes it on, if it is a UI
+/// command for a web page: `{"notify":"ui","page","cmd"}`.
+fn web_ui_line(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    (v["notify"] == "ui" && v["to"] == "web")
+        .then(|| json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+}
+
 /// What a subscription's push stream carries (`Daemon::push_loop`).
 #[derive(Clone, Copy)]
 enum Push {
     /// `events.subscribe`: every notify line; a TUI is counted.
     Events { tui: bool },
-    /// `web.subscribe`: coalesced `changed` with the `rev`.
+    /// `web.subscribe`: coalesced `changed` with the `rev`, and the UI
+    /// commands addressed to web pages.
     Web,
 }
 
@@ -1488,6 +1572,105 @@ fn take_status_filter(params: &mut Value) -> Option<(Vec<Overlay>, Vec<String>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `web.subscribe` stream over a socket pair: the daemon's end runs
+    /// `push_loop`, the lines come out of the other.
+    fn web_stream(
+        d: &Arc<Daemon>,
+        rt: &tokio::runtime::Runtime,
+    ) -> tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>> {
+        rt.block_on(async {
+            let (a, b) = UnixStream::pair().unwrap();
+            let (_, w) = a.into_split();
+            let d = Arc::clone(d);
+            tokio::spawn(async move {
+                let _ = d.push_loop(w, Push::Web).await;
+            });
+            let (r, _) = b.into_split();
+            // (Subscribed once the loop runs.)
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            BufReader::new(r).lines()
+        })
+    }
+
+    /// The web's UI commands go through the folding of changes: a burst of
+    /// changes with a command in it delivers the command once, after a
+    /// `changed`, and a command for the terminal isn't passed on.
+    #[test]
+    fn web_commands_survive_the_folding() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        d.web_ui().set_pages(&["p1-aa".to_string()]);
+        let mut lines = web_stream(&d, &rt);
+        // (Under the channel's 64, so the stream doesn't lag.)
+        for round in 0..3 {
+            for _ in 0..8 {
+                d.changed();
+            }
+            d.ui_cmd(json!({"cmd": "set_view"}));
+            d.ui_cmd_to(
+                &ui::Target::Web("p1-aa".into()),
+                json!({"cmd": "goto", "n": round}),
+            );
+            for _ in 0..8 {
+                d.changed();
+            }
+        }
+        let last = d.rev();
+        let mut got = vec![];
+        let mut seen_last = false;
+        rt.block_on(async {
+            loop {
+                let l = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                    .await
+                    .unwrap_or_else(|_| panic!("in time: {got:?}"))
+                    .unwrap()
+                    .expect("open");
+                let v: Value = serde_json::from_str(&l).unwrap();
+                seen_last |= v["rev"] == last.as_str();
+                got.push(v);
+                // (The commands sent last come after the last `changed`.)
+                if seen_last && got.iter().filter(|v| v["notify"] == "ui").count() == 3 {
+                    break;
+                }
+            }
+        });
+        let cmds: Vec<&Value> = got.iter().filter(|v| v["notify"] == "ui").collect();
+        assert_eq!(cmds.len(), 3, "{got:?}");
+        for (i, c) in cmds.iter().enumerate() {
+            assert_eq!(c["cmd"], json!({"cmd": "goto", "n": i}));
+            assert_eq!(c["page"], "p1-aa");
+            assert!(c.get("to").is_none(), "{c}");
+        }
+        assert_eq!(got[0]["notify"], "changed");
+    }
+
+    /// A command for a page that closed before it arrived is handed to the
+    /// next page that asks, once; the terminal's slot is separate.
+    #[test]
+    fn a_lost_web_command_is_parked() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let pending = |d: &Daemon| d.rpc("web.call", json!({"op": "page.pending"})).unwrap();
+        d.web_ui().set_pages(&["p1-aa".to_string()]);
+        d.ui_cmd_to(
+            &ui::Target::Web("p1-aa".into()),
+            json!({"cmd": "show_list"}),
+        );
+        // Its page is still open (it got it): nothing to hand on.
+        assert_eq!(pending(&d), Value::Null);
+        // The page reloads: the new one gets it, once.
+        d.web_ui().set_pages(&["p2-bb".to_string()]);
+        assert_eq!(d.rpc("ui.pending", json!({})).unwrap(), Value::Null);
+        assert_eq!(pending(&d), json!({"cmd": "show_list"}));
+        assert_eq!(pending(&d), Value::Null);
+        // The terminal's parked command stays the terminal's.
+        d.ui_cmd(json!({"cmd": "keys"}));
+        assert_eq!(pending(&d), Value::Null);
+        assert_eq!(
+            d.rpc("ui.pending", json!({})).unwrap(),
+            json!({"cmd": "keys"})
+        );
+    }
 
     #[test]
     fn filters_match_the_status_shown() {
