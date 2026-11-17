@@ -1164,15 +1164,16 @@ pub fn tree_add_fresh(
         Ok(()) => return Ok(false),
         Err(e) => e,
     };
-    if !dir.exists() {
-        return Err(e);
-    }
+    // (In a guarded folder nothing is looked at, not even a stat.)
     if !fs_ok {
         bail!(
-            "{} is there but git has no worktree at it; rlord removes nothing in a folder \
-             macOS guards: remove it, then ask again",
+            "{e:#}. If a folder is at {}, remove it, then ask again: rlord touches no \
+             files in a folder macOS guards",
             dir.display()
         );
+    }
+    if !dir.exists() {
+        return Err(e);
     }
     if !leftover(repo, dir) {
         bail!(
@@ -1284,11 +1285,19 @@ pub fn tree_move(
     // (a time limit) leaves it as it is.
     let itself = inspect(env, repo, dir)
         .map_err(|e| anyhow::anyhow!("rlord's tree {} was left as it is: {e:#}", dir.display()))?;
-    if itself.is_none() {
-        tracing::warn!(tree = %dir.display(), "rlord's tree is broken: making it again");
-        tree_remove(env, repo, dir, recorded, entry, fs_ok)?;
-        tree_add(env, repo, dir, commit, true)?;
-        return Ok(recreated);
+    match itself {
+        None => {
+            tracing::warn!(tree = %dir.display(), "rlord's tree is broken: making it again");
+            tree_remove(env, repo, dir, recorded, entry, fs_ok)?;
+            tree_add(env, repo, dir, commit, true)?;
+            return Ok(recreated);
+        }
+        // (Detached, as seen from inside, before anything runs there.)
+        Some(false) => bail!(
+            "{} has a branch checked out (as seen from inside): not touched",
+            dir.display()
+        ),
+        Some(true) => {}
     }
     let in_tree = |args: &[&str]| {
         git(env, dir, args, CHECKOUT).map_err(|e| {
@@ -1307,15 +1316,21 @@ pub fn tree_move(
     // Nothing to do only when rlord recorded this commit as completed: a
     // checkout killed partway can leave HEAD at the commit with files
     // missing.
-    let head = commit_of(env, dir, "HEAD");
-    if complete == Some(commit) && head.as_deref() == Some(commit) {
-        return Ok(Moved {
-            unchanged: true,
-            ..Moved::default()
-        });
-    }
     // (A big tree's status can take a while: the checkout's time limit.)
-    let dirty = in_tree(&["status", "--porcelain", "--untracked-files=all"])?;
+    let head = commit_of(env, dir, "HEAD");
+    let dirty = if complete == Some(commit) && head.as_deref() == Some(commit) {
+        // At the commit: one cheap status; clean, nothing to do.
+        let dirty = in_tree(&["status", "--porcelain", "--untracked-files=normal"])?;
+        if dirty.is_empty() {
+            return Ok(Moved {
+                unchanged: true,
+                ..Moved::default()
+            });
+        }
+        dirty
+    } else {
+        in_tree(&["status", "--porcelain", "--untracked-files=all"])?
+    };
     in_tree(&["checkout", "--quiet", "--detach", "--force", commit])?;
     in_tree(&["clean", "-fdxq"])?;
     Ok(Moved {
@@ -1354,7 +1369,15 @@ pub fn tree_remove(
     if o.ok || entry_at(&worktree_list(env, &repo.root)?, dir).is_none() {
         return Ok(());
     }
-    if fs_ok {
+    // (A folder is deleted only when, seen from inside, it is that
+    // worktree, detached; or, not a worktree at all any more, a leftover
+    // of rlord's: `leftover`.)
+    let ours = match inspect(env, repo, dir) {
+        Ok(Some(true)) => true,
+        Ok(None) => leftover(repo, dir),
+        _ => false,
+    };
+    if fs_ok && ours {
         match std::fs::remove_dir_all(dir) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2139,14 +2162,18 @@ mod tests {
                 .recreated
         );
         assert_eq!(commit_of(&r.env, &dir, "HEAD").unwrap(), two);
-        // Its `.git` file broken: never acts on the user's checkout.
+        // Its `.git` file broken, pointing nowhere rlord knows: never acts
+        // on the user's checkout, and isn't deleted either (not
+        // recognizably rlord's from inside): an error, left as it is.
+        let good = std::fs::read_to_string(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git"), "gitdir: /nowhere\n").unwrap();
         let e = entry(&r, &repo, &dir).unwrap();
-        assert!(
-            tree_move(&r.env, &repo, &dir, &one, rec, None, &e, true)
-                .unwrap()
-                .recreated
-        );
+        assert!(tree_move(&r.env, &repo, &dir, &one, rec, None, &e, true).is_err());
+        assert!(dir.exists());
+        // Put right: moved again as usual.
+        std::fs::write(dir.join(".git"), &good).unwrap();
+        let e = entry(&r, &repo, &dir).unwrap();
+        tree_move(&r.env, &repo, &dir, &one, rec, None, &e, true).unwrap();
         assert_eq!(commit_of(&r.env, &dir, "HEAD").unwrap(), one);
 
         assert!(!marker.exists(), "the user's hook ran");
@@ -2210,10 +2237,14 @@ mod tests {
         tree_add(&r.env, &repo, &dir, &head, false).unwrap();
         std::fs::remove_file(dir.join("f.txt")).unwrap();
         let e = entry(&r, &repo, &dir).unwrap();
-        // Recorded as completed: trusted (nothing runs).
+        // Recorded as completed and clean: nothing runs but one status.
         let m = tree_move(&r.env, &repo, &dir, &head, rec, Some(&head), &e, false).unwrap();
-        assert!(m.unchanged && !dir.join("f.txt").exists());
+        assert!(!m.unchanged && dir.join("f.txt").exists(), "{m:?}");
+        assert_eq!(m.discarded, 1);
+        let m = tree_move(&r.env, &repo, &dir, &head, rec, Some(&head), &e, false).unwrap();
+        assert!(m.unchanged);
         // Not recorded as completed: checked out in full.
+        std::fs::remove_file(dir.join("f.txt")).unwrap();
         let m = tree_move(&r.env, &repo, &dir, &head, rec, None, &e, false).unwrap();
         assert!(!m.unchanged);
         assert!(dir.join("f.txt").exists());
@@ -2243,7 +2274,7 @@ mod tests {
         assert!(leftover(&repo, &dir));
         // Not when rlord may not touch files there.
         let e = tree_add_fresh(&r.env, &repo, &dir, &head, false).unwrap_err();
-        assert!(e.to_string().contains("removes nothing"), "{e}");
+        assert!(e.to_string().contains("touches no files"), "{e}");
         assert!(dir.join("old.txt").exists());
         assert!(tree_add_fresh(&r.env, &repo, &dir, &head, true).unwrap());
         assert!(!dir.join("old.txt").exists());

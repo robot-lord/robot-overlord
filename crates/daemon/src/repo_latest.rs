@@ -494,7 +494,12 @@ fn resolve(
             let b = match split_remote(&env, root, remote.as_deref(), b) {
                 // (They named the remote's: on a divergence, it wins.)
                 Some(rest) => {
-                    prefer = prefer.or(Some(Prefer::Remote));
+                    if prefer == Some(Prefer::Local) {
+                        warnings.push(format!(
+                            "prefer_ignored: `{b}` asks for the remote's; prefer: local is ignored"
+                        ));
+                    }
+                    prefer = Some(Prefer::Remote);
                     explicit_remote = true;
                     rest
                 }
@@ -534,6 +539,9 @@ fn resolve(
     if from == Some(latest::DefaultFrom::LsRemote) {
         learned.default_branch = Some(branch.clone());
     }
+    // Nothing found the default branch: the checkout's own is shown, and
+    // never presented as the default (no remote-wins rule, a warning).
+    let mut current_only = from == Some(latest::DefaultFrom::Current);
     let fetch_one = |branch: &str| -> Fetch {
         let Some(r) = remote.clone() else {
             return Fetch::NoRemote;
@@ -586,12 +594,20 @@ fn resolve(
         if let Ok((b, f)) = retry {
             if b != branch {
                 branch = b;
+                current_only = f == latest::DefaultFrom::Current;
                 if f == latest::DefaultFrom::LsRemote {
                     learned.default_branch = Some(branch.clone());
                 }
                 fetch = fetch_one(&branch);
             }
         }
+    }
+    let is_default = want.branch.is_none() && !current_only;
+    if current_only {
+        warnings.push(format!(
+            "no_default_branch: couldn't find the default branch; showing the checkout's \
+             branch {branch}"
+        ));
     }
     let key = |r: &str| format!("{r}/{branch}");
     let mut fetched_at = remote
@@ -679,7 +695,7 @@ fn resolve(
         remote_commit.as_deref(),
         &rel,
         prefer,
-        want.branch.is_none(),
+        is_default,
     )
     .expect("one side exists");
     let diverged = matches!(
@@ -697,10 +713,8 @@ fn resolve(
             ..
         },
         true,
-    ) = (
-        &pick,
-        want.branch.is_none() || prefer == Some(Prefer::Remote),
-    ) {
+    ) = (&pick, is_default || prefer == Some(Prefer::Remote))
+    {
         if *n > 0 {
             warnings.push(format!(
                 "local_ahead: your local {branch} has {n} commit(s) not on {}; this is the remote's",
@@ -729,7 +743,7 @@ fn resolve(
     }
     let found = Found {
         branch,
-        is_default: want.branch.is_none(),
+        is_default,
         remote,
         fetch,
         fetched_at,
@@ -2356,9 +2370,11 @@ mod tests {
         let v = call(&d, c, json!({}));
         let path = PathBuf::from(v["path"].as_str().unwrap());
         std::fs::remove_file(path.join("f.txt")).unwrap();
-        // Completed on record: left as it is (nothing runs in it).
-        call(&d, c, json!({}));
-        assert!(!path.join("f.txt").exists());
+        // Completed on record: one status finds the edit; put right.
+        let v = call(&d, c, json!({}));
+        assert!(path.join("f.txt").exists(), "{v}");
+        assert!(v["warnings"].to_string().contains("discarded"), "{v}");
+        std::fs::remove_file(path.join("f.txt")).unwrap();
         // Killed partway: no completed commit on record.
         update(&d, &key(c), |rec| {
             rec.commit = None;
@@ -2687,6 +2703,44 @@ mod tests {
         assert_eq!(v["gone"], json!([]));
         assert_eq!(v["skipped"].as_array().unwrap().len(), 1);
         assert_eq!(records(&d).len(), 1);
+    }
+
+    /// No default branch to be found (no remote, no main/master): the
+    /// checkout's branch is shown, never as the default, with a warning.
+    #[test]
+    fn the_checkouts_branch_is_never_presented_as_the_default() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        let solo = r.root().join("solo");
+        r.g(&r.root(), &["init", "-q", "-b", "dev", "solo"]);
+        r.commit(&solo, "x");
+        let v = call(&d, &solo, json!({}));
+        assert_eq!(v["ref"], "dev");
+        assert_eq!(v["default_branch"], false, "{v}");
+        assert!(
+            v["warnings"]
+                .to_string()
+                .contains("couldn't find the default branch"),
+            "{v}"
+        );
+    }
+
+    /// `origin/<b>` with `prefer: local`: the remote's, and a warning that
+    /// `prefer` was ignored.
+    #[test]
+    fn prefer_local_is_ignored_for_an_explicit_remote() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        let c = &r.clone;
+        let theirs = r.push_remote("feat", "theirs");
+        r.g(c, &["fetch", "-q", "origin"]);
+        r.g(c, &["branch", "feat", "origin/feat"]);
+        r.g(c, &["checkout", "-q", "feat"]);
+        r.commit(c, "mine");
+        r.g(c, &["checkout", "-q", "main"]);
+        let v = call(&d, c, json!({"ref": "origin/feat", "prefer": "local"}));
+        assert_eq!(v["commit"], theirs.as_str(), "{v}");
+        assert!(v["warnings"].to_string().contains("prefer_ignored"), "{v}");
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

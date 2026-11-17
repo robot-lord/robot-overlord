@@ -768,7 +768,8 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   warning). The default branch (no `ref`): `R` whenever it exists, even
   when `L` is ahead (the user asked for "the latest main"; a
   `local_ahead` warning says how far), and a launch's base the same; so
-  is a `ref` written `<remote>/<b>` (or `prefer: remote`). A plain named
+  is a `ref` written `<remote>/<b>` (or `prefer: remote`; a
+  `prefer: local` with it is ignored, with a warning). A plain named
   `ref`: whichever exists; if both, the one ahead (`rev-list
   --left-right --count`); diverged, no move and both sides back so the
   overlord asks the user (`prefer` then). A named branch that isn't
@@ -785,7 +786,8 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   (the local branch, a warning; an `upstream` remote is owed). Default
   branch: `refs/remotes/<remote>/HEAD`, rlord's record (under a day), `git
   ls-remote --symref` (recorded), `main`/`master`, the main checkout's
-  branch (the tool only). A launch goes: the remote's HEAD as the repo
+  branch (the tool only, shown as `default_branch: false` with a
+  `no_default_branch` warning: never presented as the default). A launch goes: the remote's HEAD as the repo
   knows it, rlord's record, `main`/`master`, then the remote asked within
   its 4 s; never the checkout's current branch (whatever the user last
   checked out is no default branch): failing those, it starts at HEAD
@@ -847,9 +849,14 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   `refs/remotes/*`, index, stash, uncommitted work, config and hooks.
   `local` in the answer reports, read-only, where the branch is checked
   out and, for a named `ref` only, how many files are uncommitted there
-  (`GIT_OPTIONAL_LOCKS=0`). When the tree's HEAD is already the commit,
-  nothing runs in it (no status), and the checkout's warnings (LFS,
-  submodules, sparse), worked out once per move, come from the record.
+  (`GIT_OPTIONAL_LOCKS=0`). When the tree's HEAD is already the (recorded,
+  completed) commit, one `git status` runs in it and nothing else unless
+  it is dirty (then the edits are discarded as on a move); the
+  checkout's warnings (LFS, submodules, sparse), worked out once per
+  move, come from the record. Checkout and clean run only once the tree
+  is, seen from inside, that worktree with a detached HEAD; a folder is
+  deleted (when git can't remove it) only on the same check, or when it
+  is a leftover of rlord's.
 - A folder that is not a git repo is answered as it is (`git: false`).
   `repo_latest` is a mutating tool (it fetches and moves a tree), so a
   plain `rlord mcp` session can't call it.

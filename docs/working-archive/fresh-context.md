@@ -38,6 +38,22 @@ base work now is in `docs/architecture.md` ("The latest code
 - **One `clip` and one repo-root resolver**: `latest.rs` has its own
   `clip` and `locate` beside other helpers that clip text and
   `git::main_repo_root`; keep one of each.
+- **A stale `origin/HEAD` after a default-branch rename**: while the
+  old name still exists on the remote, `refs/remotes/origin/HEAD` keeps
+  naming it and rlord follows it; only a branch gone from the remote
+  makes it ask again (`ls-remote`).
+- **A sweep racing a just-handed-out tree**: the sweep can remove a tree
+  (unused 30 days) right after a call returned its `path`, before the
+  caller reads it; the next `repo_latest` makes it again.
+- **`drop_old_refs` works from the record read at the start of the
+  move**: a branch fetched by another call meanwhile can have its private
+  ref dropped; the next call fetches it again.
+- **Repeated logic**: the failure classes of `Fetch` (offline, failed,
+  missing) and the "is it rlord's tree" checks appear in a few places;
+  one helper each.
+- **Git spawns per call**: a `repo_latest` call still runs a dozen or so
+  git commands (locate, remote, refs, relation, status, checkout); batch
+  the plumbing (`for-each-ref`, one `rev-parse` for several refs).
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored
