@@ -725,7 +725,8 @@ rlord web remove     # delete the plugin and its token
   port = 47811   # another, if that one is taken
   ```
 
-- **What it does:** the list (tabs, groups, filter, sort, archived), the
+- **What it does:** the list (tabs, groups, filter, sort, archived; the
+  filter takes the same `tag:` and `status:` words as the TUI's `/`), the
   overlord's pane and any session's pane, live; a box to tell the overlord
   something; and a session's buttons: Resume, Restart, Stop, Archive and
   Unarchive, Pin, and Edit (name, description, tags, notes). Pick another

@@ -401,6 +401,24 @@ fn snapshot_has_the_pages_shape_and_says_unchanged() {
     // A view is a session.list query.
     let tagged = op(&r.sock, "snapshot", json!({"view": {"tag": "wip"}}))["result"].clone();
     assert_eq!(tagged["rows"].as_array().unwrap().len(), 1);
+    // The filter box's text takes the TUI's tokens; the rest is free text.
+    let ids = |search: &str| -> Vec<String> {
+        let s = op(&r.sock, "snapshot", json!({"view": {"search": search}}))["result"].clone();
+        let mut v: Vec<String> = s["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{search}: {s}"))
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(ids("tag:wip"), ["beta"]);
+    assert_eq!(ids("tag:web alpha"), ["alpha"]);
+    assert_eq!(ids("status:starting"), ["alpha", "beta", "gamma"]);
+    assert_eq!(ids("status:turn"), Vec::<String>::new());
+    assert_eq!(ids("status:bg,limited"), Vec::<String>::new());
+    assert_eq!(ids("gamma"), ["gamma"]);
     let bad = op(&r.sock, "snapshot", json!({"view": "everything"}));
     assert!(bad["error"].is_object(), "{bad}");
 }

@@ -62,6 +62,7 @@ function Controls({ store, view }: { store: Store; view: View }) {
         class="filter"
         type="search"
         placeholder="filter"
+        title="words match name, project, tags, description · status:needs|turn|bg|working|limited · tag:x · proj:x · agent:x"
         aria-label="filter sessions"
         value={text.value}
         onInput={(e) => {

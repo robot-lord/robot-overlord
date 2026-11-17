@@ -1006,7 +1006,9 @@ daemon, the always-installed side, so a bug in the plugin can't reach a
 method the web was never given. It is not a boundary against a local
 process, which can call the socket itself. `snapshot {view, rev}` is the
 list in one answer (rows for a `session.list` query, groups, labels, the
-overlord and its roster); `rev` is `<boot id>-<changes>`, and a current
+overlord and its roster); the view's `search` is the filter box's text,
+parsed by the daemon with the TUI's `SessionQuery::apply_search_text`
+(`tag:`, `status:`, …), so the page never parses it; `rev` is `<boot id>-<changes>`, and a current
 `rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
 most every 100 ms. `web.pane_target` names a pane's tmux session and
 starts nothing. Adding an op: put it on `OPS` with its arguments, add it to

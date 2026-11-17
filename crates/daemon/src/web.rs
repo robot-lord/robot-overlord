@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use rlord_core::db::{SessionQuery, SortMode};
 use rlord_core::types::Status;
 use rlord_core::{groups, plugin, tmux};
 
@@ -182,7 +183,8 @@ fn resume(d: &Daemon, args: &Value) -> Result<Value> {
 }
 
 /// Op `snapshot {view, rev}`: everything the list draws, in one answer.
-/// `view` is a `session.list` query; a `rev` that is still current gets
+/// `view` is a `session.list` query, whose `search` may hold the TUI's
+/// filter tokens (`search_tokens`); a `rev` that is still current gets
 /// `{"unchanged": true}`. Grouping and labels are worked out here: the
 /// page only draws.
 pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
@@ -197,6 +199,13 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
         v @ Value::Object(_) => v.clone(),
         _ => bail!("view must be a session.list query (an object)"),
     };
+    if let Some(text) = view
+        .get("search")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        search_tokens(&mut view, &text);
+    }
     // (The overlord is `overlord`, never one of the rows.)
     view["include_overlord"] = json!(false);
     let mut rows = d.rpc("session.list", view)?;
@@ -249,6 +258,37 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
         "overlord": o,
         "statuses": statuses,
     }))
+}
+
+/// The filter box's text, read as the TUI reads its filter
+/// (`SessionQuery::apply_search_text`): `tag:`, `status:`, `agent:`,
+/// `proj:`, `group:` and `sort:` tokens set those filters of the view,
+/// the other words are its free-text `search`. So the page and the TUI
+/// take the same filter, and the page doesn't parse it.
+fn search_tokens(view: &mut Value, text: &str) {
+    let mut q = SessionQuery::default();
+    if let Some(s) = view["sort"].as_str().and_then(SortMode::parse) {
+        q.sort = s;
+    }
+    let sort = q.sort;
+    q.apply_search_text(text);
+    view["search"] = json!(q.search);
+    if q.sort != sort {
+        view["sort"] = json!(q.sort.label());
+    }
+    if !q.status.is_empty() {
+        view["status"] = json!(q.status);
+    }
+    for (k, v) in [
+        ("tag", q.tag),
+        ("agent", q.agent),
+        ("project", q.project),
+        ("group", q.group),
+    ] {
+        if let Some(v) = v {
+            view[k] = json!(v);
+        }
+    }
 }
 
 /// Add `status_label` (as people see it) beside a row's `status`.
