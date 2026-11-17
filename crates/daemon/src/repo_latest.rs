@@ -119,6 +119,25 @@ pub struct Latest {
     /// One move or removal of a repo's tree at a time (key: its common
     /// git dir).
     pub(crate) moves: KeyLocks,
+    /// First trees being made (`worktree add` can take minutes), by repo:
+    /// made on their own thread, the call waiting a bounded time.
+    adds: Adds,
+}
+
+/// A repo's first tree being made: whether it still is, and how it went
+/// (Ok: whether a leftover was replaced).
+#[derive(Default)]
+struct AddSlot {
+    running: bool,
+    done: Option<std::result::Result<bool, String>>,
+}
+
+type Adds = Arc<(Mutex<HashMap<String, AddSlot>>, Condvar)>;
+
+/// How making a repo's first tree stands, for the caller.
+enum Adding {
+    Done(std::result::Result<bool, String>),
+    Running,
 }
 
 impl Default for Latest {
@@ -131,6 +150,7 @@ impl Default for Latest {
                 guard: Guard::new(),
             }),
             moves: KeyLocks::default(),
+            adds: Arc::default(),
         }
     }
 }
@@ -242,6 +262,79 @@ impl Latest {
             .as_ref()
             .map(|(_, f)| f.clone())
             .unwrap_or(Fetch::Cached)
+    }
+}
+
+impl Latest {
+    /// Make a repo's first tree with `add` on its own thread, unless one
+    /// is already being made; wait at most `wait` for it. A result no
+    /// caller waited for is handed to the next one.
+    fn add_tree<F>(&self, key: &str, wait: Duration, add: F) -> Adding
+    where
+        F: FnOnce() -> std::result::Result<bool, String> + Send + 'static,
+    {
+        let (lock, done) = &*self.adds;
+        let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = map.entry(key.to_string()).or_default();
+        if !slot.running {
+            if let Some(r) = slot.done.take() {
+                return Adding::Done(r);
+            }
+            slot.running = true;
+            let state = self.adds.clone();
+            let k = key.to_string();
+            let spawned = std::thread::Builder::new()
+                .name("repo-tree-add".into())
+                .spawn(move || {
+                    // (Its slot freed even if `add` panics.)
+                    struct Done(Adds, String, Option<std::result::Result<bool, String>>);
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            let (lock, done) = &*self.0;
+                            let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            let slot = map.entry(self.1.clone()).or_default();
+                            slot.running = false;
+                            slot.done = Some(
+                                self.2
+                                    .take()
+                                    .unwrap_or_else(|| Err("making the tree panicked".into())),
+                            );
+                            done.notify_all();
+                        }
+                    }
+                    let mut d = Done(state, k, None);
+                    d.2 = Some(add());
+                });
+            if spawned.is_err() {
+                slot.running = false;
+                return Adding::Done(Err("couldn't start a thread".into()));
+            }
+        }
+        let mut map = done
+            .wait_timeout_while(map, wait, |m| m.get(key).is_some_and(|s| s.running))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        let slot = map.entry(key.to_string()).or_default();
+        if slot.running {
+            return Adding::Running;
+        }
+        Adding::Done(slot.done.take().unwrap_or(Ok(false)))
+    }
+
+    /// The tree is there: an old result of making it is no news.
+    fn forget_add(&self, key: &str) {
+        let (lock, _) = &*self.adds;
+        let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(key).is_some_and(|s| !s.running) {
+            map.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_add_for_test(&self, key: &str) {
+        let (lock, _) = &*self.adds;
+        let mut map = lock.lock().unwrap();
+        map.entry(key.to_string()).or_default().running = true;
     }
 }
 
@@ -640,9 +733,13 @@ fn resolve(
         let theirs_ref = format!("refs/remotes/{r}/{branch}");
         let theirs = latest::commit_of(&env, root, &theirs_ref);
         let fresh_ms = d.latest.timing().fresh.as_millis() as i64;
-        let mine_fresh = fetched_at.is_some_and(|t| now - t < fresh_ms);
+        // (Fresh: this call's fetch went through, and recently.)
+        let mine_fresh = fetch.fresh() && fetched_at.is_some_and(|t| now - t < fresh_ms);
         let use_theirs = match (&mine, &theirs) {
             (None, Some(_)) => true,
+            // Just fetched: the remote as it is now, even behind the user's
+            // own (a force-push back to an older commit).
+            (Some(_), _) if mine_fresh => false,
             (Some(m), Some(t)) if m != t => match latest::relation(&env, root, m, t) {
                 // (`relation(mine, theirs)`: "behind" is theirs newer.)
                 latest::Relation::LocalBehind(_) => true,
@@ -904,7 +1001,7 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
     };
     let commit = commit.clone();
     // Moving the tree: one at a time per repo (a launch never waits here).
-    let _move = d.latest.moves.lock(&key);
+    let move_guard = d.latest.moves.lock(&key);
     let rec = record(d, &key);
     let dir = latest::tree_path(&repo.root);
     // (The worktree list `locate` read; read again only when the tree
@@ -936,7 +1033,7 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
         }
     });
     let mut recorded = rec.tree.as_deref().map(PathBuf::from);
-    let mut unchanged = false;
+    let unchanged;
     // In progress: the commit is recorded as completed only once the add
     // or move succeeds (one killed partway may leave HEAD at the commit
     // with files missing).
@@ -952,23 +1049,23 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
             true
         })
     };
+    if latest::entry_at(&list, &dir).is_some() {
+        d.latest.forget_add(&key);
+    }
     let moved = match latest::entry_at(&list, &dir) {
         None => {
-            // (Recorded as the tree only once it is added, below; the old
-            // commit no longer counts as completed.)
+            // (Recorded as the tree only once it is added; the old commit
+            // no longer counts as completed.)
             update(d, &key, |r| {
                 r.commit = None;
+                r.old_trees = old_trees.clone();
                 true
             });
             exclude(&env, &repo, &dir, &f, &mut v)?;
-            let replaced = latest::tree_add_fresh(&env, &repo, &dir, &commit, f.fs_ok)
-                .map_err(|e| anyhow::anyhow!("making rlord's tree at {}: {e:#}", dir.display()))?;
-            if replaced {
-                f.warnings.push(
-                    "recreated: a leftover of rlord's tree was there and was replaced".into(),
-                );
-            }
-            Some(json!({"created": true}))
+            // Made on its own thread (it can take minutes), under this
+            // lock taken again there; this call waits a bounded time.
+            drop(move_guard);
+            return first_tree(d, want, &key, &repo, &dir, &commit, &f, v);
         }
         Some(e) => {
             // No record of it (a kv reset, the other daemon's): rlord's by
@@ -1049,6 +1146,88 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
     });
     v["warnings"] = json!(f.warnings);
     Ok(v)
+}
+
+/// The repo's first tree: made on its own thread (`Latest::add_tree`),
+/// under the repo's move lock, and recorded there once it is there. Made
+/// within the wait: the call goes on as usual (it is moved, `created`).
+/// Not yet: the answer says `tree: "preparing"` with no `path`.
+#[allow(clippy::too_many_arguments)]
+fn first_tree(
+    d: &Daemon,
+    want: &Want,
+    key: &str,
+    repo: &Repo,
+    dir: &Path,
+    commit: &str,
+    f: &Found,
+    mut v: Value,
+) -> Result<Value> {
+    let me = d.me.clone();
+    let (env, k) = (d.latest.env(), key.to_string());
+    let (repo2, dir2, commit2, branch) = (
+        repo.clone(),
+        dir.to_path_buf(),
+        commit.to_string(),
+        f.branch.clone(),
+    );
+    let fs_ok = f.fs_ok;
+    let add = move || -> std::result::Result<bool, String> {
+        let d = me.upgrade().ok_or("the daemon is stopping")?;
+        let _move = d.latest.moves.lock(&k);
+        let list = latest::worktree_list(&env, &repo2.root).map_err(|e| format!("{e:#}"))?;
+        if latest::entry_at(&list, &dir2).is_some() {
+            return Ok(false);
+        }
+        let replaced = latest::tree_add_fresh(&env, &repo2, &dir2, &commit2, fs_ok)
+            .map_err(|e| format!("making rlord's tree at {}: {e:#}", dir2.display()))?;
+        let warnings = latest::tree_warnings(&env, &repo2.root, &dir2);
+        let now = now_ms();
+        update(&d, &k, |r| {
+            r.tree = Some(dir2.to_string_lossy().into_owned());
+            r.branch = Some(branch);
+            r.commit = Some(commit2);
+            r.tree_used_at = now;
+            r.used_at = now;
+            r.tree_warnings = warnings;
+            true
+        });
+        Ok(replaced)
+    };
+    match d.latest.add_tree(key, want.left(want.wait), add) {
+        Adding::Done(Ok(replaced)) => {
+            // There now: the rest as for any tree. (This call's fetch and
+            // warnings are the ones to report, not the second look's.)
+            let mut v2 = latest_in(d, want)?;
+            v2["moved"] = json!({"created": true});
+            v2["fetch"] = v["fetch"].clone();
+            v2["fetched_at"] = v["fetched_at"].clone();
+            let mut w: Vec<Value> = f.warnings.iter().map(|x| json!(x)).collect();
+            if replaced {
+                w.push(json!(
+                    "recreated: a leftover of rlord's tree was there and was replaced"
+                ));
+            }
+            for x in v2["warnings"].as_array().cloned().unwrap_or_default() {
+                if !w.contains(&x) {
+                    w.push(x);
+                }
+            }
+            v2["warnings"] = json!(w);
+            Ok(v2)
+        }
+        Adding::Done(Err(e)) => bail!("{e}"),
+        Adding::Running => {
+            let mut warnings = f.warnings.clone();
+            warnings.push(
+                "preparing: rlord's tree for this repo is still being made; call again shortly"
+                    .into(),
+            );
+            v["tree"] = json!("preparing");
+            v["warnings"] = json!(warnings);
+            Ok(v)
+        }
+    }
 }
 
 /// Keep the tree out of the user's `git status`: `/.worktrees/` in the
@@ -1509,6 +1688,24 @@ pub fn sweep(d: &Daemon) -> Value {
             }
             // (Can't tell: kept.)
             Err(_) => continue,
+        }
+        // Private refs not fetched for long, made by the tool or by
+        // launch bases alike: dropped, with what was known of them.
+        {
+            let _move = d.latest.moves.lock(&key);
+            let rec = record(d, &key);
+            let env = d.latest.env();
+            let keep = rec.branch.clone().unwrap_or_default();
+            let dropped = drop_old_refs(&env, Path::new(&root), &rec, None, &keep);
+            if !dropped.is_empty() {
+                d.latest.forget(&format!("{key}\0"));
+                update(d, &key, |r| {
+                    for k in &dropped {
+                        r.fetched.remove(k);
+                    }
+                    true
+                });
+            }
         }
         let stale = rec.tree.is_some() && now - rec.tree_used_at > UNUSED_MS;
         if stale || !rec.old_trees.is_empty() {
@@ -2963,6 +3160,60 @@ mod tests {
         for mut p in [json!([1, 2]), json!("x"), json!(3)] {
             assert!(set_launch_base(&d, &mut p).is_err());
         }
+    }
+
+    /// After a force-push back to an older commit, rlord's just-fetched
+    /// private ref is the truth, even behind the user's own origin/main.
+    #[test]
+    fn a_fresh_fetch_wins_after_a_rewind() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let old = r.g(c, &["rev-parse", "HEAD"]);
+        r.push_remote("main", "later");
+        r.g(c, &["fetch", "-q", "origin"]);
+        // The remote rewound to the old commit.
+        r.g(&r.other, &["reset", "-q", "--hard", &old]);
+        r.g(&r.other, &["push", "-q", "-f", "origin", "main"]);
+        let d = daemon(&r);
+        let v = call(&d, c, json!({}));
+        assert_eq!(v["fetch"], "fetched");
+        assert_eq!(v["commit"], old.as_str(), "{v}");
+    }
+
+    /// The first tree still being made: the answer says so, with no path.
+    #[test]
+    fn a_first_tree_still_being_made_is_said() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        d.latest
+            .set_for_test(r.env.clone(), timing(50), Guard::with(None, false));
+        d.latest.hold_add_for_test(&key(c));
+        let v = latest_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(v["tree"], "preparing", "{v}");
+        assert!(v.get("path").is_none());
+        assert!(v["warnings"].to_string().contains("call again"), "{v}");
+        assert!(!c.join(".worktrees/.rlord-latest").exists());
+    }
+
+    /// The sweep drops long-unfetched private refs of every recorded repo,
+    /// launch-only ones included.
+    #[test]
+    fn the_sweep_drops_old_private_refs() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        launch_base(&d, &json!({"repo": c, "name": "x"})).unwrap();
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "main")).is_some());
+        update(&d, &key(c), |rec| {
+            for at in rec.fetched.values_mut() {
+                *at = 1;
+            }
+            true
+        });
+        sweep(&d);
+        assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "main")).is_none());
+        assert!(record(&d, &key(c)).fetched.is_empty());
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

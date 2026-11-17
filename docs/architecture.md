@@ -711,6 +711,9 @@ limits, waits and retry windows are constants in those two files.
   only if it is recognizably a leftover of rlord's; a tree whose repo
   was moved with it is repaired by git. Edits in the tree are discarded
   on a move; the answer says how many.
+- **The first tree is made in the background** (it can take minutes),
+  under the repo's move lock; the call waits a bounded time and
+  otherwise answers `tree: "preparing"` with no path.
 - **Done means done.** A move counts as complete only once it succeeds
   (the record's commit is cleared before and set after), so a checkout
   killed partway is redone, never trusted. Only a verifiably broken tree
@@ -727,9 +730,9 @@ limits, waits and retry windows are constants in those two files.
   weaken their `--force-with-lease` and change their `git status`). A
   private ref nested with the target is deleted first; long-unused ones
   are dropped, exactly by remote and branch.
-- **Which commit.** The remote's side is the newer of rlord's private
-  ref and the user's own `origin/<b>` (when they diverged, rlord's only
-  if just fetched). The default branch (no `ref`), a launch's base, and
+- **Which commit.** The remote's side is rlord's private ref when this
+  call just fetched it (even behind the user's own `origin/<b>`: a
+  force-push back to an older commit), else the newer of the two. The default branch (no `ref`), a launch's base, and
   any `<remote>/<b>` are the remote's commit even when the local branch
   is ahead (a warning says how far); `<remote>/<b>` never falls back to
   a local branch. A plain named `ref` is the newer of local and remote;
