@@ -133,12 +133,31 @@ pub fn has_changes(dir: &str) -> Option<bool> {
 
 /// Undo a fork's `worktree_add`: remove the worktree at `dir` (with whatever is
 /// in it) and its branch `branch`. For a worktree rlord just made and
-/// nothing ran in yet.
+/// nothing ran in yet. Both are tried, whatever the first does (twice
+/// `--force`: even a locked worktree goes); the first error is returned.
 pub fn worktree_discard(repo: &str, branch: &str, dir: &Path) -> Result<()> {
     let dir_s = dir.to_string_lossy();
-    git(&["-C", repo, "worktree", "remove", "--force", &dir_s])?;
-    git(&["-C", repo, "branch", "-D", branch])?;
+    let removed = git(&[
+        "-C", repo, "worktree", "remove", "--force", "--force", &dir_s,
+    ]);
+    let deleted = git(&["-C", repo, "branch", "-D", branch]);
+    removed?;
+    deleted?;
     Ok(())
+}
+
+/// The names of `repo`'s local branches (one `git for-each-ref`); empty
+/// when git can't say.
+pub fn branches(repo: &str) -> std::collections::HashSet<String> {
+    git(&[
+        "-C",
+        repo,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads",
+    ])
+    .map(|out| out.lines().map(str::to_string).collect())
+    .unwrap_or_default()
 }
 
 /// Whether `repo` has a local branch named `branch`.
@@ -465,9 +484,38 @@ mod tests {
         // A file not added yet counts too (it doesn't come along either).
         std::fs::write(wt.join("new.txt"), "x").unwrap();
         assert_eq!(has_changes(w), Some(true));
-        // Undone: the worktree and its branch are gone.
+        assert_eq!(
+            branches(r),
+            ["x-fork".to_string(), current_branch(r)]
+                .into_iter()
+                .collect()
+        );
+        // Undone: the worktree and its branch are gone, even locked.
+        git(&["-C", r, "worktree", "lock", w]).unwrap();
         worktree_discard(r, "x-fork", &wt).unwrap();
         assert!(!wt.exists() && !branch_exists(r, "x-fork"));
+        // A worktree that can't be removed still has its branch deleted
+        // (the error said).
+        let wt2 = repo.join(".worktrees").join("z-fork");
+        worktree_add(r, "z-fork", &wt2, Some(&first)).unwrap();
+        let elsewhere = repo.join(".worktrees").join("not-a-worktree");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        git(&[
+            "-C",
+            r,
+            "worktree",
+            "remove",
+            "--force",
+            wt2.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(worktree_discard(r, "z-fork", &elsewhere).is_err());
+        assert!(!branch_exists(r, "z-fork"));
+    }
+
+    /// The branch HEAD is on in `r`.
+    fn current_branch(r: &str) -> String {
+        git(&["-C", r, "rev-parse", "--abbrev-ref", "HEAD"]).unwrap()
     }
 
     #[test]

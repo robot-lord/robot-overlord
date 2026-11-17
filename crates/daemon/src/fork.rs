@@ -128,15 +128,71 @@ impl Drop for Reserved<'_> {
     }
 }
 
+/// What git already has in a repo, for a worktree fork's default name
+/// (`default_name`): its branches and the folders where worktrees go.
+/// Read before the DB lock (`git_names`): no git runs under it.
+#[derive(Debug, Default)]
+pub(crate) struct GitNames {
+    repo: String,
+    branches: std::collections::HashSet<String>,
+    folders: std::collections::HashSet<String>,
+}
+
+impl GitNames {
+    /// One `git for-each-ref` and one read of `<repo>/<workspace_dir>`.
+    fn read(repo: &str, workspace_dir: &str) -> GitNames {
+        let folders = std::fs::read_dir(std::path::Path::new(repo).join(workspace_dir))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        GitNames {
+            repo: repo.to_string(),
+            branches: git::branches(repo),
+            folders,
+        }
+    }
+
+    /// The default name `n` would make a branch or folder git has.
+    fn has(&self, n: &str) -> bool {
+        let branch = git::sanitize_branch(n);
+        self.branches.contains(&branch) || self.folders.contains(&git::workspace_dirname(&branch))
+    }
+}
+
+/// For a fork asked for (`params`) into a new worktree with a default
+/// name and branch: what git has in its parent's repo (`GitNames`). Read
+/// with only a short lock to find the parent, then git without it.
+pub(crate) fn git_names(
+    parent_repo: impl Fn() -> Option<String>,
+    params: &Value,
+    workspace_dir: &str,
+) -> Option<GitNames> {
+    let named = |k: &str| params[k].as_str().is_some_and(|v| !v.trim().is_empty());
+    if params["workspace"] != true || named("name") || named("branch") {
+        return None;
+    }
+    parent_repo().map(|repo| GitNames::read(&repo, workspace_dir))
+}
+
 /// `want_in`, and its default name reserved for this fork until it is done
 /// (`Reserved` releases it), chosen and reserved under one lock so two
 /// forks at once never pick the same one. A name asked for isn't
 /// reserved.
 fn want_reserved<'a>(d: &'a Daemon, params: &Value) -> Result<(Want, Reserved<'a>)> {
     let workspace_dir = d.config().session.workspace_dir.clone();
+    // (The parent's repo under a short lock; git outside it.)
+    let parent_repo = || {
+        let db = d.db();
+        let r = params["ref"].as_str()?;
+        db.resolve_ref(r).ok()?.repo_path
+    };
+    let git = git_names(parent_repo, params, &workspace_dir);
     let want = {
         let db = d.db();
-        let want = want_in(&db, params, &workspace_dir)?;
+        let want = want_in(&db, params, git.as_ref())?;
         if want.auto_name {
             db.kv_set(&reserve_key(&want.name), &now_ms().to_string())?;
         }
@@ -341,10 +397,10 @@ fn opencode_run(
 }
 
 /// Read the parent and check the fork can be made (what is refused:
-/// "Forking a session" in docs/architecture.md). `workspace_dir`: where
-/// new worktrees go (`[session] workspace_dir`), for a worktree fork's
-/// default name.
-pub(crate) fn want_in(db: &Db, params: &Value, workspace_dir: &str) -> Result<Want> {
+/// "Forking a session" in docs/architecture.md). `git`: what git has in
+/// the parent's repo (`git_names`, read before the lock), for a worktree
+/// fork's default name.
+pub(crate) fn want_in(db: &Db, params: &Value, git: Option<&GitNames>) -> Result<Want> {
     let p_opt = |k: &str| {
         params[k]
             .as_str()
@@ -409,14 +465,13 @@ pub(crate) fn want_in(db: &Db, params: &Value, workspace_dir: &str) -> Result<Wa
     let asked = p_opt("name");
     let auto_name = asked.is_none();
     // A worktree fork's branch and folder are named after it (unless a
-    // branch is asked for): the default skips names git already has.
-    let git = match (
-        &parent.repo_path,
-        wants_worktree && p_opt("branch").is_none(),
-    ) {
-        (Some(repo), true) => Some((repo.as_str(), workspace_dir)),
-        _ => None,
-    };
+    // branch is asked for): the default skips names git already has (read
+    // before the lock, for the parent's repo as it is now).
+    let git = git.filter(|g| {
+        wants_worktree
+            && p_opt("branch").is_none()
+            && parent.repo_path.as_deref() == Some(g.repo.as_str())
+    });
     let name = asked.unwrap_or_else(|| default_name(db, &parent.name, git));
     Ok(Want {
         agent,
@@ -437,17 +492,13 @@ pub(crate) fn want_in(db: &Db, params: &Value, workspace_dir: &str) -> Result<Wa
 }
 
 /// `<parent>-fork`, `-fork-2`, …: the first name no session has and no
-/// fork in the making reserved; with `git` (a worktree fork: the repo and
-/// where worktrees go), none whose branch or worktree folder exists.
-fn default_name(db: &Db, parent: &str, git: Option<(&str, &str)>) -> String {
+/// fork in the making reserved; with `git` (a worktree fork), none whose
+/// branch or worktree folder git already has. No git runs here: it is
+/// under the DB lock.
+fn default_name(db: &Db, parent: &str, git: Option<&GitNames>) -> String {
     let now = now_ms();
     names::fork_name(parent, |n| {
-        name_unavailable(db, n, now)
-            || git.is_some_and(|(repo, dir)| {
-                let branch = git::sanitize_branch(n);
-                git::workspace_path(repo, dir, &branch).exists()
-                    || git::branch_exists(repo, &branch)
-            })
+        name_unavailable(db, n, now) || git.is_some_and(|g| g.has(n))
     })
 }
 
@@ -621,6 +672,12 @@ pub(crate) fn finish(
     // chose. A worktree fork's branch was named after it: that stops it
     // (its worktree is removed); any other picks the next name.
     let parent = db.resolve_ref(&want.parent.id)?;
+    // Its conversation changed meanwhile (a fresh restart, a `/clear`):
+    // the fork would copy the one it left. (The caller undoes what was
+    // made: an OpenCode fork of the old one too.)
+    if parent.agent_session.as_deref() != Some(want.conversation.as_str()) {
+        bail!("the original's conversation changed while forking: try again");
+    }
     let name = match (want.auto_name && db.name_taken(&want.name)?, &want.worktree) {
         (false, _) => want.name.clone(),
         (true, Some(_)) => bail!("{} was taken meanwhile: fork again", want.name),
@@ -1054,9 +1111,12 @@ mod tests {
         assert_eq!(named.name, "sub-fork");
     }
 
-    /// `want_in` with the default place for worktrees.
+    /// `want_in` as `want_reserved` calls it (git read first), worktrees in
+    /// the default place.
     fn want(db: &Db, params: &Value) -> Result<Want> {
-        want_in(db, params, &Config::default().session.workspace_dir)
+        let repo = || db.resolve_ref(params["ref"].as_str()?).ok()?.repo_path;
+        let git = git_names(repo, params, &Config::default().session.workspace_dir);
+        want_in(db, params, git.as_ref())
     }
 
     fn err(db: &Db, params: Value) -> String {
@@ -1117,6 +1177,38 @@ mod tests {
         assert!(err(&db, json!({"ref": "c", "branch": "b"})).contains("new worktree"));
         // The overlord is no related session.
         assert!(err(&db, json!({"ref": "c", "related": ["o"]})).contains("overlord"));
+    }
+
+    /// The names git has are read once, before the lock; picking a default
+    /// name only looks them up (no git under the lock).
+    #[test]
+    fn a_worktree_forks_default_name_skips_what_git_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let g = GitNames {
+            repo: "/r".into(),
+            branches: ["n-p-fork".to_string()].into_iter().collect(),
+            folders: ["n-p-fork-2".to_string()].into_iter().collect(),
+        };
+        assert_eq!(default_name(&db, "n-p", Some(&g)), "n-p-fork-3");
+        assert_eq!(default_name(&db, "n-p", None), "n-p-fork");
+        // Read only for a worktree fork with a default name and branch.
+        let calls = std::cell::Cell::new(0);
+        let repo = || {
+            calls.set(calls.get() + 1);
+            Some(here.to_string())
+        };
+        for p in [
+            json!({"ref": "p"}),
+            json!({"ref": "p", "workspace": true, "name": "x"}),
+            json!({"ref": "p", "workspace": true, "branch": "b"}),
+        ] {
+            assert!(git_names(repo, &p, ".worktrees").is_none(), "{p}");
+        }
+        assert_eq!(calls.get(), 0);
+        let read = git_names(repo, &json!({"ref": "p", "workspace": true}), ".worktrees");
+        assert_eq!(read.map(|g| g.repo).as_deref(), Some(here));
     }
 
     #[test]
@@ -1818,6 +1910,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.kv_get(&pending_key("01fork")).unwrap(), None);
+    }
+
+    /// The original moved on to another conversation while the fork was
+    /// made (outside the lock): refused before anything is stored, so the
+    /// caller undoes what was made.
+    #[test]
+    fn a_fork_of_a_conversation_that_changed_meanwhile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "claude", Some("c-p"), here, "");
+        let w = want(&db, &json!({"ref": "p"})).unwrap();
+        db.set_agent_session("p", "c-new", "hook").unwrap();
+        let mut started = false;
+        let e = finish(&db, "01f", &w, &Made::default(), dir.path(), &mut started)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "the original's conversation changed while forking: try again"
+        );
+        assert!(!started);
+        assert!(db.resolve_ref("01f").is_err(), "nothing stored");
     }
 
     /// A default name is the fork's while it is made: a second fork at the

@@ -1502,7 +1502,8 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   made (kv `fork_name:<name>`, ten minutes at most), so two forks at once
   never pick the same one (by `fork`, not `want_in`, which only reads).
   A worktree's branch follows it, so a worktree fork's default also
-  skips a name whose branch or worktree folder git already has. Checked again
+  skips a name whose branch or worktree folder git already has (read
+  once before the lock, `fork::git_names`: no git runs under it). Checked again
   before the worktree is made and under the last lock: taken meanwhile by
   another session, a worktree fork stops cleanly; any other picks the
   next free name.
@@ -1551,7 +1552,9 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   transcript or a bound Codex thread's rollout not on disk, OpenCode's
   `ForkEmptyError`); a `scavenged` id; a parent whose folder is gone
   (archived ones fork while it's there); an agent not installed; OpenCode
-  into a new worktree; a `branch` without `workspace`.
+  into a new worktree; a `branch` without `workspace`; a parent whose
+  conversation changed while the fork was made (checked again in
+  `finish`: "try again"; what was made is undone).
 - **Warnings** (`warnings` in the answer, by plain code, of the parent as
   read when the fork starts): a working
   parent (the copy ends at its last finished step), a shared folder with
@@ -1571,15 +1574,19 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   oldest binds once there is a thread for each of them (or it waited
   `UNREAD_GRACE_MS`), a later one only after waiting, so none stays
   unbound. Any other waiting session takes the one thread its rules
-  narrow to unless its rollout says it was forked from a thread an rlord
-  fork waiting in that folder is looking for (a fork of anything else is
-  the user's own, made in the session's pane). One not readable yet is
-  taken at once when no rlord fork waits there, else 15 seconds after
-  the thread was indexed (`UNREAD_GRACE_MS`), so no session stays
-  unbound. A waiting fork holds such a session back (as another session
-  waiting in its folder) only for `UNREAD_GRACE_MS`. No other rollout is
-  read. An answer is remembered per thread once its first line is
-  complete (`Daemon::fork_flags`, the oldest forgotten first past 4096).
+  narrow to; with no rlord fork waiting in that folder its rollout isn't
+  read. With one waiting, it is taken unless its rollout says it was
+  forked from the thread that fork is looking for (a fork of anything
+  else is the user's own, made in the session's pane), and one not
+  readable yet is taken 15 seconds after the thread was indexed
+  (`UNREAD_GRACE_MS`), so no session stays unbound. A waiting fork holds
+  such a session back (as another session waiting in its folder) only
+  for `UNREAD_GRACE_MS`. No other rollout is read. An answer is
+  remembered per thread once its first line is complete
+  (`Daemon::fork_flags`, the oldest forgotten first past 4096); a
+  complete first line that can never be read (over 4 MB, not JSON) is
+  remembered as no fork once the grace has passed. Under the lock,
+  `record_bind` never binds a thread another session already has.
   The overlord's `bind_now`, under the DB lock, reads none: the overlord
   is never forked, and no fork runs in its folder. A Codex fork runs no
   `SessionStart` before its first
