@@ -283,7 +283,9 @@ impl Pty {
                 &mut s,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                // A raw pointer: Linux's libc takes `*const winsize`,
+                // macOS's `*mut` (a `&mut` trips clippy on Linux).
+                &raw mut ws,
             ) != 0
             {
                 bail!("openpty: {}", std::io::Error::last_os_error());

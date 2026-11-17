@@ -103,7 +103,8 @@ impl PtyClient {
                 &mut s,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                // Raw: Linux's libc takes `*const winsize`, macOS's `*mut`.
+                &raw mut ws,
             );
             assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
             libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
