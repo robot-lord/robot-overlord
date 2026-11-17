@@ -39,6 +39,33 @@ This is the premise of the remote design, not an option:
 - The relay sees who is connected and traffic metadata, never content
   (see `e2e-crypto.md`).
 
+## Network invariant: one pinned relay per host
+
+An rlord host set up for one relay can never be reached through another,
+and neither the host nor its devices will ever talk to another. This
+matters most for self-hosted, on-prem relays.
+
+- **The relay is part of the host's identity.** The host's config names
+  one relay: its origin (`https://relay.example.com`) and the relay's own
+  identity public key. The relay proves it holds that key on every
+  connection (a signed challenge inside TLS). Pin the relay identity key,
+  not the TLS certificate, so ACME renewals don't break the pin; the TLS
+  certificate must still validate for the configured domain.
+- **Pairing carries the pin.** The QR holds the relay origin and the relay
+  key fingerprint alongside the host's keys. A device stores the pin per
+  paired host and only ever dials that relay for that host.
+- **Bound into the handshake.** The relay origin and relay key are in the
+  Noise prologue of pairing and reconnect. A handshake routed through any
+  other relay fails cryptographically on both ends, even if that relay
+  forwards bytes faithfully.
+- **No way to be moved.** No relay-supplied redirects, relay lists,
+  fallbacks or discovery; HTTP redirects are refused. Moving a host to a
+  different relay is a user action on the host that re-pairs every
+  device; old pairings stop working.
+- **The relay enforces it too:** a relay accepts only host identities
+  registered with it, so a host can't be registered with two relays at
+  once by accident.
+
 ## Decisions in one table
 
 | Question | Decision | Main reason |
