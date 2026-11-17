@@ -1117,6 +1117,13 @@ channel = "stable"
 # resets: it is sent this message then, if nobody touched it meanwhile.
 [limits]
 resume_message = "continue"
+
+# The web UI: an opt-in plugin (`rlord web install`), on 127.0.0.1 only.
+# `rlord web` starts it for the daemon's run; enabled = true starts it with
+# the daemon. Its link carries a token: `rlord web url`.
+[web]
+enabled = false
+port = 47811     # fixed: the browser keeps the token per address (0 = any)
 "##;
 
 #[cfg(test)]

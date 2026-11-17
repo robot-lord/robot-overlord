@@ -42,6 +42,25 @@ imported: `RLORD_TMUX_PROFILE=default rlord` (agent sessions switch to
 rlord's own bar and clickable hints for that run; a plain `rlord` switches
 back). `rlord tmux profile` says which setup is active and why.
 
+### The web UI
+
+The web plugin (`crates/web`, binary `rlord-web`) builds with the rest of
+the workspace and embeds a placeholder page until the real one is built.
+The page (`crates/web/ui/`, TypeScript) needs Node (the major in
+`crates/web/ui/.node-version`):
+
+```sh
+cargo xtask web check      # types, lint, format, unit tests (installs the pinned tools first)
+cargo xtask web build      # the page into crates/web/ui/dist/; rebuild rlord-web to embed it
+cargo xtask web watch      # rebuild on change; run a debug rlord-web with RLORD_WEB_ASSETS=crates/web/ui/dist
+cargo build -p robot-overlord-web && rlord web   # a checkout's rlord runs the rlord-web beside it
+```
+
+`scripts/demo/demo.sh --web DIR` sets up the demo with the plugin
+(`RLORD_DEMO_SOCKET` and `[web] port` in its config run a second demo
+beside another). `cargo xtask check-deps` keeps network crates out of
+`rlord`; see "Web UI" in docs/architecture.md.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions
@@ -78,7 +97,8 @@ cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --worksp
 
 Never touch the default tmux server in tests or scripts: rlord runs on its
 own socket (`tmux -L rlord`), and tests use scratch sockets
-(`RLORD_TMUX_SOCKET`).
+(`RLORD_TMUX_SOCKET`). Tests that need tmux are gated: `RLORD_TMUX_TESTS=1
+cargo test --workspace`.
 
 ## Versions and releases
 

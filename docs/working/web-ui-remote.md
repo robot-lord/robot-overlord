@@ -1,10 +1,40 @@
-**Status:** in progress (slice 1: steps 1–13 built; step 14 not started)
+**Status:** in progress (slice 1, the local web UI, is built: steps 1–14; next: the relay and the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
-Follows `web-ui-spike.md` (a local PTY bridge drives the overlord cleanly).
 Two components: the **web UI** and the **transit** (a relay). Built in
-sections.
+sections. Slice 1 (the local web UI, an opt-in plugin) is built and
+documented in `docs/architecture.md` ("Web UI") and `docs/guide.md`; what
+follows the slice 1 plan is history kept for the relay and phone work.
+
+## From the spike (folded in from `web-ui-spike.md`)
+
+A throwaway spike (`spikes/web-ui/`, since deleted; local branch
+`spike/web-ui`, never pushed) answered "can a local browser drive the
+overlord?": yes, with one tmux client on a PTY per websocket. Slice 1 kept
+that bridge and fixed what the spike found rough: the status row, tmux's
+navigation keys and the CDN assets (view sessions and an embedded page).
+What it found that still matters:
+
+- **Shared window size.** A web view is an ordinary tmux client, so the
+  window takes the latest active client's size; two views of one session
+  (or a view and the TUI overlay) take turns. Accepted in slice 1; a
+  relayed phone view at its own size would make it worse. Options: one
+  view per session at a time, or the daemon sizing the window as the
+  overlay does (`auto_size_window`).
+- **What a remote version needs beyond slice 1** (the relay plan above and
+  `e2e-crypto.md` cover transport, pairing and keys):
+  - Real auth. The URL token is a bearer secret fit for localhost only (it
+    leaks through history and screen shares); remote access needs
+    per-device keys, expiry and revocation.
+  - Least privilege. The web view is as powerful as the user's shell (the
+    overlord can launch agents and type into any session). Remote use
+    argues for a narrower view by default and an audit log of input.
+  - Bandwidth. Raw tmux output is chatty; remote may want output
+    coalescing and compression.
+  - Phone layout. xterm.js at phone width is cramped: the overlord wants a
+    chat view fed from its transcript rather than its screen, and an input
+    box rather than raw keys.
 
 ## User's spec (as given)
 
@@ -137,7 +167,7 @@ Decided 2026-11-17 (user):
 
 ## Progress
 
-- Spike: local PTY bridge works (`web-ui-spike.md`, `spikes/web-ui/`).
+- Spike: local PTY bridge works ("From the spike" above).
 - Slice 1 planned (see below). Plan by a Fable planning agent.
 - 2026-11-17, user: the web server will not live in the daemon. It becomes
   a separate opt-in executable (a plugin, downloaded only on opt-in); the
@@ -522,6 +552,25 @@ Decided 2026-11-17 (user):
   - Owed: a dry run of `release.yml` (`workflow_dispatch`, `dry_run`)
     before the next stable release; it needs the branch pushed. No
     release was cut or tagged.
+
+- Step 14 done: `docs/architecture.md` "Web UI" (under Control surfaces;
+  the plugin in the crate list); the socket paragraph no longer says "no
+  TCP listener": `rlord` listens on nothing but its socket, and has no
+  HTTP server, websocket, TLS or network-client crate (the OpenCode
+  adapter's local HTTP client is the one exempt file), per step 3's
+  finding. `docs/guide.md` "The web UI", README (a feature line, config),
+  `SECURITY.md` (what is in scope for the plugin), `CONTRIBUTING.md` (the
+  page's tooling, the gated tmux tests), `CLAUDE.md` (a standing rule:
+  no network code in `rlord`, how to add a browser op), and `[web]` in the
+  config template. `spikes/web-ui/` deleted; what still matters from
+  `web-ui-spike.md` is "From the spike" above, and the spike doc is
+  removed. This doc and `e2e-crypto.md` stay in progress (the relay and
+  the phone app are the rest of the effort). Not done: the optional `:web`
+  list command.
+- Owed from slice 1 (by hand, in a real browser): Option as Meta and the
+  browser-kept keys on a real keyboard, the wheel and copy, IME, two tabs
+  at once, the TUI overlay open alongside, WebGL context loss
+  mid-session; a dry run of `release.yml` before the next stable release.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

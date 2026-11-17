@@ -1,4 +1,4 @@
-**Status:** in progress (design proposed 2026-11-17; spike built in `spikes/e2e/`, results in "Spike results" at the end; phone benchmarks and Firefox still owed)
+**Status:** in progress (design proposed 2026-11-17; spike built in `spikes/e2e/` on its own branch, results in "Spike results" at the end; phone benchmarks and Firefox still owed. The local web UI this builds on, slice 1 of `web-ui-remote.md`, is built; the relay and the phone app are not started)
 
 # End-to-end encryption for the relay: crypto core and the frontend path
 

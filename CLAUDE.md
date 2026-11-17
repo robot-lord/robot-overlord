@@ -264,3 +264,9 @@ get handled without the user looking. For each one:
 
 - Don't touch the user's default tmux server in tests or scripts. rlord runs
   on its own socket (`tmux -L rlord`); tests use scratch sockets.
+- The `rlord` binary has no network code: HTTP servers, websockets, TLS
+  and network-client crates belong in the opt-in web plugin
+  (`crates/web`), and `cargo xtask check-deps` fails otherwise. A new
+  browser action is an op on `web::OPS` (with its arguments) and in
+  `crates/web/ui/src/proto.ts`, with a test. Read "Web UI" in
+  docs/architecture.md before changing either side.
