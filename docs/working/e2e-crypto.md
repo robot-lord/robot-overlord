@@ -1,4 +1,4 @@
-**Status:** in progress (design proposed 2026-11-17; nothing built; waiting on the user's answers and the spike)
+**Status:** in progress (design proposed 2026-11-17; spike built in `spikes/e2e/`, results in "Spike results" at the end; phone benchmarks and Firefox still owed)
 
 # End-to-end encryption for the relay: crypto core and the frontend path
 
@@ -793,3 +793,292 @@ Defaults taken, not asked: remote browser client deferred; relay auth is
 TLS plus signed challenge, mTLS optional, P-256 relay identity;
 contentless wake-ups only (no lock-screen previews). Open: who reviews the
 protocol before public use.
+
+## Spike results
+
+Built 2026-11-17 in `spikes/e2e/`, its own Cargo workspace (not in the
+main workspace, lockfile or CI). Measured on an Apple Silicon Mac,
+rustc 1.100.0, Node 26.13.0. No phone was available.
+
+### What was built
+
+| Part | Where | Notes |
+| --- | --- | --- |
+| Sans-IO core | `core/` (`rlord_e2e`) | `snow` 0.10.0 (pure-Rust primitives only; its `std` feature would pull `ring`). Pairing `Noise_IKpsk2_25519_ChaChaPoly_SHA256`, reconnect `Noise_KKpsk2_…`. ML-KEM-768 through the PSK slot, behind a feature: `libcrux-ml-kem` 0.0.11 or RustCrypto `ml-kem` 0.3.4. QR payload, relay id, live and mailbox `Session` (32-byte and Padmé padding, rekey every 2^20 frames or every message), in-place and batch calls, `forbid(unsafe_code)`. |
+| WASM wrapper | `wasm/` | `wasm-bindgen` 0.2.130. `E2eSession` owns one fixed buffer (input and output regions, 64 max frames each); JS keeps a view and re-makes it if memory grows. Copy-per-call methods kept only for the benchmark. |
+| Build | `xtask/` (`cargo xtask …`) | `wasm` (bindgen in process via `wasm-bindgen-cli-support` =0.2.130, `--target web`, no wasm-pack), `vectors [--check]`, `sizes`, `check-deps`, `serve` (static files with the CSP). |
+| Native peer | `peer/` (`e2e-peer host|device|bench`) | Both roles dial out to the relay. No listener. |
+| Forwarder | `relay/` (`e2e-relay`) | The only listener. Websocket rooms, splices binary frames, announces `rlord-relay/1 <origin> <fingerprint>`. `--upstream` chains it to another relay (the rogue-relay test). No crypto crates. |
+| Pages | `web/` | Vite 8.3.8, TypeScript 7.0.2, Vitest 5.1.0, Playwright 1.65.1, `@noble/ciphers` 2.4.0, `binaryen` 132.0.0, all pinned in `package-lock.json`. Test page (`index.html`) and benchmark page (`bench.html`), both with the WASM in a module worker. |
+| Vectors | `vectors/v1.json` | Fixed keys, ephemerals and KEM seeds in; every message, hash, frame and failure out. |
+
+### Must-prove items
+
+| # | Claim | Result |
+| --- | --- | --- |
+| 1 | `snow` and ML-KEM build for `wasm32-unknown-unknown` and run in Chrome, Firefox, Safari, Node | **Chromium 159, WebKit 27.2 (Safari's engine), Node 26: yes.** Both ML-KEM crates build and run on wasm32 (the doc had `libcrux` on WASM unconfirmed; it works, portable code). `getrandom` 0.3 needs both the `wasm_js` feature and the `getrandom_backend="wasm_js"` cfg. **Firefox: not verified.** Playwright's Firefox build (firefox-1572) exits with "Could not find profile folder" on this macOS, also when run directly, with or without the command sandbox. The Safari app itself was not automated (`safaridriver` needs a one-time "Allow Remote Automation" by hand). |
+| 2 | Native and WASM byte-identical | **Yes.** `vectors/v1.json` is written by the native core. The same JSON comes out of: native tests with the libcrux backend and with the RustCrypto backend (so the two KEM crates also agree byte for byte); WASM scalar and SIMD builds in Node; the WASM worker in headless Chromium and WebKit. Interop runs both ways through the forwarder: WASM device to native host, and native device to WASM host (pairing, 3000 echoed frames, reconnect, 3000 more). |
+| 3 | PSK-slot hybrid with `snow`'s public API | **Yes.** `snow` reads PSKs lazily when it reaches the `psk` token (`handshakestate.rs`), so `set_psk` after message 1 is processed works on both sides. Failures checked: tampered KEM ciphertext (pairing and reconnect) and a wrong pairing secret both fail at the device with a decrypt error. 12 failure cases in the vectors, all failing as expected. |
+| 4 | The relay needs no crypto code | **Yes.** `cargo xtask check-deps`: `e2e-relay` links 60 crates, none of `rlord-e2e-spike`, `snow`, `ml-kem`, `libcrux-ml-kem`, `chacha20poly1305`, `poly1305`, `curve25519-dalek`, `x25519-dalek`, `aes-gcm`. (It does link `sha1` for the websocket accept header and `rand_chacha` through `tungstenite`; neither touches content.) |
+| 5 | Throughput and latency; do SIMD and the worker pay | **Far inside a pane's needs on the Mac; phones not measured.** Numbers below. SIMD: 10 to 20% faster on frames of 256 bytes and up. Worker: pays if, and only if, frames are batched to the page. |
+| 6 | WASM size and start-up, with and without ML-KEM | Measured, below. Production-like build (libcrux, O3, +simd128): 93 KB brotli. Instantiation 2 to 8 ms in the browsers. |
+| 7 | Vite 8 bundles it under the slice 1 CSP plus `'wasm-unsafe-eval'`, in a module worker, including Safari | **Yes on Chromium and WebKit**, and also with `require-trusted-types-for 'script'` added. No CSP violations reported. The built HTML has no inline script; each `.wasm` is a separate hashed asset served as `application/wasm`. Negative control: the same page without `'wasm-unsafe-eval'` fails to compile the module in both browsers, so the policy is enforced and that is the one addition WASM needs. WebKit 27.2 honours `'wasm-unsafe-eval'` (old Safari versions remain unconfirmed). |
+| 8 | Nothing reaches the `rlord` binary | **Yes.** `cargo xtask check-deps` resolves the main workspace too: 139 crates, none on the deny list. The spike is its own workspace. |
+
+Network invariants, checked by the tests:
+
+- **Everyone dials out.** The forwarder is the only listener; the native
+  host, native device, WASM host in Node and WASM device in browsers all
+  connect to it as clients. (`cargo xtask serve` also listens, but only to
+  serve the page's static files; it stands in for the app's bundled
+  assets or the local `rlord-web` and is never on the relay path.)
+- **One pinned relay.** The QR carries the relay origin and key
+  fingerprint; both go into every prologue. Tests: a device refuses a
+  relay whose announced identity isn't the pin; with the pin check turned
+  off, a faithful forwarder with another identity (chained to the real
+  relay) makes the handshake fail on both ends (host: decrypt failed on
+  message 1; device: no message 2), for a WASM device and for a native
+  one; a forwarder at another origin that claims the pinned key also
+  fails. In core vectors the same four cases (pairing and reconnect, host
+  side and device side) fail.
+
+### Numbers
+
+Every frame is encrypted and decrypted once. MB/s is plaintext bytes.
+Latency is per frame; in browsers it is timed over groups of 16 frames (or
+64 for batches) because of timer resolution, so p99 understates tails.
+
+Native (`e2e-peer bench`, in place, aarch64):
+
+| Frame | frames/s | MB/s | p50 | p99 |
+| --- | --- | --- | --- | --- |
+| 1 B | 3.2 M | 3 | 0.29 µs | 0.33 µs |
+| 64 B | 2.1 M | 137 | 0.46 µs | 0.50 µs |
+| 1 KiB | 339 k | 348 | 2.9 µs | 3.1 µs |
+| 16 KiB | 23 k | 381 | 42 µs | 55 µs |
+
+Full handshake, both sides, with ML-KEM: 0.26 ms native; 0.7 to 0.95 ms in
+WASM (Node, Chromium, WebKit). Without ML-KEM about 0.2 ms less in WASM.
+
+WASM, MB/s (scalar / +simd128), batch of 64 frames per call:
+
+| Frame | Node 26 | Chromium 159 | WebKit 27.2 |
+| --- | --- | --- | --- |
+| 1 B | 2.7 / 2.9 | 2.7 / 2.8 | 2.6 / 2.8 |
+| 64 B | 111 / 124 | 108 / 118 | 103 / 115 |
+| 1 KiB | 283 / 338 | 273 / 331 | 258 / 310 |
+| 16 KiB | 324 / 381 | 317 / 376 | 292 / 341 |
+
+One call per frame is about 1.5× slower than batching on frames under
+256 bytes and the same above 1 KiB. Per-frame cost for a 1-byte frame:
+0.3 µs batched, 0.6 µs single (Chromium). The shared-buffer call measured
+the same as, or slightly slower than, the default copy-per-call
+wasm-bindgen style: both copy twice, and wasm-bindgen's allocation is
+cheap. Batching is the lever, not the shared buffer.
+
+Baselines (Chromium; Node similar): pure-JS ChaCha20-Poly1305
+(`@noble/ciphers`) 103 MB/s at 1 KiB, 167 MB/s at 16 KiB, 4 µs per small
+frame. WebCrypto AES-GCM awaited one by one: 0.35 MB/s at 1 byte (one
+frame per promise), 2 GB/s at 16 KiB (AES instructions). In WebKit the
+awaited WebCrypto path costs about 40 µs per frame (0.03 MB/s at 1 byte).
+Below 1 KiB, the size of every keystroke and most pane frames, WASM ChaCha
+wins by 2 to 8× in Chromium and 10 to 90× in WebKit; from 1 KiB up
+WebCrypto's AES hardware catches up and wins at 16 KiB.
+
+Receive path, 3000 frames of 1 KiB (Chromium / WebKit):
+
+| Path | Total | Page thread busy |
+| --- | --- | --- |
+| Decrypt on the page thread | 6.0 / 6.2 ms | 6.0 / 6.2 ms |
+| Worker, one `postMessage` per frame | 10.6 / 21.0 ms | 1.5 / 0.1 ms |
+| Worker, 32 frames per `postMessage` (transferred) | 6.4 / 6.9 ms | 0.1 / 0 ms |
+
+The same shape at 64 bytes and at 16 KiB. Keystroke round trip page to
+worker to encrypted frame and back: p50 10 / 20 µs, p99 35 / 40 µs; the
+encrypt itself is under 5 / 20 µs at p99 (limited by timer resolution).
+
+Against the doc's pass bar: a keystroke adds well under 1 ms at p99, on
+the Mac. Crypto at about 300 MB/s is far above what a pane produces (kB/s
+to a few MB/s) and above what xterm.js can render, though xterm.js itself
+was not measured here. The worker loads off the page thread, so
+instantiation can't delay first paint.
+
+### Sizes
+
+Bytes: raw / gzip -9 / brotli -q 11 (`cargo xtask sizes`, no test hooks).
+Speed: Node, batch of 64.
+
+| Build | cargo + bindgen | after `wasm-opt -Oz` | handshake | 64 B / 1 KiB / 16 KiB MB/s |
+| --- | --- | --- | --- | --- |
+| libcrux, O3 | 373565 / 114605 / 78538 | 331213 / 115093 / 80931 | 0.92 ms | 108 / 283 / 318 |
+| libcrux, O3, simd128 | 475285 / 142202 / 93163 | 523369 / 135340 / 86814 | 0.83 ms | 120 / 332 / 371 |
+| libcrux, Oz | 253701 / 78519 / 64541 | 187952 / 70222 / 57298 | 1.12 ms | 52 / 193 / 238 |
+| RustCrypto ml-kem, O3 | 238162 / 80904 / 63081 | 195897 / 74808 / 58216 | 0.83 ms | 110 / 282 / 319 |
+| RustCrypto ml-kem, O3, simd128 | 231761 / 77059 / 61859 | 192965 / 70679 / 56792 | 0.84 ms | 120 / 334 / 375 |
+| RustCrypto ml-kem, Oz | 222828 / 69687 / 58295 | 140886 / 59430 / 50171 | 1.34 ms | 62 / 204 / 238 |
+| classical, O3 | 200938 / 69676 / 54867 | 165008 / 64054 / 50465 | 0.66 ms | 108 / 277 / 318 |
+| classical, Oz | 171099 / 58096 / 48684 | 117150 / 50063 / 42055 | 0.79 ms | 66 / 191 / 220 |
+
+- ML-KEM costs 8 KB (RustCrypto) to 24 KB (libcrux) brotli over
+  classical at O3. With simd128, libcrux grows by 15 KB brotli (100 KB
+  raw: its portable code gets auto-vectorised); RustCrypto doesn't grow.
+- `-Oz` saves 5 to 14 KB brotli (up to 21 KB with `wasm-opt`) and costs
+  25 to 50% of frame speed. `wasm-opt -Oz` on an O3 build changes brotli
+  size by -6 to +2 KB: not worth a build step. Note: `wasm-opt
+  --all-features` emits a module V8 rejects; it needs the explicit feature
+  list rustc targets.
+- The test-page build also carries the vector runner (`serde_json`):
+  503 KB raw.
+- Instantiate (fetch, compile, instantiate in the worker): 1.3 to 2.4 ms
+  Chromium, 2.6 to 7.9 ms WebKit, 0.4 ms Node from bytes in memory.
+
+Message sizes with ML-KEM: pairing message 1 is 1282 bytes, message 2 is
+1138; reconnect 1234 and 1138. The QR string is 183 to 190 characters
+(`RLORD1:` + base64url) for a short relay origin, larger than the doc's
+"about 150 bytes" because it now carries the 32-byte relay fingerprint.
+
+### Deviations from the design
+
+- **No `simd128` backend in any released `chacha20`.** Neither 0.9 (what
+  `snow` 0.10.0 resolves) nor the latest 0.10.2 has one; only SSE2, AVX2,
+  AVX-512 and NEON. `+simd128` still gains 10 to 20% through LLVM
+  auto-vectorisation of the portable code, so no custom resolver was
+  needed.
+- **"In place" with a scratch buffer.** `snow`'s transport API takes
+  separate input and output slices, so `Session` keeps one internal
+  scratch buffer. Single-frame calls are in place in the WASM input
+  region; batch calls read the input region and write the output region.
+  No allocation per call either way.
+- **The PSK also hashes the KEM ciphertext**, not only the shared secret:
+  `SHA-256(label | pairing secret | ss | ct)` for pairing,
+  `SHA-256(label | ss | ct)` for reconnect. It binds the ciphertext
+  explicitly for no cost. Still a composition for a cryptographer to read.
+- **The prologue holds the relay identity this connection reached**, not
+  the stored pin. The pin is checked first, as a separate gate; using the
+  observed origin and key in the prologue is what makes a faithful
+  forwarder under another identity fail. In the spike the key is
+  announced; the real relay must prove it (signed challenge), or a hop at
+  the same origin (DNS hijack) could claim it.
+- **Reconnect without ML-KEM** (size baseline only) is plain `KK`.
+- **Short code**: six digits from `SHA-256(label | handshake hash)`.
+- **Relay matching by room name** (`p-<rendezvous id>`,
+  `c-<channel id>`, the channel id derived from both static keys) stands
+  in for matching by relay identity.
+- **Worker creation** uses Vite's `?worker&url` import passed through a
+  one-rule Trusted Types policy (same origin only), instead of
+  `new Worker(new URL(...))`, so the page runs under
+  `require-trusted-types-for 'script'`. The `.wasm` is still loaded with
+  `new URL(..., import.meta.url)` as planned.
+- **UniFFI smoke test skipped**, as agreed (the phone runs WASM in a
+  WebView).
+
+### Not verified
+
+- Real phones (Safari on iPhone, Chrome on Android), so the doc's pass
+  bar "on the slowest phone tested" is still open.
+- Firefox (Playwright build would not start, above) and the Safari app
+  itself (WebKit engine only).
+- How much time xterm.js spends on the same bytes (the 1/10 rule).
+- Mailbox persistence and desync healing, key wrapping, real relay, TLS
+  and the relay's signed challenge: out of the spike's scope.
+
+### Open issues found
+
+- The relay's identity key must be proven (signed challenge) for the
+  prologue binding to mean anything at the same origin; the spike only
+  announces it.
+- WebKit logs "The network connection was lost" when a session ends: the
+  spike relay drops the peer socket without finishing the websocket close
+  handshake. Cosmetic; the real relay should close cleanly.
+- After a failed decrypt, `snow` does not advance the nonce; the spike
+  treats any failure as fatal for the session, and the real code must too
+  (close and re-handshake), or a tampered frame becomes an oracle.
+- `snow` 0.10.0 still pulls the previous RustCrypto generation
+  (`chacha20poly1305` 0.10, `curve25519-dalek` 4, `getrandom` 0.3). No
+  problem in the spike; it will duplicate crates if `crates/web` uses the
+  current generation elsewhere.
+- Test vectors are 232 KB of JSON (two 16 KiB frames in several modes);
+  bundling them into the test page's worker is fine for a spike, not for
+  the real page.
+
+### Running it
+
+```sh
+cd spikes/e2e
+cargo test -p rlord-e2e-spike                       # native, libcrux
+cargo test -p rlord-e2e-spike --no-default-features --features pq-rustcrypto
+cargo xtask vectors --check && cargo xtask check-deps
+cargo xtask wasm && cargo build --release -p e2e-relay -p e2e-peer -p e2e-xtask
+cd web && npm ci --ignore-scripts && npx tsc --noEmit && npx vite build
+npx vitest run                     # vectors in Node, interop, relay pinning
+node test/browsers.ts --bench      # headless Chromium/WebKit/Firefox
+node test/bench-node.ts; ../target/release/e2e-peer bench
+cd .. && cargo xtask sizes && (cd web && node test/bench-variants.ts)
+```
+
+Manual pairing: `e2e-relay --port 9000 --fingerprint <64 hex>`, then
+`e2e-peer host --relay ws://127.0.0.1:9000 --pin <same hex>`, then
+`cargo xtask serve web/dist --relay ws://127.0.0.1:9000` and paste the
+printed `QR` line into the test page.
+
+**On a phone** (benchmark page only; it needs no relay):
+
+1. `cargo xtask serve web/dist --host 0.0.0.0 --port 8080`.
+2. iPhone: open `http://<the Mac's LAN address>:8080/bench.html` in
+   Safari, press Run, then Copy JSON. Over plain http on a LAN address the
+   page is not a secure context: the WebCrypto rows are skipped and timers
+   are coarse, but every WASM row runs. For WebCrypto too, serve it over
+   HTTPS with a certificate the phone trusts.
+3. Android: `adb reverse tcp:8080 tcp:8080`, then open
+   `http://localhost:8080/bench.html` in Chrome (localhost is a secure
+   context, so WebCrypto runs). Add `--isolate` to `serve` for finer
+   timers.
+
+Results land in `spikes/e2e/results/` when run from the Mac; paste phone
+JSON there by hand.
+
+### Recommendation
+
+Proceed with the design as written, with these choices settled by the
+spike:
+
+1. **Post-quantum in v1: yes.** The PSK-slot hybrid works on `snow`'s
+   public API, costs about 0.2 ms per handshake in WASM and 8 to 24 KB
+   brotli. Still needs the cryptographer's read before real traffic.
+2. **KEM crate: `libcrux-ml-kem`** for its formal verification; same
+   speed as RustCrypto in WASM, 16 KB brotli more at O3 (31 KB more with
+   simd128). Take RustCrypto `ml-kem` only if
+   size becomes the constraint; both are byte-identical, so switching
+   later is a dependency change, not a protocol change.
+3. **Build with `+simd128` at O3, no `wasm-opt`.** Revisit opt-level only
+   with phone numbers.
+4. **Worker yes, with batched transfers to the page.** Per-frame
+   `postMessage` doubles or triples the cost; batching matches the page
+   thread's throughput with the page nearly idle.
+5. **Batch calls across the WASM boundary**; the shared-buffer API can
+   stay (no allocation in WASM) but bought nothing measurable over
+   wasm-bindgen's default copies.
+6. **Add `require-trusted-types-for 'script'`** with the one worker-URL
+   policy; it worked in both engines.
+7. **Owed before slice work builds on this:** the phone runs (both
+   phones, the doc's pass bar), Firefox on another machine or a fixed
+   Playwright build, and the relay's signed challenge, which the pinning
+   argument depends on.
+
+## Decision after the spike (user, 2026-11-17)
+
+Go ahead with the spike's recommendation: post-quantum hybrid in v1,
+`libcrux-ml-kem`, `+simd128` at O3, crypto in a worker with batched
+transfers, Trusted Types with the one worker-URL policy.
+
+`snow` checked 2026-11-17 and accepted: 0.10.0 (2025-07-19) is the latest
+release; `main` has commits to 2026-03 (incl. `sha2` 0.11, which fixes the
+older-RustCrypto duplication); one main maintainer; ~6.1M downloads in 90
+days; one advisory (RUSTSEC-2024-0011, fixed in 0.9.5). Guards: pin
+exactly, `cargo-deny` advisories, shared vectors and the handshake version
+byte keep a swap (`clatter` or own code) a dependency change; close the
+session on any decrypt failure. At build time, prefer a newer release if
+one exists, else consider a reviewed `main` commit; the cryptographer
+review covers the exact version shipped.
+
+Still owed: phone benchmark runs, Firefox, the relay's signed challenge.
