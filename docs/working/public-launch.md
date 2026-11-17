@@ -156,6 +156,10 @@ done, in this order (decided with the user, 2026-11-12):
          They change how prompts and messages reach sessions, so settle
          them before calling it stable. They include the #64/#65
          leftovers and the accumulating pending message.
+       - [ ] Website copy pass (`robot-lord/website`): bring every page up
+         to date with what shipped since it was last written. That covers
+         the overlord on any of the three agents, session background,
+         forking, fresh repo code and signed builds.
        - [ ] By hand, by the user: the item 9 macOS fresh install.
 11. [ ] 1.0.0 stable.
 
