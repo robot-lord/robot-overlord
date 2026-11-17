@@ -1434,7 +1434,9 @@ didn't go through; it names `context.md` only if the file is there.
 session's whole conversation, on the same agent. The original is left as
 it is. Plain code, no AI: the `f` form forks directly (no overlord turn,
 no `confirm_*` tool: the options are few and each has a safe default).
-Like `import`, the slow and outside parts run without the DB lock (the
+The form sends off the UI thread; a fork that fails brings it back with
+the error and what was typed, once nothing else is open. The CLI and the
+TUI word the answer alike (`rlord_core::forked`). Like `import`, the slow and outside parts run without the DB lock (the
 hooks check, the parent's usage, OpenCode's fork call, `git worktree
 add`); reading and inserting under it, through `methods::start`, the tail
 `session.new` uses too.
@@ -1448,15 +1450,17 @@ add`); reading and inserting under it, through `methods::start`, the tail
 
 Until then a restart forks again (kv `fork_pending`, `fork::pending`,
 written with the row before the pane starts, as is `bind_fork`), logged
-as `reforked` with its new branch point. Before its file is written and
-its pane starts, the fork's note gets the new time, unseen
-(`fork::renote`; shared folder or own worktree as recorded at the fork,
-kv `fork_folder`), and the start marks seen only what it hands the
-agent; once the pane is up a Codex fork drops
-the thread bound before and is bound anew by `bind_fork`
-(`fork::reforked`). The key goes once a hook or Codex's index names the
-fork's own transcript and it is on disk (`fork::conversation_seen`), or
-at a fresh start. Forks of one parent are made one at a time (a
+as `reforked` with its new branch point. Its file is written with the
+fork's note renewed in memory (`fork::renewed_note`,
+`context::refresh_file_with`; shared folder or own worktree as recorded
+at the fork, kv `fork_folder`); only once the pane is up is the note
+stored, unseen (`fork::renote`), does a Codex fork drop the thread
+bound before to be bound anew by `bind_fork` (`fork::reforked`), and
+does the start mark seen what it handed the agent. A restart that
+fails leaves the database as it was. "On disk" is one check for both a
+parent and a restart (`fork::conversation_on_disk`). The key goes once
+a hook or Codex's index names the fork's own transcript and it is on
+disk (`fork::conversation_seen`), or at a fresh start. Forks of one parent are made one at a time (a
 `fork:<parent>` lock in `locks::SessionLocks`, from the fork call to the
 row). An OpenCode fork is only ever the id OpenCode's answer gave: a
 call that fails or times out is reported (with a word that OpenCode may
@@ -1522,18 +1526,22 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   (`context_on`); its delivery is worked out afresh, as for a launch.
   Nothing is added to the parent.
 - **Lineage**: `sessions.forked_from` (migration 0011); rows carry
-  `forked_from_name`. Where rows are shown (`session.list`,
-  `session.get`), they also carry their `forks` (id, name, archived;
-  `Db::attach_forks`, one query over these rows' forks), never on a plain
-  lookup (`resolve_ref`, which every hook makes). MCP `list_sessions`
-  rows give a count (`live_forks`), `get_session` the list. The list
-  marks a fork `⑂`; details and `rlord show` say both ways. The fork's
+  `forked_from_name`. List rows (`session.list`) carry counts only
+  (`fork_count`, `live_fork_count`: one grouped query over these rows'
+  forks); `session.get` carries the `forks` themselves (id, name,
+  archived; `Db::attach_forks`); a plain lookup (`resolve_ref`, which
+  every hook makes) neither. MCP `list_sessions` rows give `live_forks`,
+  `get_session` the list. The list marks a fork `⑂`; details and `rlord
+  show` say both ways: the TUI's details pane loads the selected row's
+  fork names with its preview, once the highlight settles, only for a
+  row with forks and again only when its count changes. The fork's
   first event is `forked` (`from`, `from_conversation`, argv) instead of
   `launched`.
 - **Refused**: an overlord; no conversation yet (none bound, Claude's
-  transcript not written, OpenCode's `ForkEmptyError`); a `scavenged` id;
-  a parent whose folder is gone (archived ones fork while it's there); an
-  agent not installed; OpenCode into a new worktree.
+  transcript or a bound Codex thread's rollout not on disk, OpenCode's
+  `ForkEmptyError`); a `scavenged` id; a parent whose folder is gone
+  (archived ones fork while it's there); an agent not installed; OpenCode
+  into a new worktree; a `branch` without `workspace`.
 - **Warnings** (`warnings` in the answer, by plain code): a working
   parent (the copy ends at its last finished step), a shared folder with
   a live parent, a context window at or over 70%, uncommitted changes
@@ -1544,12 +1552,19 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   rollout's first `session_meta` says `forked_from_id` is that one
   (`codex::rollout_forked_from`; a candidate whose first line can't be
   read yet is skipped, never a reason to wait while another names the
-  parent). Any other waiting session takes the one thread its rules
+  parent). Several forks of one parent waiting in one folder queue
+  oldest first (`discover::place_of`, by their `bind_since`): each takes
+  the thread naming the parent made closest after its own start; the
+  oldest binds once there is a thread for each of them (or it waited
+  `UNREAD_GRACE_MS`), a later one only after waiting, so none stays
+  unbound. Any other waiting session takes the one thread its rules
   narrow to if that rollout says it is no fork, never if it says it is
   one; one not readable yet is taken 15 seconds after the thread was
   indexed (`UNREAD_GRACE_MS`), as before forks, so no session stays
-  unbound. No other rollout is read.
-  An answer is remembered per thread once its first line is complete.
+  unbound. A waiting fork holds such a session back (as another session
+  waiting in its folder) only for `UNREAD_GRACE_MS`. No other rollout is
+  read. An answer is remembered per thread once its first line is
+  complete (`Daemon::fork_flags`, the oldest forgotten first past 4096).
   The overlord's `bind_now`, under the DB lock, reads none: the overlord
   is never forked, and no fork runs in its folder. A Codex fork runs no
   `SessionStart` before its first
