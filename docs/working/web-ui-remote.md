@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–5 built; steps 6–14 not started)
+**Status:** in progress (slice 1: steps 1–6 built; steps 7–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -39,6 +39,31 @@ sections.
   (announce/lookup by either side) once trust is established; heavier
   transfer only after that.
 
+## Network invariant: everyone dials out to the relay
+
+This is the premise of the remote design, not an option:
+
+- **The rlord host never accepts an incoming connection from the network.**
+  Assume it sits behind NAT, a corporate firewall, or a laptop on hotel
+  wifi. Its only listener is `rlord-web` on `127.0.0.1` for the local
+  browser. Every remote path starts with the host opening an outbound TCP
+  (TLS) connection to the relay and keeping it open.
+- **The relay is the only publicly reachable piece.** A server with a
+  domain and a TLS certificate: either the hosted one (run by the project
+  author) or one a user or company runs themselves. It is a separate
+  binary (`rlord-relay`), never part of `rlord`.
+- **Devices also dial out to the relay.** The phone never connects to the
+  host directly. No port forwarding, no UPnP, no direct peer-to-peer in v1
+  (a hole-punched direct path is a possible later optimisation, never a
+  requirement).
+- **The relay splices outbound connections.** Host and device each hold a
+  connection to the relay; the relay matches them by their relay identity
+  and forwards opaque Noise frames between them. "Anything for me?"
+  signals, mailbox delivery and live pane streams all ride on connections
+  the host and device opened themselves.
+- The relay sees who is connected and traffic metadata, never content
+  (see `e2e-crypto.md`).
+
 ## Notes and proposed refinements (Claude)
 
 - **Per-device keys, not one shared content key.** The QR carries rlord's
@@ -66,7 +91,7 @@ sections.
   relay can be swapped for one that steals keys. The web UI's JS must come
   from rlord itself (local) or from a signed native/installed app, never
   from the relay.
-- **Self-hosting:** relay as one static binary (`rlord relay`) plus a
+- **Self-hosting:** relay as one static binary (`rlord-relay`, separate from `rlord`) plus a
   container image; config is a domain, TLS cert (or ACME), and a storage
   path. No database beyond a small embedded store for mailboxes.
 
@@ -182,6 +207,30 @@ Decided 2026-11-17 (user):
   - Until step 12, `rlord web` with no plugin fails naming
     `rlord web install` (which doesn't exist yet); the opt-in prompt is
     step 12's.
+- Step 6 done (`crates/web/src/{main,daemon,token,http,assets}.rs`,
+  `build.rs`): the plugin reads `[web] port`, makes or reuses the token,
+  binds 127.0.0.1 (exit 4 if taken), says hello with its port (exit 3 on
+  another protocol), subscribes, serves, and exits 0 when the
+  subscription ends. Host check and headers on every response, Origin
+  check on upgrades, first-frame auth (4401), 16 control sockets, 1 MiB
+  control frames, the control socket's `hello`, requests and `changed`
+  events. Assets embedded by `build.rs` from `ui/dist/`, else the
+  placeholder page; `RLORD_WEB_REQUIRE_ASSETS=1` and debug-only
+  `RLORD_WEB_ASSETS` as planned. Tests: unit tests in each module, and
+  `crates/web/tests/http.rs` (the real binary started by an in-memory
+  daemon's supervisor, port 0, no tmux). Choices within the plan:
+  - Browser messages: the hello is `{"event":"hello","version","build",
+    "rev"}`; error codes are strings: `not_allowed`, `failed`,
+    `bad_request`, `daemon_unavailable`.
+  - The build id is the version plus an FNV-1a hash of the asset table
+    (no hashing crate in the build script).
+  - Without `dist/`, `build.rs` watches `ui/` (a missing path would
+    rerun it on every build).
+  - A frame over the limit ends the socket (tungstenite's error); there
+    is no 1009 close frame to rely on.
+  - `web.start` returns at hello, which comes just before the plugin
+    subscribes and serves; the listener is already bound then, so an
+    early browser connection waits in the backlog rather than failing.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

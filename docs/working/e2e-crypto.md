@@ -14,6 +14,31 @@ Planned by a Fable planning agent. Versions and browser facts were read on
 memory. Where a fact could not be confirmed from a primary source it says
 so.
 
+## Network invariant: everyone dials out to the relay
+
+This is the premise of the remote design, not an option:
+
+- **The rlord host never accepts an incoming connection from the network.**
+  Assume it sits behind NAT, a corporate firewall, or a laptop on hotel
+  wifi. Its only listener is `rlord-web` on `127.0.0.1` for the local
+  browser. Every remote path starts with the host opening an outbound TCP
+  (TLS) connection to the relay and keeping it open.
+- **The relay is the only publicly reachable piece.** A server with a
+  domain and a TLS certificate: either the hosted one (run by the project
+  author) or one a user or company runs themselves. It is a separate
+  binary (`rlord-relay`), never part of `rlord`.
+- **Devices also dial out to the relay.** The phone never connects to the
+  host directly. No port forwarding, no UPnP, no direct peer-to-peer in v1
+  (a hole-punched direct path is a possible later optimisation, never a
+  requirement).
+- **The relay splices outbound connections.** Host and device each hold a
+  connection to the relay; the relay matches them by their relay identity
+  and forwards opaque Noise frames between them. "Anything for me?"
+  signals, mailbox delivery and live pane streams all ride on connections
+  the host and device opened themselves.
+- The relay sees who is connected and traffic metadata, never content
+  (see `e2e-crypto.md`).
+
 ## Decisions in one table
 
 | Question | Decision | Main reason |
@@ -496,9 +521,6 @@ not content, not which pane, not content keys.
   check-deps` gains `robot-overlord-e2e`, `snow` and the ML-KEM crate on
   its deny list. The QR reaches the terminal as an opaque string from the
   plugin.
-- `web-ui-remote.md` still says the relay is `rlord relay`. With the "no
-  network code in `rlord`" rule it has to be a separate executable (say
-  `rlord-relay`). To be corrected there by whoever owns that doc.
 - `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target.
 
 ### Building the WASM
@@ -727,3 +749,20 @@ WebCrypto algorithms; Firefox's and Safari's JSPI status; the commit of
 `snow` that Trail of Bits reviewed; `libcrux-ml-kem` on WASM; StrongBox and
 Curve25519 on current Android; a published WASM against WebCrypto
 small-frame benchmark (none found).
+
+## Answers (user, 2026-11-17)
+
+1. Post-quantum hybrid (X25519 + ML-KEM-768) from v1, if the spike
+   confirms it works.
+2. No long backlog at the relay: the host is the source of truth and a
+   device re-syncs on connect.
+3. Phone app: a native shell around the same Preact page in a WebView.
+   Crypto runs as WASM there too; the native side keeps keys at rest, push
+   and the pinned code bundle. UniFFI shrinks to what the shell needs.
+4. Host confirmation (device name plus short code) before a newly paired
+   device can act.
+
+Defaults taken, not asked: remote browser client deferred; relay auth is
+TLS plus signed challenge, mTLS optional, P-256 relay identity;
+contentless wake-ups only (no lock-screen previews). Open: who reviews the
+protocol before public use.

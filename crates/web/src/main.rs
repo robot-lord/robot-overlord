@@ -1,17 +1,26 @@
 //! `rlord-web`, the opt-in web UI plugin. The daemon starts it
 //! (`rlord-web serve`) and supervises it; nobody runs it by hand.
 //!
+//! On start it reads `[web] port`, makes or reuses the token, binds
+//! 127.0.0.1, says `web.hello` with its port, subscribes to the daemon's
+//! changes, and serves. It exits when that subscription ends (the daemon
+//! went away), so a crashed daemon leaves no listener behind.
+//!
 //! Exit codes: 0 when the daemon goes away, 1 on an error, 2 on a wrong
 //! command line, 3 when the daemon refuses its protocol
 //! (`plugin::EXIT_INCOMPATIBLE`), 4 when its port is taken
-//! (`plugin::EXIT_PORT_IN_USE`). The daemon retries none of 3 and 4.
+//! (`plugin::EXIT_PORT_IN_USE`). The daemon retries neither 3 nor 4.
 
-use std::io::{BufRead, BufReader, Write};
+mod assets;
+mod daemon;
+mod http;
+mod token;
+
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
 
+use rlord_core::config::Config;
 use rlord_core::{paths, plugin};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,33 +49,43 @@ fn main() -> ExitCode {
     }
 }
 
-/// Say hello to the daemon, then stay until it goes away.
 fn serve() -> Result<ExitCode> {
-    let socket = paths::socket_path();
-    let stream = std::os::unix::net::UnixStream::connect(&socket)
-        .with_context(|| format!("connecting to the daemon at {}", socket.display()))?;
-    let mut w = stream.try_clone()?;
-    let hello = json!({"id": 1, "method": "web.hello", "params": {
-        "protocol": plugin::WEB_PROTOCOL,
-        "version": VERSION,
-        "pid": std::process::id(),
-        "port": 0,
-    }});
-    writeln!(w, "{hello}")?;
-    let mut lines = BufReader::new(stream).lines();
-    let reply: Value = serde_json::from_str(&lines.next().context("the daemon hung up")??)?;
-    if let Some(e) = reply.get("error") {
-        eprintln!("rlord-web: the daemon refused hello: {}", e["message"]);
-        if e["code"] == plugin::RPC_ERR_INCOMPATIBLE {
+    let cfg = Config::load()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(serve_on(cfg.web.port))
+}
+
+async fn serve_on(port: u16) -> Result<ExitCode> {
+    let token = token::load_or_create(&plugin::token_path())?;
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("rlord-web: 127.0.0.1:{port} is in use");
+            return Ok(ExitCode::from(plugin::EXIT_PORT_IN_USE as u8));
+        }
+        Err(e) => return Err(e).with_context(|| format!("listening on 127.0.0.1:{port}")),
+    };
+    let port = listener.local_addr()?.port();
+    let d = daemon::Daemon::new(paths::socket_path());
+    if let Err(e) = d.hello(port).await {
+        eprintln!("rlord-web: the daemon refused hello: {e}");
+        if e.code == i64::from(plugin::RPC_ERR_INCOMPATIBLE) {
             return Ok(ExitCode::from(plugin::EXIT_INCOMPATIBLE as u8));
         }
         return Ok(ExitCode::FAILURE);
     }
-    // Nothing else to do yet: wait for the daemon to go.
-    for line in lines {
-        if line.is_err() {
-            break;
+    let (rev, mut sub) = d.subscribe().await.context("subscribing to the daemon")?;
+    let app = http::App::new(token, port, d, rev);
+    // The daemon's changes, to every control socket; its end is ours.
+    let pump = std::sync::Arc::clone(&app);
+    tokio::spawn(async move {
+        while let Some(rev) = sub.next().await {
+            pump.changed(rev);
         }
-    }
+        eprintln!("rlord-web: the daemon went away; exiting");
+        std::process::exit(0);
+    });
+    eprintln!("rlord-web {VERSION}: listening on 127.0.0.1:{port}");
+    axum::serve(listener, http::router(app)).await?;
     Ok(ExitCode::SUCCESS)
 }
