@@ -774,7 +774,9 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   overlord asks the user (`prefer` then). A named branch that isn't
   here and whose fetch is still running, offline or failed says that
   ("still fetching feat from origin: try again shortly"), not that it
-  doesn't exist. A shallow clone that
+  doesn't exist; a launch waits on such a first fetch up to 20 s in all
+  before saying so. `<remote>/<b>` never falls back to a local `b`: the
+  remote without it is "origin has no branch b". A shallow clone that
   looks diverged says so. When the two can't be compared at all (a
   missing object), that is no divergence: an `unknown` warning, the
   remote's commit (the local one with `prefer: local`), never a refused
@@ -827,8 +829,9 @@ a repo instead, as plain code (`core/src/latest.rs` for git,
   the tree was, the recorded default branch and the last failed
   `ls-remote`, and when each branch was last fetched. A sweep shortly
   after start and daily works from those records only (it never scans
-  for repos). It drops the record of a repo that is gone (its common git
-  dir missing: a stat, checked before the guard below). It removes
+  for repos). A repo in a guarded folder is skipped first, unstatted.
+  It drops the record of a repo that is gone (its common git dir not
+  found; any other error keeps it). It removes
   trees unused for 30 days and any `old_trees` (with the checks above),
   keeping the record, its refs and its cache. A record with no tree is
   kept. `rlord latest --prune [REPO]` removes the trees, the refs and the

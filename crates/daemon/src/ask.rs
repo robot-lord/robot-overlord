@@ -295,7 +295,10 @@ pub fn format_request(p: &Value) -> Result<String> {
         Some(b) if b.eq_ignore_ascii_case("head") => {
             format!("- base: the main checkout's HEAD ({})\n", source("base"))
         }
-        Some(b) => format!("- base: {b} ({})\n", source("base")),
+        Some(b) => match get("prefer") {
+            Some(side) => format!("- base: {b}, its {side} side ({})\n", source("base")),
+            None => format!("- base: {b} ({})\n", source("base")),
+        },
         None => "- base: (the configured default)\n".to_string(),
     };
     m += &if tags.is_empty() {

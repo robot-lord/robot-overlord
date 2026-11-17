@@ -608,7 +608,9 @@ pub fn confirm_new_session(d: &Daemon, params: &Value) -> Result<Value> {
         .context("missing 'description' (the user's, verbatim)")?;
     let mut prefill = Map::new();
     prefill.insert("description".into(), json!(description));
-    for k in ["repo", "project", "agent", "model", "base", "note"] {
+    for k in [
+        "repo", "project", "agent", "model", "base", "prefer", "note",
+    ] {
         if let Some(v) = params[k].as_str().map(str::trim).filter(|v| !v.is_empty()) {
             let v = if matches!(k, "repo" | "project") {
                 expand_tilde(v)

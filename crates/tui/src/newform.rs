@@ -448,7 +448,9 @@ impl NewForm {
         if let Some(w) = p["workspace"].as_bool() {
             self.workspace = w && !matches!(self.location, Location::Folder(_));
         }
-        // (The configured default is shown as such, not as a pick.)
+        // (The configured default is shown as such, not as a pick; a side
+        // comes only with a base.)
+        self.prefer = get("prefer").unwrap_or_default();
         let default = self.default_base.clone();
         self.base = get("base")
             .filter(|b| !b.eq_ignore_ascii_case(&default))
@@ -1266,6 +1268,7 @@ impl App {
             // Empty: the configured default, sent as one (not chosen), so
             // it never overrides `[session] base`.
             "base": if f.base.trim().is_empty() { f.default_base.as_str() } else { f.base.trim() },
+            "prefer": if f.base.trim().is_empty() || f.prefer.is_empty() { None } else { Some(f.prefer.as_str()) },
             "tags": f.tags.split_whitespace().map(|t| t.trim_start_matches('#')).collect::<Vec<_>>(),
             "chosen": chosen,
             // The overlord's resolved values the user left as they were.

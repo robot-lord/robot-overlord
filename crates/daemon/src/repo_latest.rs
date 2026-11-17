@@ -74,6 +74,9 @@ pub struct Timing {
     /// ...or this long for a named branch (a launch's base, the tool's
     /// `ref`: it may have just been pushed).
     pub named_retry: Duration,
+    /// How long, in all, a launch waits on the first fetch of a named base
+    /// that is only on the remote, before it refuses ("still fetching").
+    pub named_base_wait: Duration,
 }
 
 impl Default for Timing {
@@ -84,6 +87,7 @@ impl Default for Timing {
             launch_wait: Duration::from_secs(4),
             failed_fresh: Duration::from_secs(120),
             named_retry: Duration::from_secs(10),
+            named_base_wait: Duration::from_secs(20),
         }
     }
 }
@@ -391,6 +395,19 @@ struct Found {
     warnings: Vec<String>,
 }
 
+/// A named branch not here yet whose fetch is still running (a launch
+/// waits on it longer: `Timing::named_base_wait`).
+#[derive(Debug)]
+struct StillFetching(String);
+
+impl std::fmt::Display for StillFetching {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StillFetching {}
+
 /// What a resolve learned, for the record.
 #[derive(Default)]
 struct Learned {
@@ -470,12 +487,15 @@ fn resolve(
     };
     let now = now_ms();
     let mut prefer = want.prefer;
+    // `<remote>/<b>`: the remote's asked for, never the local one instead.
+    let mut explicit_remote = false;
     let (mut branch, from) = match want.branch {
         Some(b) => {
             let b = match split_remote(&env, root, remote.as_deref(), b) {
                 // (They named the remote's: on a divergence, it wins.)
                 Some(rest) => {
                     prefer = prefer.or(Some(Prefer::Remote));
+                    explicit_remote = true;
                     rest
                 }
                 None => b.to_string(),
@@ -614,18 +634,22 @@ fn resolve(
         Fetch::Failed(why) => warnings.push(format!("fetch_failed: {why}")),
         _ => {}
     }
-    if local.is_none() && remote_commit.is_none() {
+    if remote_commit.is_none() && (local.is_none() || explicit_remote) {
         let r = remote.as_deref().unwrap_or("the remote");
+        let here = if explicit_remote {
+            String::new()
+        } else {
+            format!(", and there is no local {branch}")
+        };
         match &fetch {
             Fetch::Running => {
-                bail!("still fetching {branch} from {r}: try again shortly")
+                return Err(anyhow::Error::new(StillFetching(format!(
+                    "still fetching {branch} from {r}: try again shortly"
+                ))))
             }
-            Fetch::Offline => {
-                bail!("offline: can't fetch {branch} from {r}, and there is no local {branch}")
-            }
-            Fetch::Failed(why) => {
-                bail!("fetching {branch} from {r} failed ({why}), and there is no local {branch}")
-            }
+            Fetch::Offline => bail!("offline: can't fetch {branch} from {r}{here}"),
+            Fetch::Failed(why) => bail!("fetching {branch} from {r} failed ({why}){here}"),
+            Fetch::Missing if explicit_remote => bail!("{r} has no branch {branch}"),
             _ => bail!(
                 "no branch {branch} in {}{}",
                 root.display(),
@@ -1128,7 +1152,32 @@ fn base(d: &Daemon, cfg: &Config, want: &Want) -> Result<Value> {
         (_, Located::Repo(r)) => r,
     };
     let key = key_of(&repo);
-    let (f, learned) = resolve(d, cfg, &repo, want, &record(d, &key))?;
+    // A named base only on the remote whose first fetch is still running:
+    // waited on up to `named_base_wait` in all, then refused, saying so.
+    let until = Instant::now() + d.latest.timing().named_base_wait;
+    let (f, learned) = loop {
+        match resolve(d, cfg, &repo, want, &record(d, &key)) {
+            Err(e) if want.branch.is_some() && e.is::<StillFetching>() => {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                // (The same fetch, still running: waited on, not repeated.)
+                let longer = Want {
+                    wait: left,
+                    deadline: Some(until),
+                    ..*want
+                };
+                if let Ok(found) = resolve(d, cfg, &repo, &longer, &record(d, &key)) {
+                    break found;
+                }
+                if Instant::now() >= until {
+                    return Err(e);
+                }
+            }
+            r => break r?,
+        }
+    };
     let now = now_ms();
     update(d, &key, |r| {
         learned.apply(r, &repo, now);
@@ -1306,7 +1355,8 @@ fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<()> {
     let repo = match latest::locate(&env, Path::new(root)) {
         Ok(Located::Repo(r)) => r,
         Ok(Located::NotGit) => return gone(d),
-        Err(_) if !Path::new(key).exists() => return gone(d),
+        // (Only "not found" is gone; any other error keeps the record.)
+        Err(_) if matches!(Path::new(key).try_exists(), Ok(false)) => return gone(d),
         Err(e) => return Err(e),
     };
     let list = &repo.worktrees;
@@ -1378,17 +1428,22 @@ pub fn sweep(d: &Daemon) -> Value {
     let (mut gone, mut trees, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (key, rec) in records(d) {
         let root = root_of(&key, &rec);
-        // (A stat only, before the guard: a gone repo's record goes even
-        // from a guarded folder.)
-        if !Path::new(&key).exists() {
-            let _move = d.latest.moves.lock(&key);
-            update(d, &key, |_| false);
-            gone.push(root);
-            continue;
-        }
+        // Guarded first: nothing in a guarded folder is touched, not even
+        // a stat, unprompted (`rlord latest --prune` does).
         if guarded(d, &cfg, Path::new(&root)) {
             skipped.push(root);
             continue;
+        }
+        match Path::new(&key).try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                let _move = d.latest.moves.lock(&key);
+                update(d, &key, |_| false);
+                gone.push(root);
+                continue;
+            }
+            // (Can't tell: kept.)
+            Err(_) => continue,
         }
         let stale = rec.tree.is_some() && now - rec.tree_used_at > UNUSED_MS;
         if stale || !rec.old_trees.is_empty() {
@@ -1439,6 +1494,7 @@ mod tests {
             launch_wait: Duration::from_millis(wait_ms),
             failed_fresh: Duration::from_secs(120),
             named_retry: Duration::from_secs(10),
+            named_base_wait: Duration::from_millis(wait_ms),
         }
     }
 
@@ -2554,6 +2610,83 @@ mod tests {
         assert_eq!(v["path"], json!(path), "{v}");
         assert!(path.join("f.txt").exists(), "{v}");
         assert!(record(&d, &key(c)).commit.is_some());
+    }
+
+    /// A named base only on the remote, whose first fetch takes longer
+    /// than the 4 s launch wait: waited on (up to `named_base_wait`), not
+    /// refused.
+    #[test]
+    fn a_named_base_is_waited_on_longer() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let feat = r.push_remote("feat", "feat");
+        let slow = r.root().join("slow-upload-pack");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 1\nexec git-upload-pack \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.g(
+            c,
+            &["config", "remote.origin.uploadpack", slow.to_str().unwrap()],
+        );
+        let d = daemon(&r);
+        d.latest.set_for_test(
+            r.env.clone(),
+            Timing {
+                named_base_wait: Duration::from_secs(10),
+                ..timing(200)
+            },
+            Guard::with(None, false),
+        );
+        let b = launch_base(&d, &json!({"repo": c, "name": "s", "base": "feat"})).unwrap();
+        assert_eq!(b["commit"], feat.as_str(), "{b}");
+    }
+
+    /// `origin/<b>` when the remote has no such branch: refused, never the
+    /// local branch of that name instead.
+    #[test]
+    fn an_explicit_remote_branch_never_falls_back_to_the_local_one() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        let c = &r.clone;
+        r.g(c, &["branch", "only-here"]);
+        let e = latest_rpc(&d, json!({"repo": c, "ref": "origin/only-here"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("origin has no branch only-here"), "{e}");
+        // Plain `only-here`: the local one.
+        assert!(latest_rpc(&d, json!({"repo": c, "ref": "only-here"})).is_ok());
+    }
+
+    /// The sweep never stats a repo in a guarded folder, gone or not: it
+    /// is skipped, its record kept.
+    #[test]
+    fn the_sweep_never_stats_a_guarded_repo() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        let home = r.root().join("home");
+        let gone_guarded = home.join("Documents/gone/.git");
+        put_rec(
+            &d,
+            &gone_guarded,
+            Rec {
+                root: gone_guarded
+                    .parent()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                used_at: 1,
+                ..Rec::default()
+            },
+        );
+        d.latest.set_for_test(
+            r.env.clone(),
+            timing(30_000),
+            Guard::with(Some(&home), false),
+        );
+        let v = sweep(&d);
+        assert_eq!(v["gone"], json!([]));
+        assert_eq!(v["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(records(&d).len(), 1);
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

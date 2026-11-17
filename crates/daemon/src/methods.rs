@@ -599,15 +599,15 @@ fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
     db.kv_set(&launched_args_key(id), &serde_json::to_string(argv)?)
 }
 
-/// Where a new session lives: an explicit repo, an explicit plain folder,
-/// or the configured default repo. (The repo's main root, if it is in
-/// one; the folder it runs in.) Shared with `repo_latest::launch_base`,
-/// which reads `session.new`'s params before the DB lock.
 /// A new session's location (`new_location`): the repo's main root, if it
 /// is in one; the folder it runs in; and its branch when the params name
 /// it (`branch`, else from `name`; None: from a generated name).
 pub(crate) type Location = (Option<String>, String, Option<String>);
 
+/// Where a new session lives: an explicit repo, an explicit plain folder,
+/// or the configured default repo, and its branch name (the one rule for
+/// it). Shared with `repo_latest::set_launch_base`, which reads
+/// `session.new`'s params before the DB lock.
 pub(crate) fn new_location(cfg: &Config, params: &Value) -> Result<Location> {
     let p_opt = |k: &str| {
         params

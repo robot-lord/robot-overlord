@@ -16,8 +16,6 @@ base work now is in `docs/architecture.md` ("The latest code
   default branch. Today: `origin`, else the only remote (user's call).
 - **Tags and commit ids as `ref`**: branches only today.
 - **Submodules and LFS content** in the tree: warnings only today.
-- **A launch that prefers the local side** of a diverged named `base`
-  (today: refused, or `<remote>/<branch>` for the remote's).
 - **`git()` in `git.rs`** still has no time limit or no-prompt setup; move
   its callers to `latest::run` when next touched.
 - **Two daemons on one machine** (the dev daemon beside the real one)
@@ -31,6 +29,15 @@ base work now is in `docs/architecture.md` ("The latest code
   the error says so.
 - **From a linked worktree of a `--separate-git-dir` repo** the main
   checkout can't be known: an error asks for its path.
+- **One safe git runner for all of rlord**: `latest::run` (time limit,
+  no prompts, no hooks) lives in `latest.rs`; move it to a module of its
+  own that `git.rs` and the rest use too.
+- **`remote_env` worked out lazily**: it runs `git config` twice per
+  resolve even when nothing talks to the remote (a cached fetch, a
+  cached default branch).
+- **One `clip` and one repo-root resolver**: `latest.rs` has its own
+  `clip` and `locate` beside other helpers that clip text and
+  `git::main_repo_root`; keep one of each.
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored

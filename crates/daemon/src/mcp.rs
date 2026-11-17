@@ -209,6 +209,8 @@ pub fn tools() -> Value {
                 "model": s("Model as you would launch it (\"\" for the agent default)"),
                 "workspace": b("Own git worktree"),
                 "tags": {"type": "array", "items": {"type": "string"}},
+                "prefer": {"type": "string", "enum": ["local", "remote"],
+                           "description": "With `base`, when that branch's local and remote sides have diverged: the side the user chose"},
                 "base": s("Where its new branch would start, as you would launch it: \"latest\" (the latest default branch), a branch or <remote>/<branch> to build on, or \"head\" (omit: what the user sent)"),
                 "changed": {"type": "array", "items": {"type": "string", "enum": ["repo", "agent", "model", "worktree", "base", "tags"]},
                             "description": "Hints you changed from what the user sent"},
@@ -537,6 +539,32 @@ fn shape_base(b: &Value) -> Value {
     v
 }
 
+/// What `confirm_new_session` passes on: the description, the hints as
+/// the overlord would launch them (`base` and its `prefer` included),
+/// which it changed, and its note.
+fn confirm_params(args: &Value) -> Value {
+    let mut p = Map::new();
+    for k in [
+        "description",
+        "request_id",
+        "repo",
+        "project",
+        "agent",
+        "model",
+        "workspace",
+        "base",
+        "prefer",
+        "tags",
+        "changed",
+        "note",
+    ] {
+        if let Some(v) = args.get(k) {
+            p.insert(k.into(), v.clone());
+        }
+    }
+    Value::Object(p)
+}
+
 fn params_wants_remote(args: &Value) -> bool {
     args.get("remote_control").and_then(Value::as_bool) == Some(true)
 }
@@ -668,26 +696,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             d.rpc("ui.confirm_setup", Value::Object(p))
         }
-        "confirm_new_session" => {
-            let mut p = Map::new();
-            for k in [
-                "description",
-                "request_id",
-                "repo",
-                "project",
-                "agent",
-                "model",
-                "workspace",
-                "tags",
-                "changed",
-                "note",
-            ] {
-                if let Some(v) = args.get(k) {
-                    p.insert(k.into(), v.clone());
-                }
-            }
-            d.rpc("ui.confirm_new_session", Value::Object(p))
-        }
+        "confirm_new_session" => d.rpc("ui.confirm_new_session", confirm_params(args)),
         "create_session" => {
             // Remote Control from launch (the flag), when this machine can
             // have it; otherwise the session launches anyway, with a note.
@@ -1075,6 +1084,21 @@ mod tests {
         let out = shape_find_repos(&json!({"repos": [], "roots": []}), "");
         assert!(out["note"].as_str().unwrap().contains("no code folder"));
         assert!(out.get("skipped").is_none());
+    }
+
+    /// `confirm_new_session` passes `base` and `prefer` on to the form,
+    /// and nothing it doesn't know.
+    #[test]
+    fn confirm_new_session_forwards_base_and_prefer() {
+        let p = confirm_params(&json!({
+            "description": "d", "base": "feat", "prefer": "local",
+            "changed": ["base"], "note": "n", "extra_args": ["x"],
+        }));
+        assert_eq!(
+            p,
+            json!({"description": "d", "base": "feat", "prefer": "local",
+                   "changed": ["base"], "note": "n"})
+        );
     }
 
     #[test]
