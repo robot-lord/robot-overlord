@@ -807,3 +807,15 @@ the daemon (`crates/daemon/src/web/`), the op allow-list in the server
 process, vendored xterm.js 5.5 with `cargo xtask vendor-web`, hand-written
 ES modules with no build step, `portable-pty`, the `rlord web --flags`
 form, and web-input reporting over IPC.
+
+### Answers to the plugin re-plan (user, 2026-11-17)
+
+1. Verification as planned (compiled-in SHA-256, `SHA256SUMS`, optional
+   `gh attestation verify`); no extra signature.
+2. crates.io builds: no plugin download (default taken, not asked).
+3. Preact 11 + signals.
+4. Page built in one pinned Node job; `dist/` not committed.
+5. Plugin is a child of the daemon.
+6. Biome for formatting until Oxfmt 1.0 (default).
+7. Browser pass by hand this slice; Playwright later (default).
+8. Subcommands for `rlord web` (default).
