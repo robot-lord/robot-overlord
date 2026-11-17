@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–10 built; steps 11–14 not started)
+**Status:** in progress (slice 1: steps 1–11 built; steps 12–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -276,8 +276,14 @@ Decided 2026-11-17 (user):
   binding doesn't fire, `list_clients` hides the view, resize, two views
   at once, close, and killing the target closes the socket with no view
   left. The plugin's integration tests share `tests/common/mod.rs`.
-  Run on macOS tmux 3.8 only; owed: the same on Linux tmux 3.2a and 3.4
-  (as steps 1 and 2 were).
+  Run on macOS tmux 3.8, and later (during step 11) on Linux tmux 3.2a
+  (Ubuntu 22.04) and 3.4 (Ubuntu 24.04): `pane.rs` and `http.rs` pass on
+  both. The test binaries were cross-built with `cargo zigbuild --target
+  aarch64-unknown-linux-musl -p robot-overlord-web --tests --bins` (it
+  takes no `--no-run`) and copied into the containers with `docker cp` at
+  the same absolute paths (`CARGO_BIN_EXE_rlord-web` and
+  `CARGO_TARGET_TMPDIR` are compiled in; colima doesn't share
+  `/private/tmp`, so a bind mount shows empty folders).
 - End-to-end check of steps 3 to 7 against `scripts/demo/demo.sh`
   (2026-11-17, release `rlord-web` copied beside the demo's `rlord`,
   unverified; started by `rlord web url`): a scripted websocket client
@@ -407,6 +413,42 @@ Decided 2026-11-17 (user):
     mid-session.
   - The page is 486 kB of script (128 kB gzipped), nearly all xterm.js
     and its WebGL addon.
+
+- Step 11 done (`daemon/src/web.rs`, `ui/src/actions.ts`,
+  `components/Actions.tsx`, the views): ops `session.resume`,
+  `session.restart`, `session.stop`, `overlord.ask`, `session.archive`,
+  `session.unarchive`, `session.rename`, `session.describe`,
+  `session.notes`, `session.tag`, `session.pin`, `overlord.switch`, each
+  tested in `web_api.rs` (`actions_reach_their_methods`; the ones that
+  start an agent reach their method and fail there, with no tmux or agent).
+  The page: a session's Restart and Stop (running) or Resume (stopped),
+  Archive, Pin, and an Edit form (name, description, tags, notes) that
+  sends only the fields that changed; Unarchive for an archived one;
+  Resume on the pane's note. The overlord's Restart, Stop and its agents as
+  switch buttons. "Tell the overlord" is a box under the overlord row in
+  the list (Enter sends, Shift-Enter a new line). Nothing new for the
+  overlord itself: `overlord.md` and `mcp.rs` unchanged. Choices within
+  the plan:
+  - **Each op names its arguments** (`web::Op`): only those reach the
+    method, so a browser can't set what trusted callers set (`session.stop`'s
+    `interrupt`, `session.restart`'s `hooks_work`). Tested.
+  - `session.resume` is answered in `web.rs` (`ui::ensure_running`, with
+    the agent warm-up and Codex-server start that `call` does before
+    `ui.goto`); there is no daemon method of that name.
+  - `proto.ts` lists the ops (`OPS`, typing `request`); a daemon test holds
+    that list to the daemon's.
+  - Restart, Stop and Archive ask once more inline (Yes / No).
+  - The plugin's call limit went from 60 s to 120 s: `overlord.ask` waits
+    up to 90 s for a just-started overlord.
+  - `demo.sh` takes `RLORD_DEMO_SOCKET`, so a second demo runs beside
+    another without sharing its tmux server.
+  - Browser pass (Chromium headless, Playwright 1.65.1, a second demo on
+    its own socket and port 47821): edit (all four fields), pin and unpin,
+    stop then Resume (pane comes back), restart, archive then unarchive
+    then Resume, tell the overlord (text reached its pane, checked with
+    `capture-pane`), switch to Codex and back, the narrow layout. Checked
+    against the database: name, description, notes, tags. No console
+    errors beyond Chromium's WebGL performance notes.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

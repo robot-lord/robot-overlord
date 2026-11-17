@@ -1,8 +1,9 @@
-// The list (`#/`): the overlord on top, then the sessions. Sessions and
-// Groups tabs, a filter, the sort, and live/archived. The daemon sorts and
-// groups; this draws.
+// The list (`#/`): the overlord on top with a box to tell it something,
+// then the sessions. Sessions and Groups tabs, a filter, the sort, and
+// live/archived. The daemon sorts and groups; this draws.
 
 import { useSignal, useSignalEffect } from "@preact/signals";
+import { Tell } from "../components/Actions";
 import { now, ago, lastUpdate } from "../components/time";
 import { Status } from "../components/Status";
 import type { Overlord, Row, Snapshot } from "../proto";
@@ -23,6 +24,7 @@ export function List({ store, route }: { store: Store; route: Route }) {
     <div class="list">
       <Controls store={store} view={view} />
       {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}
+      {snap?.overlord && <Tell store={store} />}
       {view.tab === "groups" && snap && <Groups store={store} snap={snap} />}
       {snap ? (
         <Rows rows={store.rows.value} labels={labels} selected={selected} view={view} />

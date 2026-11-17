@@ -366,3 +366,78 @@ a.row:hover {
 .not-running p {
   margin: 0 0 8px;
 }
+
+/* Actions. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.actions .roster {
+  margin-left: auto;
+}
+button.agent-chip {
+  background: none;
+}
+button.agent-chip:disabled {
+  opacity: 0.5;
+}
+.confirm {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--warn);
+}
+button.danger {
+  border-color: var(--bad);
+}
+.edit {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 10px;
+  align-items: start;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.edit label {
+  display: contents;
+}
+.edit label span {
+  color: var(--dim);
+  padding-top: 4px;
+}
+textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 8px;
+  resize: vertical;
+}
+.edit-buttons {
+  grid-column: 2;
+  display: flex;
+  gap: 6px;
+}
+.tell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 2px solid var(--line);
+}
+.tell textarea {
+  flex: 1;
+  min-width: 0;
+}
+.tell-note {
+  flex-basis: 100%;
+  font-size: 12px;
+}
+.tell-note:empty {
+  display: none;
+}

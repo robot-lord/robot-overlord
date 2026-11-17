@@ -154,9 +154,17 @@ fn web_call_reaches_its_ops_and_nothing_else() {
         "ui.state",
         "tmux.reload",
         "setup.apply",
-        "session.stop",
         "session.new",
-        "overlord.ask",
+        "session.fork",
+        "session.send",
+        "session.context_add",
+        "session.group",
+        "tag.rename",
+        "tag.order",
+        "overlord.new_session",
+        "overlord.set_model",
+        "limits.resume",
+        "remote.set",
         "",
     ] {
         let got = op(&r.sock, o, json!({}));
@@ -171,6 +179,106 @@ fn web_call_reaches_its_ops_and_nothing_else() {
         ok(&r.sock, "session.get", json!({"ref": "alpha"}))["status"],
         "starting"
     );
+}
+
+/// A method's own error (not the allow-list's refusal).
+fn method_error(got: &Value) -> String {
+    assert!(got["error"].is_object(), "{got}");
+    assert_ne!(got["error"]["code"], plugin::RPC_ERR_NOT_ALLOWED, "{got}");
+    got["error"]["message"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn actions_reach_their_methods() {
+    let r = start();
+    let get = |id: &str| ok(&r.sock, "session.get", json!({"ref": id}));
+    let done = |o: &str, args: Value| {
+        let got = op(&r.sock, o, args);
+        assert!(got.get("error").is_none(), "{o}: {got}");
+        got["result"].clone()
+    };
+    // Rename, describe, notes, tags, pin.
+    done(
+        "session.rename",
+        json!({"ref": "alpha", "name": "alpha-two"}),
+    );
+    assert_eq!(get("alpha")["name"], "alpha-two");
+    done(
+        "session.describe",
+        json!({"ref": "alpha", "description": " the web UI "}),
+    );
+    assert_eq!(get("alpha")["description"], "the web UI");
+    done(
+        "session.notes",
+        json!({"ref": "alpha", "notes": "line one\nline two\n"}),
+    );
+    assert_eq!(get("alpha")["notes"], "line one\nline two");
+    done(
+        "session.tag",
+        json!({"ref": "alpha", "add": ["ui"], "remove": ["web"]}),
+    );
+    assert_eq!(get("alpha")["tags"], json!(["ui"]));
+    done("session.pin", json!({"ref": "alpha", "pinned": true}));
+    assert_eq!(get("alpha")["pinned"], true);
+    done("session.pin", json!({"ref": "alpha", "pinned": false}));
+    assert_eq!(get("alpha")["pinned"], false);
+    // The overlord's row stays fixed, as everywhere else.
+    let got = op(
+        &r.sock,
+        "session.rename",
+        json!({"ref": "overlord-1", "name": "x"}),
+    );
+    assert!(method_error(&got).contains("overlord"), "{got}");
+    // Stop; an argument that isn't the op's own is dropped (the daemon
+    // sets `interrupt` itself).
+    let stopped = done(
+        "session.stop",
+        json!({"ref": "beta", "interrupt": "still_running"}),
+    );
+    assert_eq!(stopped["stopped"], "beta", "{stopped}");
+    assert!(stopped.get("note").is_none(), "{stopped}");
+    assert_eq!(get("beta")["status"], "stopped");
+    // Archive and unarchive.
+    done("session.archive", json!({"ref": "gamma"}));
+    assert!(get("gamma")["archived_at"].is_number());
+    done("session.unarchive", json!({"ref": "gamma"}));
+    assert!(get("gamma")["archived_at"].is_null());
+    // These start agents: here (no tmux, no agent) each reaches its method
+    // and fails there.
+    for (o, args) in [
+        ("session.resume", json!({"ref": "beta"})),
+        ("session.resume", json!({"ref": "nosuch"})),
+        ("session.restart", json!({"ref": "beta"})),
+        ("overlord.switch", json!({"agent": "nosuch"})),
+    ] {
+        method_error(&op(&r.sock, o, args));
+    }
+    // An archived session isn't resumed.
+    done("session.archive", json!({"ref": "gamma"}));
+    let got = op(&r.sock, "session.resume", json!({"ref": "gamma"}));
+    assert!(method_error(&got).contains("unarchive"), "{got}");
+    // Telling the overlord needs something to say (with text it would
+    // start the overlord).
+    let got = op(&r.sock, "overlord.ask", json!({"text": "  "}));
+    assert!(method_error(&got).contains("nothing to send"), "{got}");
+}
+
+/// The page's list of ops (`crates/web/ui/src/proto.ts`, `OPS`) is the
+/// daemon's: a button can't send an op the daemon refuses, and an op added
+/// here is typed there.
+#[test]
+fn the_pages_ops_are_the_daemons() {
+    let proto = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../web/ui/src/proto.ts"
+    ))
+    .unwrap();
+    let start = proto.find("export const OPS = [").expect("OPS in proto.ts");
+    let body = &proto[start..];
+    let body = &body[..body.find("] as const").expect("end of OPS")];
+    let page: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+    let daemon: Vec<&str> = rlord_daemon::web::OPS.iter().map(|o| o.op).collect();
+    assert_eq!(page, daemon);
 }
 
 #[test]

@@ -1,7 +1,8 @@
-// A session (`#/s/<id>`): its header and its pane, or Resume when it
-// isn't running.
+// A session (`#/s/<id>`): its header, its buttons, and its pane, or
+// Resume when it isn't running.
 
 import { useEffect, useState } from "preact/hooks";
+import { ResumeButton, RunnerNote, SessionActions, useRunner } from "../components/Actions";
 import { Pane } from "../components/Pane";
 import { Status } from "../components/Status";
 import type { Row, SessionBase } from "../proto";
@@ -21,6 +22,10 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
   // Not in the list's view (archived, filtered out): asked for once.
   const [fetched, setFetched] = useState<SessionBase | null>(null);
   const [missing, setMissing] = useState<string | null>(null);
+  // Bumped after each action, to fetch again a session the list doesn't
+  // show (the list's own rows come with the next snapshot).
+  const [gen, setGen] = useState(0);
+  const act = useRunner(store, () => setGen((g) => g + 1));
   useEffect(() => {
     setFetched(null);
     setMissing(null);
@@ -33,8 +38,8 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
     return () => {
       live = false;
     };
-    // (Once per session: a listed row needs no fetch.)
-  }, [id, listed === undefined]);
+    // (Once per session and action: a listed row needs no fetch.)
+  }, [id, listed === undefined, gen]);
   const s = listed ?? fetched;
   if (!s) {
     return (
@@ -60,6 +65,7 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
         ))}
         {s.description && <p class="desc-line">{s.description}</p>}
       </header>
+      <SessionActions s={s} r={act} />
       <Pane
         key={s.id}
         target={s.id}
@@ -68,9 +74,10 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
         notRunning={
           <>
             <p>{s.archived_at ? "This session is archived." : "This session isn't running."}</p>
-            <button type="button" disabled title="Resuming from the web comes in a later build">
-              Resume
-            </button>
+            <ResumeButton s={s} r={act} />
+            <p>
+              <RunnerNote r={act} />
+            </p>
           </>
         }
       />

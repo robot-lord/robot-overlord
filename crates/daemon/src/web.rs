@@ -63,13 +63,47 @@ impl fmt::Display for NotAllowed {
 
 impl std::error::Error for NotAllowed {}
 
-/// The browser's ops and the daemon methods they call. `snapshot` is
-/// answered here. Each new op comes with a test.
-pub const OPS: &[(&str, &str)] = &[
-    ("snapshot", ""),
-    ("session.get", "session.get"),
+/// One browser op: the daemon method it calls ("" when it is answered
+/// here) and the only arguments passed on (any others are dropped, so a
+/// browser can't set what a method takes from its trusted callers, such
+/// as `session.stop`'s `interrupt` or `session.restart`'s `hooks_work`).
+pub struct Op {
+    pub op: &'static str,
+    pub method: &'static str,
+    pub args: &'static [&'static str],
+}
+
+const fn op(op: &'static str, method: &'static str, args: &'static [&'static str]) -> Op {
+    Op { op, method, args }
+}
+
+/// The browser's ops. Each new op comes with a test
+/// (`crates/daemon/tests/web_api.rs`).
+pub const OPS: &[Op] = &[
+    op("snapshot", "", &["view", "rev"]),
+    op("session.get", "session.get", &["ref"]),
     // Opening the overlord's pane when the user asks (never by itself).
-    ("overlord.ensure", "overlord.ensure"),
+    op("overlord.ensure", "overlord.ensure", &[]),
+    // A stopped session's Resume: started on its conversation (an
+    // overlord is ensured), as Enter in the list does.
+    op("session.resume", "", &["ref"]),
+    op("session.restart", "session.restart", &["ref"]),
+    op("session.stop", "session.stop", &["ref"]),
+    // The "tell the overlord" box: typed into the overlord's pane.
+    op("overlord.ask", "overlord.ask", &["text"]),
+    op("session.archive", "session.archive", &["ref"]),
+    op("session.unarchive", "session.unarchive", &["ref"]),
+    op("session.rename", "session.rename", &["ref", "name"]),
+    op(
+        "session.describe",
+        "session.describe",
+        &["ref", "description"],
+    ),
+    op("session.notes", "session.notes", &["ref", "notes"]),
+    op("session.tag", "session.tag", &["ref", "add", "remove"]),
+    op("session.pin", "session.pin", &["ref", "pinned"]),
+    // Make another agent's overlord the active one.
+    op("overlord.switch", "overlord.switch", &["agent"]),
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
@@ -103,20 +137,43 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
 /// `web.call {op, args}`: one browser request.
 pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     let op = params["op"].as_str().unwrap_or("");
-    let args = match &params["args"] {
-        Value::Null => json!({}),
-        a => a.clone(),
-    };
-    let Some((_, method)) = OPS.iter().find(|(o, _)| *o == op) else {
+    let Some(found) = OPS.iter().find(|o| o.op == op) else {
         return Err(NotAllowed(op.to_string()).into());
     };
-    if FORBIDDEN.iter().any(|f| method.starts_with(f)) {
+    if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
         return Err(NotAllowed(op.to_string()).into());
     }
+    let mut args = serde_json::Map::new();
+    if let Some(given) = params["args"].as_object() {
+        for k in found.args {
+            if let Some(v) = given.get(*k) {
+                args.insert((*k).to_string(), v.clone());
+            }
+        }
+    }
+    let args = Value::Object(args);
     match op {
         "snapshot" => snapshot(d, &args),
-        _ => d.rpc(method, args),
+        "session.resume" => resume(d, &args),
+        _ => d.rpc(found.method, args),
     }
+}
+
+/// Op `session.resume {ref}`: make sure the session runs (a stopped one is
+/// restarted on its conversation; the overlord is ensured), as Enter in
+/// the list does, without switching any terminal to it. Its row as it is
+/// now.
+fn resume(d: &Daemon, args: &Value) -> Result<Value> {
+    // What `call` does before `ui.goto`, which resumes the same way:
+    // where each agent is (may ask the login shell), and Codex's shared
+    // server for a session that runs on it, before any lock.
+    rlord_core::agents::install::warm();
+    if d.starts_on_codex_daemon("ui.goto", args) {
+        crate::codex_daemon::ensure_running();
+    }
+    let s = crate::ui::ensure_running(d, methods::p_str(args, "ref")?)?;
+    crate::codex_daemon::sync_gate(&d.db());
+    Ok(serde_json::to_value(s)?)
 }
 
 /// Op `snapshot {view, rev}`: everything the list draws, in one answer.
@@ -618,11 +675,19 @@ mod tests {
 
     #[test]
     fn no_op_reaches_a_forbidden_family() {
-        for (op, method) in OPS {
+        for o in OPS {
             for f in FORBIDDEN {
-                assert!(!method.starts_with(f), "{op} -> {method}");
-                assert!(!op.starts_with(f), "{op}");
+                assert!(!o.method.starts_with(f), "{} -> {}", o.op, o.method);
+                assert!(!o.op.starts_with(f), "{}", o.op);
             }
         }
+    }
+
+    #[test]
+    fn ops_are_listed_once() {
+        let mut names: Vec<&str> = OPS.iter().map(|o| o.op).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), OPS.len());
     }
 }

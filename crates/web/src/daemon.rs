@@ -11,8 +11,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
-/// How long a call may take (`overlord.ensure` may start an agent).
-const CALL_LIMIT: Duration = Duration::from_secs(60);
+/// How long a call may take: `overlord.ensure` and `session.resume` may
+/// start an agent, and `overlord.ask` waits up to 90 s for a just-started
+/// overlord to take input (`crates/daemon/src/ask.rs`).
+const CALL_LIMIT: Duration = Duration::from_secs(120);
 
 /// A failed call: the daemon's error (its RPC code), or no daemon (code 0).
 #[derive(Debug, Clone)]

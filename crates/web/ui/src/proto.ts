@@ -27,6 +27,30 @@ export interface Reply {
 
 export type ControlMessage = Hello | Changed | Reply;
 
+/**
+ * The ops the daemon takes from the page: its allow-list
+ * (`crates/daemon/src/web.rs` `OPS`; a daemon test holds this list to it).
+ */
+export const OPS = [
+  "snapshot",
+  "session.get",
+  "overlord.ensure",
+  "session.resume",
+  "session.restart",
+  "session.stop",
+  "overlord.ask",
+  "session.archive",
+  "session.unarchive",
+  "session.rename",
+  "session.describe",
+  "session.notes",
+  "session.tag",
+  "session.pin",
+  "overlord.switch",
+] as const;
+
+export type Op = (typeof OPS)[number];
+
 /** The close code for a missing or wrong token. */
 export const CLOSE_UNAUTHORIZED = 4401;
 

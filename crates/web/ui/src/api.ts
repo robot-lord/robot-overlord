@@ -5,7 +5,13 @@
 // server), is kept in localStorage (per origin, so per port) and taken out
 // of the address bar.
 
-import { CLOSE_UNAUTHORIZED, type ControlMessage, type ErrorCode, type Hello } from "./proto";
+import {
+  CLOSE_UNAUTHORIZED,
+  type ControlMessage,
+  type ErrorCode,
+  type Hello,
+  type Op,
+} from "./proto";
 
 /** What the page needs of a WebSocket (a fake in tests). */
 export interface Sock {
@@ -116,7 +122,7 @@ export class Control {
   }
 
   /** Ask the daemon (an op on its allow-list). */
-  request<T = unknown>(op: string, args: object = {}): Promise<T> {
+  request<T = unknown>(op: Op, args: object = {}): Promise<T> {
     const s = this.sock;
     if (!s || !this.authed || s.readyState !== OPEN) {
       return Promise.reject(new ApiError("disconnected", "not connected"));

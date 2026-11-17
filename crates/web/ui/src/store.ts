@@ -5,11 +5,11 @@
 
 import { batch, computed, type Signal, signal } from "@preact/signals";
 import type { ConnState } from "./api";
-import type { Query, Row, Snapshot, Sort, Unchanged } from "./proto";
+import type { Op, Query, Row, Snapshot, Sort, Unchanged } from "./proto";
 
 /** What the store needs of the control socket. */
 export interface Requester {
-  request<T = unknown>(op: string, args?: object): Promise<T>;
+  request<T = unknown>(op: Op, args?: object): Promise<T>;
 }
 
 export type Tab = "sessions" | "groups";
@@ -188,7 +188,7 @@ export class Store {
   }
 
   /** Ask the daemon (an op on its allow-list); fails when not connected. */
-  request<T = unknown>(op: string, args: object = {}): Promise<T> {
+  request<T = unknown>(op: Op, args: object = {}): Promise<T> {
     if (!this.api) return Promise.reject(new Error("not connected"));
     return this.api.request<T>(op, args);
   }

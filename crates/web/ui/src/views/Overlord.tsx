@@ -2,6 +2,7 @@
 // its agents. The pane follows a switch to another agent's overlord.
 
 import { useState } from "preact/hooks";
+import { OverlordActions, useRunner } from "../components/Actions";
 import { Pane } from "../components/Pane";
 import { Status } from "../components/Status";
 import type { Store } from "../store";
@@ -10,6 +11,7 @@ import { Back } from "./Session";
 export function Overlord({ store, token }: { store: Store; token: string }) {
   const o = store.snapshot.value?.overlord ?? null;
   const [starting, setStarting] = useState<string | null>(null);
+  const r = useRunner(store);
   if (!store.snapshot.value) return <p class="hint">loading…</p>;
   if (!o) {
     return (
@@ -22,7 +24,7 @@ export function Overlord({ store, token }: { store: Store; token: string }) {
       </section>
     );
   }
-  const active = o.overlords.find((r) => r.active);
+  const active = o.overlords.find((a) => a.active);
   const start = () => {
     setStarting("starting…");
     store
@@ -38,17 +40,8 @@ export function Overlord({ store, token }: { store: Store; token: string }) {
         <Status status={o.status} label={o.status_label} />
         <span class="dim">{active?.label ?? o.agent}</span>
         {o.model && <span class="dim">{o.model}</span>}
-        <span class="roster" title="the overlord's agents">
-          {o.overlords
-            .filter((r) => r.exists)
-            .map((r) => (
-              <span class={`agent-chip${r.active ? " on" : ""}`}>
-                {r.label}
-                {!r.active && r.status_label && <span class="dim"> · {r.status_label}</span>}
-              </span>
-            ))}
-        </span>
       </header>
+      <OverlordActions o={o} r={r} />
       <Pane
         target="overlord"
         token={token}
