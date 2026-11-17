@@ -101,6 +101,20 @@ export interface SessionBase {
   forked_from_name: string | null;
   fork_count: number;
   live_fork_count: number;
+  /** Subagents still running after the turn ended (status idle), else null. */
+  async_tasks: number | null;
+  /** Each such subagent, oldest first (at most 5), else null. */
+  async_work: BackgroundTask[] | null;
+  /** Background shells, any status, else null. */
+  async_shells: { count: number; tasks: BackgroundTask[] } | null;
+  /** What the list shows: a usage limit, then background work, else the status. */
+  shown_status: Status | "limited" | "background";
+}
+
+/** One piece of background work. */
+export interface BackgroundTask {
+  label: string;
+  started_at: number;
 }
 
 /** A session stopped on a usage limit. */

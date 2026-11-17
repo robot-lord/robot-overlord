@@ -92,9 +92,9 @@ pub fn tools() -> Value {
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
-            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
+            "List agent sessions with their meta-context (status, model, repo/branch, tags, description, recent activity). Status is one of: working; needs you (blocked mid-turn on the user: a permission prompt or a question); your turn (its turn is over, the next prompt is the user's); background work (its turn is over but background work it started still runs, `async_tasks` subagents, `async_labels` says what: the user is waiting on the agent; it carries on by itself when they finish. Background shells (dev servers, watchers) don't change the status: `async_shells` lists them); stopped; starting; error; limited (the agent stopped on a usage limit: `limited_until` says when it resets, `limit_reset` that the limit just reset and within a minute it can be sent to again (it carries on by itself only if `resume_scheduled`), `resume_scheduled` whether resume_after_limit will pick it up). The overlord itself is not listed.",
             json!({
-                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
+                "query": s("Search: free words match name/project/tag; status:needs (needs you) status:turn (your turn) status:working status:bg (waiting on background work) status:limited (stopped on a usage limit) tag:x proj:x agent:x filter"),
                 "archived": {"type": "string", "enum": ["live", "only", "all"], "description": "default live"},
                 "sort": sort.clone(),
                 "usage": usage,
@@ -343,13 +343,87 @@ fn session_ref(args: &Value) -> Result<String> {
         .context("missing 'session'")
 }
 
+/// Labels of a `[{label, started_at}]` task list.
+fn labels(tasks: &Value) -> Value {
+    tasks.as_array().map_or(json!([]), |t| {
+        t.iter().map(|t| t["label"].clone()).collect()
+    })
+}
+
+/// Background work, as list_sessions and get_session show it (read from
+/// the annotated session `s`): `async_tasks` (how many subagents run
+/// while its turn is over) with `async_labels` (what), and
+/// `async_shells` (`{count, labels}`, information only).
+fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
+    let mut out = Vec::new();
+    if let Some(n) = s["async_tasks"].as_u64() {
+        out.push(("async_tasks", json!(n)));
+        out.push(("async_labels", labels(&s["async_work"])));
+    }
+    if let Some(n) = s["async_shells"]["count"].as_u64() {
+        out.push((
+            "async_shells",
+            json!({"count": n, "labels": labels(&s["async_shells"]["tasks"])}),
+        ));
+    }
+    out
+}
+
+/// The status fields every overlord tool gives a session (from its
+/// annotated row `s`): `status` in words, background work
+/// (`background_fields`), and a usage limit (`limited_until`,
+/// `limit_reset`: its reset time just passed, `resume_scheduled`).
+fn status_fields(s: &Value) -> Vec<(&'static str, Value)> {
+    let mut out = vec![("status", status_word(s))];
+    out.extend(background_fields(s));
+    if !s["limit"].is_null() {
+        out.push(("limited_until", s["limit"]["until"].clone()));
+        out.push(("limit_reset", s["limit"]["reset"].clone()));
+        out.push(("resume_scheduled", s["limit"]["resume"].clone()));
+    }
+    out
+}
+
+/// An annotated row as the overlord gets it (`get_session`, `triage`):
+/// the `status_fields` in place of the raw annotations.
+pub(crate) fn overlord_status(s: &mut Value) {
+    let fields = status_fields(s);
+    if let Some(o) = s.as_object_mut() {
+        for k in [
+            "shown_status",
+            "async_tasks",
+            "async_work",
+            "async_shells",
+            "limit",
+        ] {
+            o.remove(k);
+        }
+    }
+    for (k, v) in fields {
+        s[k] = v;
+    }
+}
+
+/// The status as the overlord sees it: the daemon's `shown_status`
+/// (`background` and `limited` as they are, the rest in the words people
+/// see: working, needs you, your turn, stopped).
+fn status_word(s: &Value) -> Value {
+    match s["shown_status"]
+        .as_str()
+        .or(s["status"].as_str())
+        .unwrap_or("")
+    {
+        "background" => json!("background work"),
+        "limited" => json!("limited"),
+        st => json!(rlord_core::types::Status::label_of(st)),
+    }
+}
+
 /// The compact row the overlord sees per session.
 fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
     let mut row = json!({
         "id": s["id"], "name": s["name"],
-        // As people see it: working, needs you, your turn, stopped.
-        "status": rlord_core::types::Status::label_of(s["status"].as_str().unwrap_or("")),
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         "tags": s["tags"], "description": s["description"],
@@ -381,13 +455,8 @@ fn summarize(s: &Value) -> Value {
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
     }
-    // Stopped on a usage limit: that, rather than the status under it.
-    if !s["limit"].is_null() {
-        row["status"] = json!("limited");
-        row["limited_until"] = s["limit"]["until"].clone();
-        // (Its reset time has passed: back in a minute.)
-        row["limit_reset"] = s["limit"]["reset"].clone();
-        row["resume_scheduled"] = s["limit"]["resume"].clone();
+    for (k, v) in status_fields(s) {
+        row[k] = v;
     }
     // Archived: what it did (get_session has it all).
     if !s["archived_at"].is_null() {
@@ -633,6 +702,8 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["recent_events"] = d.rpc("session.log", json!({"ref": id, "limit": 15}))?;
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
+            // The status as list_sessions shows it.
+            overlord_status(&mut s);
             // Right after rlord starts, sub-agent data may still be loading.
             if d.warm.is_loading(id.as_str().unwrap_or("")) {
                 s["subagents_loading"] = json!(true);
@@ -649,7 +720,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             let text = tmux::capture_pane(t)?;
             let lines: Vec<&str> = text.trim_end().lines().collect();
             let tail = lines[lines.len().saturating_sub(n)..].join("\n");
-            Ok(json!({"session": s["name"], "status": s["status"], "screen": tail}))
+            Ok(json!({"session": s["name"], "status": status_word(&s), "screen": tail}))
         }
         "get_ui_state" => d.rpc("ui.state", json!({})),
         "goto_session" => d.rpc("ui.goto", json!({"ref": session_ref(args)?})),

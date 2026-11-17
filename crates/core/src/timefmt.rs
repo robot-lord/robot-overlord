@@ -87,6 +87,13 @@ fn fmt_clock(hour: i32, min: i32, weekday: Option<i32>) -> String {
     format!("{day}{h}:{min:02}{half}")
 }
 
+/// A system time as epoch milliseconds (0 before the epoch).
+pub fn ms_epoch(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1729,7 +1729,10 @@ fn draw_describe_form(
         form.prompt,
         if focus(Field::Prompt) { "▏" } else { "" }
     );
-    let wrapped: usize = text.split('\n').map(|l| wrapped_rows(l, width)).sum();
+    let wrapped: usize = text
+        .split('\n')
+        .map(|l| theme::wrapped_rows(l, width))
+        .sum();
     let box_h = (wrapped as u16 + 2).clamp(5, 12);
 
     let [head_area, label_area, box_area, rest] = RLayout::vertical([
@@ -1962,30 +1965,6 @@ fn draw_describe_form(
     // The key hints under the form are buttons too.
     hits.keycaps(rest.x, rest.y, &lines);
     f.render_widget(Paragraph::new(lines), rest);
-}
-
-/// Rows a line takes when wrapped at word boundaries to `width` columns (as
-/// the description box wraps), counting wide characters as two.
-fn wrapped_rows(line: &str, width: usize) -> usize {
-    let w = |t: &str| Span::raw(t).width();
-    let (mut rows, mut col) = (1usize, 0usize);
-    for word in line.split(' ') {
-        let ww = w(word);
-        let need = if col == 0 { ww } else { ww + 1 };
-        if col > 0 && col + need > width {
-            rows += 1;
-            col = 0;
-        }
-        // A word longer than the line breaks across rows.
-        let ww_rows = ww.max(1).div_ceil(width.max(1));
-        if ww > width {
-            rows += ww_rows - 1;
-            col = ww - (ww_rows - 1) * width;
-        } else {
-            col += if col == 0 { ww } else { ww + 1 };
-        }
-    }
-    rows
 }
 
 const OTHER_MODEL: &str = "  another model…";
@@ -2385,11 +2364,11 @@ mod tests {
 
     #[test]
     fn wrapped_rows_counts_word_wrapping() {
-        assert_eq!(wrapped_rows("", 10), 1);
-        assert_eq!(wrapped_rows("aaaa bbbb", 10), 1);
+        assert_eq!(theme::wrapped_rows("", 10), 1);
+        assert_eq!(theme::wrapped_rows("aaaa bbbb", 10), 1);
         // "aaaa bbbb cc" is 12 wide: "cc" moves to the next row.
-        assert_eq!(wrapped_rows("aaaa bbbb cc", 10), 2);
+        assert_eq!(theme::wrapped_rows("aaaa bbbb cc", 10), 2);
         // A word too long for a row breaks across rows.
-        assert_eq!(wrapped_rows(&"x".repeat(25), 10), 3);
+        assert_eq!(theme::wrapped_rows(&"x".repeat(25), 10), 3);
     }
 }

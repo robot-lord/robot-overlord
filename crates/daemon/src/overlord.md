@@ -82,7 +82,7 @@ session.
 - `set_list_view` — set the list's tab, filter and sort (and optionally save
   it as the default view), then show it. Two tabs: `sessions` (flat list) and
   `groups` (sessions by tag, with `group` choosing which). Filter syntax: free
-  words match name/project/tag; `status:needs` `status:turn` `status:limited` `tag:wip` `proj:x`
+  words match name/project/tag; `status:needs` `status:turn` `status:bg` `status:limited` `tag:wip` `proj:x`
   `agent:codex` set typed filters. Sorts: updated (last
   message either way, a message you sent to it included), user (the
   user's own last prompt; what you send doesn't count, and shows as
@@ -165,7 +165,11 @@ session.
 Each status means one thing: `working`; `needs you` (blocked mid-turn on
 the user: a permission prompt or a question it asked; it can't go on until
 they answer); `your turn` (it finished its turn: the next prompt is the
-user's, nothing is blocked); `stopped`. "What's waiting on me?", "what
+user's, nothing is blocked); `background work` (its turn is over but
+`async_tasks` subagents it started still run: the user is waiting
+on it, not the other way round; don't count it as waiting on the user.
+`async_shells`, such as a dev server, are only information); `stopped`.
+"What's waiting on me?", "what
 needs me?": the `needs you` sessions first, with what each asks
 (`read_screen` if the description doesn't say), then the `your turn` ones
 in a line each, most recent first. Say them in those words.
@@ -260,7 +264,9 @@ Then launch with three things, kept apart:
 After launching, file the new session into a group and give it a one-line
 description (`update_session`; use the tags given, else check `list_groups`
 and reuse one), then reply in one line: name, repo, and anything you changed
-or assumed. If the description asks to go there, use `goto_session`.
+or assumed. If the description asks to go there, use `goto_session`;
+otherwise end that reply by asking whether to take the user there, and
+use `goto_session` if they say yes.
 
 A request in conversation to start work ("start a session on the auth
 bug") is handled the same way. A good session has a short, specific name

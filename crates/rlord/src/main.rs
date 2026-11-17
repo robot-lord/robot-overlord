@@ -58,7 +58,7 @@ enum Command {
     },
     /// List sessions. QUERY uses the search syntax: free words match
     /// name/project/group/tag; `status:needs` (needs you) `status:turn` (your
-    /// turn) `tag:wip` `proj:x` `agent:x`
+    /// turn) `status:bg` (waiting on background work) `tag:wip` `proj:x` `agent:x`
     /// `group:x` `sort:user` set filters.
     Ls {
         query: Vec<String>,
@@ -69,8 +69,9 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// Filter by status (comma-separated: working, needs-you, your-turn,
-        /// stopped, error, starting; the stored names waiting_input and idle
-        /// work too)
+        /// bg (waiting on background work), limited (stopped on a usage
+        /// limit), stopped, error, starting; the stored names waiting_input
+        /// and idle work too)
         #[arg(long, value_delimiter = ',')]
         status: Vec<String>,
         /// Filter by tag
@@ -1294,12 +1295,14 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "-".into())
             };
             println!("{} ({})", g("name"), g("id"));
-            println!(
-                "  agent      {} · model {} · {}",
-                g("agent"),
-                g("model"),
-                g("status")
-            );
+            println!("  agent      {} · model {}", g("agent"), g("model"));
+            // The status as the list shows it, every symbol in words.
+            for (i, l) in rlord_tui::statustext::describe(&s, rlord_core::types::now_ms())
+                .iter()
+                .enumerate()
+            {
+                println!("  {:<10} {l}", if i == 0 { "status" } else { "" });
+            }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
             println!("  dir        {}", g("project_path"));
             println!("  created    {}", t("created_at"));
@@ -2333,6 +2336,8 @@ fn run_daemon() -> Result<()> {
         // Messages for sessions, held until their turn is over.
         rlord_daemon::send::start(&daemon);
         rlord_daemon::limits::start(&daemon);
+        // Turns over while background work still runs (background.rs).
+        rlord_daemon::background::start(&daemon);
         // OpenCode sessions: status from its background server's events.
         rlord_daemon::opencode::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
@@ -2805,10 +2810,18 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             pin,
             truncate(get("name"), 23),
             // Stopped on a usage limit: that, and until when.
-            match s["limit"]["until"].as_str() {
-                Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
-                Some(until) => truncate(&format!("till {until}"), 16),
-                None => rlord_core::types::Status::label_of(get("status")).to_string(),
+            match s["shown_status"]
+                .as_str()
+                .or(s["status"].as_str())
+                .unwrap_or("-")
+            {
+                "limited" if s["limit"]["reset"] == true => "limit reset".to_string(),
+                "limited" => truncate(
+                    &format!("till {}", s["limit"]["until"].as_str().unwrap_or("?")),
+                    16,
+                ),
+                "background" => format!("bg {}", s["async_tasks"]),
+                st => rlord_core::types::Status::label_of(st).to_string(),
             },
             rel_age(
                 [

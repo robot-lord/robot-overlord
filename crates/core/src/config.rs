@@ -661,7 +661,8 @@ pub struct Config {
     pub preview_refresh_ms: u64,
     /// Digits 1–9 attach straight to the Nth listed session.
     pub jump_digits: bool,
-    /// Height of the details pane under the preview (rows).
+    /// Least height of the details pane under the preview (rows); it
+    /// takes three fifths of the column when that is more.
     pub details_height: u16,
     /// What the list's Usage column shows (and the usage sort sorts by):
     /// turns, tokens or context (% of the context window).
@@ -1003,7 +1004,8 @@ layout = "side"
 list_width_pct = 50
 preview_refresh_ms = 500
 jump_digits = true      # 1-9 attach to the Nth listed session
-details_height = 12     # rows for the details pane under the preview
+details_height = 12     # least rows for the details pane under the preview
+                        # (it takes 3/5 of the column when that is more)
 usage = "turns"         # the list's Usage column: "turns" (prompts you typed),
                         # "tokens", or "context" (% of the context window)
 

@@ -1842,7 +1842,18 @@ fn hook_emit_in(
                 (Whose::Other, _) => "tool",
                 _ => kind,
             };
-            let detail = crate::own::with_source(json!({"hook": event}), source);
+            let mut detail = crate::own::with_source(json!({"hook": event}), source);
+            // How the agent started (`startup`, `resume`, `clear`,
+            // `compact`). Only `startup` is sure to be a new process,
+            // which ended the old one's background work (`background.rs`;
+            // an in-process `/resume` sends `resume` too).
+            // (Not replayed from the spool: logged at replay time, it would
+            // date the start late and drop tasks started since.)
+            if event == "SessionStart" && live {
+                if let Some(how) = payload["source"].as_str() {
+                    detail["start"] = json!(how);
+                }
+            }
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
         }
         return Ok(answer(json!({"ok": true})));

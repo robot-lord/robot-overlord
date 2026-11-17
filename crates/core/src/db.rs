@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_rlord_msg.sql"),
     include_str!("../migrations/0010_session_context.sql"),
     include_str!("../migrations/0011_forked_from.sql"),
+    include_str!("../migrations/0012_events_kind.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -224,12 +225,28 @@ pub fn normalize_status(s: &str) -> String {
         | "blocked" => "waiting_input".to_string(),
         "your-turn" | "yourturn" | "turn" | "yours" => "idle".to_string(),
         "run" | "busy" => "working".to_string(),
+        // Not stored: laid over `idle` by the daemon (background.rs).
+        "bg" | "background" | "background-work" | "waiting-background" => "background".to_string(),
         other => other.to_string(),
     }
 }
 
 pub struct Db {
     conn: Connection,
+}
+
+/// A live session's transcript, for background-work tracking
+/// (`Db::live_transcripts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTranscript {
+    pub id: String,
+    pub path: String,
+    /// When its agent process last started (ms; 0: never seen).
+    pub started_at: i64,
+    // (Stopped or failed sessions come only within the caller's grace.)
+    /// Its latest `SessionStart` of any kind (ms; 0: none): when it last
+    /// switched conversations, a `/clear` or `/resume` included.
+    pub switched_at: i64,
 }
 
 impl Db {
@@ -1600,6 +1617,45 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Live (unarchived) sessions with a transcript, the overlords included:
+    /// whether they are stopped or failed and since when (the caller allows
+    /// a grace: a `/clear` stops a session for a moment), and when its agent
+    /// process last started (0: never seen): rlord starting it (a `launched` /
+    /// `imported` / `forked` / `resumed` / `restarted` / `reforked` event;
+    /// a fork's copied transcript holds the original's launches, which
+    /// don't run in it), or the agent's own
+    /// `SessionStart` hook with `start` `startup`, always a new process,
+    /// which also catches a restart done outside rlord. Not `resume`:
+    /// Claude Code sends it for an in-process `/resume` too, which may keep
+    /// the tasks (a new process is certain only when rlord resumed it);
+    /// not `clear` or `compact`. Cheap: ids, paths and look-ups on
+    /// `idx_events_session_kind`.
+    /// Stopped or failed ones only if that was after `stopped_after` (ms).
+    pub fn live_transcripts(&self, stopped_after: i64) -> Result<Vec<LiveTranscript>> {
+        let mut st = self.conn.prepare(
+            "SELECT s.id, t.source_path, \
+                    COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
+                              AND (e.kind IN ('launched', 'imported', 'forked', 'resumed', \
+                                                'restarted', 'reforked') \
+                                   OR (e.kind = 'session_start' AND \
+                                       json_extract(e.payload, '$.start') = 'startup'))), 0) \
+             , COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
+                       AND e.kind = 'session_start'), 0) \
+             FROM sessions s JOIN transcripts t ON t.session_id = s.id \
+             WHERE s.archived_at IS NULL AND (s.status NOT IN ('stopped', 'error') \
+                   OR COALESCE(s.last_state_change_at, 0) > ?1)",
+        )?;
+        let rows = st.query_map([stopped_after], |r| {
+            Ok(LiveTranscript {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                started_at: r.get(2)?,
+                switched_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// These sessions' transcript files (session id, path).
     pub fn transcript_sources_for(&self, ids: &[&str]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
@@ -1946,7 +2002,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
         for table in [
             "sessions",
             "tags",
@@ -2187,7 +2243,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 11);
+        assert_eq!(db.schema_version().unwrap(), 12);
     }
 
     #[test]
@@ -2387,6 +2443,7 @@ mod tests {
             ("turn", "idle"),
             ("idle", "idle"),
             ("working", "working"),
+            ("bg", "background"),
         ] {
             assert_eq!(normalize_status(word), stored, "{word}");
         }
@@ -2472,5 +2529,53 @@ mod tests {
         db.kv_set("k", "1").unwrap();
         db.kv_set("k", "2").unwrap();
         assert_eq!(db.kv_get("k").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn live_transcripts_know_when_the_agent_last_started() {
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "01aaa", "a");
+        db.upsert_transcript_source("01aaa", "/t/a.jsonl").unwrap();
+        // Stopped: listed only within the grace given.
+        db.set_status("01aaa", Status::Stopped, 7).unwrap();
+        assert_eq!(db.live_transcripts(6).unwrap().len(), 1);
+        assert!(db.live_transcripts(7).unwrap().is_empty());
+        db.set_status("01aaa", Status::Idle, 8).unwrap();
+        assert_eq!(db.live_transcripts(i64::MAX).unwrap().len(), 1);
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 0);
+        db.insert_event("01aaa", 100, "restarted", "{}").unwrap();
+        db.insert_event(
+            "01aaa",
+            200,
+            "session_start",
+            r#"{"hook":"SessionStart","start":"startup"}"#,
+        )
+        .unwrap();
+        // A compaction, a /clear or an in-process /resume may keep the
+        // same process.
+        db.insert_event(
+            "01aaa",
+            250,
+            "session_start",
+            r#"{"hook":"SessionStart","start":"resume"}"#,
+        )
+        .unwrap();
+        db.insert_event(
+            "01aaa",
+            300,
+            "session_start",
+            r#"{"hook":"SessionStart","start":"compact"}"#,
+        )
+        .unwrap();
+        db.insert_event("01aaa", 400, "session_start", r#"{"hook":"SessionStart"}"#)
+            .unwrap();
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 200);
+        // Any SessionStart is a switch of conversation.
+        assert_eq!(db.live_transcripts(0).unwrap()[0].switched_at, 400);
+        db.insert_event("01aaa", 500, "reforked", "{}").unwrap();
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 500);
+        // A fork starts a process of its own.
+        db.insert_event("01aaa", 600, "forked", "{}").unwrap();
+        assert_eq!(db.live_transcripts(0).unwrap()[0].started_at, 600);
     }
 }
