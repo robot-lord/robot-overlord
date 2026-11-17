@@ -71,6 +71,8 @@ pub struct Daemon {
     /// One session at a time: typing into it vs restarting, stopping or
     /// archiving it (locks.rs, which has the lock order).
     pub(crate) sessions: locks::SessionLocks,
+    /// Each Codex thread's fork flag, read once (`discover`).
+    pub(crate) fork_flags: Mutex<discover::ForkFlags>,
     /// Background loading of sessions' sub-agent data (see warm.rs).
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
@@ -105,6 +107,7 @@ impl Daemon {
             summaries: Default::default(),
             limits: Default::default(),
             roster: Mutex::new(None),
+            fork_flags: Default::default(),
         })
     }
 

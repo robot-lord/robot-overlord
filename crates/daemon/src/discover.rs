@@ -93,6 +93,8 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
             changed |= pane_gone(d, s, gone)?;
         }
     }
+    let waiting = waiters(d, &sessions)?;
+    let now = now_ms();
     for s in &sessions {
         // Its program exited (no SessionEnd hook to say so).
         match pane_looks(s, gone) {
@@ -104,11 +106,8 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
             }
         }
         if s.agent_session.is_none() {
-            // Another session waiting for a thread in the same folder.
-            let others = sessions.iter().any(|o| {
-                o.id != s.id && o.agent_session.is_none() && o.project_path == s.project_path
-            });
-            changed |= bind(d, s, others)? || first_prompt_due(d, s)?;
+            let (others, queue) = place_of(&waiting, s, now);
+            changed |= bind(d, s, others, queue)? || first_prompt_due(d, s)?;
         } else {
             changed |= follow(d, s)?;
         }
@@ -274,21 +273,112 @@ fn settles(screen: &str, up_ms: Option<i64>) -> Option<bool> {
 
 /// Find the conversation a session launched, in its agent's index (see
 /// `pick_thread`). `others`: another session waits for one in this folder.
-fn bind(d: &Daemon, s: &Session, others: bool) -> Result<bool> {
+/// `queue`: for a user fork, its place among the forks of the same parent
+/// waiting in the same folder (`place_of`).
+fn bind(d: &Daemon, s: &Session, others: bool, queue: Option<Queue>) -> Result<bool> {
     let w = bind_inputs(&d.db(), s)?;
     // (Codex's index and the rollouts are read without the DB lock.)
     let candidates = untracked_threads(s, w.since, &w.tracked);
+    let fork = match (&w.fork, queue) {
+        (Some(parent), Some(q)) => Some(ForkQueue {
+            parent,
+            since: w.since,
+            place: q.place,
+            waiting: q.waiting,
+        }),
+        (Some(parent), None) => Some(ForkQueue {
+            parent,
+            since: w.since,
+            place: 0,
+            waiting: 1,
+        }),
+        (None, _) => None,
+    };
     let Some(t) = pick_thread(
         &candidates,
         w.prompt.as_deref(),
         others,
-        w.fork.as_deref(),
-        &rollout_fork,
+        fork,
+        &|t| rollout_fork(d, t),
         now_ms(),
     ) else {
         return Ok(false);
     };
     record_bind(&d.db(), s, t)
+}
+
+/// A session waiting for its thread: its folder, the thread it was forked
+/// from (a user fork) and since when it waits.
+#[derive(Debug, Clone)]
+struct Waiter {
+    id: String,
+    folder: String,
+    fork: Option<String>,
+    since: i64,
+}
+
+/// Every session in `sessions` still waiting for its thread (one short
+/// read of their keys).
+fn waiters(d: &Daemon, sessions: &[Session]) -> Result<Vec<Waiter>> {
+    let db = d.db();
+    let mut out = Vec::new();
+    for s in sessions.iter().filter(|s| s.agent_session.is_none()) {
+        let w = bind_inputs(&db, s)?;
+        out.push(Waiter {
+            id: s.id.clone(),
+            folder: s.project_path.clone(),
+            fork: w.fork,
+            since: w.since,
+        });
+    }
+    Ok(out)
+}
+
+/// A fork's place in the queue of forks of the same parent waiting in the
+/// same folder, oldest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Queue {
+    place: usize,
+    waiting: usize,
+}
+
+/// For session `s`, waiting: whether another session waits for a thread in
+/// its folder (`others`, for a session that isn't a fork: a waiting fork
+/// counts only for `UNREAD_GRACE_MS`, so forks never hold an ordinary
+/// session unbound), and, for a fork, its `Queue` among its parent's forks
+/// waiting there.
+fn place_of(waiting: &[Waiter], s: &Session, now: i64) -> (bool, Option<Queue>) {
+    let me = waiting.iter().find(|w| w.id == s.id);
+    let here = |w: &&Waiter| w.id != s.id && w.folder == s.project_path;
+    let others = waiting
+        .iter()
+        .filter(here)
+        .any(|w| w.fork.is_none() || now - w.since < UNREAD_GRACE_MS);
+    let queue = me.and_then(|me| {
+        let parent = me.fork.as_deref()?;
+        let mut peers: Vec<&Waiter> = waiting
+            .iter()
+            .filter(|w| w.folder == me.folder && w.fork.as_deref() == Some(parent))
+            .collect();
+        peers.sort_by(|a, b| (a.since, &a.id).cmp(&(b.since, &b.id)));
+        let place = peers.iter().position(|w| w.id == me.id)?;
+        Some(Queue {
+            place,
+            waiting: peers.len(),
+        })
+    });
+    (others, queue)
+}
+
+/// A user fork looking for its thread: its parent's thread, since when it
+/// waits, and its place among the forks of that parent waiting in its
+/// folder (`Queue`).
+#[derive(Debug, Clone, Copy)]
+struct ForkQueue<'a> {
+    parent: &'a str,
+    since: i64,
+    place: usize,
+    waiting: usize,
 }
 
 /// `bind`, once, under the caller's DB lock: for a stopped overlord about
@@ -359,25 +449,45 @@ fn untracked_threads(
         .collect()
 }
 
-/// What a thread's rollout says it was forked from (`codex::
-/// rollout_forked_from`; None: can't be told yet). A complete first line
-/// never changes: each answer is remembered by thread id once it is one;
-/// a rollout not readable yet is asked again.
-fn rollout_fork(t: &codex::Thread) -> Option<Option<String>> {
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
-        std::sync::LazyLock::new(Default::default);
-    if let Some(known) = SEEN.lock().ok().and_then(|s| s.get(&t.id).cloned()) {
-        return Some(known);
-    }
-    let forked = codex::rollout_forked_from(std::path::Path::new(&t.rollout_path))?;
-    if let Ok(mut s) = SEEN.lock() {
-        // (Bounded: threads come and go over a long run.)
-        if s.len() >= 4096 {
-            s.clear();
+/// What each Codex thread's rollout says it was forked from, remembered
+/// (`Daemon::fork_flags`): a complete first line never changes, so each is
+/// read once. Bounded: past `FLAGS_MAX` the oldest answers go first.
+#[derive(Default)]
+pub struct ForkFlags {
+    seen: HashMap<String, Option<String>>,
+    order: std::collections::VecDeque<String>,
+}
+
+const FLAGS_MAX: usize = 4096;
+
+impl ForkFlags {
+    /// Thread `t`'s answer (`codex::rollout_forked_from` through `read`;
+    /// None: can't be told yet, asked again next time, not remembered).
+    fn of(
+        &mut self,
+        t: &codex::Thread,
+        read: impl Fn(&std::path::Path) -> Option<Option<String>>,
+    ) -> Option<Option<String>> {
+        if let Some(known) = self.seen.get(&t.id) {
+            return Some(known.clone());
         }
-        s.insert(t.id.clone(), forked.clone());
+        let forked = read(std::path::Path::new(&t.rollout_path))?;
+        while self.order.len() >= FLAGS_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.order.push_back(t.id.clone());
+        self.seen.insert(t.id.clone(), forked.clone());
+        Some(forked)
     }
-    Some(forked)
+}
+
+/// What thread `t`'s rollout says it was forked from, through the
+/// daemon's remembered answers (`ForkFlags`).
+fn rollout_fork(d: &Daemon, t: &codex::Thread) -> Option<Option<String>> {
+    let mut flags = d.fork_flags.lock().unwrap_or_else(|e| e.into_inner());
+    flags.of(t, codex::rollout_forked_from)
 }
 
 fn record_bind(db: &Db, s: &Session, t: &codex::Thread) -> Result<bool> {
@@ -431,20 +541,31 @@ fn pick_thread<'a>(
     candidates: &'a [codex::Thread],
     prompt: Option<&str>,
     others_waiting: bool,
-    fork: Option<&str>,
+    fork: Option<ForkQueue>,
     forked_from: &dyn Fn(&codex::Thread) -> Option<Option<String>>,
     now: i64,
 ) -> Option<&'a codex::Thread> {
-    if let Some(parent) = fork {
-        // The thread whose rollout names the parent. One not readable yet
-        // is skipped (it can't be told apart yet); two that name it: wait.
-        let found: Vec<&codex::Thread> = candidates
+    if let Some(q) = fork {
+        // The threads whose rollout names the parent, oldest first (one
+        // not readable yet is skipped: it can't be told apart yet).
+        let mut found: Vec<&codex::Thread> = candidates
             .iter()
-            .filter(|t| forked_from(t).flatten().as_deref() == Some(parent))
+            .filter(|t| forked_from(t).flatten().as_deref() == Some(q.parent))
             .collect();
-        return match found.as_slice() {
-            [one] => Some(*one),
-            _ => None,
+        found.sort_by_key(|t| t.created_at_ms);
+        // The one made closest after this fork started.
+        let mine = found.iter().find(|t| t.created_at_ms >= q.since).copied();
+        let late = now - q.since >= UNREAD_GRACE_MS;
+        return match (q.waiting, found.as_slice()) {
+            // The only fork waiting: its one thread; two (an earlier
+            // attempt's too) are told apart by time only once it waited.
+            (0 | 1, [one]) => Some(*one),
+            (0 | 1, _) => mine.filter(|_| late),
+            // Several forks of the parent waiting here: oldest first, once
+            // each has a thread (or it waited); a later one on its own only
+            // once it waited (never unbound for ever).
+            _ if q.place == 0 && (found.len() >= q.waiting || late) => mine,
+            _ => mine.filter(|_| late),
         };
     }
     let same = |a: &str, b: &str| {
@@ -636,7 +757,14 @@ mod tests {
         // (The test's threads were indexed at 1: a moment ago.)
         let pick_at =
             |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>, now| {
-                pick_thread(c, prompt, others, fork, &|t| rollouts(&read, t), now)
+                // (The only fork of its parent waiting, since 0.)
+                let q = fork.map(|parent| ForkQueue {
+                    parent,
+                    since: 0,
+                    place: 0,
+                    waiting: 1,
+                });
+                pick_thread(c, prompt, others, q, &|t| rollouts(&read, t), now)
                     .map(|t| t.id.clone())
             };
         let pick = |c: &[codex::Thread], prompt: Option<&str>, others: bool, fork: Option<&str>| {
@@ -714,7 +842,14 @@ mod tests {
         let path = dir.path().join("rollout-once.jsonl");
         let mut t = thread("t-once-only", "x");
         t.rollout_path = path.to_string_lossy().into_owned();
-        assert_eq!(rollout_fork(&t), None, "not there yet");
+        // Its own cache (each daemon has one): nothing shared between tests.
+        let mut flags = ForkFlags::default();
+        let reads = std::cell::Cell::new(0);
+        let read = |p: &std::path::Path| {
+            reads.set(reads.get() + 1);
+            codex::rollout_forked_from(p)
+        };
+        assert_eq!(flags.of(&t, read), None, "not there yet");
         let meta = |from: &str| {
             format!(
                 "{}\n",
@@ -723,12 +858,162 @@ mod tests {
         };
         let line = meta("t-parent");
         std::fs::write(&path, &line[..line.len() - 5]).unwrap();
-        assert_eq!(rollout_fork(&t), None, "half written");
+        assert_eq!(flags.of(&t, read), None, "half written");
         std::fs::write(&path, &line).unwrap();
-        assert_eq!(rollout_fork(&t), Some(Some("t-parent".into())));
-        // Changed on disk (it never is): the remembered answer stands.
+        assert_eq!(flags.of(&t, read), Some(Some("t-parent".into())));
+        // Changed on disk (it never is): the remembered answer stands, and
+        // the file isn't read again.
         std::fs::write(&path, meta("t-other")).unwrap();
-        assert_eq!(rollout_fork(&t), Some(Some("t-parent".into())));
+        let before = reads.get();
+        assert_eq!(flags.of(&t, read), Some(Some("t-parent".into())));
+        assert_eq!(reads.get(), before);
+    }
+
+    /// Past its bound the oldest answers go, not all of them.
+    #[test]
+    fn fork_flags_forget_the_oldest_first() {
+        let mut flags = ForkFlags::default();
+        let none = |_: &std::path::Path| Some(None);
+        for i in 0..=FLAGS_MAX {
+            flags.of(&thread(&format!("t{i}"), "x"), none);
+        }
+        assert_eq!(flags.seen.len(), FLAGS_MAX);
+        assert!(!flags.seen.contains_key("t0"), "the oldest went");
+        assert!(flags.seen.contains_key("t1") && flags.seen.contains_key(&format!("t{FLAGS_MAX}")));
+    }
+
+    /// Two forks of one parent waiting in one folder: the oldest binds the
+    /// thread made closest after its own start, once each has one (or it
+    /// waited); the next binds its own after that. A waiting fork holds an
+    /// ordinary session back only for the grace period.
+    #[test]
+    fn forks_of_one_parent_bind_oldest_first() {
+        let fork_thread = |id: &str, at: i64| codex::Thread {
+            created_at_ms: at,
+            ..thread(id, "same first message")
+        };
+        let forked = |_: &codex::Thread| Some(Some("parent".to_string()));
+        let both = [fork_thread("tb", 2_500), fork_thread("ta", 1_500)];
+        let q = |since, place, waiting| ForkQueue {
+            parent: "parent",
+            since,
+            place,
+            waiting,
+        };
+        let id = |t: Option<&codex::Thread>| t.map(|t| t.id.clone());
+        // Fork A (started 1000, oldest) takes the thread made closest
+        // after its start; fork B (2000) waits its turn.
+        assert_eq!(
+            id(pick_thread(
+                &both,
+                None,
+                true,
+                Some(q(1_000, 0, 2)),
+                &forked,
+                3_000
+            ))
+            .as_deref(),
+            Some("ta")
+        );
+        assert_eq!(
+            pick_thread(&both, None, true, Some(q(2_000, 1, 2)), &forked, 3_000),
+            None
+        );
+        // A bound: B is the only one waiting, with its one thread left.
+        let left = [fork_thread("tb", 2_500)];
+        assert_eq!(
+            id(pick_thread(
+                &left,
+                None,
+                false,
+                Some(q(2_000, 0, 1)),
+                &forked,
+                3_000
+            ))
+            .as_deref(),
+            Some("tb")
+        );
+        // A's thread not there yet: A waits, rather than take B's.
+        assert_eq!(
+            pick_thread(&left, None, true, Some(q(1_000, 0, 2)), &forked, 3_000),
+            None
+        );
+        // ...until it waited: then the closest after its start, in
+        // creation order (never unbound for ever).
+        let late = 1_000 + UNREAD_GRACE_MS;
+        assert_eq!(
+            id(pick_thread(
+                &left,
+                None,
+                true,
+                Some(q(1_000, 0, 2)),
+                &forked,
+                late
+            ))
+            .as_deref(),
+            Some("tb")
+        );
+        // A later fork whose elders never got a thread binds after waiting.
+        assert_eq!(
+            id(pick_thread(
+                &left,
+                None,
+                true,
+                Some(q(2_000, 1, 2)),
+                &forked,
+                2_000 + UNREAD_GRACE_MS
+            ))
+            .as_deref(),
+            Some("tb")
+        );
+
+        // The queue, and what holds an ordinary session back.
+        let w = |id: &str, fork: Option<&str>, since| Waiter {
+            id: id.into(),
+            folder: "/src/app".into(),
+            fork: fork.map(str::to_string),
+            since,
+        };
+        let waiting = [
+            w("fb", Some("parent"), 2_000),
+            w("fa", Some("parent"), 1_000),
+            w("other", Some("elsewhere"), 1_000),
+            w("plain", None, 500),
+        ];
+        let session = |id: &str| -> Session {
+            serde_json::from_value(json!({
+                "id": id, "name": id, "name_locked": false, "agent": "codex",
+                "agent_session": null, "agent_session_trust": "minted",
+                "project_path": "/src/app", "tmux_session": null, "status": "starting",
+                "group_path": "", "pinned": false, "created_at": 1, "archived_at": null,
+                "last_user_msg_at": null, "last_agent_msg_at": null,
+                "last_state_change_at": null, "repo_path": null, "workspace_path": null,
+                "branch": null, "model": null}))
+            .unwrap()
+        };
+        assert_eq!(
+            place_of(&waiting, &session("fa"), 3_000).1,
+            Some(Queue {
+                place: 0,
+                waiting: 2
+            })
+        );
+        assert_eq!(
+            place_of(&waiting, &session("fb"), 3_000).1,
+            Some(Queue {
+                place: 1,
+                waiting: 2
+            })
+        );
+        assert_eq!(place_of(&waiting, &session("plain"), 3_000).1, None);
+        // An ordinary session: the forks hold it back only while young.
+        let alone = [w("plain", None, 500), w("fa", Some("parent"), 1_000)];
+        assert!(place_of(&alone, &session("plain"), 3_000).0);
+        assert!(!place_of(&alone, &session("plain"), 1_000 + UNREAD_GRACE_MS).0);
+        // Another ordinary session always does.
+        assert!(place_of(&waiting, &session("plain"), 1_000_000).0 == false);
+        let two_plain = [w("plain", None, 500), w("plain2", None, 600)];
+        assert!(place_of(&two_plain, &session("plain"), 1_000_000).0);
     }
 
     /// A fork bound from the index whose rollout is on disk is no longer
