@@ -562,6 +562,27 @@ pub fn tree_path(repo: &Path) -> PathBuf {
     repo.join(TREE_DIR).join(TREE_NAME)
 }
 
+/// The tree's path as git reports worktree paths (resolved: a symlinked
+/// `.worktrees` is followed), so it compares equal to git's own. With
+/// `fs_ok` the folder above it is resolved; without (a guarded folder,
+/// where rlord stats nothing), git is asked from inside the tree, and
+/// the path is taken as it is when that fails (no tree yet).
+pub fn tree_path_seen(env: &GitEnv, repo: &Path, fs_ok: bool) -> PathBuf {
+    let dir = tree_path(repo);
+    if fs_ok {
+        if let Some(Ok(p)) = dir.parent().map(std::fs::canonicalize) {
+            return p.join(TREE_NAME);
+        }
+        return dir;
+    }
+    run(env, &dir, &["rev-parse", "--show-toplevel"], PLUMBING)
+        .ok()
+        .filter(|o| o.ok)
+        .map(|o| PathBuf::from(o.text()))
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(TREE_NAME))
+        .unwrap_or(dir)
+}
+
 /// The path of the checkout that has `branch`.
 pub fn parse_checked_out(list: &[Entry], branch: &str) -> Option<String> {
     list.iter()
@@ -1455,7 +1476,7 @@ pub fn tree_remove(
 }
 
 /// Delete the private refs: all of them, or those of `branches`.
-pub fn drop_refs(env: &GitEnv, repo: &Path, only: Option<&[String]>) -> Result<usize> {
+pub fn drop_refs(env: &GitEnv, repo: &Path) -> Result<usize> {
     let out = git(
         env,
         repo,
@@ -1464,14 +1485,7 @@ pub fn drop_refs(env: &GitEnv, repo: &Path, only: Option<&[String]>) -> Result<u
     )?;
     let mut n = 0;
     for r in out.lines().filter(|r| r.starts_with(REF_PREFIX)) {
-        let wanted = only.is_none_or(|bs| {
-            bs.iter().any(|b| {
-                r.strip_prefix(REF_PREFIX)
-                    .and_then(|rest| rest.split_once('/'))
-                    .is_some_and(|(_, br)| br == b)
-            })
-        });
-        if wanted && run(env, repo, &["update-ref", "-d", r], PLUMBING).is_ok_and(|o| o.ok) {
+        if run(env, repo, &["update-ref", "-d", r], PLUMBING).is_ok_and(|o| o.ok) {
             n += 1;
         }
     }
@@ -2247,7 +2261,7 @@ mod tests {
         tree_remove(&r.env, &repo, &dir, rec, &e, true).unwrap();
         assert_eq!(entry(&r, &repo, &dir), None);
         assert!(!dir.exists());
-        assert_eq!(drop_refs(&r.env, c, None).unwrap(), 1);
+        assert_eq!(drop_refs(&r.env, c).unwrap(), 1);
         assert_eq!(commit_of(&r.env, c, &private_ref("origin", "main")), None);
         assert_eq!(r.snapshot(), before);
         // (The hook would have run for a plain checkout.)

@@ -119,24 +119,31 @@ pub struct Latest {
     /// One move or removal of a repo's tree at a time (key: its common
     /// git dir).
     pub(crate) moves: KeyLocks,
-    /// First trees being made (`worktree add` can take minutes), by repo:
-    /// made on their own thread, the call waiting a bounded time.
-    adds: Adds,
+    /// Tree jobs (adding or moving a repo's tree can take minutes), by
+    /// repo: run on their own thread, the call waiting a bounded time.
+    jobs: Jobs,
 }
 
-/// A repo's first tree being made: whether it still is, and how it went
-/// (Ok: whether a leftover was replaced).
+/// What a tree job (making or moving a repo's tree) did, for the answer.
+struct TreeDone {
+    moved: Option<Value>,
+    warnings: Vec<String>,
+}
+
+/// A repo's tree job: whether one runs, for which request (the commit it
+/// moves the tree to), and how it went.
 #[derive(Default)]
-struct AddSlot {
+struct JobSlot {
     running: bool,
-    done: Option<std::result::Result<bool, String>>,
+    request: String,
+    done: Option<std::result::Result<TreeDone, String>>,
 }
 
-type Adds = Arc<(Mutex<HashMap<String, AddSlot>>, Condvar)>;
+type Jobs = Arc<(Mutex<HashMap<String, JobSlot>>, Condvar)>;
 
-/// How making a repo's first tree stands, for the caller.
-enum Adding {
-    Done(std::result::Result<bool, String>),
+/// How a tree job stands, for the caller.
+enum Job {
+    Done(std::result::Result<TreeDone, String>),
     Running,
 }
 
@@ -150,7 +157,7 @@ impl Default for Latest {
                 guard: Guard::new(),
             }),
             moves: KeyLocks::default(),
-            adds: Arc::default(),
+            jobs: Arc::default(),
         }
     }
 }
@@ -270,75 +277,88 @@ impl Latest {
 }
 
 impl Latest {
-    /// Make a repo's first tree with `add` on its own thread, unless one
-    /// is already being made; wait at most `wait` for it. A result no
-    /// caller waited for is handed to the next one.
-    fn add_tree<F>(&self, key: &str, wait: Duration, add: F) -> Adding
+    /// Run `job` (making or moving the tree to `request`) on its own
+    /// thread and wait at most `wait` for it. A job for another request
+    /// already running is waited out first; one for this request is
+    /// joined. A result is only ever handed to the calls waiting on that
+    /// job: a later call runs its own (cheap when the tree is already
+    /// right), so no old result, nor an old error, is handed back.
+    fn tree_job<F>(&self, key: &str, request: &str, wait: Duration, job: F) -> Job
     where
-        F: FnOnce() -> std::result::Result<bool, String> + Send + 'static,
+        F: FnOnce() -> std::result::Result<TreeDone, String> + Send + 'static,
     {
-        let (lock, done) = &*self.adds;
+        let deadline = Instant::now() + wait;
+        let (lock, cv) = &*self.jobs;
         let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let slot = map.entry(key.to_string()).or_default();
+            if !slot.running || slot.request == request {
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Job::Running;
+            }
+            map = cv
+                .wait_timeout(map, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
         let slot = map.entry(key.to_string()).or_default();
         if !slot.running {
-            if let Some(r) = slot.done.take() {
-                return Adding::Done(r);
-            }
             slot.running = true;
-            let state = self.adds.clone();
+            slot.request = request.to_string();
+            slot.done = None;
+            let state = self.jobs.clone();
             let k = key.to_string();
             let spawned = std::thread::Builder::new()
-                .name("repo-tree-add".into())
+                .name("repo-tree".into())
                 .spawn(move || {
-                    // (Its slot freed even if `add` panics.)
-                    struct Done(Adds, String, Option<std::result::Result<bool, String>>);
+                    // (Its slot freed even if `job` panics.)
+                    struct Done(Jobs, String, Option<std::result::Result<TreeDone, String>>);
                     impl Drop for Done {
                         fn drop(&mut self) {
-                            let (lock, done) = &*self.0;
+                            let (lock, cv) = &*self.0;
                             let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
                             let slot = map.entry(self.1.clone()).or_default();
                             slot.running = false;
                             slot.done = Some(
                                 self.2
                                     .take()
-                                    .unwrap_or_else(|| Err("making the tree panicked".into())),
+                                    .unwrap_or_else(|| Err("the tree job panicked".into())),
                             );
-                            done.notify_all();
+                            cv.notify_all();
                         }
                     }
                     let mut d = Done(state, k, None);
-                    d.2 = Some(add());
+                    d.2 = Some(job());
                 });
             if spawned.is_err() {
                 slot.running = false;
-                return Adding::Done(Err("couldn't start a thread".into()));
+                return Job::Done(Err("couldn't start a thread".into()));
             }
         }
-        let mut map = done
-            .wait_timeout_while(map, wait, |m| m.get(key).is_some_and(|s| s.running))
+        let left = deadline.saturating_duration_since(Instant::now());
+        let mut map = cv
+            .wait_timeout_while(map, left, |m| m.get(key).is_some_and(|s| s.running))
             .unwrap_or_else(|e| e.into_inner())
             .0;
-        let slot = map.entry(key.to_string()).or_default();
-        if slot.running {
-            return Adding::Running;
-        }
-        Adding::Done(slot.done.take().unwrap_or(Ok(false)))
-    }
-
-    /// The tree is there: an old result of making it is no news.
-    fn forget_add(&self, key: &str) {
-        let (lock, _) = &*self.adds;
-        let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(key).is_some_and(|s| !s.running) {
-            map.remove(key);
+        match map.get_mut(key) {
+            Some(s) if !s.running && s.request == request => match s.done.take() {
+                Some(r) => Job::Done(r),
+                None => Job::Running,
+            },
+            _ => Job::Running,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn hold_add_for_test(&self, key: &str) {
-        let (lock, _) = &*self.adds;
+        let (lock, _) = &*self.jobs;
         let mut map = lock.lock().unwrap();
-        map.entry(key.to_string()).or_default().running = true;
+        let slot = map.entry(key.to_string()).or_default();
+        slot.running = true;
+        slot.request = "another".into();
     }
 }
 
@@ -377,9 +397,6 @@ pub struct Rec {
     pub root: String,
     /// rlord's tree (absent: none made).
     pub tree: Option<String>,
-    /// Trees at an earlier path that couldn't be removed yet: retried by
-    /// the sweep and prune.
-    pub old_trees: Vec<String>,
     /// The ref and commit it was last moved to.
     #[serde(rename = "ref")]
     pub branch: Option<String>,
@@ -396,9 +413,6 @@ pub struct Rec {
     /// What the tree's checkout leaves out (`latest::tree_warnings`), as
     /// of its last move.
     pub tree_warnings: Vec<String>,
-    /// Why the sweep or prune last couldn't remove the tree (it stays
-    /// recorded as `tree`).
-    pub remove_error: Option<String>,
     /// `<remote>/<branch>` → when rlord last fetched it (ms).
     pub fetched: BTreeMap<String, i64>,
 }
@@ -1005,40 +1019,78 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
         return Ok(v);
     };
     let commit = commit.clone();
-    // Moving the tree: one at a time per repo (a launch never waits here).
-    let move_guard = d.latest.moves.lock(&key);
-    let rec = record(d, &key);
-    let dir = latest::tree_path(&repo.root);
-    // (The worktree list `locate` read; read again only when the tree
-    // isn't in it, so a tree added meanwhile is found.)
-    let mut list = repo.worktrees.clone();
-    if latest::entry_at(&list, &dir).is_none() {
-        list = latest::worktree_list(&env, &repo.root)?;
+    // The tree's path as git reports it (a symlinked `.worktrees` too).
+    let dir = latest::tree_path_seen(&env, &repo.root, f.fs_ok);
+    if latest::entry_at(&repo.worktrees, &dir).is_none() {
+        exclude(&env, &repo, &dir, &f, &mut v)?;
     }
-    // A tree at an earlier path goes; one that can't is kept for later.
-    let mut old_trees: Vec<String> = rec.old_trees.clone();
-    if let Some(old) = rec.tree.as_deref().filter(|t| Path::new(t) != dir) {
-        old_trees.push(old.to_string());
+    // Adding or moving the tree: on its own thread under the repo's move
+    // lock (it can take minutes); this call waits a bounded time.
+    let job = {
+        let me = d.me.clone();
+        let (k, repo, dir, commit) = (key.clone(), repo.clone(), dir.clone(), commit.clone());
+        let (branch, remote, fs_ok) = (f.branch.clone(), f.remote.clone(), f.fs_ok);
+        move || -> std::result::Result<TreeDone, String> {
+            let d = me.upgrade().ok_or("the daemon is stopping")?;
+            move_tree(
+                &d,
+                &k,
+                &repo,
+                &dir,
+                &commit,
+                &branch,
+                remote.as_deref(),
+                fs_ok,
+            )
+            .map_err(|e| format!("{e:#}"))
+        }
+    };
+    match d.latest.tree_job(&key, &commit, want.left(want.wait), job) {
+        Job::Done(Ok(t)) => {
+            v["path"] = json!(dir);
+            if let Some(m) = t.moved {
+                v["moved"] = m;
+            }
+            f.warnings.extend(t.warnings);
+        }
+        Job::Done(Err(e)) => bail!("{e}"),
+        Job::Running => {
+            f.warnings.push(
+                "preparing: rlord's tree for this repo is still being made; call again shortly"
+                    .into(),
+            );
+            v["tree"] = json!("preparing");
+        }
     }
-    old_trees.retain(|old| {
-        let p = Path::new(old);
-        // (Never the live tree, whatever the record says.)
-        if p == dir {
-            return false;
-        }
-        match latest::entry_at(&list, p) {
-            None => false,
-            Some(e) => match latest::tree_remove(&env, &repo, p, Some(p), e, f.fs_ok) {
-                Ok(()) => false,
-                Err(e) => {
-                    f.warnings.push(format!("old_tree: {e:#}"));
-                    true
-                }
-            },
-        }
-    });
-    let mut recorded = rec.tree.as_deref().map(PathBuf::from);
-    let unchanged;
+    // How much is uncommitted where the user has it: for a named branch
+    // (work the tree can't show); the default branch only says where.
+    let count = want.branch.is_some();
+    if let Some((at, n)) = latest::checked_out(&env, &repo.worktrees, &f.branch, count) {
+        v["local"]["checked_out_at"] = json!(at);
+        v["local"]["uncommitted"] = json!(n);
+    }
+    v["warnings"] = json!(f.warnings);
+    Ok(v)
+}
+
+/// Add or move the repo's tree to `commit`, under its move lock (a tree
+/// job's thread), and record it once done. One add at most per call.
+#[allow(clippy::too_many_arguments)]
+fn move_tree(
+    d: &Daemon,
+    key: &str,
+    repo: &Repo,
+    dir: &Path,
+    commit: &str,
+    branch: &str,
+    remote: Option<&str>,
+    fs_ok: bool,
+) -> Result<TreeDone> {
+    let _move = d.latest.moves.lock(key);
+    let env = d.latest.env();
+    let rec = record(d, key);
+    let list = latest::worktree_list(&env, &repo.root)?;
+    let mut warnings = Vec::new();
     // In progress: the commit is recorded as completed only once the add
     // or move succeeds (one killed partway may leave HEAD at the commit
     // with files missing).
@@ -1046,101 +1098,83 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
         .commit
         .clone()
         .filter(|_| rec.tree.as_deref() == dir.to_str());
-    // (Only once the tree is known to be rlord's.)
-    let in_progress = || {
-        update(d, &key, |r| {
-            r.tree = Some(dir.to_string_lossy().into_owned());
-            r.commit = None;
-            true
-        })
-    };
-    if latest::entry_at(&list, &dir).is_some() {
-        d.latest.forget_add(&key);
-    }
-    let moved = match latest::entry_at(&list, &dir) {
+    let mut recorded = rec.tree.as_deref().map(PathBuf::from);
+    let (moved, unchanged) = match latest::entry_at(&list, dir) {
         None => {
-            // (Recorded as the tree only once it is added; the old commit
-            // no longer counts as completed.)
-            update(d, &key, |r| {
+            // (Recorded as the tree only once it is added.)
+            update(d, key, |r| {
                 r.commit = None;
-                r.old_trees = old_trees.clone();
                 true
             });
-            exclude(&env, &repo, &dir, &f, &mut v)?;
-            // Made on its own thread (it can take minutes), under this
-            // lock taken again there; this call waits a bounded time.
-            drop(move_guard);
-            return first_tree(d, want, &key, &repo, &dir, &commit, &f, v);
+            let replaced = latest::tree_add_fresh(&env, repo, dir, commit, fs_ok)
+                .map_err(|e| anyhow::anyhow!("making rlord's tree at {}: {e:#}", dir.display()))?;
+            if replaced {
+                warnings.push(
+                    "recreated: a leftover of rlord's tree was there and was replaced".into(),
+                );
+            }
+            (Some(json!({"created": true})), false)
         }
         Some(e) => {
             // No record of it (a kv reset, the other daemon's): rlord's by
             // construction when `adoptable`; recorded below.
-            if recorded.as_deref() != Some(dir.as_path()) && latest::adoptable(e, &dir) {
-                recorded = Some(dir.clone());
-                f.warnings
-                    .push("adopted: rlord's tree had no record here; it does now".into());
+            if recorded.as_deref() != Some(dir) && latest::adoptable(e, dir) {
+                recorded = Some(dir.to_path_buf());
+                warnings.push("adopted: rlord's tree had no record here; it does now".into());
             }
             // A branch checked out in rlord's recorded tree: it is detached
-            // and moved, so nothing on record counts as completed (an
-            // interrupted move is never trusted later).
-            let had_branch = e.branch.is_some() && recorded.as_deref() == Some(dir.as_path());
-            if had_branch || latest::may_touch(recorded.as_deref(), &dir, e).is_ok() {
-                in_progress();
+            // and moved, so nothing on record counts as completed.
+            let had_branch = e.branch.is_some() && recorded.as_deref() == Some(dir);
+            if had_branch || latest::may_touch(recorded.as_deref(), dir, e).is_ok() {
+                update(d, key, |r| {
+                    r.tree = Some(dir.to_string_lossy().into_owned());
+                    r.commit = None;
+                    true
+                });
             }
             let complete = complete.as_deref().filter(|_| !had_branch);
             let m = latest::tree_move(
                 &env,
-                &repo,
-                &dir,
-                &commit,
+                repo,
+                dir,
+                commit,
                 recorded.as_deref(),
                 complete,
                 e,
-                f.fs_ok,
+                fs_ok,
             )?;
-            unchanged = m.unchanged;
             if m.discarded > 0 {
-                f.warnings.push(format!(
+                warnings.push(format!(
                     "discarded: {} file(s) edited in rlord's tree were thrown away (it is read-only)",
                     m.discarded
                 ));
             }
             if m.recreated {
-                f.warnings
-                    .push("recreated: rlord's tree was broken and was made again".into());
+                warnings.push("recreated: rlord's tree was broken and was made again".into());
             }
             let was = rec.commit.clone().zip(rec.branch.clone());
-            moved_since(&env, &repo.root, was, &f.branch, &commit)
+            (
+                moved_since(&env, &repo.root, was, branch, commit),
+                m.unchanged,
+            )
         }
     };
-    v["path"] = json!(dir);
-    if let Some(m) = moved {
-        v["moved"] = m;
-    }
-    // How much is uncommitted where the user has it: for a named branch
-    // (work the tree can't show); the default branch only says where.
-    let count = want.branch.is_some();
-    if let Some((at, n)) = latest::checked_out(&env, &list, &f.branch, count) {
-        v["local"]["checked_out_at"] = json!(at);
-        v["local"]["uncommitted"] = json!(n);
-    }
     // What the checkout leaves out: worked out once per move, kept.
     let tree_warnings = if unchanged {
         rec.tree_warnings.clone()
     } else {
-        latest::tree_warnings(&env, &repo.root, &dir)
+        latest::tree_warnings(&env, &repo.root, dir)
     };
-    f.warnings.extend(tree_warnings.iter().cloned());
-    let dropped = drop_old_refs(&env, &repo.root, &rec, f.remote.as_deref(), &f.branch);
+    warnings.extend(tree_warnings.iter().cloned());
+    let dropped = drop_old_refs(&env, &repo.root, &rec, remote, branch);
     if !dropped.is_empty() {
         d.latest.forget(&format!("{key}\0"));
     }
     let now = now_ms();
-    update(d, &key, |r| {
-        r.old_trees = old_trees;
+    update(d, key, |r| {
         r.tree = Some(dir.to_string_lossy().into_owned());
-        r.branch = Some(f.branch.clone());
-        r.commit = Some(commit);
+        r.branch = Some(branch.to_string());
+        r.commit = Some(commit.to_string());
         r.tree_used_at = now;
         r.used_at = now;
         r.tree_warnings = tree_warnings;
@@ -1149,90 +1183,7 @@ fn latest_in(d: &Daemon, want: &Want) -> Result<Value> {
         }
         true
     });
-    v["warnings"] = json!(f.warnings);
-    Ok(v)
-}
-
-/// The repo's first tree: made on its own thread (`Latest::add_tree`),
-/// under the repo's move lock, and recorded there once it is there. Made
-/// within the wait: the call goes on as usual (it is moved, `created`).
-/// Not yet: the answer says `tree: "preparing"` with no `path`.
-#[allow(clippy::too_many_arguments)]
-fn first_tree(
-    d: &Daemon,
-    want: &Want,
-    key: &str,
-    repo: &Repo,
-    dir: &Path,
-    commit: &str,
-    f: &Found,
-    mut v: Value,
-) -> Result<Value> {
-    let me = d.me.clone();
-    let (env, k) = (d.latest.env(), key.to_string());
-    let (repo2, dir2, commit2, branch) = (
-        repo.clone(),
-        dir.to_path_buf(),
-        commit.to_string(),
-        f.branch.clone(),
-    );
-    let fs_ok = f.fs_ok;
-    let add = move || -> std::result::Result<bool, String> {
-        let d = me.upgrade().ok_or("the daemon is stopping")?;
-        let _move = d.latest.moves.lock(&k);
-        let list = latest::worktree_list(&env, &repo2.root).map_err(|e| format!("{e:#}"))?;
-        if latest::entry_at(&list, &dir2).is_some() {
-            return Ok(false);
-        }
-        let replaced = latest::tree_add_fresh(&env, &repo2, &dir2, &commit2, fs_ok)
-            .map_err(|e| format!("making rlord's tree at {}: {e:#}", dir2.display()))?;
-        let warnings = latest::tree_warnings(&env, &repo2.root, &dir2);
-        let now = now_ms();
-        update(&d, &k, |r| {
-            r.tree = Some(dir2.to_string_lossy().into_owned());
-            r.branch = Some(branch);
-            r.commit = Some(commit2);
-            r.tree_used_at = now;
-            r.used_at = now;
-            r.tree_warnings = warnings;
-            true
-        });
-        Ok(replaced)
-    };
-    match d.latest.add_tree(key, want.left(want.wait), add) {
-        Adding::Done(Ok(replaced)) => {
-            // There now: the rest as for any tree. (This call's fetch and
-            // warnings are the ones to report, not the second look's.)
-            let mut v2 = latest_in(d, want)?;
-            v2["moved"] = json!({"created": true});
-            v2["fetch"] = v["fetch"].clone();
-            v2["fetched_at"] = v["fetched_at"].clone();
-            let mut w: Vec<Value> = f.warnings.iter().map(|x| json!(x)).collect();
-            if replaced {
-                w.push(json!(
-                    "recreated: a leftover of rlord's tree was there and was replaced"
-                ));
-            }
-            for x in v2["warnings"].as_array().cloned().unwrap_or_default() {
-                if !w.contains(&x) {
-                    w.push(x);
-                }
-            }
-            v2["warnings"] = json!(w);
-            Ok(v2)
-        }
-        Adding::Done(Err(e)) => bail!("{e}"),
-        Adding::Running => {
-            let mut warnings = f.warnings.clone();
-            warnings.push(
-                "preparing: rlord's tree for this repo is still being made; call again shortly"
-                    .into(),
-            );
-            v["tree"] = json!("preparing");
-            v["warnings"] = json!(warnings);
-            Ok(v)
-        }
-    }
+    Ok(TreeDone { moved, warnings })
 }
 
 /// Keep the tree out of the user's `git status`: `/.worktrees/` in the
@@ -1555,8 +1506,7 @@ pub fn prune_rpc(d: &Daemon, params: Value) -> Result<Value> {
     for (key, root) in keys {
         match remove(d, &key, &root, Remove::All) {
             Ok(None) => removed.push(json!(root)),
-            Ok(Some(path)) => left.push(json!({"repo": root, "path": path,
-                "why": "not rlord's tree as git sees it: left in place"})),
+            Ok(Some((path, why))) => left.push(json!({"repo": root, "path": path, "why": why})),
             Err(e) => failed.push(json!({"repo": root, "error": format!("{e:#}")})),
         }
     }
@@ -1574,25 +1524,24 @@ fn root_of(key: &str, rec: &Rec) -> String {
 /// What `remove` takes away.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Remove {
-    /// The trees, the private refs and the record (prune).
+    /// The tree, the private refs and the record (prune).
     All,
-    /// The trees only; the record keeps its refs and cache (the sweep).
-    Trees,
-    /// Only old trees left over from an earlier path (the sweep).
-    OldTrees,
+    /// The tree only; the record keeps its refs and cache (the sweep).
+    Tree,
 }
 
-/// Remove a repo's trees (the recorded one, any old ones it couldn't
-/// remove before, and an unrecorded one `latest::adoptable` says is
-/// rlord's), only after `latest::may_touch`; with `Remove::All` its
-/// private refs and record too. All under the repo's move lock, the
-/// record read and written there, so a live call can't interleave. A
-/// repo that is gone: its record only. An old tree that still can't be
-/// removed stays recorded.
-fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<String>> {
+/// Remove a repo's tree (the recorded one, or an unrecorded one
+/// `latest::adoptable` says is rlord's), only after `latest::may_touch`;
+/// with `Remove::All` its private refs and record too. All under the
+/// repo's move lock, the record read and written there. A repo that is
+/// gone: its record only. In a guarded folder only git runs (no stat, no
+/// file touched). A folder left at the tree's path (not rlord's to
+/// remove) comes back with its path and why.
+fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<(String, String)>> {
     let _move = d.latest.moves.lock(key);
     let rec = record(d, key);
     let env = d.latest.env();
+    let fs_ok = !guarded(d, &d.config(), Path::new(root));
     let gone = |d: &Daemon| {
         update(d, key, |_| false);
         Ok(None)
@@ -1600,70 +1549,58 @@ fn remove(d: &Daemon, key: &str, root: &str, what: Remove) -> Result<Option<Stri
     let repo = match latest::locate(&env, Path::new(root)) {
         Ok(Located::Repo(r)) => r,
         Ok(Located::NotGit) => return gone(d),
-        // (Only "not found" is gone; any other error keeps the record.)
-        Err(_) if matches!(Path::new(key).try_exists(), Ok(false)) => return gone(d),
+        // (Only "not found" is gone, and only where rlord may stat; any
+        // other error keeps the record.)
+        Err(_) if fs_ok && matches!(Path::new(key).try_exists(), Ok(false)) => return gone(d),
         Err(e) => return Err(e),
     };
     let list = &repo.worktrees;
-    let live = latest::tree_path(&repo.root);
-    // The live tree: the recorded one, or one rlord can adopt.
+    let live = latest::tree_path_seen(&env, &repo.root, fs_ok);
+    // The tree: the recorded one, or one rlord can adopt.
     let current: Option<PathBuf> = match rec.tree.as_deref() {
-        _ if what == Remove::OldTrees => None,
         Some(t) => Some(PathBuf::from(t)),
         None => latest::entry_at(list, &live)
             .is_some_and(|e| latest::adoptable(e, &live))
             .then(|| live.clone()),
     };
-    let remove_one = |t: &Path| -> Result<()> {
-        match latest::entry_at(list, t) {
-            Some(e) => latest::tree_remove(&env, &repo, t, Some(t), e, true),
-            None => Ok(()),
-        }
-    };
-    let mut first_err = None;
-    // Old trees: never the live tree's path.
-    let mut left = Vec::new();
-    for t in rec.old_trees.iter().map(PathBuf::from) {
-        if t == live || Some(&t) == current.as_ref() {
-            continue;
-        }
-        if let Err(e) = remove_one(&t) {
-            left.push(t.to_string_lossy().into_owned());
-            first_err.get_or_insert(e);
+    if let Some(t) = current.as_deref() {
+        if let Some(e) = latest::entry_at(list, t) {
+            latest::tree_remove(&env, &repo, t, Some(t), e, fs_ok)?;
         }
     }
-    // The live tree: kept as `tree`, with the error, if it won't go.
-    let live_err = current
-        .as_deref()
-        .and_then(|t| remove_one(t).err())
-        .map(|e| format!("{e:#}"));
-    if let Some(e) = &live_err {
-        first_err.get_or_insert(anyhow::anyhow!("{e}"));
-    }
-    if what == Remove::All && left.is_empty() && live_err.is_none() {
-        latest::drop_refs(&env, &repo.root, None)?;
+    if what == Remove::All {
+        latest::drop_refs(&env, &repo.root)?;
         d.latest.forget(&format!("{key}\0"));
         update(d, key, |_| false);
     } else {
         update(d, key, |r| {
-            if current.is_some() && live_err.is_none() {
-                r.tree = None;
-                r.branch = None;
-                r.commit = None;
-            }
-            r.remove_error = live_err.clone();
-            r.old_trees = left.clone();
+            r.tree = None;
+            r.branch = None;
+            r.commit = None;
             true
         });
     }
-    if let Some(e) = first_err {
-        return Err(e);
+    // Still at the tree's path, not rlord's to remove: said, with its path
+    // and why, never "removed".
+    if what != Remove::All {
+        return Ok(None);
     }
-    // A folder still at the tree's path that wasn't rlord's to remove (not
-    // recorded, not adoptable): said, with its path, never "removed".
-    let left_in_place = (what == Remove::All && matches!(live.try_exists(), Ok(true)))
-        .then(|| live.to_string_lossy().into_owned());
-    Ok(left_in_place)
+    let path = live.to_string_lossy().into_owned();
+    let not_ours = "not rlord's tree as git sees it: left in place";
+    Ok(if fs_ok {
+        matches!(live.try_exists(), Ok(true)).then(|| (path, not_ours.to_string()))
+    } else {
+        // (Guarded: git's list, no stat.)
+        latest::worktree_list(&env, &repo.root)
+            .ok()
+            .filter(|l| latest::entry_at(l, &live).is_some())
+            .map(|_| {
+                (
+                    path,
+                    format!("{not_ours} (in a folder macOS guards: only git was used)"),
+                )
+            })
+    })
 }
 
 /// The daily sweep, from the records only: a repo that is gone loses its
@@ -1717,13 +1654,8 @@ pub fn sweep(d: &Daemon) -> Value {
             }
         }
         let stale = rec.tree.is_some() && now - rec.tree_used_at > UNUSED_MS;
-        if stale || !rec.old_trees.is_empty() {
-            let what = if stale {
-                Remove::Trees
-            } else {
-                Remove::OldTrees
-            };
-            match remove(d, &key, &root, what) {
+        if stale {
+            match remove(d, &key, &root, Remove::Tree) {
                 Ok(_) => trees.push(root),
                 Err(e) => tracing::warn!(repo = root, error = %e, "removing rlord's tree"),
             }
@@ -2453,43 +2385,6 @@ mod tests {
         assert_eq!(d.db().kv_prefix(KV).unwrap().len(), 2);
     }
 
-    /// An earlier tree that can't be removed stays recorded, for the sweep
-    /// or prune to try again; it is never touched unless it is rlord's.
-    #[test]
-    fn an_old_tree_that_cannot_go_is_kept_for_later() {
-        let r = Repos::new();
-        let d = daemon(&r);
-        let c = &r.clone;
-        // A detached worktree under the tree's old name, recorded as the
-        // tree (an earlier build): `may_touch` refuses it (not its name).
-        let old = c.join(".worktrees/rlord-latest");
-        r.g(
-            c,
-            &["worktree", "add", "-q", "--detach", old.to_str().unwrap()],
-        );
-        update(&d, &key(c), |rec| {
-            rec.root = c.to_string_lossy().into_owned();
-            rec.tree = Some(old.to_string_lossy().into_owned());
-            true
-        });
-        let v = call(&d, c, json!({}));
-        assert!(v["warnings"].to_string().contains("old_tree"), "{v}");
-        let rec = record(&d, &key(c));
-        assert_eq!(rec.old_trees, vec![old.to_string_lossy().into_owned()]);
-        assert!(old.exists());
-        // The sweep tries again and keeps it; prune says it failed.
-        sweep(&d);
-        assert_eq!(record(&d, &key(c)).old_trees.len(), 1);
-        let p = prune_rpc(&d, json!({"repo": c})).unwrap();
-        assert_eq!(p["failed"].as_array().unwrap().len(), 1, "{p}");
-        assert!(old.exists());
-        assert_eq!(record(&d, &key(c)).old_trees.len(), 1);
-    }
-
-    /// A remote that hangs: a launch still comes back within its wait
-    /// (never asking the remote for the default branch while `main` is
-    /// there), and the fetch, finishing later with nobody waiting, is
-    /// recorded by its own thread.
     #[test]
     fn a_launch_waits_at_most_its_budget_and_a_late_fetch_is_recorded() {
         let r = Repos::new();
@@ -2651,7 +2546,7 @@ mod tests {
         let c = &r.clone;
         assert_eq!(call(&d, c, json!({}))["fetch"], "fetched");
         assert_eq!(call(&d, c, json!({}))["fetch"], "cached");
-        latest::drop_refs(&r.env, c, None).unwrap();
+        latest::drop_refs(&r.env, c).unwrap();
         assert_eq!(call(&d, c, json!({}))["fetch"], "fetched");
         // Prune forgets the repo's fetches too.
         prune_rpc(&d, json!({"repo": c})).unwrap();
@@ -2745,7 +2640,7 @@ mod tests {
     }
 
     /// The sweep that can't remove the live tree keeps it recorded as the
-    /// tree (never moved to `old_trees`), with the error.
+    /// tree.
     #[test]
     fn a_live_tree_that_wont_go_stays_the_tree() {
         let r = Repos::new();
@@ -2762,8 +2657,6 @@ mod tests {
         sweep(&d);
         let rec = record(&d, &key(c));
         assert_eq!(rec.tree, Some(path.to_string_lossy().into_owned()));
-        assert!(rec.old_trees.is_empty());
-        assert!(rec.remove_error.is_some());
         assert!(path.exists());
     }
 
@@ -3251,6 +3144,70 @@ mod tests {
         sweep(&d);
         assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "main")).is_some());
         assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "feat")).is_none());
+    }
+
+    /// A symlinked `.worktrees` (git lists the real path): the tree is
+    /// found as git has it, made once and then moved, never looped on.
+    #[test]
+    fn a_symlinked_worktrees_folder_is_followed() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let real = r.root().join("real-worktrees");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, c.join(".worktrees")).unwrap();
+        let d = daemon(&r);
+        let v = call(&d, c, json!({}));
+        assert_eq!(v["path"], json!(real.join(".rlord-latest")), "{v}");
+        assert_eq!(v["moved"], json!({"created": true}));
+        let newer = r.push_remote("main", "newer");
+        let d = again(&r, &d);
+        let v = call(&d, c, json!({}));
+        assert_eq!(v["commit"], newer.as_str(), "{v}");
+        assert_eq!(v["path"], json!(real.join(".rlord-latest")));
+        assert!(
+            v.get("moved").is_some_and(|m| m.get("created").is_none()),
+            "{v}"
+        );
+    }
+
+    /// A repo in a guarded folder: the first tree is made with git alone,
+    /// the exclude note survives into the answer, and prune removes it
+    /// with git alone too.
+    #[test]
+    fn a_guarded_repo_gets_its_tree_and_its_note() {
+        let r = Repos::new();
+        std::fs::create_dir(r.root().join("Documents")).unwrap();
+        r.g(&r.root(), &["clone", "-q", "remote.git", "Documents/app"]);
+        let app = r.root().join("Documents/app");
+        let d = daemon(&r);
+        d.latest.set_for_test(
+            r.env.clone(),
+            timing(30_000),
+            Guard::with(Some(&r.root()), false),
+        );
+        let v = call(&d, &app, json!({}));
+        assert!(v["exclude_note"].is_string(), "{v}");
+        assert!(v["path"].is_string(), "{v}");
+        assert!(v["warnings"].to_string().contains("guarded_folder"), "{v}");
+        let p = prune_rpc(&d, json!({"repo": app})).unwrap();
+        assert_eq!(p["removed"].as_array().unwrap().len(), 1, "{p}");
+        assert!(!app.join(".worktrees/.rlord-latest").exists());
+    }
+
+    /// A move still running (another call's): the answer says the tree is
+    /// being prepared, with no path; a later call moves it.
+    #[test]
+    fn a_move_still_running_is_said() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let d = daemon(&r);
+        call(&d, c, json!({}));
+        d.latest
+            .set_for_test(r.env.clone(), timing(50), Guard::with(None, false));
+        d.latest.hold_add_for_test(&key(c));
+        let v = latest_rpc(&d, json!({"repo": c})).unwrap();
+        assert_eq!(v["tree"], "preparing", "{v}");
+        assert!(v.get("path").is_none());
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

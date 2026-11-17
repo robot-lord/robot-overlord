@@ -711,14 +711,23 @@ limits, waits and retry windows are constants in those two files.
   only if it is recognizably a leftover of rlord's; a tree whose repo
   was moved with it is repaired by git. Edits in the tree are discarded
   on a move; the answer says how many.
-- **The first tree is made in the background** (it can take minutes),
-  under the repo's move lock; the call waits a bounded time and
-  otherwise answers `tree: "preparing"` with no path.
+- **Tree work runs in the background.** Adding or moving the tree (it
+  can take minutes) is a job on its own thread under the repo's move
+  lock; the call waits a bounded time and otherwise answers
+  `tree: "preparing"` with no path. A job's result goes only to the
+  calls waiting on it: a later call runs its own, so no old result or
+  old error is handed back. At most one re-add per call, and no call
+  repeats itself.
+- **Paths as git has them.** The tree's path is resolved the way git
+  reports worktree paths (a symlinked `.worktrees` is followed; in a
+  guarded folder git is asked, nothing is statted), so rlord's path and
+  git's always match.
 - **Done means done.** A move counts as complete only once it succeeds
   (the record's commit is cleared before and set after), so a checkout
   killed partway is redone, never trusted. Only a verifiably broken tree
   is rebuilt; a lock or a time limit is an error that leaves it as it
-  is. A tree that can't be removed stays in the record and is retried.
+  is. The tree's path is fixed, so there are no trees at old paths to
+  track.
 - **Which repo.** Identity is the common git dir (records and locks are
   keyed by it). rlord works from git's main worktree, or a bare repo's
   folder; with `--separate-git-dir` it takes the checkout it was asked
@@ -771,10 +780,11 @@ limits, waits and retry windows are constants in those two files.
 - **Records and cleanup.** One kv key per repo (`repo_latest:<common git
   dir>`). A sweep after start and then daily works from those records
   only, never scanning for repos: it drops the record of a repo that is
-  gone, removes long-unused trees (keeping refs and cache) and retries
-  old ones. `rlord latest --prune [REPO]` (the current folder's repo by
+  gone, removes long-unused trees (keeping refs and cache) and drops
+  long-unfetched private refs. `rlord latest --prune [REPO]` (the current folder's repo by
   default, every one with `--all`) removes trees, refs and record now,
-  and says what it left in place; `--list` shows them.
+  and says what it left in place and why (in a guarded folder with git
+  alone); `--list` shows them.
 - **macOS privacy.** In a repo inside a folder macOS guards (and not
   under a scan root) rlord reads no file itself and stats nothing
   unprompted: only git runs there (it acts on the user's repo, which

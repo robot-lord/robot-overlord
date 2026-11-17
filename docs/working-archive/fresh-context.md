@@ -54,6 +54,9 @@ base work now is in `docs/architecture.md` ("The latest code
 - **Git spawns per call**: a `repo_latest` call still runs a dozen or so
   git commands (locate, remote, refs, relation, status, checkout); batch
   the plumbing (`for-each-ref`, one `rev-parse` for several refs).
+- **Threads per git call**: `latest::run` starts a waiting thread and two
+  reader threads for every git command; a pool, or one reader thread
+  for both streams, would do.
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored

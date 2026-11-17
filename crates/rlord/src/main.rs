@@ -1964,21 +1964,18 @@ fn absolute_folder(p: &str, cwd: &std::path::Path) -> Result<String> {
     rlord_core::config::absolute_dir(&abs)
 }
 
-/// `rlord latest`: one RPC each (`repo.latest`, `_list`, `_prune`).
 /// `repo.latest_prune`'s params for `rlord latest --prune [REPO] [--all]`:
-/// REPO (made absolute against `cwd`), else the current folder's repo;
-/// every repo only with `--all`.
-fn prune_params(repo: Option<String>, all: bool, cwd: &std::path::Path) -> Value {
+/// REPO (made absolute against `cwd`, `absolute_folder`), else the
+/// current folder's repo; every repo only with `--all`.
+fn prune_params(repo: Option<String>, all: bool, cwd: &std::path::Path) -> Result<Value> {
     if all {
-        return json!({"all": true});
+        return Ok(json!({"all": true}));
     }
-    let p = std::path::PathBuf::from(rlord_core::config::expand_tilde(
-        repo.as_deref().unwrap_or("."),
-    ));
-    let p = if p.is_absolute() { p } else { cwd.join(p) };
-    json!({"repo": p.to_string_lossy()})
+    let p = absolute_folder(repo.as_deref().unwrap_or("."), cwd)?;
+    Ok(json!({"repo": p}))
 }
 
+/// `rlord latest`: one RPC each (`repo.latest`, `_list`, `_prune`).
 /// `prune`: Some(all) for `--prune`.
 fn latest_cmd(
     repo: Option<String>,
@@ -1988,25 +1985,13 @@ fn latest_cmd(
     prune: Option<bool>,
     json: bool,
 ) -> Result<Value> {
-    let abs = |r: String| -> Result<String> {
-        let p = std::path::PathBuf::from(rlord_core::config::expand_tilde(&r));
-        Ok(if p.is_absolute() {
-            p
-        } else {
-            std::env::current_dir()?.join(p)
-        }
-        .to_string_lossy()
-        .into_owned())
-    };
+    let cwd = std::env::current_dir()?;
     let v = if list {
         call("repo.latest_list", json!({}))?
     } else if let Some(all) = prune {
-        call(
-            "repo.latest_prune",
-            prune_params(repo.clone(), all, &std::env::current_dir()?),
-        )?
+        call("repo.latest_prune", prune_params(repo.clone(), all, &cwd)?)?
     } else {
-        let repo = abs(repo.unwrap_or_else(|| ".".into()))?;
+        let repo = absolute_folder(repo.as_deref().unwrap_or("."), &cwd)?;
         call(
             "repo.latest",
             json!({"repo": repo, "ref": git_ref, "prefer": prefer}),
@@ -2732,19 +2717,13 @@ mod tests {
     fn latest_prune_is_the_current_repo_unless_all() {
         use serde_json::json;
         let cwd = std::path::Path::new("/w/app/sub");
-        assert_eq!(
-            super::prune_params(None, false, cwd),
-            json!({"repo": "/w/app/sub/."})
-        );
-        assert_eq!(
-            super::prune_params(Some("../other".into()), false, cwd),
-            json!({"repo": "/w/app/sub/../other"})
-        );
-        assert_eq!(
-            super::prune_params(Some("/r".into()), false, cwd),
-            json!({"repo": "/r"})
-        );
-        assert_eq!(super::prune_params(None, true, cwd), json!({"all": true}));
+        let p =
+            |r: Option<&str>, all| super::prune_params(r.map(str::to_string), all, cwd).unwrap();
+        assert_eq!(p(None, false), json!({"repo": "/w/app/sub"}));
+        assert_eq!(p(Some("../other"), false), json!({"repo": "/w/app/other"}));
+        assert_eq!(p(Some("/r/"), false), json!({"repo": "/r"}));
+        assert_eq!(p(None, true), json!({"all": true}));
+        assert!(super::prune_params(Some("/".into()), false, cwd).is_err());
     }
 
     use super::*;
