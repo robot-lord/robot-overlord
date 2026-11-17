@@ -14,7 +14,7 @@
 //! notification that never came (the agent was restarted, a task died
 //! with it) can't leave a session stuck.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -23,7 +23,6 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use rlord_core::agents::background::{Kind, Task, Tracker};
-use rlord_core::db::{ArchivedMode, SessionQuery};
 use rlord_core::types::now_ms;
 
 use crate::Daemon;
@@ -81,11 +80,14 @@ fn mtime_ms(p: &Path) -> Option<i64> {
 /// When the session last wrote anything: its transcript, or the output of
 /// one of its open subagents (they write there, not in the transcript):
 /// each one's `outputFile` and its sidechain transcript
-/// (`<session>/subagents/agent-<id>.jsonl`). At most `STAT_CAP` of them.
+/// (`<session>/subagents/agent-<id>.jsonl`). At most `STAT_CAP` of them,
+/// the most recently started first.
 fn last_write(path: &Path, t: &Tracker) -> i64 {
     let side = path.with_extension("").join("subagents");
     let mut newest = mtime_ms(path).unwrap_or(0);
-    for (id, task) in t.of(Kind::Agent).take(STAT_CAP) {
+    let mut agents: Vec<_> = t.of(Kind::Agent).collect();
+    agents.sort_by_key(|(_, t)| std::cmp::Reverse(t.started_at));
+    for (id, task) in agents.into_iter().take(STAT_CAP) {
         let mut files: Vec<PathBuf> = task.output.iter().cloned().collect();
         files.push(side.join(format!("agent-{id}.jsonl")));
         for f in files {
@@ -95,11 +97,24 @@ fn last_write(path: &Path, t: &Tracker) -> i64 {
     newest
 }
 
-/// What a tracker shows at `now`, given the session's last write.
-fn shown(t: &Tracker, last_write: i64, now: i64) -> Shown {
-    if now - last_write >= STALE_MS {
-        return Shown::default();
+/// Bring a tracker up to date: read what was appended, drop the work
+/// launched before the agent was last started again (`started_at`: its
+/// tasks died with the old process), and drop everything once nothing was
+/// written for `STALE_MS`. Returns what it shows.
+fn refresh(t: &mut Tracker, path: &Path, started_at: i64, now: i64) -> Shown {
+    let _ = t.advance(path);
+    if started_at > 0 {
+        t.open
+            .retain(|_, task| task.started_at == 0 || task.started_at >= started_at);
     }
+    if !t.open.is_empty() && now - last_write(path, t) >= STALE_MS {
+        t.forget_open();
+    }
+    shown(t)
+}
+
+/// What a tracker shows.
+fn shown(t: &Tracker) -> Shown {
     let list = |kind| {
         let mut v: Vec<Task> = t.of(kind).map(|(_, t)| t.clone()).collect();
         v.sort_by_key(|t| t.started_at);
@@ -117,45 +132,34 @@ fn shown(t: &Tracker, last_write: i64, now: i64) -> Shown {
     }
 }
 
-/// Read what every live session's transcript appended since the last look.
+/// Read what every running session's transcript appended since the last
+/// look (the overlords too: one can wait on its own subagent).
 fn scan(d: &Daemon) -> Result<()> {
-    let sources: Vec<(String, String)> = {
-        let db = d.db();
-        let live: Vec<String> = db
-            .sessions(&SessionQuery {
-                archived: ArchivedMode::Live,
-                ..Default::default()
-            })?
-            .into_iter()
-            .map(|s| s.id)
-            .collect();
-        db.transcript_sources()?
-            .into_iter()
-            .filter(|(id, _)| live.contains(id))
-            .collect()
-    };
+    // (Ids, paths and start times only, under the DB lock.)
+    let sources = d.db().running_transcripts()?;
     // Copy the read state out: the reads happen unlocked (only this
     // thread writes it back).
-    let mut seen: HashMap<String, Seen> = {
-        let all = d.background.seen.lock().expect("background mutex");
-        sources
-            .iter()
-            .map(|(id, _)| (id.clone(), all.get(id).cloned().unwrap_or_default()))
-            .collect()
-    };
+    let mut seen: HashMap<String, Seen> =
+        d.background.seen.lock().expect("background mutex").clone();
     let now = now_ms();
     let mut after = HashMap::new();
-    for (id, path) in &sources {
-        let s = seen.get_mut(id).expect("copied above");
+    let running: HashSet<&str> = sources.iter().map(|(id, _, _)| id.as_str()).collect();
+    // Not running (stopped, failed, archived): nothing of theirs runs.
+    // The read position is kept, so a resume doesn't find it all again.
+    for (id, s) in seen.iter_mut() {
+        if !running.contains(id.as_str()) {
+            s.tracker.forget_open();
+        }
+    }
+    for (id, path, started_at) in &sources {
+        let s = seen.entry(id.clone()).or_default();
         if s.path != *path {
             *s = Seen {
                 path: path.clone(),
                 ..Default::default()
             };
         }
-        let p = Path::new(path);
-        let _ = s.tracker.advance(p);
-        let sh = shown(&s.tracker, last_write(p, &s.tracker), now);
+        let sh = refresh(&mut s.tracker, Path::new(path), *started_at, now);
         if sh != Shown::default() {
             after.insert(id.clone(), sh);
         }
@@ -224,11 +228,35 @@ mod tests {
 
     #[test]
     fn stale_work_is_not_shown() {
-        let t = tracker(&[agent("a1")]);
-        let now = 10 * STALE_MS;
-        assert_eq!(shown(&t, now - 1_000, now).agent_count, 1);
-        // Nothing written for the stale time: back to "your turn".
-        assert_eq!(shown(&t, now - STALE_MS, now), Shown::default());
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        std::fs::write(&main, format!("{}\n", agent("a1"))).unwrap();
+        let mut t = Tracker::default();
+        let now = now_ms();
+        assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
+        // Nothing written for the stale time: dropped, back to "your turn".
+        assert_eq!(refresh(&mut t, &main, 0, now + STALE_MS), Shown::default());
+        assert!(t.open.is_empty());
+        // ...and not found again.
+        assert_eq!(refresh(&mut t, &main, 0, now), Shown::default());
+    }
+
+    #[test]
+    fn a_restart_drops_the_work_from_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        let mut old = agent("a1");
+        old["timestamp"] = json!("2026-01-01T00:00:00.000Z");
+        let mut new = agent("a2");
+        new["timestamp"] = json!("2026-01-01T00:10:00.000Z");
+        std::fs::write(&main, format!("{old}\n{new}\n")).unwrap();
+        let started =
+            rlord_core::agents::transcript::parse_iso_ms("2026-01-01T00:05:00.000Z").unwrap();
+        let mut t = Tracker::default();
+        // (`now` right after: fresh enough by the file's mtime.)
+        let sh = refresh(&mut t, &main, started, now_ms());
+        assert_eq!(sh.agent_count, 1);
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a2"]);
     }
 
     #[test]
@@ -272,6 +300,9 @@ mod tests {
         .unwrap();
         db.upsert_transcript_source("s1", path.to_str().unwrap())
             .unwrap();
+        // (Running: a stopped session isn't scanned.)
+        db.set_status("s1", rlord_core::types::Status::Idle, 1)
+            .unwrap();
         Daemon::new(db, rlord_core::config::Config::default())
     }
 
@@ -303,6 +334,25 @@ mod tests {
         scan(&d).unwrap();
         annotate(&d, &mut rows);
         assert!(rows[0]["background_tasks"].is_null());
+    }
+
+    #[test]
+    fn a_stopped_session_shows_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        let d = daemon(&path);
+        std::fs::write(&path, format!("{}\n{}\n", agent("a1"), shell("b1"))).unwrap();
+        scan(&d).unwrap();
+        let mut rows = [json!({"id": "s1", "status": "idle"})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["background_tasks"], 1);
+        d.db()
+            .set_status("s1", rlord_core::types::Status::Stopped, now_ms())
+            .unwrap();
+        scan(&d).unwrap();
+        annotate(&d, &mut rows);
+        assert!(rows[0]["background_tasks"].is_null());
+        assert!(rows[0]["background_shells"].is_null());
     }
 
     #[test]

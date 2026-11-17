@@ -2630,9 +2630,9 @@ fn print_session_table(list: &Value, usage: rlord_core::usage::UsageMetric) {
             match s["limit"]["until"].as_str() {
                 Some(_) if s["limit"]["reset"] == true => "limit reset".to_string(),
                 Some(until) => truncate(&format!("till {until}"), 16),
-                None => match s["background_tasks"].as_u64() {
-                    Some(n) => format!("bg {n}"),
-                    None => rlord_core::types::Status::label_of(get("status")).to_string(),
+                None => match s["shown_status"].as_str() {
+                    Some("background") => format!("bg {}", s["background_tasks"]),
+                    _ => rlord_core::types::Status::label_of(get("status")).to_string(),
                 },
             },
             rel_age(

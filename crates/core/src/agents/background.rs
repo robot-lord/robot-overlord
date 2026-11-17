@@ -17,7 +17,10 @@
 //!   "task-notification"` whose text holds `<task-notification>` with
 //!   `<task-id>` and a final `<status>` (`completed`, `failed`, `killed`,
 //!   `stopped`). The same id can notify more than once (a resumed agent):
-//!   finishing an id that isn't open changes nothing.
+//!   finishing an id that isn't open changes nothing. A successful
+//!   `TaskStop` (or the older `KillShell`) finishes it too: its
+//!   `toolUseResult` is `{message: "Successfully stopped task: …",
+//!   task_id}` (`shell_id` for `KillShell`).
 //!
 //! The read is incremental: `Tracker` keeps its byte offset (and the
 //! file's inode) and only reads what was appended since, a bounded chunk
@@ -94,19 +97,17 @@ pub struct Tracker {
 
 impl Tracker {
     /// Read what was appended to `path` since the last call (bounded by
-    /// `CHUNK`). Returns whether `open` changed. A file that shrank or was
-    /// replaced (new inode) is read again from its tail.
-    pub fn advance(&mut self, path: &Path) -> std::io::Result<bool> {
+    /// `CHUNK`). A file that shrank or was replaced (new inode) is read
+    /// again from its tail.
+    pub fn advance(&mut self, path: &Path) -> std::io::Result<()> {
         // Adapter hook: only Claude Code transcripts are read today.
         if Format::of(path) != Format::Claude {
-            let changed = !self.open.is_empty();
             self.open.clear();
-            return Ok(changed);
+            return Ok(());
         }
         let mut f = std::fs::File::open(path)?;
         let meta = f.metadata()?;
         let (len, ino) = (meta.len(), meta.ino());
-        let before = self.open.clone();
         if self.ino != ino || self.offset > len {
             *self = Tracker {
                 ino,
@@ -115,11 +116,15 @@ impl Tracker {
         }
         if self.offset == 0 && len > FIRST_READ {
             self.offset = len - FIRST_READ;
-            // Starting mid-file: the first line is cut.
-            self.skip_line = true;
+            // Starting mid-file: the first line is cut, unless the byte
+            // before the start ends a line.
+            f.seek(SeekFrom::Start(self.offset - 1))?;
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b)?;
+            self.skip_line = b[0] != b'\n';
         }
         if self.offset >= len {
-            return Ok(self.open != before);
+            return Ok(());
         }
         f.seek(SeekFrom::Start(self.offset))?;
         let mut r = BufReader::new(f.take(CHUNK));
@@ -154,7 +159,14 @@ impl Tracker {
                 self.feed(&v);
             }
         }
-        Ok(self.open != before)
+        Ok(())
+    }
+
+    /// Forget the open work (it went stale, or the agent was started
+    /// again: its tasks died with the old process). The read position
+    /// stays, so it isn't found again.
+    pub fn forget_open(&mut self) {
+        self.open.clear();
     }
 
     /// Apply one transcript line to the open background work.
@@ -212,6 +224,9 @@ impl Tracker {
         if line["origin"]["kind"] == "task-notification" {
             finish(&mut self.open, content);
         }
+        if let Some(id) = stopped(r, content) {
+            self.open.remove(id);
+        }
     }
 
     /// Open work of `kind`.
@@ -237,6 +252,21 @@ fn finish(open: &mut BTreeMap<String, Task>, content: &Value) {
             }
         }
     }
+}
+
+/// The id a successful `TaskStop` / `KillShell` result stopped.
+fn stopped<'a>(r: &'a Value, content: &Value) -> Option<&'a str> {
+    let failed = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|b| b["is_error"] == true);
+    let ok = r["message"]
+        .as_str()
+        .is_some_and(|m| m.starts_with("Successfully"))
+        || r["success"] == true;
+    let id = r["task_id"].as_str().or(r["shell_id"].as_str())?;
+    (ok && !failed).then_some(id)
 }
 
 /// The id and kind of background work a tool result says it started.
@@ -381,15 +411,16 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         write(&mut f, &[agent_launch("a1"), bash_launch("b1")]);
         let mut t = Tracker::default();
-        assert!(t.advance(&p).unwrap());
+        t.advance(&p).unwrap();
         assert_eq!(t.open.len(), 2);
-        assert!(!t.advance(&p).unwrap());
+        t.advance(&p).unwrap();
         // Half a line: not read yet.
         let n = note("a1", "completed").to_string();
         write!(f, "{}", &n[..10]).unwrap();
-        assert!(!t.advance(&p).unwrap());
+        t.advance(&p).unwrap();
+        assert_eq!(t.open.len(), 2);
         writeln!(f, "{}", &n[10..]).unwrap();
-        assert!(t.advance(&p).unwrap());
+        t.advance(&p).unwrap();
         assert_eq!(t.open.keys().collect::<Vec<_>>(), ["b1"]);
     }
 
@@ -472,13 +503,72 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_stop_finishes_it() {
+        // As TaskStop answers (Claude Code 2.1.3xx).
+        let stop = |id: &str, err: bool| {
+            json!({"type": "user", "message": {"content": [{"type": "tool_result",
+                "tool_use_id": "toolu_9", "is_error": err,
+                "content": format!("{{\"message\":\"Successfully stopped task: {id} (x)\"}}")}]},
+                "toolUseResult": {"message": format!("Successfully stopped task: {id} (x)"),
+                    "task_id": id, "task_type": "local_agent", "command": "x"}})
+        };
+        assert_eq!(count(&[agent_launch("a1"), stop("a1", false)]), 0);
+        assert_eq!(count(&[agent_launch("a1"), stop("a1", true)]), 1);
+        let kill = json!({"type": "user", "toolUseResult": {"success": true,
+            "message": "Successfully killed shell: b1 (x)", "shell_id": "b1"}});
+        assert_eq!(count(&[bash_launch("b1"), kill]), 0);
+    }
+
+    #[test]
+    fn forgetting_keeps_the_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        write(&mut f, &[agent_launch("a1")]);
+        let mut t = Tracker::default();
+        t.advance(&p).unwrap();
+        t.forget_open();
+        t.advance(&p).unwrap();
+        assert!(t.open.is_empty());
+        write(&mut f, &[agent_launch("a2")]);
+        t.advance(&p).unwrap();
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a2"]);
+    }
+
+    /// The ids read from a file whose last line, a launch of `b`, is
+    /// `FIRST_READ + extra` bytes long (newline included), after a launch of
+    /// `a`: the first read starts `extra` bytes into it.
+    fn tail_ids(extra: u64) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        write(&mut f, &[agent_launch("a")]);
+        let empty = json!({"type": "user", "toolUseResult": {"backgroundTaskId": "b"}, "pad": ""});
+        let pad = (FIRST_READ + extra) as usize - empty.to_string().len() - 1;
+        let mut last = empty;
+        last["pad"] = json!("x".repeat(pad));
+        writeln!(f, "{last}").unwrap();
+        let mut t = Tracker::default();
+        t.advance(&p).unwrap();
+        t.open.keys().cloned().collect()
+    }
+
+    #[test]
+    fn the_first_read_skips_only_a_cut_line() {
+        // Starts right after a newline: that line is whole, read it.
+        assert_eq!(tail_ids(0), ["b"]);
+        // Starts inside it: skipped.
+        assert!(tail_ids(1).is_empty());
+    }
+
+    #[test]
     fn other_agents_have_none() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("rollout-2026-01-01T00-00-00-x.jsonl");
         let mut f = std::fs::File::create(&p).unwrap();
         write(&mut f, &[bash_launch("b1")]);
         let mut t = Tracker::default();
-        assert!(!t.advance(&p).unwrap());
+        t.advance(&p).unwrap();
         assert!(t.open.is_empty());
     }
 }

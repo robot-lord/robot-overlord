@@ -50,7 +50,10 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             format!("Stopped on a usage limit until {until}.{resume}")
         };
     }
-    if let Some(n) = s["background_tasks"].as_u64() {
+    if let Some(n) = s["background_tasks"]
+        .as_u64()
+        .filter(|_| s["shown_status"] == "background")
+    {
         let tasks: Vec<&Value> = s["background_work"]
             .as_array()
             .map(|a| a.iter().collect())
@@ -215,7 +218,7 @@ mod tests {
 
     #[test]
     fn background_work_with_labels_and_age() {
-        let s = json!({"status": "idle", "background_tasks": 2, "background_work": [
+        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 2, "background_work": [
             {"label": "Run tests", "started_at": 60_000},
             {"label": "Review PR", "started_at": 120_000}]});
         assert_eq!(
@@ -223,13 +226,13 @@ mod tests {
             "Waiting on 2 background tasks: Run tests, Review PR, started 4m ago. \
              Its turn is over; it goes on when they finish."
         );
-        let s = json!({"status": "idle", "background_tasks": 1});
+        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 1});
         assert!(status_sentence(&s, 0).starts_with("Waiting on 1 background task."));
     }
 
     #[test]
     fn limit_wins_and_remote_is_spelled_out() {
-        let s = json!({"status": "idle", "background_tasks": 1,
+        let s = json!({"status": "idle", "shown_status": "background", "background_tasks": 1,
             "limit": {"until": "3:00pm", "resume": true},
             "remote": {"state": "on"}});
         assert_eq!(

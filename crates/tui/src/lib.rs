@@ -2790,7 +2790,8 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let Some(until) = l["until"].as_str() else {
-        if let Some(n) = s["background_tasks"].as_u64() {
+        if s["shown_status"] == "background" {
+            let n = s["background_tasks"].as_u64().unwrap_or(0);
             return theme::background_chip(n, full);
         }
         return theme::status_chip(s["status"].as_str().unwrap_or("-"));

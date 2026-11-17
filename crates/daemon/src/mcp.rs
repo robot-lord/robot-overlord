@@ -343,25 +343,43 @@ fn session_ref(args: &Value) -> Result<String> {
         .context("missing 'session'")
 }
 
-/// Background work, as list_sessions and get_session show it. Its turn
-/// over while subagents it started still run: status `background`, with
-/// `background_tasks` (how many) and `background_labels` (what). Background
-/// shells never change the status: `background_shells` lists them.
-fn background_status(s: &Value, row: &mut Value) {
+/// Labels of a `[{label, started_at}]` task list.
+fn labels(tasks: &Value) -> Value {
+    tasks.as_array().map_or(json!([]), |t| {
+        t.iter().map(|t| t["label"].clone()).collect()
+    })
+}
+
+/// Background work, as list_sessions and get_session show it (read from
+/// the annotated session `s`): `background_tasks` (how many subagents run
+/// while its turn is over) with `background_labels` (what), and
+/// `background_shells` (`{count, labels}`, information only).
+fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
+    let mut out = Vec::new();
     if let Some(n) = s["background_tasks"].as_u64() {
-        row["status"] = json!("background");
-        row["background_tasks"] = json!(n);
-        row["background_labels"] = s["background_work"].as_array().map_or(json!([]), |t| {
-            t.iter().map(|t| t["label"].clone()).collect()
-        });
+        out.push(("background_tasks", json!(n)));
+        out.push(("background_labels", labels(&s["background_work"])));
     }
     if let Some(n) = s["background_shells"]["count"].as_u64() {
-        row["background_shells"] = json!({
-            "count": n,
-            "labels": s["background_shells"]["tasks"]
-                .as_array()
-                .map_or(json!([]), |t| t.iter().map(|t| t["label"].clone()).collect::<Value>()),
-        });
+        out.push((
+            "background_shells",
+            json!({"count": n, "labels": labels(&s["background_shells"]["tasks"])}),
+        ));
+    }
+    out
+}
+
+/// The status as the overlord sees it: the daemon's `shown_status`
+/// (`background` and `limited` as they are, the rest in the words people
+/// see: working, needs you, your turn, stopped).
+fn status_word(s: &Value) -> Value {
+    match s["shown_status"]
+        .as_str()
+        .or(s["status"].as_str())
+        .unwrap_or("")
+    {
+        st @ ("background" | "limited") => json!(st),
+        st => json!(rlord_core::types::Status::label_of(st)),
     }
 }
 
@@ -370,8 +388,9 @@ fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
     let mut row = json!({
         "id": s["id"], "name": s["name"],
-        // As people see it: working, needs you, your turn, stopped.
-        "status": rlord_core::types::Status::label_of(s["status"].as_str().unwrap_or("")),
+        // As people see it: working, needs you, your turn, stopped,
+        // background, limited.
+        "status": status_word(s),
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         "tags": s["tags"], "description": s["description"],
@@ -403,10 +422,11 @@ fn summarize(s: &Value) -> Value {
     if live_forks > 0 {
         row["live_forks"] = json!(live_forks);
     }
-    background_status(s, &mut row);
-    // Stopped on a usage limit: that, rather than the status under it.
+    for (k, v) in background_fields(s) {
+        row[k] = v;
+    }
+    // Stopped on a usage limit.
     if !s["limit"].is_null() {
-        row["status"] = json!("limited");
         row["limited_until"] = s["limit"]["until"].clone();
         // (Its reset time has passed: back in a minute.)
         row["limit_reset"] = s["limit"]["reset"].clone();
@@ -657,10 +677,11 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             s["subagents"] = d.rpc("session.subagents", json!({"ref": id}))?;
             s["background"] = d.rpc("session.context", json!({"ref": id}))?;
             // The status as list_sessions shows it.
-            let annotated = s.clone();
-            background_status(&annotated, &mut s);
-            if !annotated["limit"].is_null() {
-                s["status"] = json!("limited");
+            if let Some(st) = s["shown_status"].as_str().map(str::to_string) {
+                s["status"] = json!(st);
+            }
+            for (k, v) in background_fields(&s) {
+                s[k] = v;
             }
             if let Some(o) = s.as_object_mut() {
                 o.remove("background_work");
