@@ -522,7 +522,8 @@ drawn over (`shown_status_matches`).
   - An id can notify more than once (a resumed agent); a notification
     for an id that isn't open is ignored. A successful `SendMessage` that
     resumes an agent (`toolUseResult: {success: true, resumedAgentId,
-    revivedAgentId}`) opens it again.
+    revivedAgentId}`) opens it again, with the label and files it had (the
+    last 32 finished agents are remembered).
   - A successful `TaskStop` finishes a task too (`toolUseResult:
     {message: "Successfully stopped task: …", task_id}`); the older
     `KillShell` result has `shell_id`. The tool result's text is never
@@ -537,9 +538,12 @@ drawn over (`shown_status_matches`).
   and the last start of each agent process, using
   `idx_events_session_kind`. A start is either:
   - a `resumed`, `restarted` or `reforked` event, or
-  - a `session_start` hook event whose `start` is `startup` or `resume`
-    (recorded from the hook's `source`). This also catches a restart done
-    outside rlord. `clear` and `compact` keep the same process.
+  - a `session_start` hook event whose `start` is `startup` (recorded
+    from the hook's `source`): always a new process, so this also catches
+    a restart done outside rlord. `resume` doesn't count: Claude Code sends
+    it for an in-process `/resume` too, which may keep the tasks, and a new
+    process is certain only when rlord resumed it. `clear` and `compact`
+    keep the same process too.
 
   Open work is forgotten in only these ways besides a finish or a stop
   call:
@@ -555,7 +559,7 @@ drawn over (`shown_status_matches`).
   file (a skipped long line included) and didn't fail, nothing is opened, and the subagents'
   own files are stat'ed only while some are open. Otherwise it reads what
   was appended since its byte offset: whole lines only, at most 4 MB a
-  tick, and a longer line is skipped unparsed. A cheap substring check
+  session and 16 MB in all per tick (the rest waits for the next), and a longer line is skipped unparsed. A cheap substring check
   picks the lines worth a JSON parse. The first look starts at the last
   4 MB, skipping its first line unless the byte before it is a newline.
   A new inode or a shorter file is read afresh, with the open work

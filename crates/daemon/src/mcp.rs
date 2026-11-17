@@ -354,7 +354,7 @@ fn labels(tasks: &Value) -> Value {
 /// the annotated session `s`): `async_tasks` (how many subagents run
 /// while its turn is over) with `async_labels` (what), and
 /// `async_shells` (`{count, labels}`, information only).
-fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
+pub(crate) fn background_fields(s: &Value) -> Vec<(&'static str, Value)> {
     let mut out = Vec::new();
     if let Some(n) = s["async_tasks"].as_u64() {
         out.push(("async_tasks", json!(n)));

@@ -40,6 +40,9 @@ pub const STALE_MS: i64 = 30 * 60_000;
 const STAT_CAP: usize = 5;
 /// Tasks listed per row.
 const LIST_CAP: usize = 5;
+/// Bytes read per tick across all sessions; the rest waits for the next
+/// tick (first looks at many large transcripts after a daemon start).
+const TICK_BUDGET: u64 = 16 << 20;
 
 /// One live session's transcript as last read.
 #[derive(Default, Clone)]
@@ -109,7 +112,7 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
 /// Bring a tracker up to date: read what was appended and drop the work
 /// launched before the agent was last started again (`started_at`: its
 /// tasks died with the old process). Returns what it shows at `now`.
-fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64) -> Shown {
+fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Shown {
     use std::os::unix::fs::MetadataExt;
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
@@ -123,11 +126,13 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64) -> Shown {
     let stamp = (meta.len(), meta.ino(), main);
     // (Saved only once the whole file is read, a skipped long line
     // included, and the read didn't fail: else read on next tick.)
-    if stamp != s.stamp
-        && s.tracker.advance_with(path, &meta).is_ok()
-        && s.tracker.offset == meta.len()
-    {
-        s.stamp = stamp;
+    if stamp != s.stamp {
+        if let Ok(n) = s.tracker.advance_within(path, &meta, *budget) {
+            *budget = budget.saturating_sub(n);
+            if s.tracker.offset == meta.len() {
+                s.stamp = stamp;
+            }
+        }
     }
     let t = &mut s.tracker;
     // A task with no launch time can't be placed after the start: dropped.
@@ -152,7 +157,7 @@ fn closed_by_hooks(t: &mut Tracker, finished: &[(String, i64)]) {
             .get(id)
             .is_some_and(|task| task.kind == Kind::Agent && *at >= task.started_at)
         {
-            t.open.remove(id);
+            t.close(id);
         }
     }
 }
@@ -202,6 +207,7 @@ fn scan(d: &Daemon) -> Result<()> {
     // Not running (stopped, failed, archived): nothing of theirs runs.
     // (Resumed later, the work found again is older than the resume.)
     seen.retain(|id, _| running.contains(id.as_str()));
+    let mut budget = TICK_BUDGET;
     for (id, path, started_at) in &sources {
         let s = seen.entry(id.clone()).or_default();
         // (A new path, after a `/clear`: the tracker notices the new file
@@ -217,7 +223,7 @@ fn scan(d: &Daemon) -> Result<()> {
                 closed_by_hooks(&mut s.tracker, &done);
             }
         }
-        let sh = refresh(s, Path::new(path), *started_at, now);
+        let sh = refresh(s, Path::new(path), *started_at, now, &mut budget);
         if sh != Shown::default() {
             after.insert(id.clone(), sh);
         }
@@ -266,6 +272,11 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budget with no limit, for one call.
+    fn all() -> u64 {
+        u64::MAX
+    }
     use std::io::Write;
 
     fn tracker(lines: &[Value]) -> Tracker {
@@ -291,21 +302,21 @@ mod tests {
         std::fs::write(&main, format!("{}\n{}\n", agent("a1"), shell("b1"))).unwrap();
         let mut t = Seen::default();
         let now = now_ms();
-        assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
+        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).agent_count, 1);
         // Nothing written for the stale time: the agent and the shell are
         // hidden, back to "your turn".
-        let later = refresh(&mut t, &main, 0, now + STALE_MS);
+        let later = refresh(&mut t, &main, 0, now + STALE_MS, &mut all());
         assert_eq!(later, Shown::default());
         // Not forgotten: shown again once it writes (here: `now` again).
         assert_eq!(t.tracker.open.len(), 2);
-        assert_eq!(refresh(&mut t, &main, 0, now).agent_count, 1);
+        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).agent_count, 1);
         // A late notification still closes it.
         let done = json!({"type": "attachment", "attachment": {"type": "queued_command",
             "commandMode": "task-notification",
             "prompt": "<task-notification><task-id>a1</task-id><status>completed</status></task-notification>"}});
         let mut f = std::fs::File::options().append(true).open(&main).unwrap();
         writeln!(f, "{done}").unwrap();
-        refresh(&mut t, &main, 0, now + STALE_MS);
+        refresh(&mut t, &main, 0, now + STALE_MS, &mut all());
         assert_eq!(t.tracker.open.keys().collect::<Vec<_>>(), ["b1"]);
     }
 
@@ -322,7 +333,7 @@ mod tests {
             rlord_core::agents::transcript::parse_iso_ms("2026-01-01T00:05:00.000Z").unwrap();
         let mut t = Seen::default();
         // (`now` right after: fresh enough by the file's mtime.)
-        let sh = refresh(&mut t, &main, started, now_ms());
+        let sh = refresh(&mut t, &main, started, now_ms(), &mut all());
         assert_eq!(sh.agent_count, 1);
         assert_eq!(t.tracker.open.keys().collect::<Vec<_>>(), ["a2"]);
     }
@@ -345,10 +356,38 @@ mod tests {
         // More than one tick's read: the file is unchanged in between, yet
         // each tick goes on reading until the end.
         for _ in 0..5 {
-            refresh(&mut s, &main, 0, now);
+            refresh(&mut s, &main, 0, now, &mut all());
         }
         assert!(s.tracker.open.is_empty());
         assert_eq!(s.stamp.0, std::fs::metadata(&main).unwrap().len());
+    }
+
+    #[test]
+    fn the_tick_budget_is_shared_and_the_rest_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        let mut f = std::fs::File::create(&main).unwrap();
+        let pad = json!({"type": "assistant", "pad": "x".repeat(1000)});
+        for _ in 0..10 {
+            writeln!(f, "{pad}").unwrap();
+        }
+        writeln!(f, "{}", agent("a1")).unwrap();
+        drop(f);
+        let mut s = Seen::default();
+        let mut budget = 3_000;
+        refresh(&mut s, &main, 0, now_ms(), &mut budget);
+        // Spent, not all read, the stamp not saved.
+        assert!(budget < 1_100);
+        assert!(s.tracker.open.is_empty());
+        assert_eq!(s.stamp, (0, 0, 0));
+        let mut none = 0;
+        refresh(&mut s, &main, 0, now_ms(), &mut none);
+        assert!(s.tracker.open.is_empty());
+        // Later ticks carry on.
+        for _ in 0..10 {
+            refresh(&mut s, &main, 0, now_ms(), &mut 3_000);
+        }
+        assert_eq!(s.tracker.open.len(), 1);
     }
 
     #[test]
@@ -357,8 +396,14 @@ mod tests {
         let main = dir.path().join("s1.jsonl");
         std::fs::write(&main, format!("{}\n", agent("a1"))).unwrap();
         let mut s = Seen::default();
-        assert_eq!(refresh(&mut s, &main, 0, now_ms()).agent_count, 1);
-        assert_eq!(refresh(&mut s, &main, 1, now_ms()), Shown::default());
+        assert_eq!(
+            refresh(&mut s, &main, 0, now_ms(), &mut all()).agent_count,
+            1
+        );
+        assert_eq!(
+            refresh(&mut s, &main, 1, now_ms(), &mut all()),
+            Shown::default()
+        );
     }
 
     #[test]
@@ -372,8 +417,8 @@ mod tests {
         std::fs::create_dir_all(&side).unwrap();
         std::fs::write(side.join("agent-a1.jsonl"), "").unwrap();
         let mut s = Seen::default();
-        refresh(&mut s, &old, 0, now_ms());
-        refresh(&mut s, &new, 0, now_ms());
+        refresh(&mut s, &old, 0, now_ms(), &mut all());
+        refresh(&mut s, &new, 0, now_ms(), &mut all());
         // Both transcripts quiet; the subagent's own file is what's fresh.
         assert!(now_ms() - last_write(0, &s.tracker) < STALE_MS);
     }
@@ -386,9 +431,12 @@ mod tests {
         std::fs::write(&old, format!("{}\n", agent("a1"))).unwrap();
         std::fs::write(&new, "").unwrap();
         let mut t = Seen::default();
-        refresh(&mut t, &old, 0, now_ms());
+        refresh(&mut t, &old, 0, now_ms(), &mut all());
         // Same process (no new start): the open work goes on.
-        assert_eq!(refresh(&mut t, &new, 0, now_ms()).agent_count, 1);
+        assert_eq!(
+            refresh(&mut t, &new, 0, now_ms(), &mut all()).agent_count,
+            1
+        );
     }
 
     #[test]

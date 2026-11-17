@@ -36,6 +36,11 @@ file). PR #68.
   without an error. A task with no launch time is dropped on a restart.
   Each agent keeps the sidechain folder it was launched next to. Lists cap
   at 5 with "+N more". `triage` speaks the same status words.
+- Round 8: a resumed agent gets back its label and files (32 finished
+  agents remembered). Only `SessionStart` `startup` counts as a new process.
+  `resume` does not, since an in-process `/resume` may keep the tasks.
+  Reads share 16 MB a tick across sessions. `rlord show` prints the status
+  sentences.
 - The stale guard (30 min) hides work; it never forgets it. Work is
   forgotten on a stop, or when a new agent process starts (an rlord
   resume, restart or refork event, or a `SessionStart` hook with source
@@ -43,6 +48,10 @@ file). PR #68.
 
 ## Owed
 
+- **Hooks-first redesign.** Take the subagent count from the `subagents`
+  table (the hooks) and read the transcript only for forked skills, shells
+  and labels. Today the transcript is primary and the hooks only close
+  agents they saw finish.
 - **Codex and OpenCode adapters.** `Tracker::advance` is the hook. Neither
   agent has a known background-task record yet.
 - **Needs-you reason.** The popup and details say "blocked on a permission

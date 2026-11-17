@@ -1252,12 +1252,14 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "-".into())
             };
             println!("{} ({})", g("name"), g("id"));
-            println!(
-                "  agent      {} · model {} · {}",
-                g("agent"),
-                g("model"),
-                g("status")
-            );
+            println!("  agent      {} · model {}", g("agent"), g("model"));
+            // The status as the list shows it, every symbol in words.
+            for (i, l) in rlord_tui::statustext::describe(&s, rlord_core::types::now_ms())
+                .iter()
+                .enumerate()
+            {
+                println!("  {:<10} {l}", if i == 0 { "status" } else { "" });
+            }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
             println!("  dir        {}", g("project_path"));
             println!("  created    {}", t("created_at"));

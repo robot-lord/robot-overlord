@@ -25,7 +25,8 @@ mod overlay;
 mod overlord;
 mod record;
 mod setupform;
-mod statustext;
+/// A session's status in words (also `rlord show`).
+pub mod statustext;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -514,6 +515,8 @@ impl App {
         // (A daemon change notice or an action: the overlord's
         // conversations may have changed too.)
         self.convs_stale = true;
+        // Rows may move under the pointer: the popup is checked again.
+        self.hover_stale = true;
         let q = self.query();
         // The selection follows the session, not the row: a re-sort or the
         // overlord rows appearing must not move it to another session.
@@ -888,7 +891,6 @@ impl App {
             }
             if pushed {
                 self.dirty = true;
-                self.hover_stale = true;
             }
             if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
             {
@@ -2470,7 +2472,7 @@ impl App {
         let prompt = match &self.mode {
             Mode::Normal => None,
             Mode::Filter(b) => Some(format!(
-                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working|limited · tag: · proj:)"
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|bg|working|limited · tag: · proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),

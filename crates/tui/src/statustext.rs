@@ -33,7 +33,7 @@ pub fn legend() -> Vec<(String, &'static str)> {
     v.insert(
         3,
         (
-            "◔ bg N".into(),
+            crate::theme::background_short("N"),
             "turn over, N background subagents still running",
         ),
     );
@@ -51,10 +51,7 @@ pub fn legend() -> Vec<(String, &'static str)> {
     v
 }
 
-/// "4m", "2h", "3d": how long ago `at` (ms) was, from `now`.
-pub fn ago(at: i64, now: i64) -> String {
-    rlord_core::timefmt::rel_age_at(at, now)
-}
+use rlord_core::timefmt::rel_age_at;
 
 /// The status itself, as a sentence.
 pub fn status_sentence(s: &Value, now: i64) -> String {
@@ -97,7 +94,7 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             }
         }
         if let Some(t) = oldest {
-            out.push_str(&format!(", started {} ago", ago(t, now)));
+            out.push_str(&format!(", started {} ago", rel_age_at(t, now)));
         }
         out.push_str(". Its turn is over; it goes on when they finish.");
         return out;
@@ -152,7 +149,7 @@ pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
         .filter_map(|t| {
             let label = t["label"].as_str()?;
             Some(match t["started_at"].as_i64().filter(|t| *t > 0) {
-                Some(at) => format!("{label} ({} ago)", ago(at, now)),
+                Some(at) => format!("{label} ({} ago)", rel_age_at(at, now)),
                 None => label.to_string(),
             })
         })
@@ -286,12 +283,5 @@ mod tests {
                 "2 background shells: Dev server, Watch tests (1m ago).",
             ]
         );
-    }
-
-    #[test]
-    fn ages() {
-        assert_eq!(ago(0, 59_000), "59s");
-        assert_eq!(ago(0, 3_600_000), "1h");
-        assert_eq!(ago(10, 0), "0s");
     }
 }

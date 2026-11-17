@@ -1607,9 +1607,11 @@ impl Db {
     /// overlords included, each with its transcript and when its agent
     /// process last started (0: never seen): rlord starting it again (a
     /// `resumed` / `restarted` / `reforked` event), or the agent's own
-    /// `SessionStart` hook for a new process (`start` `startup` or
-    /// `resume`; not `clear` or `compact`), which also catches a restart
-    /// done outside rlord. Cheap: ids, paths and look-ups on
+    /// `SessionStart` hook with `start` `startup`, always a new process,
+    /// which also catches a restart done outside rlord. Not `resume`:
+    /// Claude Code sends it for an in-process `/resume` too, which may keep
+    /// the tasks (a new process is certain only when rlord resumed it);
+    /// not `clear` or `compact`. Cheap: ids, paths and look-ups on
     /// `idx_events_session_kind`.
     pub fn running_transcripts(&self) -> Result<Vec<(String, String, i64)>> {
         let mut st = self.conn.prepare(
@@ -1617,7 +1619,7 @@ impl Db {
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
                               AND (e.kind IN ('resumed', 'restarted', 'reforked') \
                                    OR (e.kind = 'session_start' AND \
-                                       json_extract(e.payload, '$.start') IN ('startup', 'resume')))), 0) \
+                                       json_extract(e.payload, '$.start') = 'startup'))), 0) \
              FROM sessions s JOIN transcripts t ON t.session_id = s.id \
              WHERE s.archived_at IS NULL AND s.status NOT IN ('stopped', 'error')",
         )?;
@@ -2533,10 +2535,18 @@ mod tests {
             "01aaa",
             200,
             "session_start",
+            r#"{"hook":"SessionStart","start":"startup"}"#,
+        )
+        .unwrap();
+        // A compaction, a /clear or an in-process /resume may keep the
+        // same process.
+        db.insert_event(
+            "01aaa",
+            250,
+            "session_start",
             r#"{"hook":"SessionStart","start":"resume"}"#,
         )
         .unwrap();
-        // A compaction or a /clear keeps the same process.
         db.insert_event(
             "01aaa",
             300,

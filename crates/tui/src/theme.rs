@@ -183,9 +183,15 @@ pub fn background_chip(n: u64, full: bool) -> Span<'static> {
             if n == 1 { "" } else { "s" }
         )
     } else {
-        format!("◔ bg {n}")
+        background_short(&n.to_string())
     };
     Span::styled(text, Style::default().fg(accent()))
+}
+
+/// The list's short form of the background-work chip, for count `n`
+/// (`"N"` in the legend).
+pub fn background_short(n: &str) -> String {
+    format!("◔ bg {n}")
 }
 
 /// A stable color per tag, so a group reads the same everywhere.

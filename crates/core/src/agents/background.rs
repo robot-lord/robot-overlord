@@ -39,7 +39,7 @@
 //! one go and keeps usage totals; this one needs a bounded read and its
 //! own state. They share the same reset rule: new inode or shorter file.)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,8 @@ const FINAL: [&str; 4] = ["completed", "failed", "killed", "stopped"];
 
 /// Tool calls whose description is remembered until their result comes.
 const PENDING_CAP: usize = 64;
+/// Finished agents remembered for a `SendMessage` resume (label, files).
+const CLOSED_CAP: usize = 32;
 
 /// What a piece of background work is.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -97,9 +99,12 @@ pub struct Tracker {
     pub ino: u64,
     /// Task/agent ids launched and not yet finished.
     pub open: BTreeMap<String, Task>,
-    /// Tool calls not yet answered: `tool_use_id → description`, for
-    /// the label of a launch (a Bash result doesn't repeat it).
-    pending: HashMap<String, String>,
+    /// Tool calls not yet answered: `(tool_use_id, description)`, oldest
+    /// first, for the label of a launch (a Bash result doesn't repeat it).
+    pending: VecDeque<(String, String)>,
+    /// Agents that finished, oldest first: a resume by `SendMessage` gets
+    /// back their label and files.
+    closed: VecDeque<(String, Task)>,
     /// The bytes at `offset` are the rest of a line not to be parsed (cut
     /// by the first read's start, or over `CHUNK` long).
     skip_line: bool,
@@ -121,15 +126,26 @@ impl Tracker {
     /// `advance` with the file's metadata already in hand (one stat per
     /// tick): nothing is opened when nothing was appended.
     pub fn advance_with(&mut self, path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+        self.advance_within(path, meta, CHUNK).map(|_| ())
+    }
+
+    /// `advance_with` reading at most `budget` bytes (the daemon shares a
+    /// budget between sessions per tick). Returns the bytes read.
+    pub fn advance_within(
+        &mut self,
+        path: &Path,
+        meta: &std::fs::Metadata,
+        budget: u64,
+    ) -> std::io::Result<u64> {
         // Adapter hook: only Claude Code transcripts are read today.
         let (len, ino) = (meta.len(), meta.ino());
         if Format::of(path) != Format::Claude {
             self.open.clear();
             (self.offset, self.ino) = (len, ino);
-            return Ok(());
+            return Ok(0);
         }
         if self.ino == ino && self.offset == len {
-            return Ok(());
+            return Ok(0);
         }
         if self.ino != ino || self.offset > len {
             // Another file (a `/clear` moves the session to a new one, in
@@ -137,9 +153,11 @@ impl Tracker {
             // work carries over. A new process is what ends it (the
             // daemon drops work launched before the agent's last start).
             let open = std::mem::take(&mut self.open);
+            let closed = std::mem::take(&mut self.closed);
             *self = Tracker {
                 ino,
                 open,
+                closed,
                 ..Default::default()
             };
         }
@@ -154,11 +172,12 @@ impl Tracker {
             f.read_exact(&mut b)?;
             self.skip_line = b[0] != b'\n';
         }
-        if self.offset >= len {
-            return Ok(());
+        let limit = budget.min(CHUNK);
+        if self.offset >= len || limit == 0 {
+            return Ok(0);
         }
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut r = BufReader::new(f.take(CHUNK));
+        let mut r = BufReader::new(f.take(limit));
         let mut buf = Vec::new();
         let mut read = 0u64;
         loop {
@@ -178,8 +197,9 @@ impl Tracker {
             if !whole {
                 // A line over `CHUNK` (it filled the whole read): skip it
                 // unparsed. Otherwise it is still being written: wait.
-                if read == 0 && n == CHUNK {
+                if read == 0 && n == CHUNK && limit == CHUNK {
                     self.offset += n;
+                    read += n;
                     self.skip_line = true;
                 }
                 break;
@@ -193,7 +213,7 @@ impl Tracker {
                 }
             }
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Apply one transcript line to the open background work.
@@ -203,23 +223,25 @@ impl Tracker {
         if line["type"] == "attachment" {
             let a = &line["attachment"];
             if a["type"] == "queued_command" && a["commandMode"] == "task-notification" {
-                finish(&mut self.open, &a["prompt"]);
+                for id in finished(&a["prompt"]) {
+                    self.close(&id);
+                }
             }
             return;
         }
         if line["type"] == "assistant" {
             for b in content.as_array().into_iter().flatten() {
                 if b["type"] == "tool_use" {
-                    // (Bounded: answers that never came are forgotten.)
+                    // (Bounded: the oldest unanswered call is forgotten.)
                     if self.pending.len() >= PENDING_CAP {
-                        self.pending.clear();
+                        self.pending.pop_front();
                     }
                     let label = b["input"]["description"]
                         .as_str()
                         .or(b["name"].as_str())
                         .unwrap_or("task");
                     if let Some(id) = b["id"].as_str() {
-                        self.pending.insert(id.to_string(), clip(label, 60));
+                        self.pending.push_back((id.to_string(), clip(label, 60)));
                     }
                 }
             }
@@ -228,12 +250,23 @@ impl Tracker {
         if line["type"] != "user" {
             return;
         }
-        let asked: Option<String> = content
+        let started_at = line["timestamp"]
+            .as_str()
+            .and_then(parse_iso_ms)
+            .unwrap_or(0);
+        // Every answered call leaves `pending`; the launch's label is its.
+        let mut asked = None;
+        for id in content
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|b| b["tool_use_id"].as_str())
-            .find_map(|id| self.pending.remove(id));
+        {
+            if let Some(i) = self.pending.iter().position(|(p, _)| p == id) {
+                let (_, label) = self.pending.remove(i).expect("found above");
+                asked.get_or_insert(label);
+            }
+        }
         let r = &line["toolUseResult"];
         if let Some((id, kind)) = launched(r) {
             let label = r["description"]
@@ -241,10 +274,6 @@ impl Tracker {
                 .map(|d| clip(d, 60))
                 .or(asked)
                 .unwrap_or_else(|| "task".to_string());
-            let started_at = line["timestamp"]
-                .as_str()
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
             let output = r["outputFile"].as_str().map(PathBuf::from);
             self.open.insert(
                 id.to_string(),
@@ -258,26 +287,46 @@ impl Tracker {
             );
         }
         if line["origin"]["kind"] == "task-notification" {
-            finish(&mut self.open, content);
+            for id in finished(content) {
+                self.close(&id);
+            }
         }
         if let Some(id) = stopped(r, content) {
-            self.open.remove(id);
+            self.close(id);
         }
-        // An agent resumed by a message: running again.
+        // An agent resumed by a message: running again, with what it had
+        // when it finished (its label, files) if that is remembered.
         let resumed = r["resumedAgentId"]
             .as_str()
             .or(r["revivedAgentId"].as_str());
         if let Some(id) = resumed.filter(|_| r["success"] == true) {
-            let started_at = line["timestamp"]
-                .as_str()
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
-            let task = self.open.entry(id.to_string()).or_insert_with(|| Task {
-                label: "resumed agent".into(),
-                kind: Kind::Agent,
-                ..Default::default()
+            let before = self
+                .closed
+                .iter()
+                .position(|(c, _)| c == id)
+                .and_then(|i| self.closed.remove(i))
+                .map(|(_, t)| t);
+            let task = self.open.entry(id.to_string()).or_insert_with(|| {
+                before.unwrap_or_else(|| Task {
+                    label: "resumed agent".into(),
+                    kind: Kind::Agent,
+                    ..Default::default()
+                })
             });
             task.started_at = started_at;
+        }
+    }
+
+    /// Close an open task (finished, stopped, or seen finished by the
+    /// hooks). An agent is remembered a while, for a resume.
+    pub fn close(&mut self, id: &str) {
+        if let Some(t) = self.open.remove(id) {
+            if t.kind == Kind::Agent {
+                if self.closed.len() >= CLOSED_CAP {
+                    self.closed.pop_front();
+                }
+                self.closed.push_back((id.to_string(), t));
+            }
         }
     }
 
@@ -287,8 +336,9 @@ impl Tracker {
     }
 }
 
-/// Close the work whose final notification is in `content`.
-fn finish(open: &mut BTreeMap<String, Task>, content: &Value) {
+/// The ids a final notification in `content` says finished.
+fn finished(content: &Value) -> Vec<String> {
+    let mut out = Vec::new();
     let mut texts: Vec<&str> = Vec::new();
     match content {
         Value::String(s) => texts.push(s),
@@ -300,10 +350,11 @@ fn finish(open: &mut BTreeMap<String, Task>, content: &Value) {
     for t in texts {
         for (id, status) in notifications(t) {
             if FINAL.contains(&status) {
-                open.remove(id);
+                out.push(id.to_string());
             }
         }
     }
+    out
 }
 
 /// The id a successful `TaskStop` / `KillShell` result stopped.
@@ -519,6 +570,25 @@ mod tests {
     }
 
     #[test]
+    fn pending_calls_are_bounded_and_answered_ones_leave() {
+        let mut t = Tracker::default();
+        let call = |id: String| {
+            json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": id,
+                "name": "Bash", "input": {"description": "x"}}]}})
+        };
+        for i in 0..PENDING_CAP + 3 {
+            t.feed(&call(format!("t{i}")));
+        }
+        // The oldest went first.
+        assert_eq!(t.pending.len(), PENDING_CAP);
+        assert_eq!(t.pending.front().unwrap().0, "t3");
+        // Any result for a call (not just a launch) drops it.
+        t.feed(&json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t5", "content": "ok"}]}}));
+        assert!(!t.pending.iter().any(|(id, _)| id == "t5"));
+    }
+
+    #[test]
     fn a_shell_is_shell_kind_and_agents_are_agents() {
         let mut t = Tracker::default();
         t.feed(&bash_launch("b1"));
@@ -615,6 +685,29 @@ mod tests {
         }
         assert_eq!(t.open["a1"].kind, Kind::Agent);
         assert_eq!(t.open["a1"].started_at, 5000);
+        // What it had when it finished comes back with it.
+        let mut launch = agent_launch("a1");
+        launch["toolUseResult"]["description"] = json!("Review PR");
+        launch["toolUseResult"]["outputFile"] = json!("/o/a1.output");
+        let mut t = Tracker {
+            side: Some("/s/subagents".into()),
+            ..Default::default()
+        };
+        for l in [launch, note("a1", "completed")] {
+            t.feed(&l);
+        }
+        t.feed(
+            &json!({"type": "user", "toolUseResult": {"success": true, "resumedAgentId": "a1"}}),
+        );
+        assert_eq!(t.open["a1"].label, "Review PR");
+        assert_eq!(
+            t.open["a1"].output.as_deref(),
+            Some(Path::new("/o/a1.output"))
+        );
+        assert_eq!(
+            t.open["a1"].side.as_deref(),
+            Some(Path::new("/s/subagents"))
+        );
         let failed =
             json!({"type": "user", "toolUseResult": {"success": false, "resumedAgentId": "a2"}});
         assert_eq!(count(&[failed]), 0);

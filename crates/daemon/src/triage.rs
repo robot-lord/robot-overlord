@@ -80,10 +80,21 @@ pub fn triage(d: &crate::Daemon, params: &Value) -> Result<Value> {
         crate::set_shown_status(rows);
         for r in rows.iter_mut() {
             r["status"] = crate::mcp::status_word(r);
+            let fields = crate::mcp::background_fields(r);
             if let Some(o) = r.as_object_mut() {
-                for k in ["shown_status", "async_work", "limit"] {
+                for k in [
+                    "shown_status",
+                    "async_tasks",
+                    "async_work",
+                    "async_shells",
+                    "limit",
+                ] {
                     o.remove(k);
                 }
+            }
+            // The same shape as list_sessions and get_session.
+            for (k, v) in fields {
+                r[k] = v;
             }
         }
     }
