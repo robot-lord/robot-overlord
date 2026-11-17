@@ -192,21 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn details_layout_and_popup_place() {
-        use crate::{details_split, hover_rect};
-        use ratatui::layout::Rect;
-        // The details take most of a tall column; the preview keeps 6+.
-        assert_eq!(details_split(40, 12), Some(24));
-        assert_eq!(details_split(20, 12), Some(12));
-        assert_eq!(details_split(12, 12), Some(6));
-        assert_eq!(details_split(9, 12), None);
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(hover_rect(area, 10, 5, 30, 4), Rect::new(12, 6, 30, 4));
-        // Near the right and bottom edges: kept inside, above the pointer.
-        assert_eq!(hover_rect(area, 70, 22, 30, 4), Rect::new(50, 18, 30, 4));
-    }
-
-    #[test]
     fn plain_statuses() {
         let s = json!({"status": "idle"});
         assert_eq!(

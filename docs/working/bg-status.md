@@ -49,7 +49,7 @@ file). PR #68.
 - The stale guard (30 min) hides work; it never forgets it. Work is
   forgotten on a stop, or when a new agent process starts (an rlord
   resume, restart or refork event, or a `SessionStart` hook with source
-  `startup` or `resume`).
+  `startup`; `resume` doesn't count).
 
 ## Owed
 

@@ -1847,7 +1847,9 @@ fn hook_emit_in(
             // `compact`). Only `startup` is sure to be a new process,
             // which ended the old one's background work (`background.rs`;
             // an in-process `/resume` sends `resume` too).
-            if event == "SessionStart" {
+            // (Not replayed from the spool: logged at replay time, it would
+            // date the start late and drop tasks started since.)
+            if event == "SessionStart" && live {
                 if let Some(how) = payload["source"].as_str() {
                     detail["start"] = json!(how);
                 }

@@ -533,7 +533,9 @@ drawn over (`shown_status_matches`).
   stops a session for a moment (`SessionEnd`) in the same process, and its
   tasks go on. `Db::live_transcripts` returns ids, paths, statuses and the
   last start of each agent process, using `idx_events_session_kind`. A start is either:
-  - a `resumed`, `restarted` or `reforked` event, or
+  - a `launched`, `imported`, `forked`, `resumed`, `restarted` or
+    `reforked` event (a fork's copied transcript holds the original's
+    launches, which don't run in it), or
   - a `session_start` hook event whose `start` is `startup` (recorded
     from the hook's `source`): always a new process, so this also catches
     a restart done outside rlord. `resume` doesn't count: Claude Code sends

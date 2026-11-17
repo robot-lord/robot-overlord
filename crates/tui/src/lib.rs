@@ -2795,18 +2795,20 @@ fn details_split(right_h: u16, configured: u16) -> Option<u16> {
     (h >= 4).then_some(h)
 }
 
-/// Where a `w`×`h` popup for the pointer at (`x`, `y`) goes: just below
-/// and right of it, moved back inside `area` (above it when no room below).
+/// Where a `w`×`h` popup for the pointer at (`x`, `y`) goes: above its
+/// row, right of the pointer, so the rows below stay readable; with no
+/// room above, beside the row from its line down, at the right edge.
 fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
-    let x = (x + 2).min(area.right().saturating_sub(w)).max(area.x);
-    let y = if y + 1 + h <= area.bottom() {
-        y + 1
+    if y >= area.y + h {
+        let x = (x + 2).min(area.right().saturating_sub(w)).max(area.x);
+        Rect::new(x, y - h, w, h)
     } else {
-        y.saturating_sub(h).max(area.y)
-    };
-    Rect::new(x, y, w, h)
+        let x = area.right().saturating_sub(w).max(area.x);
+        let y = y.min(area.bottom().saturating_sub(h));
+        Rect::new(x, y, w, h)
+    }
 }
 
 /// A session's status, or in its place that it is stopped on a usage
@@ -3542,6 +3544,22 @@ fn context_legend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_layout_and_popup_place() {
+        // The details take most of a tall column; the preview keeps 6+.
+        assert_eq!(details_split(40, 12), Some(24));
+        assert_eq!(details_split(20, 12), Some(12));
+        assert_eq!(details_split(12, 12), Some(6));
+        assert_eq!(details_split(9, 12), None);
+        let area = Rect::new(0, 0, 80, 24);
+        // Above the row, right of the pointer.
+        assert_eq!(hover_rect(area, 10, 5, 30, 4), Rect::new(12, 1, 30, 4));
+        // Near the right edge: kept inside.
+        assert_eq!(hover_rect(area, 70, 22, 30, 4), Rect::new(50, 18, 30, 4));
+        // No room above: beside the row, at the right edge.
+        assert_eq!(hover_rect(area, 10, 2, 30, 4), Rect::new(50, 2, 30, 4));
+    }
 
     #[test]
     fn key_specs_parse() {

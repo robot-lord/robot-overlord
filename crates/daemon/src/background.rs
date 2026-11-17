@@ -77,6 +77,8 @@ struct Shown {
 pub struct Background {
     /// Read state, touched by the scan only (copied out to read).
     seen: Mutex<HashMap<String, Seen>>,
+    /// Which session the next tick reads first.
+    turn: std::sync::atomic::AtomicUsize,
     /// What the rows show; `annotate` reads only this.
     shown: Mutex<HashMap<String, Shown>>,
 }
@@ -138,7 +140,9 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
     if stamp != s.stamp {
         if let Ok(n) = s.tracker.advance_within(path, &meta, *budget) {
             *budget = budget.saturating_sub(n);
-            if s.tracker.offset == meta.len() {
+            // (All read, or all but a line still being written: that
+            // line's end changes the file, and is read then.)
+            if s.tracker.offset == meta.len() || s.tracker.partial {
                 s.stamp = stamp;
             }
         }
@@ -214,7 +218,14 @@ fn scan(d: &Daemon) -> Result<()> {
     // (Resumed later, the work found again is older than the resume.)
     seen.retain(|id, _| running.contains(id.as_str()));
     let mut budget = TICK_BUDGET;
-    for l in &sources {
+    // Start at a different session each tick: a late one isn't starved of
+    // the budget.
+    let start = d
+        .background
+        .turn
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = sources.len().max(1);
+    for l in sources.iter().cycle().skip(start % n).take(sources.len()) {
         let s = seen.entry(l.id.clone()).or_default();
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
@@ -383,6 +394,34 @@ mod tests {
             refresh(&mut s, &main, 0, now_ms(), &mut 3_000);
         }
         assert_eq!(s.tracker.open.len(), 1);
+    }
+
+    #[test]
+    fn a_partial_last_line_saves_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("s1.jsonl");
+        std::fs::write(&main, format!("{}\n{{\"type\":\"user\"", agent("a1"))).unwrap();
+        let mut s = Seen::default();
+        refresh(&mut s, &main, 0, now_ms(), &mut all());
+        assert_eq!(s.stamp.0, std::fs::metadata(&main).unwrap().len());
+        assert_eq!(s.tracker.open.len(), 1);
+    }
+
+    #[test]
+    fn a_fork_drops_the_launches_it_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("fork.jsonl");
+        let mut copied = agent("a1");
+        copied["timestamp"] = json!("2026-01-01T00:00:00.000Z");
+        std::fs::write(&main, format!("{copied}\n")).unwrap();
+        // Its `forked` event, after the copied launch.
+        let forked =
+            rlord_core::agents::transcript::parse_iso_ms("2026-01-02T00:00:00.000Z").unwrap();
+        let mut s = Seen::default();
+        assert_eq!(
+            refresh(&mut s, &main, forked, now_ms(), &mut all()),
+            Shown::default()
+        );
     }
 
     #[test]

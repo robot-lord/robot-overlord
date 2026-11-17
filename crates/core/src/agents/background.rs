@@ -110,27 +110,28 @@ pub struct Tracker {
     skip_line: bool,
     /// The sidechain folder of the transcript being read, for launches.
     side: Option<PathBuf>,
+    /// When this file was switched to (ms; 0: the first file): launches
+    /// dated before it are old.
+    since: i64,
+    /// The bytes from `offset` to the end are a line still being written.
+    pub partial: bool,
 }
 
 impl Tracker {
     /// Read what was appended to `path` since the last call (bounded by
     /// `CHUNK`). A file that shrank or was
     /// replaced (new inode) is read again from its tail. (Tests; the
-    /// daemon has the metadata already: `advance_with`.)
+    /// daemon has the metadata already: `advance_within`.)
     #[cfg(test)]
     pub fn advance(&mut self, path: &Path) -> std::io::Result<()> {
         let meta = std::fs::metadata(path)?;
-        self.advance_with(path, &meta)
+        self.advance_within(path, &meta, CHUNK).map(|_| ())
     }
 
-    /// `advance` with the file's metadata already in hand (one stat per
-    /// tick): nothing is opened when nothing was appended.
-    pub fn advance_with(&mut self, path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
-        self.advance_within(path, meta, CHUNK).map(|_| ())
-    }
-
-    /// `advance_with` reading at most `budget` bytes (the daemon shares a
-    /// budget between sessions per tick). Returns the bytes read.
+    /// Read what was appended since the last call, at most `budget` bytes
+    /// (and `CHUNK`; the daemon shares a budget between sessions per tick),
+    /// with the file's metadata already in hand: nothing is opened when
+    /// nothing was appended. Returns the bytes read.
     pub fn advance_within(
         &mut self,
         path: &Path,
@@ -152,12 +153,21 @@ impl Tracker {
             // the same process) or a rewrite: read it afresh, but the open
             // work carries over. A new process is what ends it (the
             // daemon drops work launched before the agent's last start).
+            // (Launches dated before the switch belong to that file's past:
+            // an in-process `/resume` to an older conversation. A `/clear`'s
+            // new file has none.)
+            let since = if self.ino != 0 {
+                crate::types::now_ms()
+            } else {
+                0
+            };
             let open = std::mem::take(&mut self.open);
             let closed = std::mem::take(&mut self.closed);
             *self = Tracker {
                 ino,
                 open,
                 closed,
+                since,
                 ..Default::default()
             };
         }
@@ -180,6 +190,7 @@ impl Tracker {
         let mut r = BufReader::new(f.take(limit));
         let mut buf = Vec::new();
         let mut read = 0u64;
+        self.partial = false;
         loop {
             buf.clear();
             let n = r.read_until(b'\n', &mut buf)? as u64;
@@ -197,10 +208,14 @@ impl Tracker {
             if !whole {
                 // A line over `CHUNK` (it filled the whole read): skip it
                 // unparsed. Otherwise it is still being written: wait.
+                // (Partial only if it runs to the end of the file, not to the
+                // end of this read.)
+                self.partial = self.offset + n == len;
                 if read == 0 && n == CHUNK && limit == CHUNK {
                     self.offset += n;
                     read += n;
                     self.skip_line = true;
+                    self.partial = false;
                 }
                 break;
             }
@@ -268,7 +283,8 @@ impl Tracker {
             }
         }
         let r = &line["toolUseResult"];
-        if let Some((id, kind)) = launched(r) {
+        let old = started_at > 0 && started_at < self.since;
+        if let Some((id, kind)) = launched(r).filter(|_| !old) {
             let label = r["description"]
                 .as_str()
                 .map(|d| clip(d, 60))
@@ -776,6 +792,23 @@ mod tests {
         assert_eq!(tail_ids(0), ["b"]);
         // Starts inside it: skipped.
         assert!(tail_ids(1).is_empty());
+    }
+
+    #[test]
+    fn a_switch_to_an_older_file_ignores_its_old_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        std::fs::write(&a, format!("{}\n", agent_launch("a1"))).unwrap();
+        let mut old = agent_launch("old");
+        old["timestamp"] = json!("2020-01-01T00:00:00.000Z");
+        let mut new = agent_launch("new");
+        new["timestamp"] = json!("2099-01-01T00:00:00.000Z");
+        std::fs::write(&b, format!("{old}\n{new}\n")).unwrap();
+        let mut t = Tracker::default();
+        t.advance(&a).unwrap();
+        t.advance(&b).unwrap();
+        assert_eq!(t.open.keys().collect::<Vec<_>>(), ["a1", "new"]);
     }
 
     #[test]

@@ -1620,8 +1620,10 @@ impl Db {
     /// Live (unarchived) sessions with a transcript, the overlords included:
     /// whether they are stopped or failed and since when (the caller allows
     /// a grace: a `/clear` stops a session for a moment), and when its agent
-    /// process last started (0: never seen): rlord starting it again (a
-    /// `resumed` / `restarted` / `reforked` event), or the agent's own
+    /// process last started (0: never seen): rlord starting it (a `launched` /
+    /// `imported` / `forked` / `resumed` / `restarted` / `reforked` event;
+    /// a fork's copied transcript holds the original's launches, which
+    /// don't run in it), or the agent's own
     /// `SessionStart` hook with `start` `startup`, always a new process,
     /// which also catches a restart done outside rlord. Not `resume`:
     /// Claude Code sends it for an in-process `/resume` too, which may keep
@@ -1632,7 +1634,8 @@ impl Db {
         let mut st = self.conn.prepare(
             "SELECT s.id, t.source_path, \
                     COALESCE((SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.id \
-                              AND (e.kind IN ('resumed', 'restarted', 'reforked') \
+                              AND (e.kind IN ('launched', 'imported', 'forked', 'resumed', \
+                                                'restarted', 'reforked') \
                                    OR (e.kind = 'session_start' AND \
                                        json_extract(e.payload, '$.start') = 'startup'))), 0) \
              , s.status IN ('stopped', 'error'), COALESCE(s.last_state_change_at, 0) \
@@ -2568,5 +2571,8 @@ mod tests {
         assert_eq!(db.live_transcripts().unwrap()[0].started_at, 200);
         db.insert_event("01aaa", 500, "reforked", "{}").unwrap();
         assert_eq!(db.live_transcripts().unwrap()[0].started_at, 500);
+        // A fork starts a process of its own.
+        db.insert_event("01aaa", 600, "forked", "{}").unwrap();
+        assert_eq!(db.live_transcripts().unwrap()[0].started_at, 600);
     }
 }

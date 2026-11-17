@@ -424,9 +424,6 @@ fn summarize(s: &Value) -> Value {
     let ts = |k: &str| s[k].as_i64().map(|t| rel_age(Some(t)));
     let mut row = json!({
         "id": s["id"], "name": s["name"],
-        // As people see it: working, needs you, your turn, stopped,
-        // background, limited.
-
         "agent": s["agent"], "model": s["model"],
         "repo": s["repo_path"], "dir": s["project_path"], "branch": s["branch"],
         "tags": s["tags"], "description": s["description"],
