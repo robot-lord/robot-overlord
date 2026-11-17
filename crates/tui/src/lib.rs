@@ -25,6 +25,8 @@ mod overlay;
 mod overlord;
 mod record;
 mod setupform;
+/// A session's status in words (also `rlord show`).
+pub mod statustext;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -320,6 +322,15 @@ struct App {
     /// The last event was pointer motion that changed nothing: no need to
     /// draw again for it (motion arrives in floods).
     idle_motion: bool,
+    /// The session whose list row is under the pointer (by id), and where
+    /// the pointer is: its status in words shows in a popup there
+    /// (`statustext`). Cleared by anything but pointer motion (a key, the
+    /// wheel, a click, focus loss) and by a list refresh, which can move
+    /// rows under a pointer that stays put.
+    hover_row: Option<(String, u16, u16)>,
+    /// The list was refreshed since the pointer last moved: drop the
+    /// popup if its session is no longer the row under the pointer.
+    hover_stale: bool,
     /// Preview: lines scrolled up from the bottom (0: following the end),
     /// how far it can go (set when drawn), and the text's length when last
     /// loaded (so new output doesn't move a scrolled view).
@@ -387,6 +398,8 @@ impl App {
             hits: Default::default(),
             last_click: None,
             idle_motion: false,
+            hover_row: None,
+            hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
             preview_len: 0,
@@ -502,6 +515,8 @@ impl App {
         // (A daemon change notice or an action: the overlord's
         // conversations may have changed too.)
         self.convs_stale = true;
+        // Rows may move under the pointer: the popup is checked again.
+        self.hover_stale = true;
         let q = self.query();
         // The selection follows the session, not the row: a re-sort or the
         // overlord rows appearing must not move it to another session.
@@ -833,6 +848,17 @@ impl App {
             // (Pointer motion that changed nothing: the screen is as drawn.)
             if refreshed || !std::mem::take(&mut self.idle_motion) {
                 terminal.draw(|f| self.draw(f))?;
+                // Refreshed under a pointer that stayed put: keep the popup
+                // only if its session is still the row there (the hit
+                // map is the one just drawn).
+                if std::mem::take(&mut self.hover_stale) {
+                    let keep = self.hover_row.as_ref().is_some_and(|(id, x, y)| {
+                        hover_still_there(self.hits.under_popup(*x, *y), &self.sessions, id)
+                    });
+                    if !keep && self.hover_row.take().is_some() {
+                        terminal.draw(|f| self.draw(f))?;
+                    }
+                }
             }
 
             let mut tick = Duration::from_millis(self.config.preview_refresh_ms.clamp(50, 250));
@@ -840,7 +866,11 @@ impl App {
                 tick = tick.min(due.saturating_duration_since(Instant::now()));
             }
             if event::poll(tick)? {
-                let quit = match event::read()? {
+                let ev = event::read()?;
+                if !matches!(&ev, Event::Mouse(m) if m.kind == event::MouseEventKind::Moved) {
+                    self.hover_row = None;
+                }
+                let quit = match ev {
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
                         self.handle_key(k, terminal)?
                     }
@@ -1505,17 +1535,21 @@ impl App {
             Tab::Groups => self.draw_groups(f, list_area),
         }
         if let Some(right) = right {
-            let details_h = self.config.details_height.clamp(4, 20);
-            if right.height >= details_h + 6 {
-                let [p, d] = RLayout::vertical([Constraint::Min(4), Constraint::Length(details_h)])
-                    .areas(right);
-                self.draw_preview(f, p);
-                self.draw_details(f, d);
-            } else {
-                self.draw_preview(f, right);
+            match details_split(right.height, self.config.details_height) {
+                Some(details_h) => {
+                    let [p, d] =
+                        RLayout::vertical([Constraint::Min(4), Constraint::Length(details_h)])
+                            .areas(right);
+                    self.draw_preview(f, p);
+                    self.draw_details(f, d);
+                }
+                None => self.draw_preview(f, right),
             }
         }
         self.draw_footer(f, footer_area);
+        if matches!(self.mode, Mode::Normal) {
+            self.draw_hover(f);
+        }
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
@@ -1531,6 +1565,46 @@ impl App {
             Mode::Confirm(c) => self.draw_confirm(f, c),
             _ => {}
         }
+    }
+
+    /// The popup over the list row under the pointer: its status, and every
+    /// symbol on the row, in words.
+    fn draw_hover(&self, f: &mut Frame) {
+        let Some((id, x, y)) = &self.hover_row else {
+            return;
+        };
+        let (x, y) = (*x, *y);
+        let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
+            return;
+        };
+        let lines = statustext::describe(s, rlord_core::types::now_ms());
+        let area = f.area();
+        // (Border and padding: 2 columns a side; wide characters count
+        // two.)
+        let w = lines
+            .iter()
+            .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
+            .max()
+            .unwrap_or(10)
+            .min(64)
+            .min(area.width);
+        let inner = usize::from(w.saturating_sub(4));
+        let rows: u16 = lines
+            .iter()
+            .map(|l| theme::wrapped_rows(l, inner) as u16)
+            .sum();
+        let text: Vec<Line> = lines
+            .into_iter()
+            .map(|l| Line::styled(l, Style::default().fg(theme::text())))
+            .collect();
+        let p = Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(theme::panel(theme::title("status"), false));
+        let h = (rows + 2).min(area.height);
+        let r = hover_rect(area, x, y, w, h);
+        f.render_widget(ratatui::widgets::Clear, r);
+        f.render_widget(p, r);
+        self.hits.add(r, mouse::Hit::Popup);
     }
 
     fn draw_list(&mut self, f: &mut Frame, area: Rect) {
@@ -2034,6 +2108,18 @@ impl App {
                     Style::default().fg(theme::yellow()),
                 ))
             },
+        ];
+        // Every symbol on its row, in words.
+        for (n, l) in statustext::describe(s, rlord_core::types::now_ms())
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::from(vec![
+                key(if n == 0 { "status" } else { "" }),
+                Span::styled(l, theme::muted()),
+            ]));
+        }
+        lines.extend([
             Line::raw(""),
             Line::from({
                 let mut v = vec![key("groups")];
@@ -2097,7 +2183,7 @@ impl App {
                 key("usage"),
                 Span::styled(usage_details(&s["usage"]), theme::muted()),
             ]),
-        ];
+        ]);
         // Lineage: what it was forked from, and its forks in the list.
         if s["forked_from"].is_string() {
             lines.push(Line::from(vec![
@@ -2387,7 +2473,7 @@ impl App {
         let prompt = match &self.mode {
             Mode::Normal => None,
             Mode::Filter(b) => Some(format!(
-                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|working|limited · tag: · proj:)"
+                "search: {b}▏   (enter: jump · tab: keep filter · esc: clear · status:needs|turn|bg|working|limited · tag: · proj:)"
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),
@@ -2694,14 +2780,62 @@ fn usage_details(u: &Value) -> String {
     )
 }
 
+/// The status a row shows (the daemon's `shown_status`; the stored one for
+/// a row without it).
+fn shown(s: &Value) -> &str {
+    s["shown_status"]
+        .as_str()
+        .or(s["status"].as_str())
+        .unwrap_or("-")
+}
+
+/// Whether the hovered session `id` is still the list row `hit` (what is
+/// under the pointer now).
+fn hover_still_there(hit: Option<mouse::Hit>, sessions: &[Value], id: &str) -> bool {
+    matches!(hit, Some(mouse::Hit::Row(i)) if sessions.get(i).is_some_and(|s| s["id"] == id))
+}
+
+/// The details panel's height under the preview, in a right column
+/// `right_h` rows tall: the larger of the configured height and three
+/// fifths of the column (the preview is a quick glance), leaving the
+/// preview at least 6 rows. None: too short for both.
+fn details_split(right_h: u16, configured: u16) -> Option<u16> {
+    let want = configured.clamp(4, 40).max(right_h * 3 / 5);
+    let h = want.min(right_h.saturating_sub(6));
+    (h >= 4).then_some(h)
+}
+
+/// Where a `w`×`h` popup for the pointer at (`x`, `y`) goes: above its
+/// row, right of the pointer, so the rows below stay readable; with no
+/// room above, beside the row from its line down, at the right edge.
+fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    if y >= area.y + h {
+        let x = (x + 2).min(area.right().saturating_sub(w)).max(area.x);
+        Rect::new(x, y - h, w, h)
+    } else {
+        let x = area.right().saturating_sub(w).max(area.x);
+        let y = y.min(area.bottom().saturating_sub(h));
+        Rect::new(x, y, w, h)
+    }
+}
+
 /// A session's status, or in its place that it is stopped on a usage
 /// limit and until when (`limit`, from the daemon's `limits`). `full`:
 /// in words (the details pane); otherwise what fits the list's column.
-/// `↻`: a resume is scheduled for when it resets.
+/// `↻`: a resume is scheduled for when it resets. Its turn over while
+/// subagents it started still run (`async_tasks`, from the daemon's
+/// `background`): that, in place of "your turn".
 fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
-    let Some(until) = l["until"].as_str() else {
-        return theme::status_chip(s["status"].as_str().unwrap_or("-"));
+    let until = match shown(s) {
+        "limited" => l["until"].as_str().unwrap_or("?"),
+        "background" => {
+            let n = s["async_tasks"].as_u64().unwrap_or(0);
+            return theme::background_chip(n, full);
+        }
+        st => return theme::status_chip(st),
     };
     let resume = if l["resume"] == true { " ↻" } else { "" };
     // Its reset time passed: held a minute more.
@@ -3421,6 +3555,22 @@ fn context_legend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_layout_and_popup_place() {
+        // The details take most of a tall column; the preview keeps 6+.
+        assert_eq!(details_split(40, 12), Some(24));
+        assert_eq!(details_split(20, 12), Some(12));
+        assert_eq!(details_split(12, 12), Some(6));
+        assert_eq!(details_split(9, 12), None);
+        let area = Rect::new(0, 0, 80, 24);
+        // Above the row, right of the pointer.
+        assert_eq!(hover_rect(area, 10, 5, 30, 4), Rect::new(12, 1, 30, 4));
+        // Near the right edge: kept inside.
+        assert_eq!(hover_rect(area, 70, 22, 30, 4), Rect::new(50, 18, 30, 4));
+        // No room above: beside the row, at the right edge.
+        assert_eq!(hover_rect(area, 10, 2, 30, 4), Rect::new(50, 2, 30, 4));
+    }
 
     #[test]
     fn key_specs_parse() {

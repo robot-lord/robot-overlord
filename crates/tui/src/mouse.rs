@@ -50,6 +50,9 @@ pub(crate) enum Hit {
     Pick(usize),
     /// A modal's body, and everything around it.
     Inside,
+    /// The hover popup over the list: covers the rows under it (a click
+    /// there does nothing; the pointer on it keeps it open).
+    Popup,
     Outside,
 }
 
@@ -126,6 +129,18 @@ impl Hits {
             }
             self.spans(x, y.saturating_add(i as u16), parts);
         }
+    }
+
+    /// Forget the hover popup's area (closed: what it covered is hit).
+    pub(crate) fn drop_popup(&self) {
+        self.0
+            .borrow_mut()
+            .retain(|(_, h)| !matches!(h, Hit::Popup));
+    }
+
+    /// The topmost region under the pointer, the hover popup left out.
+    pub(crate) fn under_popup(&self, x: u16, y: u16) -> Option<Hit> {
+        hit_at(&self.0.borrow(), x, y, |h| !matches!(h, Hit::Popup)).cloned()
     }
 
     /// The topmost region under the pointer.
@@ -279,8 +294,12 @@ impl App {
             return Ok(false);
         }
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, false, terminal),
-            MouseEventKind::Down(MouseButton::Right) => self.click(m.column, m.row, true, terminal),
+            MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
+                // The popup goes, and the click lands on what it covered.
+                self.hover_row = None;
+                self.hits.drop_popup();
+                self.click(m.column, m.row, button == MouseButton::Right, terminal)
+            }
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, true, terminal),
             MouseEventKind::ScrollDown => self.wheel(m.column, m.row, false, terminal),
             MouseEventKind::Moved => {
@@ -297,6 +316,24 @@ impl App {
     /// their selection, like the launcher, don't follow: the rows would
     /// move under the pointer.)
     pub(crate) fn hover(&mut self, x: u16, y: u16) -> bool {
+        // Over a session row in the list: its status in words, in a popup.
+        let row = match (&self.mode, self.hits.at(x, y)) {
+            // On the popup itself: it stays.
+            (Mode::Normal, Some(Hit::Popup)) => return false,
+            (Mode::Normal, Some(Hit::Row(i))) => self
+                .sessions
+                .get(i)
+                .and_then(|s| s["id"].as_str())
+                .map(|id| (id.to_string(), x, y)),
+            _ => None,
+        };
+        // Keyed on the row's session: placed once when it opens on a row, and
+        // left there while the pointer moves within it (motion arrives in
+        // floods; no redraw for those).
+        if row.as_ref().map(|r| &r.0) != self.hover_row.as_ref().map(|r| &r.0) {
+            self.hover_row = row;
+            return true;
+        }
         match (&mut self.mode, self.hits.at(x, y)) {
             (Mode::Menu(m), Some(Hit::Pick(i))) if i < m.items.len() && m.sel != i => {
                 m.sel = i;
@@ -1776,6 +1813,7 @@ mod tests {
         // A limited session: resume it, unless that is already scheduled.
         app.mode = Mode::Normal;
         app.sessions[1]["limit"] = json!({"until": "3:00pm", "resume": false});
+        app.sessions[1]["shown_status"] = json!("limited");
         app.table.select(Some(1));
         app.open_menu(30, 8, false);
         assert_eq!(
