@@ -409,14 +409,36 @@ enum Command {
     Mcp {
         /// Serve every tool (sending to sessions, stopping, renaming, UI
         /// control). Only rlord's overlord config passes it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "session")]
         overlord: bool,
+        /// A session's own read-only look-ups (server `rlord_session`),
+        /// bound to the session whose token `--token-file` holds. rlord
+        /// wires it into the sessions it starts.
+        #[arg(long, requires = "token_file")]
+        session: bool,
+        /// The session's token file (with `--session`).
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
         /// The daemon's socket, as the daemon resolved it. The overlord's
         /// MCP config always passes it: an agent may start this server with
         /// another environment (OpenCode's shared server), where the XDG
         /// dirs would name another socket. Given, no daemon is autostarted.
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+    },
+    /// A session's own read-only look-ups, for its agent: `rlord context
+    /// help` lists them; `rlord context <tool> key=value…` calls one.
+    Context {
+        /// The session's token file (default: $RLORD_SESSION_TOKEN_FILE)
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+        /// The daemon's socket
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// `help`, or a tool name
+        tool: String,
+        /// The tool's arguments, as key=value
+        args: Vec<String>,
     },
     /// The overlord overlay itself (runs inside the tmux popup)
     #[command(hide = true)]
@@ -619,7 +641,25 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Mcp { overlord, socket } => mcp_stdio(overlord, socket),
+        Command::Mcp {
+            overlord,
+            session,
+            token_file,
+            socket,
+        } => {
+            let mode = match (session, token_file) {
+                (true, Some(t)) => McpMode::Session(t),
+                _ if overlord => McpMode::Overlord,
+                _ => McpMode::ReadOnly,
+            };
+            mcp_stdio(mode, socket)
+        }
+        Command::Context {
+            token_file,
+            socket,
+            tool,
+            args,
+        } => context_cli(token_file, socket, &tool, &args),
         Command::Update {
             tag,
             force,
@@ -2359,8 +2399,17 @@ fn restart_daemon() -> Result<()> {
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
 /// Without `overlord` it is read-only (the daemon serves and accepts only
 /// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
-fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
+fn mcp_stdio(mode: McpMode, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
+    let overlord = matches!(mode, McpMode::Overlord);
+    let scoped = matches!(mode, McpMode::Session(_));
+    // A session's own tools: by its token, read fresh from its file on
+    // each call (never the token on argv).
+    let token = |p: &std::path::Path| {
+        std::fs::read_to_string(p)
+            .map(|t| t.trim().to_string())
+            .with_context(|| format!("reading the session token {}", p.display()))
+    };
     let caller = std::env::var("RLORD_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty());
@@ -2390,23 +2439,40 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "rlord", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": if overlord {
+                "serverInfo": {"name": if scoped { "rlord_session" } else { "rlord" },
+                               "version": env!("CARGO_PKG_VERSION")},
+                "instructions": if scoped {
+                    "This session's own rlord look-ups (read-only): its brief, related sessions, and their history."
+                } else if overlord {
                     "Robot Overlord control surface: inspect agent sessions and drive the rlord UI (navigate, set the list view, propose or create sessions)."
                 } else {
                     "Robot Overlord look-ups (read-only): list rlord's agent sessions, read their screens, search and read their history."
                 },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
-                .map(|t| json!({"tools": t}))
-                .map_err(|e| (-32603, format!("{e:#}"))),
+            "tools/list" => match &mode {
+                McpMode::Session(p) => {
+                    token(p).and_then(|t| call("sctx.tools", json!({"token": t})))
+                }
+                _ => call("mcp.tools", json!({"overlord": overlord})),
+            }
+            .map(|t| json!({"tools": t}))
+            .map_err(|e| (-32603, format!("{e:#}"))),
             "tools/call" => {
-                let r = call(
-                    "mcp.call",
-                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
-                           "caller": caller, "overlord": overlord}),
-                );
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                let r = match &mode {
+                    McpMode::Session(p) => token(p).and_then(|t| {
+                        call(
+                            "sctx.call",
+                            json!({"token": t, "name": params["name"], "arguments": arguments}),
+                        )
+                    }),
+                    _ => call(
+                        "mcp.call",
+                        json!({"name": params["name"], "arguments": arguments,
+                               "caller": caller, "overlord": overlord}),
+                    ),
+                };
                 Ok(match r {
                     Ok(v) => json!({"content": [{"type": "text",
                         "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
@@ -2426,6 +2492,114 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         out.flush()?;
     }
     Ok(())
+}
+
+/// Which tools `rlord mcp` serves.
+enum McpMode {
+    /// Every tool (`--overlord`).
+    Overlord,
+    /// `mcp::READ_ONLY_TOOLS`.
+    ReadOnly,
+    /// A session's own look-ups (`--session --token-file`).
+    Session(std::path::PathBuf),
+}
+
+/// `rlord context`: a session's own look-ups from its shell. Never starts
+/// a daemon.
+fn context_cli(
+    token_file: Option<std::path::PathBuf>,
+    socket: Option<std::path::PathBuf>,
+    tool: &str,
+    args: &[String],
+) -> Result<()> {
+    let file = token_file
+        .or_else(|| {
+            std::env::var_os("RLORD_SESSION_TOKEN_FILE")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .context(
+            "no session token: pass --token-file (rlord sets RLORD_SESSION_TOKEN_FILE in its sessions)",
+        )?;
+    let token = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading {}", file.display()))?
+        .trim()
+        .to_string();
+    let socket = socket.unwrap_or_else(paths::socket_path);
+    if matches!(tool, "help" | "--help" | "-h") {
+        let tools = client_call(&socket, "sctx.tools", json!({"token": token}))?;
+        print!("{}", context_help(&tools));
+        return Ok(());
+    }
+    let r = client_call(
+        &socket,
+        "sctx.call",
+        json!({"token": token, "name": tool, "arguments": context_args(args)?}),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `key=value` pairs as a tool's arguments (whole numbers as numbers).
+fn context_args(args: &[String]) -> Result<Value> {
+    let mut m = serde_json::Map::new();
+    for a in args {
+        let (k, v) = a
+            .split_once('=')
+            .with_context(|| format!("'{a}': arguments are key=value"))?;
+        let v = match v.parse::<u64>() {
+            Ok(n) => json!(n),
+            Err(_) => json!(v),
+        };
+        m.insert(k.trim().to_string(), v);
+    }
+    Ok(Value::Object(m))
+}
+
+/// The tool list as `rlord context help` prints it.
+fn context_help(tools: &Value) -> String {
+    let mut out = String::from(
+        "rlord context <tool> [key=value ...]  (read-only look-ups for this session)\n\n",
+    );
+    for t in tools.as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "{}: {}\n",
+            t["name"].as_str().unwrap_or(""),
+            t["description"].as_str().unwrap_or("")
+        ));
+        for (k, v) in t["inputSchema"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!(
+                "  {k}=...  {}\n",
+                v["description"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod context_cli_tests {
+    use super::*;
+
+    #[test]
+    fn context_arguments_parse() {
+        let v = context_args(&["session=web".into(), "limit=3".into()]).unwrap();
+        assert_eq!(v, json!({"session": "web", "limit": 3}));
+        assert!(context_args(&["oops".into()]).is_err());
+    }
+
+    #[test]
+    fn context_help_lists_tools_and_arguments() {
+        let t = json!([{"name": "read_history", "description": "Read it.",
+                        "inputSchema": {"properties": {"session": {"description": "Which"}}}}]);
+        let h = context_help(&t);
+        assert!(h.contains("read_history: Read it."), "{h}");
+        assert!(h.contains("  session=...  Which"), "{h}");
+    }
 }
 
 /// `nav next|prev`: move to the neighbouring live session in list order.

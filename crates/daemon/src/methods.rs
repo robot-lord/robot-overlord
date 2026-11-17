@@ -558,6 +558,15 @@ fn pane_env(
     let mut env = Vec::new();
     if !daemon {
         env.push(("RLORD_SESSION_ID".to_string(), session_id.to_string()));
+        // Where its look-up token is (`rlord context`): a path, never the
+        // token itself.
+        let token = crate::session_tools::token_path(&paths::data_dir(), session_id);
+        if token.is_file() {
+            env.push((
+                crate::session_tools::TOKEN_ENV.to_string(),
+                token.to_string_lossy().into_owned(),
+            ));
+        }
     }
     let path = std::env::var("PATH").unwrap_or_default();
     env.extend(path_with(program, &path).map(|p| ("PATH".to_string(), p)));
@@ -822,8 +831,11 @@ pub(crate) fn session_new_with(
     // Its file first (the agent may read it at once). Best effort: a
     // file that can't be written never stops the launch; the launch then
     // carries no flag or pointer naming it.
+    // Its own read-only look-ups, computed at every start and never
+    // stored (the token first: its background names it).
+    let own_tools = crate::session_tools::wiring(db, &base, &id, agent, &role, daemon);
     let file_ok = delivery.is_some() && {
-        let text = context::launch_file_text_rows(db, &name, &[], &rows, now_ms());
+        let text = context::launch_file_text_rows(db, &id, &name, &[], &rows, now_ms());
         match context::write_file(&base, &id, &text) {
             Ok(_) => true,
             Err(e) => {
@@ -834,6 +846,7 @@ pub(crate) fn session_new_with(
     };
     let carried = delivery.filter(|d| file_ok || *d == context::Delivery::Hook);
     let mut args = spec_args(agent, &spec);
+    args.extend(own_tools);
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
@@ -1228,6 +1241,17 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // without it the start carries no flag or pointer naming it.
     let base = paths::data_dir();
     let bg_file = context::file_path(&base, &s.id);
+    // With its own read-only look-ups, computed at every start (the token
+    // first: its background names it).
+    let mut own_args = spec_args(agent, &spec);
+    own_args.extend(crate::session_tools::wiring(
+        db,
+        &base,
+        &s.id,
+        agent,
+        &s.role,
+        s.codex_daemon,
+    ));
     let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
         Ok(f) => f.is_some(),
         Err(e) => {
@@ -1240,13 +1264,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // them).
     let (mut argv, resumed) = match &refork {
         Some(parent) => (
-            crate::fork::refork_argv(
-                agent,
-                &s,
-                parent,
-                model.as_deref(),
-                &spec_args(agent, &spec),
-            )?,
+            crate::fork::refork_argv(agent, &s, parent, model.as_deref(), &own_args)?,
             false,
         ),
         None => agent.resume(
@@ -1254,7 +1272,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             &s.agent_session_trust,
             &s.project_path,
             model.as_deref(),
-            &spec_args(agent, &spec),
+            &own_args,
         )?,
     };
     let mut mode = context::mode(db, &s.id)?;
@@ -1548,6 +1566,11 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
     db.set_archived(&s.id, Some(now))?;
+    // Its look-ups stop answering (a start after unarchiving makes a new
+    // token).
+    if let Err(e) = crate::session_tools::revoke(db, &paths::data_dir(), &s.id) {
+        tracing::warn!(session = %s.id, error = %e, "removing the session's token");
+    }
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "archived", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);

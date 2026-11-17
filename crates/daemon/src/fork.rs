@@ -714,7 +714,9 @@ pub(crate) fn finish(
     // A fork always has background: at least its note and link.
     let mode = context::delivery(agent, made.hooks);
     let bg_file = context::file_path(base, id);
-    let text = context::launch_file_text_rows(db, &name, &copied, &add, now);
+    // Its own look-ups (the token first: its background names it).
+    let own_tools = crate::session_tools::wiring(db, base, id, agent, "", false);
+    let text = context::launch_file_text_rows(db, id, &name, &copied, &add, now);
     let carried = match context::write_file(base, id, &text) {
         Ok(_) => Some(mode),
         Err(e) => {
@@ -724,6 +726,7 @@ pub(crate) fn finish(
     };
     let spec = spec_of(want);
     let mut args = spec_args(agent, &spec);
+    args.extend(own_tools);
     args.extend(context::launch_args(carried, &bg_file));
     let first = context::launch_prompt(want.prompt.as_deref(), carried, &bg_file);
     let launch = launch(want, made, &project, first.as_deref(), &args)?;
@@ -1382,7 +1385,7 @@ mod tests {
             .filter(|r| !except.contains(&r.id))
             .cloned()
             .collect();
-        let text = context::launch_file_text_rows(&db, "n-p-fork", &copied, &add, 50);
+        let text = context::launch_file_text_rows(&db, "01F", "n-p-fork", &copied, &add, 50);
         assert!(!text.contains("\"g\""), "{text}");
         assert!(text.contains("Forked from session"), "{text}");
         assert!(text.contains("use the staging DB"), "{text}");
@@ -1456,7 +1459,7 @@ mod tests {
             .chain(add.iter().map(|r| (r.kind.to_string(), r.body.clone())))
             .collect();
         assert_eq!(stored, shown);
-        let text = context::launch_file_text_rows(&db, "f", &copied, &add, 50);
+        let text = context::launch_file_text_rows(&db, "01F", "f", &copied, &add, 50);
         assert_eq!(text.matches("use the staging DB").count(), 1, "{text}");
     }
 

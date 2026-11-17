@@ -331,7 +331,7 @@ pub fn render(
     file: Option<&Path>,
     budget: usize,
 ) -> String {
-    render_as(name, true, rows, related, file, budget)
+    render_as(name, true, rows, related, file, budget, None)
 }
 
 /// `render`; `worker`: the session is one the overlord launched (the
@@ -343,12 +343,24 @@ pub fn render_as(
     related: &[Related],
     file: Option<&Path>,
     budget: usize,
+    lookup: Option<&str>,
 ) -> String {
     let mut header = HEADER.replace("{name}", &one_line(name, 80));
     if worker {
         header.push_str(WORKER);
     }
-    compose(header, rows, related, file, budget)
+    // How to look more up (`session_tools::lookup_section`) goes last; its
+    // room is kept first.
+    let tail = lookup.unwrap_or("");
+    let mut out = compose(
+        header,
+        rows,
+        related,
+        file,
+        budget.saturating_sub(tail.chars().count()),
+    );
+    out.push_str(tail);
+    out
 }
 
 /// Whether the overlord launched session `id` with its background (kv
@@ -735,12 +747,13 @@ fn related_of(db: &Db, rows: &[ContextRow]) -> Vec<Related> {
 /// be stored at `at`. Launched by the overlord: the worker header.
 pub fn launch_file_text(
     db: &Db,
+    id: &str,
     name: &str,
     notes: &[String],
     links: &[String],
     at: i64,
 ) -> String {
-    launch_file_text_rows(db, name, &[], &rows_from(notes, links, "overlord"), at)
+    launch_file_text_rows(db, id, name, &[], &rows_from(notes, links, "overlord"), at)
 }
 
 /// Of `rows`, those a new session's `store_rows` will store after
@@ -766,6 +779,7 @@ pub fn kept_rows<'a>(
 /// stored (`kept_rows`).
 pub fn launch_file_text_rows(
     db: &Db,
+    id: &str,
     name: &str,
     copied: &[ContextRow],
     rows: &[NewRow],
@@ -788,7 +802,16 @@ pub fn launch_file_text_rows(
             ..r
         })
         .collect();
-    render_as(name, true, &rows, &related_of(db, &rows), None, FILE_BUDGET)
+    let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), id);
+    render_as(
+        name,
+        true,
+        &rows,
+        &related_of(db, &rows),
+        None,
+        FILE_BUDGET,
+        lookup.as_deref(),
+    )
 }
 
 /// The session's whole background for its file; None when it has none.
@@ -821,6 +844,7 @@ pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result
             row.seen_at = None;
         }
     }
+    let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), &s.id);
     Ok(Some(render_as(
         &s.name,
         launched_with_it(db, &s.id)?,
@@ -828,6 +852,7 @@ pub fn file_text_with(db: &Db, s: &Session, renewed: Option<&Renewed>) -> Result
         &related_of(db, &rows),
         None,
         FILE_BUDGET,
+        lookup.as_deref(),
     )))
 }
 
@@ -1018,7 +1043,16 @@ pub fn hook_reply_from(
     let file = Some(file).filter(|f| f.is_file());
     let text = if full {
         let worker = launched_with_it(db, &s.id)?;
-        render_as(&s.name, worker, &rows, &related, file, budget)
+        let lookup = crate::session_tools::lookup_section(&rlord_core::paths::data_dir(), &s.id);
+        render_as(
+            &s.name,
+            worker,
+            &rows,
+            &related,
+            file,
+            budget,
+            lookup.as_deref(),
+        )
     } else {
         render_update(&rows, &related, file, budget)
     };
@@ -1725,7 +1759,7 @@ mod tests {
         session(&db, "b", "beta", "");
         let notes = vec!["use staging".to_string()];
         let links = vec!["b".to_string()];
-        let before = launch_file_text(&db, "alpha", &notes, &links, 60_000);
+        let before = launch_file_text(&db, "01X", "alpha", &notes, &links, 60_000);
         turn_on(&db, "a").unwrap();
         store(&db, "a", &notes, &links, 60_000).unwrap();
         let s = db.resolve_ref("a").unwrap();

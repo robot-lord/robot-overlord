@@ -21,6 +21,7 @@ mod repo_scan;
 pub mod rpc;
 pub mod search;
 pub mod send;
+pub mod session_tools;
 pub mod setup;
 pub mod summary;
 pub mod triage;
@@ -920,6 +921,19 @@ impl Daemon {
                 )
             }
             "ui.propose_session" => ui::propose_session(self, params),
+            // A session's own read-only look-ups (`rlord mcp --session`,
+            // `rlord context`): by token only, a dispatch of their own (no
+            // overlord tool is reachable through it).
+            "sctx.tools" => {
+                session_tools::resolve(&self.db(), params["token"].as_str().unwrap_or(""))
+                    .map(|_| session_tools::tools())
+            }
+            "sctx.call" => session_tools::call(
+                self,
+                params["token"].as_str().unwrap_or(""),
+                params["name"].as_str().unwrap_or(""),
+                &params.get("arguments").cloned().unwrap_or(json!({})),
+            ),
             // Without `overlord: true` (`rlord mcp --overlord`) the server
             // is read-only: only `mcp::READ_ONLY_TOOLS`, listed and callable.
             "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
