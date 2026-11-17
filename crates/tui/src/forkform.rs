@@ -352,20 +352,14 @@ impl App {
     }
 }
 
-/// The status line after a fork: the new session, then what to know.
+/// The status line after a fork: the new session, then what to know
+/// (`rlord_core::forked`, as `rlord fork` says it).
 pub(crate) fn fork_status(v: &Value) -> String {
-    let mut out = format!(
-        "forked {} → {}",
-        v["forked_from_name"].as_str().unwrap_or("?"),
-        v["name"].as_str().unwrap_or("?")
-    );
-    for w in v["warnings"].as_array().into_iter().flatten() {
-        if let Some(w) = w.as_str() {
-            out.push_str(" · ");
-            out.push_str(w);
-        }
-    }
-    out
+    let f = rlord_core::forked::forked(v, false);
+    std::iter::once(f.headline)
+        .chain(f.warnings)
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 #[cfg(test)]

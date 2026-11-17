@@ -2510,28 +2510,13 @@ fn installed_by(exe: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// What `rlord fork` prints: the fork, then each warning on its own line.
+/// What `rlord fork` prints: the fork, then each warning on its own line
+/// (`rlord_core::forked`, as the TUI says it).
 fn fork_lines(r: &Value) -> String {
-    let s = |k: &str| r[k].as_str().unwrap_or("?");
-    let mut out = format!(
-        "forked {} → {} ({})",
-        r["forked_from_name"].as_str().unwrap_or("?"),
-        s("name"),
-        s("id")
-    );
-    // Only a worktree this fork made (one in its parent's is no news).
-    if r["new_worktree"] == true {
-        out.push_str(&format!(
-            " in a new worktree {} [{}]",
-            s("project_path"),
-            s("branch")
-        ));
-    }
-    out.push('\n');
-    for w in r["warnings"].as_array().into_iter().flatten() {
-        if let Some(w) = w.as_str() {
-            out.push_str(&format!("  note: {w}\n"));
-        }
+    let f = rlord_core::forked::forked(r, true);
+    let mut out = format!("{}\n", f.headline);
+    for w in f.warnings {
+        out.push_str(&format!("  note: {w}\n"));
     }
     out
 }
