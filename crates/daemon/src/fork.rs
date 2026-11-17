@@ -128,14 +128,30 @@ impl Drop for Reserved<'_> {
     }
 }
 
+/// `want`, and its default name reserved for this fork until it is done
+/// (`Reserved` releases it), chosen and reserved under one lock so two
+/// forks at once never pick the same one. A name asked for isn't
+/// reserved.
+fn want_reserved<'a>(d: &'a Daemon, params: &Value) -> Result<(Want, Reserved<'a>)> {
+    let want = {
+        let db = d.db();
+        let want = want(&db, params)?;
+        if want.auto_name {
+            db.kv_set(&reserve_key(&want.name), &now_ms().to_string())?;
+        }
+        want
+    };
+    let reserved = Reserved(d, want.auto_name.then(|| want.name.clone()));
+    Ok((want, reserved))
+}
+
 /// `session.fork` params: `ref` (the parent), `prompt`, `name`,
 /// `description`, `model`, `context`, `related`, `workspace` (a new
 /// worktree) and `branch`.
 pub fn fork(d: &Daemon, params: &Value) -> Result<Value> {
     let cfg = d.config();
     let base = paths::data_dir();
-    let mut want = want(&d.db(), params)?;
-    let _reserved = Reserved(d, want.auto_name.then(|| want.name.clone()));
+    let (mut want, _reserved) = want_reserved(d, params)?;
     // One fork of a parent at a time, from its fork call to its row (the
     // agent's fork of one conversation is made once at a time; two forks'
     // worktrees and names never race). (`locks` order: this, then the DB.)
@@ -395,11 +411,6 @@ pub(crate) fn want(db: &Db, params: &Value) -> Result<Want> {
             );
         }
     }
-    // All read and checked: the name is this fork's until it is done
-    // (`Reserved`). Nothing after this can fail.
-    if auto_name {
-        db.kv_set(&reserve_key(&name), &now_ms().to_string())?;
-    }
     Ok(Want {
         agent,
         conversation,
@@ -427,9 +438,9 @@ fn default_name(db: &Db, parent: &str) -> String {
 
 /// What to say about the fork, by plain code: a live parent shares its
 /// folder; a working one's last step isn't in the copy; a nearly full
-/// context window; what a new worktree leaves behind.
-pub(crate) fn warnings(want: &Want, made: &Made) -> Vec<String> {
-    let p = &want.parent;
+/// context window; what a new worktree leaves behind. `p`: the parent as
+/// read when the fork starts (`finish`), not when it was asked for.
+pub(crate) fn warnings(want: &Want, p: &Session, made: &Made) -> Vec<String> {
     let mut out = Vec::new();
     if p.status == Status::Working {
         out.push(format!(
@@ -621,6 +632,9 @@ pub(crate) fn finish(
         .filter(|r| !except.contains(&r.id))
         .cloned()
         .collect();
+    // Only what will be stored (`kept_rows`): its file, written before the
+    // rows are, shows exactly what the database will hold.
+    let add = context::kept_rows(&copied, add);
     // A fork always has background: at least its note and link.
     let mode = context::delivery(agent, made.hooks);
     let bg_file = context::file_path(base, id);
@@ -686,7 +700,7 @@ pub(crate) fn finish(
                    "forked_from_name": parent.name})
         }
     };
-    out["warnings"] = json!(warnings(want, made));
+    out["warnings"] = json!(warnings(want, &parent, made));
     // (Said apart from `workspace_path`, which a fork in its parent's
     // worktree has too.)
     out["new_worktree"] = json!(want.worktree.is_some());
@@ -953,8 +967,6 @@ mod tests {
         // Nothing committed yet: said plainly (not git's own words).
         let e = plan("sub").unwrap_err().to_string();
         assert_eq!(e, "nothing committed yet: fork it in the same folder");
-        // (As `fork`'s `Reserved` does when it gives up.)
-        db.kv_delete(&reserve_key("sub-fork")).unwrap();
         git(&[
             "-c",
             "user.name=t",
@@ -1099,15 +1111,21 @@ mod tests {
             context_pct: Some(82),
             ..Default::default()
         };
-        let says = warnings(&w, &made).join("\n");
+        let says = warnings(&w, &w.parent, &made).join("\n");
         assert!(says.contains("last finished step"), "{says}");
         assert!(says.contains("shares its folder"), "{says}");
         assert!(says.contains("82% full"), "{says}");
         w.parent.status = Status::Stopped;
-        assert!(warnings(&w, &Made::default()).is_empty());
+        assert!(warnings(&w, &w.parent, &Made::default()).is_empty());
         w.parent.status = Status::Idle;
         w.parent.archived_at = Some(5);
-        assert!(warnings(&w, &Made::default()).is_empty());
+        assert!(warnings(&w, &w.parent, &Made::default()).is_empty());
+        // Said of the parent as read when the fork starts, not as asked.
+        let mut now = w.parent.clone();
+        now.status = Status::Working;
+        assert!(warnings(&w, &now, &Made::default())
+            .join("\n")
+            .contains("last finished step"));
     }
 
     #[test]
@@ -1147,7 +1165,6 @@ mod tests {
         refs.push("n-p".into());
         let w8 = want(&db, &json!({"ref": "p", "related": refs})).unwrap();
         assert_eq!(w8.related, eight);
-        db.kv_delete(&reserve_key(&w8.name)).unwrap();
         let parent_rows = db.context_rows("p").unwrap();
         let (except, add) = rows(&w, &parent_rows, &ForkFolder::Shared, 1_800_000_000_000);
         // Its note and its link to the parent first, then the overlord's
@@ -1220,6 +1237,55 @@ mod tests {
             note.contains("own worktree, /r/.worktrees/x (branch x)"),
             "{note}"
         );
+    }
+
+    /// The file a fork starts with shows exactly the rows stored for it:
+    /// a new row the same as a copied one (or an earlier new one) is
+    /// neither stored nor shown.
+    #[test]
+    fn a_forks_file_shows_what_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        mk(&db, "p", "claude", Some("c-p"), here, "");
+        mk(&db, "x", "claude", None, here, "");
+        db.context_add("p", 1, "note", "use the staging DB", "overlord")
+            .unwrap();
+        db.context_add("p", 2, "link", "x", "overlord").unwrap();
+        db.context_mark_all_seen("p", 3).unwrap();
+        let copied = db.context_rows("p").unwrap();
+        let new = |kind, body: &str| NewRow {
+            kind,
+            body: body.into(),
+            source: "overlord",
+        };
+        let add = vec![
+            new("note", "use the staging DB"),
+            new("note", "and a queue"),
+            new("note", "and a queue"),
+            new("link", "x"),
+        ];
+        let kept = context::kept_rows(&copied, add.clone());
+        assert_eq!(kept, [new("note", "and a queue")]);
+        // Stored as at the start (every new row offered): the same.
+        mk(&db, "f", "claude", Some("c-f"), here, "");
+        db.context_copy("p", "f", &[]).unwrap();
+        context::store_rows(&db, "f", &add, 50).unwrap();
+        let stored: Vec<(String, String)> = db
+            .context_rows("f")
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.kind, r.body))
+            .collect();
+        let shown: Vec<(String, String)> = copied
+            .iter()
+            .map(|r| (r.kind.clone(), r.body.clone()))
+            .chain(kept.iter().map(|r| (r.kind.to_string(), r.body.clone())))
+            .collect();
+        assert_eq!(stored, shown);
+        let text = context::launch_file_text_rows(&db, "f", &copied, &add, 50);
+        assert_eq!(text.matches("and a queue").count(), 1, "{text}");
+        assert_eq!(text.matches("use the staging DB").count(), 1, "{text}");
     }
 
     #[test]
@@ -1646,27 +1712,35 @@ mod tests {
     fn a_default_name_is_reserved_while_the_fork_is_made() {
         let dir = tempfile::tempdir().unwrap();
         let here = dir.path().to_str().unwrap();
-        let db = Db::open_in_memory().unwrap();
-        mk(&db, "p", "codex", Some("t-p"), here, "");
-        let first = want(&db, &json!({"ref": "p"})).unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        mk(&d.db(), "p", "codex", Some("t-p"), here, "");
+        // Checking alone reserves nothing.
+        let looked = want(&d.db(), &json!({"ref": "p"})).unwrap();
+        assert_eq!(looked.name, "n-p-fork");
+        let (first, held) = want_reserved(&d, &json!({"ref": "p"})).unwrap();
         assert!(first.auto_name);
-        let second = want(&db, &json!({"ref": "p"})).unwrap();
+        let (second, _held2) = want_reserved(&d, &json!({"ref": "p"})).unwrap();
         assert_eq!(
             (first.name.as_str(), second.name.as_str()),
             ("n-p-fork", "n-p-fork-2")
         );
         // Asked for by name: not reserved, not changed.
-        let named = want(&db, &json!({"ref": "p", "name": "n-p-fork"})).unwrap();
+        let (named, _none) = want_reserved(&d, &json!({"ref": "p", "name": "n-p-fork"})).unwrap();
         assert!(!named.auto_name);
         assert_eq!(named.name, "n-p-fork");
-        // Released (`Reserved`), or older than it may hold: free again.
-        db.kv_delete(&reserve_key("n-p-fork")).unwrap();
-        db.kv_set(
-            &reserve_key("n-p-fork-2"),
-            &(now_ms() - RESERVED_MS - 1).to_string(),
-        )
-        .unwrap();
-        assert!(!name_unavailable(&db, "n-p-fork-2", now_ms()));
-        assert_eq!(want(&db, &json!({"ref": "p"})).unwrap().name, "n-p-fork");
+        // Released when the fork is done (`Reserved`), or older than it
+        // may hold: free again.
+        drop(held);
+        d.db()
+            .kv_set(
+                &reserve_key("n-p-fork-2"),
+                &(now_ms() - RESERVED_MS - 1).to_string(),
+            )
+            .unwrap();
+        assert!(!name_unavailable(&d.db(), "n-p-fork-2", now_ms()));
+        assert_eq!(
+            want(&d.db(), &json!({"ref": "p"})).unwrap().name,
+            "n-p-fork"
+        );
     }
 }

@@ -743,8 +743,24 @@ pub fn launch_file_text(
     launch_file_text_rows(db, name, &[], &rows_from(notes, links, "overlord"), at)
 }
 
+/// Of `rows`, those a new session's `store_rows` will store after
+/// `copied` (stored unseen, as `context_copy` does): `Db::context_add`
+/// skips a link already there and a note the same as one not handed over
+/// yet, and in a new session nothing is handed over yet. So its file,
+/// rendered before the rows are stored, shows exactly what is stored.
+pub fn kept_rows(copied: &[ContextRow], rows: Vec<NewRow>) -> Vec<NewRow> {
+    let mut seen: std::collections::HashSet<(String, String)> = copied
+        .iter()
+        .map(|r| (r.kind.clone(), r.body.clone()))
+        .collect();
+    rows.into_iter()
+        .filter(|r| seen.insert((r.kind.to_string(), r.body.clone())))
+        .collect()
+}
+
 /// `launch_file_text` for rows copied from another session (`copied`, as
-/// they are stored there) followed by new ones.
+/// they are stored there) followed by new ones (as `kept_rows` keeps
+/// them).
 pub fn launch_file_text_rows(
     db: &Db,
     name: &str,
@@ -755,14 +771,18 @@ pub fn launch_file_text_rows(
     let rows: Vec<ContextRow> = copied
         .iter()
         .cloned()
-        .chain(rows.iter().map(|r| ContextRow {
-            id: 0,
-            at,
-            kind: r.kind.to_string(),
-            body: r.body.clone(),
-            source: r.source.to_string(),
-            seen_at: None,
-        }))
+        .chain(
+            kept_rows(copied, rows.to_vec())
+                .into_iter()
+                .map(|r| ContextRow {
+                    id: 0,
+                    at,
+                    kind: r.kind.to_string(),
+                    body: r.body.clone(),
+                    source: r.source.to_string(),
+                    seen_at: None,
+                }),
+        )
         .enumerate()
         .map(|(i, r)| ContextRow {
             id: i as i64 + 1,

@@ -1453,12 +1453,16 @@ written with the row before the pane starts, as is `bind_fork`), logged
 as `reforked` with its new branch point. Its file is written with the
 fork's note renewed in memory (`fork::renewed_note`,
 `context::refresh_file_with`; shared folder or own worktree as recorded
-at the fork, kv `fork_folder`); only once the pane is up is the note
+at the fork, kv `fork_folder`), and a Codex fork's `bind_fork` is
+written, before the pane starts. Only once the pane is up is the note
 stored, unseen (`fork::renote`), does a Codex fork drop the thread
-bound before to be bound anew by `bind_fork` (`fork::reforked`), and
-does the start mark seen what it handed the agent. A restart that
-fails leaves the database as it was. "On disk" is one check for both a
-parent and a restart (`fork::conversation_on_disk`). The key goes once
+bound before so the new one is bound (`fork::reforked`), and does the
+start mark seen what it handed the agent. From the pane on nothing
+fails the restart (each step is logged if it fails; the status, the
+seen marks and the event are always written); a restart that fails
+before it leaves the note and the bound thread as they were. "On disk"
+is one check for both a parent and a restart
+(`fork::conversation_on_disk`). The key goes once
 a hook or Codex's index names the fork's own transcript and it is on
 disk (`fork::conversation_seen`), or at a fresh start. Forks of one parent are made one at a time (a
 `fork:<parent>` lock in `locks::SessionLocks`, from the fork call to the
@@ -1524,6 +1528,8 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   the oldest copied links are dropped, never the link to the parent nor
   a session named in `related`. A fork always has background
   (`context_on`); its delivery is worked out afresh, as for a launch.
+  Its file, written before the rows are stored, shows only what will be
+  stored (`context::kept_rows`: what `context_add` would skip, it skips).
   Nothing is added to the parent.
 - **Lineage**: `sessions.forked_from` (migration 0011); rows carry
   `forked_from_name`. List rows (`session.list`) carry counts only
@@ -1542,7 +1548,8 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   `ForkEmptyError`); a `scavenged` id; a parent whose folder is gone
   (archived ones fork while it's there); an agent not installed; OpenCode
   into a new worktree; a `branch` without `workspace`.
-- **Warnings** (`warnings` in the answer, by plain code): a working
+- **Warnings** (`warnings` in the answer, by plain code, of the parent as
+  read when the fork starts): a working
   parent (the copy ends at its last finished step), a shared folder with
   a live parent, a context window at or over 70%, uncommitted changes
   left behind by a new worktree.
@@ -1558,9 +1565,11 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   oldest binds once there is a thread for each of them (or it waited
   `UNREAD_GRACE_MS`), a later one only after waiting, so none stays
   unbound. Any other waiting session takes the one thread its rules
-  narrow to if that rollout says it is no fork, never if it says it is
-  one; one not readable yet is taken 15 seconds after the thread was
-  indexed (`UNREAD_GRACE_MS`), as before forks, so no session stays
+  narrow to unless its rollout says it was forked from a thread an rlord
+  fork waiting in that folder is looking for (a fork of anything else is
+  the user's own, made in the session's pane). One not readable yet is
+  taken at once when no rlord fork waits there, else 15 seconds after
+  the thread was indexed (`UNREAD_GRACE_MS`), so no session stays
   unbound. A waiting fork holds such a session back (as another session
   waiting in its folder) only for `UNREAD_GRACE_MS`. No other rollout is
   read. An answer is remembered per thread once its first line is
