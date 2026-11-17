@@ -1,4 +1,5 @@
-//! The HTTP side: static files, the control websocket, and the checks and
+//! The HTTP side: static files, the control websocket (the pane socket is
+//! `pane.rs`), and the checks and
 //! headers every request goes through (docs/working/web-ui-remote.md,
 //! "Auth, headers, assets").
 //!
@@ -53,6 +54,7 @@ pub struct App {
     /// A tick per daemon change (the rev is in `rev`).
     pub changes: broadcast::Sender<()>,
     pub controls: AtomicUsize,
+    pub panes: AtomicUsize,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             rev: Mutex::new(rev),
             changes: broadcast::channel(16).0,
             controls: AtomicUsize::new(0),
+            panes: AtomicUsize::new(0),
         })
     }
 
@@ -101,6 +104,7 @@ impl App {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/ws", get(control_upgrade))
+        .route("/pane", get(crate::pane::upgrade))
         .fallback(static_file)
         .layer(axum::middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)

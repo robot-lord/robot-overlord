@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–6 built; steps 7–14 not started)
+**Status:** in progress (slice 1: steps 1–7 built; steps 8–14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -63,6 +63,33 @@ This is the premise of the remote design, not an option:
   the host and device opened themselves.
 - The relay sees who is connected and traffic metadata, never content
   (see `e2e-crypto.md`).
+
+## Network invariant: one pinned relay per host
+
+An rlord host set up for one relay can never be reached through another,
+and neither the host nor its devices will ever talk to another. This
+matters most for self-hosted, on-prem relays.
+
+- **The relay is part of the host's identity.** The host's config names
+  one relay: its origin (`https://relay.example.com`) and the relay's own
+  identity public key. The relay proves it holds that key on every
+  connection (a signed challenge inside TLS). Pin the relay identity key,
+  not the TLS certificate, so ACME renewals don't break the pin; the TLS
+  certificate must still validate for the configured domain.
+- **Pairing carries the pin.** The QR holds the relay origin and the relay
+  key fingerprint alongside the host's keys. A device stores the pin per
+  paired host and only ever dials that relay for that host.
+- **Bound into the handshake.** The relay origin and relay key are in the
+  Noise prologue of pairing and reconnect. A handshake routed through any
+  other relay fails cryptographically on both ends, even if that relay
+  forwards bytes faithfully.
+- **No way to be moved.** No relay-supplied redirects, relay lists,
+  fallbacks or discovery; HTTP redirects are refused. Moving a host to a
+  different relay is a user action on the host that re-pairs every
+  device; old pairings stop working.
+- **The relay enforces it too:** a relay accepts only host identities
+  registered with it, so a host can't be registered with two relays at
+  once by accident.
 
 ## Notes and proposed refinements (Claude)
 
@@ -231,6 +258,36 @@ Decided 2026-11-17 (user):
   - `web.start` returns at hello, which comes just before the plugin
     subscribes and serves; the listener is already bound then, so an
     early browser connection waits in the backlog rather than failing.
+- Step 7 done (`crates/web/src/pane.rs`): the pane socket at `/pane`
+  (Origin check, token first frame, 32 sockets, 64 KiB frames). The page
+  sends `{"type":"open","target","cols","rows"}`; the plugin asks
+  `web.pane_target`, refuses a target that isn't running (`closed`,
+  reason `not_running`; an unknown one `not_found`), calls
+  `bind_web_table`, runs `view_command` on an `openpty` PTY (tokio
+  `AsyncFd`, no PTY crate), waits for `view_shows`, and answers
+  `{"type":"opened","target","id","name"}`. Then binary frames are bytes
+  both ways; `{"type":"resize"}` sets the PTY size; `{"type":"close"}`,
+  the socket going, or the client exiting (`closed`, reason `ended`) ends
+  it: the tmux client gets SIGTERM (SIGKILL after 1 s) and a view
+  session still there is killed. `sweep_views` runs at plugin start.
+  View names are `webview-<pid>-<n>`. Gated test
+  `crates/web/tests/pane.rs` (socket `rlord-test-web`): sweep at start,
+  not running, open, no status row, typing in and output back, a root
+  binding doesn't fire, `list_clients` hides the view, resize, two views
+  at once, close, and killing the target closes the socket with no view
+  left. The plugin's integration tests share `tests/common/mod.rs`.
+  Run on macOS tmux 3.8 only; owed: the same on Linux tmux 3.2a and 3.4
+  (as steps 1 and 2 were).
+- End-to-end check of steps 3 to 7 against `scripts/demo/demo.sh`
+  (2026-11-17, release `rlord-web` copied beside the demo's `rlord`,
+  unverified; started by `rlord web url`): a scripted websocket client
+  got the control `hello` and a snapshot with the overlord; opened the
+  overlord's pane at 100x30 and got its screen; the view session had
+  `status off` (the overlord's own stays on) and a 100x30 window, and no
+  status-row text was streamed; typed bytes reached the overlord's pane
+  and came back in the stream; closing left no view session. Stopping
+  the demo stopped the plugin with its daemon. A real browser is still
+  step 10's by-hand pass.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

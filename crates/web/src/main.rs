@@ -3,7 +3,7 @@
 //!
 //! On start it reads `[web] port`, makes or reuses the token, binds
 //! 127.0.0.1, says `web.hello` with its port, subscribes to the daemon's
-//! changes, and serves. It exits when that subscription ends (the daemon
+//! changes, sweeps leftover view sessions, and serves. It exits when that subscription ends (the daemon
 //! went away), so a crashed daemon leaves no listener behind.
 //!
 //! Exit codes: 0 when the daemon goes away, 1 on an error, 2 on a wrong
@@ -14,6 +14,7 @@
 mod assets;
 mod daemon;
 mod http;
+mod pane;
 mod token;
 
 use std::process::ExitCode;
@@ -75,6 +76,15 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     let (rev, mut sub) = d.subscribe().await.context("subscribing to the daemon")?;
+    // View sessions a bridge left behind (it died between making one and
+    // attaching, or with the last plugin).
+    let swept = tokio::task::spawn_blocking(rlord_core::tmux::sweep_views).await?;
+    if !swept.is_empty() {
+        eprintln!(
+            "rlord-web: removed {} leftover view session(s)",
+            swept.len()
+        );
+    }
     let app = http::App::new(token, port, d, rev);
     // The daemon's changes, to every control socket; its end is ours.
     let pump = std::sync::Arc::clone(&app);
