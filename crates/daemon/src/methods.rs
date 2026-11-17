@@ -1175,30 +1175,55 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let tmux_name = tmux_name_of(db, &s)?;
     let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, &argv);
     note_launch(db, &s.id, &argv)?;
+    // A re-fork binds its new thread as at the fork: the key that says so
+    // is written before the pane starts, so it can't be lost after.
+    if let Some(parent) = &refork {
+        crate::fork::refork_bind_key(db, &s, parent)?;
+    }
     if tmux::has_session(&tmux_name) {
         tmux::respawn_pane(&tmux_name, &s.project_path, &cmd)?;
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    // The pane is up: from here nothing fails the restart (as at `start`).
+    // Each step is logged if it fails, and the status, the seen marks and
+    // the event are always written.
+    let session = s.id.clone();
+    let logged = |what: &str, r: Result<()>| {
+        if let Err(e) = r {
+            tracing::warn!(session = %session, error = %e, "restart: {what}");
+        }
+    };
     let now = now_ms();
     if let Some(fallback) = fell_back {
-        context::record_mode(db, &s.id, fallback)?;
+        logged(
+            "recording the mode",
+            context::record_mode(db, &s.id, fallback),
+        );
         tracing::info!(session = %s.id, mode = fallback.as_str(), "hooks gone: background another way");
     }
     if let Some(p) = &pointer {
-        note_first_prompt(db, &s.id, agent, Some(p), now)?;
+        logged(
+            "noting the first prompt",
+            note_first_prompt(db, &s.id, agent, Some(p), now),
+        );
     } else if refork.is_some() {
         // (Its thread, forked from the parent's, is one started from now.)
-        note_first_prompt(db, &s.id, agent, None, now)?;
+        logged(
+            "noting the first prompt",
+            note_first_prompt(db, &s.id, agent, None, now),
+        );
     }
-    // The pane is up: the re-fork's note (as its file already showed it)
-    // and its new thread are stored now, before what it handed over is
-    // marked seen.
+    // The re-fork's note (as its file already showed it) and its new
+    // thread are stored now, before what it handed over is marked seen.
     if let Some(body) = &renewed {
-        crate::fork::renote(db, &s, body, renewed_at)?;
+        logged(
+            "renewing the fork's note",
+            crate::fork::renote(db, &s, body, renewed_at),
+        );
     }
-    if let Some(parent) = &refork {
-        crate::fork::reforked(db, &s, parent)?;
+    if refork.is_some() {
+        logged("unbinding the old thread", crate::fork::reforked(db, &s));
     }
     // Only what this start carried fresh counts as handed over: the
     // pointer sent again, or the system prompt file rewritten just now.
@@ -1206,32 +1231,45 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let fresh =
         pointer.is_some() || (carried == Some(context::Delivery::SystemPromptFile) && rewritten);
     if fresh {
-        db.context_mark_all_seen(&s.id, now)?;
+        logged(
+            "marking its background seen",
+            db.context_mark_all_seen(&s.id, now).map_err(Into::into),
+        );
     }
-    db.set_status(&s.id, Status::Starting, now)?;
+    logged(
+        "setting its status",
+        db.set_status(&s.id, Status::Starting, now)
+            .map(|_| ())
+            .map_err(Into::into),
+    );
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
     crate::codex_daemon::sync_gate(db);
-    db.insert_event(
-        &s.id,
-        now,
-        match (resumed, &refork) {
-            (true, _) => "resumed",
-            // (Forked again: the `forked` event's branch point, now.)
-            (false, Some(_)) => "reforked",
-            (false, None) => "restarted",
-        },
-        &match (resumed, agent.deferred(model.as_deref())) {
-            // (Resumed: whatever model the conversation has by now.)
-            (true, Some(d)) => json!({"argv": argv,
-                "model": format!("the session keeps its own (launched with {})", d.model)}),
-            (_, _) if refork.is_some() => {
-                json!({"argv": argv, "from": s.forked_from, "from_conversation": refork})
+    logged(
+        "logging the event",
+        db.insert_event(
+            &s.id,
+            now,
+            match (resumed, &refork) {
+                (true, _) => "resumed",
+                // (Forked again: the `forked` event's branch point, now.)
+                (false, Some(_)) => "reforked",
+                (false, None) => "restarted",
+            },
+            &match (resumed, agent.deferred(model.as_deref())) {
+                // (Resumed: whatever model the conversation has by now.)
+                (true, Some(d)) => json!({"argv": argv,
+                    "model": format!("the session keeps its own (launched with {})", d.model)}),
+                (_, _) if refork.is_some() => {
+                    json!({"argv": argv, "from": s.forked_from, "from_conversation": refork})
+                }
+                _ => json!({"argv": argv}),
             }
-            _ => json!({"argv": argv}),
-        }
-        .to_string(),
-    )?;
+            .to_string(),
+        )
+        .map(|_| ())
+        .map_err(Into::into),
+    );
     tracing::info!(session = %s.id, resumed, "restarted session");
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }

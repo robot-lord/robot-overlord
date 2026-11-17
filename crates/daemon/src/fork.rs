@@ -801,14 +801,25 @@ pub(crate) fn renote(db: &Db, s: &Session, body: &str, at: i64) -> Result<()> {
     Ok(())
 }
 
-/// A fork's pane started again with a new fork of `parent` (`refork_argv`):
-/// an agent that picks its own id makes a new thread, so the one bound
-/// before (its rollout never written) goes, and the new one is bound as at
-/// the fork (`bind_fork`). (Claude keeps its own id: nothing to do.)
-pub(crate) fn reforked(db: &Db, s: &Session, parent: &str) -> Result<()> {
+/// A fork about to start again with a new fork of `parent`
+/// (`refork_argv`): an agent that picks its own id makes a new thread,
+/// bound as at the fork (`bind_fork`). Written before the pane starts, so
+/// it can't be lost after; while the old thread is still bound it changes
+/// nothing (only an unbound session is bound). (Claude keeps its own id:
+/// nothing to do.)
+pub(crate) fn refork_bind_key(db: &Db, s: &Session, parent: &str) -> Result<()> {
+    if Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()) {
+        db.kv_set(&methods::bind_fork_key(&s.id), parent)?;
+    }
+    Ok(())
+}
+
+/// A fork's pane started again with a new fork (`refork_bind_key`): the
+/// thread bound before (its rollout never written) goes, so the new one is
+/// bound. Once the pane is up.
+pub(crate) fn reforked(db: &Db, s: &Session) -> Result<()> {
     if Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()) {
         db.clear_agent_session(&s.id)?;
-        db.kv_set(&methods::bind_fork_key(&s.id), parent)?;
     }
     Ok(())
 }
@@ -1339,7 +1350,15 @@ mod tests {
         db.upsert_transcript_source("cx", "/r/rollout-t-stale.jsonl")
             .unwrap();
         mk(&db, "cl", "claude", Some("c-new"), here, "");
-        reforked(&db, &db.resolve_ref("cx").unwrap(), "t-parent").unwrap();
+        let cx = db.resolve_ref("cx").unwrap();
+        // Before the pane: the key only; the old thread stays bound.
+        refork_bind_key(&db, &cx, "t-parent").unwrap();
+        assert_eq!(
+            db.resolve_ref("cx").unwrap().agent_session.as_deref(),
+            Some("t-stale")
+        );
+        // Once the pane is up: the old thread goes.
+        reforked(&db, &cx).unwrap();
         let s = db.resolve_ref("cx").unwrap();
         assert_eq!(s.agent_session, None);
         assert_eq!(db.transcript_source("cx").unwrap(), None);
@@ -1347,7 +1366,9 @@ mod tests {
             db.kv_get(&methods::bind_fork_key("cx")).unwrap().as_deref(),
             Some("t-parent")
         );
-        reforked(&db, &db.resolve_ref("cl").unwrap(), "c-parent").unwrap();
+        let cl = db.resolve_ref("cl").unwrap();
+        refork_bind_key(&db, &cl, "c-parent").unwrap();
+        reforked(&db, &cl).unwrap();
         assert_eq!(
             db.resolve_ref("cl").unwrap().agent_session.as_deref(),
             Some("c-new")
