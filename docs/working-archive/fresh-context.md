@@ -86,6 +86,14 @@ base work now is in `docs/architecture.md` ("The latest code
   one place.
 - **"preparing" when queued behind another ref**: the message doesn't
   say the tree is busy with another ref's request.
+- **`n` form lost on a second failure**: a launch from the `n` form
+  that fails twice in a row can lose what the user typed.
+- **`StillFetching` resolves twice**: a named base that is still
+  fetching is resolved once to wait and again after.
+- **Nested-ref pre-scan**: the check for refs nested under a private
+  ref's name scans every private ref before each fetch.
+- **`root_of` in `list_rpc`**: each listed record asks git for its
+  root again.
 - **No end-to-end launch test**: `session_new` needs an installed agent
   and tmux, so the base is tested through `set_launch_base` and
   `methods::new_worktree`, and the note through `base_note`; the stored

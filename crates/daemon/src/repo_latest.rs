@@ -795,12 +795,17 @@ fn resolve(
     let mut fetched_at = remote
         .as_deref()
         .and_then(|r| snap.fetched.get(&key(r)).copied());
-    if fetch == Fetch::Fetched {
-        // (When it really finished: it may have been handed over later.)
+    if fetch.fresh() {
+        // (When it really finished: it may have been handed over later,
+        // or, cached, be a while ago.)
         let k = remote
             .as_deref()
             .map(|r| format!("{}\0{r}\0{branch}", repo.common.display()));
-        fetched_at = k.and_then(|k| d.latest.ok_ms(&k)).or(Some(now));
+        let ok = k.and_then(|k| d.latest.ok_ms(&k));
+        fetched_at = match fetch {
+            Fetch::Fetched => ok.or(Some(now)),
+            _ => ok.or(fetched_at),
+        };
     }
     let local = latest::commit_of(&env, root, &format!("refs/heads/{branch}"));
     // The remote's side: rlord's private ref or the user's own

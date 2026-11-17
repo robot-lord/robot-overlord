@@ -1436,8 +1436,9 @@ checkout's `HEAD`, with no fetch; `create_session`'s `base` names a branch (or
 `propose_session` like the other hints. Left alone, the form shows and
 sends the configured `base` marked as a default, so it never overrides
 `[session] base`; only the user's pick or a confirmed change does. A
-`confirm_new_session` that leaves `base` out puts it back to the
-configured default, like any hint it leaves out. No remote, offline, a
+`confirm_new_session` that leaves `base` out keeps it as the request
+sent it (with its `prefer`); only `""` puts it back to the configured
+default. No remote, offline, a
 failed fetch or no default branch fall back (to the last known commit,
 or to `HEAD`) and never refuse the launch; only a named `base` that has
 diverged or doesn't exist does, with both sides in the error. The

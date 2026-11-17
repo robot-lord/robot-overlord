@@ -107,7 +107,7 @@ pub struct Output {
     pub ok: bool,
     pub stdout: String,
     pub stderr: String,
-    /// stdout was cut at its cap.
+    /// stdout was cut at its cap, or not read to its end.
     pub clipped: bool,
 }
 
@@ -160,18 +160,48 @@ fn run_capped(
     let streams = Streams::start(child.stdout.take(), child.stderr.take(), cap);
     // Waited on in its own thread; this one blocks on its answer, at most
     // `limit`.
+    // It waits for the exit without reaping (`WNOWAIT`), then reaps under
+    // `reaped`: while unreaped, `pid` (and its group) can't be reused, so
+    // the kill below never reaches another process.
     let pid = child.id() as i32;
+    let reaped = Arc::new(Mutex::new(false));
     let (tx, exited) = mpsc::channel();
+    let r = reaped.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait());
+        loop {
+            // SAFETY: waitid fills `info`; WNOWAIT leaves the child to reap.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+        let mut done = r.lock().unwrap_or_else(|e| e.into_inner());
+        let st = child.wait();
+        *done = true;
+        drop(done);
+        let _ = tx.send(st);
     });
     let status = match exited.recv_timeout(limit) {
         Ok(st) => st?,
         Err(_) => {
-            // SAFETY: plain syscall on the group git leads (`process_group`).
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+            let done = reaped.lock().unwrap_or_else(|e| e.into_inner());
+            if !*done {
+                // SAFETY: plain syscall on the group git leads
+                // (`process_group`), its leader not reaped yet.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
             }
+            drop(done);
             // (Reaped by the waiting thread.)
             let _ = exited.recv_timeout(Duration::from_secs(5));
             bail!(
@@ -254,9 +284,12 @@ impl Streams {
     /// one open.
     fn finish(self) -> (String, String, bool) {
         let deadline = Instant::now() + Duration::from_secs(1);
+        // (A stream not read to its end is as good as clipped.)
+        let mut whole = true;
         for _ in 0..2 {
             let left = deadline.saturating_duration_since(Instant::now());
             if self.done.recv_timeout(left).is_err() {
+                whole = false;
                 break;
             }
         }
@@ -264,7 +297,7 @@ impl Streams {
             String::from_utf8_lossy(&b.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
         };
         let dropped = self.out_dropped.load(std::sync::atomic::Ordering::Relaxed);
-        (text(&self.out), text(&self.err), dropped)
+        (text(&self.out), text(&self.err), dropped || !whole)
     }
 }
 
@@ -872,11 +905,14 @@ pub fn default_branch(
             return None;
         }
         let o = run(renv, repo, &["ls-remote", "--symref", r, "HEAD"], limit);
+        // (Killed only because the caller's deadline was near: no
+        // failure of the remote's, not remembered as one.)
+        let cut = o.is_err() && limit < LS_REMOTE;
         let b = o
             .ok()
             .filter(|o| o.ok)
             .and_then(|o| parse_symref(&o.stdout));
-        *failed = b.is_none();
+        *failed = b.is_none() && !cut;
         b
     };
     if let AskRemote::First(limit) | AskRemote::Launch(limit) = ask {
@@ -1155,8 +1191,8 @@ pub fn may_touch(recorded: Option<&Path>, dir: &Path, entry: &Entry) -> Result<(
 /// let git find another checkout, the user's). An error (a time limit,
 /// git not running) says nothing about the tree: the caller leaves it.
 fn inspect(env: &GitEnv, repo: &Repo, dir: &Path) -> Result<Option<bool>> {
-    let o = run(
-        &pinned(env, dir),
+    let o = tree_run(
+        env,
         dir,
         &[
             "rev-parse",
@@ -1190,6 +1226,29 @@ fn pinned(env: &GitEnv, dir: &Path) -> GitEnv {
         Some(p) => env.with("GIT_CEILING_DIRECTORIES", p.to_string_lossy().into()),
         None => env.clone(),
     }
+}
+
+/// Git run inside rlord's tree `dir`, always `pinned` to it. The only way
+/// rlord runs git there: `tree_git` and `tree_head` go through it too.
+fn tree_run(env: &GitEnv, dir: &Path, args: &[&str], limit: Duration) -> Result<Output> {
+    run(&pinned(env, dir), dir, args, limit)
+}
+
+/// `tree_run`, its output when it succeeds, else an error.
+fn tree_git(env: &GitEnv, dir: &Path, args: &[&str], limit: Duration) -> Result<String> {
+    git(&pinned(env, dir), dir, args, limit)
+}
+
+/// The tree's `HEAD` commit, by `tree_run`.
+fn tree_head(env: &GitEnv, dir: &Path) -> Option<String> {
+    let o = tree_run(
+        env,
+        dir,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        PLUMBING,
+    )
+    .ok()?;
+    (o.ok && !o.text().is_empty()).then(|| o.text().to_string())
 }
 
 /// `inspect`, as a check: it is that worktree, detached.
@@ -1253,13 +1312,13 @@ pub fn tree_add_fresh(
         )
         .is_ok_and(|o| o.ok);
         if repaired && inspect(env, repo, dir)? == Some(true) {
-            git(
+            tree_git(
                 env,
                 dir,
                 &["checkout", "--quiet", "--detach", "--force", commit],
                 CHECKOUT,
             )?;
-            git(env, dir, &["clean", "-fdxq"], CHECKOUT)?;
+            tree_git(env, dir, &["clean", "-fdxq"], CHECKOUT)?;
             return Ok(true);
         }
     }
@@ -1384,8 +1443,6 @@ pub fn tree_move(
     entry: &Entry,
     fs_ok: bool,
 ) -> Result<Moved> {
-    // (Every git call inside the tree is pinned to it: `pinned`.)
-    let tenv = &pinned(env, dir);
     // rlord's by name and record, but a branch got checked out in it:
     // detached again (only once it is verifiably that worktree), not
     // refused forever. Unrecorded, or not itself: `may_touch` refuses.
@@ -1399,16 +1456,16 @@ pub fn tree_move(
         && !entry.prunable
         && inspect(env, repo, dir)?.is_some()
     {
-        forced = git(
-            tenv,
+        forced = tree_git(
+            env,
             dir,
             &["status", "--porcelain", "--untracked-files=no"],
             CHECKOUT,
         )?
         .lines()
         .count() as u32;
-        git(
-            tenv,
+        tree_git(
+            env,
             dir,
             &["checkout", "--quiet", "--detach", "--force"],
             CHECKOUT,
@@ -1456,7 +1513,7 @@ pub fn tree_move(
         Some(true) => {}
     }
     let in_tree = |args: &[&str]| {
-        git(tenv, dir, args, CHECKOUT).map_err(|e| {
+        tree_git(env, dir, args, CHECKOUT).map_err(|e| {
             let e = e.to_string();
             let hint = if e.contains("index.lock") {
                 " (a git command may be running there; if none is, remove its index.lock)"
@@ -1473,7 +1530,7 @@ pub fn tree_move(
     // checkout killed partway can leave HEAD at the commit with files
     // missing.
     // (A big tree's status can take a while: the checkout's time limit.)
-    let head = commit_of(tenv, dir, "HEAD");
+    let head = tree_head(env, dir);
     let dirty = if complete == Some(commit) && head.as_deref() == Some(commit) {
         // At the commit: one cheap status; clean, nothing to do.
         let dirty = in_tree(&["status", "--porcelain", "--untracked-files=normal"])?;
@@ -1579,10 +1636,9 @@ pub fn drop_refs(env: &GitEnv, repo: &Path) -> Result<usize> {
 /// What the tree's checkout leaves out, said as warnings (git only).
 pub fn tree_warnings(env: &GitEnv, repo: &Path, dir: &Path) -> Vec<String> {
     let mut w = Vec::new();
-    let tenv = &pinned(env, dir);
     let has = |path: &str| {
-        run(
-            tenv,
+        tree_run(
+            env,
             dir,
             &["cat-file", "-e", &format!("HEAD:{path}")],
             PLUMBING,
@@ -1592,7 +1648,7 @@ pub fn tree_warnings(env: &GitEnv, repo: &Path, dir: &Path) -> Vec<String> {
     if has(".gitmodules") {
         w.push("submodules_not_checked_out: submodule folders are empty".to_string());
     }
-    let lfs = run(tenv, dir, &["show", "HEAD:.gitattributes"], PLUMBING)
+    let lfs = tree_run(env, dir, &["show", "HEAD:.gitattributes"], PLUMBING)
         .is_ok_and(|o| o.ok && o.stdout.contains("filter=lfs"));
     if lfs {
         w.push("lfs_pointers: Git LFS files are pointers, not their content".to_string());
@@ -2618,8 +2674,8 @@ mod tests {
         std::fs::write(c.join("f.txt"), "edited").unwrap();
         std::fs::write(c.join("new.txt"), "mine").unwrap();
         std::fs::remove_file(dir.join(".git")).unwrap();
-        let o = run(
-            &pinned(&r.env, &dir),
+        let o = tree_run(
+            &r.env,
             &dir,
             &["checkout", "--quiet", "--detach", "--force"],
             PLUMBING,
@@ -2627,19 +2683,42 @@ mod tests {
         .unwrap();
         assert!(!o.ok);
         assert!(
-            !run(&pinned(&r.env, &dir), &dir, &["clean", "-fdxq"], PLUMBING)
+            !tree_run(&r.env, &dir, &["clean", "-fdxq"], PLUMBING)
                 .unwrap()
                 .ok
         );
+        assert!(tree_git(&r.env, &dir, &["clean", "-fdxq"], PLUMBING).is_err());
         let newer = r.push_remote("main", "newer");
         fetch(&r, c, "main");
         let e = entry(&r, &repo, &dir).unwrap();
         let rec = Some(dir.as_path());
         let _ = tree_move(&r.env, &repo, &dir, &newer, rec, Some(&head), &e, true);
-        assert_eq!(r.g(c, &["symbolic-ref", "--short", "HEAD"]), "main");
-        assert_eq!(r.g(c, &["rev-parse", "HEAD"]), mine);
-        assert_eq!(std::fs::read_to_string(c.join("f.txt")).unwrap(), "edited");
-        assert_eq!(std::fs::read_to_string(c.join("new.txt")).unwrap(), "mine");
+        let untouched = |c: &Path| {
+            assert_eq!(r.g(c, &["symbolic-ref", "--short", "HEAD"]), "main");
+            assert_eq!(r.g(c, &["rev-parse", "HEAD"]), mine);
+            assert_eq!(std::fs::read_to_string(c.join("f.txt")).unwrap(), "edited");
+            assert_eq!(std::fs::read_to_string(c.join("new.txt")).unwrap(), "mine");
+        };
+        untouched(c);
+        // The moved-repo path (`tree_add_fresh` repairs, then checks out
+        // and cleans in the tree): with the tree broken after the move,
+        // and whole.
+        let moved = r.root().join("moved-clone");
+        std::fs::rename(c, &moved).unwrap();
+        let repo = repo_of(&r, &moved);
+        let dir = tree_path(&moved);
+        let git_file = std::fs::read_to_string(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join(".git"),
+            "gitdir: /nowhere/.git/worktrees/-rlord-latest\n",
+        )
+        .unwrap();
+        let _ = tree_add_fresh(&r.env, &repo, &dir, &newer, true);
+        untouched(&moved);
+        std::fs::write(dir.join(".git"), git_file).unwrap();
+        assert!(tree_add_fresh(&r.env, &repo, &dir, &head, true).unwrap());
+        assert_eq!(r.g(&dir, &["rev-parse", "HEAD"]), head);
+        untouched(&moved);
     }
 
     #[test]
