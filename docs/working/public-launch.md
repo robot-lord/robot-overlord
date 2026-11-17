@@ -126,10 +126,39 @@ done, in this order (decided with the user, 2026-11-12):
        will create one on claude/opus; under qemu the list can't start
        (ratatui ENOSYS: emulation only); the 0.18.1 stable tarballs
        carry those xattr warnings.
-10. [ ] 1.0.0 stable.
+10. [ ] Added 2026-11-16, before the 1.0 cut:
+       - [ ] #66 (`repo_latest`, fresh code for the overlord and new
+         sessions) and #67 (Developer ID signing, installers that fall
+         back when there is no stable release).
+       - [ ] Back-version the old stable tags (approved by the user): rename
+         `v0.2.0`…`v0.18.1` to `vX.Y.Z-dev.0`, delete the `v0.18.1`
+         release and remove the Homebrew formula. Do this after #67 is
+         released. Linux and Homebrew have no install until 1.0.0.
+       - [ ] `cargo xtask fresh-install`: its "newest stable from GitHub,
+         upgraded in place" run needs a stable release, and there won't be
+         one. Upgrade from the newest release instead.
+       - [ ] Sign stable releases in CI (`docs/working/signing.md`), or
+         1.0.0 ships ad-hoc and macOS asks again for folder access on
+         every update.
+       - [ ] Session context PRs 2–4 (`docs/working/session-context.md`).
+         They change how prompts and messages reach sessions, so settle
+         them before calling it stable. They include the #64/#65
+         leftovers and the accumulating pending message.
+       - [ ] By hand, by the user: the item 7 daemon restart check and the
+         item 9 macOS fresh install.
+11. [ ] 1.0.0 stable.
 
-After 1.0: an AUR package, and the Homebrew tap and crates.io tokens as
-repo secrets (to do later, not part of the CI release builds step).
+After 1.0:
+- 1.x features: an overlord that switches agent when it hits a usage limit,
+  and `[limits] auto_resume`, with a must-choose prompt when it isn't set.
+- An AUR package, and the Homebrew tap and crates.io tokens as repo secrets
+  (to do later, not part of the CI release builds step).
+- **Versioning changes at 1.0 (user, 2026-11-16).** A dev build no longer
+  claims the next minor version. Every dev build is a pre-release of the
+  next patch (after `1.0.0`: `1.0.1-dev.N`), and the stable cut picks
+  `1.0.1` or `1.1.0` to fit what changed. At the cut, update CLAUDE.md
+  ("Releases"), CONTRIBUTING.md, `xtask/src/version.rs` and
+  `check-version-bump` to match. Until then the 0.x scheme stays.
 
 ## Before flipping it public
 
