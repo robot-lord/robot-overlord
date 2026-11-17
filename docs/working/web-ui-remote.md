@@ -403,3 +403,13 @@ regenerates `Cargo.lock`.
   `portable-pty`.
 - Size mismatches between overlay and web views look odd; accepted.
 - Daemon restart drops every pane; the start-up sweep cleans leftovers.
+
+### Answers (user, 2026-11-17)
+
+1. Off by default; `rlord web` or `[web] enabled = true` starts it.
+2. Port 47811 (default taken, not asked).
+3. Web as a UI-command target: next slice.
+4. Resume button, never auto-resume.
+5. Latest active view sets the size.
+6. Delete `spikes/web-ui/` and fold the spike doc in at step 12 (default).
+7. `:web` last and optional (default).
