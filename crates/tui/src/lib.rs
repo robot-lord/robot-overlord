@@ -300,6 +300,12 @@ struct App {
     fork_send: Option<forkform::ForkSend>,
     /// That form with its error, to reopen once nothing else is open.
     fork_retry: Option<Box<forkform::ForkForm>>,
+    /// A manual-form launch on its way (`session.new` may fetch for a few
+    /// seconds: never on this thread), and the form it came from
+    /// (`poll_launch`).
+    launch_send: Option<newform::LaunchSend>,
+    /// That form, to reopen with its error once nothing else is open.
+    launch_retry: Option<Box<newform::NewForm>>,
     /// The sent form's (first run, overlay after), for the overlord's
     /// answer (`open_setup_from`).
     setup_reply_flags: Option<(bool, bool)>,
@@ -365,6 +371,8 @@ impl App {
             pending_select: None,
             pending_setup: None,
             setup_rx: None,
+            launch_send: None,
+            launch_retry: None,
             setup_put_off: false,
             startup_chain: false,
             overlay_after_startup: false,
@@ -854,7 +862,8 @@ impl App {
             if pushed {
                 self.dirty = true;
             }
-            if self.poll_setup() || self.poll_setup_send() || self.poll_fork() {
+            if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
+            {
                 self.dirty = true;
             }
             self.continue_startup();

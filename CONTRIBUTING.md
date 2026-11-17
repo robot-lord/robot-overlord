@@ -86,11 +86,13 @@ Every PR bumps `[workspace.package] version` in `Cargo.toml` (and commits
 `Cargo.lock`); `cargo xtask check-version-bump` enforces it (CI, and
 `.githooks/pre-push` once you `git config core.hooksPath .githooks`).
 
-- **Development builds** `X.Y.Z-dev.N`: what ordinary PRs bump to (the next
-  version with `-dev.1`, then `-dev.2`, …). Released for macOS only, as GitHub
-  pre-releases; `[update] channel = "dev"` installs them.
-- **Stable releases** `X.Y.Z`: a PR that drops the suffix. Released for every
-  platform, with the Homebrew formula and crates.io.
+- **Stable releases** `X.Y.Z`: what a tested PR bumps to. A feature bumps
+  the minor (`1.0.0` → `1.1.0`), a fix the patch (`1.1.0` → `1.1.1`).
+  Released for every platform, with the Homebrew formula and crates.io.
+- **Development builds** `X.Y.Z-dev.N`: optional, for work that isn't ready
+  yet: a pre-release of the next version (`1.2.0-dev.1`, then `-dev.2`, …).
+  Released for macOS only, as GitHub pre-releases; `[update] channel =
+  "dev"` installs them.
 
 After a PR merges, release from the merged `main`:
 

@@ -88,8 +88,10 @@ pub fn workspace_path(repo: &str, workspace_dir: &str, branch: &str) -> PathBuf 
 
 /// Create the worktree at `dir` on `branch`. With no `start`: a new branch
 /// off the repo's HEAD, or a checkout of `branch` if it already exists.
-/// With `start` (a fork's: its parent's last commit): a new branch started
-/// there, and an existing branch is refused. Errors if git refuses (e.g.
+/// With `start` (a fork's: its parent's last commit; a new session's
+/// base, `latest.rs`): a new branch started there, with no upstream
+/// (`--no-track`: a start at a private ref never becomes it), and an
+/// existing branch is refused. Errors if git refuses (e.g.
 /// the branch is checked out elsewhere), or the folder exists.
 pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -> Result<()> {
     if dir.exists() {
@@ -106,7 +108,17 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
     match (exists, start) {
         (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch])?,
         (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?,
-        (false, Some(s)) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s, s])?,
+        (false, Some(start)) => git(&[
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            &dir_s,
+            start,
+        ])?,
     };
     Ok(())
 }
@@ -162,23 +174,19 @@ pub fn branches(repo: &str) -> std::collections::HashSet<String> {
 
 /// Whether `repo` has a local branch named `branch`.
 pub fn branch_exists(repo: &str, branch: &str) -> bool {
-    git(&[
-        "-C",
-        repo,
-        "rev-parse",
-        "--verify",
-        "--quiet",
+    crate::latest::commit_of(
+        &crate::latest::GitEnv::default(),
+        Path::new(repo),
         &format!("refs/heads/{branch}"),
-    ])
-    .is_ok()
+    )
+    .is_some()
 }
 
 /// Whether some checkout of `repo` (the main one or a worktree) has
 /// `branch` checked out; `git worktree add` refuses a second one.
 pub fn branch_checked_out(repo: &str, branch: &str) -> bool {
-    let want = format!("branch refs/heads/{branch}");
-    git(&["-C", repo, "worktree", "list", "--porcelain"])
-        .map(|out| out.lines().any(|l| l == want))
+    crate::latest::worktree_list(&crate::latest::GitEnv::default(), Path::new(repo))
+        .map(|l| l.iter().any(|e| e.branch.as_deref() == Some(branch)))
         .unwrap_or(false)
 }
 
@@ -193,6 +201,10 @@ pub fn ensure_excluded(repo: &str, workspace_dir: &str) -> Result<()> {
     };
     let exclude = git_dir.join("info").join("exclude");
     let line = format!("/{}/", workspace_dir.trim_matches('/'));
+    // One at a time (two launches into one repo would both add the line),
+    // and appended in one write, never rewriting what is there.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     if current.lines().any(|l| l.trim() == line) {
         return Ok(());
@@ -200,13 +212,18 @@ pub fn ensure_excluded(repo: &str, workspace_dir: &str) -> Result<()> {
     if let Some(p) = exclude.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let mut content = current;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
+    let mut add = String::new();
+    if !current.is_empty() && !current.ends_with('\n') {
+        add.push('\n');
     }
-    content.push_str(&line);
-    content.push('\n');
-    std::fs::write(&exclude, content)?;
+    add.push_str(&line);
+    add.push('\n');
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)?
+        .write_all(add.as_bytes())?;
     Ok(())
 }
 
@@ -766,9 +783,16 @@ mod tests {
             std::fs::canonicalize(&repo).unwrap().to_string_lossy()
         );
         ensure_excluded(r, ".worktrees").unwrap();
-        ensure_excluded(r, ".worktrees").unwrap(); // idempotent
+        // Idempotent, and at once from many threads still one line.
+        ensure_excluded(r, ".worktrees").unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| ensure_excluded(r, ".rlord-many").unwrap());
+            }
+        });
         let ex = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert_eq!(ex.matches("/.worktrees/").count(), 1);
+        assert_eq!(ex.matches("/.rlord-many/").count(), 1);
         assert!(git(&["-C", r, "status", "--porcelain"]).unwrap().is_empty());
         // Existing dir is refused, existing branch is checked out.
         assert!(worktree_add(r, "feature/one", &ws, None).is_err());

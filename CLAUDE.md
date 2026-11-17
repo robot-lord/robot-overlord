@@ -77,6 +77,9 @@ the deterministic part and hands it only what needs judgment.
   session's agent for a report, rlord works out which sessions changed since
   the overlord last reviewed them, what their meta-context is missing, and
   excerpts from their transcripts. The overlord spends tokens only on those.
+- Example: `repo_latest` (`crates/daemon/src/repo_latest.rs`). Rather than
+  have the overlord reason about which checkout is current, rlord fetches
+  the branch and hands back one read-only tree at its newest commit.
 - Signals come from data rlord already has: DB timestamps, hook events, kv
   watermarks, transcript files read directly. Don't add an AI call inside
   rlord to produce them.
@@ -150,18 +153,20 @@ hasn't seen.
 ## Releases: cut one after every merge to main
 
 Every PR merged to `main` ships as a release, cut by `cargo xtask release`
-(`xtask/src/release.rs`). Dev builds are built on the maintainer's Apple
-Silicon Mac. Stable releases are built in GitHub Actions
+(`xtask/src/release.rs`). Stable releases are built in GitHub Actions
 (`.github/workflows/release.yml`, started by the tag push); the build
 commands live in `cargo xtask build-release`, shared with the local
-fallback. CONTRIBUTING.md has the full setup.
+fallback. Dev builds are built on the maintainer's Apple Silicon Mac.
+CONTRIBUTING.md has the full setup.
 
 - **In each PR:** bump `[workspace.package] version` in `Cargo.toml` and
-  commit the regenerated `Cargo.lock`. Ordinary PRs bump to a **development
-  build**: the next version with `-dev.N` (`0.18.0` → `0.19.0-dev.1` for a
-  feature or `0.18.1-dev.1` for a fix, then `-dev.2`, … for later PRs
-  toward it). A **stable release** (`X.Y.Z`, no suffix) only when the user
-  asks for one. `cargo xtask check-version-bump` enforces a semver bump: CI
+  commit the regenerated `Cargo.lock`. A tested PR ships as a **stable
+  release**: a feature bumps the minor (`1.0.0` → `1.1.0`), a fix the
+  patch (`1.1.0` → `1.1.1`). A **development build** (`-dev.N`, a GitHub
+  pre-release of the next version: `1.2.0-dev.1`, then `-dev.2`, …) is
+  optional, only for work that isn't ready yet. Every merge is still
+  released (stable: CI builds every platform; `--local` when it is
+  urgent). `cargo xtask check-version-bump` enforces a semver bump: CI
   runs it on every PR, and `.githooks/pre-push` before pushing a branch
   (enable once per clone with `git config core.hooksPath .githooks`).
 - **After the PR merges, cutting the release is Claude's job.** Don't
@@ -240,7 +245,7 @@ Linux.
 Dependabot opens one grouped PR per week for Cargo and one for GitHub
 Actions (`.github/dependabot.yml`), here and in `robot-lord/website`. Its
 PRs don't bump the version, so `version-bump` fails on them: they need a
-bump commit (next `-dev.N`) before they can merge. CI's `advisories` job
+bump commit (the next patch, as a fix) before they can merge. CI's `advisories` job
 (cargo-deny, `deny.toml`) fails on known-vulnerable dependencies; an
 exception in `deny.toml` needs a reason.
 

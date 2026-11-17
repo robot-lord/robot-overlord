@@ -25,10 +25,15 @@ pub fn fmt_ts(ms: i64) -> String {
 /// Compact relative age: `12s`, `5m`, `3h`, `2d`, `6w`. `None` → `-`
 /// (unknown is displayed as unknown, never as epoch).
 pub fn rel_age(ms: Option<i64>) -> String {
-    let Some(ms) = ms else {
-        return "-".to_string();
-    };
-    let secs = ((now_ms() - ms) / 1000).max(0);
+    match ms {
+        Some(ms) => rel_age_at(ms, now_ms()),
+        None => "-".to_string(),
+    }
+}
+
+/// `rel_age` as seen at `now` (ms).
+pub fn rel_age_at(ms: i64, now: i64) -> String {
+    let secs = ((now - ms) / 1000).max(0);
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
