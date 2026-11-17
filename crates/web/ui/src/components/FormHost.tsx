@@ -1,10 +1,12 @@
 // The form open over the page (store.form), and the banner for one the
 // overlord opened while the user was typing in another.
 
+import { Fork } from "../forms/Fork";
+import { Keys } from "../forms/Keys";
 import { NewSession } from "../forms/NewSession";
+import { CodeFolder } from "../forms/CodeFolder";
 import type { Store } from "../store";
 import { formOf } from "../ui";
-import { Modal } from "./Modal";
 
 const NAMES: Record<string, string> = {
   describe: "new session",
@@ -18,9 +20,6 @@ const NAMES: Record<string, string> = {
 export function FormHost({ store }: { store: Store }) {
   const form = store.form.value;
   const parked = store.parked.value;
-  const close = () => {
-    store.form.value = null;
-  };
   return (
     <>
       {parked && (
@@ -47,11 +46,11 @@ export function FormHost({ store }: { store: Store }) {
         <NewSession store={store} kind="describe" cmd={form.cmd} />
       )}
       {form?.kind === "manual" && <NewSession store={store} kind="manual" cmd={form.cmd} />}
-      {form && !["describe", "confirm", "manual"].includes(form.kind) && (
-        <Modal title={NAMES[form.kind] ?? form.kind} onClose={close}>
-          <p class="hint">This form isn't in the web UI yet.</p>
-        </Modal>
+      {form?.kind === "setup" && <CodeFolder store={store} cmd={form.cmd} />}
+      {form?.kind === "keys" && (
+        <Keys store={store} row={form.cmd?.cmd === "keys" ? form.cmd.row : ""} />
       )}
+      {form?.kind === "fork" && form.session && <Fork store={store} s={form.session} />}
     </>
   );
 }

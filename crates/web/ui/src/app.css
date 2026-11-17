@@ -673,3 +673,34 @@ textarea {
 .choices button:hover {
   background: var(--line);
 }
+.menu {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+.keys {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+.keys td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.keys tr.on {
+  background: var(--line);
+}
+.keys kbd {
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+.finding-taken {
+  color: var(--bad);
+}
+.finding-shadows {
+  color: var(--warn);
+}
+.field-value button.on {
+  border-color: var(--accent);
+}

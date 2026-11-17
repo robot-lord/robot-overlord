@@ -8,6 +8,12 @@ import { Status, Work } from "../components/Status";
 import type { Row, SessionBase } from "../proto";
 import type { Store } from "../store";
 
+/** Open the fork form for `s` (not over a form the user is typing in). */
+export function openFork(store: Store, s: SessionBase): void {
+  if (store.form.value?.touched || s.role === "overlord") return;
+  store.form.value = { kind: "fork", cmd: null, touched: false, session: s };
+}
+
 /** Back to the list (narrow screens only show one at a time). */
 export function Back() {
   return (
@@ -66,7 +72,7 @@ export function Session({ store, id, token }: { store: Store; id: string; token:
         {s.description && <p class="desc-line">{s.description}</p>}
         <Work s={s} />
       </header>
-      <SessionActions s={s} r={act} />
+      <SessionActions s={s} r={act} onFork={() => openFork(store, s)} />
       <Pane
         key={s.id}
         target={s.id}

@@ -742,6 +742,28 @@ Decided 2026-11-17 (user):
     the overlord's note read-only; Launch starts the session, the page
     goes to it, and its background holds the note (from the daemon's
     proposal store).
+  - Step 9 done (`ui/src/forms/{Fork.tsx,setup.ts,CodeFolder.tsx,
+    Keys.tsx}`): the fork form (Fork among a session's buttons, key `f`
+    on a session; a worktree offered for Claude Code and Codex in a repo,
+    as `ForkForm::for_session`; warnings shown as a notice); the
+    code-folder form ("Code folder" in the header; the overlord's
+    `confirm_setup` opens it with its note and marks what it changed;
+    with a description it asks the overlord, else `form.setup_save`); the
+    key screen, read-only ("Keys" in the header, and `open_keys` with
+    only a page), with the note that keys change in a terminal. Vitest:
+    `forms.test.ts`. Choices within the plan:
+    - The code-folder form is `CodeFolder.tsx`, not `Setup.tsx`: on
+      macOS's case-insensitive disk `forms/Setup` resolves to
+      `forms/setup.ts`.
+    - The browser can't look at the disk, so it doesn't decide "create it"
+      or "home" itself: the daemon's save refuses, the form reads which
+      question its message asks (`askFor`), and the user's answer goes
+      back with `create` or `allow_home`.
+    Checked headless (Chromium and WebKit): `open_keys` from the stand-in
+    shows the keys with the asked one highlighted; `confirm_setup` opens
+    the form with its note, saving a new folder asks first, then writes
+    `code_dir` to the demo's config; a fork from a session's view starts
+    and the page goes to it.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

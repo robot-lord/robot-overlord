@@ -13,7 +13,7 @@ import { listView, Store } from "./store";
 import { decide, Reporter } from "./ui";
 import { List, open as openForm } from "./views/List";
 import { Overlord } from "./views/Overlord";
-import { Session } from "./views/Session";
+import { openFork, Session } from "./views/Session";
 import "./app.css";
 
 function safeStorage(): Storage | null {
@@ -109,15 +109,21 @@ function report(): void {
 }
 effect(report);
 document.addEventListener("visibilitychange", report);
-// The list's keys: n (describe a new session), N (manual). Never while
+// The list's keys: n (describe a new session), N (manual), f (fork the
+// session shown). Never while
 // typing in a field or a pane, or with a form open.
 document.addEventListener("keydown", (e) => {
   const t = e.target instanceof HTMLElement ? e.target : null;
   if (e.metaKey || e.ctrlKey || e.altKey || store.form.value) return;
   if (t?.closest("input, textarea, select, [contenteditable], .pane")) return;
+  const r = route.value;
   if (e.key === "n") openForm(store, "describe");
   else if (e.key === "N") openForm(store, "manual");
-  else return;
+  else if (e.key === "f" && r.kind === "session") {
+    const s = store.row(r.id);
+    if (!s) return;
+    openFork(store, s);
+  } else return;
   e.preventDefault();
 });
 for (const ev of ["pointerdown", "keydown", "wheel"] as const) {
@@ -145,6 +151,16 @@ function App() {
           {words[conn]}
         </span>
         {store.error.value && conn === "open" && <span class="err">{store.error.value}</span>}
+        {conn === "open" && (
+          <span class="menu">
+            <button type="button" class="dim" onClick={() => openForm(store, "setup")}>
+              Code folder
+            </button>
+            <button type="button" class="dim" onClick={() => openForm(store, "keys")}>
+              Keys
+            </button>
+          </span>
+        )}
       </header>
       <FormHost store={store} />
       <Toast store={store} />

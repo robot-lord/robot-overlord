@@ -6,7 +6,7 @@
 // replaces a form the user has typed into: it is parked, and a banner
 // offers to open it.
 
-import type { ListView, UiCmd } from "./proto";
+import type { ListView, SessionBase, UiCmd } from "./proto";
 import type { Route } from "./route";
 
 /** The forms a page can have open (`page.report`'s `form`). */
@@ -17,6 +17,8 @@ export interface OpenForm {
   kind: FormKind;
   cmd: UiCmd | null;
   touched: boolean;
+  /** The session a fork form forks. */
+  session?: SessionBase;
 }
 
 /** What to do for a command. */
