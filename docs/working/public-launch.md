@@ -68,7 +68,7 @@ done, in this order (decided with the user, 2026-11-12):
        launch"). Not checked live: a draft held in a running OpenCode
        session through rlord, and a subagent asking for an unlisted tool
        on OpenCode.
-7. [ ] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
+7. [x] Codex daemon mode (shipped, 0.23.0-dev.12). Codex Remote Control
        deferred past 1.0 (Brandon, 2026-11-13): wait until Codex makes it
        official. Findings and branch `codex-remote`:
        `docs/working-archive/codex-daemon.md`. Open until these live
@@ -88,9 +88,21 @@ done, in this order (decided with the user, 2026-11-12):
          rlord. Payloads and the bug it found (a `codex exec fork`
          `SessionStart` could bind a waiting session; fixed in
          0.23.0-dev.25): `docs/working-archive/codex-daemon.md`;
-       - [ ] a daemon restart or update mid-turn, by hand (what the session
+       - [x] a daemon restart or update mid-turn, by hand (what the session
          shows; `notLoaded` should read as not running, so it stops once
-         the pane is gone).
+         the pane is gone). Done 2026-11-16 on 0.23.0-dev.29, codex-cli
+         and daemon 0.169.0, macOS, scratch rlord and `CODEX_HOME` as
+         above (`daemon restart` only; `update` not run, nothing newer).
+         `restart` waits up to about 60s for a running turn, then
+         interrupts it (`turn_aborted`, `interrupted`), and the new daemon
+         at once starts the turn again on the same thread with no client
+         and no new prompt (the model re-ran its command). So the thread
+         stays loaded and `notLoaded` never came up; rlord was right
+         anyway: with the pane gone it stayed "working" while the
+         resumed turn ran and went "stopped" (`session_end`) within a
+         `discover` pass of `task_complete`. With the pane up, the TUI
+         showed "Conversation interrupted", then "Working" again, then
+         the answer. Details: `docs/working-archive/codex-daemon.md`.
        Linux is not a blocker (as in item 1): it is on the "After launch
        (owed, daemon mode)" list in `docs/working-archive/codex-daemon.md`.
 8. [x] Polish: clickable "more" markers, groups-tab counts, light-theme
@@ -144,8 +156,7 @@ done, in this order (decided with the user, 2026-11-12):
          They change how prompts and messages reach sessions, so settle
          them before calling it stable. They include the #64/#65
          leftovers and the accumulating pending message.
-       - [ ] By hand, by the user: the item 7 daemon restart check and the
-         item 9 macOS fresh install.
+       - [ ] By hand, by the user: the item 9 macOS fresh install.
 11. [ ] 1.0.0 stable.
 
 After 1.0:
