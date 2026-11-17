@@ -577,6 +577,12 @@ fn resolve(
     // what is left of the budget.
     if fetch == Fetch::Missing && from.is_some() {
         let mut failed = false;
+        // (Not within `LS_RETRY_MS` of a failed ask.)
+        let ask_again = if now - snap.ls_failed_at < LS_RETRY_MS {
+            latest::AskRemote::Never
+        } else {
+            latest::AskRemote::First(want.left(latest::LS_REMOTE))
+        };
         let retry = latest::default_branch(
             &env,
             &renv,
@@ -584,11 +590,16 @@ fn resolve(
             remote.as_deref(),
             None,
             true,
-            latest::AskRemote::First(want.left(latest::LS_REMOTE)),
+            ask_again,
             &mut failed,
         );
         learned.ls_failed |= failed;
-        if let Ok((b, f)) = retry {
+        // A launch never takes the checkout's own branch for the default
+        // one: it bails below (and starts at HEAD, saying why).
+        let retry = retry
+            .ok()
+            .filter(|(_, f)| want.deadline.is_none() || *f != latest::DefaultFrom::Current);
+        if let Some((b, f)) = retry {
             if b != branch {
                 branch = b;
                 current_only = f == latest::DefaultFrom::Current;
@@ -1164,8 +1175,9 @@ pub fn launch_base(d: &Daemon, params: &Value) -> Result<Value> {
         _ => {}
     }
     let wait = d.latest.timing().launch_wait;
-    // The side the user chose for a base that had diverged.
-    let prefer = match field("prefer") {
+    // The side the user chose for a base that had diverged: only with a
+    // named base (never for the default branch, which is the remote's).
+    let prefer = match field("prefer").filter(|_| named.is_some()) {
         Some(p) => {
             Some(Prefer::parse(p).ok_or_else(|| anyhow::anyhow!("prefer: local or remote"))?)
         }
@@ -2845,6 +2857,74 @@ mod tests {
         assert_eq!(dropped, vec!["origin/feat".to_string()]);
         assert!(latest::commit_of(&r.env, c, &latest::private_ref("origin", "feat")).is_none());
         assert!(latest::commit_of(&r.env, c, &latest::private_ref("upstream", "feat")).is_some());
+    }
+
+    /// The default branch gone from the remote, the remote not to be asked
+    /// again yet, no main/master here: a launch never takes the checkout's
+    /// own branch; it starts at HEAD and says why.
+    #[test]
+    fn a_launch_retry_never_takes_the_checkouts_branch() {
+        let r = Repos::new();
+        let c = &r.clone;
+        r.g(&r.remote, &["branch", "-m", "main", "trunk"]);
+        r.g(&r.remote, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+        r.g(c, &["checkout", "-q", "-b", "wip"]);
+        r.g(c, &["branch", "-D", "main"]);
+        r.g(c, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let d = daemon(&r);
+        // (origin/HEAD still says main; the remote failed a moment ago.)
+        put_rec(
+            &d,
+            &c.join(".git"),
+            Rec {
+                root: c.to_string_lossy().into_owned(),
+                ls_failed_at: now_ms(),
+                ..Rec::default()
+            },
+        );
+        let b = launch_base(&d, &json!({"repo": c, "name": "x"})).unwrap();
+        assert_eq!(b["head"], true, "{b}");
+        assert!(b["why"].as_str().unwrap().contains("no branch main"), "{b}");
+    }
+
+    /// `prefer` without a named base is ignored at launch: the default
+    /// branch is the remote's even with an unpushed local commit.
+    #[test]
+    fn a_launch_ignores_prefer_without_a_base() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let theirs = r.g(c, &["rev-parse", "HEAD"]);
+        r.commit(c, "unpushed");
+        let d = daemon(&r);
+        let b = launch_base(&d, &json!({"repo": c, "name": "x", "prefer": "local"})).unwrap();
+        assert_eq!(b["commit"], theirs.as_str(), "{b}");
+    }
+
+    /// The repo moved with its tree: the tree's `.git` names the old
+    /// place. Git repairs it and the tree is moved as usual.
+    #[test]
+    fn a_moved_repos_tree_is_repaired() {
+        let r = Repos::new();
+        let d = daemon(&r);
+        call(&d, &r.clone, json!({}));
+        let moved = r.root().join("moved-clone");
+        std::fs::rename(&r.clone, &moved).unwrap();
+        let newer = r.push_remote("main", "newer");
+        let d = daemon(&r);
+        let v = call(&d, &moved, json!({}));
+        assert_eq!(
+            v["path"],
+            json!(moved.join(".worktrees/.rlord-latest")),
+            "{v}"
+        );
+        assert_eq!(v["commit"], newer.as_str());
+        assert_eq!(
+            r.g(
+                &moved.join(".worktrees/.rlord-latest"),
+                &["rev-parse", "HEAD"]
+            ),
+            newer
+        );
     }
 
     /// A failed `ls-remote` is remembered: not asked again for a while.

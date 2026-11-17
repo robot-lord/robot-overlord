@@ -736,7 +736,10 @@ the newest committed code of a repo, as plain code (`core/src/latest.rs` for git
   worktree for is replaced only when it is recognizably a leftover
   rlord tree (empty, or a `.git` file pointing into this repo's
   `worktrees/`) and rlord may touch files there; else an error names
-  it. A lock or a time limit (its `status` gets the checkout's 120 s) is
+  it. One whose `.git` names `worktrees/-rlord-latest` in another place
+  (the repo was moved with it) is put right with `git worktree repair`,
+  then moved as usual. "Prunable" with the folder still there (its
+  `.git` gone) is removed and made again, not force-added over. A lock or a time limit (its `status` gets the checkout's 120 s) is
   an error, and the tree is left as it is. A tree at an earlier path that can't be
   removed stays in the record (`old_trees`); the sweep and prune try
   again, never at the live tree's path. A live tree the sweep or prune
@@ -795,7 +798,11 @@ the newest committed code of a repo, as plain code (`core/src/latest.rs` for git
   and its note says why. Any call's `ls-remote` answer is recorded, and
   so is its failure, even when the launch then falls back. A failed
   `ls-remote` isn't tried again for 5 minutes. Never `remote set-head`. A
-  HEAD naming a branch the remote no longer has (renamed) is asked again.
+  default branch the remote no longer has (renamed) is asked of the
+  remote again, whatever found it (not within 5 minutes of a failed
+  ask); a launch still without one starts at HEAD, never at the
+  checkout's branch. A launch's `prefer` counts only with a named
+  `base`.
 - **Never hang, never prompt.** Every call goes through `latest::run`: a
   time limit (10 s plumbing, 120 s checkout, 8 s `ls-remote`, 300 s
   fetch) that kills git's process group, no terminal or askpass prompt,

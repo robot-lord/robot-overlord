@@ -1175,6 +1175,29 @@ pub fn tree_add_fresh(
     if !dir.exists() {
         return Err(e);
     }
+    // The repo was moved with its tree: the tree's `.git` file names the
+    // old admin dir. Git puts that right (`worktree repair`); then it is
+    // moved to the commit like any tree.
+    if moved_tree(dir) {
+        let d = dir.to_string_lossy();
+        let repaired = run(
+            env,
+            &repo.root,
+            &["worktree", "repair", d.as_ref()],
+            CHECKOUT,
+        )
+        .is_ok_and(|o| o.ok);
+        if repaired && inspect(env, repo, dir)? == Some(true) {
+            git(
+                env,
+                dir,
+                &["checkout", "--quiet", "--detach", "--force", commit],
+                CHECKOUT,
+            )?;
+            git(env, dir, &["clean", "-fdxq"], CHECKOUT)?;
+            return Ok(true);
+        }
+    }
     if !leftover(repo, dir) {
         bail!(
             "{} is there, git has no worktree at it, and it isn't a leftover rlord tree: \
@@ -1186,6 +1209,39 @@ pub fn tree_add_fresh(
         .with_context(|| format!("removing the leftover tree {}", dir.display()))?;
     tree_add(env, repo, dir, commit, false)?;
     Ok(true)
+}
+
+/// Whether `dir`'s `.git` file names an admin dir `worktrees/<name>` for
+/// rlord's tree (`<name>` is `TREE_NAME`, maybe with git's number), in
+/// whatever repo: the tree of a repo that was moved.
+fn moved_tree(dir: &Path) -> bool {
+    if dir.file_name().and_then(|n| n.to_str()) != Some(TREE_NAME) {
+        return false;
+    }
+    let git = dir.join(".git");
+    if !std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    std::fs::read_to_string(&git).is_ok_and(|t| {
+        let Some(p) = t
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(|p| Path::new(p.trim()))
+        else {
+            return false;
+        };
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // (Git names the admin dir after the folder, its leading dot made
+        // a dash: `-rlord-latest`, maybe numbered.)
+        p.parent()
+            .and_then(|x| x.file_name())
+            .and_then(|n| n.to_str())
+            == Some("worktrees")
+            && name
+                .trim_start_matches(['.', '-'])
+                .strip_prefix(TREE_NAME.trim_start_matches('.'))
+                .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+    })
 }
 
 /// Whether the folder at `dir` is recognizably a leftover of rlord's
@@ -1276,7 +1332,10 @@ pub fn tree_move(
     };
     // Its folder gone: added again over its registration (git only, so
     // this works in a guarded folder too).
-    if entry.prunable {
+    // ("prunable" may also mean the folder is there with its `.git` gone:
+    // that goes the way of a broken tree, below. In a guarded folder
+    // nothing is statted: git's add is tried.)
+    if entry.prunable && (!fs_ok || matches!(dir.try_exists(), Ok(false))) {
         tracing::warn!(tree = %dir.display(), "rlord's tree folder is gone: adding it again");
         tree_add(env, repo, dir, commit, true)?;
         return Ok(recreated);
@@ -1372,9 +1431,14 @@ pub fn tree_remove(
     // (A folder is deleted only when, seen from inside, it is that
     // worktree, detached; or, not a worktree at all any more, a leftover
     // of rlord's: `leftover`.)
+    // (Or registered as rlord's tree, `may_touch` above, and its `.git`
+    // gone: git calls it prunable.)
     let ours = match inspect(env, repo, dir) {
         Ok(Some(true)) => true,
-        Ok(None) => leftover(repo, dir),
+        Ok(None) => {
+            leftover(repo, dir)
+                || (entry.prunable && fs_ok && matches!(dir.join(".git").try_exists(), Ok(false)))
+        }
         _ => false,
     };
     if fs_ok && ours {
@@ -2255,6 +2319,26 @@ mod tests {
         assert!(e.prunable);
         let m = tree_move(&r.env, &repo, &dir, &head, rec, Some(&head), &e, false).unwrap();
         assert!(m.recreated && dir.join("f.txt").exists());
+    }
+
+    /// Registered, its folder there but its `.git` gone (git calls it
+    /// prunable too): not force-added over (that fails every time), but
+    /// removed and made again.
+    #[test]
+    fn a_tree_without_its_git_file_is_made_again() {
+        let r = Repos::new();
+        let c = &r.clone;
+        let repo = repo_of(&r, c);
+        let head = r.g(c, &["rev-parse", "HEAD"]);
+        let dir = tree_path(c);
+        let rec = Some(dir.as_path());
+        tree_add(&r.env, &repo, &dir, &head, false).unwrap();
+        std::fs::remove_file(dir.join(".git")).unwrap();
+        let e = entry(&r, &repo, &dir).unwrap();
+        assert!(e.prunable);
+        let m = tree_move(&r.env, &repo, &dir, &head, rec, None, &e, true).unwrap();
+        assert!(m.recreated);
+        assert_eq!(commit_of(&r.env, &dir, "HEAD").unwrap(), head);
     }
 
     /// A folder at the tree's path that git doesn't know: replaced only

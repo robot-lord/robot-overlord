@@ -562,6 +562,13 @@ fn confirm_params(args: &Value) -> Value {
             p.insert(k.into(), v.clone());
         }
     }
+    // (A side only with the base it is for.)
+    if p.get("base")
+        .and_then(Value::as_str)
+        .is_none_or(|b| b.trim().is_empty())
+    {
+        p.remove("prefer");
+    }
     Value::Object(p)
 }
 
@@ -586,6 +593,10 @@ fn new_session_params(args: &Value) -> Value {
     let related = crate::methods::ref_list(args, "related");
     if !related.is_empty() {
         p.insert("related".into(), json!(related));
+    }
+    // (A side only with the base it is for.)
+    if !p.contains_key("base") {
+        p.remove("prefer");
     }
     Value::Object(p)
 }
@@ -1084,6 +1095,20 @@ mod tests {
         let out = shape_find_repos(&json!({"repos": [], "roots": []}), "");
         assert!(out["note"].as_str().unwrap().contains("no code folder"));
         assert!(out.get("skipped").is_none());
+    }
+
+    /// `prefer` without a `base` goes nowhere (create, propose, confirm).
+    #[test]
+    fn prefer_goes_only_with_a_base() {
+        let a = json!({"prompt": "x", "prefer": "local"});
+        assert!(new_session_params(&a).get("prefer").is_none());
+        assert!(
+            confirm_params(&json!({"description": "d", "prefer": "local"}))
+                .get("prefer")
+                .is_none()
+        );
+        let b = json!({"prompt": "x", "base": "feat", "prefer": "local"});
+        assert_eq!(new_session_params(&b)["prefer"], "local");
     }
 
     /// `confirm_new_session` passes `base` and `prefer` on to the form,
