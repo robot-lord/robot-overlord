@@ -264,7 +264,9 @@ Then launch with three things, kept apart:
 After launching, file the new session into a group and give it a one-line
 description (`update_session`; use the tags given, else check `list_groups`
 and reuse one), then reply in one line: name, repo, and anything you changed
-or assumed. If the description asks to go there, use `goto_session`.
+or assumed. If the description asks to go there, use `goto_session`;
+otherwise end that reply by asking whether to take the user there, and
+use `goto_session` if they say yes.
 
 A request in conversation to start work ("start a session on the auth
 bug") is handled the same way. A good session has a short, specific name
