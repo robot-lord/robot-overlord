@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1: steps 1–12 built; steps 13–14 not started)
+**Status:** in progress (slice 1: steps 1–13 built; step 14 not started)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -485,6 +485,43 @@ Decided 2026-11-17 (user):
     point `RLORD_WEB_BIN` at a missing file.
   - Not tested: the download itself (no network in tests); first real
     check is the release dry run.
+
+- Step 13 done (`xtask/src/{version,build,release,fresh_install}.rs`,
+  `smoke_in_container.sh`, `fresh_install.sh`, `release.yml`,
+  `ui/vite.config.ts`): `Version::web_tarball` (`rlord-web-v<ver>-<target>
+  .tar.gz`: the binary, both licenses, `THIRD-PARTY-LICENSES.md`), in
+  `tarballs()` and so in `workflow_assets()`, preflight's asset list,
+  `SHA256SUMS`, the attestations and `verify_and_publish`; a dev build
+  checks `dev_assets()` (both macOS tarballs). `build-release`, per target:
+  the plugin (`-p robot-overlord-web`, `RLORD_WEB_REQUIRE_ASSETS=1`),
+  `codesign` on macOS, SHA-256, then `rlord` with `RLORD_WEB_SHA256`, both
+  tarballs. The page is built once first (`cargo xtask web build`) or
+  copied from `RLORD_WEB_DIST`. `release.yml`: `build-macos` and
+  `build-linux` need `web-assets`, download `web-page` and set
+  `RLORD_WEB_DIST`. Smoke (`smoke-linux`) and `fresh-install` install the
+  plugin with `rlord web install --yes --from /dist`, check `(verified)`
+  and start it (`rlord web url`). Choices within the plan:
+  - **The build checks the coupling itself**: after packing a target it can
+    run (macOS on the Mac, x86_64 Linux on CI's runner), the new `rlord`
+    installs the new plugin with `web install --from` in a scratch home
+    (`check_install`); a mismatch stops the build before anything ships.
+  - The licenses come from Vite's own `build.license`
+    (`THIRD-PARTY-LICENSES.md` in `dist/`, so the page's artifact carries
+    it to the build jobs, and the plugin also serves it). `.md` is
+    `text/markdown`.
+  - `sha256` in xtask runs `shasum` (as `write_sums` does): xtask has no
+    hashing crate.
+  - Checked here: `cargo xtask build-release macos` (plugin signed, its
+    hash found in the built `rlord`, `check_install` passed) and
+    `build-release linux` (both targets, debs and rpms), then
+    `smoke-linux` on ubuntu:24.04 and 22.04 with the web steps. The
+    `fresh-install --offline --only tarball,deb ubuntu:24.04` (the deb's
+    `rlord` also takes the plugin: same binary, same hash). The
+    smoke step first piped `rlord web status` into `grep -q`, which made
+    rlord panic on the closed pipe; it reads from a file now.
+  - Owed: a dry run of `release.yml` (`workflow_dispatch`, `dry_run`)
+    before the next stable release; it needs the branch pushed. No
+    release was cut or tagged.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

@@ -16,6 +16,9 @@ export default defineConfig({
     modulePreload: { polyfill: false },
     sourcemap: false,
     reportCompressedSize: false,
+    // The bundled packages' licenses, shipped in the plugin's tarball
+    // (`cargo xtask build-release`) and served beside the page.
+    license: { fileName: "THIRD-PARTY-LICENSES.md" },
   },
   test: {
     include: ["test/**/*.test.ts"],

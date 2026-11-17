@@ -31,6 +31,7 @@
 //!   the workflow's (rehearse that with a dry run of release.yml).
 //!
 //! Assets: rlord-v<ver>-<target>.tar.gz (rlord, install.sh, licenses),
+//! rlord-web-v<ver>-<target>.tar.gz (the opt-in web plugin, its licenses),
 //! SHA256SUMS; stable also rlord_<ver>-1_<arch>.deb and
 //! rlord-<ver>-1.<arch>.rpm.
 //!
@@ -221,7 +222,13 @@ pub fn main(args: &[String]) -> Result<()> {
     match mode {
         Mode::Dev | Mode::StableLocal { .. } => {
             build::build(Platform::Macos, &dist)?;
-            if mode != Mode::Dev {
+            if mode == Mode::Dev {
+                for asset in ver.dev_assets() {
+                    if !dist.join(&asset).is_file() {
+                        bail!("the build didn't write {asset}");
+                    }
+                }
+            } else {
                 build::build(Platform::Linux, &dist)?;
                 // What CI's "Check assets" step checks, for a release made here.
                 for asset in ver.workflow_assets() {
