@@ -59,10 +59,17 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
             let bin = binary(&target_dir, MAC);
             // The linker ad-hoc signs, but post-link strip can leave the
             // signature stale; re-sign so the binary runs on other Macs
-            // (arm64 refuses unsigned code).
+            // (arm64 refuses unsigned code). With a Developer ID in the
+            // keychain the signature keeps one identity across builds, so
+            // macOS privacy grants (folder access) survive an update.
+            let identity = sign_identity();
+            match &identity {
+                Some(name) => eprintln!("signing with {name}"),
+                None => eprintln!("signing ad-hoc (no Developer ID Application identity)"),
+            }
             cmd::run(
                 Command::new("codesign")
-                    .args(["--force", "--sign", "-"])
+                    .args(sign_args(identity.as_deref()))
                     .arg(&bin),
             )?;
             cmd::run(Command::new("codesign").arg("--verify").arg(&bin))?;
@@ -172,4 +179,83 @@ fn pack(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) ->
             .arg(stage)
             .arg(&name),
     )
+}
+
+/// The bundle-style identifier a Developer ID signature carries. Fixed, so
+/// macOS sees every build as the same program.
+const SIGN_ID: &str = "com.robot-lord.rlord";
+
+/// `codesign` arguments: a Developer ID with hardened runtime and a secure
+/// timestamp, or ad-hoc (`-`) when there is none.
+fn sign_args(identity: Option<&str>) -> Vec<String> {
+    match identity {
+        Some(name) => [
+            "--force",
+            "--sign",
+            name,
+            "--options",
+            "runtime",
+            "--timestamp",
+            "--identifier",
+            SIGN_ID,
+        ]
+        .map(String::from)
+        .to_vec(),
+        None => ["--force", "--sign", "-"].map(String::from).to_vec(),
+    }
+}
+
+/// The identity to sign with. `RLORD_SIGN_IDENTITY` wins ("-" or "" for
+/// ad-hoc); otherwise the keychain's first valid "Developer ID
+/// Application" identity, if any (none on CI runners: ad-hoc there).
+fn sign_identity() -> Option<String> {
+    if let Ok(v) = std::env::var("RLORD_SIGN_IDENTITY") {
+        let v = v.trim();
+        return (!v.is_empty() && v != "-").then(|| v.to_string());
+    }
+    let out = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    developer_id(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The first "Developer ID Application: …" name in `security
+/// find-identity -v` output.
+fn developer_id(listing: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let start = line.find('"')?;
+        let rest = &line[start + 1..];
+        let name = &rest[..rest.find('"')?];
+        name.starts_with("Developer ID Application:")
+            .then(|| name.to_string())
+    })
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_developer_id_identity() {
+        let listing = "  1) ABCDEF \"Apple Development: X (T1)\"\n  2) 012345 \"Developer ID Application: Brandon Ayers (PL2X8AJK8A)\"\n     2 valid identities found\n";
+        assert_eq!(
+            developer_id(listing).as_deref(),
+            Some("Developer ID Application: Brandon Ayers (PL2X8AJK8A)")
+        );
+        assert_eq!(developer_id("     0 valid identities found\n"), None);
+    }
+
+    #[test]
+    fn signs_ad_hoc_without_an_identity() {
+        assert_eq!(sign_args(None), ["--force", "--sign", "-"]);
+        let a = sign_args(Some("Developer ID Application: X (T)"));
+        assert!(a.windows(2).any(|w| w == ["--options", "runtime"]));
+        assert!(a.windows(2).any(|w| w == ["--identifier", SIGN_ID]));
+        assert!(a.contains(&"--timestamp".to_string()));
+    }
 }
