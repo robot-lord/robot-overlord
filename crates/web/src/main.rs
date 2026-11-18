@@ -16,6 +16,7 @@ mod assets;
 mod daemon;
 mod http;
 mod pane;
+mod remote;
 mod token;
 
 use std::process::ExitCode;
@@ -86,6 +87,7 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
             swept.len()
         );
     }
+    let remote = remote::start(d.clone(), Config::load()?.remote, rev.clone());
     let app = http::App::new(token, port, d, rev);
     // No page is open yet (a plugin before this one may have left some).
     app.report_pages().await;
@@ -95,7 +97,10 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
     tokio::spawn(async move {
         while let Some(e) = sub.next().await {
             match e {
-                daemon::Event::Changed(rev) => pump.changed(rev),
+                daemon::Event::Changed(rev) => {
+                    remote.changed(rev.clone());
+                    pump.changed(rev)
+                }
                 daemon::Event::Ui { page, cmd } => pump.ui(&page, cmd).await,
             }
         }

@@ -29,8 +29,17 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Constant-time token compare.
 subtle = "2"
+# Remote access (src/remote/): the end-to-end core, the relay link, and a
+# TLS websocket client to the one pinned relay (ring, webpki's roots; no
+# aws-lc, no native TLS).
+rlord-e2e = { package = "robot-overlord-e2e", path = "../e2e" }
+rlord-relay-proto = { package = "robot-overlord-relay-proto", path = "../relay-proto" }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+getrandom = "0.3"
+base64 = "0.22"
 
 [dev-dependencies]
 rlord-daemon = { package = "robot-overlord-daemon", path = "../daemon" }
 tempfile = "3"
-tokio-tungstenite = "0.29"
