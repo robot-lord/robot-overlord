@@ -4,8 +4,23 @@
 // until proto.ts follows.
 
 import { describe, expect, it } from "vitest";
-import type { Group, Overlord, RosterEntry, Row, Snapshot, Status } from "../src/proto";
+import type {
+  FormDefaults,
+  FormRepos,
+  FormSetup,
+  Group,
+  Overlord,
+  RosterEntry,
+  Row,
+  Snapshot,
+  Status,
+  UiCmd,
+} from "../src/proto";
+import defaults from "./fixtures/form_defaults.json";
+import repos from "./fixtures/form_repos.json";
+import setup from "./fixtures/form_setup.json";
 import fixture from "./fixtures/snapshot.json";
+import cmds from "./fixtures/ui_cmds.json";
 
 // --- Type-level checks (`tsc --noEmit` fails on a mismatch) ---
 
@@ -49,9 +64,39 @@ const keys: [
   Equal<keyof FxGroup, RequiredKeys<Group>>,
 ] = [true, true, true, true, true];
 
+// The UI commands (one of each) and the forms' answers, as the daemon
+// sends them (the answers have more fields than the forms use).
+type Cmd<C extends UiCmd["cmd"]> = Widen<Extract<UiCmd, { cmd: C }>>;
+const cmdsFit: {
+  goto: Cmd<"goto">;
+  show_list: Cmd<"show_list">;
+  set_view: Cmd<"set_view">;
+  new_session: Cmd<"new_session">;
+  confirm_new_session: Cmd<"confirm_new_session">;
+  setup: Cmd<"setup">;
+  keys: Cmd<"keys">;
+  notice: Cmd<"notice">;
+} = cmds;
+const cmdKeys: Equal<keyof typeof cmds, UiCmd["cmd"]> = true;
+const formsFit: [Widen<FormDefaults>, Widen<FormRepos>, Widen<FormSetup>] = [
+  defaults,
+  repos,
+  setup,
+];
+
 // --- Values the types can't see ---
 
 const STATUSES: Status[] = ["starting", "working", "waiting_input", "idle", "stopped", "error"];
+
+describe("ui command and form fixtures", () => {
+  it("fit proto.ts", () => {
+    expect(cmdKeys).toBe(true);
+    for (const [name, c] of Object.entries(cmdsFit)) expect(c.cmd).toBe(name);
+    expect(formsFit[0].agents.length).toBeGreaterThan(0);
+    expect(formsFit[1].repos[0]?.path).toBeTruthy();
+    expect(typeof formsFit[2].status.needed).toBe("boolean");
+  });
+});
 
 describe("snapshot fixture", () => {
   it("fits proto.ts", () => {

@@ -692,6 +692,22 @@ pub struct WebConfig {
     /// the browser keeps the token per origin, and the origin includes the
     /// port.
     pub port: u16,
+    /// Where the overlord's UI commands (go to a session, show the list,
+    /// open a form) land when both a terminal and a web page are open.
+    pub ui_target: UiTarget,
+}
+
+/// `[web] ui_target`: which screen gets the overlord's UI commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiTarget {
+    /// The one the user did something on last.
+    #[default]
+    Auto,
+    /// The terminal whenever one is attached (else the web page).
+    Terminal,
+    /// The web page whenever one is open (else the terminal).
+    Web,
 }
 
 pub const DEFAULT_WEB_PORT: u16 = 47811;
@@ -701,6 +717,7 @@ impl Default for WebConfig {
         WebConfig {
             enabled: false,
             port: DEFAULT_WEB_PORT,
+            ui_target: UiTarget::Auto,
         }
     }
 }
@@ -1151,6 +1168,10 @@ resume_message = "continue"
 [web]
 enabled = false
 port = 47811     # fixed: the browser keeps the token per address (0 = any)
+# Where the overlord shows things (a session, the list, a form) when a
+# terminal and the web page are both open: "auto" (the one you used
+# last), "terminal" or "web".
+ui_target = "auto"
 "##;
 
 #[cfg(test)]
@@ -1249,6 +1270,10 @@ mod tests {
         assert!(!c.web.enabled);
         assert_eq!(c.web.port, 0);
         assert!(toml::from_str::<Config>("[web]\nport = 70000\n").is_err());
+        assert_eq!(c.web.ui_target, UiTarget::Auto);
+        let c: Config = toml::from_str("[web]\nui_target = \"web\"\n").unwrap();
+        assert_eq!(c.web.ui_target, UiTarget::Web);
+        assert!(toml::from_str::<Config>("[web]\nui_target = \"both\"\n").is_err());
     }
 
     #[test]

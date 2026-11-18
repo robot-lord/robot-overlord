@@ -9,6 +9,8 @@ export interface Hello {
   /** The plugin's version plus a hash of its embedded page: a page from another build reloads. */
   build: string;
   rev: string;
+  /** This page's id: the daemon addresses UI commands to it. */
+  page: string;
 }
 
 /** Something in the daemon changed: ask for a new snapshot. */
@@ -25,7 +27,13 @@ export interface Reply {
   error?: { code: ErrorCode; message: string };
 }
 
-export type ControlMessage = Hello | Changed | Reply;
+/** A UI command from the overlord, for this page (`UiCmd`). */
+export interface UiEvent {
+  event: "ui";
+  cmd: UiCmd;
+}
+
+export type ControlMessage = Hello | Changed | UiEvent | Reply;
 
 /**
  * The ops the daemon takes from the page: its allow-list
@@ -47,6 +55,18 @@ export const OPS = [
   "session.tag",
   "session.pin",
   "overlord.switch",
+  "page.report",
+  "page.pending",
+  "view.default",
+  "keys.list",
+  "form.defaults",
+  "form.repos",
+  "form.setup",
+  "form.setup_save",
+  "overlord.new_session",
+  "overlord.setup_request",
+  "session.new",
+  "session.fork",
 ] as const;
 
 export type Op = (typeof OPS)[number];
@@ -206,7 +226,172 @@ export interface Query {
   archived?: "live" | "only" | "all";
   sort?: Sort;
   reverse?: boolean;
-  search?: string;
+  /** The filter box's text; the daemon reads its `tag:` / `status:` tokens. */
+  query?: string;
+  /** The usage measure; none: the user's own (or the configured one). */
+  usage?: string;
 }
 
 export type Sort = "activity" | "user" | "state" | "created" | "name" | "usage";
+
+// The overlord's UI commands for this page (crates/daemon/src/ui.rs; one
+// of each in test/fixtures/ui_cmds.json, written by a daemon test).
+
+/** A list view as the daemon and the TUI hold it (`ui::normalize_view`). */
+export interface ListView {
+  /** The filter box's text (the TUI's syntax: `tag:x status:needs …`). */
+  query: string;
+  /** A sort label (`updated`, `user`, `state`, `created`, `name`, `usage`). */
+  sort: string;
+  reverse: boolean;
+  /** The usage measure (`turns`, `tokens`, `context`); null: the default. */
+  usage: string | null;
+  archived: string;
+  tab: string;
+  /** The picked group ("" untagged); null: none. */
+  group: string | null;
+}
+
+/** The overlord's new-session proposal (`propose_session`). */
+export interface NewPrefill {
+  repo?: string;
+  project?: string;
+  name?: string;
+  branch?: string;
+  agent?: string;
+  model?: string;
+  prompt?: string;
+  /** The overlord's background, shown read-only (sent back by `proposal`). */
+  context?: string;
+  base?: string;
+  prefer?: string;
+  workspace?: boolean;
+  related?: string[];
+  related_names?: string[];
+  /** The id the launch names so the daemon adds the background. */
+  proposal: string;
+}
+
+/** The describe form reopened with the overlord's hints (`confirm_new_session`). */
+export interface ConfirmPrefill {
+  description: string;
+  repo?: string;
+  project?: string;
+  agent?: string;
+  /** "" is the agent's default. */
+  model?: string;
+  base?: string;
+  prefer?: string;
+  workspace?: boolean;
+  tags?: string[];
+  changed?: string[];
+  note?: string;
+  /** Hints that are the user's own picks. */
+  chosen: string[];
+  /** Hints the overlord set. */
+  resolved: string[];
+}
+
+/** The code-folder form as the overlord proposes it (`confirm_setup`). */
+export interface SetupPrefill {
+  code_dir?: string;
+  repo_roots?: string[];
+  description?: string;
+  note?: string;
+  changed?: string[];
+}
+
+/** The code folder as configured now (`setup.status`). */
+export interface SetupStatus {
+  code_dir: string;
+  done: boolean;
+  needed: boolean;
+  repo_roots: string[];
+  roots_default: string;
+  skipped: boolean;
+}
+
+export type UiCmd =
+  | { cmd: "goto"; id: string; overlord: boolean }
+  | { cmd: "show_list" }
+  | { cmd: "set_view"; view: ListView; select?: string }
+  | { cmd: "new_session"; prefill: NewPrefill }
+  | { cmd: "confirm_new_session"; prefill: ConfirmPrefill }
+  | { cmd: "setup"; prefill: SetupPrefill; status: SetupStatus }
+  | { cmd: "keys"; row: string }
+  | { cmd: "notice"; text: string };
+
+/** One agent the forms offer (`session.defaults`' `agents`). */
+export interface AgentChoice {
+  name: string;
+  label: string;
+  installed: boolean;
+  /** rlord can run it (false: `too_old` says the version). */
+  supported: boolean;
+  too_old: string | null;
+  hooks: boolean | null;
+  model: string;
+  models: string[];
+  install: { command: string; docs: string; via: string; alternatives: unknown[] } | null;
+}
+
+/** The forms' defaults (op `form.defaults`). */
+export interface FormDefaults {
+  agent: string;
+  agents: AgentChoice[];
+  base: string;
+  code_dir: string;
+  default_repo: string;
+  model: string;
+  workspace: boolean;
+}
+
+/** One repo the finder knows. */
+export interface RepoChoice {
+  path: string;
+  default: boolean;
+  last_used_at: number | null;
+}
+
+/** The repo finder (op `form.repos`). */
+export interface FormRepos {
+  repos: RepoChoice[];
+  /** The first disk scan is still running: ask again shortly. */
+  scanning: boolean;
+  skipped: string[];
+  skipped_more: number;
+  roots: string[];
+  code_dir: string;
+  depth: number;
+}
+
+/** A code folder rlord suggests, or an alternative. */
+export interface Candidate {
+  path: string;
+  [k: string]: unknown;
+}
+
+/** The code-folder form's look-up (op `form.setup`). */
+export interface FormSetup {
+  status: SetupStatus;
+  suggest: {
+    suggestion: Candidate | null;
+    alternatives: Candidate[];
+    code_dir: string;
+    needed: boolean;
+    done: boolean;
+    roots: { configured: string[]; effective: string[] };
+    roots_default: string;
+    sources: Record<string, unknown>;
+  };
+}
+
+/** One key rlord binds (op `keys.list`). */
+export interface KeyRow {
+  id: string;
+  does: string;
+  where: string;
+  key: string;
+  default: string;
+  findings: { level: string; text: string }[];
+}

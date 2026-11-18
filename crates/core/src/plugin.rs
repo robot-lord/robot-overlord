@@ -13,7 +13,7 @@ use crate::paths;
 
 /// Bumped whenever a `web.*` daemon method the plugin uses changes shape.
 /// The plugin's `web.hello` carries it; the daemon refuses another one.
-pub const WEB_PROTOCOL: u32 = 1;
+pub const WEB_PROTOCOL: u32 = 2;
 
 /// The plugin's executable name.
 pub const BIN_NAME: &str = "rlord-web";
@@ -82,6 +82,32 @@ pub fn installed_path() -> PathBuf {
 /// The web plugin's token file (0600, made by the plugin, read by the CLI).
 pub fn token_path() -> PathBuf {
     paths::data_dir().join("web.token")
+}
+
+/// The page's URL for a plugin on `port`, with the token in the fragment
+/// (which the browser never sends anywhere).
+pub fn page_url(port: u64) -> Result<String> {
+    let path = token_path();
+    let token = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading the web token ({})", path.display()))?;
+    Ok(format!("http://127.0.0.1:{port}/#t={}", token.trim()))
+}
+
+/// Open `url` in the user's browser (`open` on macOS, `xdg-open`
+/// elsewhere). False when that didn't work.
+pub fn open_in_browser(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Where the daemon appends the plugin's output.

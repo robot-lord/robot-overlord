@@ -113,7 +113,15 @@ export function ResumeButton({ s, r }: { s: SessionBase; r: Runner }) {
 }
 
 /** A session's buttons, and its edit form when open. */
-export function SessionActions({ s, r }: { s: SessionBase; r: Runner }) {
+export function SessionActions({
+  s,
+  r,
+  onFork,
+}: {
+  s: SessionBase;
+  r: Runner;
+  onFork?: () => void;
+}) {
   const [editing, setEditing] = useState(false);
   const ref = s.id;
   const busy = r.busy !== null;
@@ -162,6 +170,16 @@ export function SessionActions({ s, r }: { s: SessionBase; r: Runner }) {
         <button type="button" aria-expanded={editing} onClick={() => setEditing(!editing)}>
           Edit
         </button>
+        {onFork && (
+          <button
+            type="button"
+            disabled={busy}
+            title="a new session from a copy of its conversation (f)"
+            onClick={onFork}
+          >
+            Fork
+          </button>
+        )}
       </>
     );
   }

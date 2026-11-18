@@ -3,12 +3,15 @@
 // live/archived. The daemon sorts and groups; this draws.
 
 import { useSignal, useSignalEffect } from "@preact/signals";
+import { useEffect } from "preact/hooks";
 import { Tell } from "../components/Actions";
 import { now, ago, lastUpdate } from "../components/time";
 import { Status } from "../components/Status";
+import { usageFigure } from "../components/usage";
 import type { Overlord, Row, Snapshot } from "../proto";
 import { href, type Route } from "../route";
 import { SORTS, type Store, type View } from "../store";
+import type { FormKind } from "../ui";
 
 /** "Claude Code" for "claude", from the overlord's roster. */
 function agentLabels(s: Snapshot | null): Map<string, string> {
@@ -19,9 +22,27 @@ export function List({ store, route }: { store: Store; route: Route }) {
   const snap = store.snapshot.value;
   const view = store.view.value;
   const labels = agentLabels(snap);
-  const selected = route.kind === "session" ? route.id : null;
+  // The open session, else the row the overlord asked to highlight.
+  const selected = route.kind === "session" ? route.id : store.selected.value;
   return (
     <div class="list">
+      <div class="new">
+        <button
+          type="button"
+          title="describe it; the overlord sets it up (n)"
+          onClick={() => open(store, "describe")}
+        >
+          + New session
+        </button>
+        <button
+          type="button"
+          class="dim"
+          title="pick every field yourself (N)"
+          onClick={() => open(store, "manual")}
+        >
+          Manual
+        </button>
+      </div>
       <Controls store={store} view={view} />
       {snap && <OverlordRow o={snap.overlord} labels={labels} active={route.kind === "overlord"} />}
       {snap?.overlord && <Tell store={store} />}
@@ -35,14 +56,25 @@ export function List({ store, route }: { store: Store; route: Route }) {
   );
 }
 
+/** Open a form of the user's own (not over one they are typing in). */
+export function open(store: Store, kind: FormKind): void {
+  if (store.form.value?.touched) return;
+  store.form.value = { kind, cmd: null, touched: false };
+}
+
 function Controls({ store, view }: { store: Store; view: View }) {
   // Typing waits a moment before asking the daemon.
   const text = useSignal(view.search);
   useSignalEffect(() => {
     const t = text.value;
+    if (t === store.view.peek().search) return;
     const id = setTimeout(() => store.setView({ search: t }), 200);
     return () => clearTimeout(id);
   });
+  // A view set from elsewhere (the overlord, the default) shows its filter.
+  useEffect(() => {
+    if (text.peek() !== view.search) text.value = view.search;
+  }, [view.search]);
   return (
     <div class="controls">
       <div class="tabs" role="tablist">
@@ -62,6 +94,7 @@ function Controls({ store, view }: { store: Store; view: View }) {
         class="filter"
         type="search"
         placeholder="filter"
+        title="words match name, project, tags, description · status:needs|turn|bg|working|limited · tag:x · proj:x · agent:x"
         aria-label="filter sessions"
         value={text.value}
         onInput={(e) => {
@@ -127,7 +160,7 @@ function OverlordRow({
   }
   return (
     <a class={`row overlord${active ? " selected" : ""}`} href={href({ kind: "overlord" })}>
-      <Status status={o.status} label={o.status_label} />
+      <Status s={o} at={now.value} />
       <span class="name">overlord</span>
       <span class="agent">{labels.get(o.agent) ?? o.agent}</span>
     </a>
@@ -160,6 +193,17 @@ function Groups({ store, snap }: { store: Store; snap: Snapshot }) {
   );
 }
 
+function UsageFigure({ r }: { r: Row }) {
+  const f = usageFigure(r);
+  if (!f) return null;
+  return (
+    <span class="usage" title={f[1]}>
+      {" · "}
+      {f[0]}
+    </span>
+  );
+}
+
 function Rows({
   rows,
   labels,
@@ -183,7 +227,7 @@ function Rows({
             class={`row${r.id === selected ? " selected" : ""}${r.archived_at ? " archived" : ""}`}
             href={href({ kind: "session", id: r.id })}
           >
-            <Status status={r.status} label={r.status_label} />
+            <Status s={r} at={at} />
             <span class="name">
               {r.pinned && (
                 <span class="pin" title="pinned">
@@ -192,17 +236,15 @@ function Rows({
               )}
               {r.name}
             </span>
-            <span class="agent">{labels.get(r.agent) ?? r.agent}</span>
+            <span class="agent">
+              {labels.get(r.agent) ?? r.agent}
+              <UsageFigure r={r} />
+            </span>
             <span class="when" title={new Date(lastUpdate(r)).toLocaleString()}>
               {ago(lastUpdate(r), at)}
             </span>
-            {(r.tags.length > 0 || r.description || r.limit) && (
+            {(r.tags.length > 0 || r.description) && (
               <span class="more">
-                {r.limit && (
-                  <span class="limit">
-                    {r.limit.reset ? "limit reset" : `limit until ${r.limit.until}`}
-                  </span>
-                )}
                 {r.tags.map((t) => (
                   <span class="tag">#{t}</span>
                 ))}

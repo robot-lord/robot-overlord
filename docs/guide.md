@@ -703,6 +703,8 @@ rlord web new-token  # a new link: the old one stops working, open pages disconn
 rlord web remove     # delete the plugin and its token
 ```
 
+In the list, `:web` opens it too, once it's installed.
+
 - **Installing** downloads the plugin for your rlord's version from the
   same GitHub release (`gh` when it's logged in, else `curl`) and checks it
   against a SHA-256 built into rlord: rlord only ever runs the exact
@@ -725,17 +727,33 @@ rlord web remove     # delete the plugin and its token
   port = 47811   # another, if that one is taken
   ```
 
-- **What it does:** the list (tabs, groups, filter, sort, archived), the
-  overlord's pane and any session's pane, live; a box to tell the overlord
-  something; and a session's buttons: Resume, Restart, Stop, Archive and
-  Unarchive, Pin, and Edit (name, description, tags, notes). Pick another
-  agent in the overlord's view to switch the overlord to it. Panes are the
-  real ones: what you type goes to the agent, and the same session can be
-  open in a terminal at the same time (the window takes the size of
-  whichever was used last). Opening a stopped session never starts it:
-  press Resume.
-- New sessions, forks and setup are terminal-only for now, and the
-  overlord's `goto` and view commands act on a terminal, not the browser.
+- **What it does:** the list (tabs, groups, filter, sort, archived; the
+  filter takes the same `tag:` and `status:` words as the TUI's `/`; each
+  row's usage), the overlord's pane and any session's pane, live; a box to
+  tell the overlord something; and a session's buttons: Resume, Restart,
+  Stop, Archive and Unarchive, Pin, Edit (name, description, tags, notes)
+  and Fork. Pick another agent in the overlord's view to switch the
+  overlord to it. Panes are the real ones: what you type goes to the
+  agent, and the same session can be open in a terminal at the same time
+  (the window takes the size of whichever was used last). Opening a
+  stopped session never starts it: press Resume.
+- **New sessions, forks and the code folder** work as in the list:
+  "+ New session" (`n`) to describe one for the overlord, "Manual" (`N`)
+  to fill in every field and launch it yourself, Fork (`f`) on a session,
+  and "Code folder" in the header. "Keys" shows every key rlord binds,
+  read-only: change one in a terminal (`:keys`), where rlord can check it
+  reaches it. Setting up the overlord the first time is in a terminal too.
+- **The overlord shows things on the screen you used last.** When it
+  opens a session, the list, a view or a form for you, it goes to the
+  terminal or the browser, whichever you typed or clicked in most
+  recently, and the other one shows a one-line notice. A browser page
+  with no view of its own starts from the list's default view. To always
+  prefer one:
+
+  ```toml
+  [web]
+  ui_target = "web"   # or "terminal"; "auto" (the default): the one used last
+  ```
 
 ## rlord's tmux
 

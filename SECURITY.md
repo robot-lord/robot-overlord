@@ -17,6 +17,8 @@ scope.
 The web UI is an opt-in plugin (`rlord web install`); without it, rlord
 has no network listener. With it, the plugin listens on `127.0.0.1`
 only, and its link's token gives whoever holds it the same control of
-your sessions as your terminal. Reports about the plugin reaching
+your sessions as your terminal: the page can launch and fork sessions
+directly (in any folder, with any prompt) and save the code folder to
+`config.toml`, as the list's own forms do. Reports about the plugin reaching
 beyond `127.0.0.1`, a page from another site driving it, or rlord running
 a plugin other than the one it was released with are in scope.

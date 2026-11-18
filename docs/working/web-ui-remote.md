@@ -1,4 +1,4 @@
-**Status:** in progress (slice 1, the local web UI, is built: steps 1–14; next: the relay and the phone app)
+**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; next: the relay and the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -578,6 +578,254 @@ Decided 2026-11-17 (user):
   browser-kept keys on a real keyboard, the wheel and copy, IME, two tabs
   at once, the TUI overlay open alongside, WebGL context loss
   mid-session; a dry run of `release.yml` before the next stable release.
+- Slice 1 follow-ups (`feat/web-ui-2`, into `feature/web`, 1.3.0-dev.2):
+  - **Release dry run** (`release.yml`, `workflow_dispatch` on
+    `feature/web`, `dry_run` on, run 44185921608): preflight (warnings
+    only: not on main, not stable, ref vs version), `web-assets`,
+    `build-linux` and `smoke-linux` (both arches, five distros, each with
+    `rlord web install --from` and `(verified)`) passed. `build-macos` was
+    refused before it started: the `release` environment's deployment
+    branch policy allows only `main` and `v*` tags, so `feature/web` can't
+    use it, and `release` was skipped. Not worked around. Owed: the macOS
+    half (signing, `Verify signature` on both binaries) and the `release`
+    job's asset check, from `main` (or with `feature/*` let into the
+    environment, the user's call).
+  - The page draws `shown_status` as the TUI does (`components/Status.tsx`
+    `shown`, after `state_chip`): "till 14:05" / "limited until 14:05"
+    (↻, "· resumes then", the reset), "bg N" / "waiting on N background
+    tasks"; pane headers name the work and background shells
+    (`statustext.rs`'s sentences), list rows carry them in the status's
+    tooltip. The row's separate limit tag is gone. `session.get` through
+    `web.call` now gets `status_label` (a session the list doesn't show
+    read "not started").
+  - The filter box takes the TUI's tokens: `snapshot` runs the view's
+    `search` through `SessionQuery::apply_search_text` (`search_tokens`),
+    so `tag:`, `status:` (`bg`, `limited`, `turn` included), `agent:`,
+    `proj:`, `group:` and `sort:` work; the page parses nothing.
+  - `:web` in the list (`launcher.rs`): starts the plugin if needed and
+    opens the page; not installed: says to run `rlord web`. `page_url` and
+    `open_in_browser` moved to `core/src/plugin.rs` for both callers.
+  - Checked in headless Chromium (Playwright 1.65.1, outside the repo)
+    against a second demo (socket `rlord-demo-f2`, port 47831) with
+    background work written into a transcript: "bg 1" and its tooltip,
+    the header lines, every filter token; `:web` driven in the demo's TUI
+    with a stand-in `open`. A usage limit is checked by unit tests only
+    (the demo can't make one).
+- Slice 2 (the web as a UI target; `feat/web-ui-2`, 1.3.0-dev.3), per
+  the plan below and the user's answers:
+  - Step 1 done, the gate passed (`web_tmux.rs`
+    `client_activity_is_input_not_output`, tmux 3.8): a client whose pane
+    prints for 3 s keeps its `client_activity`; a resize doesn't move it
+    either; a key press moves it to now. Resolution: one second (epoch
+    seconds). No fallback needed.
+  - Step 2 done (`ui.rs` `Target`, `pick`, `target`; `web.rs` `WebUi`,
+    `web.pages`, op `page.report`; `config.rs` `[web] ui_target`):
+    `pick(terminal_s, pages, pref)` is pure and unit-tested; `target`
+    feeds it the user's terminal (`user_client`'s activity) and each page's
+    last use (a user-driven op, a `page.report` with `input`, or the last
+    key typed into the pane it shows, from `view_clients`). `ui.state`
+    has `target`, `web` and `current_view` from the target. Choices within
+    the plan:
+    - `ui_target = "terminal" | "web"` is a preference, not a lock: with
+      only the other surface present, that one gets the command (so a
+      web-only user isn't refused because of a config line).
+    - Pages never used rank by arrival (the newest wins among them).
+    - The pages are dropped when the last `web.subscribe` stream ends
+      (counted, since a restarted plugin's stream can overlap the old
+      one's); the plugin is to send `web.pages {pages: []}` at its start
+      so a crashed plugin's pages go at once.
+    - Look-ups that don't count as use: `snapshot`, `session.get`,
+      `page.report` (unless `input`); later steps add their own.
+    - `page.report`'s `form` is one of `describe`, `confirm`, `manual`,
+      `fork`, `setup`, `keys` or null.
+  - Step 3 done (`lib.rs` `ui_cmd_to`, `notice_others`, `pending_web`,
+    `push_loop`, `web_ui_line`; `web.rs` op `page.pending`; TUI
+    `push_of`, `notice`; `WEB_PROTOCOL` 2). Lines are `{"notify":"ui",
+    "to":"terminal"|"web", "page"?, "cmd"}`; `web.subscribe` passes the
+    web's on as `{"notify":"ui","page","cmd"}`, at once when they come
+    alone, and after the folded `changed` when they come in a burst
+    (kept, in order). Choices within the plan:
+    - The web's slot holds the last web command with its page id, and
+      `page.pending` hands it over only when that page has closed since
+      (a reload, a reconnect): a page that got it never sees it twice.
+    - `notice_others` sends to the terminal's TUI (when one runs) or the
+      most recently used page; notices are never parked.
+  - Step 4 done (`ui.rs`, `setup.rs`, `mcp.rs`, `web.rs`): `show_list`,
+    `goto`, `set_view`, `propose_session`, `confirm_new_session`,
+    `setup::confirm` and `keys_open` pick the target once and pass it
+    down (`show_list_on`, `open_form`, `show_form`, `switch_to`); every
+    answer has `on`, and `create_session` / `fork_session` with `go` pass
+    it on. No screen: they fail naming `rlord` in a terminal and `rlord
+    web`. `snapshot`'s view takes `query` (before `search`) and `usage`;
+    ops `view.default` and `keys.list`. The proposal store
+    (`Daemon::proposals`, last 8, ids `p<n>`): `propose_session` keeps
+    `context` and `related` there and the prefill carries `proposal`.
+    Tests: `web_api.rs` `the_overlords_ui_tools_land_on_a_page`,
+    `snapshot_takes_query_and_the_default_view`; gated `web_tmux.rs`
+    `the_surface_used_last_gets_the_command` (terminal and page both
+    present, each in turn the later; `ui_target = "web"`). Choices within
+    the plan and the user's answers:
+    - **Key screen (answer 2): read-only in the page.** `open_keys` goes
+      to the terminal whenever one is attached, whatever the target
+      (keys change only there); with only a page, the page is sent `keys
+      {row}` and shows them read-only (`keys.list`, now a passive op), and
+      the answer's note says changing one needs a terminal.
+    - `goto` checks for a screen before resuming the session (no point
+      starting what can't be shown).
+    - Notices go out for `goto` and the forms (new session, confirm,
+      code folder, keys), not for `set_list_view` or `show_list`.
+    - `set_list_view` on the web sends `set_view`, then `show_list` unless
+      `show: false`, and updates the page's view in the daemon at once.
+  - Step 5 done (`web.rs`): ops `form.defaults`, `form.repos`,
+    `form.setup` (status and suggestion in one answer), `form.setup_save`,
+    `overlord.new_session` (a `project` becomes the form's wire shape,
+    `folder_request`), `overlord.setup_request`, `session.new` (`launch`:
+    a `proposal` id brings the stored `context` and `related`, and
+    `by_overlord`), `session.fork`. Argument filtering moved into
+    `filtered` and is unit-tested per op (the "never" column dropped).
+    Fixtures written by `web_api.rs` `the_forms_ops_and_fixtures`
+    (`RLORD_UPDATE_FIXTURES=1`): `form_defaults.json`, `form_repos.json`,
+    `form_setup.json` and `ui_cmds.json` (one of each command), with the
+    scratch folder written as `/scratch`. Choices within the plan:
+    - `form.setup_save` also passes `allow_home`: the plan's table left it
+      out, but without it the form could never save a confirmed home
+      folder (`save_call`'s home rule).
+    - The look-ups (`form.defaults`, `form.repos`, `form.setup`) don't
+      count as use of the page; the saves and launches do.
+    - `web_api.rs` now points `HOME` at its scratch folder (the repo
+      finder and the suggestion look there).
+  - Step 6 done (`crates/web/src/{daemon,http,main}.rs`): page ids
+    `p<n>-<8 hex>`, the `hello` carries `page`, every `web.call` carries
+    the socket's own id (a `page` in the browser's frame is ignored),
+    `web.pages` on every open (before `hello`) and close, and once at
+    start with none; `Subscription::next` yields `Event::Changed` or
+    `Event::Ui {page, cmd}`, and a UI command goes to that page's socket
+    only as `{"event":"ui","cmd"}`. `web.pages` calls are serialized so
+    the daemon gets the lists in order. Test: `http.rs`
+    `pages_and_their_ui_commands`; unit test for the stream's lines.
+  - Step 7 done (`ui/src/{proto,api,store,ui,main}.ts(x)`,
+    `components/{Toast,Modal,FormHost,usage}`, `views/List.tsx`):
+    `UiCmd` and the forms' answer types in `proto.ts`, held to the
+    daemon's fixtures by `fixture.test.ts`; `ui.ts` `decide` (pure: goto,
+    show_list, set_view, notice, and a form command that opens, or is
+    parked behind a banner when the open form was typed into) and
+    `Reporter` (`page.report`: only what changed, everything again after
+    a reconnect, input at most every 5 s from pointer, key and wheel
+    events); `page.pending` on every hello. The store maps between the
+    page's view and the daemon's (`viewOf`, `listView`), sends the filter
+    as `query` with the usage measure, highlights `set_view`'s `select`,
+    and a browser with no saved view starts from `view.default`. Rows
+    show the usage figure in the list's measure. The form host shows a
+    placeholder until steps 8 and 9.
+  - Step 8 done (`ui/src/forms/{hints.ts,NewSession.tsx}`,
+    `components/Picker.tsx`, the list's "+ New session" and "Manual",
+    keys `n` / `N`): `hints.ts` is the TUI's rules (`fresh`, `setAgent`,
+    `picked`, `described`, `owner`, `setLocation`, `typedBase`, `request`,
+    `launch`, `prefill`, `prefillConfirm`, `agentBlocker`), Vitest-tested
+    against the daemon's fixtures (labels, the confirm round trip, a plain
+    folder, a proposal launched by its id). The describe form sends
+    `overlord.new_session` and goes to the overlord; the manual form sends
+    `session.new` and goes to the new session; a failure keeps the form.
+    Each hint shows whose it is (yours, the overlord's, default) and
+    "changed" when the overlord changed it; a reopened form's note sits on
+    top and Send reads "Confirm". The repo picker lists the finder's
+    repos (asking again while the first scan runs), and takes a typed path
+    as a repo or a plain folder (the daemon checks it at launch).
+    Found on the way, fixed in its own commit: `page.pending` handed a
+    command to a reloaded page even when the old page had acted on it;
+    any call from the addressed page now clears it, and the page answers
+    each command with an empty `page.report`. Also fixed: the page's
+    report effect returned before reading its signals while connecting,
+    so it never ran again.
+    Checked headless (Chromium and WebKit, demo `rlord-demo-s2`, port
+    47841): `propose_session` from the stand-in opens the proposal with
+    the overlord's note read-only; Launch starts the session, the page
+    goes to it, and its background holds the note (from the daemon's
+    proposal store).
+  - Step 9 done (`ui/src/forms/{Fork.tsx,setup.ts,CodeFolder.tsx,
+    Keys.tsx}`): the fork form (Fork among a session's buttons, key `f`
+    on a session; a worktree offered for Claude Code and Codex in a repo,
+    as `ForkForm::for_session`; warnings shown as a notice); the
+    code-folder form ("Code folder" in the header; the overlord's
+    `confirm_setup` opens it with its note and marks what it changed;
+    with a description it asks the overlord, else `form.setup_save`); the
+    key screen, read-only ("Keys" in the header, and `open_keys` with
+    only a page), with the note that keys change in a terminal. Vitest:
+    `forms.test.ts`. Choices within the plan:
+    - The code-folder form is `CodeFolder.tsx`, not `Setup.tsx`: on
+      macOS's case-insensitive disk `forms/Setup` resolves to
+      `forms/setup.ts`.
+    - The browser can't look at the disk, so it doesn't decide "create it"
+      or "home" itself: the daemon's save refuses, the form reads which
+      question its message asks (`askFor`), and the user's answer goes
+      back with `create` or `allow_home`.
+    Checked headless (Chromium and WebKit): `open_keys` from the stand-in
+    shows the keys with the asked one highlighted; `confirm_setup` opens
+    the form with its note, saving a new folder asks first, then writes
+    `code_dir` to the demo's config; a fork from a session's view starts
+    and the page goes to it.
+  - Step 10 done (`overlord.md`, `mcp.rs`): the intro's summon line
+    names the web UI's overlord row; a short "The user's screen"
+    paragraph (terminal or web UI, whichever used last, `on` in each
+    answer, no overlay to hide in the web UI); `get_ui_state` (`target`,
+    what the screen shows), `goto_session` and `show_list` say "the
+    user's screen"; `open_keys` "terminal only; the web UI shows them
+    read-only". `mcp.rs`: `get_ui_state` names `target` and `web`;
+    `goto_session`, `show_list`, `set_list_view`, `open_keys`,
+    `confirm_setup`, `propose_session`, `confirm_new_session` and `go` on
+    `create_session` / `fork_session` say "the user's screen (their
+    terminal, or the web UI if they used it last)" and "(in a terminal,
+    hides your overlay)". No tool added or removed; `READ_ONLY_TOOLS`
+    and `MUTATING` unchanged.
+  - Step 11 done: headless pass (Playwright 1.65.1, outside the repo)
+    in Chromium and WebKit against a second demo (`RLORD_DEMO_SOCKET=
+    rlord-demo-s2`, `/tmp/rwd/s2`, `[web] port = 47841`), the overlord
+    stood in for by raw `mcp.call` requests on the demo's socket, and a
+    terminal stood in for by a tmux client on a PTY on the demo's socket.
+    17 checks, all passing in both browsers: with only the page,
+    `get_ui_state` says `web` and what the page shows; `goto_session`
+    moves the page; `set_list_view` fills the filter box, filters and
+    highlights the row; `propose_session` opens the proposal with the
+    overlord's notes, Launch starts it with its background; the describe
+    form's request reaches the overlord's pane, `confirm_new_session`
+    (with that request's id) reopens it with the agent marked "overlord's
+    · changed" and the note, and Confirm sends it back `confirmed: yes`;
+    a form the user typed into stays while the overlord's proposal waits
+    behind the banner; with two tabs only the one used last moves; with a
+    terminal too, the one typed in last gets `goto_session` (the other
+    keeps its place; the page shows the notice), and `ui_target =
+    "terminal"` (config reloaded) sends `show_list` to the terminal though
+    the page was used last; at 390 px wide the form fits with no sideways
+    scroll; no console errors. Found and fixed: the parked-form banner sat
+    under the dialog's backdrop, so "open it now" couldn't be clicked.
+    Test-harness notes: the demo's stand-in overlord never reads its
+    input, so its terminal's input queue fills after a few requests (the
+    pass restarts it before each); what it was typed is read with
+    `pipe-pane` (its screen redraws).
+  - Step 12 done: `docs/architecture.md` "Web UI" ("The web as a UI
+    target": surfaces and the target rule, pages and `page.report`,
+    addressed `ui` lines and the parked slots, the hand-answered ops and
+    the proposal store; `snapshot`'s `query` and `usage`), `docs/guide.md`
+    (the forms, keys read-only, "the screen you used last", `[web]
+    ui_target`), `SECURITY.md` (the page launches and forks directly and
+    saves the code folder), the config template (`ui_target`). CLAUDE.md's
+    browser-op rule still holds as written.
+- Owed after slice 2 (carried over from slice 1, plus slice 2's own):
+  - By hand in a real browser: Option as Meta and the browser-kept keys
+    on a real keyboard, the wheel and copy, IME, the TUI overlay open
+    alongside, WebGL context loss mid-session; slice 2's forms with a real
+    keyboard (Tab order, Enter in the pickers), and the target rule with
+    a person moving between a real terminal and the browser.
+  - The release dry run's macOS half (signing, `Verify signature` on both
+    binaries) and the `release` job's asset check, from `main` (or with
+    `feature/*` let into the `release` environment: the user's call).
+  - Not headless-checked: the code-folder form's "Use the home folder
+    anyway" path (unit-tested in `forms.test.ts`; the demo can't point at
+    a real home safely), and a usage limit's display (unit tests only).
+  - The overlord's "no overlord yet" error from `overlord.new_session`
+    still names `Alt-O` and the manual form's `N` (`ask::send`); in the
+    page the form shows it as is. Worth a web-neutral wording later.
+  - The relay and the phone app (the rest of this effort).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -1274,3 +1522,500 @@ form, and web-input reporting over IPC.
 6. Biome for formatting until Oxfmt 1.0 (default).
 7. Browser pass by hand this slice; Playwright later (default).
 8. Subcommands for `rlord web` (default).
+
+## Slice 2 plan: the web as a UI target
+
+Planned 2026-11-17 (Fable planning agent). Built on `feat/web-ui-2`
+(steps 1 to 12; see "Progress" for what each did and the choices made).
+Goal: a
+user with only the web UI open can use everything the overlord does that
+targets "the user's terminal" today: `goto_session`, `show_list`,
+`set_list_view`, `get_ui_state`, `propose_session`, `confirm_new_session`,
+`confirm_setup`, `go: true` on `create_session` / `fork_session`, and the
+forms (new session `n`, manual `N`, fork `f`, the code folder), with the
+describe-then-confirm loop running in the browser. No new MCP tool. No
+network code in `rlord`; the plugin stays opt-in.
+
+What exists today (read from the code, for the implementer):
+
+- `ui.rs` does terminal navigation with tmux (`switch_user_to`,
+  `ensure_home`, `hide_overlord`) and pushes typed commands to the TUI with
+  `Daemon::ui_cmd` (`{"notify":"ui","cmd":…}` on the broadcast). Commands:
+  `set_view`, `new_session`, `confirm_new_session`, `setup`,
+  `overlord_setup`, `keys` (`tui/src/overlord.rs` `handle_ui_cmd`).
+- One command is parked when no TUI is subscribed (`pending_ui`, 30 s,
+  taken by `ui.pending`). The TUI reports its view with `ui.view.report`.
+- `web.subscribe` drops every `ui` line (`push_loop`), and the drain after
+  a `changed` throws away whatever came meanwhile.
+- `web.call` filters arguments per op (`web::OPS`); `ui.*` and `setup.*`
+  are forbidden method families.
+- The forms call `session.defaults`, `repo.find`, `overlord.status`,
+  `overlord.new_session` (`ask::new_session`), `session.new`,
+  `session.fork`, `setup.status`, `setup.suggest`, `setup.apply`,
+  `overlord.setup_request`.
+- The page keeps its own view in `localStorage`; its filter is free text
+  only (`snapshot` passes `search`, not the `tag:` / `status:` syntax).
+
+### Decisions
+
+#### Which screen a command lands on: the one the user used last
+
+A **surface** is somewhere the user looks at rlord: the terminal (a tmux
+client, with or without the TUI) or a web page (one browser tab's control
+socket). Later the phone is a third; the code should hold a list of
+surfaces with a last-used time, not a terminal/web boolean.
+
+- **One target per command, chosen by plain code: the surface the user
+  last did something on.** With one surface present it is the target.
+  With none, the tools fail as today, with a message naming both ways in
+  (`rlord` in a terminal, or `rlord web`).
+- **Not both.** Rejected: a form open on two screens can be sent twice
+  (two launches), and a terminal the user left on a session would be
+  pulled to the list while they work in the browser.
+- **Last-used time, per surface:**
+  - Terminal: tmux's `client_activity` of `tmux::user_client` (as today's
+    choice of client).
+  - Web page: the latest of (a) the daemon's own clock when a
+    user-driven op arrives from that page (every op except `snapshot`,
+    `session.get`, `page.report` without `input`, `page.pending`,
+    `form.*` look-ups), (b) a `page.report` with `input: true` (the page
+    sends one on pointer or key input, at most every 5 s), and (c)
+    `tmux::view_clients` activity for the pane that page shows (typing
+    into the overlord's pane in the browser). The daemon stamps the time;
+    the page never sends one.
+  - Sending a form counts: `overlord.new_session` from a page makes that
+    page the target for the `confirm_new_session` that answers it; the
+    same call from the TUI's socket leaves the terminal ahead through its
+    key press.
+  - A tie or an unknown goes to the terminal (today's behaviour).
+- **Among pages**, the target is the one with the latest time. A hidden
+  tab still counts (the user who asked from it and switched tabs finds
+  the form when they come back); `visible` is reported for
+  `get_ui_state` only.
+- **The other surface gets a one-line notice** when there is one:
+  `{"cmd":"notice","text":"the overlord opened a new-session form in the
+  web UI"}` (the TUI's status line, the page's toast). Choosing wrongly is
+  the main way this can annoy; the notice makes it visible.
+- **Every targeted tool's answer says where it landed** (`"on":
+  "terminal" | "web"`), so the overlord can say "it's open in your
+  browser" when that matters.
+- **Terminal only, unchanged:** the overlord overlay (`ui.overlord`,
+  `ui.overlay.*`), the overlord's first-run dialog (`overlord_setup`) and
+  the key screen (`open_keys`: it tests that a key reaches rlord through
+  the terminal, which a browser can't). `open_keys` with no terminal fails
+  saying the key screen needs a terminal. When the target is the web,
+  nothing touches the terminal: no `hide_overlord`, no `ensure_home`.
+
+`ui.rs` gets one function that decides, `ui::target(d) -> Target`
+(`Terminal(Client)`, `Web(page id)`, `None`), built on a pure
+`pick(terminal: Option<ms>, pages: &[(id, ms)])` that is unit-tested.
+Each tool calls it once and passes the result down, so the command and
+the "bring it to the front" step can't pick different surfaces.
+
+#### What the daemon knows about pages
+
+- The plugin gives each control socket a **page id** (`p<n>-<8 hex>`),
+  tells the page in `hello` (`"page"`), and stamps it on every
+  `web.call` (`{op, args, page}`). The browser can't choose it.
+- The plugin reports the open pages with **`web.pages {pages: [ids]}`**
+  on every control-socket open and close (the whole list each time, so a
+  lost call heals on the next). Plugin-only, like `web.hello`: never a
+  browser op.
+- The daemon keeps `web_ui: Mutex<WebUi>`: per page `{route, view,
+  visible, form, last_input}`. A page missing from `web.pages` is
+  dropped; all are dropped when the `web.subscribe` stream ends (the
+  plugin is gone). At most 16 (the plugin's control-socket limit).
+- **Op `page.report {route, view, visible, form, input}`** (answered in
+  `web.rs`, no daemon method): what that page shows. `route` is `{kind:
+  "list" | "overlord" | "session", id?}` (kind checked, id clipped);
+  `view` goes through `ui::normalize_view` (the TUI's view shape, so both
+  surfaces report the same object); `form` is the open form's kind or
+  null. It does not call `Daemon::changed()`.
+- **`ui.state` (`get_ui_state`)** gains `target` (`terminal`, `web`,
+  `none`) and `web`: `{open, pages, showing: {kind, id, name}, visible,
+  form}` for the most recent page (null when no page is open).
+  `current_view` becomes the target surface's view. `terminal`,
+  `tui_running`, `overlord_overlay_open` and `default_view` stay as they
+  are.
+
+#### How `ui` commands reach the page
+
+Over the stream the plugin already holds: a new line on `web.subscribe`.
+
+- `Daemon::ui_cmd` becomes `ui_cmd_to(target, cmd)`: the line is
+  `{"notify":"ui","to":"terminal","cmd":…}` or `{"notify":"ui",
+  "to":"web","page":"<id>","cmd":…}`. The TUI ignores `to: "web"` lines (one
+  condition where it parses `notify: ui`, `tui/src/lib.rs`); a line with
+  no `to` means the terminal, so nothing else changes for it.
+- `push_loop`, `Push::Web`: `ui` lines addressed to the web are written
+  through as they come, in order, never folded into a `changed`. The
+  drain after a `changed` must keep them (collect, then write), not
+  discard them as it does now. A lagged receiver may still lose one; the
+  parked copy below covers the common case.
+- **Parked per surface.** `pending_ui` becomes one slot for the terminal
+  and one for the web (30 s each). A command for the web with no page
+  open is parked; op `page.pending` hands it to the next page that says
+  hello. The terminal's `ui.pending` never takes the web's, and the
+  other way round.
+- Plugin: `daemon.rs`'s `Subscription::next` yields `Changed(rev)` or
+  `Ui {page, cmd}`; `http.rs` sends `{"event":"ui","cmd":…}` only to the
+  control socket with that page id.
+- `plugin::WEB_PROTOCOL` goes up by one (`web.call` gains `page`,
+  `web.pages` is new, the stream carries `ui`).
+- Relay later: `ui` commands and `page.report` are mailbox messages, the
+  same shapes.
+
+Commands the page handles (typed in `proto.ts` as `UiCmd`):
+
+| Command | From | The page |
+| --- | --- | --- |
+| `goto {id, overlord}` | `goto_session`, `go: true` | routes to `#/s/<id>` or `#/overlord` |
+| `show_list` | `show_list`, `set_list_view` with `show` | routes to `#/` and closes an untouched form |
+| `set_view {view, select}` | `set_list_view` | applies the view to its store, highlights `select` |
+| `new_session {prefill}` | `propose_session` | opens the manual form pre-filled |
+| `confirm_new_session {prefill}` | `confirm_new_session` | reopens the describe form with the overlord's hints, note and labels |
+| `setup {prefill, status}` | `confirm_setup` | opens the code-folder form |
+| `notice {text}` | the other surface was targeted | a toast |
+
+As in the TUI, a form command never replaces a form the user has typed
+into: it is kept, and a banner offers to open it.
+
+#### The tools, retargeted (`ui.rs`, `setup.rs`)
+
+- `show_list`: terminal as today; web sends `show_list`.
+- `goto`: `ensure_running` first (unchanged), then terminal as today, or
+  `goto` to the page. Answer: `switched_to` plus `on`.
+- `set_view`: starts from the target's current view (the TUI's
+  `ui_view`, or the page's reported view), applies the changes, sends
+  `set_view` to the target, and shows the list there unless `show:
+  false`. `save_as_default` and the sticky usage measure are daemon
+  state, shared by both surfaces.
+- `propose_session`, `confirm_new_session`, `setup::confirm`: build the
+  prefill as today, send the command to the target; on the terminal
+  `show_list` follows as today, on the web the command itself opens the
+  form.
+- `keys_open`: terminal only.
+- **`snapshot` takes the list's filter syntax.** Its `view` gains
+  `query` (the text the TUI's filter takes); the daemon runs
+  `SessionQuery::apply_search_text` on it, as `mcp::call` does for
+  `list_sessions`, and passes `usage`. The page's filter box then means
+  what the TUI's does, so `set_list_view`'s `status:needs tag:wip` works
+  in the browser. `search` stays accepted.
+- **Default view.** Op `view.default` (answered in `web.rs` by
+  `ui::default_view`): a page with no saved view of its own starts from
+  the daemon's default; after that its view is the browser's own, as in
+  slice 1.
+
+#### Ops added to the allow-list, and what each may pass
+
+`ui.*` and `setup.*` stay forbidden as pass-through families. The ops
+below that need them are answered by hand in `web.rs` (method `""`, as
+`session.resume` is), calling the Rust function with arguments picked one
+by one; no op name starts with a forbidden family either. Each gets a
+test in `web_api.rs`.
+
+| Op | Reaches | Arguments passed on | Never from a browser |
+| --- | --- | --- | --- |
+| `page.report` | `web.rs` | `route`, `view`, `visible`, `form`, `input` | a time, a page id |
+| `page.pending` | `web.rs` (the web's parked command) | none | |
+| `view.default` | `ui::default_view` | none | |
+| `form.defaults` | `session.defaults` | none | `no_listing` |
+| `form.repos` | `repo.find` | none | |
+| `form.setup` | `setup::status` + `setup::suggest` | none | `launch_dir` |
+| `form.setup_save` | `setup::apply` | `code_dir`, `roots`, `create` | `skip` |
+| `overlord.new_session` | `ask::new_session` | `description`, `repo`, `project`, `agent`, `model`, `workspace`, `base`, `prefer`, `tags`, `chosen`, `resolved`, `confirmed` | `request_id` |
+| `overlord.setup_request` | `ask::setup_request` | `description`, `code_dir`, `code_dir_source`, `roots`, `roots_source` | |
+| `session.new` | `session.new` | `repo`, `project`, `name`, `branch`, `agent`, `model`, `workspace`, `prompt`, `base`, `prefer`, `proposal` | `extra_args`, `role`, `tmux_name`, `hooks_work`, `base_resolved`, `location_resolved`, `remote_control`, `context`, `related`, `by_overlord` |
+| `session.fork` | `session.fork` | `ref`, `prompt`, `name`, `workspace` | `context`, `related`, `description`, `model`, `branch` |
+
+- **The overlord's background stays on the daemon's side.**
+  `propose_session` carries `context`, `related` and "launched by the
+  overlord". The TUI sends those back itself; a browser must not be able
+  to write text the session is told is the overlord's. So
+  `propose_session` keeps each proposal in memory under a short id (the
+  last 8), the prefill carries the id, and the web's `session.new` passes
+  `proposal`: `web.rs` fills `context`, `related` and `by_overlord` from
+  the stored proposal. The form shows them read-only, as the TUI does.
+- `overlord.new_session` with `project` (a plain folder): `web.rs` turns
+  it into the form's wire shape (`repo: "<path> (plain folder, not a
+  repo)"`, `workspace: false`), so that quirk lives in one place in Rust.
+- Both launch ops go through `Daemon::call`, so the agent warm-up, the
+  Codex-server start and the hooks check run as for the TUI.
+- `form.setup_save` writes `config.toml` and may create the folder: the
+  first browser op that writes config. It is what the user confirms in
+  the form, limited to those three arguments. `SECURITY.md` should say
+  so, and that the browser can now launch a session directly (it could
+  already ask the overlord to).
+
+#### The page (`crates/web/ui/src/`)
+
+- `ui.ts`: takes a `UiCmd` and the current state (route, store, open
+  form) and returns what to do. Pure, Vitest-tested. Also the
+  `page.report` sender (on hello, route, view, visibility, form open or
+  close, and throttled input) and `page.pending` on hello.
+- `components/Modal.tsx`, `components/Picker.tsx` (a filtered list: repos
+  with `scanning` and `skipped`; agents; an agent's models),
+  `components/Toast.tsx`.
+- `forms/hints.ts`: pure: which hints the user picked (`chosen`), which
+  the overlord set (`resolved`), the request the form sends, and the
+  prefill applied from `confirm_new_session` and `propose_session`.
+  Mirrors `newform.rs` `submit_request`, `prefill_confirm` and
+  `prefill`; tested against fixtures the daemon writes.
+- `forms/NewSession.tsx`, two kinds as in the TUI:
+  - **Describe** (`n`): a description box first, then the hints (repo,
+    agent, model, worktree, base, tags), each shown with its default and
+    a label (yours, the overlord's, default), plainly optional. Send:
+    `overlord.new_session`, then route to `#/overlord` so the user sees
+    any question it asks. Reopened by `confirm_new_session`: the note on
+    top, changed hints marked, Send sets `confirmed: true`. No overlord:
+    the error names the manual form.
+  - **Manual** (`N`): repo first, name, agent, model, worktree, branch,
+    base, prompt; the overlord's background and related sessions
+    read-only when it proposed the session. Launch: `session.new`, then
+    route to the new session. A failure keeps the form and its text.
+  - An agent that isn't installed blocks Send with the reason, as
+    `agent_blocker` does.
+- `forms/Fork.tsx` (`f`): what the fork should do first, its name, a new
+  worktree when the agent and repo allow it (the same test as
+  `ForkForm::for_session`). `session.fork`, then route to the fork;
+  warnings shown.
+- `forms/Setup.tsx`: an optional description for the overlord, the
+  folder (rlord's suggestion and its alternatives), what the finder
+  scans. With a description and not yet confirmed: `overlord.setup_request`;
+  otherwise `form.setup_save`, asking first before creating a folder or
+  using the home folder (`save_call`'s rules, in `forms/setup.ts`, pure
+  and tested).
+- Entry points: "New session" (describe) and "Manual" in the list's
+  header; Fork among a session's actions; "Code folder" in the header's
+  menu. Keys `n`, `N`, `f` work when focus is on the list (never in a
+  field or a pane).
+- `List.tsx`: the filter box sends `query`; a usage figure on each row
+  (the measure in `usage_metric`).
+- Nothing in the page says "tmux" or "terminal" for its own actions.
+- No overlord set up yet: unchanged, the page says to run `rlord` in a
+  terminal. The first-run sequence stays in the TUI.
+
+#### The overlord's instructions and tool descriptions
+
+CLAUDE.md requires both in the same change. Agent-neutral, and shorter
+where possible: `overlord.md` is loaded every turn.
+
+`overlord.md`:
+
+- Intro: "they drive the real rlord UI the user is looking at" stays;
+  add one short paragraph, "The user's screen": it is a terminal or the
+  web UI in a browser; rlord sends what you show to whichever they used
+  last, and each answer's `on` says which. In the web UI you are a pane
+  beside the list, with no overlay to hide. The key screen exists only
+  in a terminal.
+- "The user summons you with Alt-O" gains "(in the web UI: the overlord
+  row)".
+- `get_ui_state`: "which session their terminal shows" becomes "which
+  screen they're on (`target`) and what it shows".
+- `goto_session`, `show_list`, `set_list_view`: "the user's terminal" /
+  "hide yourself" become "the user's screen"; keep the Alt-O hint as the
+  terminal case.
+- `propose_session`, `confirm_new_session`, `confirm_setup`: no change
+  in when to use them; "on their screen" already fits.
+- `open_keys`: add "terminal only".
+- Nothing about tmux, page ids or routes; no parameter details.
+
+`mcp.rs` descriptions: `get_ui_state` (names `target` and `web`),
+`goto_session`, `show_list`, `set_list_view`, `open_keys`,
+`confirm_setup`, `propose_session`, `confirm_new_session`, and `go` on
+`create_session` and `fork_session`: "the user's terminal" becomes "the
+user's screen (their terminal, or the web UI if they used it last)";
+"(hides your overlay)" becomes "(in a terminal, hides your overlay)".
+`READ_ONLY_TOOLS` and `MUTATING` are unchanged. `tidy.md` and
+`import.md` use none of these tools.
+
+#### Tests
+
+Scratch tmux sockets only (`rlord-test-web`, `rlord-test-web-api`), never
+`tmux -L rlord` or the default server; no real agent, no model call. The
+overlord is stood in for by raw `mcp.call` requests on the test daemon's
+socket.
+
+- **Unit, daemon:** `pick` (one surface, both, tie, none; several
+  pages); `normalize_view` on a page's report; the proposal store (kept,
+  bounded, unknown id refused).
+- **In-memory daemon, no tmux** (`web_api.rs`; with no tmux server there
+  is no terminal, so a registered page is the target):
+  - `web.pages` and `page.report` register and drop pages; pages are
+    dropped when the subscription ends; a `page.report` can't set a
+    time or another page's state.
+  - `set_list_view`, `show_list`, `propose_session`,
+    `confirm_new_session` and `confirm_setup` through `mcp.call` each
+    put the right `ui` line, addressed to the page, on a `web.subscribe`
+    stream, and answer `on: "web"`; with no page and no terminal they
+    fail naming both ways in.
+  - `ui` lines survive coalescing: a burst of changes with a command in
+    the middle delivers the command exactly once.
+  - Parking: a command with no page open comes back from `page.pending`
+    once, within 30 s; the terminal's `ui.pending` doesn't take it.
+  - `get_ui_state`: `target`, `web.showing`, `current_view` from the
+    page.
+  - Every new op: reaches its function with only the listed arguments;
+    the "never" column is dropped (`session.new` with `extra_args`,
+    `role`, `by_overlord`, `context`; `form.setup_save` with `skip`);
+    `session.new` with a `proposal` gets the stored background.
+    `setup::apply` writes to a temp config path, as its own tests do.
+  - `snapshot` with `query: "tag:x status:turn"` filters as
+    `list_sessions` does.
+  - `the_pages_ops_are_the_daemons` keeps holding `proto.ts` `OPS` to
+    `web::OPS`.
+  - Fixtures written by a daemon test (`RLORD_UPDATE_FIXTURES=1`) and
+    type-checked by `fixture.test.ts`: one of each `UiCmd`, and the
+    answers of `form.defaults`, `form.repos`, `form.setup`.
+- **Gated tmux** (`web_tmux.rs`, `RLORD_TMUX_TESTS=1`):
+  - `client_activity` moves on input and not on output (step 1).
+  - A terminal client on a PTY and a page both present: the later one is
+    the target; `goto_session` to a session running `cat` switches the
+    terminal client when it is the target and sends `goto` when the page
+    is, leaving the terminal where it was.
+  - `open_keys` with only a page fails with the terminal-only message.
+- **TUI:** a `ui` line with `to: "web"` is ignored; `notice` sets the
+  status line.
+- **Plugin** (`crates/web/tests/http.rs`, in-memory daemon): `hello`
+  carries a page id; `web.pages` follows opens and closes; a `ui` event
+  reaches only the addressed socket; `page` can't be set from the
+  browser's request.
+- **Page** (Vitest): `ui.ts` for each command, including a parked form
+  command; `forms/hints.ts` and `forms/setup.ts` against the fixtures
+  (chosen and resolved labels, the confirm round trip, a plain folder,
+  create and home prompts); the view set from a command; `page.report`
+  throttling.
+- **`overlord.rs`'s test** that every tool is mentioned in `overlord.md`
+  still passes (no tool added or removed).
+- **By hand and headless** against `demo.sh --web`, the overlord stood in
+  for by `mcp.call` from a script: each tool with only a browser, only a
+  terminal, and both (typing in one, then the other); the confirm loop
+  end to end (describe, reopened form, confirmed send); manual launch,
+  fork and code folder; two tabs; phone width.
+
+### Implementation steps
+
+For an Opus implementer at high effort. One commit each; the PR bumps
+the version to the next `-dev.N` and regenerates `Cargo.lock`. Record
+each step in "Progress" as slice 1 did.
+
+1. **Prove the activity signal** (`web_tmux.rs`, gated): on a scratch
+   socket, `client_activity` moves when a client types and not when its
+   pane prints; note its resolution (seconds). If output moves it, stop
+   and use the fallback under "Risks" before going on.
+2. **Surfaces and the target** (`daemon/src/ui.rs`, `web.rs`, `lib.rs`):
+   `WebUi` on `Daemon`, `web.pages`, `page` on `web.call`, op
+   `page.report`, `ui::target` and `pick`, `ui.state`'s `target` and
+   `web`. Tests.
+3. **Addressed commands** (`lib.rs`, `ui.rs`, `tui/src/lib.rs`,
+   `tui/src/overlord.rs`): `ui_cmd_to`, the two parked slots, op
+   `page.pending`, `push_loop` writing `ui` lines to the web stream
+   without loss, the TUI ignoring `to: "web"`, `notice` on both sides,
+   `WEB_PROTOCOL` + 1. Tests.
+4. **Retarget the tools** (`ui.rs`, `setup.rs`): `show_list`, `goto`,
+   `set_view`, `propose_session` (with the proposal store),
+   `confirm_new_session`, `setup::confirm`, `keys_open`; `on` in each
+   answer; `snapshot`'s `query` and `usage`; op `view.default`. Tests.
+5. **Form ops** (`web.rs`): the table above, each with its test, and the
+   fixtures.
+6. **Plugin** (`crates/web/src/daemon.rs`, `http.rs`): page ids, `hello`
+   with `page`, `web.pages`, `page` on calls, `ui` events to the
+   addressed socket. Tests.
+7. **Page: commands** (`proto.ts`, `ui.ts`, `store.ts`, `main.tsx`,
+   `List.tsx`, `Toast.tsx`): `UiCmd` types and fixtures, `goto`,
+   `show_list`, `set_view`, `notice`, `page.report`, `page.pending`, the
+   filter syntax, the default view, the usage figure.
+8. **Page: new-session forms** (`Modal.tsx`, `Picker.tsx`,
+   `forms/hints.ts`, `forms/NewSession.tsx`): describe and manual, the
+   reopened confirm form, the proposed session.
+9. **Page: fork and code-folder forms** (`forms/Fork.tsx`,
+   `forms/setup.ts`, `forms/Setup.tsx`).
+10. **The overlord's words** (`overlord.md`, `mcp.rs`), as listed above.
+11. **Browser pass** on the demo, by hand and headless, with the
+    scripted `mcp.call` stand-in; fix what it finds.
+12. **Docs**: `docs/architecture.md` "Web UI" (surfaces and the target
+    rule, addressed `ui` lines, the hand-answered ops, the proposal
+    store), `docs/guide.md`, `SECURITY.md`, the browser-op rule in
+    `CLAUDE.md` if its wording no longer holds; "Owed from slice 1"
+    carried over.
+
+Steps 2 to 5 are daemon-only and testable without the plugin or the
+page; 6 needs 3; 7 needs 6; 8 and 9 need 5 and 7.
+
+### Risks
+
+- **The activity signal.** The rule rests on tmux's `client_activity`
+  meaning input. If the TUI's own redraws move it, the terminal would
+  always look newest. Step 1 checks before anything is built on it.
+  Fallback: the TUI reports its key presses (a throttled call beside
+  `ui.view.report`), and a terminal showing a session directly counts
+  through `client_activity` only when no TUI is subscribed.
+- **Wrong target with both open.** Seconds-level resolution and a user
+  moving between screens while the overlord thinks can send a form to
+  the screen they just left. Bounded by the notice on the other surface,
+  `on` in the answer, and the form staying open until used.
+- **Form logic in two languages.** `newform.rs` and `setupform.rs` hold
+  rules (what counts as chosen, the base default, create and home
+  prompts) that `forms/*.ts` repeats. The labels on a reopened form are
+  already worked out in Rust (`apply_provenance`); the rest is held by
+  shared fixtures. Drift shows up as a wrong label, not a wrong launch:
+  the daemon checks every launch argument again.
+- **A wider browser surface.** The page can now launch a session with
+  any prompt in any folder, and write the code folder to `config.toml`.
+  Still behind Host, Origin, the token and the allow-list, and no more
+  than `overlord.ask` could already cause, but direct. Argument
+  filtering and its tests are the guard.
+- **A lost command.** A lagged stream or a page reconnecting at the
+  wrong moment drops a `ui` line; only the last one is parked. The
+  overlord's answer still says a form was opened. Same weakness as the
+  TUI's today.
+- **`ui_view` is one slot for every TUI.** Slice 2 keeps that and adds
+  per-page views beside it; two TUIs still overwrite each other, as now.
+- **Slow ops.** `overlord.new_session` waits up to 90 s for an overlord
+  to start and `session.new` may fetch its base; the plugin's 120 s call
+  limit covers both, and the forms must show "sending" rather than
+  freeze.
+- **`overlord.md` grows.** The added paragraph must be paid for by
+  trimming the lines it makes redundant.
+
+### Open questions for the user
+
+1. **Target rule.** Planned: the surface you used last, one target per
+   command, a one-line notice on the other. Alternatives: always both
+   (rejected above for double sends), or a fixed preference in config
+   (`[web] ui_target = "auto" | "terminal" | "web"`). Is "used last"
+   right, and do you want the config override as well?
+2. **Key screen.** Planned: terminal only; `open_keys` says so when only
+   a browser is open. Agreed, or should the page at least show the
+   current keys read-only?
+3. **Default view.** Planned: one default view in the daemon
+   (`save_as_default`), which a browser adopts only when it has no saved
+   view; after that each browser keeps its own. Or should the browser
+   always open on the daemon's default, as the TUI does?
+4. **First run in the browser.** Planned: out of this slice. With no
+   overlord set up, the page still says to run `rlord` in a terminal;
+   only the code-folder form comes to the web. Should the overlord's own
+   setup dialog (agent, model) come too?
+5. **The notice on the other screen.** Planned: yes, for form and
+   navigation commands. Too noisy for `set_list_view` and `show_list`?
+6. **Launching straight from the browser.** The manual form and fork
+   call `session.new` and `session.fork` directly, with filtered
+   arguments. Fine for the local page; for the relayed phone later,
+   should direct launches be off by default (describe-to-the-overlord
+   only)?
+7. **Filter syntax.** The browser's filter box takes the TUI's syntax
+   (`tag:`, `status:`, `agent:`) from this slice on, so the overlord's
+   `set_list_view` means the same on both. Any objection to changing the
+   box's meaning from plain free text?
+
+### Slice 2 answers (user, 2026-11-17)
+
+1. UI target: the surface used last, plus a config override
+   `[web] ui_target = auto | terminal | web`.
+2. Key screen: shown read-only in the page; editing stays in the terminal.
+3. The overlord's first-run dialog stays terminal-only this slice.
+4. Direct launches (`session.new`, `session.fork`): the relayed phone
+   gets the same as local (not off by default).
+5. Defaults taken, not asked: a browser adopts the daemon's default view
+   only when it has no saved one; the one-line notice on the other surface
+   stays; the filter syntax change already landed (`1a2d5b6`).

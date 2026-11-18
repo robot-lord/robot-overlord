@@ -13,6 +13,11 @@
 //!   most one per 100 ms (`Daemon::push_loop`).
 //! - `web.pane_target {target}`: which tmux session a pane shows. Starts
 //!   nothing.
+//! - `web.pages {pages}`: the pages (control sockets) open now, by the
+//!   page id the plugin gave each. `web.call` carries the id of the page
+//!   that asked (`page`), never set by the browser. The daemon keeps what
+//!   each page shows (`WebUi`), so the overlord's UI commands can land on
+//!   a page (`ui::target`).
 //!
 //! The daemon also runs the plugin, as a child process (`Web`): started by
 //! `web.start` (`rlord web`) or at daemon start with `[web] enabled`,
@@ -31,6 +36,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use rlord_core::db::{SessionQuery, SortMode};
 use rlord_core::types::Status;
 use rlord_core::{groups, plugin, tmux};
 
@@ -104,6 +110,99 @@ pub const OPS: &[Op] = &[
     op("session.pin", "session.pin", &["ref", "pinned"]),
     // Make another agent's overlord the active one.
     op("overlord.switch", "overlord.switch", &["agent"]),
+    // What the page shows (answered here; see `WebUi`).
+    op(
+        "page.report",
+        "",
+        &["route", "view", "visible", "form", "input"],
+    ),
+    // A UI command that never reached its page (asked on connecting).
+    op("page.pending", "", &[]),
+    // The list view a page with none of its own starts from.
+    op("view.default", "", &[]),
+    // The key screen, read-only (keys change only in a terminal).
+    op("keys.list", "keys.list", &[]),
+    // The forms' look-ups: agents, models and defaults; the repo finder;
+    // the code folder as set now and rlord's suggestion.
+    op("form.defaults", "session.defaults", &[]),
+    op("form.repos", "repo.find", &[]),
+    op("form.setup", "", &[]),
+    // The code-folder form's save: what the user confirmed there.
+    op(
+        "form.setup_save",
+        "",
+        &["code_dir", "roots", "create", "allow_home"],
+    ),
+    // The describe-a-session form: a request to the overlord.
+    op(
+        "overlord.new_session",
+        "overlord.new_session",
+        &[
+            "description",
+            "repo",
+            "project",
+            "agent",
+            "model",
+            "workspace",
+            "base",
+            "prefer",
+            "tags",
+            "chosen",
+            "resolved",
+            "confirmed",
+        ],
+    ),
+    // The code-folder form with a description: a request to the overlord.
+    op(
+        "overlord.setup_request",
+        "overlord.setup_request",
+        &[
+            "description",
+            "code_dir",
+            "code_dir_source",
+            "roots",
+            "roots_source",
+        ],
+    ),
+    // The manual form's launch. The overlord's background for a session it
+    // proposed comes from the daemon (`proposal`), never from the page.
+    op(
+        "session.new",
+        "",
+        &[
+            "repo",
+            "project",
+            "name",
+            "branch",
+            "agent",
+            "model",
+            "workspace",
+            "prompt",
+            "base",
+            "prefer",
+            "proposal",
+        ],
+    ),
+    op(
+        "session.fork",
+        "session.fork",
+        &["ref", "prompt", "name", "workspace"],
+    ),
+];
+
+/// Ops that don't count as the user doing something on the page (look-ups
+/// and reports a page makes by itself): every other op moves the page's
+/// last use (`ui::target`). A `page.report` counts only with `input`.
+const PASSIVE: &[&str] = &[
+    "snapshot",
+    "session.get",
+    "page.report",
+    "page.pending",
+    "view.default",
+    "keys.list",
+    "form.defaults",
+    "form.repos",
+    "form.setup",
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
@@ -134,27 +233,42 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"protocol": plugin::WEB_PROTOCOL, "version": env!("CARGO_PKG_VERSION")}))
 }
 
-/// `web.call {op, args}`: one browser request.
+/// `web.call {op, args, page}`: one browser request, from the page with
+/// that id (the plugin's, never the browser's).
 pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     let op = params["op"].as_str().unwrap_or("");
     let Some(found) = OPS.iter().find(|o| o.op == op) else {
         return Err(NotAllowed(op.to_string()).into());
     };
+    let page = params["page"].as_str().unwrap_or("");
+    if !PASSIVE.contains(&op) {
+        d.web_ui().used(page);
+    }
+    // Anything from the page a command was for: it is alive and has it
+    // (the page says so after each command), so it isn't handed on.
+    arrived(d, page);
     if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
         return Err(NotAllowed(op.to_string()).into());
     }
-    let mut args = serde_json::Map::new();
-    if let Some(given) = params["args"].as_object() {
-        for k in found.args {
-            if let Some(v) = given.get(*k) {
-                args.insert((*k).to_string(), v.clone());
-            }
-        }
-    }
-    let args = Value::Object(args);
+    let args = filtered(found, &params["args"]);
     match op {
         "snapshot" => snapshot(d, &args),
         "session.resume" => resume(d, &args),
+        "page.report" => d.web_ui().report(page, &args),
+        "page.pending" => Ok(pending(d)),
+        "view.default" => crate::ui::default_view(d),
+        "form.setup" => Ok(json!({
+            "status": crate::setup::status(d)?,
+            "suggest": crate::setup::suggest(d, &json!({}))?,
+        })),
+        "form.setup_save" => crate::setup::apply(d, &args),
+        "overlord.new_session" => d.rpc(found.method, folder_request(args)),
+        "session.new" => launch(d, args),
+        // A session the list doesn't show: labelled as rows are.
+        "session.get" => d.rpc(found.method, args).map(|mut s| {
+            label(&mut s);
+            s
+        }),
         _ => d.rpc(found.method, args),
     }
 }
@@ -176,8 +290,63 @@ fn resume(d: &Daemon, args: &Value) -> Result<Value> {
     Ok(serde_json::to_value(s)?)
 }
 
+/// Only the arguments `op` passes on (any others are dropped).
+fn filtered(op: &Op, given: &Value) -> Value {
+    let mut args = serde_json::Map::new();
+    if let Some(given) = given.as_object() {
+        for k in op.args {
+            if let Some(v) = given.get(*k) {
+                args.insert((*k).to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(args)
+}
+
+/// Op `overlord.new_session`: a plain folder (`project`) goes as the TUI's
+/// form sends one: `repo: "<path> (plain folder, not a repo)"`, no
+/// worktree.
+fn folder_request(mut args: Value) -> Value {
+    let folder = args
+        .as_object_mut()
+        .and_then(|o| o.remove("project"))
+        .and_then(|p| p.as_str().map(str::to_string))
+        .filter(|p| !p.trim().is_empty());
+    if let Some(f) = folder.filter(|_| args["repo"].as_str().is_none_or(str::is_empty)) {
+        args["repo"] = json!(format!("{} (plain folder, not a repo)", f.trim()));
+        args["workspace"] = json!(false);
+    }
+    args
+}
+
+/// Op `session.new`: the manual form's launch. With `proposal` (a session
+/// the overlord proposed), the overlord's background and related sessions
+/// come from the daemon's copy, and the session is told the overlord
+/// launched it.
+fn launch(d: &Daemon, args: Value) -> Result<Value> {
+    d.rpc("session.new", launch_params(d, args)?)
+}
+
+/// `launch`'s parameters for `session.new`.
+fn launch_params(d: &Daemon, mut args: Value) -> Result<Value> {
+    let id = args
+        .as_object_mut()
+        .and_then(|o| o.remove("proposal"))
+        .and_then(|p| p.as_str().map(str::to_string))
+        .filter(|p| !p.is_empty());
+    if let Some(id) = id {
+        let kept = crate::ui::proposal(d, &id)?;
+        args["context"] = kept["context"].clone();
+        args["related"] = kept["related"].clone();
+        args["by_overlord"] = json!(true);
+    }
+    Ok(args)
+}
+
 /// Op `snapshot {view, rev}`: everything the list draws, in one answer.
-/// `view` is a `session.list` query; a `rev` that is still current gets
+/// `view` is a `session.list` query, whose `query` (or `search`) is the
+/// filter box's text, with the TUI's tokens (`search_tokens`), and whose
+/// `usage` picks the usage measure; a `rev` that is still current gets
 /// `{"unchanged": true}`. Grouping and labels are worked out here: the
 /// page only draws.
 pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
@@ -192,6 +361,21 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
         v @ Value::Object(_) => v.clone(),
         _ => bail!("view must be a session.list query (an object)"),
     };
+    // The filter text: `query` (the TUI's view shape, as `set_list_view`
+    // sends it), else `search`.
+    let text = ["query", "search"]
+        .iter()
+        .find_map(|k| view.get(*k).and_then(Value::as_str).map(str::to_string));
+    if let Some(o) = view.as_object_mut() {
+        o.remove("query");
+        // No measure: the user's sticky one (or config `usage`).
+        if o.get("usage").is_some_and(Value::is_null) {
+            o.remove("usage");
+        }
+    }
+    if let Some(text) = text {
+        search_tokens(&mut view, &text);
+    }
     // (The overlord is `overlord`, never one of the rows.)
     view["include_overlord"] = json!(false);
     let mut rows = d.rpc("session.list", view)?;
@@ -246,6 +430,37 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
     }))
 }
 
+/// The filter box's text, read as the TUI reads its filter
+/// (`SessionQuery::apply_search_text`): `tag:`, `status:`, `agent:`,
+/// `proj:`, `group:` and `sort:` tokens set those filters of the view,
+/// the other words are its free-text `search`. So the page and the TUI
+/// take the same filter, and the page doesn't parse it.
+fn search_tokens(view: &mut Value, text: &str) {
+    let mut q = SessionQuery::default();
+    if let Some(s) = view["sort"].as_str().and_then(SortMode::parse) {
+        q.sort = s;
+    }
+    let sort = q.sort;
+    q.apply_search_text(text);
+    view["search"] = json!(q.search);
+    if q.sort != sort {
+        view["sort"] = json!(q.sort.label());
+    }
+    if !q.status.is_empty() {
+        view["status"] = json!(q.status);
+    }
+    for (k, v) in [
+        ("tag", q.tag),
+        ("agent", q.agent),
+        ("project", q.project),
+        ("group", q.group),
+    ] {
+        if let Some(v) = v {
+            view[k] = json!(v);
+        }
+    }
+}
+
 /// Add `status_label` (as people see it) beside a row's `status`.
 fn label(row: &mut Value) {
     let l = row["status"]
@@ -279,6 +494,179 @@ pub fn pane_target(d: &Daemon, params: &Value) -> Result<Value> {
         "tmux_session": s.tmux_session,
         "running": running,
     }))
+}
+
+// ---- the pages (what each open web page shows) ----
+
+/// At most this many pages are kept (the plugin's control-socket limit).
+const MAX_PAGES: usize = 16;
+
+/// The open web pages, as the plugin and the pages report them: the web's
+/// side of "which screen is the user on" (`ui::target`, `ui.state`).
+#[derive(Default)]
+pub struct WebUi {
+    pages: Vec<Page>,
+}
+
+/// One open page (a browser tab's control socket).
+#[derive(Clone, Debug, Default)]
+pub struct Page {
+    /// The plugin's id for it (`p<n>-<8 hex>`).
+    pub id: String,
+    /// `{kind: "list" | "overlord" | "session", id?}`.
+    pub route: Value,
+    /// Its list view, in the TUI's shape (`ui::normalize_view`); null
+    /// before it reports one.
+    pub view: Value,
+    pub visible: bool,
+    /// The form open on it, if any.
+    pub form: Option<String>,
+    /// When the user last did something on it (the daemon's clock, ms).
+    pub last_input: Option<i64>,
+    /// Order of arrival: among pages never used, the newest wins.
+    pub seq: u64,
+}
+
+/// The forms a page may say it has open.
+const FORMS: &[&str] = &["describe", "confirm", "manual", "fork", "setup", "keys"];
+
+impl WebUi {
+    /// `web.pages`: the pages open now. New ones are added, missing ones
+    /// dropped; the others keep what they reported.
+    pub fn set_pages(&mut self, ids: &[String]) {
+        self.pages.retain(|p| ids.contains(&p.id));
+        let mut seq = self.pages.iter().map(|p| p.seq).max().unwrap_or(0);
+        for id in ids {
+            if self.pages.len() >= MAX_PAGES {
+                break;
+            }
+            if !id.is_empty() && !self.pages.iter().any(|p| &p.id == id) {
+                seq += 1;
+                self.pages.push(Page {
+                    id: clip(id, 40),
+                    route: json!({"kind": "list"}),
+                    seq,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    /// The plugin is gone: so are its pages.
+    pub fn clear(&mut self) {
+        self.pages.clear();
+    }
+
+    /// Page `id` was used now. (An unknown id changes nothing.)
+    pub fn used(&mut self, id: &str) {
+        if let Some(p) = self.pages.iter_mut().find(|p| p.id == id) {
+            p.last_input = Some(rlord_core::types::now_ms());
+        }
+    }
+
+    pub fn pages(&self) -> &[Page] {
+        &self.pages
+    }
+
+    pub fn page(&self, id: &str) -> Option<&Page> {
+        self.pages.iter().find(|p| p.id == id)
+    }
+
+    pub fn page_mut(&mut self, id: &str) -> Option<&mut Page> {
+        self.pages.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Op `page.report {route, view, visible, form, input}` from page
+    /// `id`: what it shows now. Only the fields given change; `input:
+    /// true` stamps its last use with the daemon's clock.
+    fn report_fields(&mut self, id: &str, args: &Value) -> Result<()> {
+        let Some(p) = self.pages.iter_mut().find(|p| p.id == id) else {
+            bail!("this page isn't open (reload it)");
+        };
+        if let Some(r) = args.get("route").filter(|r| !r.is_null()) {
+            let kind = r["kind"].as_str().unwrap_or("");
+            if !matches!(kind, "list" | "overlord" | "session") {
+                bail!("route kind must be list, overlord or session");
+            }
+            let mut route = json!({"kind": kind});
+            if let Some(i) = r["id"].as_str().filter(|_| kind == "session") {
+                route["id"] = json!(clip(i, 80));
+            }
+            p.route = route;
+        }
+        if let Some(v) = args.get("view").filter(|v| v.is_object()) {
+            p.view = crate::ui::normalize_view(v);
+        }
+        if let Some(v) = args.get("visible").and_then(Value::as_bool) {
+            p.visible = v;
+        }
+        match args.get("form") {
+            None => {}
+            Some(Value::Null) => p.form = None,
+            Some(f) => {
+                let f = f.as_str().unwrap_or("");
+                if !FORMS.contains(&f) {
+                    bail!("form must be one of {} or null", FORMS.join(", "));
+                }
+                p.form = Some(f.to_string());
+            }
+        }
+        if args["input"] == true {
+            p.last_input = Some(rlord_core::types::now_ms());
+        }
+        Ok(())
+    }
+
+    fn report(&mut self, id: &str, args: &Value) -> Result<Value> {
+        self.report_fields(id, args)?;
+        Ok(json!({"ok": true}))
+    }
+}
+
+/// How long a UI command waits for a page (`page.pending`).
+const PENDING_FOR: Duration = Duration::from_secs(30);
+
+/// A call from `page`: the parked command for it, if any, has arrived.
+fn arrived(d: &Daemon, page: &str) {
+    let mut slot = d.pending_web.lock().expect("ui mutex");
+    if slot.as_ref().is_some_and(|(_, p, _)| p == page) {
+        *slot = None;
+    }
+}
+
+/// Op `page.pending`: the last UI command for a web page, once, if it is
+/// under 30 s old, its page never said anything after it, and that page
+/// has closed since (so it may never have arrived: a reload, a reconnect).
+/// Null otherwise.
+fn pending(d: &Daemon) -> Value {
+    let mut slot = d.pending_web.lock().expect("ui mutex");
+    let lost = slot
+        .as_ref()
+        .is_some_and(|(at, page, _)| at.elapsed() < PENDING_FOR && d.web_ui().page(page).is_none());
+    if !lost {
+        return Value::Null;
+    }
+    slot.take().map(|(_, _, cmd)| cmd).unwrap_or(Value::Null)
+}
+
+/// `s` cut to at most `n` characters.
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// `web.pages {pages: [ids]}`: the plugin's open pages, the whole list
+/// each time (so a lost call heals on the next).
+pub fn pages(d: &Daemon, params: &Value) -> Result<Value> {
+    let ids: Vec<String> = params["pages"]
+        .as_array()
+        .context("pages must be a list of page ids")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let mut w = d.web_ui();
+    w.set_pages(&ids);
+    Ok(json!({"pages": w.pages().len()}))
 }
 
 // ---- running the plugin ----
@@ -681,6 +1069,69 @@ mod tests {
                 assert!(!o.op.starts_with(f), "{}", o.op);
             }
         }
+    }
+
+    fn op_named(name: &str) -> &'static Op {
+        OPS.iter().find(|o| o.op == name).unwrap()
+    }
+
+    /// A browser can't set what only trusted callers set: the overlord's
+    /// background, its role, extra agent arguments; those come from the
+    /// daemon's copy of the proposal.
+    #[test]
+    fn a_launch_takes_only_the_forms_fields() {
+        let d = Daemon::new(
+            rlord_core::db::Db::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        let got = filtered(
+            op_named("session.new"),
+            &json!({"repo": "/r", "name": "n", "extra_args": ["--danger"], "role": "overlord",
+                    "by_overlord": true, "context": "mine", "related": ["x"],
+                    "tmux_name": "t", "hooks_work": true, "remote_control": true}),
+        );
+        assert_eq!(got, json!({"repo": "/r", "name": "n"}));
+        assert_eq!(launch_params(&d, got.clone()).unwrap(), got);
+        // A proposal's background is the daemon's.
+        d.proposals.lock().unwrap().push_back((
+            "p1".into(),
+            json!({"context": "the overlord's", "related": ["a1"]}),
+        ));
+        let p = launch_params(&d, json!({"repo": "/r", "proposal": "p1"})).unwrap();
+        assert_eq!(
+            p,
+            json!({"repo": "/r", "context": "the overlord's", "related": ["a1"], "by_overlord": true})
+        );
+        assert!(launch_params(&d, json!({"proposal": "p9"})).is_err());
+        let f = filtered(
+            op_named("session.fork"),
+            &json!({"ref": "a", "prompt": "p", "context": "c", "related": ["b"], "model": "m",
+                    "branch": "b", "description": "d", "workspace": true}),
+        );
+        assert_eq!(f, json!({"ref": "a", "prompt": "p", "workspace": true}));
+        let s = filtered(
+            op_named("form.setup_save"),
+            &json!({"code_dir": "/c", "skip": true, "roots": "follow"}),
+        );
+        assert_eq!(s, json!({"code_dir": "/c", "roots": "follow"}));
+        let r = filtered(
+            op_named("overlord.new_session"),
+            &json!({"description": "d", "request_id": "r1"}),
+        );
+        assert_eq!(r, json!({"description": "d"}));
+    }
+
+    /// A plain folder goes to the overlord as the TUI's form sends one.
+    #[test]
+    fn a_folder_request_has_the_forms_wire_shape() {
+        assert_eq!(
+            folder_request(json!({"description": "d", "project": "/tmp/x", "workspace": true})),
+            json!({"description": "d", "repo": "/tmp/x (plain folder, not a repo)", "workspace": false})
+        );
+        assert_eq!(
+            folder_request(json!({"repo": "/r", "workspace": true})),
+            json!({"repo": "/r", "workspace": true})
+        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub fn tools() -> Value {
         "description": "Only with `base`, after a launch refused because that branch's local and remote sides have diverged: the side the user chose"});
     new_session_props["base"] = s("Where a new branch starts. Omit: the user's configured default ([session] base: the latest default branch, or \"head\"). \"latest\": the latest default branch, fetched, whatever the config says. A branch name, or <remote>/<branch> for the remote's: its newest commit, to build on it (refused if the local and remote branch have diverged: ask the user, then pass `prefer`). \"head\": whatever the repo's main checkout has now. Ignored when `branch` already exists or there is no worktree. The answer's `base` says which commit was used.");
     let mut create_props = new_session_props.clone();
-    create_props["go"] = b("Switch the user's terminal to the new session (default false)");
+    create_props["go"] = b("Show the new session on the user's screen (their terminal, or the web UI if they used it last; default false)");
     create_props["remote_control"] = b("Turn on Remote Control (continue it from the Claude app) once launched; only when the user asks. Claude Code sessions only.");
     json!([
         tool("list_sessions",
@@ -108,13 +108,13 @@ pub fn tools() -> Value {
             json!({"session": s(SESSION_REF), "lines": {"type": "integer", "description": "default 60"}}),
             &["session"]),
         tool("get_ui_state",
-            "What the user is looking at: which session their terminal shows, whether your overlay is open, the list's current and default view.",
+            "What the user is looking at. `target`: the screen your UI tools land on (terminal, web, or none: the one they used last). `terminal`: which session their terminal shows; `web`: what the web UI's most recent page shows (session or list, an open form), null when none is open; whether your overlay is open; the list's current view (on the target screen) and default view.",
             json!({}), &[]),
         tool("goto_session",
-            "Switch the user's terminal to a session (hides your overlay). Stopped sessions are resumed first.",
+            "Show a session on the user's screen (their terminal, or the web UI if they used it last; in a terminal, hides your overlay). Stopped sessions are resumed first. The answer's `on` says which screen.",
             json!({"session": s(SESSION_REF)}), &["session"]),
         tool("show_list",
-            "Show the user the rlord session list (hides your overlay).",
+            "Show the user the rlord session list on their screen (their terminal, or the web UI if they used it last; in a terminal, hides your overlay).",
             json!({}), &[]),
         tool("search_history",
             "Search what sessions said and did: their summaries, descriptions, notes and full transcripts (archived ones too). Returns matching sessions, best first, each with a few short snippets and the transcript line of each. Bounded; plain text search, every word must appear. Not your own conversations: those are `recall`.",
@@ -143,10 +143,10 @@ pub fn tools() -> Value {
             "Every key rlord binds (global keys, the list's keys) as set now, each with what stands in its way: taken (won't work as set) or shadows (rlord takes it from Claude Code, the shell or the user's tmux).",
             json!({}), &[]),
         tool("open_keys",
-            "Open the key screen on the user's list (hides your overlay), optionally at one key. The user presses the new key there: rlord tests it reaches rlord, checks it, and saves it to config.toml when they confirm.",
+            "Open the key screen, optionally at one key: in the user's terminal when one is attached (in a terminal, hides your overlay). The user presses the new key there: rlord tests it reaches rlord, checks it, and saves it to config.toml when they confirm. With only the web UI open, it shows the keys read-only (changing one needs a terminal: the answer's `on` and note say so).",
             json!({"key": s("Key id from keys_list (e.g. tmux.back, keys.quit); omit for the whole list")}), &[]),
         tool("set_list_view",
-            "Set the session list's tab, filter and sort, optionally save it as the default view, and show it to the user. The list has two tabs: 'sessions' (flat) and 'groups' (sessions by tag: tags are the groups).",
+            "Set the session list's tab, filter and sort on the user's screen (their terminal, or the web UI if they used it last), optionally save it as the default view, and show it to the user. The list has two tabs: 'sessions' (flat) and 'groups' (sessions by tag: tags are the groups).",
             json!({
                 "tab": {"type": "string", "enum": ["sessions", "groups"], "description": "Which tab to show"},
                 "group": s("On the groups tab, the group (tag) to open; \"\" = untagged. Implies tab groups."),
@@ -185,7 +185,7 @@ pub fn tools() -> Value {
                 "limit": {"type": "integer", "description": "Conversations to return for a query (default 6)"},
             }), &[]),
         tool("confirm_setup",
-            "Open the code-folder form on the user's screen (hides your overlay) for them to confirm: the folder they keep repos in (`code_dir`: the repo finder scans it and new repos go there). Pass what you would save; with nothing passed the form shows rlord's own suggestion, worked out from the projects it has seen. Nothing is saved until they confirm there, and rlord saves it then: you don't act again.",
+            "Open the code-folder form on the user's screen (their terminal, or the web UI if they used it last; in a terminal, hides your overlay) for them to confirm: the folder they keep repos in (`code_dir`: the repo finder scans it and new repos go there). Pass what you would save; with nothing passed the form shows rlord's own suggestion, worked out from the projects it has seen. Nothing is saved until they confirm there, and rlord saves it then: you don't act again.",
             json!({
                 "code_dir": s("The folder as you would save it; answering a setup request, the one the description names (it wins over the hints). Omit: rlord's suggestion"),
                 "repo_roots": {"type": "array", "items": {"type": "string"},
@@ -196,10 +196,10 @@ pub fn tools() -> Value {
                 "note": s("One line for the top of the form, e.g. \"Scanning both ~/ko and ~/proj, new repos in ~/ko\""),
             }), &[]),
         tool("propose_session",
-            "Open the new-session form pre-filled on the user's screen for them to review and launch. Prefer this over create_session unless told to just do it.",
+            "Open the new-session form pre-filled on the user's screen (their terminal, or the web UI if they used it last) for them to review and launch. Prefer this over create_session unless told to just do it.",
             new_session_props, &[]),
         tool("confirm_new_session",
-            "Reopen the user's new-session form with your corrections when their description contradicts the hints they sent (or left as defaults): their description verbatim, the hints as you would launch them, which ones you changed and why. Nothing launches until they send it back; that message says `confirmed: yes`.",
+            "Reopen the user's new-session form on their screen (their terminal, or the web UI if they used it last) with your corrections when their description contradicts the hints they sent (or left as defaults): their description verbatim, the hints as you would launch them, which ones you changed and why. Nothing launches until they send it back; that message says `confirmed: yes`.",
             json!({
                 "description": s("The user's description, verbatim"),
                 "request_id": s("The `request_id:` of the new-session request you're answering (omit if none)"),
@@ -232,7 +232,7 @@ pub fn tools() -> Value {
                 "model": s("Another model than the original's, one of that agent's (default: the original's)"),
                 "worktree": b("Work in a new git worktree branched from the original's last commit instead of its folder (default false). Claude Code and Codex only; uncommitted changes don't come along. Only when the user asks, or the two must not touch the same files."),
                 "branch": s("The new worktree's branch, with worktree only (default: derived from the name)"),
-                "go": b("Switch the user's terminal to the fork (default false)"),
+                "go": b("Show the fork on the user's screen (their terminal, or the web UI if they used it last; default false)"),
             }), &["session"]),
         tool("update_session",
             "Edit a session's meta-context. Only the fields given change.",
@@ -808,7 +808,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
                 // The session exists either way; a failed switch is a note,
                 // not a failed launch.
                 match d.rpc("ui.goto", json!({"ref": s["id"]})) {
-                    Ok(_) => out["user_switched_to_it"] = json!(true),
+                    Ok(g) => {
+                        out["user_switched_to_it"] = json!(true);
+                        out["on"] = g["on"].clone();
+                    }
                     Err(e) => out["switch_failed"] = json!(format!("{e:#}")),
                 }
             }
@@ -838,7 +841,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             if args.get("go").and_then(Value::as_bool) == Some(true) {
                 // The fork exists either way; a failed switch is a note.
                 match d.rpc("ui.goto", json!({"ref": s["id"]})) {
-                    Ok(_) => out["user_switched_to_it"] = json!(true),
+                    Ok(g) => {
+                        out["user_switched_to_it"] = json!(true);
+                        out["on"] = g["on"].clone();
+                    }
                     Err(e) => out["switch_failed"] = json!(format!("{e:#}")),
                 }
             }

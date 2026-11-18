@@ -480,3 +480,243 @@ fn view_helpers() {
 
     tx(&["kill-server"]);
 }
+
+/// Slice 2, step 1: a client's `client_activity` (what `tmux::Client`'s
+/// `activity` reads) moves when the client types and not when its pane
+/// prints, so "the surface the user used last" can rest on it. Its
+/// resolution is one second (epoch seconds).
+#[test]
+fn client_activity_is_input_not_output() {
+    let Some(_g) = setup() else { return };
+    let target = "rlord_webactivity";
+    // A pane that keeps printing (as an agent or the TUI redrawing does).
+    tmux::new_session(target, "/tmp", "while :; do date +%s%N; sleep 0.05; done").unwrap();
+    let mut c = PtyClient::spawn(&["attach-session", "-t", &format!("={target}")], 80, 24);
+    wait_for("the client", || {
+        tx(&["list-clients", "-F", "#{session_name}"]) == target
+    });
+    let activity = || -> i64 {
+        tx(&["list-clients", "-F", "#{client_activity}"])
+            .parse()
+            .unwrap()
+    };
+    let drawn = |c: &PtyClient| c.out.lock().unwrap().len();
+    let before = activity();
+    let bytes = drawn(&c);
+    // Output for a few seconds: drawn to the client, activity unchanged.
+    std::thread::sleep(Duration::from_millis(3200));
+    assert!(drawn(&c) > bytes + 1000, "the pane wasn't printing");
+    assert_eq!(activity(), before, "output moved client_activity");
+    // A resize (a browser view fitting itself) isn't input either.
+    let ws = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // Safety: TIOCSWINSZ on the PTY master this test owns.
+    unsafe {
+        use std::os::fd::AsRawFd;
+        libc::ioctl(c.master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
+    }
+    wait_for("the resize", || {
+        tx(&["list-clients", "-F", "#{client_width}"]) == "100"
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(activity(), before, "a resize moved client_activity");
+    // A key press moves it to now.
+    c.send(b"x");
+    let now_s = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    wait_for("the key press to count", || activity() > before);
+    assert!(now_s() - activity() <= 1, "{} vs {}", activity(), now_s());
+    c.close();
+    tx(&["kill-server"]);
+}
+
+/// A daemon on the scratch tmux server, serving on a temp socket, with
+/// session `s1` running in tmux session `rlord_s1`.
+fn daemon(cfg: rlord_core::config::Config) -> (Arc<rlord_daemon::Daemon>, tempfile::TempDir) {
+    use rlord_core::db::{Db, NewSession};
+    let db = Db::open_in_memory().unwrap();
+    db.insert_session(&NewSession {
+        id: "s1",
+        name: "s1",
+        agent: "claude",
+        agent_session: Some("s1"),
+        project_path: "/tmp",
+        tmux_session: Some("rlord_s1"),
+        launch_spec: "{}",
+        created_at: 1,
+        repo_path: None,
+        workspace_path: None,
+        branch: Some("main"),
+        role: "",
+    })
+    .unwrap();
+    let d = rlord_daemon::Daemon::new(db, cfg);
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("d.sock");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let d2 = d.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = rlord_daemon::Daemon::bind(&sock).unwrap();
+            tx.send(()).unwrap();
+            let _ = d2.serve(listener).await;
+        });
+    });
+    rx.recv().unwrap();
+    (d, dir)
+}
+
+/// One request to the daemon at `dir`; the whole response.
+fn call(dir: &tempfile::TempDir, method: &str, params: serde_json::Value) -> serde_json::Value {
+    use std::io::BufRead;
+    let mut s = std::os::unix::net::UnixStream::connect(dir.path().join("d.sock")).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    writeln!(
+        s,
+        "{}",
+        serde_json::json!({"id": 1, "method": method, "params": params})
+    )
+    .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(s).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+/// The overlord's tool call; its result (panics on an error).
+fn tool(dir: &tempfile::TempDir, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let r = call(
+        dir,
+        "mcp.call",
+        serde_json::json!({"name": name, "arguments": args, "overlord": true}),
+    );
+    assert!(r["error"].is_null(), "{name}: {r}");
+    r["result"].clone()
+}
+
+/// The plugin's stream: the next UI line.
+fn next_ui(
+    lines: &mut std::io::Lines<std::io::BufReader<std::os::unix::net::UnixStream>>,
+) -> serde_json::Value {
+    loop {
+        let l = lines.next().expect("open").expect("a line in time");
+        let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+        if v["notify"] == "ui" {
+            return v;
+        }
+    }
+}
+
+/// Slice 2: a terminal and a web page both present. The one used later
+/// gets `goto_session`: the terminal is switched, or the page is sent
+/// `goto` and the terminal stays where it was; the other gets a notice.
+/// `[web] ui_target` overrides.
+#[test]
+fn the_surface_used_last_gets_the_command() {
+    use serde_json::json;
+    use std::io::BufRead;
+    let Some(_g) = setup() else { return };
+    tmux::new_session("rlord_s1", "/tmp", "cat").unwrap();
+    tmux::new_session("rlord_home", "/tmp", "cat").unwrap();
+    // (The list's session: a stand-in for the TUI.)
+    tmux::set_home("rlord_home").unwrap();
+    let mut term = PtyClient::spawn(&["attach-session", "-t", "=rlord_home"], 80, 24);
+    let client_on = || tx(&["list-clients", "-F", "#{session_name}"]);
+    wait_for("the terminal", || client_on() == "rlord_home");
+    let (_d, dir) = daemon(Default::default());
+    let s = std::os::unix::net::UnixStream::connect(dir.path().join("d.sock")).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+    let mut lines = std::io::BufReader::new(s).lines();
+    lines.next().unwrap().unwrap();
+    assert!(call(&dir, "web.pages", json!({"pages": ["p1-aa"]}))["error"].is_null());
+    let page_input = || {
+        let r = call(
+            &dir,
+            "web.call",
+            json!({"op": "page.report", "page": "p1-aa", "args": {"input": true}}),
+        );
+        assert!(r["error"].is_null(), "{r}");
+    };
+
+    // The terminal typed last: it is switched; the page gets a notice.
+    term.send(b"x");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(tool(&dir, "get_ui_state", json!({}))["target"], "terminal");
+    let g = tool(&dir, "goto_session", json!({"session": "s1"}));
+    assert_eq!(g["on"], "terminal", "{g}");
+    wait_for("the terminal on s1", || client_on() == "rlord_s1");
+    let n = next_ui(&mut lines);
+    assert_eq!(n["cmd"]["cmd"], "notice", "{n}");
+    assert!(
+        n["cmd"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("in the terminal"),
+        "{n}"
+    );
+
+    // The page used later (a second on: whole seconds): it gets `goto`,
+    // and the terminal stays where it is.
+    tx_ok(&[
+        "switch-client",
+        "-c",
+        &tx(&["list-clients", "-F", "#{client_name}"]),
+        "-t",
+        "=rlord_home",
+    ])
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    page_input();
+    assert_eq!(tool(&dir, "get_ui_state", json!({}))["target"], "web");
+    let g = tool(&dir, "goto_session", json!({"session": "s1"}));
+    assert_eq!(g["on"], "web", "{g}");
+    let c = next_ui(&mut lines);
+    assert_eq!(
+        c["cmd"],
+        json!({"cmd": "goto", "id": "s1", "overlord": false})
+    );
+    assert_eq!(c["page"], "p1-aa");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(client_on(), "rlord_home");
+
+    // The terminal again.
+    std::thread::sleep(Duration::from_millis(1100));
+    term.send(b"y");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        tool(&dir, "goto_session", json!({"session": "s1"}))["on"],
+        "terminal"
+    );
+    wait_for("the terminal on s1", || client_on() == "rlord_s1");
+    drop(lines);
+    drop(w);
+
+    // ui_target = "web": the page, though the terminal typed last.
+    let mut cfg = rlord_core::config::Config::default();
+    cfg.web.ui_target = rlord_core::config::UiTarget::Web;
+    let (_d2, dir2) = daemon(cfg);
+    assert!(call(&dir2, "web.pages", json!({"pages": ["p2-bb"]}))["error"].is_null());
+    term.send(b"z");
+    std::thread::sleep(Duration::from_millis(300));
+    let st = tool(&dir2, "get_ui_state", json!({}));
+    assert_eq!(st["target"], "web", "{st}");
+    assert_eq!(tool(&dir2, "show_list", json!({}))["on"], "web");
+    assert_eq!(client_on(), "rlord_s1");
+    // The key screen still goes to the terminal (keys change only there).
+    let k = tool(&dir2, "open_keys", json!({}));
+    assert_eq!(k["on"], "terminal", "{k}");
+    wait_for("the terminal on the list", || client_on() == "rlord_home");
+
+    term.close();
+    tx(&["kill-server"]);
+}

@@ -135,6 +135,18 @@ enum Push {
     Ui(Value),
 }
 
+/// A line of the daemon's push stream as the TUI takes it: a UI command
+/// for the terminal (a line with no `to` is one too), or a change. A
+/// command for a web page isn't this terminal's: None.
+fn push_of(line: &str) -> Option<Push> {
+    let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+    match v["notify"].as_str() {
+        Some("ui") if v["to"] == "web" => None,
+        Some("ui") => Some(Push::Ui(v["cmd"].clone())),
+        _ => Some(Push::Changed),
+    }
+}
+
 /// Background thread: hold an `events.subscribe` connection (as a TUI, so
 /// the daemon knows UI commands have somewhere to land) and forward pushes.
 /// Reconnects with backoff if the daemon restarts.
@@ -147,11 +159,7 @@ fn spawn_subscriber() -> mpsc::Receiver<Push> {
                 let reader = BufReader::new(stream);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
-                    let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                    let push = match v["notify"].as_str() {
-                        Some("ui") => Push::Ui(v["cmd"].clone()),
-                        _ => Push::Changed,
-                    };
+                    let Some(push) = push_of(&line) else { continue };
                     if tx.send(push).is_err() {
                         return; // app gone
                     }
@@ -3555,6 +3563,32 @@ fn context_legend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The push stream: a command for a web page isn't the terminal's; a
+    /// line with no `to` is (an older daemon's); a notice sets the status
+    /// line.
+    #[test]
+    fn commands_for_the_web_are_not_the_terminals() {
+        let web = r#"{"notify":"ui","to":"web","page":"p1-ab","cmd":{"cmd":"show_list"}}"#;
+        assert!(push_of(web).is_none());
+        let term = r#"{"notify":"ui","to":"terminal","cmd":{"cmd":"show_list"}}"#;
+        assert!(matches!(push_of(term), Some(Push::Ui(c)) if c["cmd"] == "show_list"));
+        let old = r#"{"notify":"ui","cmd":{"cmd":"keys"}}"#;
+        assert!(matches!(push_of(old), Some(Push::Ui(_))));
+        assert!(matches!(
+            push_of(r#"{"notify":"changed"}"#),
+            Some(Push::Changed)
+        ));
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.handle_ui_cmd(serde_json::json!({"cmd": "notice",
+            "text": "the overlord opened a new-session form in the web UI"}));
+        assert_eq!(
+            app.status_line,
+            "the overlord opened a new-session form in the web UI"
+        );
+    }
 
     #[test]
     fn details_layout_and_popup_place() {

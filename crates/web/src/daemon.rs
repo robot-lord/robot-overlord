@@ -84,6 +84,11 @@ impl Daemon {
         .await
     }
 
+    /// `web.pages`: the pages open now, the whole list.
+    pub async fn pages(&self, ids: Vec<String>) -> Result<Value, CallError> {
+        self.call("web.pages", json!({"pages": ids})).await
+    }
+
     /// `web.subscribe`: the current rev, and the stream of later ones.
     pub async fn subscribe(&self) -> Result<(String, Subscription), CallError> {
         let s = self.connect().await?;
@@ -96,6 +101,15 @@ impl Daemon {
     }
 }
 
+/// What the daemon's push stream says.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// Something changed; the state's new rev.
+    Changed(String),
+    /// A UI command for one page (`crates/daemon/src/ui.rs`).
+    Ui { page: String, cmd: Value },
+}
+
 /// The daemon's push stream.
 pub struct Subscription {
     lines: Lines<BufReader<OwnedReadHalf>>,
@@ -104,15 +118,28 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    /// The next change's rev; None once the daemon has gone.
-    pub async fn next(&mut self) -> Option<String> {
+    /// The next change or UI command; None once the daemon has gone.
+    pub async fn next(&mut self) -> Option<Event> {
         loop {
             let line = self.lines.next_line().await.ok()??;
-            let v: Value = serde_json::from_str(&line).unwrap_or_default();
-            if v["notify"] == "changed" {
-                return Some(v["rev"].as_str().unwrap_or("").to_string());
+            if let Some(e) = event(&line) {
+                return Some(e);
             }
         }
+    }
+}
+
+/// A line of the push stream as an `Event` (None: not one this plugin
+/// knows).
+fn event(line: &str) -> Option<Event> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    match v["notify"].as_str()? {
+        "changed" => Some(Event::Changed(v["rev"].as_str().unwrap_or("").to_string())),
+        "ui" => Some(Event::Ui {
+            page: v["page"].as_str()?.to_string(),
+            cmd: v.get("cmd")?.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -138,4 +165,27 @@ async fn answer(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Value, Ca
         });
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_lines_are_events() {
+        assert_eq!(
+            event(r#"{"notify":"changed","rev":"b-3"}"#),
+            Some(Event::Changed("b-3".into()))
+        );
+        assert_eq!(
+            event(r#"{"notify":"ui","page":"p1-ab","cmd":{"cmd":"show_list"}}"#),
+            Some(Event::Ui {
+                page: "p1-ab".into(),
+                cmd: json!({"cmd": "show_list"})
+            })
+        );
+        assert_eq!(event(r#"{"notify":"ui","cmd":{"cmd":"show_list"}}"#), None);
+        assert_eq!(event(r#"{"notify":"other"}"#), None);
+        assert_eq!(event("not json"), None);
+    }
 }

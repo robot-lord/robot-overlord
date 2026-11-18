@@ -183,3 +183,86 @@ async fn the_plugin_goes_with_the_daemon() {
     assert!(log.contains("the daemon went away"), "{log}");
     drop(r);
 }
+
+/// One request on a control socket; its answer.
+async fn ask(ws: &mut common::Ws, frame: serde_json::Value) -> serde_json::Value {
+    let id = frame["id"].clone();
+    ws.send(Message::text(frame.to_string())).await.unwrap();
+    loop {
+        let a = next_json(ws).await;
+        if a["id"] == id {
+            return a;
+        }
+    }
+}
+
+/// The daemon's view of the screens (`ui.state`).
+async fn ui_state() -> serde_json::Value {
+    let sock = paths::socket_path();
+    tokio::task::spawn_blocking(move || {
+        rlord_daemon::client_call(&sock, "ui.state", json!({})).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+/// Each control socket is a page: its hello names it, the daemon hears of
+/// it opening and closing, its calls carry its id (never one the browser
+/// sends), and a UI command reaches only the page it is for.
+#[tokio::test(flavor = "multi_thread")]
+async fn pages_and_their_ui_commands() {
+    let _g = LOCK.lock().await;
+    let r = tokio::task::spawn_blocking(start).await.unwrap();
+    assert_eq!(ui_state().await["target"], "none");
+    let (mut a, ha) = r.control().await;
+    let (mut b, hb) = r.control().await;
+    let (pa, pb) = (ha["page"].as_str().unwrap(), hb["page"].as_str().unwrap());
+    assert!(pa.starts_with("p1-") && pb.starts_with("p2-"), "{pa} {pb}");
+    let st = ui_state().await;
+    assert_eq!(
+        (&st["target"], &st["web"]["pages"]),
+        (&json!("web"), &json!(2))
+    );
+    // B reports a form and input, naming A at the top level: the plugin
+    // stamps B's own id, so B is the one the daemon now picks.
+    let got = ask(
+        &mut b,
+        json!({"id": 1, "op": "page.report", "page": pa,
+               "args": {"form": "fork", "input": true}}),
+    )
+    .await;
+    assert!(got["error"].is_null(), "{got}");
+    assert_eq!(ui_state().await["web"]["form"], "fork");
+    // The overlord's show_list: to B only.
+    let sock = paths::socket_path();
+    let shown = tokio::task::spawn_blocking(move || {
+        rlord_daemon::client_call(
+            &sock,
+            "mcp.call",
+            json!({"name": "show_list", "arguments": {}, "overlord": true}),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(shown["on"], "web", "{shown}");
+    let ev = loop {
+        let ev = next_json(&mut b).await;
+        if ev["event"] == "ui" {
+            break ev;
+        }
+    };
+    assert_eq!(ev["cmd"], json!({"cmd": "show_list"}));
+    // A: nothing but a pending answer of null (nothing was lost).
+    let p = ask(&mut a, json!({"id": 2, "op": "page.pending", "args": {}})).await;
+    assert_eq!(p["ok"], serde_json::Value::Null, "{p}");
+    // B closes: the daemon hears of it.
+    b.close(None).await.unwrap();
+    let t = Instant::now();
+    while ui_state().await["web"]["pages"] != 1 {
+        assert!(t.elapsed() < Duration::from_secs(5), "B still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(a);
+    drop(r);
+}

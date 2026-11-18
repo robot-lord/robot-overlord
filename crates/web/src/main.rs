@@ -3,7 +3,8 @@
 //!
 //! On start it reads `[web] port`, makes or reuses the token, binds
 //! 127.0.0.1, says `web.hello` with its port, subscribes to the daemon's
-//! changes, sweeps leftover view sessions, and serves. It exits when that subscription ends (the daemon
+//! changes and UI commands, sweeps leftover view sessions, tells the
+//! daemon no page is open yet, and serves. It exits when that subscription ends (the daemon
 //! went away), so a crashed daemon leaves no listener behind.
 //!
 //! Exit codes: 0 when the daemon goes away, 1 on an error, 2 on a wrong
@@ -86,11 +87,17 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
         );
     }
     let app = http::App::new(token, port, d, rev);
-    // The daemon's changes, to every control socket; its end is ours.
+    // No page is open yet (a plugin before this one may have left some).
+    app.report_pages().await;
+    // The daemon's changes, to every control socket, and its UI commands,
+    // each to its page; its end is ours.
     let pump = std::sync::Arc::clone(&app);
     tokio::spawn(async move {
-        while let Some(rev) = sub.next().await {
-            pump.changed(rev);
+        while let Some(e) = sub.next().await {
+            match e {
+                daemon::Event::Changed(rev) => pump.changed(rev),
+                daemon::Event::Ui { page, cmd } => pump.ui(&page, cmd).await,
+            }
         }
         eprintln!("rlord-web: the daemon went away; exiting");
         std::process::exit(0);

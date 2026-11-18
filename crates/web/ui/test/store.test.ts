@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../src/api";
 import type { Snapshot } from "../src/proto";
-import { DEBOUNCE_MS, inGroup, type Requester, Store } from "../src/store";
+import {
+  DEBOUNCE_MS,
+  inGroup,
+  listView,
+  type Requester,
+  Store,
+  sortOf,
+  viewOf,
+} from "../src/store";
 import fixture from "./fixtures/snapshot.json";
 
 const base = fixture as Snapshot;
@@ -183,5 +191,92 @@ describe("store", () => {
     expect(inGroup({ ...row, tags: [] }, "")).toBe(true);
     expect(inGroup({ ...row, tags: ["a"] }, "")).toBe(false);
     expect(inGroup({ ...row, tags: ["a", "b"] }, "b")).toBe(true);
+  });
+});
+
+describe("views from the daemon", () => {
+  it("maps the daemon's view shape both ways", () => {
+    const l = {
+      query: "tag:web status:needs",
+      sort: "updated",
+      reverse: true,
+      usage: "tokens",
+      archived: "only",
+      tab: "groups",
+      group: "web",
+    };
+    const v = viewOf(l);
+    expect(v).toEqual({
+      archived: "only",
+      sort: "activity",
+      reverse: true,
+      search: "tag:web status:needs",
+      tab: "groups",
+      group: "web",
+      usage: "tokens",
+    });
+    expect(listView(v)).toEqual(l);
+    expect(sortOf("status")).toBeNull();
+    expect(viewOf({ ...l, sort: "bogus", tab: "x", archived: "x" })).toMatchObject({
+      sort: "activity",
+      tab: "sessions",
+      archived: "live",
+    });
+  });
+
+  it("sends the filter as query, with the usage measure", async () => {
+    const s = new Store();
+    const { api, calls } = fakeApi();
+    s.connected(api);
+    calls[0]?.resolve(snap("r-1"));
+    await settle();
+    s.applyView(
+      {
+        query: "tag:wip",
+        sort: "name",
+        reverse: false,
+        usage: "context",
+        archived: "live",
+        tab: "sessions",
+        group: null,
+      },
+      "beta",
+    );
+    expect(s.selected.value).toBe("beta");
+    expect(calls.at(-1)?.args.view).toMatchObject({
+      query: "tag:wip",
+      sort: "name",
+      usage: "context",
+    });
+  });
+
+  it("a browser with no view of its own starts from the daemon's default", async () => {
+    const s = new Store(null, { defaultView: true });
+    const { api, calls } = fakeApi();
+    s.connected(api);
+    expect(calls[0]?.op).toBe("view.default");
+    calls[0]?.resolve({
+      query: "status:needs",
+      sort: "state",
+      reverse: false,
+      usage: null,
+      archived: "live",
+      tab: "sessions",
+      group: null,
+    });
+    await settle();
+    expect(calls[1]?.op).toBe("snapshot");
+    expect(calls[1]?.args.view).toMatchObject({ query: "status:needs", sort: "state" });
+    // One that has its own keeps it.
+    const saved = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => saved.get(k) ?? null,
+      setItem: (k: string, v: string) => void saved.set(k, v),
+    };
+    new Store(storage).setView({ sort: "name" });
+    const own = new Store(storage, { defaultView: true });
+    const b = fakeApi();
+    own.connected(b.api);
+    expect(b.calls[0]?.op).toBe("snapshot");
   });
 });

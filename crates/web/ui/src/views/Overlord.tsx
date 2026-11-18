@@ -4,7 +4,7 @@
 import { useState } from "preact/hooks";
 import { OverlordActions, useRunner } from "../components/Actions";
 import { Pane } from "../components/Pane";
-import { Status } from "../components/Status";
+import { Status, Work } from "../components/Status";
 import type { Store } from "../store";
 import { Back } from "./Session";
 
@@ -37,9 +37,10 @@ export function Overlord({ store, token }: { store: Store; token: string }) {
       <header class="view-head">
         <Back />
         <h1>overlord</h1>
-        <Status status={o.status} label={o.status_label} />
+        <Status s={o} full />
         <span class="dim">{active?.label ?? o.agent}</span>
         {o.model && <span class="dim">{o.model}</span>}
+        <Work s={o} />
       </header>
       <OverlordActions o={o} r={r} />
       <Pane
