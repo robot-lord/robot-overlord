@@ -1434,7 +1434,8 @@ including when the active one hits a usage limit.
   `turn_context.cwd`. An imported Codex thread resumes in the pane
   (`codex resume <id> --no-daemon`); a thread the index lists as an
   app-server client's (`source` vscode) may be hosted by Codex's
-  background server, so it is flagged "maybe open elsewhere".
+  background server; written in the last 10 minutes, it is flagged
+  "may be held by Codex's app/server" (`maybe_held_by_codex_server`).
   `session.import` adds a stopped row with trust `hook` (the id is the
   transcript's file name, so restarts resume it) and no tmux name until it
   first runs. It can recreate a removed worktree from its branch, or import

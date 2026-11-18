@@ -450,10 +450,9 @@ rlord can't always tell, and may type a message (or a usage-limit
 "continue") into that turn. Daemon mode has been checked on macOS only
 so far.
 
-Not yet: importing Codex conversations started outside rlord, sub-agent
-tracking. Remote Control is Claude Code only: Codex's waits until Codex
-makes it official. A session blocked on a permission prompt shows "needs
-you" only with trusted hooks.
+Not yet: sub-agent tracking. Remote Control is Claude Code only: Codex's
+waits until Codex makes it official. A session blocked on a permission
+prompt shows "needs you" only with trusted hooks.
 
 ## OpenCode sessions
 

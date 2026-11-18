@@ -36,7 +36,8 @@ The overlord starts you in one of two modes. It says which.
    when passing `ids` to the tools. `<agent>` is the conversation's `agent` (claude, codex). The scan
    covers Claude Code and Codex; OpenCode conversations aren't importable.
 
-   Mark lines with `(open elsewhere)` when `maybe_open_elsewhere` is set and
+   Mark lines with `(open elsewhere)` when `maybe_open_elsewhere` is set,
+   `(held by Codex app?)` when `maybe_held_by_codex_app` is set and
    `(recreate worktree)` when `dir_gone` and `recreatable`. End with a count
    of what you skipped. Import nothing in this mode.
 
@@ -55,8 +56,9 @@ You're given the approved list (ids, plus any changes the user made).
    - `archive: true` for the archive ones; `recreate_worktree: true` where
      the folder is gone but recreatable.
 3. Reply with one line: how many were imported and archived, any errors,
-   and which ones are open elsewhere: the user must close those copies
-   before resuming them in rlord, or the two will fork the conversation.
+   and which ones are open elsewhere or may be held by the Codex app:
+   the user must close those copies before resuming them in rlord, or the
+   two will fork the conversation.
 
 ## Never
 

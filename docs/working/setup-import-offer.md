@@ -17,7 +17,7 @@ until now only the overlord offered when asked.
    scan would list in its first 30 days (same file, mtime, cwd and
    exclusion checks; newest 500 dirs, rlord's own and temp ones skipped by name;
    at most 50 transcripts read, true if that budget runs out on rejects; stops at
-   the first). Only Claude Code can be imported so far.
+   the first). Claude Code and Codex can be imported (Codex since 1.12.0).
 3. The dialog explains import: `y` import my sessions, `d` don't ask
    again, Esc later. Keys in its first 800ms are dropped; quitting and
    staying brings it back. On first run the overlay waits until the offer
@@ -29,8 +29,8 @@ until now only the overlord offered when asked.
    `d` records `no:`; if that fails, the offer reopens with the error.
 5. `overlord.md` routes `[rlord import request]` to "Importing existing
    work": `rlord-import` proposes, the user approves, then it imports. If
-   nothing is found, the overlord says only Claude Code import is supported
-   so far.
+   nothing is found, the overlord says only Claude Code and Codex
+   import are supported so far.
 
 ## Decisions (user's)
 

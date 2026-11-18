@@ -1543,6 +1543,9 @@ fn import_cmd(
             if c["open_elsewhere"] == true || c["recently_written"] == true {
                 flags.push("maybe open elsewhere");
             }
+            if c["maybe_held_by_codex_server"] == true {
+                flags.push("may be held by Codex's app/server");
+            }
             let flags = if flags.is_empty() {
                 String::new()
             } else {

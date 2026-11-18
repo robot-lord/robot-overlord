@@ -168,6 +168,14 @@ pub fn head_commit(dir: &str) -> Result<String> {
     git(&["-C", dir, "rev-parse", "--verify", "HEAD"])
 }
 
+/// The branch checked out in `dir` (None: detached, or not a repo).
+pub fn checked_out_branch(dir: &str) -> Option<String> {
+    git(&["-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
 /// Whether the checkout at `dir` has anything not committed: changed
 /// files, and untracked ones not ignored (a new worktree has neither).
 /// None when git can't say.

@@ -55,6 +55,10 @@ pub struct Candidate {
     /// A running process has this conversation id on its command line: it is
     /// open somewhere else right now (another session manager, a terminal).
     pub open_elsewhere: bool,
+    /// (Codex) started by an app-server client (an editor, the Codex app,
+    /// Codex's background server) and written in the last few minutes: it
+    /// may still be held there.
+    pub maybe_held_by_codex_server: bool,
     /// The transcript was written in the last few minutes: possibly open
     /// somewhere even if no command line names it.
     pub recently_written: bool,
@@ -396,6 +400,7 @@ fn candidate(
         last_user_at: last_of("user"),
         last_agent_at: last_of("assistant"),
         open_elsewhere: procs.lines().any(|l| l.contains(id)),
+        maybe_held_by_codex_server: false,
         recently_written,
     })
 }
@@ -438,11 +443,14 @@ const CWD_SEARCH_MAX: u64 = 64 * 1024 * 1024;
 
 /// Why conversation `id` isn't importable (None: it is, or no transcript
 /// by that id exists). For error messages when an import by id fails.
-pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Why {
     let projects = claude::config_dir().join("projects");
     // Every transcript whose id starts with `id` (a full id or a prefix).
     let mut hits = Vec::new();
-    for dir in std::fs::read_dir(&projects).ok()?.flatten() {
+    let Ok(dirs) = std::fs::read_dir(&projects) else {
+        return Why::NotFound;
+    };
+    for dir in dirs.flatten() {
         for f in std::fs::read_dir(dir.path())
             .into_iter()
             .flatten()
@@ -455,24 +463,42 @@ pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String
         }
     }
     match hits.as_slice() {
-        [] => Some(format!(
-            "no transcript whose id starts with {id} under {}",
-            projects.display()
-        )),
+        [] => Why::NotFound,
+        [(_, full, _)] if tracked(full) => Why::Tracked,
         [(path, full, slug)] => {
-            if tracked(full) {
-                return Some(
-                    "rlord already tracks it (now or as an earlier conversation of a session)"
-                        .into(),
-                );
-            }
             let slug = slug.to_string_lossy();
-            candidate(path, full, &slug, None, "", &excluded_dirs()).err()
+            match candidate(path, full, &slug, None, "", &excluded_dirs()) {
+                Ok(_) => Why::Importable,
+                Err(e) => Why::Rejected(e),
+            }
         }
-        _ => Some(format!(
-            "{} conversations start with {id}; use more of the id",
-            hits.len()
-        )),
+        _ => Why::Ambiguous(hits.len()),
+    }
+}
+
+/// What one agent says about an id asked for by `explain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    NotFound,
+    /// rlord tracks it already.
+    Tracked,
+    /// This many conversations start with the id.
+    Ambiguous(usize),
+    Rejected(String),
+    Importable,
+}
+
+const TRACKED: &str = "rlord already tracks it (now or as an earlier conversation of a session)";
+
+impl Why {
+    /// Why it can't be imported (None: not found, or importable).
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Why::NotFound | Why::Importable => None,
+            Why::Tracked => Some(TRACKED.into()),
+            Why::Ambiguous(_) => Some("several conversations match; use more of the id".into()),
+            Why::Rejected(e) => Some(e.clone()),
+        }
     }
 }
 
@@ -513,7 +539,8 @@ pub fn has_codex_conversations_in(
         let Some(id) = codex_rollout_id(&path) else {
             continue;
         };
-        if tracked(id) {
+        // The index's own rejects cost no read.
+        if tracked(id) || index.get(id).and_then(index_reject).is_some() {
             continue;
         }
         if reads >= MAX_READS {
@@ -616,6 +643,9 @@ pub fn scan_codex_in(
         if opts.only.is_empty() && mtime < opts.since_ms {
             continue;
         }
+        if index.get(id).and_then(index_reject).is_some() {
+            continue;
+        }
         let Ok(c) = codex_candidate(&path, id, Some(mtime), procs, excluded, index.get(id)) else {
             continue;
         };
@@ -704,6 +734,21 @@ fn session_meta(path: &Path, head: &[Value]) -> Result<SessionMeta, String> {
     ))
 }
 
+fn is_headless_source(s: &str) -> bool {
+    matches!(s, "exec" | "mcp")
+}
+
+/// Why the index alone rules a thread out (no rollout read needed).
+fn index_reject(i: &IndexRow) -> Option<String> {
+    if let Some(s) = i.source.as_deref().filter(|s| is_headless_source(s)) {
+        return Some(format!("a headless run (source {s}), not a conversation"));
+    }
+    i.thread_source
+        .as_deref()
+        .filter(|t| *t != "user")
+        .map(|_| "a sub-agent's thread, not the user's conversation".to_string())
+}
+
 fn codex_candidate(
     path: &Path,
     id: &str,
@@ -712,6 +757,9 @@ fn codex_candidate(
     excluded: &[PathBuf],
     indexed: Option<&IndexRow>,
 ) -> Result<Candidate, String> {
+    if let Some(why) = indexed.and_then(index_reject) {
+        return Err(why);
+    }
     let (head, tail) = transcript::read_head_tail(path);
     let meta = session_meta(path, &head)?;
     let originator = meta.str("originator");
@@ -720,7 +768,7 @@ fn codex_candidate(
     let source = indexed
         .and_then(|i| i.source.clone())
         .or_else(|| meta.str("source"));
-    if let Some(s) = source.as_deref().filter(|s| matches!(*s, "exec" | "mcp")) {
+    if let Some(s) = source.as_deref().filter(|s| is_headless_source(s)) {
         return Err(format!("a headless run (source {s}), not a conversation"));
     }
     if let Some(o) = originator.as_deref().filter(|o| o.contains("exec")) {
@@ -779,8 +827,15 @@ fn codex_candidate(
         .or(mtime)
         .ok_or("no timestamps in the rollout")?;
     let started_at = head.iter().find_map(ts);
-    // Codex records the branch when the thread starts (`session_meta.git`).
-    let branch = meta.branch().filter(|b| !b.is_empty() && b != "HEAD");
+    // Codex records the branch only when the thread starts
+    // (`session_meta.git`), in the folder it started in. A thread that moved
+    // since: that branch says nothing about where it is now, so it isn't
+    // offered for recreating a worktree. (A folder that exists gets its
+    // current branch from git: `add_git_info`.)
+    let moved = meta.str("cwd").is_some_and(|start| start != cwd);
+    let branch = meta
+        .branch()
+        .filter(|b| !b.is_empty() && b != "HEAD" && !moved);
     let dir_exists = Path::new(&cwd).is_dir();
     let recently_written =
         mtime.is_some_and(|m| ms_epoch(SystemTime::now()) - m < RECENT_WRITE.as_millis() as i64);
@@ -804,22 +859,23 @@ fn codex_candidate(
         last_active_at,
         last_user_at: last_of("you"),
         last_agent_at: last_of("agent"),
+        open_elsewhere: procs.lines().any(|l| l.contains(id)),
         // A thread an app-server client started (`source` vscode: an
-        // editor, or Codex's background server) may still be hosted there;
-        // resuming it in the pane (`--no-daemon`) would run it twice.
-        open_elsewhere: procs.lines().any(|l| l.contains(id))
-            || source.as_deref() == Some("vscode"),
+        // editor, the Codex app, or Codex's background server) and written
+        // lately may still be held there; resuming it in the pane
+        // (`--no-daemon`) would run it twice.
+        maybe_held_by_codex_server: recently_written && source.as_deref() == Some("vscode"),
         recently_written,
     })
 }
 
 /// Why Codex thread `id` isn't importable (None: it is, or no rollout by
 /// that id exists).
-pub fn explain_codex(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+pub fn explain_codex(id: &str, tracked: &dyn Fn(&str) -> bool) -> Why {
     explain_codex_in(&codex::home(), id, tracked)
 }
 
-fn explain_codex_in(home: &Path, id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+fn explain_codex_in(home: &Path, id: &str, tracked: &dyn Fn(&str) -> bool) -> Why {
     let hits: Vec<(PathBuf, String)> = codex::rollouts_in(&home.join("sessions"))
         .into_iter()
         .filter_map(|(_, p)| {
@@ -828,21 +884,16 @@ fn explain_codex_in(home: &Path, id: &str, tracked: &dyn Fn(&str) -> bool) -> Op
         })
         .collect();
     match hits.as_slice() {
-        [] => None,
+        [] => Why::NotFound,
+        [(_, full)] if tracked(full) => Why::Tracked,
         [(path, full)] => {
-            if tracked(full) {
-                return Some(
-                    "rlord already tracks it (now or as an earlier conversation of a session)"
-                        .into(),
-                );
-            }
             let index = codex_index(home);
-            codex_candidate(path, full, None, "", &excluded_dirs(), index.get(full)).err()
+            match codex_candidate(path, full, None, "", &excluded_dirs(), index.get(full)) {
+                Ok(_) => Why::Importable,
+                Err(e) => Why::Rejected(e),
+            }
         }
-        _ => Some(format!(
-            "{} conversations start with {id}; use more of the id",
-            hits.len()
-        )),
+        _ => Why::Ambiguous(hits.len()),
     }
 }
 
@@ -862,13 +913,29 @@ pub fn scan_all(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candidat
 }
 
 /// Why conversation `id` (of any importable agent) isn't importable.
+/// Starts with `TRACKED` when rlord tracks it (the CLI looks for that).
 pub fn explain(id: &str, tracked: &dyn Fn(&str) -> bool) -> String {
-    match (explain_claude(id, tracked), explain_codex(id, tracked)) {
-        (c, None) => c.unwrap_or_else(|| "unknown".into()),
-        (None, Some(x)) => x,
-        // No Claude transcript by that id: Codex's answer.
-        (Some(c), Some(x)) if c.starts_with("no transcript") => x,
-        (Some(c), Some(x)) => format!("Claude Code: {c}; Codex: {x}"),
+    merge_why(id, explain_claude(id, tracked), explain_codex(id, tracked))
+}
+
+fn merge_why(id: &str, claude: Why, codex: Why) -> String {
+    use Why::*;
+    let count = |w: &Why| match w {
+        NotFound => 0,
+        Ambiguous(n) => *n,
+        _ => 1,
+    };
+    match (claude, codex) {
+        (NotFound, NotFound) => {
+            format!("no Claude Code or Codex conversation's id starts with {id}")
+        }
+        (c, x) if count(&c) + count(&x) > 1 => format!(
+            "{} conversations start with {id}; use more of the id",
+            count(&c) + count(&x)
+        ),
+        (w, NotFound) | (NotFound, w) => w.reason().unwrap_or_else(|| "unknown".into()),
+        // (Unreachable: one hit each counts two.)
+        (c, _) => c.reason().unwrap_or_else(|| "unknown".into()),
     }
 }
 
@@ -877,6 +944,13 @@ pub fn explain(id: &str, tracked: &dyn Fn(&str) -> bool) -> String {
 pub fn add_git_info(c: &mut Candidate) {
     if c.dir_exists {
         c.repo = git::main_repo_root(&c.cwd);
+        // Codex records the branch only at the start: the checkout says
+        // what it is now.
+        if c.agent == "codex" {
+            if let Some(b) = git::checked_out_branch(&c.cwd) {
+                c.branch = Some(b);
+            }
+        }
         // A worktree has its own top level; a subfolder of the main checkout
         // shares the main one.
         let top = git::repo_root(&c.cwd)
@@ -1165,6 +1239,7 @@ mod tests {
             last_user_at: None,
             last_agent_at: None,
             open_elsewhere: false,
+            maybe_held_by_codex_server: false,
             recently_written: false,
         };
         add_git_info(&mut c);
@@ -1255,11 +1330,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let cwd = work.path().to_string_lossy().into_owned();
-        // A conversation: it moved to `cwd` in its latest turn.
+        // A conversation.
         rollout(
             home.path(),
             CX_A,
-            json!({"id": CX_A, "cwd": "/started/here", "originator": "codex-tui",
+            json!({"id": CX_A, "cwd": cwd, "originator": "codex-tui",
                    "source": "cli", "git": {"branch": "fix-login"}}),
             &codex_turn(&cwd, "fix the flaky login test", "Fixed."),
         );
@@ -1324,13 +1399,22 @@ mod tests {
             scan_codex_in(home.path(), &only, &|_| false, "", &[]).len(),
             1
         );
-        let why = explain_codex_in(home.path(), CX_B, &|_| false).unwrap();
+        let why = explain_codex_in(home.path(), CX_B, &|_| false)
+            .reason()
+            .unwrap();
         assert!(why.contains("headless"), "{why}");
-        let why = explain_codex_in(home.path(), CX_C, &|_| false).unwrap();
+        let why = explain_codex_in(home.path(), CX_C, &|_| false)
+            .reason()
+            .unwrap();
         assert!(why.contains("sub-agent"), "{why}");
-        let why = explain_codex_in(home.path(), CX_D, &|_| false).unwrap();
+        let why = explain_codex_in(home.path(), CX_D, &|_| false)
+            .reason()
+            .unwrap();
         assert!(why.contains("nothing typed"), "{why}");
-        assert!(explain_codex_in(home.path(), "ffff", &|_| false).is_none());
+        assert_eq!(
+            explain_codex_in(home.path(), "ffff", &|_| false),
+            Why::NotFound
+        );
 
         // The first-run check sees the same.
         assert!(has_codex_conversations_in(home.path(), 0, &|_| false, &[]));
@@ -1371,7 +1455,7 @@ mod tests {
         let found = scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[]);
         let ids: Vec<(&str, bool)> = found
             .iter()
-            .map(|c| (c.agent_session.as_str(), c.open_elsewhere))
+            .map(|c| (c.agent_session.as_str(), c.maybe_held_by_codex_server))
             .collect();
         // A thread an app-server client started may be hosted there.
         assert_eq!(ids.len(), 2);
@@ -1393,8 +1477,69 @@ mod tests {
                    "cwd": "/src/app", "source": "exec"}),
             &codex_turn("/src/app", "summarize", "ok"),
         );
-        let why = explain_codex_in(home.path(), CX_A, &|_| false).unwrap();
+        let why = explain_codex_in(home.path(), CX_A, &|_| false)
+            .reason()
+            .unwrap();
         assert!(why.contains("headless"), "{why}");
+    }
+
+    #[test]
+    fn explanations_merge_by_kind() {
+        use Why::*;
+        let m = |c, x| merge_why("ab", c, x);
+        assert!(m(NotFound, NotFound).starts_with("no Claude Code or Codex"));
+        // The CLI's "already tracked" path keys on this prefix.
+        assert!(m(NotFound, Tracked).starts_with("rlord already tracks"));
+        assert!(m(Tracked, NotFound).starts_with("rlord already tracks"));
+        assert_eq!(m(Rejected("x".into()), NotFound), "x");
+        assert!(m(Tracked, Importable).starts_with("2 conversations"));
+        assert!(m(Ambiguous(3), NotFound).starts_with("3 conversations"));
+    }
+
+    #[test]
+    fn a_moved_codex_thread_keeps_no_start_branch() {
+        let home = tempfile::tempdir().unwrap();
+        rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "cwd": "/gone/a", "git": {"branch": "feat"}}),
+            &codex_turn("/gone/b", "hello there", "hi"),
+        );
+        let c = &scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[])[0];
+        assert_eq!(c.cwd, "/gone/b");
+        assert_eq!(c.branch, None);
+    }
+
+    #[test]
+    fn index_rejects_cost_no_read_and_app_threads_are_flagged_only_when_fresh() {
+        let home = tempfile::tempdir().unwrap();
+        // Unreadable rollouts the index already rules out: never read, so
+        // the offer's budget isn't spent on them (the file isn't JSON).
+        let day = home.path().join("sessions/2026/11/11");
+        std::fs::create_dir_all(&day).unwrap();
+        for id in [CX_B, CX_C] {
+            std::fs::write(day.join(format!("rollout-x-{id}.jsonl")), "junk\n").unwrap();
+        }
+        rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "cwd": "/src/app"}),
+            &codex_turn("/src/app", "hello there", "hi"),
+        );
+        let c = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, thread_source TEXT, source TEXT);
+             INSERT INTO threads VALUES ('{CX_A}', '/src/app', 'user', 'vscode');
+             INSERT INTO threads VALUES ('{CX_B}', '/src/app', 'subagent', 'cli');
+             INSERT INTO threads VALUES ('{CX_C}', '/src/app', 'user', 'exec');"
+        ))
+        .unwrap();
+        drop(c);
+        let found = scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[]);
+        assert_eq!(found.len(), 1);
+        // Just written: may be held by the app.
+        assert!(found[0].maybe_held_by_codex_server && !found[0].open_elsewhere);
+        assert!(has_codex_conversations_in(home.path(), 0, &|_| false, &[]));
     }
 
     #[test]

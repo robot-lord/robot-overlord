@@ -2881,6 +2881,7 @@ mod tests {
             last_user_at: Some(4_000),
             last_agent_at: Some(5_000),
             open_elsewhere: true,
+            maybe_held_by_codex_server: false,
             recently_written: false,
         }
     }

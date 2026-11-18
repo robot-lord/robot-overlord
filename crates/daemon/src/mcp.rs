@@ -491,6 +491,9 @@ fn summarize_candidate(c: &Value) -> Value {
     if c["open_elsewhere"] == true || c["recently_written"] == true {
         row["maybe_open_elsewhere"] = json!(true);
     }
+    if c["maybe_held_by_codex_server"] == true {
+        row["maybe_held_by_codex_app"] = json!(true);
+    }
     row
 }
 

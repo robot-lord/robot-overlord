@@ -12,9 +12,9 @@ OpenCode stays unsupported.
 - Rollouts: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl`,
   listed by `codex::rollouts_in` (directory walk + mtime, no reads). The
   id is the file name's trailing uuid.
-- Per candidate: the first 16 KB of the `session_meta` line (`originator`,
-  `source`, `cwd`, `git.branch`; the line can be megabytes of
-  instructions, so fields are found by key as `codex::rollout_cwd` does),
+- Per candidate: the `session_meta` line (`originator`, `source`, `cwd`,
+  `git.branch`), parsed from the head window, else read whole up to 4 MB,
+  else searched by key in its first 16 KB,
   plus the usual head/tail windows (`transcript::read_head_tail`,
   `excerpts_from(Format::Codex)`), the same reader running sessions use.
 - Thread index `state_5.sqlite`, one read-only `SELECT id, cwd, source,
@@ -81,3 +81,16 @@ Owed:
   `scan_claude`/`scan_codex` wrappers.
 - `explain_codex` / import by id: a per-id `WHERE id = ?` lookup instead of
   loading the whole index.
+
+## Review round 2 (PR #78)
+
+Fixed: index-only rejects (exec/mcp source, non-user thread_source) run
+before any rollout read, in the scan and the offer check; a folder that
+exists gets its branch from git, and a thread that moved folders keeps no
+start branch (so it isn't offered for recreating); app-server threads get
+their own flag (`maybe_held_by_codex_server`, shown as "may be held by
+Codex's app/server") only when recently written; `explain` merges typed
+per-agent results (`Why`).
+
+Still owed: per-id lookup instead of full scans for import/explain; dedupe
+Codex helpers with `agents::codex`; drop unused `scan_claude`/`scan_codex`.
