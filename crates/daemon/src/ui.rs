@@ -709,10 +709,16 @@ const PROPOSALS: usize = 8;
 /// Keep a proposal's background; its id.
 fn keep_proposal(d: &Daemon, background: Value) -> String {
     let mut p = d.proposals.lock().expect("ui mutex");
+    // `p<n>-<boot id>`: a form left open across a daemon restart can't
+    // name a newer proposal (the counter starts again after a restart).
     let n = p.back().map_or(0, |(id, _)| {
-        id.trim_start_matches('p').parse::<u64>().unwrap_or(0)
+        id.trim_start_matches('p')
+            .split('-')
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0)
     });
-    let id = format!("p{}", n + 1);
+    let id = format!("p{}-{}", n + 1, d.boot_id);
     p.push_back((id.clone(), background));
     while p.len() > PROPOSALS {
         p.pop_front();
@@ -1110,7 +1116,10 @@ mod target_tests {
         let ids: Vec<String> = (0..10)
             .map(|i| keep_proposal(&d, json!({"context": format!("c{i}")})))
             .collect();
-        assert_eq!(ids[0], "p1");
+        assert_eq!(ids[0], format!("p1-{}", d.boot_id));
+        assert_eq!(ids[9], format!("p10-{}", d.boot_id));
+        // After a restart (another boot id) an old id names nothing.
+        assert!(proposal(&d, &ids[9].replace(&d.boot_id, "other")).is_err());
         assert_eq!(proposal(&d, &ids[9]).unwrap()["context"], "c9");
         assert_eq!(proposal(&d, &ids[2]).unwrap()["context"], "c2");
         assert!(proposal(&d, &ids[1]).is_err());
