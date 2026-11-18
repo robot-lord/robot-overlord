@@ -184,6 +184,71 @@ impl<'a> Line<'a> {
     }
 }
 
+impl Line<'_> {
+    /// This line says the user interrupted the turn (Claude writes a
+    /// marker line; Codex's `turn_aborted` already reads as `turn_ended`).
+    pub fn interrupted(&self) -> bool {
+        match self.format {
+            Format::Claude => claude::interrupted(self.v),
+            Format::Codex | Format::OpenCode => false,
+        }
+    }
+}
+
+/// How a transcript's last turn stands, read from its tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnTail {
+    /// A turn is open: a prompt, a tool call, a tool result.
+    Open,
+    /// The agent's final reply ended it.
+    Ended,
+    /// The user interrupted it (no `Stop` hook runs for that).
+    Interrupted,
+}
+
+/// The tail of a transcript, for re-checking a stored status
+/// (`rlord_daemon::recheck`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tail {
+    /// The last line that says anything about the turn. None: no such
+    /// line in the tail.
+    pub turn: Option<TurnTail>,
+    /// When the last stamped line was written (ms): the agent's latest
+    /// sign of life in the file.
+    pub last_at: Option<i64>,
+}
+
+/// `Tail` of a transcript file: its last `EXCERPT_WINDOW` bytes only, and
+/// the incremental read positions are left alone. None for a file that
+/// can't be read, and for OpenCode (its own server reports its turns).
+pub fn tail(path: &Path) -> Option<Tail> {
+    if opencode::locate(path).is_some() {
+        return None;
+    }
+    let format = Format::of(path);
+    let text = read_window(path, true)?;
+    let lines: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    Some(tail_of(format, &lines))
+}
+
+/// `tail` over lines already parsed (oldest first).
+pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
+    let lines = || lines.iter().rev().map(|v| format.line(v));
+    Tail {
+        turn: lines().find_map(|l| {
+            if l.interrupted() {
+                return Some(TurnTail::Interrupted);
+            }
+            l.turn_ended()
+                .map(|e| if e { TurnTail::Ended } else { TurnTail::Open })
+        }),
+        last_at: lines().find_map(|l| l.at().and_then(parse_iso_ms)),
+    }
+}
+
 /// Parse ISO-8601 `2026-10-27T17:03:44.498Z` to ms epoch (lenient).
 pub fn parse_iso_ms(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T')?;
@@ -879,6 +944,79 @@ mod tests {
         );
         // Nothing to save a read position for.
         assert!(take_dirty_cursors().iter().all(|(c, _)| c != &p));
+    }
+
+    /// A transcript's tail: the last turn line decides (an interrupt
+    /// marker over the user line it is), the last stamp is the latest sign
+    /// of life.
+    #[test]
+    fn a_tail_says_how_the_last_turn_stands() {
+        let at = |s: &str| parse_iso_ms(s);
+        let user = |ts: &str, text: &str| {
+            json!({"type": "user", "timestamp": ts,
+                   "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+        };
+        let reply = |ts: &str, stop: &str| {
+            json!({"type": "assistant", "timestamp": ts,
+                   "message": {"stop_reason": stop, "content": [{"type": "text", "text": "ok"}]}})
+        };
+        let meta =
+            |ts: &str| json!({"type": "system", "subtype": "turn_duration", "timestamp": ts});
+        let t = |lines: &[Value]| tail_of(Format::Claude, lines);
+        // A final reply, then bookkeeping lines: ended, alive at the last.
+        let ended = t(&[
+            user("2026-11-12T10:00:00Z", "fix it"),
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            meta("2026-11-12T10:00:06Z"),
+        ]);
+        assert_eq!(ended.turn, Some(TurnTail::Ended));
+        assert_eq!(ended.last_at, at("2026-11-12T10:00:06Z"));
+        // A tool call waiting (on a permission prompt, or running): open.
+        let open = t(&[
+            user("2026-11-12T10:00:00Z", "fix it"),
+            reply("2026-11-12T10:00:05Z", "tool_use"),
+        ]);
+        assert_eq!(open.turn, Some(TurnTail::Open));
+        // Escape, with or without a tool call stopped: interrupted.
+        for marker in [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]\n",
+        ] {
+            let lines = [
+                reply("2026-11-12T10:00:05Z", "tool_use"),
+                user("2026-11-12T10:00:09Z", marker),
+            ];
+            assert_eq!(t(&lines).turn, Some(TurnTail::Interrupted), "{marker}");
+        }
+        // A prompt that only mentions it is not one.
+        let quoted = t(&[user(
+            "2026-11-12T10:00:09Z",
+            "why [Request interrupted by user]?",
+        )]);
+        assert_eq!(quoted.turn, Some(TurnTail::Open));
+        // Nothing about a turn: unknown.
+        assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
+        // Codex: an aborted turn is a turn ended.
+        let ev = |kind: &str| json!({"timestamp": "2026-11-12T10:00:00Z", "type": "event_msg", "payload": {"type": kind}});
+        let codex = |lines: &[Value]| tail_of(Format::Codex, lines).turn;
+        assert_eq!(codex(&[ev("task_started")]), Some(TurnTail::Open));
+        assert_eq!(
+            codex(&[ev("task_started"), ev("turn_aborted")]),
+            Some(TurnTail::Ended)
+        );
+        // From a file: its tail, the same answer.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("abc.jsonl");
+        let body: String = [
+            user("2026-11-12T10:00:00Z", "fix it"),
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+        ]
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect();
+        std::fs::write(&p, body).unwrap();
+        assert_eq!(tail(&p).unwrap().turn, Some(TurnTail::Ended));
+        assert_eq!(tail(&dir.path().join("none.jsonl")), None);
     }
 
     /// A Codex conversation killed mid-turn and resumed: the old open turn

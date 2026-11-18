@@ -61,13 +61,16 @@ fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
     Ok(d.db()
         .running_sessions()?
         .into_iter()
-        .filter(|s| Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()))
-        .filter(|s| {
-            s.agent_session.is_none()
-                || s.agent_session_trust != "hook"
-                || s.status == Status::Starting
-        })
+        .filter(is_unhooked)
         .collect())
+}
+
+/// Whether a live session is one `unhooked` follows here.
+pub(crate) fn is_unhooked(s: &Session) -> bool {
+    Agent::parse(&s.agent).is_some_and(|a| !a.mints_id())
+        && (s.agent_session.is_none()
+            || s.agent_session_trust != "hook"
+            || s.status == Status::Starting)
 }
 
 /// Live sessions on Codex's daemon that the hooks follow (not `unhooked`):

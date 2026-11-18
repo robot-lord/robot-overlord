@@ -392,6 +392,24 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     }
 }
 
+/// The user interrupted the turn (Escape, or a prompt answered with
+/// "no"): Claude Code writes a user line `[Request interrupted by user]`
+/// (`… for tool use]` when it stopped a tool call) and runs no `Stop`
+/// hook. The turn is over: Claude waits for the next prompt.
+pub(crate) fn interrupted(v: &Value) -> bool {
+    if v["type"] != "user" {
+        return false;
+    }
+    let marker = |t: &str| t.trim_start().starts_with("[Request interrupted by user");
+    match &v["message"]["content"] {
+        Value::String(s) => marker(s),
+        Value::Array(a) => a
+            .iter()
+            .any(|x| x["type"] == "text" && x["text"].as_str().is_some_and(marker)),
+        _ => false,
+    }
+}
+
 /// A usage limit stopped the turn: Claude Code writes a synthetic
 /// assistant line for it (`"You've hit your 5-hour limit · resets 1:30pm
 /// (America/Los_Angeles)"`) with `isApiErrorMessage: true`, `apiError:
