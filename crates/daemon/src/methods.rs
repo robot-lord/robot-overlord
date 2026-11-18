@@ -1961,13 +1961,16 @@ fn hook_emit_in(
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
         // The session's own Stop while overlord messages wait for it: the
-        // hook's answer carries them on (`send::stop_claim`), so its turn
-        // goes on and its status stays as it is. Best effort, like the
-        // background. A prompt ends a run of such claims.
+        // hook's answer carries them on (`send::stop_claim`). The status
+        // goes idle as usual; the ack (`send::claim_ack`) sets it working
+        // again, so a lost ack never leaves it working. Best effort, like
+        // the background. A prompt ends a run of such claims.
         let mut claim = None;
         if live && whose != Whose::Other {
             let r = match event {
-                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
+                "Stop" => {
+                    crate::send::stop_claim(db, &s, agent, revives_dead, now).map(|c| claim = c)
+                }
                 "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
                 _ => Ok(()),
             };
@@ -1975,7 +1978,6 @@ fn hook_emit_in(
                 tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
             }
         }
-        let status = if claim.is_some() { None } else { status };
         if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }

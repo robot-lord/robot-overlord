@@ -40,6 +40,9 @@ gets the text.
   hook client's ack is lost, the next Stop or the idle paste delivers it
   again (at most one duplicate, as designed). A direct send while a claim
   is out (status idle, which a claim prevents) could duplicate too.
+- Later messages (review of #79): a TTL for the `own::mark` of a
+  message OpenCode queued behind a long turn; dedupe `deliver`'s server
+  path with `sent`; remove kv `stop_claims:<id>` on archive.
 - Later messages: the OpenCode POST (10s limit) runs inside the
   `session.send` RPC, under the session's lock.
 - First prompts: `apply_first_prompt` / `apply_deferred` share their

@@ -2299,8 +2299,8 @@ mod tests {
     }
 
     /// A session's own Stop hook carries a held message on: its answer
-    /// blocks the stop with the framed text, the status stays working,
-    /// and the ack takes the message off the queue.
+    /// blocks the stop with the framed text; the ack sets it working again
+    /// and takes the message off the queue.
     #[test]
     fn a_stop_hook_carries_a_held_message_on() {
         use rlord_core::types::Status;
@@ -2340,12 +2340,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("also the footer"));
-        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Working);
+        // Idle as usual until the ack: a lost one leaves nothing stuck.
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
         let ack = r["reply_ack"].as_str().unwrap();
         assert_eq!(
             methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
             json!({"acked": true})
         );
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Working);
         assert!(db
             .kv_map(crate::send::PENDING_KEY)
             .unwrap()

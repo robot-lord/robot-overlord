@@ -1373,7 +1373,7 @@ including when the active one hits a usage limit.
   `[rlord]` line, the words, then the context labelled as the
   overlord's). Delivery per agent:
   - **OpenCode:** `POST /api/session/<id>/prompt` with `delivery:
-    "queue"` (`Service::queue_prompt`), whatever its turn; its inbox runs
+    "queue"` (`Service::queue_prompt`), mid-turn only with `when_idle` (as for every agent); its inbox runs
     it once the current turn is over. Marked as rlord's first
     (`own::mark`). Only a surely refused POST (no connection, a 4xx)
     falls back to the pane; an unanswered one is logged `unknown` and
@@ -1381,7 +1381,7 @@ including when the active one hits a usage limit.
   - **Claude, Codex, mid-turn** (`when_idle`): held; the session's own
     live Stop hook claims it (`send::stop_claim`) and answers
     `{"decision": "block", "reason": <framed text>}`, so the agent goes on
-    with it in the same turn and the status stays working. It leaves the
+    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or dead sessions are not claimed. It leaves the
     queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
     unacknowledged, the next Stop or the idle paste carries it again: at
     most one duplicate). At most `CLAIMS_MAX` (3) Stops in a row (kv
