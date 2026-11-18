@@ -692,7 +692,6 @@ pub(crate) fn stop_claim(
     entry.insert("claimed".into(), json!(claimed));
     entry.insert("claim_at".into(), json!(now));
     db.kv_set_map(PENDING_KEY, &m)?;
-    db.kv_set(&key, &(in_row + 1).to_string())?;
     Ok(Some(crate::context::Reply {
         output: json!({"decision": "block", "reason": text}),
         ack,
@@ -731,6 +730,11 @@ pub(crate) fn claim_ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
         .min(parts.len());
     let taken = &parts[..n];
     take(db, id, taken)?;
+    // One more Stop in a row carried messages on (counted only once they
+    // surely went).
+    let key = claims_key(id);
+    let in_row: u64 = db.kv_get(&key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    db.kv_set(&key, &(in_row + 1).to_string())?;
     // The Stop set it idle; it carries on with them. (Only from idle: a
     // stop or restart meanwhile wins.)
     if db
@@ -1346,8 +1350,17 @@ mod tests {
         let log = db.list_events(&id, 20).unwrap();
         let e = log.iter().find(|e| e.kind == "message_delivered").unwrap();
         assert_eq!(e.payload["via"], "stop_hook", "{}", e.payload);
-        // Third in a row: still claimed; the fourth lets the turn end.
-        assert!(stop_claim(&db, &s, Agent::Claude, 6).unwrap().is_some());
+        // Only acknowledged claims count: one so far. An unacked one
+        // doesn't.
+        let unacked = stop_claim(&db, &s, Agent::Claude, 6).unwrap().unwrap();
+        assert!(!unacked.ack.is_empty());
+        for at in [61, 62] {
+            queue(&db, &id, &msg("more")).unwrap();
+            let r = stop_claim(&db, &s, Agent::Claude, at).unwrap().unwrap();
+            assert!(claim_ack(&db, &r.ack, at).unwrap());
+        }
+        // Three delivered in a row: the next Stop lets the turn end.
+        queue(&db, &id, &msg("later")).unwrap();
         assert!(stop_claim(&db, &s, Agent::Claude, 7).unwrap().is_none());
         // (That cleared the count.) A prompt clears it too.
         assert!(stop_claim(&db, &s, Agent::Claude, 8).unwrap().is_some());

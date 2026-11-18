@@ -745,9 +745,9 @@ transcript store so `rlord search` covers them.
 ## Inter-session messaging
 
 **Built today:** the overlord's `send_to_session` (see "Passing work to
-a session" under "The overlord"): OpenCode's server queue, Claude's and
-Codex's Stop-hook block mid-turn (capped at 3 in a row), and the idle
-paste. The mailbox and pull tool described here are the original design
+a session" under "The overlord"): OpenCode's server queue, Claude's
+Stop-hook block mid-turn (at most 3 delivered in a row; Codex's is off,
+`send::CODEX_STOP_CLAIM = false`), and the idle paste. The mailbox and pull tool described here are the original design
 and are not built; a session's background ("Session background") reaches
 it through its hooks.
 
@@ -1384,7 +1384,7 @@ including when the active one hits a usage limit.
     with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or errored sessions are not claimed; a Stop is never a usage-limit reply (Claude ends such a turn with `StopFailure`). Codex: off (`send::CODEX_STOP_CLAIM`) until its block is checked live; it gets the idle paste. It leaves the
     queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
     unacknowledged, the next Stop or the idle paste carries it again: at
-    most one duplicate). At most `CLAIMS_MAX` (3) Stops in a row (kv
+    most one duplicate). At most `CLAIMS_MAX` (3) acknowledged claims in a row (kv
     `stop_claims:<id>`, cleared by a prompt or a Stop that carries
     nothing); then the turn ends and it is typed in. Not while its first
     prompt is still on its way.

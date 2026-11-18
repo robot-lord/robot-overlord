@@ -1960,22 +1960,6 @@ fn hook_emit_in(
         // session only comes back if its tmux session really exists.
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
-        // The session's own Stop while overlord messages wait for it: the
-        // hook's answer carries them on (`send::stop_claim`). The status
-        // goes idle as usual; the ack (`send::claim_ack`) sets it working
-        // again, so a lost ack never leaves it working. Best effort, like
-        // the background. A prompt ends a run of such claims.
-        let mut claim = None;
-        if live && whose != Whose::Other {
-            let r = match event {
-                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
-                "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
-                _ => Ok(()),
-            };
-            if let Err(e) = r {
-                tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
-            }
-        }
         if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }
@@ -2001,10 +1985,24 @@ fn hook_emit_in(
                     detail["start"] = json!(how);
                 }
             }
-            if claim.is_some() {
-                detail["continued"] = json!("held messages");
-            }
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
+        }
+        // The session's own Stop while overlord messages wait for it: the
+        // hook's answer carries them on (`send::stop_claim`). Last, after
+        // every fallible step: an event that failed leaves no claim. The
+        // status went idle as usual; the ack (`send::claim_ack`) sets it
+        // working again, so a lost ack never leaves it working. Best
+        // effort, like the background. A prompt ends a run of claims.
+        let mut claim = None;
+        if live && whose != Whose::Other {
+            let r = match event {
+                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
+                "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
+            }
         }
         if let Some(c) = claim {
             return Ok(json!({"ok": true, "reply": c.output, "reply_ack": c.ack}));

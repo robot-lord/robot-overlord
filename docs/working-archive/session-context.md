@@ -39,7 +39,13 @@ gets the text.
 - Later messages: the Stop sets the status idle as usual and the claim's
   ack sets it working again. If the ack is lost, the idle paste (after
   10s) or the next Stop delivers the message again: at most one
-  duplicate, as designed.
+  duplicate, as designed. The grace is time-based (10s), not tied to
+  the ack.
+- Later messages: `deliver` types, then takes the parts it carried,
+  without a lock `stop_claim` shares (hooks hold only the DB): a Stop
+  in that window can claim the same parts again.
+- Later messages: every Stop and prompt of a session does a kv delete
+  (`stop_claims:<id>`) on the hook's hot path.
 - Codex Stop-hook claim: off (`send::CODEX_STOP_CLAIM = false`) until its
   block is checked live; Codex takes held messages at its idle prompt.
 - `limits::limited_in` reads kv `limits` beside the daemon's in-memory
