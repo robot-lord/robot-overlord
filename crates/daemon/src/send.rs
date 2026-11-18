@@ -366,7 +366,7 @@ fn not_now(d: &Daemon, s: &Session, text: &str, when_idle: bool, why: &str) -> R
 
 /// Hold `text` for session `id` until its turn is over. Returns whether it
 /// replaced one already waiting.
-fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
+pub(crate) fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
     let mut m = db.kv_map(PENDING_KEY)?;
     let now = now_ms();
     let replaced = m

@@ -32,8 +32,13 @@
 //! line (`agents::Deferred`: the model). The launch creates the session
 //! with its model before opening the TUI; if that didn't take, the model
 //! is set here once the session exists, and when it can't be in time
-//! (`DEFERRED_WAIT_MS`) the session's log says it wasn't applied. The first
-//! prompt always rides on the command line: nothing here can lose it.
+//! (`DEFERRED_WAIT_MS`) the session's log says it wasn't applied.
+//!
+//! It also sends a launch's first prompt (`first_prompt`: kept off the
+//! TUI's command line), POSTed once the session exists and its model is
+//! settled (`apply_first_prompt`). When that can't be done within
+//! `FIRST_PROMPT_WAIT_MS`, or the POST fails, the prompt is queued to be
+//! typed in at the session's first idle turn (`send::queue`), never lost.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -161,6 +166,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     match f.link.take() {
         Some((svc, mut events)) => {
             changed |= apply_deferred(d, Some(&svc), &up)?;
+            changed |= apply_first_prompt(d, Some(&svc), &up)?;
             // A session still starting: its creation may have been missed
             // (the event is sent once). Its row says when it is there.
             let starting: Vec<&Session> = up
@@ -199,6 +205,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         }
         None => {
             changed |= apply_deferred(d, None, &up)?;
+            changed |= apply_first_prompt(d, None, &up)?;
             // Gone, not merely out of reach for a moment (a stream that
             // just broke, an error answer): nothing was there twice running.
             let rows = With::Rows {
@@ -448,6 +455,7 @@ fn on_signal(
     let mut changed = apply(&d.db(), &mut f.blocked, &s, signal)?;
     if *signal == Signal::Created {
         changed |= apply_deferred(d, Some(svc), &[&s])?;
+        changed |= apply_first_prompt(d, Some(svc), &[&s])?;
     }
     Ok(changed)
 }
@@ -687,6 +695,107 @@ fn apply_deferred(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Resu
         }
     }
     Ok(changed)
+}
+
+/// How long a launch's first prompt may wait for its session before it is
+/// queued to be typed in instead.
+const FIRST_PROMPT_WAIT_MS: i64 = 30_000;
+
+/// Send each launch's first prompt (`first_prompt::Way::Server`), once:
+/// POSTed when OpenCode has the session and its model is settled (no
+/// `Deferred` left, or that has run out of time). A POST that fails, or a
+/// session not there within `FIRST_PROMPT_WAIT_MS`: the prompt is queued
+/// for the session's first idle turn (`send::queue`). Either way the file
+/// goes and the log says how it went.
+fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Result<bool> {
+    let waiting: Vec<(&Session, String)> = {
+        let db = d.db();
+        up.iter()
+            .filter_map(|s| {
+                let k = crate::first_prompt::pending_key(&s.id);
+                Some((*s, db.kv_get(&k).ok()??))
+            })
+            .collect()
+    };
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let read = match linked {
+        Some(_) => None,
+        None => Service::read(&opencode::service_file()),
+    };
+    let svc = linked.or(read.as_ref());
+    let mut changed = false;
+    for (s, raw) in waiting {
+        let Some(id) = s.agent_session.as_deref() else {
+            continue;
+        };
+        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        let file = std::path::PathBuf::from(held["file"].as_str().unwrap_or(""));
+        let late = now_ms() - held["at"].as_i64().unwrap_or(0) > FIRST_PROMPT_WAIT_MS;
+        // Its model first: a prompt sent before it would run on another.
+        let model_held = d.db().kv_get(&deferred_key(&s.id))?.is_some();
+        if model_held && !late {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let step = first_prompt_step(
+            text.trim().is_empty(),
+            svc.and_then(|svc| svc.has_session(id)),
+            late,
+        );
+        let outcome = match step {
+            FirstStep::Wait => continue,
+            FirstStep::Lost => json!({"sent": false, "why": "its file was gone or empty"}),
+            FirstStep::Post => match svc.map(|svc| svc.prompt(id, &text)) {
+                Some(Ok(())) => json!({"sent": true, "via": "server"}),
+                Some(Err(e)) => json!({"sent": false, "queued": true,
+                                       "why": format!("{e:#}")}),
+                None => continue,
+            },
+            FirstStep::Queue => json!({"sent": false, "queued": true, "why": match svc {
+                Some(_) => "OpenCode hasn't created the session in time",
+                None => "OpenCode's server couldn't be reached in time",
+            }}),
+        };
+        let db = d.db();
+        db.kv_delete(&crate::first_prompt::pending_key(&s.id))?;
+        if outcome["queued"] == true {
+            crate::send::queue(&db, &s.id, &text)?;
+        }
+        db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
+        drop(db);
+        if let Err(e) = std::fs::remove_file(&file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(session = %s.id, error = %e, "removing the first prompt's file");
+            }
+        }
+        if outcome["sent"] != true {
+            tracing::warn!(session = %s.id, outcome = %outcome, "an OpenCode launch's first prompt");
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// What to do about a launch's first prompt.
+#[derive(Debug, PartialEq)]
+enum FirstStep {
+    Post,
+    Queue,
+    Lost,
+    Wait,
+}
+
+/// `empty`: its file is gone or empty; `has`: whether the server has the
+/// session (None: can't be told, or no server).
+fn first_prompt_step(empty: bool, has: Option<bool>, late: bool) -> FirstStep {
+    match (empty, has) {
+        (true, _) => FirstStep::Lost,
+        (false, Some(true)) => FirstStep::Post,
+        _ if late => FirstStep::Queue,
+        _ => FirstStep::Wait,
+    }
 }
 
 /// What to do about a launch's model.
@@ -933,6 +1042,17 @@ mod tests {
         // Not there yet: wait; past the wait, one last try (the server may
         // have it though its row can't be read), else it is reported.
         assert_eq!(deferred_step(want, None, false), Deferred::Wait);
+        // (A first prompt: posted once the session is there, queued when
+        // it is late, said lost when its file is.)
+        assert_eq!(first_prompt_step(false, Some(true), false), FirstStep::Post);
+        assert_eq!(
+            first_prompt_step(false, Some(false), false),
+            FirstStep::Wait
+        );
+        assert_eq!(first_prompt_step(false, None, false), FirstStep::Wait);
+        assert_eq!(first_prompt_step(false, None, true), FirstStep::Queue);
+        assert_eq!(first_prompt_step(false, Some(true), true), FirstStep::Post);
+        assert_eq!(first_prompt_step(true, Some(true), false), FirstStep::Lost);
         assert_eq!(deferred_step(want, None, true), set);
         assert!(matches!(
             deferred_step("opus", None, false),

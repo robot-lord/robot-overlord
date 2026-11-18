@@ -2072,7 +2072,7 @@ pub(crate) mod tests {
         // The caller's id isn't inherited from whichever pane started
         // OpenCode's shared server.
         assert_eq!(server["environment"]["RLORD_SESSION_ID"], "");
-        assert_eq!(server["environment"]["RLORD_SESSION_TOKEN_FILE"], "");
+        assert_eq!(server["environment"]["RLORD_SESSION_LOOKUP_FILE"], "");
         let rules = cfg["permissions"].as_array().unwrap();
         // The last matching rule wins: "ask" for everything comes first.
         assert_eq!(

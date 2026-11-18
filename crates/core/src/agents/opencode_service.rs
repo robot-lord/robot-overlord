@@ -312,6 +312,23 @@ impl Service {
         super::opencode::fork_response(&text, Some((200..300).contains(&status)))
     }
 
+    /// Send session `id` a message as the user's (`POST
+    /// /api/session/{id}/prompt`, body `{text}`): OpenCode admits it and
+    /// runs a turn on it. A new session's first prompt goes this way, off
+    /// the TUI's command line.
+    pub fn prompt(&self, id: &str, text: &str) -> Result<()> {
+        if !is_session_id(id) {
+            bail!("not an OpenCode session id");
+        }
+        self.json(
+            "POST",
+            &format!("/api/session/{id}/prompt"),
+            Some(&serde_json::json!({ "text": text })),
+            Duration::from_secs(10),
+        )
+        .map(|_| ())
+    }
+
     /// Text generated from session `id`'s context without adding to its
     /// history (`POST /api/session/{id}/generate`): the session's own
     /// model answers, and only its token totals change.
@@ -1040,6 +1057,23 @@ mod tests {
         // An id that isn't one never reaches a URL.
         assert!(svc.generate("ses_1a/../x", "hi", limit).is_err());
         assert_eq!(svc.has_session("../x"), Some(false));
+    }
+
+    #[test]
+    fn a_first_prompt_is_posted_to_the_server() {
+        let (svc, asked) = serve(vec![
+            ok(r#"{"data":{"id":"msg_1"}}"#),
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into(),
+        ]);
+        svc.prompt("ses_1a", "fix \"it\"").unwrap();
+        let req = asked.recv().unwrap();
+        assert!(
+            req.starts_with("POST /api/session/ses_1a/prompt HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.ends_with(r#"{"text":"fix \"it\""}"#), "{req}");
+        assert!(svc.prompt("ses_1a", "x").is_err());
+        assert!(svc.prompt("ses_1a/../x", "x").is_err());
     }
 
     #[test]

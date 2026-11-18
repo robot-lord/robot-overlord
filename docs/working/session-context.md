@@ -643,6 +643,48 @@ Still owed:
   `context::check`).
 - The demo OpenCode stand-in embeds Python (shell-is-glue rule).
 
+## PR 3 progress (1.4.0)
+
+- [x] `daemon/src/first_prompt.rs`: `Way { Argv, Stdin, Server, Pointer }`
+  per agent; `place` writes the first prompt (user's words, with the
+  background pointer line when there is one) to 0600
+  `<data>/sessions/<id>/prompt.md`. Used by `session_new`, `fork::finish`
+  and a re-fork's restart. Fixed text with no words
+  (`context::pointer_only`) stays on argv. A file that can't be written
+  leaves the prompt on argv (logged).
+- [x] Codex: argv carries `first_prompt::pointer_line` (user's decision);
+  that line is `bind_prompt`. `session_brief`'s first prompt now reads
+  the launch spec's words before `bind_prompt`.
+- [x] OpenCode: `Service::prompt` (`POST /api/session/<id>/prompt`,
+  `{text}`; route and body read from the installed 2.2.7 binary's API
+  table, not run live). kv `first_prompt:<id>`;
+  `opencode::apply_first_prompt` posts once the session exists and no
+  model `Deferred` is pending (or it ran out). Failed POST, or no session
+  within 30s: queued with `send::queue` (typed at the first idle turn).
+  Event `first_prompt` either way; the file is removed after.
+- [x] Claude: stdin (`exec … < prompt.md`, `first_prompt::with_stdin`)
+  wired but off (`CLAUDE_STDIN = false`): V1 was not run in this PR (the
+  live check was refused by the agent's permission gate). Claude's
+  prompt stays on argv until V1 passes.
+- [x] #70 owed: the pane env var is `RLORD_SESSION_LOOKUP_FILE` (Codex's
+  default env policy drops `*TOKEN*`, `*KEY*`, `*SECRET*`; test); the
+  OpenCode module doc no longer says the prompt rides on argv.
+- Not done from the plan: a `FirstPrompt::Typed` mode for Claude (the
+  queue fallback covers OpenCode only), `discover` changes (none needed:
+  Codex is still launched with a prompt).
+
+Owed from PR 3:
+- Run V1 (Claude interactive with the prompt file on stdin, also with
+  `--resume … --fork-session`), then set `CLAUDE_STDIN = true`.
+- Live-check the OpenCode POST (V4) on a scratch server: that the TUI
+  opened with `-s` shows the posted turn, and that the 30s fallback is
+  long enough.
+- Live-check that Codex reads `prompt.md` from the pointer line in its
+  default sandbox (the plan's Codex pointer-read check).
+- The queued fallback is logged as an overlord message (`message_queued`
+  from `overlord`); its prompt is marked rlord's, not the user's.
+- `launch_spec.prompt` still holds the words in the DB (not argv).
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;
@@ -668,9 +710,8 @@ Still owed:
     to `prompt.md` as `codex fork`'s `[PROMPT]`, OpenCode's POST to the
     fork's id. `bind_prompt` doesn't apply to forks (`bind_fork`).
 - Follow-up, not in this effort: the guard rail above.
-- The first prompt (with the pointer line for Codex untrusted / OpenCode)
-  is still on argv, `launched_args`, the `launched` event and
-  `bind_prompt`: PR 3.
+- The first prompt left argv in PR 3 for Codex and OpenCode; Claude's
+  waits on V1 (see "PR 3 progress").
 - `get_session` (a read-only tool) shows any session's background to any
   session that added plain `rlord mcp`, like its notes. PR 2's scoped
   tools are the real surface for workers.

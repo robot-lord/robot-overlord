@@ -4,6 +4,7 @@ pub mod background;
 pub mod codex_daemon;
 pub mod context;
 pub mod discover;
+pub mod first_prompt;
 pub mod fork;
 pub mod import;
 pub mod limits;
