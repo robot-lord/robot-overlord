@@ -584,6 +584,10 @@ rlord can adopt agent conversations you started elsewhere: in a terminal,
 another session manager, or the desktop app. It finds them in the agents' own
 files (`~/.claude/projects/`), so it doesn't matter what started them.
 
+- **Offered on first run**: while rlord has no sessions besides the
+  overlord, it offers this once the code-folder step is behind you. `y`
+  opens the overlord and asks it to import your sessions (it checks which
+  agents have any), `n` stops asking, Esc asks again next start.
 - **Ask the overlord**: "import my sessions from the last month". It proposes
   which to import, archive or skip, with names and groups. Nothing is
   imported until you approve the list.
