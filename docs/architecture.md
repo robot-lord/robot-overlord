@@ -746,8 +746,8 @@ transcript store so `rlord search` covers them.
 
 **Built today:** the overlord's `send_to_session` (see "Passing work to
 a session" under "The overlord"): OpenCode's server queue, Claude's
-Stop-hook block mid-turn (at most 3 delivered in a row; Codex's is off,
-`send::CODEX_STOP_CLAIM = false`), and the idle paste. The mailbox and pull tool described here are the original design
+and Codex's Stop-hook block mid-turn (at most 3 delivered in a row;
+`send::CODEX_STOP_CLAIM` for Codex), and the idle paste. The mailbox and pull tool described here are the original design
 and are not built; a session's background ("Session background") reaches
 it through its hooks.
 
@@ -829,11 +829,11 @@ reachable through it.
 - **Wiring**, computed at every start, never stored: Claude
   `--mcp-config=<data>/sessions/<id>/mcp.json` and
   `--allowedTools=mcp__rlord_session` (`=` form: both take several
-  values and the first prompt may follow). Codex: none for now
-  (`session_tools::CODEX_MCP` is off until live check V5; the code for
-  `-c mcp_servers.rlord_session.*` is there behind it). Codex and
-  OpenCode have only the CLI, which isn't relied on inside Codex's
-  sandbox. `get_session` and the launch
+  values and the first prompt may follow). Codex in the pane:
+  `-c mcp_servers.rlord_session.{command,args,default_tools_approval_mode}`
+  (`session_tools::CODEX_MCP`; any `-c` runs Codex embedded, which
+  `--no-daemon` already does). Daemon-mode Codex and OpenCode have only
+  the CLI, which isn't relied on inside Codex's sandbox. `get_session` and the launch
   and fork answers say which (`lookup`: `mcp` only when the last start's
   wiring produced flags, kv `session_lookup:<id>`; else `cli`, or `none`
   without a token), so the
@@ -1378,10 +1378,10 @@ including when the active one hits a usage limit.
     (`own::mark`). Only a surely refused POST (no connection, a 4xx)
     falls back to the pane; an unanswered one is logged `unknown` and
     never sent again.
-  - **Claude, mid-turn** (`when_idle`): held; the session's own
+  - **Claude and Codex, mid-turn** (`when_idle`): held; the session's own
     live Stop hook claims it (`send::stop_claim`) and answers
     `{"decision": "block", "reason": <framed text>}`, so the agent goes on
-    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or errored sessions are not claimed; a Stop is never a usage-limit reply (Claude ends such a turn with `StopFailure`). Codex: off (`send::CODEX_STOP_CLAIM`) until its block is checked live; it gets the idle paste. It leaves the
+    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or errored sessions are not claimed; a Stop is never a usage-limit reply (Claude ends such a turn with `StopFailure`). Codex the same (`send::CODEX_STOP_CLAIM`, checked live on 0.169.0: the TUI shows "Blocked by hook" with the reason and the agent answers it; the second Stop has `stop_hook_active: true`). It leaves the
     queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
     unacknowledged, the next Stop or the idle paste carries it again: at
     most one duplicate). At most `CLAIMS_MAX` (3) acknowledged claims in a row (kv

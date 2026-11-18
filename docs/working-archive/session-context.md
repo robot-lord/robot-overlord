@@ -11,20 +11,35 @@ git history (`docs/working/session-context.md`).
 
 ## Live checks not run
 
-- V4: the OpenCode first-prompt POST on a scratch server (the TUI opened
-  with `-s` shows the posted turn; the 30s fallback is long enough).
-- V5: Codex `-c mcp_servers.rlord_session` in a worker. Until it passes,
-  `session_tools::CODEX_MCP = false` and Codex sessions get `lookup: cli`.
-- V6: OpenCode's `delivery: "queue"` POST for a later message, mid-turn.
-  Not run: OpenCode's server is shared and writes the user's own OpenCode
-  database. Route and body read from the 2.2.7 binary's API table
-  (`delivery: "steer" | "queue"`).
-- Codex's Stop-hook block (`decision: block`, `reason`) live; then turn `CODEX_STOP_CLAIM` on. The 0.169.0
-  binary's hook schema has it (Claude-compatible, `stop_hook_active`);
-  only Claude's was run (V3, below).
-- Codex reading `prompt.md` from the pointer line in its default sandbox.
 - V1 (Claude's first prompt on stdin) on Linux and other Claude Code
   versions.
+- Codex's Stop-hook claim on a daemon-mode session (hooks run in Codex's
+  daemon); only the in-pane TUI was run.
+
+Passed 2026-11-18 (Codex 0.169.0, OpenCode server with "Big Pickle"),
+on scratch tmux sockets and a scratch rlord (own XDG dirs and tmux
+socket):
+
+- Codex reading `prompt.md` from the pointer line, default sandbox: it
+  read the file and answered as told (also end to end from `rlord new`).
+- Codex Stop-hook block: a `-c hooks.Stop=...` hook answering once with
+  `decision: block`; the TUI shows "Blocked by hook" and the reason, and
+  the agent answers it in the same turn. The second Stop carries
+  `stop_hook_active: true`. `CODEX_STOP_CLAIM` is on. Testing note: a
+  hook given by `-c` needs trust, given per run as
+  `-c 'hooks.state={"/<session-flags>/config.toml:stop:0:0"={trusted_hash="sha256:..."}}'`
+  (the hash from a stdio `codex app-server`'s `hooks/list`), and any
+  `-c` makes Codex run embedded (no shared daemon).
+- V5: an in-pane Codex session launched with
+  `-c mcp_servers.rlord_session.*` called `session_brief` with no
+  approval prompt. `CODEX_MCP` is on.
+- V4: the OpenCode first-prompt POST shows as the first turn in the TUI.
+- V6: a `when_idle` send mid-turn went `via: server` (`delivery:
+  "queue"`) and ran as its own turn after the current one finished.
+- Codex import: a Codex conversation started outside rlord was listed,
+  imported, and `codex resume <id>` reopened that thread; rlord followed
+  its status from the transcript. (The scan flags a conversation touched
+  in the last minutes "maybe open elsewhere", even after its TUI exited.)
 
 V3 passed (2026-11-17, Claude Code 2.1.327): a scratch tmux socket, a
 Stop hook from a scratch `--settings` file answering once with
@@ -51,8 +66,6 @@ gets the text.
   stripping `frame_message`'s header (`strip_prefix`) rather than sharing
   a body helper; the pending kv map is parsed twice on some paths
   (`claim_out` then `pending_parts`, `stop_claim` then `first_waiting`).
-- Codex Stop-hook claim: off (`send::CODEX_STOP_CLAIM = false`) until its
-  block is checked live; Codex takes held messages at its idle prompt.
 - `limits::limited_in` reads kv `limits` beside the daemon's in-memory
   copy (`limits::limited`): share one helper. Remove kv
   `stop_claims:<id>` on archive.

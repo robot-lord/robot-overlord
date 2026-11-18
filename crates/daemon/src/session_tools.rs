@@ -44,10 +44,10 @@ pub const SERVER: &str = "rlord_session";
 pub use rlord_core::agents::TOKEN_ENV;
 
 /// Whether in-pane Codex sessions get the `rlord_session` MCP server
-/// (`-c mcp_servers.rlord_session.*`). Off until live check V5 shows Codex
-/// takes it in a worker: until then Codex sessions have the CLI line
-/// (`lookup` `cli`), and the overlord copies the facts they need.
-pub const CODEX_MCP: bool = false;
+/// (`-c mcp_servers.rlord_session.*`). On since live check V5 passed
+/// (Codex 0.169.0, `--no-daemon`: it called `session_brief` with no
+/// approval prompt). Daemon-mode sessions still get the CLI line.
+pub const CODEX_MCP: bool = true;
 
 const ANSWER_MAX: usize = 16_000;
 const PER_MINUTE: usize = 30;

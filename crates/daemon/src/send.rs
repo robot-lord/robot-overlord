@@ -10,7 +10,7 @@
 //!   (`Service::queue_prompt`), mid-turn only with `when_idle`: OpenCode's inbox runs
 //!   it once the current turn is over. Only a POST that surely failed
 //!   falls back to typing, below.
-//! - **Claude (Codex once `CODEX_STOP_CLAIM` is on), mid-turn** (with `when_idle`): held, and claimed by
+//! - **Claude and Codex, mid-turn** (with `when_idle`): held, and claimed by
 //!   the session's own Stop hook (`stop_claim`): the hook answers
 //!   `decision: block` with the message as its reason, so the agent
 //!   carries on with it instead of ending its turn. At most `CLAIMS_MAX`
@@ -77,10 +77,10 @@ pub const PENDING_KEY: &str = "send_pending";
 /// turn ends, and what is left is typed in at the idle prompt.
 pub const CLAIMS_MAX: u64 = 3;
 
-/// Whether Codex's Stop hook claims held messages. Off until its block
-/// (`decision: block`, in the 0.169.0 hook schema) is checked live:
-/// until then Codex takes them at its idle prompt.
-pub const CODEX_STOP_CLAIM: bool = false;
+/// Whether Codex's Stop hook claims held messages. On since its block
+/// (`decision: block`) was checked live (Codex 0.169.0, in the pane): the
+/// reason reaches the agent, which goes on in the same turn.
+pub const CODEX_STOP_CLAIM: bool = true;
 
 /// How long the idle paste leaves alone messages a Stop hook's answer
 /// carries, waiting for its ack.
@@ -663,8 +663,8 @@ pub(crate) fn stop_claim(
     // Not for a session that can't take it now: stopped, restarting or
     // in error, or on a usage limit. (A turn that ended on an API error,
     // a usage limit included, ends with Claude's `StopFailure`, never
-    // `Stop`: so this Stop isn't a limit reply.) Codex only once its
-    // block is checked live (`CODEX_STOP_CLAIM`).
+    // `Stop`: so this Stop isn't a limit reply.) Codex while
+    // `CODEX_STOP_CLAIM` is on.
     let claims = match agent {
         Agent::Claude => true,
         Agent::Codex => CODEX_STOP_CLAIM,
