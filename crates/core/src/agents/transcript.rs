@@ -222,6 +222,8 @@ pub struct Tail {
     /// The last line that says anything about the turn. None: no such
     /// line in the tail.
     pub turn: Option<TurnTail>,
+    /// When that line was written (ms).
+    pub turn_at: Option<i64>,
     /// When the last stamped line was written (ms): the agent's latest
     /// sign of life in the file.
     pub last_at: Option<i64>,
@@ -246,17 +248,20 @@ pub fn tail(path: &Path) -> Option<Tail> {
 /// `tail` over lines already parsed (oldest first).
 pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
     let lines = || lines.iter().rev().map(|v| format.line(v));
+    let turn = lines().find_map(|l| {
+        if l.local_output() {
+            return None;
+        }
+        let at = l.at().and_then(parse_iso_ms);
+        if l.interrupted() {
+            return Some((TurnTail::Interrupted, at));
+        }
+        l.turn_ended()
+            .map(|e| (if e { TurnTail::Ended } else { TurnTail::Open }, at))
+    });
     Tail {
-        turn: lines().find_map(|l| {
-            if l.local_output() {
-                return None;
-            }
-            if l.interrupted() {
-                return Some(TurnTail::Interrupted);
-            }
-            l.turn_ended()
-                .map(|e| if e { TurnTail::Ended } else { TurnTail::Open })
-        }),
+        turn: turn.map(|t| t.0),
+        turn_at: turn.and_then(|t| t.1),
         last_at: lines().find_map(|l| l.at().and_then(parse_iso_ms)),
     }
 }
@@ -1020,7 +1025,29 @@ mod tests {
             ),
         ]);
         assert_eq!(bash.turn, Some(TurnTail::Ended));
+        assert_eq!(bash.turn_at, at("2026-11-12T10:00:05Z"));
         assert_eq!(bash.last_at, at("2026-11-12T10:00:21Z"));
+        // A slash command's wrapper, or a compaction's summary: the same.
+        let mut summary = user("2026-11-12T10:00:30Z", "This session is being continued");
+        summary["isCompactSummary"] = json!(true);
+        let cmd = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:20Z",
+                "<command-name>/compact</command-name>",
+            ),
+            user(
+                "2026-11-12T10:00:21Z",
+                "<command-message>compact</command-message>",
+            ),
+            summary,
+        ]);
+        assert_eq!(cmd.turn, Some(TurnTail::Ended));
+        // A Stop hook's feedback (a meta line) sends the agent on: open.
+        let mut feedback = user("2026-11-12T10:00:06Z", "Stop hook feedback:\nrun the tests");
+        feedback["isMeta"] = json!(true);
+        let fed = t(&[reply("2026-11-12T10:00:05Z", "end_turn"), feedback]);
+        assert_eq!(fed.turn, Some(TurnTail::Open));
         // Nothing about a turn: unknown.
         assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
         // Codex: an aborted turn is a turn ended.

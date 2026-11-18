@@ -271,6 +271,46 @@ pub fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether session `name`'s agent is gone: its tmux session missing, or
+/// the program in its pane exited (rlord keeps a dead pane on screen). An
+/// error when tmux couldn't say (no server reached, a failed call): never
+/// read as gone.
+pub fn pane_gone(name: &str) -> Result<bool> {
+    let out = tmux_cmd()
+        .args(["has-session", "-t", &exact(name)])
+        .output()
+        .context("running tmux")?;
+    if !session_found(out.status.success(), &String::from_utf8_lossy(&out.stderr))? {
+        return Ok(true);
+    }
+    // (tmux 3.8 answers a target it can't find with nothing, and success.)
+    match run(&[
+        "display-message",
+        "-p",
+        "-t",
+        &format!("={name}:"),
+        "#{pane_dead}",
+    ])?
+    .as_str()
+    {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => bail!("tmux: no pane state for {name} ({other:?})"),
+    }
+}
+
+/// `has-session`'s answer: found, not found (`can't find session`), or an
+/// error (anything else: `no server running`, `error connecting to …`).
+fn session_found(ok: bool, stderr: &str) -> Result<bool> {
+    if ok {
+        Ok(true)
+    } else if stderr.contains("can't find session") {
+        Ok(false)
+    } else {
+        bail!("tmux: {}", stderr.trim())
+    }
+}
+
 /// Session option naming the agent's pane. With the user's tmux profile a
 /// session can have splits and windows, and the agent's pane isn't
 /// necessarily listed first (`split-window -b` puts the new one ahead).
@@ -1527,6 +1567,19 @@ mod tests {
     }
 
     use super::*;
+
+    /// As tmux 3.8 answered on a scratch socket (2026-11-18).
+    #[test]
+    fn a_missing_session_is_told_from_a_tmux_failure() {
+        assert!(session_found(true, "").unwrap());
+        assert!(!session_found(false, "can't find session: nope\n").unwrap());
+        assert!(session_found(false, "no server running on /tmp/tmux-501/x\n").is_err());
+        assert!(session_found(
+            false,
+            "error connecting to /tmp/tmux-501/x (No such file or directory)"
+        )
+        .is_err());
+    }
 
     #[test]
     fn user_client_is_most_recent() {

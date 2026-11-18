@@ -411,13 +411,28 @@ pub(crate) fn interrupted(v: &Value) -> bool {
 }
 
 /// A user line that is local output, not a turn: a `!` shell command and
-/// its output, a local command's output, a meta line. Claude writes these
-/// without the model running; a reply, if one follows, is its own line.
+/// its output, a slash command's wrapper and output, a compaction's
+/// summary, a meta line. Claude writes these without the model running; a
+/// reply, if one follows, is its own line. Not a Stop hook's feedback
+/// (`Stop hook feedback:`, a meta line): that sends the agent on.
 pub(crate) fn local_output(v: &Value) -> bool {
     if v["type"] != "user" {
         return false;
     }
-    if v["isMeta"] == true {
+    let text_starts = |p: &str| match &v["message"]["content"] {
+        Value::String(s) => s.trim_start().starts_with(p),
+        Value::Array(a) => a.iter().any(|x| {
+            x["type"] == "text"
+                && x["text"]
+                    .as_str()
+                    .is_some_and(|t| t.trim_start().starts_with(p))
+        }),
+        _ => false,
+    };
+    if text_starts("Stop hook feedback:") {
+        return false;
+    }
+    if v["isMeta"] == true || v["isCompactSummary"] == true {
         return true;
     }
     let local = |t: &str| {
@@ -427,6 +442,9 @@ pub(crate) fn local_output(v: &Value) -> bool {
             "<bash-stdout>",
             "<bash-stderr>",
             "<local-command-",
+            "<command-name>",
+            "<command-message>",
+            "<command-args>",
         ]
         .iter()
         .any(|p| t.starts_with(p))
