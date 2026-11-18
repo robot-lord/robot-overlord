@@ -204,9 +204,12 @@ pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
 
 /// Tags are rlord's groups: `{groups: [{tag, count}], untagged}` over live
 /// sessions.
-pub fn tag_list(db: &Db) -> Result<Value> {
+/// Groups and counts. `{archived: true}` counts archived sessions too
+/// (the TUI's tags editor suggests from those).
+pub fn tag_list(db: &Db, params: &Value) -> Result<Value> {
+    let archived = params["archived"].as_bool().unwrap_or(false);
     let groups: Vec<Value> = db
-        .tag_counts()?
+        .tag_counts_in(archived)?
         .into_iter()
         .map(|(tag, count)| json!({"tag": tag, "count": count}))
         .collect();

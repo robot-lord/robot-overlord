@@ -597,7 +597,7 @@ impl Daemon {
             "session.unarchive" => methods::session_unarchive(&db, &params),
             "session.rename" => methods::session_rename(&db, &params),
             "session.tag" => methods::session_tag(&db, &params),
-            "tag.list" => methods::tag_list(&db),
+            "tag.list" => methods::tag_list(&db, &params),
             "overlord.mark_reviewed" => triage::mark_reviewed(&db, &params),
             "tag.rename" => methods::tag_rename(&db, &params),
             "tag.order" => methods::tag_order(&db, &params),

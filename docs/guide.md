@@ -760,10 +760,11 @@ in the config).
 - **Editing tags:** `#` opens the tags editor for the selected session:
   its tags as a list, and an input that suggests tags already in use
   (archived sessions' too). `enter` (or space) adds the highlighted row;
-  a tag nobody uses asks first (`y` creates it, `n` goes back), so a
-  half-typed tag isn't saved by accident. `tab` completes, `↑↓` choose.
-  With the input empty, `↑↓` pick a tag and `d` or Delete removes it;
-  `enter` saves. `ctrl-s` adds what's typed, then saves. `esc` cancels.
+  a tag nobody uses asks first (only `y` creates it; `n` or `esc` goes
+  back), so a half-typed tag isn't saved by accident. `tab` completes,
+  `↑↓` choose. With the input empty, `↑↓` pick a tag and `ctrl-d` or
+  Delete removes it; `enter` saves. `ctrl-s` adds what's typed, then
+  saves. `esc` clears typed text, then cancels with no change.
 - **The list's Groups column** shows a session's tags when they fit, else
   how many groups it is in, dimmed (`#3`); the details pane and the groups
   tab always show them all. It's at most 15 cells wide, and only gets

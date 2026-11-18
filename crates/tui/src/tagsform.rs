@@ -144,7 +144,13 @@ impl TagEditor {
     /// Add the highlighted row: a known tag goes straight in, a new one
     /// waits for y/n. False when there was nothing to add.
     fn take_choice(&mut self) -> bool {
-        let Some(c) = self.choices().into_iter().nth(self.sel) else {
+        let typed = normalize(&self.input);
+        let c = if self.tags.contains(&typed) {
+            None
+        } else {
+            self.choices().into_iter().nth(self.sel)
+        };
+        let Some(c) = c else {
             // Typed a tag the session already has: just clear the input.
             self.input.clear();
             self.sel = 0;
@@ -208,7 +214,8 @@ impl TagEditor {
     pub fn key(&mut self, k: KeyEvent) -> Option<bool> {
         if let Some(t) = self.confirm_new.clone() {
             match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                // Only an explicit y creates it: a reflexive enter doesn't.
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.add(t);
                     if std::mem::take(&mut self.save_after) {
                         return Some(true);
@@ -226,6 +233,11 @@ impl TagEditor {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let typing = !self.input.is_empty();
         match k.code {
+            // Esc clears typed text first; on an empty input it cancels.
+            KeyCode::Esc if typing => {
+                self.input.clear();
+                self.sel = 0;
+            }
             KeyCode::Esc => return Some(false),
             // Save: typed text is resolved first, never dropped.
             KeyCode::Char('s') if ctrl => {
@@ -262,9 +274,7 @@ impl TagEditor {
             // Removing takes its own key on a tag picked with ↑↓, so a held
             // backspace never eats tags.
             KeyCode::Delete if !typing => self.remove_selected(),
-            KeyCode::Char('d') if !typing && !ctrl && self.tag_sel.is_some() => {
-                self.remove_selected()
-            }
+            KeyCode::Char('d') if ctrl && !typing => self.remove_selected(),
             KeyCode::Backspace => {
                 self.input.pop();
                 self.sel = 0;
@@ -296,16 +306,25 @@ impl App {
         self.mode = Mode::Tags(Box::new(TagEditor::new(&id, &name, tags, known)));
     }
 
-    /// Every tag in use, with how many sessions have it: all sessions,
-    /// archived ones too and regardless of the filter (one `session.list`
-    /// when the editor opens); the loaded list if that call fails.
+    /// Every tag in use, with how many sessions have it, archived ones too
+    /// and regardless of the filter (`tag.list` when the editor opens); the
+    /// loaded list if that call fails.
     fn known_tags(&mut self) -> Vec<(String, usize)> {
-        let everything = self
-            .call("session.list", json!({"archived": "all"}))
-            .and_then(|v| v.as_array().cloned());
-        let sessions = everything.as_deref().unwrap_or(&self.all);
+        if let Some(v) = self.call("tag.list", json!({"archived": true})) {
+            return v["groups"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|g| {
+                    Some((
+                        g["tag"].as_str()?.to_string(),
+                        g["count"].as_u64()? as usize,
+                    ))
+                })
+                .collect();
+        }
         let mut m: std::collections::BTreeMap<String, usize> = Default::default();
-        for s in sessions {
+        for s in &self.all {
             for t in groups::tags_of(s) {
                 *m.entry(t.to_string()).or_default() += 1;
             }
@@ -331,7 +350,7 @@ impl App {
         let choices = ed.choices();
         // Fixed rows: title, blank, input, choices, blank, hints (2),
         // borders (2). The tag list gets what's left and scrolls.
-        let fixed = 7 + choices.len() as u16;
+        let fixed = 8 + choices.len() as u16;
         let screen = f.area();
         let want = fixed + ed.tags.len().max(1) as u16;
         let h = want.min(screen.height);
@@ -404,7 +423,7 @@ impl App {
         } else if ed.input.is_empty() {
             let mut keys = vec![("enter", "save", Cap::Context)];
             if ed.tag_sel.is_some() {
-                keys.push(("d", "remove tag", Cap::Context));
+                keys.push(("^d", "remove tag", Cap::Context));
             }
             keys.push(("↑↓", "pick a tag", Cap::Global));
             keys.push(("esc", "cancel", Cap::Global));
@@ -420,10 +439,11 @@ impl App {
                 ("↑↓", "choose", Cap::Global),
             ]));
             lines.push(keys_line(&[
-                ("ctrl-s", "add and save", Cap::Global),
-                ("esc", "cancel", Cap::Global),
+                ("^s", "add and save", Cap::Global),
+                ("esc", "clear", Cap::Global),
             ]));
         }
+        self.modal_hits(f.area(), area, &lines);
         f.render_widget(
             Paragraph::new(lines).block(theme::modal(&format!("# {}", ed.name))),
             area,
@@ -588,19 +608,54 @@ mod tests {
             press(&mut e, KeyCode::Backspace);
         }
         assert_eq!(e.tags, ["web", "wip", "ui"]);
-        // d with nothing picked starts typing instead.
+        // Nothing picked: Delete does nothing.
+        press(&mut e, KeyCode::Delete);
+        assert_eq!(e.tags.len(), 3);
+        // A letter types, and drops a pick.
+        press(&mut e, KeyCode::Up);
         press(&mut e, KeyCode::Char('d'));
         assert_eq!(e.input, "d");
+        assert_eq!(e.tag_sel, None);
         press(&mut e, KeyCode::Backspace);
-        // ↑ picks the last, ↑ again the one before; d removes it.
+        assert_eq!(e.tags.len(), 3);
+        // ↑ picks the last, ↑ again the one before; ctrl-d removes it.
         press(&mut e, KeyCode::Up);
         press(&mut e, KeyCode::Up);
-        press(&mut e, KeyCode::Char('d'));
+        e.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(e.tags, ["web", "ui"]);
         press(&mut e, KeyCode::Delete);
         assert_eq!(e.tags, ["web"]);
         assert_eq!(e.diff(), (vec![], vec!["wip".into(), "ui".into()]));
         assert_eq!(press(&mut e, KeyCode::Esc), Some(false));
+    }
+
+    #[test]
+    fn esc_clears_text_then_cancels() {
+        let mut e = ed(&[]);
+        typ(&mut e, "we");
+        assert_eq!(press(&mut e, KeyCode::Esc), None);
+        assert!(e.input.is_empty());
+        assert_eq!(press(&mut e, KeyCode::Esc), Some(false));
+    }
+
+    #[test]
+    fn enter_never_creates_a_new_tag() {
+        let mut e = ed(&[]);
+        typ(&mut e, "fresh");
+        press(&mut e, KeyCode::Enter);
+        press(&mut e, KeyCode::Enter);
+        assert!(e.tags.is_empty());
+        assert!(e.confirm_new.is_some());
+    }
+
+    #[test]
+    fn typing_a_tag_it_has_adds_nothing() {
+        // "we" is on the session; "web" would be the top suggestion.
+        let mut e = ed(&["we"]);
+        typ(&mut e, "we");
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.tags, ["we"]);
+        assert!(e.input.is_empty());
     }
 
     #[test]
