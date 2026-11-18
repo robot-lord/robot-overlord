@@ -4,14 +4,14 @@
 //! its import flow (`overlord.md` "Importing existing work": it checks
 //! which agents have conversations, proposes a list, the user approves).
 //! Plain code, no AI: a kv row, the session list and, only once those
-//! pass, a bounded existence check of Claude Code's transcripts
-//! (`import::has_claude_conversations`: the scan's own checks, stopping
-//! at the first match).
+//! pass, a bounded existence check of the agents' transcripts
+//! (`import::has_conversations`: the scan's own checks for Claude Code
+//! and Codex, stopping at the first match).
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-use rlord_core::import::has_claude_conversations;
+use rlord_core::import::has_conversations;
 use rlord_core::types::now_ms;
 
 use crate::{ask, overlord, Daemon};
@@ -27,8 +27,8 @@ pub(crate) const REQUEST: &str = "[rlord import request] I'm new to rlord. \
 
 /// `setup.import_offer`: `{"offer": true}` while it hasn't been answered,
 /// rlord has no sessions besides its overlords (archived ones count), and
-/// there are Claude Code conversations to import (the only agent rlord can
-/// import so far).
+/// there are Claude Code or Codex conversations to import (OpenCode
+/// isn't importable).
 pub(crate) fn offer(d: &Daemon) -> Result<Value> {
     offer_with(d, &|| {
         // Only once the cheap gate passed.
@@ -36,7 +36,7 @@ pub(crate) fn offer(d: &Daemon) -> Result<Value> {
         // The window the overlord's flow scans first (`scan_agent_sessions`'s
         // default).
         let since = now_ms() - SINCE_DAYS * 24 * 3_600_000;
-        Ok(has_claude_conversations(since, &|id| tracked.contains(id)))
+        Ok(has_conversations(since, &|id| tracked.contains(id)))
     })
 }
 

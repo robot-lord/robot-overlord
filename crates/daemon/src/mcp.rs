@@ -288,7 +288,7 @@ pub fn tools() -> Value {
                 "all": b("Mark every live session reviewed"),
             }), &[]),
         tool("scan_agent_sessions",
-            "Find agent conversations on this machine that rlord doesn't track yet (Claude Code's so far; read from its own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
+            "Find agent conversations on this machine that rlord doesn't track yet (Claude Code's and Codex's, each with its agent; OpenCode's aren't importable; read from the agents' own transcript files; no AI), most recently active first, for importing existing work. Each has its folder (and whether it still exists or can be recreated), repo/branch, title, first/latest prompt, latest reply, PR link, when it started and was last active, and whether it may be open elsewhere right now.",
             json!({
                 "since_days": {"type": "integer", "description": "Only conversations with an exchange in the last N days (default 30)"},
                 "limit": {"type": "integer", "description": "Max conversations (default 30)"},

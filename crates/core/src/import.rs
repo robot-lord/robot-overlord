@@ -1,9 +1,12 @@
 //! Finding agent conversations rlord doesn't track yet, so existing work can
 //! be imported. Reads only the agents' own files (no AI, and nothing specific
 //! to whichever session manager started them): for Claude Code, the
-//! transcripts under `~/.claude/projects/<cwd slug>/<uuid>.jsonl`.
+//! transcripts under `~/.claude/projects/<cwd slug>/<uuid>.jsonl`; for
+//! Codex, its rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`)
+//! and its thread index (`state_5.sqlite`), read as `agents::codex` reads
+//! them for running sessions. OpenCode isn't importable.
 //!
-//! The format is internal to Claude Code and changes between versions, so
+//! The formats are internal to the agents and change between versions, so
 //! every field is optional and anything unreadable is skipped, never fatal.
 
 use std::path::{Path, PathBuf};
@@ -11,8 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::agents::claude;
 use crate::agents::transcript::{self, Format};
+use crate::agents::{claude, codex};
 use crate::git;
 
 /// One conversation that could be imported.
@@ -473,6 +476,362 @@ pub fn explain_claude(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String
     }
 }
 
+// ---- Codex ----
+
+/// Scan Codex's rollouts, as `scan_claude` scans Claude's transcripts.
+pub fn scan_codex(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candidate> {
+    let procs = process_commands();
+    scan_codex_in(&codex::home(), opts, tracked, &procs, &excluded_dirs())
+}
+
+/// Whether any Claude Code or Codex conversation exists that the scan
+/// would list (the first-run offer). Bounded per agent.
+pub fn has_conversations(since_ms: i64, tracked: &dyn Fn(&str) -> bool) -> bool {
+    has_claude_conversations(since_ms, tracked)
+        || has_codex_conversations_in(&codex::home(), since_ms, tracked, &excluded_dirs())
+}
+
+/// Whether any Codex conversation exists that `scan_codex` would list, over
+/// an explicit Codex home: newest rollouts first, at most `MAX_READS` read
+/// (the budget spent on rejects answers true, as Claude's does).
+pub fn has_codex_conversations_in(
+    home: &Path,
+    since_ms: i64,
+    tracked: &dyn Fn(&str) -> bool,
+    excluded: &[PathBuf],
+) -> bool {
+    let index = codex_index(home);
+    let mut files = codex::rollouts_in(&home.join("sessions"));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    let mut reads = 0;
+    for (mtime, path) in files {
+        let mtime = ms_epoch(mtime);
+        if mtime < since_ms {
+            // Newest first: the rest are older still.
+            return false;
+        }
+        let Some(id) = codex_rollout_id(&path) else {
+            continue;
+        };
+        if tracked(id) {
+            continue;
+        }
+        if reads >= MAX_READS {
+            return true;
+        }
+        reads += 1;
+        if codex_candidate(&path, id, Some(mtime), "", excluded, index.get(id))
+            .is_ok_and(|c| c.last_active_at >= since_ms)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The thread id when `path` is a Codex rollout: `rollout-<time>-<uuid>.jsonl`.
+fn codex_rollout_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    uuid::Uuid::parse_str(id).is_ok().then_some(id)
+}
+
+/// What Codex's thread index says about a thread (columns an older index
+/// lacks are None).
+#[derive(Debug, Clone, Default)]
+struct IndexRow {
+    cwd: Option<String>,
+    /// Where it was started from: `cli`, `vscode`, `exec`…
+    source: Option<String>,
+    /// `user`, or a sub-agent's.
+    thread_source: Option<String>,
+}
+
+/// Every thread in Codex's index (one read-only query; empty without an
+/// index or with a schema rlord doesn't know).
+fn codex_index(home: &Path) -> std::collections::HashMap<String, IndexRow> {
+    use rusqlite::OpenFlags;
+    let mut out = std::collections::HashMap::new();
+    let db = home.join("state_5.sqlite");
+    if !db.exists() {
+        return out;
+    }
+    let Ok(c) = rusqlite::Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return out;
+    };
+    // Codex may be writing: wait a little, never long.
+    let _ = c.busy_timeout(Duration::from_millis(200));
+    // An older index has no source columns: then only folders.
+    let (mut q, full) = match c.prepare("SELECT id, cwd, source, thread_source FROM threads") {
+        Ok(q) => (q, true),
+        Err(_) => match c.prepare("SELECT id, cwd FROM threads") {
+            Ok(q) => (q, false),
+            Err(_) => return out,
+        },
+    };
+    let rows = q.query_map([], |r| {
+        let opt = |i| r.get::<_, Option<String>>(i);
+        Ok((
+            r.get::<_, String>(0)?,
+            IndexRow {
+                cwd: opt(1)?,
+                source: if full { opt(2)? } else { None },
+                thread_source: if full { opt(3)? } else { None },
+            },
+        ))
+    });
+    if let Ok(rows) = rows {
+        out.extend(rows.flatten());
+    }
+    out
+}
+
+/// `scan_codex` over an explicit Codex home, process list and excluded
+/// folders (tests).
+pub fn scan_codex_in(
+    home: &Path,
+    opts: &ScanOpts,
+    tracked: &dyn Fn(&str) -> bool,
+    procs: &str,
+    excluded: &[PathBuf],
+) -> Vec<Candidate> {
+    let index = codex_index(home);
+    let mut out = Vec::new();
+    for (mtime, path) in codex::rollouts_in(&home.join("sessions")) {
+        let Some(id) = codex_rollout_id(&path) else {
+            continue;
+        };
+        if tracked(id) {
+            continue;
+        }
+        if !opts.only.is_empty() && !opts.only.iter().any(|o| id.starts_with(o.as_str())) {
+            continue;
+        }
+        let mtime = ms_epoch(mtime);
+        // Cheap pre-filter, as for Claude.
+        if opts.only.is_empty() && mtime < opts.since_ms {
+            continue;
+        }
+        let Ok(c) = codex_candidate(&path, id, Some(mtime), procs, excluded, index.get(id)) else {
+            continue;
+        };
+        if opts.only.is_empty() && c.last_active_at < opts.since_ms {
+            continue;
+        }
+        out.push(c);
+    }
+    out.sort_by_key(|c| std::cmp::Reverse(c.last_active_at));
+    if opts.limit > 0 {
+        out.truncate(opts.limit);
+    }
+    out
+}
+
+/// A field of the rollout's `session_meta` line, read from its first bytes
+/// as `codex::rollout_cwd` reads `cwd` (the line can be megabytes of
+/// instructions; its own fields come first). An object (`"source":
+/// {"subagent": …}`) reads as its first key.
+fn meta_field(meta: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let at = meta.find(&pat)? + pat.len();
+    let v = serde_json::Deserializer::from_str(&meta[at..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    match v {
+        Value::String(s) => Some(s),
+        Value::Object(m) => m.keys().next().cloned(),
+        _ => None,
+    }
+}
+
+/// How much of a rollout's first line `codex_candidate` reads for its meta.
+const META_BYTES: u64 = 16 * 1024;
+
+fn codex_candidate(
+    path: &Path,
+    id: &str,
+    mtime: Option<i64>,
+    procs: &str,
+    excluded: &[PathBuf],
+    indexed: Option<&IndexRow>,
+) -> Result<Candidate, String> {
+    let meta = {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|f| f.take(META_BYTES).read_to_end(&mut buf))
+            .map_err(|e| format!("can't read the rollout: {e}"))?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        text.split('\n').next().unwrap_or("").to_string()
+    };
+    let originator = meta_field(&meta, "originator");
+    // Headless runs (`codex exec`, the SDK, an MCP server) and sub-agents'
+    // threads aren't the user's conversations.
+    let source = indexed
+        .and_then(|i| i.source.clone())
+        .or_else(|| meta_field(&meta, "source"));
+    if let Some(s) = source.as_deref().filter(|s| matches!(*s, "exec" | "mcp")) {
+        return Err(format!("a headless run (source {s}), not a conversation"));
+    }
+    if let Some(o) = originator.as_deref().filter(|o| o.contains("exec")) {
+        return Err(format!(
+            "a headless run (originator {o}), not a conversation"
+        ));
+    }
+    let sub = indexed
+        .and_then(|i| i.thread_source.as_deref())
+        .is_some_and(|t| t != "user")
+        || source.as_deref() == Some("subagent");
+    if sub {
+        return Err("a sub-agent's thread, not the user's conversation".into());
+    }
+
+    let (head, tail) = transcript::read_head_tail(path);
+    // Where it last ran: the latest turn's folder, else the index's, else
+    // where it started.
+    let cwd = tail
+        .iter()
+        .rev()
+        .filter(|v| v["type"] == "turn_context")
+        .find_map(|v| v["payload"]["cwd"].as_str().map(str::to_string))
+        .or_else(|| indexed.and_then(|i| i.cwd.clone()))
+        .or_else(|| meta_field(&meta, "cwd"))
+        .ok_or("no working directory in the rollout")?;
+    if cwd.ends_with("/robot-overlord/overlord") {
+        return Err("rlord's own overlord conversation".into());
+    }
+    if let Some(d) = excluded.iter().find(|d| Path::new(&cwd).starts_with(d)) {
+        return Err(format!(
+            "runs in {} (rlord data or a temp dir)",
+            d.display()
+        ));
+    }
+    let mut ex = transcript::excerpts_from(Format::Codex, &head, &tail);
+    let typed = |p: &Option<String>| p.as_deref().is_some_and(|t| !t.starts_with('/'));
+    if !typed(&ex.first_prompt) && !typed(&ex.last_prompt) {
+        return Err("nothing typed in it (an empty start, or only slash commands)".into());
+    }
+    if ex.first_prompt.is_none() {
+        ex.first_prompt = ex.last_prompt.clone();
+    }
+    let ts = |v: &Value| v["timestamp"].as_str().and_then(transcript::parse_iso_ms);
+    let who = |v: &Value| Format::Codex.line(v).message().map(|(w, _)| w);
+    let last_of = |kind: &str| {
+        tail.iter()
+            .rev()
+            .filter(|v| who(v) == Some(kind))
+            .find_map(ts)
+    };
+    let last_active_at = tail
+        .iter()
+        .rev()
+        .filter(|v| matches!(who(v), Some("you" | "agent")))
+        .find_map(ts)
+        .or(mtime)
+        .ok_or("no timestamps in the rollout")?;
+    let started_at = head.iter().find_map(ts);
+    // Codex records the branch when the thread starts (`session_meta.git`).
+    let branch = head
+        .iter()
+        .find(|v| v["type"] == "session_meta")
+        .and_then(|v| v["payload"]["git"]["branch"].as_str().map(str::to_string))
+        .or_else(|| {
+            let at = meta.find("\"git\":")?;
+            meta_field(&meta[at..], "branch")
+        })
+        .filter(|b| !b.is_empty() && b != "HEAD");
+    let dir_exists = Path::new(&cwd).is_dir();
+    let recently_written =
+        mtime.is_some_and(|m| ms_epoch(SystemTime::now()) - m < RECENT_WRITE.as_millis() as i64);
+    Ok(Candidate {
+        agent: "codex".into(),
+        agent_session: id.to_string(),
+        transcript: path.to_string_lossy().into_owned(),
+        cwd,
+        dir_exists,
+        repo: None,
+        branch,
+        worktree: false,
+        recreatable: false,
+        title: ex.title,
+        first_prompt: ex.first_prompt,
+        last_prompt: ex.last_prompt,
+        last_reply: ex.last_reply,
+        pr_url: None,
+        entrypoint: originator,
+        started_at,
+        last_active_at,
+        last_user_at: last_of("you"),
+        last_agent_at: last_of("agent"),
+        open_elsewhere: procs.lines().any(|l| l.contains(id)),
+        recently_written,
+    })
+}
+
+/// Why Codex thread `id` isn't importable (None: it is, or no rollout by
+/// that id exists).
+pub fn explain_codex(id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+    explain_codex_in(&codex::home(), id, tracked)
+}
+
+fn explain_codex_in(home: &Path, id: &str, tracked: &dyn Fn(&str) -> bool) -> Option<String> {
+    let hits: Vec<(PathBuf, String)> = codex::rollouts_in(&home.join("sessions"))
+        .into_iter()
+        .filter_map(|(_, p)| {
+            let full = codex_rollout_id(&p)?.to_string();
+            full.starts_with(id).then_some((p, full))
+        })
+        .collect();
+    match hits.as_slice() {
+        [] => None,
+        [(path, full)] => {
+            if tracked(full) {
+                return Some(
+                    "rlord already tracks it (now or as an earlier conversation of a session)"
+                        .into(),
+                );
+            }
+            let index = codex_index(home);
+            codex_candidate(path, full, None, "", &excluded_dirs(), index.get(full)).err()
+        }
+        _ => Some(format!(
+            "{} conversations start with {id}; use more of the id",
+            hits.len()
+        )),
+    }
+}
+
+/// Every importable agent's conversations (Claude Code, Codex), most
+/// recently active first, at most `opts.limit` overall.
+pub fn scan_all(opts: &ScanOpts, tracked: &dyn Fn(&str) -> bool) -> Vec<Candidate> {
+    let procs = process_commands();
+    let ex = excluded_dirs();
+    let projects = claude::config_dir().join("projects");
+    let mut out = scan_claude_in(&projects, opts, tracked, &procs, &ex);
+    out.extend(scan_codex_in(&codex::home(), opts, tracked, &procs, &ex));
+    out.sort_by_key(|c| std::cmp::Reverse(c.last_active_at));
+    if opts.limit > 0 {
+        out.truncate(opts.limit);
+    }
+    out
+}
+
+/// Why conversation `id` (of any importable agent) isn't importable.
+pub fn explain(id: &str, tracked: &dyn Fn(&str) -> bool) -> String {
+    match (explain_claude(id, tracked), explain_codex(id, tracked)) {
+        (c, None) => c.unwrap_or_else(|| "unknown".into()),
+        (None, Some(x)) => x,
+        // No Claude transcript by that id: Codex's answer.
+        (Some(c), Some(x)) if c.starts_with("no transcript") => x,
+        (Some(c), Some(x)) => format!("Claude Code: {c}; Codex: {x}"),
+    }
+}
+
 /// Fill in `repo`, `worktree` and `recreatable` (git subprocesses, so only
 /// for the candidates a caller keeps, not every transcript scanned).
 pub fn add_git_info(c: &mut Candidate) {
@@ -816,5 +1175,172 @@ mod tests {
         let slug = claude::project_slug("/elsewhere");
         let why = candidate(&p, ID_B, &slug, None, "", &[]).unwrap_err();
         assert!(why.contains("matches its folder"), "{why}");
+    }
+
+    // ---- Codex ----
+
+    const CX_A: &str = "01a1ce53-c71d-7e13-b376-63f7271fa320";
+    const CX_B: &str = "02b2ce53-c71d-7e13-b376-63f7271fa321";
+    const CX_C: &str = "03c3ce53-c71d-7e13-b376-63f7271fa322";
+    const CX_D: &str = "04d4ce53-c71d-7e13-b376-63f7271fa323";
+
+    fn rollout(home: &Path, id: &str, meta: Value, lines: &[Value]) -> PathBuf {
+        let day = home.join("sessions/2026/11/11");
+        std::fs::create_dir_all(&day).unwrap();
+        let p = day.join(format!("rollout-2026-11-11T21-55-59-{id}.jsonl"));
+        let mut all = vec![json!({"timestamp": "2026-11-11T21:55:59.000Z",
+                                  "type": "session_meta", "payload": meta})];
+        all.extend_from_slice(lines);
+        let text: Vec<String> = all.iter().map(Value::to_string).collect();
+        std::fs::write(&p, text.join("\n") + "\n").unwrap();
+        p
+    }
+
+    fn codex_turn(cwd: &str, prompt: &str, reply: &str) -> Vec<Value> {
+        let item = |at: &str, ty: &str, payload: Value| json!({"timestamp": format!("2026-11-11T22:00:{at}.000Z"), "type": ty, "payload": payload});
+        let msg = |role: &str, part: &str, text: &str| json!({"type": "message", "role": role, "content": [{"type": part, "text": text}]});
+        vec![
+            item("01", "turn_context", json!({"cwd": cwd, "model": "gpt-x"})),
+            item("02", "response_item", msg("user", "input_text", prompt)),
+            item(
+                "05",
+                "response_item",
+                msg("assistant", "output_text", reply),
+            ),
+        ]
+    }
+
+    #[test]
+    fn codex_conversations_are_found_with_their_folder_and_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        // A conversation: it moved to `cwd` in its latest turn.
+        rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "cwd": "/started/here", "originator": "codex-tui",
+                   "source": "cli", "git": {"branch": "fix-login"}}),
+            &codex_turn(&cwd, "fix the flaky login test", "Fixed."),
+        );
+        // A headless run, a sub-agent's thread, nothing typed.
+        rollout(
+            home.path(),
+            CX_B,
+            json!({"id": CX_B, "cwd": cwd, "originator": "codex_exec", "source": "exec"}),
+            &codex_turn(&cwd, "summarize", "ok"),
+        );
+        rollout(
+            home.path(),
+            CX_C,
+            json!({"id": CX_C, "cwd": cwd, "source": {"subagent": {"other": "x"}}}),
+            &codex_turn(&cwd, "look this up", "ok"),
+        );
+        rollout(
+            home.path(),
+            CX_D,
+            json!({"id": CX_D, "cwd": "/src/app"}),
+            &[],
+        );
+        let opts = ScanOpts::default();
+        let found = scan_codex_in(home.path(), &opts, &|_| false, "", &[]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let c = &found[0];
+        assert_eq!(
+            (c.agent.as_str(), c.agent_session.as_str()),
+            ("codex", CX_A)
+        );
+        assert_eq!(c.cwd, cwd);
+        assert!(c.dir_exists);
+        assert_eq!(c.branch.as_deref(), Some("fix-login"));
+        assert_eq!(c.entrypoint.as_deref(), Some("codex-tui"));
+        assert_eq!(c.first_prompt.as_deref(), Some("fix the flaky login test"));
+        assert_eq!(c.last_reply.as_deref(), Some("Fixed."));
+        assert_eq!(
+            c.last_active_at,
+            transcript::parse_iso_ms("2026-11-11T22:00:05.000Z").unwrap()
+        );
+        assert!(c.last_user_at < c.last_agent_at);
+
+        // Tracked, out of the window, excluded folders, open elsewhere.
+        assert!(scan_codex_in(home.path(), &opts, &|id| id == CX_A, "", &[]).is_empty());
+        let late = ScanOpts {
+            since_ms: c.last_active_at + 1,
+            ..Default::default()
+        };
+        assert!(scan_codex_in(home.path(), &late, &|_| false, "", &[]).is_empty());
+        let ex = [work.path().to_path_buf()];
+        assert!(scan_codex_in(home.path(), &opts, &|_| false, "", &ex).is_empty());
+        let procs = format!("codex resume {CX_A}");
+        assert!(scan_codex_in(home.path(), &opts, &|_| false, &procs, &[])[0].open_elsewhere);
+
+        // By id prefix, any age; the rejects say why.
+        let only = ScanOpts {
+            only: vec!["01a1".into()],
+            since_ms: i64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            scan_codex_in(home.path(), &only, &|_| false, "", &[]).len(),
+            1
+        );
+        let why = explain_codex_in(home.path(), CX_B, &|_| false).unwrap();
+        assert!(why.contains("headless"), "{why}");
+        let why = explain_codex_in(home.path(), CX_C, &|_| false).unwrap();
+        assert!(why.contains("sub-agent"), "{why}");
+        let why = explain_codex_in(home.path(), CX_D, &|_| false).unwrap();
+        assert!(why.contains("nothing typed"), "{why}");
+        assert!(explain_codex_in(home.path(), "ffff", &|_| false).is_none());
+
+        // The first-run check sees the same.
+        assert!(has_codex_conversations_in(home.path(), 0, &|_| false, &[]));
+        assert!(!has_codex_conversations_in(
+            home.path(),
+            0,
+            &|id| id == CX_A,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn codex_index_marks_sub_agents_and_headless_runs() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        // The rollouts say nothing; the index does.
+        for id in [CX_A, CX_B, CX_C] {
+            rollout(
+                home.path(),
+                id,
+                json!({"id": id, "cwd": cwd}),
+                &codex_turn(&cwd, "hello there", "hi"),
+            );
+        }
+        let c = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, \
+               cwd TEXT NOT NULL, created_at_ms INTEGER, thread_source TEXT, \
+               source TEXT NOT NULL DEFAULT 'cli');
+             INSERT INTO threads VALUES ('{CX_A}', '', '{cwd}', 1, 'user', 'cli');
+             INSERT INTO threads VALUES ('{CX_B}', '', '{cwd}', 1, 'subagent', 'cli');
+             INSERT INTO threads VALUES ('{CX_C}', '', '{cwd}', 1, 'user', 'exec');"
+        ))
+        .unwrap();
+        drop(c);
+        let ids: Vec<String> =
+            scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[])
+                .into_iter()
+                .map(|c| c.agent_session)
+                .collect();
+        assert_eq!(ids, [CX_A]);
+    }
+
+    #[test]
+    fn codex_rollout_names_carry_the_id() {
+        let p = |n: &str| PathBuf::from(format!("/s/{n}"));
+        let a = p(&format!("rollout-2026-11-11T21-55-59-{CX_A}.jsonl"));
+        assert_eq!(codex_rollout_id(&a), Some(CX_A));
+        assert_eq!(codex_rollout_id(&p("rollout-x.jsonl")), None);
+        assert_eq!(codex_rollout_id(&p(&format!("{CX_A}.jsonl"))), None);
     }
 }

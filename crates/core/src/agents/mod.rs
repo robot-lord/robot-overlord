@@ -583,7 +583,7 @@ impl Agent {
 
     /// Can rlord import its conversations started outside rlord.
     pub fn importable(self) -> bool {
-        matches!(self, Agent::Claude)
+        matches!(self, Agent::Claude | Agent::Codex)
     }
 
     // ---- its screen ----

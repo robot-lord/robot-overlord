@@ -30,7 +30,10 @@ The overlord starts you in one of two modes. It says which.
    PR link and a long exchange all point to real work.
 4. Reply with the proposal only, one line per conversation, import first:
 
-   `import  <id first 8>  <name>  #<group>  — <one-line description>`
+   `import  <id first 8>  <agent>  <name>  #<group>  — <one-line description>`
+
+   `<agent>` is the conversation's `agent` (claude, codex). The scan
+   covers Claude Code and Codex; OpenCode conversations aren't importable.
 
    Mark lines with `(open elsewhere)` when `maybe_open_elsewhere` is set and
    `(recreate worktree)` when `dir_gone` and `recreatable`. End with a count
