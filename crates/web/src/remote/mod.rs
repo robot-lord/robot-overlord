@@ -147,6 +147,8 @@ pub(crate) struct Actor {
     pub(crate) devices: Devices,
     pub(crate) audit: Audit,
     pub(crate) rev: String,
+    /// The relay's `boot` from the current connection's `ready`.
+    pub(crate) boot: String,
     tx: mpsc::UnboundedSender<Input>,
     conn: Conn,
     attempts: u64,
@@ -190,6 +192,7 @@ pub fn start(d: Daemon, cfg: RemoteConfig, rev: String) -> Handle {
         devices,
         audit: Audit::new(plugin::remote_log_path()),
         rev,
+        boot: String::new(),
         tx: tx.clone(),
         conn: Conn::Off,
         attempts: 0,
@@ -400,11 +403,12 @@ impl Actor {
         if !matches!(self.conn, Conn::Connecting { attempt: a } if a == attempt) {
             return;
         }
-        let (ws, _ready) = match result {
+        let (ws, ready) = match result {
             Ok(x) => x,
             Err(f) => return self.disconnected(f),
         };
         keys::forget_token(&self.dir);
+        self.boot = ready.boot;
         self.error = None;
         self.backoff = Duration::from_secs(1);
         let (mut sink, mut stream) = ws.split();

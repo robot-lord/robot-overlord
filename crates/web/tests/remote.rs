@@ -91,7 +91,7 @@ async fn world(n: usize) -> World {
     )
     .await
     .unwrap();
-    assert_eq!(r["origin"], relay.origin());
+    assert_eq!(r["relay"], relay.origin());
     World {
         rig,
         relay,
@@ -444,17 +444,127 @@ async fn replayed_and_tampered_frames_get_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn without_remote_setup_the_plugin_never_dials_out() {
+async fn the_plugin_dials_out_only_when_asked() {
     let _g = LOCK.lock().await;
     env_once("remote", "rlord-test-remote");
+    // A user of the local page only: no [remote], no keys.
+    std::fs::write(paths::config_path(), "[web]\nport = 0\n").unwrap();
+    let _ = std::fs::remove_dir_all(plugin::remote_dir());
+    let relay_dir = tempfile::tempdir().unwrap();
+    let relay = rlord_relay::start(rlord_relay::Config::new(relay_dir.path()))
+        .await
+        .unwrap();
     let rig = tokio::task::spawn_blocking(|| Rig::start(|_| {}))
         .await
         .unwrap();
-    // Off by default, and nothing set up: no relay connection, ever.
-    let s = rpc("relay.status", json!({})).await.unwrap();
-    assert_eq!(s["connected"], false, "{s}");
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let s = rpc("relay.status", json!({})).await.unwrap();
     assert_eq!(s["connected"], false, "{s}");
-    drop(rig);
+    assert_eq!(relay.connections(), 0);
+    // Set up, but no device and no pairing: still nothing.
+    let token = relay
+        .admin()
+        .token_new(1, Duration::from_secs(600), "local")
+        .unwrap();
+    rpc(
+        "relay.setup",
+        json!({"address": relay.address().to_string(), "token": token}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(relay.connections(), 0);
+    // A paired device keeps it connected...
+    let _dev = pair("kept").await;
+    assert!(relay.connections() >= 1);
+    // ... until remote access is turned off, across a plugin restart.
+    rpc("relay.disable", json!({})).await.unwrap();
+    status_until("disconnected", |s| s["connected"] == false).await;
+    rig.daemon.web().stop();
+    rig.daemon.web().start(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(relay.connections(), 0);
+    let s = rpc("relay.status", json!({})).await.unwrap();
+    assert_eq!(s["enabled"], false, "{s}");
+    assert_eq!(s["devices"].as_array().map(Vec::len), Some(1), "{s}");
+}
+
+/// Starts the plugin with `RLORD_WEB_TEST_CRASH` set to `crash` (or
+/// unset); its pid.
+fn start_plugin(rig: &Rig, crash: Option<&str>) -> u64 {
+    // Safety: under LOCK; the daemon passes its environment to the plugin.
+    match crash {
+        Some(c) => std::env::set_var("RLORD_WEB_TEST_CRASH", c),
+        None => std::env::remove_var("RLORD_WEB_TEST_CRASH"),
+    }
+    let st = rig.daemon.web().start(false).unwrap();
+    std::env::remove_var("RLORD_WEB_TEST_CRASH");
+    st["pid"].as_u64().unwrap()
+}
+
+async fn gone(pid: u64) {
+    let t = Instant::now();
+    while alive(pid) {
+        assert!(t.elapsed() < WAIT, "the plugin never crashed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_in_the_mailbox_never_repeats_an_op() {
+    let _g = LOCK.lock().await;
+    let w = world(1).await;
+    let mut dev = pair("crashy").await;
+    let mut c = dev.connect().await.unwrap();
+    let mut live = dev.live(&mut c).await.unwrap();
+    dev.key_mailbox(&mut c, &mut live).await.unwrap();
+    let t = Instant::now();
+    while !audit().contains(&format!("{} mailbox keyed", dev.id())) {
+        assert!(t.elapsed() < WAIT);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    c.close().await;
+    let marker = format!("{} mailbox op", dev.id());
+    let ops = || audit().matches(&marker).count();
+
+    // Killed after decrypting, before saving: handled again, once.
+    w.rig.daemon.web().stop();
+    let mut c = dev.connect().await.unwrap();
+    let req = dev
+        .mailbox_request("c1", "overlord.ask", json!({"text": "one"}))
+        .unwrap();
+    c.send_mailbox(req).await.unwrap();
+    let pid = start_plugin(&w.rig, Some("mailbox_decrypted"));
+    gone(pid).await;
+    assert_eq!(ops(), 0);
+    start_plugin(&w.rig, None);
+    let (seq, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
+    assert_eq!(dev.mailbox_open(&payload).unwrap()["id"], "c1");
+    c.send(|n| ToRelay::Ack {
+        n,
+        seq,
+        device: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(ops(), 1);
+
+    // Killed after saving, before acknowledging: the relay delivers it
+    // again, the host knows it, the op never runs; a resend is a repeat.
+    w.rig.daemon.web().stop();
+    let req = dev
+        .mailbox_request("c2", "overlord.ask", json!({"text": "two"}))
+        .unwrap();
+    c.send_mailbox(req).await.unwrap();
+    let pid = start_plugin(&w.rig, Some("mailbox_saved"));
+    gone(pid).await;
+    start_plugin(&w.rig, None);
+    let again = dev
+        .mailbox_request("c2", "overlord.ask", json!({"text": "two"}))
+        .unwrap();
+    c.send_mailbox(again).await.unwrap();
+    let (_, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
+    let a = dev.mailbox_open(&payload).unwrap();
+    assert_eq!(a["error"]["code"], "repeat", "{a}");
+    assert_eq!(ops(), 1, "no op ran twice, and c2 not at all");
 }

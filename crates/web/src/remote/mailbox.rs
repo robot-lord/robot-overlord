@@ -3,19 +3,22 @@
 //! the relay; the host answers the same way
 //! (`docs/working/e2e-protocol.md`, "Requests by mailbox").
 //!
-//! Per device, in `remote/`: `mailbox-<id>.bin` (the exported mailbox
-//! session) and `requests-<id>.json` (the last 64 request ids). Order per
-//! request: decrypt; record its id and save the advanced state; then
-//! acknowledge the relay and act; then encrypt the answer, save, and send
-//! it. A crash before the save leaves the frame at the relay and the old
-//! state on disk, so it is simply handled again; a crash after it can't
-//! repeat the op (its id is recorded) and the device's resend is answered
-//! `repeat`.
+//! Per device, in `remote/mailbox-<id>.json`, in one atomic write: the
+//! exported mailbox session, the last 64 request ids, and the relay boot
+//! and queue number of the last frame handled. Order per request: decrypt;
+//! record its id and the frame's number and save with the advanced state;
+//! then acknowledge the relay and act; then encrypt the answer, save, and
+//! send it. A crash before the save leaves the frame at the relay and the
+//! old state on disk, so it is handled again as if new; a crash after it
+//! is recognised when the relay delivers the frame again (by its number),
+//! never repeats the op (its id is recorded), and the device's resend is
+//! answered `repeat`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use rlord_core::private;
@@ -32,10 +35,33 @@ pub const MAILBOX_OPS: &[&str] = &["overlord.ask", "overlord.new_session"];
 /// Request ids remembered per device.
 const REMEMBER: usize = 64;
 
+/// A device's mailbox and what has been handled through it, saved
+/// together in one file so a crash never leaves them out of step.
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    /// `MailboxSession::export`, base64url; None after a failure.
+    #[serde(default)]
+    state: Option<String>,
+    /// The last request ids acted on (or refused).
+    #[serde(default)]
+    ids: VecDeque<String>,
+    /// The relay boot and queue number of the last frame handled: a frame
+    /// the relay delivers again (we crashed before acknowledging it) is
+    /// recognised and not decrypted twice.
+    #[serde(default)]
+    boot: String,
+    #[serde(default)]
+    seq: u64,
+}
+
+struct Entry {
+    session: Option<MailboxSession>,
+    saved: Saved,
+}
+
 pub(crate) struct Mailboxes {
     dir: PathBuf,
-    cache: HashMap<String, MailboxSession>,
-    requests: HashMap<String, VecDeque<String>>,
+    cache: HashMap<String, Entry>,
 }
 
 impl Mailboxes {
@@ -43,84 +69,104 @@ impl Mailboxes {
         Mailboxes {
             dir,
             cache: HashMap::new(),
-            requests: HashMap::new(),
         }
     }
 
-    fn state_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("mailbox-{id}.bin"))
+    fn path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("mailbox-{id}.json"))
     }
 
-    fn requests_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("requests-{id}.json"))
+    fn entry(&mut self, id: &str) -> &mut Entry {
+        if !self.cache.contains_key(id) {
+            let saved: Saved = std::fs::read(self.path(id))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let session = saved
+                .state
+                .as_deref()
+                .and_then(super::session::unb64)
+                .and_then(|b| MailboxSession::import(&b).ok());
+            self.cache.insert(id.to_string(), Entry { session, saved });
+        }
+        self.cache.get_mut(id).expect("just inserted")
     }
 
     /// The device's mailbox, loaded on first use.
     pub fn get(&mut self, id: &str) -> Option<&mut MailboxSession> {
-        if !self.cache.contains_key(id) {
-            let b = std::fs::read(self.state_path(id)).ok()?;
-            let m = MailboxSession::import(&b).ok()?;
-            self.cache.insert(id.to_string(), m);
-        }
-        self.cache.get_mut(id)
+        self.entry(id).session.as_mut()
     }
 
     /// A newly keyed mailbox replaces the device's old one.
     pub fn install(&mut self, id: &str, m: MailboxSession) -> Result<()> {
-        self.cache.insert(id.to_string(), m);
+        self.entry(id).session = Some(m);
         self.save(id)
     }
 
-    /// Save the device's mailbox as it is in memory now.
+    /// Save the device's mailbox and what was handled, as they are in
+    /// memory now (one atomic write).
     pub fn save(&mut self, id: &str) -> Result<()> {
-        let Some(m) = self.cache.get(id) else {
-            return Ok(());
+        let dir = self.dir.clone();
+        let path = self.path(id);
+        let e = self.entry(id);
+        e.saved.state = match &e.session {
+            Some(m) => Some(super::session::b64(
+                &m.export().map_err(|e| anyhow::anyhow!("{e}"))?,
+            )),
+            None => None,
         };
-        let bytes = m.export().map_err(|e| anyhow::anyhow!("{e}"))?;
-        private::dir(&self.dir)?;
-        private::write(&self.state_path(id), &bytes)?;
+        let bytes = serde_json::to_vec(&e.saved)?;
+        private::dir(&dir)?;
+        private::write(&path, &bytes)?;
         Ok(())
     }
 
     /// The mailbox failed (a gap, a replay, tampering): gone on this end;
-    /// the device's next live session keys a new one.
-    pub fn discard(&mut self, id: &str) {
-        self.cache.remove(id);
-        let _ = std::fs::remove_file(self.state_path(id));
+    /// the device's next live session keys a new one. The request ids stay.
+    pub fn discard(&mut self, id: &str) -> Result<()> {
+        self.entry(id).session = None;
+        self.save(id)
     }
 
     /// The device was revoked.
     pub fn forget(&mut self, id: &str) {
-        self.discard(id);
-        self.requests.remove(id);
-        let _ = std::fs::remove_file(self.requests_path(id));
+        self.cache.remove(id);
+        let _ = std::fs::remove_file(self.path(id));
     }
 
-    fn ids(&mut self, id: &str) -> &mut VecDeque<String> {
-        if !self.requests.contains_key(id) {
-            let v: VecDeque<String> = std::fs::read(self.requests_path(id))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
-            self.requests.insert(id.to_string(), v);
-        }
-        self.requests.get_mut(id).expect("just inserted")
+    /// Was the frame `(boot, seq)` handled already?
+    pub fn handled(&mut self, id: &str, boot: &str, seq: u64) -> bool {
+        let s = &self.entry(id).saved;
+        !boot.is_empty() && s.boot == boot && seq <= s.seq
+    }
+
+    /// Note the frame `(boot, seq)` as handled (saved with the next save).
+    pub fn mark(&mut self, id: &str, boot: &str, seq: u64) {
+        let s = &mut self.entry(id).saved;
+        s.boot = boot.to_string();
+        s.seq = seq;
     }
 
     pub fn seen(&mut self, id: &str, rid: &str) -> bool {
-        self.ids(id).iter().any(|r| r == rid)
+        self.entry(id).saved.ids.iter().any(|r| r == rid)
     }
 
-    pub fn record(&mut self, id: &str, rid: &str) -> Result<()> {
-        let ids = self.ids(id);
+    /// Note a request id (saved with the next save).
+    pub fn record(&mut self, id: &str, rid: &str) {
+        let ids = &mut self.entry(id).saved.ids;
         ids.push_back(rid.to_string());
         while ids.len() > REMEMBER {
             ids.pop_front();
         }
-        let bytes = serde_json::to_vec(&*ids)?;
-        private::dir(&self.dir)?;
-        private::write(&self.requests_path(id), &bytes)?;
-        Ok(())
+    }
+}
+
+/// For the crash tests only (debug builds): exit at the named point when
+/// `RLORD_WEB_TEST_CRASH` names it.
+fn crash_point(name: &str) {
+    if cfg!(debug_assertions) && std::env::var("RLORD_WEB_TEST_CRASH").is_ok_and(|v| v == name) {
+        eprintln!("rlord-web: crashing at {name} (RLORD_WEB_TEST_CRASH)");
+        std::process::exit(9);
     }
 }
 
@@ -146,6 +192,11 @@ impl Actor {
         let Some(device) = self.devices.by_fp(&fp).map(|d| d.id.clone()) else {
             return ack(self);
         };
+        let boot = self.boot.clone();
+        // Delivered again after a crash before our acknowledgement: handled.
+        if self.mailboxes.handled(&device, &boot, seq) {
+            return ack(self);
+        }
         let Some(m) = self.mailboxes.get(&device) else {
             return ack(self);
         };
@@ -156,60 +207,55 @@ impl Actor {
         let plain = match m.decrypt(&payload[8..]) {
             Ok(p) => p,
             Err(e) => {
-                self.mailboxes.discard(&device);
+                if let Err(e) = self.mailboxes.discard(&device) {
+                    eprintln!("rlord-web: saving a mailbox: {e:#}");
+                }
                 self.audit.log(&device, &format!("mailbox discarded ({e})"));
                 return ack(self);
             }
         };
+        crash_point("mailbox_decrypted");
+        self.mailboxes.mark(&device, &boot, seq);
         let req = stream::single(&plain)
             .ok()
             .filter(|m| m.stream == CONTROL)
             .and_then(|m| serde_json::from_slice::<Value>(&m.body).ok());
-        let Some(req) = req else {
-            let _ = self.mailboxes.save(&device);
-            ack(self);
-            return self.mailbox_answer(
-                &device,
-                error_answer(&Value::Null, "bad_request", "not JSON"),
-            );
-        };
-        let rid = req["id"].clone();
-        let Some(rid_text) = request_id(&rid) else {
-            let _ = self.mailboxes.save(&device);
-            ack(self);
-            return self.mailbox_answer(&device, error_answer(&rid, "bad_request", "no id"));
-        };
-        let op = req["op"].as_str().unwrap_or("").to_string();
-        if self.mailboxes.seen(&device, &rid_text) {
-            let _ = self.mailboxes.save(&device);
-            ack(self);
-            return self.mailbox_answer(
-                &device,
-                error_answer(&rid, "repeat", "this request was received already"),
-            );
-        }
-        if !MAILBOX_OPS.contains(&op.as_str()) {
-            let _ = self.mailboxes.save(&device);
-            ack(self);
-            return self.mailbox_answer(
-                &device,
-                error_answer(
+        let rid = req.as_ref().map(|r| r["id"].clone()).unwrap_or(Value::Null);
+        let refusal = match &req {
+            None => Some(error_answer(&Value::Null, "bad_request", "not JSON")),
+            Some(r) => match request_id(&rid) {
+                None => Some(error_answer(&rid, "bad_request", "no id")),
+                Some(t) if self.mailboxes.seen(&device, &t) => Some(error_answer(
                     &rid,
-                    "not_allowed",
-                    "only overlord.ask and overlord.new_session travel by mailbox",
-                ),
-            );
-        }
-        // Recorded and saved before acting: never done twice.
-        if let Err(e) = self
-            .mailboxes
-            .record(&device, &rid_text)
-            .and_then(|_| self.mailboxes.save(&device))
-        {
+                    "repeat",
+                    "this request was received already",
+                )),
+                Some(t) => {
+                    self.mailboxes.record(&device, &t);
+                    let op = r["op"].as_str().unwrap_or("");
+                    (!MAILBOX_OPS.contains(&op)).then(|| {
+                        error_answer(
+                            &rid,
+                            "not_allowed",
+                            "only overlord.ask and overlord.new_session travel by mailbox",
+                        )
+                    })
+                }
+            },
+        };
+        // The advanced state, the request id and this frame's number, in
+        // one write, before acting: never done twice.
+        if let Err(e) = self.mailboxes.save(&device) {
             eprintln!("rlord-web: saving a mailbox: {e:#}");
             return;
         }
+        crash_point("mailbox_saved");
         ack(self);
+        if let Some(answer) = refusal {
+            return self.mailbox_answer(&device, answer);
+        }
+        let req = req.unwrap_or_default();
+        let op = req["op"].as_str().unwrap_or("").to_string();
         self.audit.log(&device, &format!("mailbox op {op}"));
         let args = req.get("args").cloned().unwrap_or(json!({}));
         let (d, tx) = (self.d.clone(), self.tx_clone());
@@ -274,19 +320,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_ids_persist_and_roll() {
+    fn request_ids_and_frames_persist() {
         let tmp = tempfile::tempdir().unwrap();
         let mut m = Mailboxes::new(tmp.path().to_path_buf());
         assert!(!m.seen("d", "r1"));
-        m.record("d", "r1").unwrap();
+        m.record("d", "r1");
+        m.mark("d", "b1", 7);
+        m.save("d").unwrap();
         let mut m = Mailboxes::new(tmp.path().to_path_buf());
         assert!(m.seen("d", "r1"));
+        assert!(m.handled("d", "b1", 7) && m.handled("d", "b1", 3));
+        assert!(!m.handled("d", "b1", 8) && !m.handled("d", "b2", 1));
         for i in 0..REMEMBER {
-            m.record("d", &format!("x{i}")).unwrap();
+            m.record("d", &format!("x{i}"));
         }
         assert!(!m.seen("d", "r1"));
         m.forget("d");
-        assert!(!tmp.path().join("requests-d.json").exists());
+        assert!(!tmp.path().join("mailbox-d.json").exists());
         assert_eq!(request_id(&json!(5)), Some("5".into()));
         assert_eq!(request_id(&json!("")), None);
         assert_eq!(request_id(&json!(null)), None);

@@ -6,8 +6,8 @@
 //!   and never reused for another.
 //! - `pin.json`: the origin and fingerprint these keys were made for.
 //! - `enroll.json`: an enrolment token, until the relay has accepted us.
-//! - `devices.json` (`devices.rs`), `mailbox-<device id>.bin` and
-//!   `requests-<device id>.json` (`mailbox.rs`).
+//! - `devices.json` (`devices.rs`) and `mailbox-<device id>.json`
+//!   (`mailbox.rs`).
 //!
 //! The pin is part of the keys: moving to another relay is `rlord relay
 //! setup --reset`, which deletes this folder (every device pairs again).
