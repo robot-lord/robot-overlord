@@ -8,6 +8,7 @@ members = [
     "crates/web",
     "crates/e2e",
     "crates/e2e-wasm",
+    "crates/relay-proto",
     "xtask",
 ]
 # Plain `cargo build`/`cargo run`/`cargo test` at the root leave xtask and

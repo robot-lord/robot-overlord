@@ -32,9 +32,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::session::{ciphertext, pad_into, padme_len, unpad};
 use crate::{Error, Result, MAX_PLAINTEXT, TAG_LEN, VERSION};
 
-/// Length of [`MailboxSession::export`]'s bytes: version, then key and
-/// counter for each direction.
-pub const MAILBOX_EXPORT_LEN: usize = 1 + 2 * (32 + 8);
+/// Length of [`MailboxSession::export`]'s bytes: version, the id, then key
+/// and counter for each direction.
+pub const MAILBOX_EXPORT_LEN: usize = 1 + 8 + 2 * (32 + 8);
 
 /// One direction's Noise cipher state.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -98,18 +98,28 @@ impl CipherState {
 
 /// The mailbox session of one host and one device.
 pub struct MailboxSession {
+    id: [u8; 8],
     send: CipherState,
     recv: CipherState,
     poisoned: bool,
 }
 
 impl MailboxSession {
-    pub(crate) fn from_keys(send: [u8; 32], recv: [u8; 32]) -> Self {
+    pub(crate) fn from_keys(id: [u8; 8], send: [u8; 32], recv: [u8; 32]) -> Self {
         Self {
+            id,
             send: CipherState { k: send, n: 0 },
             recv: CipherState { k: recv, n: 0 },
             poisoned: false,
         }
+    }
+
+    /// Which mailbox this is: both ends derive the same 8 bytes from the
+    /// keying handshake. The owner sends it in clear beside each frame, so
+    /// a frame queued under a mailbox that has since been replaced is
+    /// dropped by id instead of poisoning the new one. Not secret.
+    pub fn id(&self) -> [u8; 8] {
+        self.id
     }
 
     /// True once a decrypt has failed: discard this session.
@@ -171,6 +181,7 @@ impl MailboxSession {
         }
         let mut b = Vec::with_capacity(MAILBOX_EXPORT_LEN);
         b.push(VERSION);
+        b.extend_from_slice(&self.id);
         for c in [&self.send, &self.recv] {
             b.extend_from_slice(&c.k);
             b.extend_from_slice(&c.n.to_be_bytes());
@@ -191,8 +202,9 @@ impl MailboxSession {
             n: u64::from_be_bytes(bytes[off + 32..off + 40].try_into().unwrap()),
         };
         Ok(MailboxSession {
-            send: state(1),
-            recv: state(41),
+            id: bytes[1..9].try_into().unwrap(),
+            send: state(9),
+            recv: state(49),
             poisoned: false,
         })
     }
@@ -204,8 +216,8 @@ mod tests {
 
     #[test]
     fn export_import_round_trip() {
-        let mut a = MailboxSession::from_keys([1; 32], [2; 32]);
-        let mut b = MailboxSession::from_keys([2; 32], [1; 32]);
+        let mut a = MailboxSession::from_keys([5; 8], [1; 32], [2; 32]);
+        let mut b = MailboxSession::from_keys([5; 8], [2; 32], [1; 32]);
         for i in 0..5u8 {
             let f = a.encrypt(&[i; 10]).unwrap();
             assert_eq!(b.decrypt(&f).unwrap(), vec![i; 10]);
@@ -225,8 +237,8 @@ mod tests {
 
     #[test]
     fn a_gap_poisons() {
-        let mut a = MailboxSession::from_keys([1; 32], [2; 32]);
-        let mut b = MailboxSession::from_keys([2; 32], [1; 32]);
+        let mut a = MailboxSession::from_keys([5; 8], [1; 32], [2; 32]);
+        let mut b = MailboxSession::from_keys([5; 8], [2; 32], [1; 32]);
         let _lost = a.encrypt(b"one").unwrap();
         let two = a.encrypt(b"two").unwrap();
         assert_eq!(b.decrypt(&two), Err(Error::Decrypt));
@@ -237,7 +249,7 @@ mod tests {
 
     #[test]
     fn padme_sizes() {
-        let mut a = MailboxSession::from_keys([1; 32], [2; 32]);
+        let mut a = MailboxSession::from_keys([5; 8], [1; 32], [2; 32]);
         let f = a.encrypt(&[0; 998]).unwrap();
         assert_eq!(f.len(), crate::mailbox_wire_len(998));
         assert_eq!(f.len(), 2 + 1024 + TAG_LEN);

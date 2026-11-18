@@ -198,12 +198,15 @@ impl Established {
             return Err(Error::Format("only a mailbox handshake keys a mailbox"));
         }
         let initiator = self.hs.is_initiator();
+        let id: [u8; 8] = sha256(&[b"rlord-e2e/1 mailbox id", &self.handshake_hash])[..8]
+            .try_into()
+            .unwrap();
         let (i2r, r2i) = self.hs.dangerously_get_raw_split();
         let (i2r, r2i) = (Zeroizing::new(i2r), Zeroizing::new(r2i));
         Ok(if initiator {
-            MailboxSession::from_keys(*i2r, *r2i)
+            MailboxSession::from_keys(id, *i2r, *r2i)
         } else {
-            MailboxSession::from_keys(*r2i, *i2r)
+            MailboxSession::from_keys(id, *r2i, *i2r)
         })
     }
 

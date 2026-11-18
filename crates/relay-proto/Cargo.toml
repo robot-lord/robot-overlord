@@ -1,0 +1,30 @@
+# The relay link's protocol (`rlord_relay_proto`): the messages, frame
+# headers, the two signed transcripts and the relay address, shared by the
+# relay, the host (`rlord-web`) and devices. Sans-IO (no sockets, no
+# randomness of its own: callers pass seeds and nonces) so it builds to
+# WASM too. No Noise, no KEM: the relay holds no content crypto.
+[package]
+name = "robot-overlord-relay-proto"
+description = "rlord's relay link protocol. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_relay_proto"
+
+[dependencies]
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "std"] }
+# The version p256 resolves, so no duplicates in the relay.
+sha2 = { version = "0.11", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# p256's dependencies link getrandom 0.4 (unused here: callers pass seeds);
+# on wasm32 it needs its browser backend to compile.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

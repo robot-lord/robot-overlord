@@ -110,6 +110,21 @@ pub fn open_in_browser(url: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// The plugin's remote-access keys and device records (0700; files 0600):
+/// `host.key`, `relay.key`, `pin.json`, `devices.json`,
+/// `mailbox-<device id>.bin`. Only `rlord-web` reads them; the `rlord`
+/// binary and the daemon never do (`rlord web remove` deletes the folder).
+pub fn remote_dir() -> PathBuf {
+    paths::data_dir().join("remote")
+}
+
+/// The plugin's remote-access audit log (0600, rotated at 1 MiB): one line
+/// per pairing, confirmation, revocation, link and remote op, never
+/// arguments.
+pub fn remote_log_path() -> PathBuf {
+    paths::data_dir().join("remote.log")
+}
+
 /// Where the daemon appends the plugin's output.
 pub fn log_path() -> PathBuf {
     paths::data_dir().join("web.log")
