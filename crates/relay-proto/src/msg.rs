@@ -257,6 +257,22 @@ pub enum FromRelay {
     },
     /// Device: its host signalled while it was connected.
     Signal,
+    /// A lane-2 frame from this connection was queued with this `seq` (for
+    /// a host, in the queue to `device`). Every lane-2 frame is answered
+    /// `queued` or `refused`, in the order the frames were sent.
+    Queued {
+        seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<B64>,
+    },
+    /// A lane-2 frame from this connection was not queued (`code`: `full`,
+    /// `no_queue`, `unknown`, …); nothing of it is kept. Resend it later
+    /// (before any newer one) or give up.
+    Refused {
+        code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<B64>,
+    },
     /// A live frame had nowhere to go.
     Undeliverable {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +346,11 @@ pub mod close {
     pub const LIMIT: u16 = 4429;
     /// The relay is overloaded.
     pub const OVERLOADED: u16 = 4503;
+    /// This connection's link ended under it (its host dropped it, or the
+    /// link stalled in either direction): the end-to-end session on it is
+    /// broken. Reconnect at once, with a fresh handshake; not final, no
+    /// backoff the first time (a client that keeps getting it backs off).
+    pub const RESET: u16 = 4205;
 
     /// Codes a client must not retry without a change (the user's action,
     /// a new config or a newer client).
@@ -407,6 +428,20 @@ mod tests {
             .to_json(),
             r#"{"t":"bye","code":"overloaded","retry_after":30}"#
         );
+        assert_eq!(
+            FromRelay::Queued {
+                seq: 4,
+                device: None
+            }
+            .to_json(),
+            r#"{"t":"queued","seq":4}"#
+        );
+        let q = FromRelay::Refused {
+            code: code::FULL.into(),
+            device: Some(B64(vec![1; 32])),
+        };
+        assert!(q.to_json().starts_with(r#"{"t":"refused","code":"full","device":""#));
+        assert_eq!(FromRelay::parse(&q.to_json()).unwrap(), q);
         let l = FromRelay::Link {
             id: 7,
             device: B64(vec![1; 32]),
@@ -431,5 +466,6 @@ mod tests {
         assert!(close::is_final(close::NOT_ALLOWED));
         assert!(!close::is_final(close::OVERLOADED));
         assert!(!close::is_final(close::REPLACED));
+        assert!(!close::is_final(close::RESET));
     }
 }
