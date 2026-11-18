@@ -67,6 +67,13 @@ export const OPS = [
   "overlord.setup_request",
   "session.new",
   "session.fork",
+  "overlord.messages",
+  "device.list",
+  "device.pair",
+  "device.pair_cancel",
+  "device.confirm",
+  "device.reject",
+  "device.revoke",
 ] as const;
 
 export type Op = (typeof OPS)[number];

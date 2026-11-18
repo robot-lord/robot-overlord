@@ -1,0 +1,30 @@
+{
+  "connected": true,
+  "devices": [
+    {
+      "id": "ab12cd34ef560789",
+      "last_seen": 1800000100,
+      "linked": true,
+      "name": "phone",
+      "paired_at": 1800000000
+    }
+  ],
+  "enabled": false,
+  "error": null,
+  "pairing": {
+    "expires": 1800000300
+  },
+  "pending": {
+    "code": "654321",
+    "expires": 1800000200,
+    "name": "laptop"
+  },
+  "plugin": {
+    "installed": false,
+    "problem": "the web plugin is not installed (run `rlord web install`)",
+    "state": "stopped"
+  },
+  "relay": "",
+  "relay_key": "",
+  "reported": true
+}

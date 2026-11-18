@@ -15,6 +15,7 @@ pub mod overlord;
 pub mod own;
 pub mod profile;
 pub mod recall;
+pub mod relay;
 pub mod remote;
 pub mod repo_latest;
 mod repo_scan;
@@ -60,7 +61,9 @@ pub struct Daemon {
     /// `{"notify":"ui","to":"terminal","cmd":{...}}` — a UI command for
     /// the TUI (set_view, new_session) issued by the overlord;
     /// `{"notify":"ui","to":"web","page":"<id>","cmd":{...}}` — one for a
-    /// web page (`web.subscribe` passes these on; the TUI ignores them).
+    /// web page (`web.subscribe` passes these on; the TUI ignores them);
+    /// `{"notify":"remote","id","req"}` — a user's relay command for the
+    /// plugin (`relay.rs`; only `web.subscribe` gets these).
     notify: tokio::sync::broadcast::Sender<String>,
     /// The TUI's current list view, as it last reported it.
     pub(crate) ui_view: Mutex<Value>,
@@ -90,6 +93,9 @@ pub struct Daemon {
     pub(crate) warm: warm::Warm,
     /// Remote Control: availability and each session's link (remote.rs).
     pub(crate) remote: remote::Remote,
+    /// Remote access through a relay: the plugin's state, and the user's
+    /// commands waiting for its answer (relay.rs).
+    pub(crate) relay: relay::Relay,
     /// Archive summaries being written (summary.rs).
     pub(crate) summaries: summary::Summaries,
     /// Sessions stopped on a usage limit (limits.rs).
@@ -137,6 +143,7 @@ impl Daemon {
             sessions: Default::default(),
             warm: Default::default(),
             remote: Default::default(),
+            relay: Default::default(),
             summaries: Default::default(),
             limits: Default::default(),
             background: Default::default(),
@@ -186,6 +193,16 @@ impl Daemon {
     /// The web plugin's supervisor.
     pub fn web(&self) -> &Arc<web::Web> {
         &self.web
+    }
+
+    /// A line for the subscribers' streams, as is.
+    pub(crate) fn notify_line(&self, line: String) {
+        let _ = self.notify.send(line);
+    }
+
+    /// How many `web.subscribe` streams are open (the plugin's).
+    pub(crate) fn web_subscribers(&self) -> usize {
+        self.web_subscribers.load(Ordering::SeqCst)
     }
 
     /// The open web pages.
@@ -293,6 +310,24 @@ impl Daemon {
                 }
             }
             ui::Target::None => {}
+        }
+    }
+
+    /// A one-line notice (never parked) on every surface there now: the
+    /// terminal's TUIs and every open web page, each in its own words.
+    pub(crate) fn notice_all(&self, terminal: &str, web: &str) {
+        if self.tui_count() > 0 {
+            let cmd = json!({"cmd": "notice", "text": terminal});
+            let _ = self
+                .notify
+                .send(json!({"notify": "ui", "to": "terminal", "cmd": cmd}).to_string());
+        }
+        let cmd = json!({"cmd": "notice", "text": web});
+        let pages: Vec<String> = self.web_ui().pages().iter().map(|p| p.id.clone()).collect();
+        for page in pages {
+            let _ = self
+                .notify
+                .send(json!({"notify": "ui", "to": "web", "page": page, "cmd": cmd}).to_string());
         }
     }
 
@@ -529,11 +564,16 @@ impl Daemon {
                 Err(RecvError::Lagged(_)) => CHANGED.to_string(),
                 Err(RecvError::Closed) => break Ok(()),
             };
+            // (A relay command is for the plugin alone.)
+            if matches!(kind, Push::Events { .. }) && is_remote_line(&line) {
+                continue;
+            }
             let mut out = vec![line];
             if let Push::Web = kind {
                 if out[0] != CHANGED {
-                    // A UI command: through at once if it is the web's.
-                    match web_ui_line(&out[0]) {
+                    // A UI command (through at once if it is the web's) or
+                    // a relay command.
+                    match web_line(&out[0]) {
                         Some(l) => out[0] = l,
                         None => continue,
                     }
@@ -550,7 +590,7 @@ impl Daemon {
                     loop {
                         match rx.try_recv() {
                             Ok(l) if l != CHANGED => {
-                                if let Some(l) = web_ui_line(&l) {
+                                if let Some(l) = web_line(&l) {
                                     out.push(l);
                                 }
                             }
@@ -574,11 +614,14 @@ impl Daemon {
         if tui {
             self.tui_subscribers.fetch_sub(1, Ordering::SeqCst);
         }
-        // The plugin is gone, and its pages with it (unless a restarted
-        // plugin's stream is already up: it reports its own).
+        // The plugin is gone, and its pages and relay state with it (unless
+        // a restarted plugin's stream is already up: it reports its own).
         if let Push::Web = kind {
             if self.web_subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
                 self.web_ui().clear();
+                if self.relay.plugin_gone() {
+                    self.changed();
+                }
             }
         }
         r
@@ -586,7 +629,13 @@ impl Daemon {
 
     fn dispatch(&self, req: Request) -> Response {
         let id = req.id;
-        match self.call(&req.method, req.params) {
+        // The user's relay commands: from the socket only, never through
+        // `rpc` (so no MCP tool or web op reaches them).
+        let r = match relay::user_call(self, &req.method, &req.params) {
+            Some(r) => r.map_err(MethodError::Internal),
+            None => self.call(&req.method, req.params),
+        };
+        match r {
             Ok(result) => Response::ok(id, result),
             Err(MethodError::NotFound) => Response::err(
                 id,
@@ -1097,6 +1146,9 @@ impl Daemon {
             "web.start" => web::start(self),
             "web.stop" => web::stop(self),
             "web.rotate" => web::rotate(self),
+            // The plugin's relay side (relay.rs).
+            "web.remote_reply" => relay::remote_reply(self, params),
+            "web.remote_state" => relay::remote_state(self, params),
             "mcp.tools" => Ok(mcp::tools_for(params["overlord"] == true)),
             "mcp.call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1118,12 +1170,22 @@ impl Daemon {
     }
 }
 
-/// A broadcast line as `web.subscribe` passes it on, if it is a UI
-/// command for a web page: `{"notify":"ui","page","cmd"}`.
-fn web_ui_line(line: &str) -> Option<String> {
+/// A broadcast line as `web.subscribe` passes it on: a UI command for a
+/// web page (`{"notify":"ui","page","cmd"}`), or a relay command for the
+/// plugin (`{"notify":"remote","id","req"}`, as is).
+fn web_line(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line).ok()?;
+    if v["notify"] == "remote" {
+        return Some(line.to_string());
+    }
     (v["notify"] == "ui" && v["to"] == "web")
         .then(|| json!({"notify": "ui", "page": v["page"], "cmd": v["cmd"]}).to_string())
+}
+
+/// A relay command (`relay.rs`), which only the plugin's stream carries.
+fn is_remote_line(line: &str) -> bool {
+    line.contains(r#""notify":"remote""#)
+        && serde_json::from_str::<Value>(line).is_ok_and(|v| v["notify"] == "remote")
 }
 
 /// What a subscription's push stream carries (`Daemon::push_loop`).
@@ -1647,12 +1709,59 @@ mod tests {
         assert_eq!(got[0]["notify"], "changed");
     }
 
+    /// The user's relay commands are reached only from the socket: never
+    /// through `rpc`, which the MCP tools and the web ops call methods by.
+    #[test]
+    fn relay_commands_are_not_reachable_through_rpc() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        for m in [
+            "relay.status",
+            "relay.setup",
+            "relay.pair",
+            "relay.pair_cancel",
+            "relay.confirm",
+            "relay.reject",
+            "relay.devices",
+            "relay.revoke",
+            "relay.disable",
+        ] {
+            let e = d.rpc(m, json!({})).unwrap_err().to_string();
+            assert!(e.contains("no such method"), "{m}: {e}");
+        }
+        assert!(relay::user_call(&d, "relay.other", &json!({})).is_none());
+        // The dispatcher answers them.
+        let r = d.dispatch(Request {
+            id: 1,
+            method: "relay.status".into(),
+            params: json!({}),
+        });
+        assert_eq!(
+            serde_json::to_value(&r).unwrap()["result"]["enabled"],
+            false
+        );
+    }
+
+    /// A relay command reaches the plugin's stream only.
+    #[test]
+    fn remote_lines_are_the_plugins() {
+        let line = json!({"notify": "remote", "id": "r1", "req": {"cmd": "pair"}}).to_string();
+        assert!(is_remote_line(&line));
+        assert_eq!(web_line(&line), Some(line.clone()));
+        assert!(!is_remote_line(r#"{"notify":"changed"}"#));
+        assert!(!is_remote_line(
+            r#"{"notify":"ui","to":"web","page":"p","cmd":{"cmd":"notice","text":"\"notify\":\"remote\""}}"#
+        ));
+    }
+
     /// A command for a page that closed before it arrived is handed to the
     /// next page that asks, once; the terminal's slot is separate.
     #[test]
     fn a_lost_web_command_is_parked() {
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
-        let pending = |d: &Daemon| d.rpc("web.call", json!({"op": "page.pending"})).unwrap();
+        let pending = |d: &Daemon| {
+            d.rpc("web.call", json!({"op": "page.pending", "via": "local"}))
+                .unwrap()
+        };
         d.web_ui().set_pages(&["p1-aa".to_string()]);
         d.ui_cmd_to(
             &ui::Target::Web("p1-aa".into()),
@@ -1670,7 +1779,7 @@ mod tests {
         d.ui_cmd_to(&ui::Target::Web("p2-bb".into()), json!({"cmd": "goto"}));
         d.rpc(
             "web.call",
-            json!({"op": "page.report", "page": "p2-bb", "args": {}}),
+            json!({"op": "page.report", "via": "local", "page": "p2-bb", "args": {}}),
         )
         .unwrap();
         d.web_ui().set_pages(&["p3-cc".to_string()]);
