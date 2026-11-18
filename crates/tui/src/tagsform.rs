@@ -30,15 +30,16 @@ pub(crate) fn suggest(query: &str, known: &[(String, usize)], exclude: &[String]
     }
     let mut hits: Vec<(u8, usize, &str)> = known
         .iter()
-        .filter(|(t, _)| !t.is_empty() && !exclude.contains(t))
+        .filter(|(t, _)| !t.is_empty() && !has(exclude, t))
         .filter_map(|(t, n)| {
-            let rank = if *t == q {
+            let lt = t.to_lowercase();
+            let rank = if lt == q {
                 0
-            } else if t.starts_with(&q) {
+            } else if lt.starts_with(&q) {
                 1
-            } else if t.contains(&q) {
+            } else if lt.contains(&q) {
                 2
-            } else if subsequence(&q, t) {
+            } else if subsequence(&q, &lt) {
                 3
             } else {
                 return None;
@@ -51,6 +52,13 @@ pub(crate) fn suggest(query: &str, known: &[(String, usize)], exclude: &[String]
         .take(MAX_SUGGESTIONS)
         .map(|(_, _, t)| t.to_string())
         .collect()
+}
+
+/// Whether `list` has `t`, ignoring case (tags are stored lower case, but
+/// one set elsewhere may not be).
+pub(crate) fn has(list: &[String], t: &str) -> bool {
+    let t = t.to_lowercase();
+    list.iter().any(|x| x.to_lowercase() == t)
 }
 
 fn subsequence(q: &str, t: &str) -> bool {
@@ -94,6 +102,8 @@ pub(crate) struct TagEditor {
     pub confirm_new: Option<String>,
     /// Save once the pending new tag is answered (ctrl-s with text typed).
     pub save_after: bool,
+    /// Esc with unsaved changes: asking whether to discard them.
+    pub confirm_discard: bool,
 }
 
 impl TagEditor {
@@ -109,11 +119,14 @@ impl TagEditor {
             tag_sel: None,
             confirm_new: None,
             save_after: false,
+            confirm_discard: false,
         }
     }
 
     fn is_known(&self, t: &str) -> bool {
-        self.known.iter().any(|(k, _)| k == t) || self.original.iter().any(|k| k == t)
+        let t = t.to_lowercase();
+        self.known.iter().any(|(k, _)| k.to_lowercase() == t)
+            || self.original.iter().any(|k| k.to_lowercase() == t)
     }
 
     /// The rows under the input, in order. The typed text comes first when
@@ -121,7 +134,9 @@ impl TagEditor {
     /// text itself would add.
     pub fn choices(&self) -> Vec<Choice> {
         let t = normalize(&self.input);
-        if t.is_empty() {
+        // Empty, or a tag the session already has: no rows, nothing
+        // highlighted, and enter just clears the input.
+        if t.is_empty() || has(&self.tags, &t) {
             return Vec::new();
         }
         let mut known = self.known.clone();
@@ -135,7 +150,7 @@ impl TagEditor {
             .into_iter()
             .map(Choice::Known)
             .collect();
-        if !self.is_known(&t) && !self.tags.contains(&t) {
+        if !self.is_known(&t) {
             v.insert(0, Choice::New(t));
         }
         v
@@ -145,7 +160,7 @@ impl TagEditor {
     /// waits for y/n. False when there was nothing to add.
     fn take_choice(&mut self) -> bool {
         let typed = normalize(&self.input);
-        let c = if self.tags.contains(&typed) {
+        let c = if has(&self.tags, &typed) {
             None
         } else {
             self.choices().into_iter().nth(self.sel)
@@ -164,7 +179,7 @@ impl TagEditor {
     }
 
     pub fn add(&mut self, t: String) {
-        if !self.tags.contains(&t) {
+        if !has(&self.tags, &t) {
             self.tags.push(t);
         }
         self.input.clear();
@@ -212,6 +227,14 @@ impl TagEditor {
     /// One key. Returns Some(true) to save, Some(false) to cancel, None to
     /// stay open.
     pub fn key(&mut self, k: KeyEvent) -> Option<bool> {
+        if self.confirm_discard {
+            self.confirm_discard = false;
+            // y or esc again: discard. Anything else: back to editing.
+            return match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Esc => Some(false),
+                _ => None,
+            };
+        }
         if let Some(t) = self.confirm_new.clone() {
             match k.code {
                 // Only an explicit y creates it: a reflexive enter doesn't.
@@ -238,6 +261,7 @@ impl TagEditor {
                 self.input.clear();
                 self.sel = 0;
             }
+            KeyCode::Esc if self.changed() => self.confirm_discard = true,
             KeyCode::Esc => return Some(false),
             // Save: typed text is resolved first, never dropped.
             KeyCode::Char('s') if ctrl => {
@@ -411,7 +435,16 @@ impl App {
             lines.push(if on { l.style(theme::selected()) } else { l });
         }
         lines.push(Line::from(""));
-        if let Some(t) = &ed.confirm_new {
+        if ed.confirm_discard {
+            lines.push(Line::from(Span::styled(
+                "  Discard your changes to the tags?",
+                Style::default().fg(theme::yellow()).bold(),
+            )));
+            lines.push(keys_line(&[
+                ("y/esc", "discard", Cap::Context),
+                ("n", "keep editing", Cap::Global),
+            ]));
+        } else if let Some(t) = &ed.confirm_new {
             lines.push(Line::from(Span::styled(
                 format!("  #{t} is a new tag. Create it?"),
                 Style::default().fg(theme::yellow()).bold(),
@@ -421,17 +454,16 @@ impl App {
                 ("n", "back", Cap::Global),
             ]));
         } else if ed.input.is_empty() {
+            // Two short rows: nothing runs past the modal's inner width.
             let mut keys = vec![("enter", "save", Cap::Context)];
             if ed.tag_sel.is_some() {
-                keys.push(("^d", "remove tag", Cap::Context));
+                keys.push(("^d", "remove", Cap::Context));
             }
-            keys.push(("↑↓", "pick a tag", Cap::Global));
-            keys.push(("esc", "cancel", Cap::Global));
             lines.push(keys_line(&keys));
-            lines.push(Line::from(Span::styled(
-                "  type to add a tag",
-                theme::faint(),
-            )));
+            lines.push(keys_line(&[
+                ("↑↓", "pick", Cap::Global),
+                ("esc", "cancel", Cap::Global),
+            ]));
         } else {
             lines.push(keys_line(&[
                 ("enter", "add", Cap::Context),
@@ -626,7 +658,54 @@ mod tests {
         press(&mut e, KeyCode::Delete);
         assert_eq!(e.tags, ["web"]);
         assert_eq!(e.diff(), (vec![], vec!["wip".into(), "ui".into()]));
+        // Changes made: esc asks first; esc again discards.
+        assert_eq!(press(&mut e, KeyCode::Esc), None);
+        assert!(e.confirm_discard);
         assert_eq!(press(&mut e, KeyCode::Esc), Some(false));
+    }
+
+    #[test]
+    fn discard_asks_and_n_keeps_editing() {
+        let mut e = ed(&[]);
+        typ(&mut e, "ui");
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(press(&mut e, KeyCode::Esc), None);
+        assert_eq!(press(&mut e, KeyCode::Char('n')), None);
+        assert_eq!(e.tags, ["ui"]);
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(press(&mut e, KeyCode::Char('y')), Some(false));
+    }
+
+    #[test]
+    fn case_never_makes_a_duplicate() {
+        let mut e = TagEditor::new(
+            "id",
+            "s",
+            vec!["Web".into()],
+            vec![("Web".into(), 2), ("Tools".into(), 1)],
+        );
+        // Typing the session's tag in another case: no rows, nothing added.
+        typ(&mut e, "web");
+        assert!(e.choices().is_empty());
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.tags, ["Web"]);
+        // A known tag in another case is known, added as it is spelled.
+        typ(&mut e, "tools");
+        assert_eq!(e.choices(), [Choice::Known("Tools".into())]);
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.tags, ["Web", "Tools"]);
+        assert!(e.confirm_new.is_none());
+    }
+
+    #[test]
+    fn existing_tag_typed_highlights_nothing() {
+        // "we" is on the session; "web" would otherwise be suggested.
+        let mut e = ed(&["we"]);
+        typ(&mut e, "we");
+        assert!(e.choices().is_empty());
+        press(&mut e, KeyCode::Down);
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.tags, ["we"]);
     }
 
     #[test]
