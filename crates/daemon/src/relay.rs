@@ -93,8 +93,14 @@ pub fn user_call(d: &Daemon, method: &str, params: &Value) -> Option<Result<Valu
 /// and what it last reported. Never starts anything.
 pub(crate) fn status(d: &Daemon) -> Result<Value> {
     let cfg = d.config();
-    let web = d.web().status(cfg.web.enabled);
     let m = d.relay.mirror();
+    // A plugin that reports is running; otherwise ask the supervisor
+    // (which hashes the plugin file: not on every poll).
+    let web = if m.is_some() {
+        json!({"installed": true, "state": "running", "problem": null})
+    } else {
+        d.web().status(cfg.web.enabled)
+    };
     let field = |k: &str| m.as_ref().map(|m| m[k].clone()).unwrap_or(Value::Null);
     Ok(json!({
         "enabled": cfg.remote.enabled,

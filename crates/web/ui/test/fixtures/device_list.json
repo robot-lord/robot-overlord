@@ -20,9 +20,9 @@
     "name": "laptop"
   },
   "plugin": {
-    "installed": false,
-    "problem": "the web plugin is not installed (run `rlord web install`)",
-    "state": "stopped"
+    "installed": true,
+    "problem": null,
+    "state": "running"
   },
   "relay": "",
   "relay_key": "",
