@@ -288,8 +288,12 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
             local_after |= l.local_command_output();
             (None, false)
         } else if l.interrupted() {
+            local_after = false;
             (Some(TurnTail::Interrupted), false)
         } else {
+            // (A local command's output covers the wrapper right before it
+            // only: any other line in between ends that.)
+            local_after = false;
             let ended = l.turn_ended();
             let starts = l.prompt().is_some() || (format == Format::Codex && ended == Some(false));
             (
@@ -1137,6 +1141,21 @@ mod tests {
             ),
         ]);
         assert_eq!(custom.turn, Some(TurnTail::Open));
+        // Output, then a reply, then a wrapper before both: the output is
+        // not that wrapper's (it belongs to none): the wrapper is a turn.
+        let apart = t(&[
+            user(
+                "2026-11-12T10:00:20Z",
+                "<command-name>/review</command-name>",
+            ),
+            reply("2026-11-12T10:00:25Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:30Z",
+                "<local-command-stdout>x</local-command-stdout>",
+            ),
+        ]);
+        assert_eq!(apart.turn, Some(TurnTail::Ended));
+        assert_eq!(apart.prompt_at, at("2026-11-12T10:00:20Z"));
         // ... which the user started; a built-in command starts none.
         assert_eq!(custom.prompt_at, at("2026-11-12T10:00:20Z"));
         assert_eq!(builtin.prompt_at, None);

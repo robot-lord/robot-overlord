@@ -328,9 +328,11 @@ pub fn pid_alive(pid: i32) -> bool {
 /// `agent_panes`' lines: pane id, dead (`1`), the session's pinned pane,
 /// the server's pid, session name.
 fn parse_agent_panes(out: &str) -> AgentPanes {
-    // Per session: its pin, its first pane's state, its pinned pane's.
+    // Per session: its pin, its first pane's state, its pinned pane's;
+    // and every pane's state by id (a pin moved by `join-pane`).
     let mut seen: std::collections::HashMap<String, (String, bool, Option<bool>)> =
         Default::default();
+    let mut panes: std::collections::HashMap<String, bool> = Default::default();
     let mut server_pid = None;
     for l in out.lines() {
         let mut f = l.splitn(5, '\t');
@@ -341,6 +343,7 @@ fn parse_agent_panes(out: &str) -> AgentPanes {
         };
         server_pid = server_pid.or(pid.parse().ok());
         let dead = dead == "1";
+        panes.insert(pane.to_string(), dead);
         let e = seen
             .entry(session.to_string())
             .or_insert_with(|| (pin.to_string(), dead, None));
@@ -351,11 +354,12 @@ fn parse_agent_panes(out: &str) -> AgentPanes {
     let dead = seen
         .into_iter()
         .map(|(s, (pin, first, pinned))| {
-            // Pinned, and that pane gone: the agent's pane is dead.
+            // Pinned: that pane, in this session or moved to another;
+            // gone everywhere, the agent's pane is dead.
             let d = if pin.is_empty() {
                 first
             } else {
-                pinned.unwrap_or(true)
+                pinned.or_else(|| panes.get(&pin).copied()).unwrap_or(true)
             };
             (s, d)
         })
@@ -1636,6 +1640,9 @@ mod tests {
         assert_eq!(p.dead.get("c"), Some(&true), "none pinned: the first");
         assert_eq!(p.dead.get("d"), Some(&true));
         assert_eq!(p.dead.get("e"), Some(&true), "its pinned pane is gone");
+        // A pinned pane moved to another session (`join-pane`): still it.
+        let moved = parse_agent_panes("%7\t1\t%8\t77\tf\n%8\t0\t\t77\tg");
+        assert_eq!(moved.dead.get("f"), Some(&false));
         assert_eq!(p.server_pid, Some(77));
         assert!(no_answer("no server running on /tmp/tmux-501/x\n"));
         assert!(no_answer(

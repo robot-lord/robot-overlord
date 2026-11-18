@@ -189,6 +189,8 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
     db.kv_delete(&format!("pane_gone_turn:{}", s.id))?;
+    // Nobody waits in a stopped session.
+    db.kv_delete(&methods::needs_you_key(&s.id))?;
     // (Its thread leaves the gate: a stopped session's hooks are dropped.)
     crate::codex_daemon::sync_gate(db);
     Ok(true)

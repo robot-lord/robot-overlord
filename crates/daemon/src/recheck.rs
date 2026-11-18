@@ -244,8 +244,9 @@ fn check(
     Ok(done)
 }
 
-/// Write the corrected status, only if the session's status is still the
-/// one judged (an event may have moved it meanwhile). Returns whether it
+/// Write the corrected status, only if the session is still as judged:
+/// its status and its message times (an event may have moved them
+/// meanwhile). Returns whether it
 /// was written.
 /// `ended_at`: when the agent's final reply was written, for a turn found
 /// ended (its last message, as a `Stop` would have recorded).
@@ -257,9 +258,17 @@ fn apply(
     now: i64,
     ended_at: Option<i64>,
 ) -> Result<bool> {
+    // (A hook that kept the status but moved a message, e.g. a prompt
+    // while working, is news too: the evidence is stale.)
+    let same = |cur: &Session| {
+        cur.status == s.status
+            && cur.last_state_change_at == s.last_state_change_at
+            && cur.last_user_msg_at == s.last_user_msg_at
+            && cur.last_agent_msg_at == s.last_agent_msg_at
+            && cur.last_rlord_msg_at == s.last_rlord_msg_at
+    };
     match db.resolve_ref(&s.id) {
-        Ok(cur) if cur.status == s.status && cur.last_state_change_at == s.last_state_change_at => {
-        }
+        Ok(cur) if same(&cur) => {}
         _ => return Ok(false),
     }
     db.set_status(&s.id, to, now)?;
@@ -720,6 +729,19 @@ mod tests {
         let seen = db.resolve_ref("s").unwrap();
         assert!(apply(&db, &seen, Status::Idle, "turn_ended", 60, Some(40)).unwrap());
         assert_eq!(db.resolve_ref("s").unwrap().last_agent_msg_at, Some(50));
+    }
+
+    /// A prompt that kept the status (working, working) still makes the
+    /// evidence stale.
+    #[test]
+    fn a_message_meanwhile_is_news_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        add(&db, dir.path(), "s", "claude", Status::Working, 5, "");
+        let seen = db.resolve_ref("s").unwrap();
+        db.touch_last_user_msg("s", 7).unwrap();
+        assert!(!apply(&db, &seen, Status::Idle, "turn_ended", 8, None).unwrap());
+        assert_eq!(db.resolve_ref("s").unwrap().status, Status::Working);
     }
 
     #[test]
