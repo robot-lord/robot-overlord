@@ -102,6 +102,16 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
                     pump.changed(rev)
                 }
                 daemon::Event::Ui { page, cmd } => pump.ui(&page, cmd).await,
+                // The user's relay commands. (Placeholder until the
+                // remote module lands: every command fails, plainly.)
+                daemon::Event::Remote { id, .. } => {
+                    let d = pump.daemon.clone();
+                    tokio::spawn(async move {
+                        let _ = d
+                            .remote_reply(&id, Err("remote access is not built yet".into()))
+                            .await;
+                    });
+                }
             }
         }
         eprintln!("rlord-web: the daemon went away; exiting");

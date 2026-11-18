@@ -10,6 +10,7 @@ use rlord_core::timefmt::{fmt_ts, rel_age};
 use rlord_core::{paths, tmux};
 use rlord_daemon::{autostart, client_call, methods, spool_hook_event, Daemon};
 
+mod relay_cmd;
 mod web_install;
 
 #[derive(Parser)]
@@ -426,6 +427,12 @@ enum Command {
         #[command(subcommand)]
         cmd: Option<WebCmd>,
     },
+    /// Remote access: your devices reach this machine through one relay,
+    /// end to end encrypted (needs the web plugin)
+    Relay {
+        #[command(subcommand)]
+        cmd: relay_cmd::RelayCmd,
+    },
     /// The overlord overlay itself (runs inside the tmux popup)
     #[command(hide = true)]
     Overlay {
@@ -463,7 +470,8 @@ enum WebCmd {
         from: Option<std::path::PathBuf>,
     },
     /// Stop the plugin, delete it and its token, and turn `[web] enabled`
-    /// off
+    /// and `[remote] enabled` off; asks before deleting remote access's
+    /// keys and paired devices
     Remove,
 }
 
@@ -669,6 +677,7 @@ fn main() -> Result<()> {
         Command::Reset { hard, yes, rescan } => reset(hard, yes, rescan),
         Command::Overlay { token } => rlord_tui::run_overlay(token),
         Command::Web { cmd } => web_cmd(cmd),
+        Command::Relay { cmd } => relay_cmd::run(cmd, call),
         Command::Overlord(OverlordCmd::Open) => {
             if tmux::inside_rlord() {
                 nav_overlord()

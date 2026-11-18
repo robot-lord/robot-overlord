@@ -16,6 +16,7 @@ pub mod plugin;
 pub mod privacy;
 pub mod private;
 pub mod process;
+pub mod qr;
 pub mod themes;
 pub mod timefmt;
 pub mod tmux;

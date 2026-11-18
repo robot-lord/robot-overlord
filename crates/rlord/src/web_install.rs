@@ -213,12 +213,51 @@ pub fn remove() -> Result<()> {
         Config::set_bool("web", "enabled", false)?;
         gone.push("[web] enabled (now false)".into());
     }
+    // Remote access needs the plugin: off with it.
+    if Config::load().is_ok_and(|c| c.remote.enabled) {
+        Config::set_bool("remote", "enabled", false)?;
+        gone.push("[remote] enabled (now false)".into());
+    }
+    // Its keys and paired devices: only the plugin could use them.
+    let remote = plugin::remote_dir();
+    if remote.exists() {
+        if remove_remote_asked(&remote)? {
+            std::fs::remove_dir_all(&remote)
+                .with_context(|| format!("removing {}", remote.display()))?;
+            gone.push(remote.display().to_string());
+        } else {
+            println!(
+                "rlord web: kept {} (remote access's keys and paired devices)",
+                remote.display()
+            );
+        }
+    }
     if gone.is_empty() {
         println!("rlord web: nothing to remove");
     } else {
         println!("rlord web: removed {}", gone.join(", "));
     }
     Ok(())
+}
+
+/// Whether to delete remote access's keys and paired devices: asked on a
+/// terminal; kept without one.
+fn remove_remote_asked(dir: &Path) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!(
+        "Also delete remote access's keys and paired devices ({})? Every device would \
+         pair again. [y/N] ",
+        dir.display()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Before `rlord web` asks the daemon: with no plugin, opt in (asked on a

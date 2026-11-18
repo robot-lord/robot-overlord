@@ -24,6 +24,7 @@ mod newform;
 mod overlay;
 mod overlord;
 mod record;
+mod relay;
 mod setupform;
 /// A session's status in words (also `rlord show`).
 pub mod statustext;
@@ -206,6 +207,8 @@ enum Mode {
     Command(Box<launcher::Launcher>),
     /// The key screen (`:keys`, or the overlord's `open_keys`).
     Keys(Box<keyscreen::KeyScreen>),
+    /// The Devices screen (`:relay`): remote access's paired devices.
+    Devices(Box<relay::Devices>),
     /// The right-click menu of a row or a group.
     Menu(Box<mouse::Menu>),
     /// "Stop web-fix?", before a click does something hard to undo.
@@ -899,6 +902,7 @@ impl App {
             }
             if pushed {
                 self.dirty = true;
+                self.refresh_devices();
             }
             if self.poll_setup() || self.poll_setup_send() || self.poll_fork() || self.poll_launch()
             {
@@ -941,6 +945,7 @@ impl App {
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
+            Mode::Devices(s) => self.handle_devices(k, s),
             Mode::Menu(m) => return self.handle_menu(k, m, terminal),
             Mode::Confirm(c) => return self.handle_confirm(k, *c, terminal),
             Mode::ConfirmQuit => {
@@ -1569,6 +1574,7 @@ impl App {
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
             Mode::Keys(ks) => self.draw_keys(f, ks),
+            Mode::Devices(s) => self.draw_devices(f, s),
             Mode::Menu(m) => self.draw_menu(f, m),
             Mode::Confirm(c) => self.draw_confirm(f, c),
             _ => {}
@@ -2506,6 +2512,7 @@ impl App {
                 l.buf
             )),
             Mode::Keys(_) => Some("keys — see the key screen".to_string()),
+            Mode::Devices(_) => Some("devices — see the Devices screen".to_string()),
             // The menu sits over the list; the footer stays as it is.
             Mode::Menu(_) | Mode::Confirm(_) => None,
         };

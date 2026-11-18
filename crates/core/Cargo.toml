@@ -30,6 +30,8 @@ libc.workspace = true
 sha2 = "0.10"
 tempfile = { version = "3", optional = true }
 memchr = "2"
+# Draws the pairing offer (qr.rs); no network code, no image support.
+qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

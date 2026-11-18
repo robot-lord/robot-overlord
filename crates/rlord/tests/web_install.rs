@@ -240,3 +240,63 @@ fn rlord_web_without_a_plugin_or_a_terminal_names_install_yes() {
         text(&o)
     );
 }
+
+/// Remote access lives in the plugin: without one, every `rlord relay`
+/// command names the install, before any daemon is started.
+#[test]
+fn rlord_relay_without_a_plugin_names_the_install() {
+    let e = Env::new();
+    for args in [
+        &["relay", "status"][..],
+        &["relay", "setup", "https://relay.example.com#k=abc"],
+        &["relay", "pair", "--text"],
+        &["relay", "confirm"],
+        &["relay", "reject"],
+        &["relay", "devices"],
+        &["relay", "revoke", "phone"],
+        &["relay", "disable"],
+    ] {
+        for hash in [Some("ab".repeat(32)), None] {
+            let o = e.rlord(hash.as_deref(), args);
+            assert!(!o.status.success(), "{args:?}: {}", text(&o));
+            assert!(
+                text(&o).contains("remote access needs the web plugin")
+                    && text(&o).contains("rlord web install"),
+                "{args:?}: {}",
+                text(&o)
+            );
+        }
+    }
+    assert!(!e.dir.path().join("run/robot-overlord/daemon.sock").exists());
+}
+
+/// `rlord web remove` turns remote access off too; its keys and devices
+/// are deleted only after a yes (kept without a terminal).
+#[test]
+fn remove_keeps_remote_keys_without_a_yes() {
+    let e = Env::new();
+    let (rel, hash) = e.release("#!/bin/sh\n");
+    let o = e.rlord(
+        Some(&hash),
+        &["web", "install", "--yes", "--from", rel.to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let remote = e.data().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(remote.join("devices.json"), "[]").unwrap();
+    std::fs::create_dir_all(e.config().parent().unwrap()).unwrap();
+    std::fs::write(
+        e.config(),
+        "[remote]\nenabled = true\nrelay = \"https://relay.example.com\"\n",
+    )
+    .unwrap();
+    let o = e.rlord(Some(&hash), &["web", "remove"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!e.installed().exists());
+    assert!(remote.join("devices.json").exists(), "{}", text(&o));
+    assert!(text(&o).contains("kept"), "{}", text(&o));
+    assert_eq!(
+        std::fs::read_to_string(e.config()).unwrap(),
+        "[remote]\nenabled = false\nrelay = \"https://relay.example.com\"\n"
+    );
+}

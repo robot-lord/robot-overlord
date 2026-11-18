@@ -348,7 +348,10 @@ async fn serve_page(
                         // (`page` is this socket's, never the browser's.)
                         let r = app
                             .daemon
-                            .call("web.call", json!({"op": op, "args": args, "page": page}))
+                            .call(
+                                "web.call",
+                                json!({"op": op, "args": args, "via": "local", "page": page}),
+                            )
                             .await;
                         let msg = match r {
                             Ok(v) => Message::Text(json!({"id": id, "ok": v}).to_string().into()),

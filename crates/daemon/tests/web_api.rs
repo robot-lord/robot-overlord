@@ -42,6 +42,8 @@ fn env() -> &'static Path {
         // (The repo finder and the code-folder suggestion look in $HOME.)
         std::env::set_var("HOME", dir.join("home"));
         std::fs::create_dir_all(dir.join("home")).unwrap();
+        // No web plugin to find (not even one built beside the tests).
+        std::env::set_var("RLORD_WEB_BIN", dir.join("no-plugin"));
         dir
     })
 }
@@ -70,9 +72,18 @@ fn add(db: &Db, id: &str, role: &str, tmux: Option<&str>) {
     .unwrap();
 }
 
+/// Tests that write config.toml (one scratch file for them all) take
+/// turns.
+static CONFIG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A daemon with an overlord and three sessions (two tagged `web`, one
 /// also `wip`), serving on a temp socket.
 fn start() -> Running {
+    start_with(|_| {})
+}
+
+/// `start`, with `more` done to the database first.
+fn start_with(more: impl FnOnce(&Db)) -> Running {
     env();
     let db = Db::open_in_memory().unwrap();
     add(&db, "overlord-1", "overlord", Some("overlord-rlord"));
@@ -83,6 +94,7 @@ fn start() -> Running {
     db.add_tag("beta", "web").unwrap();
     db.add_tag("beta", "wip").unwrap();
     db.set_group_order(&["wip".to_string()]).unwrap();
+    more(&db);
     let daemon = Daemon::new(db, Config::default());
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("d.sock");
@@ -125,8 +137,13 @@ fn ok(sock: &Path, method: &str, params: Value) -> Value {
     r["result"].clone()
 }
 
+/// A local page's request (no page id).
 fn op(sock: &Path, op: &str, args: Value) -> Value {
-    raw(sock, "web.call", json!({"op": op, "args": args}))
+    raw(
+        sock,
+        "web.call",
+        json!({"op": op, "args": args, "via": "local"}),
+    )
 }
 
 #[test]
@@ -522,7 +539,7 @@ fn op_from(sock: &Path, page: &str, op: &str, args: Value) -> Value {
     raw(
         sock,
         "web.call",
-        json!({"op": op, "args": args, "page": page}),
+        json!({"op": op, "args": args, "via": "local", "page": page}),
     )
 }
 
@@ -942,6 +959,7 @@ fn the_forms_ops_and_fixtures() {
 
     // form.setup_save: `skip` isn't the browser's (dropped, so this asks
     // for a folder); a folder is saved to config.toml (a scratch one).
+    let config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
     let e = method_error(&op(&r.sock, "form.setup_save", json!({"skip": true})));
     assert!(e.contains("code_dir"), "{e}");
     let code = env().join("home").join("code");
@@ -959,6 +977,7 @@ fn the_forms_ops_and_fixtures() {
     assert!(code.is_dir());
     let cfg = std::fs::read_to_string(saved["config"].as_str().unwrap()).unwrap();
     assert!(cfg.contains("code_dir"), "{cfg}");
+    drop(config);
 
     // The launches and the requests reach their methods (no tmux or
     // overlord here: they fail there, not at the allow-list).
@@ -1038,4 +1057,540 @@ fn the_forms_ops_and_fixtures() {
         json!({"cmd": "notice", "text": "the overlord opened a new-session form in the terminal"}),
     );
     fixture("ui_cmds", &Value::Object(cmds));
+}
+
+// ---- slice 3: remote access ----
+
+/// A paired device's request, as the plugin passes it on.
+fn op_remote(sock: &Path, device: &str, op: &str, args: Value) -> Value {
+    raw(
+        sock,
+        "web.call",
+        json!({"op": op, "args": args, "via": "remote", "device": device}),
+    )
+}
+
+fn not_allowed(got: &Value) -> String {
+    assert_eq!(got["error"]["code"], plugin::RPC_ERR_NOT_ALLOWED, "{got}");
+    got["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// Every `web.call` says who asked; a device reaches only the ops marked
+/// `remote`, with only their arguments, and never as a page.
+#[test]
+fn a_device_reaches_only_the_remote_ops() {
+    let r = start();
+    // No `via`, another one, or a device without its id: refused.
+    for params in [
+        json!({"op": "session.get", "args": {"ref": "alpha"}}),
+        json!({"op": "session.get", "args": {"ref": "alpha"}, "via": "phone"}),
+        json!({"op": "session.get", "args": {"ref": "alpha"}, "via": "remote"}),
+        json!({"op": "session.get", "args": {"ref": "alpha"}, "via": "remote", "device": ""}),
+    ] {
+        let m = not_allowed(&raw(&r.sock, "web.call", params.clone()));
+        assert!(m.contains("via"), "{params}: {m}");
+    }
+    // Each local-only op: refused from a device, before anything runs.
+    let local: Vec<&str> = rlord_daemon::web::OPS
+        .iter()
+        .filter(|o| !o.remote)
+        .map(|o| o.op)
+        .collect();
+    assert_eq!(
+        local,
+        [
+            "page.report",
+            "page.pending",
+            "keys.list",
+            "form.setup",
+            "form.setup_save",
+            "overlord.setup_request",
+            "device.list",
+            "device.pair",
+            "device.pair_cancel",
+            "device.confirm",
+            "device.reject",
+            "device.revoke",
+        ]
+    );
+    for o in &local {
+        let m = not_allowed(&op_remote(&r.sock, "ab12cd34", o, json!({})));
+        assert!(m.contains("remote device"), "{o}: {m}");
+    }
+    // Each remote op reaches its method (here, with nothing to run, many
+    // fail there: never at the allow-list).
+    for o in rlord_daemon::web::OPS.iter().filter(|o| o.remote) {
+        let got = op_remote(&r.sock, "ab12cd34", o.op, json!({}));
+        assert_ne!(
+            got["error"]["code"],
+            plugin::RPC_ERR_NOT_ALLOWED,
+            "{}: {got}",
+            o.op
+        );
+    }
+    let got = op_remote(&r.sock, "ab12cd34", "session.get", json!({"ref": "alpha"}));
+    assert_eq!(got["result"]["id"], "alpha", "{got}");
+    let got = op_remote(
+        &r.sock,
+        "ab12cd34",
+        "session.describe",
+        json!({"ref": "alpha", "description": "from the phone"}),
+    );
+    assert!(got["error"].is_null(), "{got}");
+    assert_eq!(
+        ok(&r.sock, "session.get", json!({"ref": "alpha"}))["description"],
+        "from the phone"
+    );
+    // Only its arguments: the daemon's own `interrupt` is dropped.
+    let stopped = op_remote(
+        &r.sock,
+        "ab12cd34",
+        "session.stop",
+        json!({"ref": "beta", "interrupt": "still_running"}),
+    );
+    assert_eq!(stopped["result"]["stopped"], "beta", "{stopped}");
+    assert!(stopped["result"].get("note").is_none(), "{stopped}");
+    // A device's snapshot has no relay state; a page's has.
+    let snap = op_remote(&r.sock, "ab12cd34", "snapshot", json!({}))["result"].clone();
+    assert!(
+        snap["rows"].is_array() && snap.get("relay").is_none(),
+        "{snap}"
+    );
+    let snap = op(&r.sock, "snapshot", json!({}))["result"].clone();
+    assert_eq!(snap["relay"]["devices"], 0, "{snap}");
+
+    // A device is never a page: a page id passed along is ignored, and
+    // its ops don't count as use of a screen.
+    ok(
+        &r.sock,
+        "web.pages",
+        json!({"pages": ["p1-aaaa", "p2-bbbb"]}),
+    );
+    op_from(
+        &r.sock,
+        "p1-aaaa",
+        "page.report",
+        json!({"form": "manual", "input": true}),
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    let got = raw(
+        &r.sock,
+        "web.call",
+        json!({"op": "session.pin", "args": {"ref": "gamma", "pinned": true},
+               "via": "remote", "device": "ab12cd34", "page": "p2-bbbb"}),
+    );
+    assert!(got["error"].is_null(), "{got}");
+    assert_eq!(ui_state(&r.sock)["web"]["form"], "manual");
+}
+
+/// The user's relay commands are the socket's alone: no op names them, no
+/// MCP tool reaches them, and `relay.` is a forbidden family.
+#[test]
+fn relay_commands_are_the_users_only() {
+    let r = start();
+    for m in [
+        "relay.status",
+        "relay.setup",
+        "relay.pair",
+        "relay.pair_cancel",
+        "relay.confirm",
+        "relay.reject",
+        "relay.devices",
+        "relay.revoke",
+        "relay.disable",
+    ] {
+        not_allowed(&op(&r.sock, m, json!({})));
+        not_allowed(&op_remote(&r.sock, "ab12cd34", m, json!({})));
+        let got = tool(&r.sock, m, json!({}));
+        assert!(got["error"].is_object(), "{m}: {got}");
+    }
+    // No tool's code names one (the tools reach methods through
+    // `Daemon::rpc`, which has none of them either: a unit test).
+    let mcp = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp.rs")).unwrap();
+    assert!(!mcp.contains("\"relay."), "mcp.rs names a relay.* method");
+    let tools = ok(&r.sock, "mcp.tools", json!({"overlord": true}));
+    assert!(!tools.to_string().contains("relay."), "{tools}");
+    // The socket answers them. With no plugin: what to install.
+    let st = ok(&r.sock, "relay.status", json!({}));
+    assert_eq!(
+        (&st["enabled"], &st["reported"], &st["plugin"]["installed"]),
+        (&json!(false), &json!(false), &json!(false)),
+        "{st}"
+    );
+    let e = method_error(&raw(&r.sock, "relay.confirm", json!({})));
+    assert!(e.contains("rlord web install"), "{e}");
+    let e = method_error(&raw(&r.sock, "relay.pair", json!({})));
+    assert!(e.contains("rlord relay setup"), "{e}");
+}
+
+/// A stand-in for the plugin: subscribes, answers each relay command it
+/// is sent with `answer`, and records them.
+struct FakePlugin {
+    seen: std::sync::mpsc::Receiver<Value>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl FakePlugin {
+    fn start(sock: &Path, answer: fn(&Value) -> Value) -> FakePlugin {
+        let s = UnixStream::connect(sock).unwrap();
+        let mut w = s.try_clone().unwrap();
+        writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+        let mut lines = BufReader::new(s).lines();
+        lines.next().unwrap().unwrap();
+        let (tx, seen) = std::sync::mpsc::channel();
+        let sock = sock.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let _w = w;
+            for l in lines {
+                let Ok(l) = l else { return };
+                let v: Value = serde_json::from_str(&l).unwrap();
+                if v["notify"] != "remote" {
+                    continue;
+                }
+                let mut reply = answer(&v["req"]);
+                reply["id"] = v["id"].clone();
+                let got = raw(&sock, "web.remote_reply", reply);
+                assert!(got["error"].is_null(), "{got}");
+                if tx.send(v).is_err() {
+                    return;
+                }
+            }
+        });
+        FakePlugin {
+            seen,
+            _thread: thread,
+        }
+    }
+
+    /// The next command it was sent (`{notify, id, req}`).
+    fn next(&self) -> Value {
+        self.seen.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+}
+
+/// How the stand-in answers: as the protocol says (docs/working/
+/// e2e-protocol.md, "Host and daemon").
+fn plugin_answer(req: &Value) -> Value {
+    match req["cmd"].as_str().unwrap() {
+        "setup" => json!({"ok": {"origin": "https://relay.example.com",
+                                 "fingerprint": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80"}}),
+        "pair" => json!({"ok": {"qr": "RLORD1:AQIDBAUGBwgJCgsMDQ4PEA", "expires": 1_900_000_000}}),
+        "confirm" => json!({"ok": {"device": {"id": "ab12cd34ef560789", "name": "phone"}}}),
+        "revoke" if req["device"] == "nosuch" => json!({"error": "no device nosuch"}),
+        _ => json!({"ok": {}}),
+    }
+}
+
+/// The user's commands go to the plugin on its stream and its answers
+/// come back; setup and disable write `[remote]`; the page's `device.*`
+/// ops take the same path.
+#[test]
+fn relay_commands_go_to_the_plugin_and_back() {
+    let r = start();
+    let _config = CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    let plugin = FakePlugin::start(&r.sock, plugin_answer);
+    // A TUI's stream never sees them (a setup token travels in one).
+    let events = UnixStream::connect(&r.sock).unwrap();
+    events
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut ew = events.try_clone().unwrap();
+    writeln!(
+        ew,
+        "{}",
+        json!({"id": 1, "method": "events.subscribe", "params": {"client": "tui"}})
+    )
+    .unwrap();
+    let mut event_lines = BufReader::new(events).lines();
+    event_lines.next().unwrap().unwrap();
+
+    // Setup: forwarded as asked; the answer is written to config.toml.
+    let got = ok(
+        &r.sock,
+        "relay.setup",
+        json!({"address": " https://relay.example.com#k=q83v ", "token": "t0k"}),
+    );
+    assert_eq!(got["relay"], "https://relay.example.com", "{got}");
+    let sent = plugin.next();
+    assert!(sent["id"].is_string(), "{sent}");
+    assert_eq!(
+        sent["req"],
+        json!({"cmd": "setup", "address": "https://relay.example.com#k=q83v", "token": "t0k",
+               "reset": false})
+    );
+    let cfg = Config::load().unwrap();
+    assert!(cfg.remote.enabled);
+    assert_eq!(cfg.remote.relay, "https://relay.example.com");
+    assert_eq!(
+        cfg.remote.relay_key,
+        "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80"
+    );
+    let st = ok(&r.sock, "relay.status", json!({}));
+    assert_eq!(st["enabled"], true, "{st}");
+    let e = method_error(&raw(&r.sock, "relay.setup", json!({})));
+    assert!(e.contains("address"), "{e}");
+
+    // Pair: the offer, with its modules for a page to draw.
+    let got = ok(&r.sock, "relay.pair", json!({}));
+    assert_eq!(plugin.next()["req"], json!({"cmd": "pair"}));
+    assert_eq!(got["qr"], "RLORD1:AQIDBAUGBwgJCgsMDQ4PEA");
+    assert_eq!(got["expires"], 1_900_000_000);
+    let rows = got["qr_rows"].as_array().unwrap();
+    assert!(rows.len() >= 21, "{got}");
+    assert!(rows.iter().all(|r| r.as_str().unwrap().len() == rows.len()));
+    // ... the same from the page's Devices view; never from a device.
+    let page = op(&r.sock, "device.pair", json!({}))["result"].clone();
+    assert_eq!(plugin.next()["req"], json!({"cmd": "pair"}));
+    assert_eq!(page["qr_rows"], got["qr_rows"]);
+    fixture("device_pair", &page);
+    not_allowed(&op_remote(&r.sock, "ab12cd34", "device.pair", json!({})));
+
+    // The rest, each as the protocol names it.
+    for (method, params, req) in [
+        (
+            "relay.pair_cancel",
+            json!({}),
+            json!({"cmd": "pair_cancel"}),
+        ),
+        ("relay.confirm", json!({}), json!({"cmd": "confirm"})),
+        ("relay.reject", json!({}), json!({"cmd": "reject"})),
+        (
+            "relay.revoke",
+            json!({"device": "ab12cd34"}),
+            json!({"cmd": "revoke", "device": "ab12cd34"}),
+        ),
+    ] {
+        ok(&r.sock, method, params);
+        assert_eq!(plugin.next()["req"], req, "{method}");
+    }
+    let got = ok(&r.sock, "relay.confirm", json!({}));
+    plugin.next();
+    assert_eq!(got["device"]["name"], "phone");
+    for (o, args, req) in [
+        (
+            "device.pair_cancel",
+            json!({}),
+            json!({"cmd": "pair_cancel"}),
+        ),
+        ("device.confirm", json!({}), json!({"cmd": "confirm"})),
+        ("device.reject", json!({}), json!({"cmd": "reject"})),
+        (
+            "device.revoke",
+            json!({"device": "ab12cd34", "id": "other"}),
+            json!({"cmd": "revoke", "device": "ab12cd34"}),
+        ),
+    ] {
+        let got = op(&r.sock, o, args);
+        assert!(got["error"].is_null(), "{o}: {got}");
+        assert_eq!(plugin.next()["req"], req, "{o}");
+    }
+    // The plugin's error is the command's.
+    let e = method_error(&raw(&r.sock, "relay.revoke", json!({"device": "nosuch"})));
+    assert!(e.contains("no device nosuch"), "{e}");
+    plugin.next();
+    let e = method_error(&raw(&r.sock, "relay.revoke", json!({})));
+    assert!(e.contains("device id"), "{e}");
+    // A late or unknown answer is refused.
+    let got = raw(&r.sock, "web.remote_reply", json!({"id": "r999", "ok": {}}));
+    assert!(got["error"].is_object(), "{got}");
+
+    // Disable: the plugin closes its connection; enabled = false.
+    ok(&r.sock, "relay.disable", json!({}));
+    assert_eq!(plugin.next()["req"], json!({"cmd": "disable"}));
+    assert!(!Config::load().unwrap().remote.enabled);
+    let e = method_error(&raw(&r.sock, "relay.pair", json!({})));
+    assert!(e.contains("off"), "{e}");
+
+    for l in event_lines.by_ref() {
+        let Ok(l) = l else { break };
+        assert!(!l.contains("remote"), "a TUI got a relay command: {l}");
+    }
+}
+
+/// The plugin's mirror: kept, answered from, a change of `rev`, and a
+/// notice on every surface when a device starts waiting for the user.
+#[test]
+fn the_mirror_and_the_confirmation_notice() {
+    let r = start();
+    let mut stream = WebStream::open(&r.sock);
+    ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    // A TUI too: the terminal's surface.
+    let tui = UnixStream::connect(&r.sock).unwrap();
+    tui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tw = tui.try_clone().unwrap();
+    writeln!(
+        tw,
+        "{}",
+        json!({"id": 1, "method": "events.subscribe", "params": {"client": "tui"}})
+    )
+    .unwrap();
+    let mut tui_lines = BufReader::new(tui).lines();
+    tui_lines.next().unwrap().unwrap();
+    let state = |pending: Value| {
+        json!({
+            "relay": "https://relay.example.com", "connected": true, "error": null,
+            "devices": [{"id": "ab12cd34ef560789", "name": "phone", "paired_at": 1_800_000_000,
+                         "last_seen": 1_800_000_100, "linked": true}],
+            "pairing": {"expires": 1_800_000_300},
+            "pending": pending,
+        })
+    };
+    let rev = r.daemon.rev();
+    ok(
+        &r.sock,
+        "web.remote_state",
+        state(json!({"name": "tablet", "code": "123456", "expires": 1_800_000_120})),
+    );
+    assert_ne!(r.daemon.rev(), rev);
+    let n = stream.next_ui();
+    assert_eq!(n["page"], "p1-aaaa");
+    assert_eq!(n["cmd"]["cmd"], "notice");
+    let text = n["cmd"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("tablet") && text.contains("123456") && text.contains("Devices"),
+        "{text}"
+    );
+    // The terminal's own words, on its status line.
+    let n = loop {
+        let v: Value = serde_json::from_str(&tui_lines.next().unwrap().unwrap()).unwrap();
+        if v["notify"] == "ui" {
+            break v;
+        }
+    };
+    assert_eq!(
+        (&n["to"], &n["cmd"]["cmd"]),
+        (&json!("terminal"), &json!("notice"))
+    );
+    let text = n["cmd"]["text"].as_str().unwrap();
+    assert!(text.contains("tablet") && text.contains(":relay"), "{text}");
+    // The same state again: no second notice; another device: its own.
+    ok(
+        &r.sock,
+        "web.remote_state",
+        state(json!({"name": "tablet", "code": "123456", "expires": 1_800_000_120})),
+    );
+    ok(
+        &r.sock,
+        "web.remote_state",
+        state(json!({"name": "laptop", "code": "654321", "expires": 1_800_000_200})),
+    );
+    let n = stream.next_ui();
+    assert!(n["cmd"]["text"].as_str().unwrap().contains("laptop"), "{n}");
+    // Answered from the mirror.
+    let st = ok(&r.sock, "relay.status", json!({}));
+    assert_eq!(st["reported"], true, "{st}");
+    assert_eq!(st["connected"], true);
+    assert_eq!(st["devices"][0]["name"], "phone");
+    assert_eq!(st["pending"]["code"], "654321");
+    let devices = ok(&r.sock, "relay.devices", json!({}));
+    assert_eq!(devices["devices"][0]["id"], "ab12cd34ef560789");
+    let snap = op(&r.sock, "snapshot", json!({}))["result"].clone();
+    assert_eq!(
+        snap["relay"],
+        json!({"enabled": false, "connected": true, "devices": 1,
+               "pending": {"name": "laptop", "code": "654321", "expires": 1_800_000_200}})
+    );
+    let list = op(&r.sock, "device.list", json!({}))["result"].clone();
+    assert_eq!(list["devices"], st["devices"]);
+    fixture("device_list", &list);
+    // Not an object: refused.
+    let bad = raw(&r.sock, "web.remote_state", json!(["x"]));
+    assert!(bad["error"].is_object(), "{bad}");
+
+    // The plugin goes: so does what it said.
+    drop(stream);
+    let start = Instant::now();
+    loop {
+        ok(
+            &r.sock,
+            "session.describe",
+            json!({"ref": "alpha", "description": "x"}),
+        );
+        if ok(&r.sock, "relay.status", json!({}))["reported"] == false {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "mirror kept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A Claude Code transcript line.
+fn claude_line(kind: &str, text: &str) -> String {
+    let content = if kind == "user" {
+        json!(text)
+    } else {
+        json!([{"type": "text", "text": text}])
+    };
+    json!({"type": kind, "timestamp": "2026-11-17T10:00:00.000Z",
+           "message": {"role": kind, "content": content}})
+    .to_string()
+}
+
+/// The overlord's conversation as text: from its transcript, at most 50
+/// messages a call, each at most 4 KiB, paged back by `before`.
+#[test]
+fn overlord_messages_are_bounded() {
+    let dir = env().join("messages");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("0b1d7a52-0000-4000-8000-000000000001.jsonl");
+    let mut lines = Vec::new();
+    for i in 0..60 {
+        lines.push(claude_line("user", &format!("ask {i}")));
+        // Long, in three-byte characters: past 4 KiB until clipped.
+        let reply = if i % 10 == 0 {
+            "€".repeat(3000)
+        } else {
+            format!("answer {i}")
+        };
+        lines.push(claude_line("assistant", &reply));
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let p = path.to_str().unwrap().to_string();
+    let r = start_with(|db| db.upsert_transcript_source("overlord-1", &p).unwrap());
+
+    let got = op(&r.sock, "overlord.messages", json!({}))["result"].clone();
+    assert_eq!(got["overlord"]["id"], "overlord-1", "{got}");
+    let msgs = got["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 50);
+    assert_eq!(got["more"], true);
+    assert_eq!(msgs.last().unwrap()["text"], "answer 59");
+    assert_eq!(msgs.last().unwrap()["who"], "agent");
+    assert!(msgs
+        .iter()
+        .all(|m| m["text"].as_str().unwrap().len() <= 4096));
+    assert!(msgs
+        .iter()
+        .any(|m| m["text"].as_str().unwrap().starts_with('€')));
+    // Paged back from the oldest shown.
+    let first = msgs[0]["line"].as_u64().unwrap();
+    let back = op(
+        &r.sock,
+        "overlord.messages",
+        json!({"before": first, "limit": 5}),
+    )["result"]
+        .clone();
+    let back = back["messages"].as_array().unwrap().clone();
+    assert_eq!(back.len(), 5);
+    assert!(back.iter().all(|m| m["line"].as_u64().unwrap() < first));
+    // A big limit is 50; from a device too.
+    let big = op_remote(
+        &r.sock,
+        "ab12cd34",
+        "overlord.messages",
+        json!({"limit": 500}),
+    )["result"]
+        .clone();
+    assert_eq!(big["messages"].as_array().unwrap().len(), 50);
+    // The start: nothing earlier.
+    let all = op(&r.sock, "overlord.messages", json!({"before": 3}))["result"].clone();
+    assert_eq!(all["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(all["more"], false);
+    // A look-up: no change.
+    let rev = r.daemon.rev();
+    op(&r.sock, "overlord.messages", json!({}));
+    assert_eq!(r.daemon.rev(), rev);
+    // No transcript: no messages.
+    let none = start();
+    let got = op(&none.sock, "overlord.messages", json!({}))["result"].clone();
+    assert_eq!(got["messages"], json!([]), "{got}");
 }

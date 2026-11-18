@@ -13,7 +13,7 @@ use crate::paths;
 
 /// Bumped whenever a `web.*` daemon method the plugin uses changes shape.
 /// The plugin's `web.hello` carries it; the daemon refuses another one.
-pub const WEB_PROTOCOL: u32 = 2;
+pub const WEB_PROTOCOL: u32 = 3;
 
 /// The plugin's executable name.
 pub const BIN_NAME: &str = "rlord-web";
