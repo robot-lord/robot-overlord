@@ -913,6 +913,88 @@ Decided 2026-11-17 (user):
     failures (wrong kind both ways, mailbox as live and live as mailbox,
     tampered message 1 and 2, a frame after poisoning, oversized frame,
     mailbox gap, replay, tamper, export after poison, bad stream flags).
+  - Added to the core while building: a **mailbox id** (8 bytes from the
+    keying handshake's hash, part of the export, 89 bytes now), sent in
+    clear before each lane-2 frame, so a frame queued under a replaced
+    mailbox is dropped by id instead of poisoning the new one.
+  - Step 4 done: `crates/e2e-wasm` (the spike's wrapper without the
+    benchmark-only calls, plus `E2eMailbox`, mailbox handshakes,
+    `fragment`, `Reassembler`, `device_id`, `run_vectors`); `cargo xtask
+    e2e wasm|test-wasm` (O3, `+simd128`, bindgen in process into
+    `crates/e2e-wasm/pkg/`, 562 KB raw with the vector runner); a
+    separate Vitest project (`vitest.e2e.config.ts`, `test/e2e/`,
+    excluded from `web check` and from `tsc`, since the page has no Node
+    types): the vectors byte for byte, fragmenting, and an interop run.
+    `rust-toolchain.toml` gains `wasm32-unknown-unknown`; CI's `web` job
+    runs `cargo xtask e2e test-wasm`. Deviation: the interop run is the
+    WASM core as a device against the native core as host over stdio
+    (`rlord-device interop-host`), not through the relay: a WASM host
+    would need the relay link's P-256 signing in JS, which no WASM build
+    has yet. The relay path is covered natively (below).
+  - Step 5 done: `crates/relay-proto` (`msg`, `frame`, `auth`,
+    `address`, `check_challenge`). Transcript fields are length-prefixed
+    (the plan wrote plain concatenation). Binary frames put the lane
+    first (the plan put the address first) so a frame parses without
+    knowing its lane. p256 0.14 needs getrandom 0.4's `wasm_js` on wasm32
+    (a target-only dependency). `docs/working/e2e-protocol.md` written as
+    the shared spec (to be reviewed, then promoted).
+  - Steps 6, 7 and the relay half of 17: built in parallel by another
+    Opus agent on `feat/web-ui-3-relay`, merged here (see its entry
+    below).
+  - Step 8 done: `check-deps` gains the longer `rlord` deny list, the
+    relay tree check, the e2e sans-IO check, the plugin-listener source
+    check and the bind-to-every-interface source check, each with a
+    planted-name test.
+  - Step 9, 14, 15, 16: built in parallel by another Opus agent on
+    `feat/web-ui-3-daemon`, merged here. As built: `web::Op.remote`
+    (`op()`/`local()`), `via` required, `relay.*` dispatched from the
+    socket only (never `Daemon::rpc`, so never MCP or `web.call`),
+    `WEB_PROTOCOL` 3, `overlord.messages`, the `device.*` ops, the
+    mirror with `notice_all`, `rlord_core::qr` (`qrcode` 0.14.1, no
+    default features), `rlord relay …`, `:relay` (TUI Devices screen),
+    the page's Devices modal. Its deviations: the page's Devices is a
+    modal (form kind `devices`), not a route (`page.report` only takes
+    route kinds); `snapshot.relay.devices` is a count; every forwarded
+    command starts the plugin if needed (not only setup);
+    `relay.pair` checks setup first; `setup --reset --yes`; `revoke`
+    takes an id, id prefix or name; `rlord web remove` also turns
+    `[remote] enabled` off; a fresh QR survives a state report up to 3 s
+    older than it. The overlord: nothing new (it can see
+    `web.form = "devices"` in `get_ui_state` while the modal is open,
+    and no device data), so `overlord.md` and `mcp.rs` are unchanged.
+  - Steps 10 to 12 done (`crates/web/src/remote/`): one actor task owns
+    keys, devices, the relay connection, links, sessions and the
+    pairing; daemon calls run in their own tasks and come back to it.
+    `keys.rs`, `link.rs` (TLS with ring and webpki roots plus `ca_file`;
+    no redirects, no extensions; close codes mapped to final or retry),
+    `pairing.rs`, `devices.rs`, `session.rs` (20 ops/s, burst 40),
+    `mailbox.rs`, `audit.rs`. Off unless enabled, pinned, and a device
+    or a pairing exists; "wrong relay" and final close codes stop it
+    until a command or restart; `bye`'s `retry_after` honoured with up to
+    20% jitter. Deviation found by the crash tests: the mailbox's state,
+    request ids and the last handled `(boot, seq)` are one atomic file
+    (`mailbox-<id>.json`), saved before acting and acknowledging;
+    otherwise a crash between saving and acknowledging made the
+    redelivered frame fail to decrypt and discard the mailbox.
+  - Step 13 done: `crates/e2e-device` (lib `rlord_e2e_device`, bin
+    `rlord-device`: pair, check, snapshot, ask, interop-host) with hostile
+    relays in `testing.rs` (a relay claiming the pinned key, a faithful
+    forwarder under its own identity, a redirect). Tests:
+    `e2e-device/tests/pin.rs` (claimed key, other key, other origin,
+    redirect: nothing sent after the failed check, no other address
+    tried) and `web/tests/remote.rs` against the real plugin, daemon and
+    relay: pair and confirm, the cheap check, snapshot, `changed`,
+    `overlord.ask` reaching the daemon, the local-only ops refused, a
+    signal waking a device, a snapshot of several frames, a mailbox
+    request answered after the plugin returns, `repeat`, ops refused by
+    mailbox, revocation (link closed, 4403 after), reject, a spent QR,
+    three wrong secrets closing the rendezvous, a forwarder failing on
+    both ends, replayed and tampered frames, no dialling without setup
+    or after `disable` across a restart, and both mailbox crash points
+    (`RLORD_WEB_TEST_CRASH`, debug builds only).
+  - Step 18 (docs): `docs/architecture.md` "Remote access (through a
+    relay)", `docs/guide.md` "Remote access through a relay",
+    `SECURITY.md`, `CLAUDE.md`'s rules, `docs/relay.md` (the relay agent).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
