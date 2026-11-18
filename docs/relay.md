@@ -75,6 +75,10 @@ the internal network.
 5. `docker compose exec relay /rlord-relay address` prints the relay
    address to paste into `rlord relay setup`.
 
+The image's own command listens wherever `relay.toml` says; the compose
+file passes `--listen 0.0.0.0:8080` so Caddy can reach it. A new image
+package on ghcr.io starts private: make it public once.
+
 The image is `ghcr.io/robot-lord/rlord-relay:<version>` (and `:latest`
 for the newest stable release), for linux/amd64 and linux/arm64. It holds
 only the static binary and runs as a non-root user. The data directory
@@ -109,7 +113,7 @@ attestation verify`), then:
   a private CA if each host sets `[remote] ca_file`.
 - **Files mode** (`[tls] mode = "files"`): the relay terminates TLS
   (TLS 1.3 and 1.2). It re-reads `cert` and `key` on SIGHUP (`systemctl
-  reload rlord-relay`) and every 12 hours, so a renewal needs no restart.
+  reload rlord-relay`; in proxy mode SIGHUP does nothing) and every 12 hours, so a renewal needs no restart.
   A broken file keeps the old certificate in use and logs a warning.
 - **Proxy mode** (`[tls] mode = "proxy"`): plain HTTP for a reverse proxy
   that terminates TLS. It listens on `127.0.0.1:8080` unless `listen` says

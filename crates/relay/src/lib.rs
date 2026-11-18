@@ -262,17 +262,24 @@ pub async fn start(cfg: Config) -> Result<Running> {
                 }
             }
         }));
-        if cfg.reload_on_sighup {
-            let f = files.clone();
-            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-            tasks.push(tokio::spawn(async move {
-                while hup.recv().await.is_some() {
-                    if let Err(e) = f.reload() {
-                        tracing::warn!("certificate reload: {e:#}");
+    }
+    // SIGHUP re-reads the certificate files; in proxy mode it is ignored
+    // (its default action would stop the relay on `systemctl reload`).
+    if cfg.reload_on_sighup {
+        let f = tls.clone();
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        tasks.push(tokio::spawn(async move {
+            while hup.recv().await.is_some() {
+                match &f {
+                    Some(f) => {
+                        if let Err(e) = f.reload() {
+                            tracing::warn!("certificate reload: {e:#}");
+                        }
                     }
+                    None => tracing::info!("SIGHUP: nothing to reload in proxy mode"),
                 }
-            }));
-        }
+            }
+        }));
     }
     tracing::info!(%addr, origin = %address.origin, "relay listening");
     Ok(Running {
