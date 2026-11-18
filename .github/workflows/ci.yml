@@ -61,6 +61,9 @@ jobs:
       - run: cargo xtask web install
       # Types (tsc), lint (oxlint, type-aware), format (biome), unit tests (vitest).
       - run: cargo xtask web check
+      # The end-to-end crypto core built to WASM (crates/e2e-wasm), and
+      # its vectors run in Node: byte for byte the native core's.
+      - run: cargo xtask e2e test-wasm
       - run: cargo xtask web build
       - run: cargo test -p robot-overlord-web
         env:
