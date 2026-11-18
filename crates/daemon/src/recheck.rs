@@ -226,6 +226,10 @@ fn check(
     let db = d.db();
     // (The one stop path for a gone pane: `discover`'s.)
     if to == Status::Stopped {
+        // (The same compare-and-set as any fix, under this lock.)
+        if !unchanged(&db, s)? {
+            return Ok(false);
+        }
         return crate::discover::stop_from_pane(&db, s);
     }
     // A turn found ended: its final reply is the last message.
@@ -244,6 +248,20 @@ fn check(
     Ok(done)
 }
 
+/// Whether session `s` is still as it was read: its status, when that
+/// last changed, and its message times. (A hook that kept the status but
+/// moved a message, e.g. a prompt while working, is news too: the
+/// evidence is stale.) Asked under the same DB lock as the write.
+fn unchanged(db: &Db, s: &Session) -> Result<bool> {
+    Ok(db.resolve_ref(&s.id).is_ok_and(|cur| {
+        cur.status == s.status
+            && cur.last_state_change_at == s.last_state_change_at
+            && cur.last_user_msg_at == s.last_user_msg_at
+            && cur.last_agent_msg_at == s.last_agent_msg_at
+            && cur.last_rlord_msg_at == s.last_rlord_msg_at
+    }))
+}
+
 /// Write the corrected status, only if the session is still as judged:
 /// its status and its message times (an event may have moved them
 /// meanwhile). Returns whether it
@@ -258,18 +276,8 @@ fn apply(
     now: i64,
     ended_at: Option<i64>,
 ) -> Result<bool> {
-    // (A hook that kept the status but moved a message, e.g. a prompt
-    // while working, is news too: the evidence is stale.)
-    let same = |cur: &Session| {
-        cur.status == s.status
-            && cur.last_state_change_at == s.last_state_change_at
-            && cur.last_user_msg_at == s.last_user_msg_at
-            && cur.last_agent_msg_at == s.last_agent_msg_at
-            && cur.last_rlord_msg_at == s.last_rlord_msg_at
-    };
-    match db.resolve_ref(&s.id) {
-        Ok(cur) if same(&cur) => {}
-        _ => return Ok(false),
+    if !unchanged(db, s)? {
+        return Ok(false);
     }
     db.set_status(&s.id, to, now)?;
     // (Never moved back: a later message already recorded stands.)
@@ -742,6 +750,27 @@ mod tests {
         db.touch_last_user_msg("s", 7).unwrap();
         assert!(!apply(&db, &seen, Status::Idle, "turn_ended", 8, None).unwrap());
         assert_eq!(db.resolve_ref("s").unwrap().status, Status::Working);
+    }
+
+    /// The pane-stop path has the same compare-and-set: a message moved
+    /// since the session was read, and nothing is stopped.
+    #[test]
+    fn a_pane_stop_checks_what_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        add(&d.db(), dir.path(), "s", "claude", Status::Idle, 5, "");
+        let seen = d.db().resolve_ref("s").unwrap();
+        let dead: HashMap<String, bool> = [("s".to_string(), true)].into();
+        let mut gone = HashMap::new();
+        assert!(!check(&d, &seen, Some(&dead), &mut gone, 10).unwrap());
+        // A prompt arrives (the status stays) before the second look.
+        d.db().touch_last_user_msg("s", 11).unwrap();
+        assert!(!check(&d, &seen, Some(&dead), &mut gone, 12).unwrap());
+        assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Idle);
+        // Read again: stopped.
+        let fresh = d.db().resolve_ref("s").unwrap();
+        assert!(check(&d, &fresh, Some(&dead), &mut gone, 13).unwrap());
+        assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Stopped);
     }
 
     #[test]

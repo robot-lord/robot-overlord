@@ -431,8 +431,9 @@ trusted hooks) against what is there to see:
 
 - **Agent pane gone** on two answered looks in a row: `stopped`, through
   `discover`'s stop (`session_end` from the pane). One `list-panes -a` a
-  pass looks at each session's pinned agent pane (`@rlord_pane`; a pin
-  whose pane is gone is dead; no pin: the first pane): its program
+  pass looks at each session's pinned agent pane (`@rlord_pane`, set
+  again to the pane every respawn uses; a pin whose pane is gone
+  everywhere is dead; no pin: the first pane): its program
   exited, or the session isn't listed. When no server answers at the
   socket, every session is gone only if the server process seen before
   (`#{pid}`) has exited: a deleted socket file with the server alive
@@ -459,8 +460,10 @@ ended) is left for the user to clear: a new prompt in that session, or
 restarting it (`rlord restart <session>`).
 
 Reading the tail, lines the user's own commands wrote say nothing about
-the turn: `!` shell commands, a built-in slash command followed by its
-local output (or error output), a compaction's summary, meta lines. A
+the turn (an allow-list): `!` shell commands, a built-in slash command
+followed by its local output (or error output), a compaction's summary.
+Any other meta line (a message from another session or a coordinator)
+may start a turn. A
 custom command or skill with no output after it is the model's turn, and
 a Stop hook's feedback reopens one. Sessions `discover` or `opencode.rs`
 follow are theirs. One session's failure doesn't stop the pass. A fix is

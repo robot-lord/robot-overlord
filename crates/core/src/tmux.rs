@@ -499,6 +499,16 @@ pub fn new_plain_session(name: &str, cwd: &str, cmd: &str) -> Result<()> {
 pub fn respawn_pane(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     let (_, pane_id) = window_pane_ids(name)?;
     run(&["respawn-pane", "-k", "-c", cwd, "-t", &pane_id, pane_cmd])?;
+    // The agent runs in this pane now: pinned to it. (When the pinned pane
+    // was gone, `window_pane_ids` fell back to the first one; a pin left
+    // naming the gone pane would read the live agent as dead.)
+    run(&[
+        "set-option",
+        "-t",
+        &format!("{}:", exact(name)),
+        AGENT_PANE,
+        &pane_id,
+    ])?;
     Ok(())
 }
 
@@ -1725,6 +1735,21 @@ mod tests {
         let (w, p) = window_pane_ids(name).unwrap();
         assert!(w.starts_with('@') && p.starts_with('%'));
         respawn_pane(name, "/tmp", "sleep 30").unwrap();
+        // A pin naming a pane that is gone: the respawn re-pins to the pane
+        // it used, so the agent reads alive (not stopped again).
+        run(&[
+            "set-option",
+            "-t",
+            &format!("={name}:"),
+            AGENT_PANE,
+            "%9999",
+        ])
+        .unwrap();
+        respawn_pane(name, "/tmp", "sleep 30").unwrap();
+        let pin = run(&["show-options", "-v", "-t", &format!("={name}:"), AGENT_PANE]).unwrap();
+        assert_eq!(pin, window_pane_ids(name).unwrap().1);
+        let panes = agent_panes().unwrap().unwrap();
+        assert_eq!(panes.dead.get(name), Some(&false));
 
         // Key hints: a slim bar of rlord's own without a profile...
         let opt = |o: &str| run(&["show-options", "-v", "-t", &format!("={name}:"), o]).unwrap();

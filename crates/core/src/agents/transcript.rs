@@ -1096,6 +1096,17 @@ mod tests {
             summary,
         ]);
         assert_eq!(cmd.turn, Some(TurnTail::Ended));
+        // A meta line that isn't known local output may start a turn: a
+        // message from another session, a coordinator's: open.
+        for text in [
+            "Another Claude session sent a message: check the tests",
+            "The coordinator sent a message while you were working: fix it",
+        ] {
+            let mut meta = user("2026-11-12T10:00:06Z", text);
+            meta["isMeta"] = json!(true);
+            let r = t(&[reply("2026-11-12T10:00:05Z", "end_turn"), meta]);
+            assert_eq!(r.turn, Some(TurnTail::Open), "{text}");
+        }
         // A Stop hook's feedback (a meta line) sends the agent on: open.
         let mut feedback = user("2026-11-12T10:00:06Z", "Stop hook feedback:\nrun the tests");
         feedback["isMeta"] = json!(true);
