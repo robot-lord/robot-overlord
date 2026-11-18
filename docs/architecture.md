@@ -278,8 +278,8 @@ facts live in its module) is what the rest of rlord asks:
   `first_prompt` event. Whatever rlord types into the session waits
   until the first prompt has gone, and 15s after it is sent or typed.
   A pointer-only first prompt (no words of the user's) stays on argv. Claude reads the file on stdin
-  (`exec … < prompt.md`) once live check V1 passes
-  (`first_prompt::CLAUDE_STDIN`); until then its prompt stays on argv.
+  (`exec … < prompt.md`; `first_prompt::CLAUDE_STDIN`, on since live
+  check V1 passed on Claude Code 2.1.327, plain and forked).
   Fixed text with no user words (`context::pointer_only`) stays on argv.
 - **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
   agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same

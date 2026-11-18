@@ -643,7 +643,11 @@ Still owed:
   `context::check`).
 - The demo OpenCode stand-in embeds Python (shell-is-glue rule).
 
-## PR 3 progress (1.4.0)
+## PR 3 progress
+
+- [x] V1 passed (2026-11-17, Claude Code 2.1.327): `exec claude < prompt.md`
+  ran the prompt and kept the terminal for typed input; `--resume …
+  --fork-session` with stdin also worked. `CLAUDE_STDIN = true` (1.10.0). (1.4.0)
 
 - [x] `daemon/src/first_prompt.rs`: `Way { Argv, Stdin, Server, Pointer }`
   per agent; `place` writes the first prompt (user's words, with the

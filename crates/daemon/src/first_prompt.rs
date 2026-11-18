@@ -6,10 +6,10 @@
 //! go into the session's own 0600 file (`<data>/sessions/<id>/prompt.md`)
 //! and reach the agent another way (`Way`, the user's choice per agent):
 //!
-//! - **Claude Code**: the file on the agent's stdin (`Way::Stdin`), once
-//!   live check V1 has shown that an interactive `claude` takes piped
-//!   stdin as its first prompt and keeps its terminal. Until then
-//!   (`CLAUDE_STDIN` false) its prompt stays on argv (`Way::Argv`).
+//! - **Claude Code**: the file on the agent's stdin (`Way::Stdin`). Live
+//!   check V1 (Claude Code 2.1.327, plain and `--resume … --fork-session`)
+//!   showed an interactive `claude` takes piped stdin as its first prompt
+//!   and keeps its terminal. `CLAUDE_STDIN` false puts it back on argv.
 //! - **Codex**: argv carries only a fixed line pointing at the file
 //!   (`Way::Pointer`); Codex reads it as its first step. That line is also
 //!   what its conversation is bound by (`bind_prompt`).
@@ -30,9 +30,9 @@ use serde_json::json;
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
 
-/// Whether Claude takes its first prompt on stdin. Off until live check V1
-/// passes (owed: `docs/working/session-context.md`).
-pub const CLAUDE_STDIN: bool = false;
+/// Whether Claude takes its first prompt on stdin. On since live check V1 passed
+/// (Claude Code 2.1.327, plain and forked).
+pub const CLAUDE_STDIN: bool = true;
 
 /// How an agent's first prompt reaches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
