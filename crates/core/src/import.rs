@@ -743,10 +743,23 @@ fn index_reject(i: &IndexRow) -> Option<String> {
     if let Some(s) = i.source.as_deref().filter(|s| is_headless_source(s)) {
         return Some(format!("a headless run (source {s}), not a conversation"));
     }
-    i.thread_source
-        .as_deref()
-        .filter(|t| *t != "user")
-        .map(|_| "a sub-agent's thread, not the user's conversation".to_string())
+    let sub = i.thread_source.as_deref().is_some_and(|t| t != "user")
+        || i.source.as_deref().is_some_and(is_subagent_source);
+    sub.then(|| "a sub-agent's thread, not the user's conversation".to_string())
+}
+
+/// A sub-agent's source: `subagent`, or (the index keeps an object source
+/// as JSON text) an object with a `subagent` key.
+fn is_subagent_source(s: &str) -> bool {
+    s == "subagent" || serde_json::from_str::<Value>(s).is_ok_and(|v| v.get("subagent").is_some())
+}
+
+/// A Codex app-server (its background server, or one the Codex app runs)
+/// is running: it may hold any thread an app-server client started.
+fn codex_server_running(procs: &str) -> bool {
+    procs
+        .lines()
+        .any(|l| l.contains("codex") && l.contains("app-server"))
 }
 
 fn codex_candidate(
@@ -779,7 +792,8 @@ fn codex_candidate(
     let sub = indexed
         .and_then(|i| i.thread_source.as_deref())
         .is_some_and(|t| t != "user")
-        || source.as_deref() == Some("subagent");
+        || source.as_deref().is_some_and(is_subagent_source)
+        || meta.str("source").is_some_and(|s| is_subagent_source(&s));
     if sub {
         return Err("a sub-agent's thread, not the user's conversation".into());
     }
@@ -864,7 +878,8 @@ fn codex_candidate(
         // editor, the Codex app, or Codex's background server) and written
         // lately may still be held there; resuming it in the pane
         // (`--no-daemon`) would run it twice.
-        maybe_held_by_codex_server: recently_written && source.as_deref() == Some("vscode"),
+        maybe_held_by_codex_server: source.as_deref() == Some("vscode")
+            && (recently_written || codex_server_running(procs)),
         recently_written,
     })
 }
@@ -1540,6 +1555,42 @@ mod tests {
         // Just written: may be held by the app.
         assert!(found[0].maybe_held_by_codex_server && !found[0].open_elsewhere);
         assert!(has_codex_conversations_in(home.path(), 0, &|_| false, &[]));
+    }
+
+    #[test]
+    fn sub_agent_sources_and_running_servers() {
+        assert!(is_subagent_source("subagent"));
+        assert!(is_subagent_source(r#"{"subagent":{"other":"x"}}"#));
+        assert!(!is_subagent_source("cli") && !is_subagent_source(r#"{"x":1}"#));
+        let row = IndexRow {
+            source: Some(r#"{"subagent":"review"}"#.into()),
+            ..Default::default()
+        };
+        assert!(index_reject(&row).is_some_and(|w| w.contains("sub-agent")));
+        assert!(codex_server_running("/opt/bin/codex app-server --listen x"));
+        assert!(!codex_server_running("codex resume abc"));
+
+        // An old app-server thread is flagged while a server runs.
+        let home = tempfile::tempdir().unwrap();
+        let p = rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "cwd": "/src/app", "source": "vscode"}),
+            &codex_turn("/src/app", "hello there", "hi"),
+        );
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let scan = |procs: &str| {
+            scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, procs, &[])[0]
+                .maybe_held_by_codex_server
+        };
+        assert!(!scan(""));
+        assert!(scan("codex app-server"));
     }
 
     #[test]

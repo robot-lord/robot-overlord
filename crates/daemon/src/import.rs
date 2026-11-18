@@ -107,7 +107,8 @@ pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
     };
     let mut c = scan_all(&opts, &|_| false)
         .into_iter()
-        .find(|c| agent.is_none_or(|a| a.name() == c.agent))
+        // An `agent` hint that doesn't match is ignored: the id decides.
+        .next()
         .ok_or_else(|| {
             let why = explain(&sid, &|_| false);
             anyhow::anyhow!("can't import conversation {sid}: {why}")

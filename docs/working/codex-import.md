@@ -94,3 +94,16 @@ per-agent results (`Why`).
 
 Still owed: per-id lookup instead of full scans for import/explain; dedupe
 Codex helpers with `agents::codex`; drop unused `scan_claude`/`scan_codex`.
+
+## Review round 3 (PR #78)
+
+Fixed: the app-server flag is also set while a `codex app-server` process
+runs (any age); the sub-agent check reads an index `source` stored as JSON
+object text, and the rollout meta; a mismatched `agent` hint on
+`session.import` is ignored (the id decides).
+
+Owed: query filter before `add_git_info`; cwd fallback when the tail has
+no `turn_context` (a long last turn); per-id lookup; helper dedupe with
+`agents::codex`; reject rules kept in three places (index, meta,
+candidate) merged into one; the offer's Codex check stats every rollout
+before sorting; `add_git_info`'s Codex-only branch special case.
