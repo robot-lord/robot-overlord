@@ -190,6 +190,8 @@ enum Mode {
     Fork(Box<forkform::ForkForm>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
+    /// The active overlord is out of usage: switch to another agent's?
+    LimitSwitch(Box<overlord::LimitSwitch>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -420,7 +422,20 @@ impl App {
     /// `:overlord <agent>`): started, or created the first time. The one
     /// it replaces keeps running with its conversation.
     pub(crate) fn switch_overlord(&mut self, agent: &str) {
-        if let Some(v) = self.call("overlord.switch", json!({"agent": agent})) {
+        if let Err(e) = self.try_switch_overlord(agent) {
+            self.status_line = format!("error: {e:#}");
+        }
+    }
+
+    /// `switch_overlord`, handing a failure back (the limit offer keeps
+    /// its dialog open on one).
+    pub(crate) fn try_switch_overlord(&mut self, agent: &str) -> Result<()> {
+        {
+            let v = client_call(
+                &paths::socket_path(),
+                "overlord.switch",
+                json!({"agent": agent}),
+            )?;
             let label = rlord_core::agents::Agent::parse(agent).map_or(agent, |a| a.label());
             self.status_line = match (v["switched"] == true, v["created"] == true) {
                 (false, _) => format!("the overlord is already on {label}"),
@@ -431,6 +446,7 @@ impl App {
             };
             self.dirty = true;
         }
+        Ok(())
     }
 
     /// Schedule the selected session to carry on once its usage limit
@@ -545,6 +561,8 @@ impl App {
                     .call("overlord.get", json!({}))
                     .filter(|o| !o.is_null())
                 {
+                    // Out of usage: offer another agent's (once a limit).
+                    self.offer_limit_switch(&o);
                     self.sessions.insert(0, o);
                     self.overlord_rows = 1;
                 }
@@ -930,6 +948,7 @@ impl App {
             Mode::Fork(f) => self.handle_fork_form(k, f),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+            Mode::LimitSwitch(l) => self.handle_limit_switch(k, l),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
@@ -1557,6 +1576,7 @@ impl App {
             Mode::Fork(s) => self.draw_fork_form(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
+            Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
@@ -2487,7 +2507,10 @@ impl App {
             Mode::ConfirmQuit => {
                 Some("quit rlord?  y / enter: quit · any other key: stay".to_string())
             }
-            Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
+            Mode::OverlordSetup(_)
+            | Mode::OverlordUpgrade(_)
+            | Mode::RemoteOffer(_)
+            | Mode::LimitSwitch(_) => {
                 Some("overlord — see dialog".to_string())
             }
             Mode::Setup(_) => Some("code folder — see form".to_string()),
@@ -2614,6 +2637,30 @@ impl App {
         self.hits.spans(left.x, left.y, global_hits);
         // (After the divider, "│  ".)
         let mut ctx_hits = vec![(3, None)];
+        // Too many row keys for the room: keep what fits and end on
+        // "? more" (the help lists every key), never a key cut in half.
+        let cap_w = |k: &str, l: &str| -> usize {
+            keycap(k, l, Cap::Context).iter().map(|s| s.width()).sum()
+        };
+        let room = usize::from(right.width).saturating_sub(3);
+        let total: usize = ctx.iter().map(|(k, l, _)| cap_w(k, l)).sum();
+        if total > room {
+            let help = self.keys.label(Action::Help);
+            let more = cap_w(&help, "more");
+            let mut used = more;
+            let keep = ctx
+                .iter()
+                .take_while(|(k, l, _)| {
+                    used += cap_w(k, l);
+                    used <= room
+                })
+                .count();
+            ctx.truncate(keep);
+            // (Not even "more" fits: nothing.)
+            if more <= room {
+                ctx.push((help, "more", press(Action::Help)));
+            }
+        }
         let ctx_line = context_line(
             ctx.into_iter()
                 .map(|(k, label, hit)| {
@@ -3528,6 +3575,10 @@ fn context_legend(
         // Its row is fixed: no name, pin, tags, description, notes, archive.
         return v;
     }
+    // (A conversation to copy.) Early: a narrow footer drops the last keys.
+    if resumable {
+        v.push((Action::Fork, "fork"));
+    }
     if archived {
         v.push((Action::Unarchive, "unarchive"));
     } else {
@@ -3545,10 +3596,6 @@ fn context_legend(
     v.push((Action::Tags, "tags"));
     v.push((Action::Describe, "describe"));
     v.push((Action::Notes, "notes"));
-    // (A conversation to copy.)
-    if resumable {
-        v.push((Action::Fork, "fork"));
-    }
     v
 }
 
@@ -3636,8 +3683,8 @@ mod tests {
         assert_eq!(
             labels(&context_legend(false, None, Some(&running))),
             [
-                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes", "fork"
+                "attach", "restart", "stop", "fork", "archive", "rename", "pin", "tags",
+                "describe", "notes"
             ]
         );
         let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
@@ -3879,8 +3926,17 @@ mod tests {
         );
         assert!(!right.contains("unarchive"), "{running}");
 
-        // Narrower than both halves: the global keys stay whole.
+        // A normal width: fork shows, and keys that don't fit end on
+        // "more" (the help), never a cut-off label.
         app.table.select(Some(1));
+        let mid = footer_row(&app, 160);
+        assert!(mid.contains(" fork "), "{mid}");
+        let (_, right) = mid.split_once('│').unwrap();
+        assert!(right.trim_end().ends_with("more"), "{mid}");
+        let wide = footer_row(&app, 200);
+        assert!(wide.contains(" fork "), "{wide}");
+
+        // Narrower than both halves: the global keys stay whole.
         let narrow = footer_row(&app, 120);
         assert!(
             narrow.contains(" new ") && narrow.contains(" quit ") && narrow.contains(" overlord "),
