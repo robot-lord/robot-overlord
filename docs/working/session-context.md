@@ -493,7 +493,7 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 - [x] `rlord mcp --session --token-file <p> [--socket]` (server
   `rlord_session`, conflicts with `--overlord`, never autostarts) and
   `rlord context [--token-file] [--socket] <tool|help> key=value…`.
-- [x] Wiring per agent at every start; pane env `RLORD_SESSION_TOKEN_FILE`
+- [x] Wiring per agent at every start; pane env `RLORD_SESSION_LOOKUP_FILE`
   (not for Codex daemon mode).
 - [x] Background "Looking up more" section.
 - [x] `overlord.md` (link rather than copy), `docs/architecture.md` (MCP
@@ -538,7 +538,7 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 
 1. `read_history` passes a hit's `transcript` through (test: a hit
    before a `/clear`; a foreign path refused).
-2. `RLORD_SESSION_TOKEN_FILE` is scrubbed wherever `RLORD_SESSION_ID`
+2. `RLORD_SESSION_LOOKUP_FILE` is scrubbed wherever `RLORD_SESSION_ID`
    is (`agents::PANE_ENV` / `scrub_pane_env`): the Codex-daemon pane's
    unset list, autostart, `process::run`, OpenCode's shared-server
    environment and `run_bounded`, Codex's server commands, install's
@@ -565,7 +565,7 @@ minor releases now).
 1. A failed worktree add removes only a registration at `dir` and a
    branch that weren't there before the call (test: the user's
    "missing but already registered" worktree survives).
-2. No `RLORD_SESSION_TOKEN_FILE` in OpenCode or Codex daemon-mode panes
+2. No `RLORD_SESSION_LOOKUP_FILE` in OpenCode or Codex daemon-mode panes
    (shared servers run their commands); architecture.md fixed.
 3. The background's CLI line always passes `--token-file` and
    `--socket`.
@@ -746,6 +746,24 @@ Owed (round 3): the POST on the follower thread; per-pass file read,
 a held typed first prompt logs `message_held` (not a first-prompt kind);
 `tick` checks kv `first_prompt:<id>` inline rather than via
 `first_waiting`.
+
+### Review round 4 (PR #73)
+
+1. A first prompt queued for typing waits through a stop for the
+   restart; only an archived or gone session drops it.
+2. After the POST, kv and file are settled only if the hold still names
+   the same file with the same words (under the DB lock).
+3. A POSTed first prompt holds the overlord's messages for 15s
+   (`first_prompt::mark_sent` / `waiting`, kv `first_prompt_sent:<id>`),
+   used by `send` and `tick` alike.
+4. `launch_words` falls back to a fork's parent's (up to 4 levels).
+5. A restart with a held first prompt (it carries the pointer) puts no
+   new pointer on argv.
+6. Docs say `RLORD_SESSION_LOOKUP_FILE` throughout.
+
+Owed (round 4): `apply_first_prompt` / `apply_deferred` dedupe; the dead
+`Way::Argv` arm in `place`; triage reads `launch_words` under the DB
+lock (one query per row).
 
 ## Owed / deferred
 

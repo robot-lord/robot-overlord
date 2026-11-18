@@ -1352,7 +1352,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             .as_str()
             .is_some_and(|p| !p.trim().is_empty());
     let placed = crate::first_prompt::place(&base, &s.id, agent, first.as_deref(), words);
-    let first = placed.argv.clone();
+    // A first prompt still held from an earlier start (it carries the
+    // pointer already) goes instead of a new pointer on argv.
+    let carried_held = placed.server.is_none()
+        && !words
+        && db
+            .kv_get(&crate::first_prompt::pending_key(&s.id))?
+            .is_some();
+    let first = placed.argv.clone().filter(|_| !carried_held);
+    let pointer_sent = pointer_sent && !carried_held;
     if let Some(p) = &first {
         agent.add_first_prompt(&mut argv, p);
     }

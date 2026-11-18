@@ -404,8 +404,7 @@ fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
 /// server (`first_prompt::pending_key`) or for typing (`FIRST_KEY`). The
 /// overlord's messages wait for it.
 fn first_waiting(db: &Db, id: &str) -> Result<bool> {
-    Ok(db.kv_map(FIRST_KEY)?.contains_key(id)
-        || db.kv_get(&crate::first_prompt::pending_key(id))?.is_some())
+    Ok(db.kv_map(FIRST_KEY)?.contains_key(id) || crate::first_prompt::waiting(db, id, now_ms())?)
 }
 
 /// How many times typing a first prompt may fail before it is dropped.
@@ -493,8 +492,7 @@ fn tick(d: &Daemon) -> Result<()> {
             for id in m.keys().cloned().collect::<Vec<_>>() {
                 // (A session's first prompt goes before its messages.)
                 if key == PENDING_KEY
-                    && (firsts.contains_key(&id)
-                        || db.kv_get(&crate::first_prompt::pending_key(&id))?.is_some())
+                    && (firsts.contains_key(&id) || crate::first_prompt::waiting(&db, &id, now)?)
                 {
                     continue;
                 }
@@ -502,6 +500,11 @@ fn tick(d: &Daemon) -> Result<()> {
                 match next(s.as_ref(), limited.get(&id).copied(), now) {
                     Next::Wait => {}
                     Next::Deliver => due.push((id, key)),
+                    // A first prompt of a session that stopped waits
+                    // for its restart; only archived or gone drops it.
+                    Next::Drop(_)
+                        if key == FIRST_KEY
+                            && s.as_ref().is_some_and(|s| s.archived_at.is_none()) => {}
                     Next::Drop(why) => {
                         m.remove(&id);
                         dropped = true;

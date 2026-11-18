@@ -835,7 +835,8 @@ reachable through it.
   without a token), so the
   overlord copies the needed facts into `context` for the last two. A
   Claude or in-pane Codex pane's env gets `RLORD_SESSION_LOOKUP_FILE` (a
-  path); OpenCode and Codex daemon-mode panes don't, since their shell
+  path; no `TOKEN`, `KEY` or `SECRET` in its name, which Codex's default
+  env policy drops); OpenCode and Codex daemon-mode panes don't, since their shell
   commands run in a shared server. The variable is scrubbed with
   `RLORD_SESSION_ID` from everything shared between sessions
   (`agents::PANE_ENV`: the daemon drops it from its own environment at

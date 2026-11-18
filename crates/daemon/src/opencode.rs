@@ -765,9 +765,24 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
             }}),
         };
         let db = d.db();
-        db.kv_delete(&crate::first_prompt::pending_key(&s.id))?;
+        // Settled only if what is held is still what was read (same file,
+        // same words): a newer hold is left for its own turn.
+        let key = crate::first_prompt::pending_key(&s.id);
+        let same_file = db
+            .kv_get(&key)?
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .is_some_and(|h| h["file"] == held["file"]);
+        let same = same_file && std::fs::read_to_string(&file).unwrap_or_default() == text;
+        if !same {
+            db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
+            continue;
+        }
+        db.kv_delete(&key)?;
         if outcome["queued"] == true {
             crate::send::queue_first(&db, &s.id, &text)?;
+        }
+        if outcome["sent"] == true {
+            crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
         }
         db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
         drop(db);

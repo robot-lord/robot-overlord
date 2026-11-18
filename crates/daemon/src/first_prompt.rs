@@ -76,14 +76,23 @@ pub fn pointer_line(id: &str, file: &Path) -> String {
     )
 }
 
-/// The user's words a session was launched with (its launch spec).
+/// The user's words a session was launched with (its launch spec); for a
+/// fork given none, its parent's (a few levels at most).
 pub fn launch_words(db: &Db, id: &str) -> Option<String> {
-    let raw = db.launch_spec(id).ok()?;
-    let spec: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    spec["prompt"]
-        .as_str()
-        .map(str::to_string)
-        .filter(|p| !p.trim().is_empty())
+    let mut id = id.to_string();
+    for _ in 0..4 {
+        let own = db
+            .launch_spec(&id)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|spec| spec["prompt"].as_str().map(str::to_string))
+            .filter(|p| !p.trim().is_empty());
+        if own.is_some() {
+            return own;
+        }
+        id = db.resolve_ref(&id).ok()?.forked_from?;
+    }
+    None
 }
 
 /// What follows the id in every `pointer_line`.
@@ -191,6 +200,32 @@ pub fn hold(db: &Db, id: &str, file: Option<&Path>, at: i64) -> Result<()> {
         ),
         None => db.kv_delete(&pending_key(id)),
     }
+}
+
+/// kv: when a first prompt was POSTed (epoch ms).
+fn sent_key(id: &str) -> String {
+    format!("first_prompt_sent:{id}")
+}
+
+/// How long after a POSTed first prompt the overlord's messages wait (its
+/// turn may not show as started yet).
+const SENT_SETTLE_MS: i64 = 15_000;
+
+/// Note that session `id`'s first prompt was POSTed at `at`.
+pub fn mark_sent(db: &Db, id: &str, at: i64) -> Result<()> {
+    db.kv_set(&sent_key(id), &at.to_string())
+}
+
+/// Whether session `id`'s first prompt is still on its way: held for its
+/// server, or POSTed within `SENT_SETTLE_MS` of `now`.
+pub fn waiting(db: &Db, id: &str, now: i64) -> Result<bool> {
+    if db.kv_get(&pending_key(id))?.is_some() {
+        return Ok(true);
+    }
+    let sent = db
+        .kv_get(&sent_key(id))?
+        .and_then(|v| v.parse::<i64>().ok());
+    Ok(sent.is_some_and(|t| now - t < SENT_SETTLE_MS))
 }
 
 /// Give a held first prompt (if any) a fresh clock: a restart carries it
@@ -313,6 +348,18 @@ mod tests {
         // Text that only looks like the start of one is the user's own.
         let own = "[rlord session note] keep this".to_string();
         assert_eq!(task("01xyz", Some(own.clone()), None), Some(own));
+    }
+
+    #[test]
+    fn messages_wait_while_a_first_prompt_is_on_its_way() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!waiting(&db, "s", 1_000).unwrap());
+        hold(&db, "s", Some(Path::new("/x/prompt.md")), 1_000).unwrap();
+        assert!(waiting(&db, "s", 1_000_000).unwrap());
+        hold(&db, "s", None, 0).unwrap();
+        mark_sent(&db, "s", 1_000).unwrap();
+        assert!(waiting(&db, "s", 1_000 + SENT_SETTLE_MS - 1).unwrap());
+        assert!(!waiting(&db, "s", 1_000 + SENT_SETTLE_MS).unwrap());
     }
 
     #[test]
