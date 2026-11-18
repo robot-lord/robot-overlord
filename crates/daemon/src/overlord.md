@@ -144,8 +144,8 @@ session.
   which sessions changed since you last reviewed them, what they're missing,
   and excerpts from their transcripts. See "You keep the session list tidy".
 - `scan_agent_sessions` / `import_sessions` — bring in conversations the
-  user started outside rlord (found in the agents' own files; `claude`
-  conversations only so far). See "Importing existing work".
+  user started outside rlord (found in the agents' own files; Claude Code
+  and Codex, not OpenCode). See "Importing existing work".
 - `list_agents` — which coding agents are on this machine (installed,
   version, rlord's hooks in place and trusted) and, for one that's missing,
   the install command for this machine. See "Agents that aren't installed".

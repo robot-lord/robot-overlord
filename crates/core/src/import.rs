@@ -649,8 +649,60 @@ fn meta_field(meta: &str, key: &str) -> Option<String> {
     }
 }
 
-/// How much of a rollout's first line `codex_candidate` reads for its meta.
+/// How much of a rollout's first line `codex_candidate` reads for its meta
+/// when the line can't be parsed whole.
 const META_BYTES: u64 = 16 * 1024;
+
+/// A rollout's `session_meta` payload: parsed whole when possible, else
+/// the first `META_BYTES` of its line, searched by key.
+enum SessionMeta {
+    Parsed(Value),
+    Prefix(String),
+}
+
+impl SessionMeta {
+    fn str(&self, key: &str) -> Option<String> {
+        match self {
+            SessionMeta::Parsed(p) => match &p[key] {
+                Value::String(s) => Some(s.clone()),
+                // An object source (`{"subagent": …}`): its first key.
+                Value::Object(m) => m.keys().next().cloned(),
+                _ => None,
+            },
+            SessionMeta::Prefix(t) => meta_field(t, key),
+        }
+    }
+
+    fn branch(&self) -> Option<String> {
+        match self {
+            SessionMeta::Parsed(p) => p["git"]["branch"].as_str().map(str::to_string),
+            SessionMeta::Prefix(t) => meta_field(&t[t.find("\"git\":")?..], "branch"),
+        }
+    }
+}
+
+/// The meta from the parsed head window; a first line too long for that
+/// window is read whole (up to `codex::FIRST_LINE_MAX`, as
+/// `rollout_first_line` does), and only past that by its prefix. So a big
+/// `AGENTS.md` before `source` doesn't hide it.
+fn session_meta(path: &Path, head: &[Value]) -> Result<SessionMeta, String> {
+    use std::io::{BufRead, Read};
+    if let Some(v) = head.first().filter(|v| v["type"] == "session_meta") {
+        return Ok(SessionMeta::Parsed(v["payload"].clone()));
+    }
+    let f = std::fs::File::open(path).map_err(|e| format!("can't read the rollout: {e}"))?;
+    let mut line = Vec::new();
+    let _ = std::io::BufReader::new(f.take(codex::FIRST_LINE_MAX)).read_until(b'\n', &mut line);
+    if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+        if v["type"] == "session_meta" {
+            return Ok(SessionMeta::Parsed(v["payload"].clone()));
+        }
+    }
+    line.truncate(META_BYTES as usize);
+    Ok(SessionMeta::Prefix(
+        String::from_utf8_lossy(&line).into_owned(),
+    ))
+}
 
 fn codex_candidate(
     path: &Path,
@@ -660,21 +712,14 @@ fn codex_candidate(
     excluded: &[PathBuf],
     indexed: Option<&IndexRow>,
 ) -> Result<Candidate, String> {
-    let meta = {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        std::fs::File::open(path)
-            .and_then(|f| f.take(META_BYTES).read_to_end(&mut buf))
-            .map_err(|e| format!("can't read the rollout: {e}"))?;
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        text.split('\n').next().unwrap_or("").to_string()
-    };
-    let originator = meta_field(&meta, "originator");
+    let (head, tail) = transcript::read_head_tail(path);
+    let meta = session_meta(path, &head)?;
+    let originator = meta.str("originator");
     // Headless runs (`codex exec`, the SDK, an MCP server) and sub-agents'
     // threads aren't the user's conversations.
     let source = indexed
         .and_then(|i| i.source.clone())
-        .or_else(|| meta_field(&meta, "source"));
+        .or_else(|| meta.str("source"));
     if let Some(s) = source.as_deref().filter(|s| matches!(*s, "exec" | "mcp")) {
         return Err(format!("a headless run (source {s}), not a conversation"));
     }
@@ -691,7 +736,6 @@ fn codex_candidate(
         return Err("a sub-agent's thread, not the user's conversation".into());
     }
 
-    let (head, tail) = transcript::read_head_tail(path);
     // Where it last ran: the latest turn's folder, else the index's, else
     // where it started.
     let cwd = tail
@@ -700,7 +744,7 @@ fn codex_candidate(
         .filter(|v| v["type"] == "turn_context")
         .find_map(|v| v["payload"]["cwd"].as_str().map(str::to_string))
         .or_else(|| indexed.and_then(|i| i.cwd.clone()))
-        .or_else(|| meta_field(&meta, "cwd"))
+        .or_else(|| meta.str("cwd"))
         .ok_or("no working directory in the rollout")?;
     if cwd.ends_with("/robot-overlord/overlord") {
         return Err("rlord's own overlord conversation".into());
@@ -736,15 +780,7 @@ fn codex_candidate(
         .ok_or("no timestamps in the rollout")?;
     let started_at = head.iter().find_map(ts);
     // Codex records the branch when the thread starts (`session_meta.git`).
-    let branch = head
-        .iter()
-        .find(|v| v["type"] == "session_meta")
-        .and_then(|v| v["payload"]["git"]["branch"].as_str().map(str::to_string))
-        .or_else(|| {
-            let at = meta.find("\"git\":")?;
-            meta_field(&meta[at..], "branch")
-        })
-        .filter(|b| !b.is_empty() && b != "HEAD");
+    let branch = meta.branch().filter(|b| !b.is_empty() && b != "HEAD");
     let dir_exists = Path::new(&cwd).is_dir();
     let recently_written =
         mtime.is_some_and(|m| ms_epoch(SystemTime::now()) - m < RECENT_WRITE.as_millis() as i64);
@@ -768,7 +804,11 @@ fn codex_candidate(
         last_active_at,
         last_user_at: last_of("you"),
         last_agent_at: last_of("agent"),
-        open_elsewhere: procs.lines().any(|l| l.contains(id)),
+        // A thread an app-server client started (`source` vscode: an
+        // editor, or Codex's background server) may still be hosted there;
+        // resuming it in the pane (`--no-daemon`) would run it twice.
+        open_elsewhere: procs.lines().any(|l| l.contains(id))
+            || source.as_deref() == Some("vscode"),
         recently_written,
     })
 }
@@ -1308,7 +1348,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let cwd = work.path().to_string_lossy().into_owned();
         // The rollouts say nothing; the index does.
-        for id in [CX_A, CX_B, CX_C] {
+        for id in [CX_A, CX_B, CX_C, CX_D] {
             rollout(
                 home.path(),
                 id,
@@ -1323,16 +1363,38 @@ mod tests {
                source TEXT NOT NULL DEFAULT 'cli');
              INSERT INTO threads VALUES ('{CX_A}', '', '{cwd}', 1, 'user', 'cli');
              INSERT INTO threads VALUES ('{CX_B}', '', '{cwd}', 1, 'subagent', 'cli');
-             INSERT INTO threads VALUES ('{CX_C}', '', '{cwd}', 1, 'user', 'exec');"
+             INSERT INTO threads VALUES ('{CX_C}', '', '{cwd}', 1, 'user', 'exec');
+             INSERT INTO threads VALUES ('{CX_D}', '', '{cwd}', 1, 'user', 'vscode');"
         ))
         .unwrap();
         drop(c);
-        let ids: Vec<String> =
-            scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[])
-                .into_iter()
-                .map(|c| c.agent_session)
-                .collect();
-        assert_eq!(ids, [CX_A]);
+        let found = scan_codex_in(home.path(), &ScanOpts::default(), &|_| false, "", &[]);
+        let ids: Vec<(&str, bool)> = found
+            .iter()
+            .map(|c| (c.agent_session.as_str(), c.open_elsewhere))
+            .collect();
+        // A thread an app-server client started may be hosted there.
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.contains(&(CX_A, false)) && ids.contains(&(CX_D, true)),
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_huge_session_meta_still_says_it_is_headless() {
+        let home = tempfile::tempdir().unwrap();
+        // Instructions far past the head window, before `source`.
+        let big = "x".repeat(3 * 1024 * 1024);
+        rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "base_instructions": {"text": big},
+                   "cwd": "/src/app", "source": "exec"}),
+            &codex_turn("/src/app", "summarize", "ok"),
+        );
+        let why = explain_codex_in(home.path(), CX_A, &|_| false).unwrap();
+        assert!(why.contains("headless"), "{why}");
     }
 
     #[test]

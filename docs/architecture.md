@@ -1422,12 +1422,19 @@ including when the active one hits a usage limit.
   on Claude, a narrow tool list).
 - **Import** (`core/src/import.rs`, `daemon/src/import.rs`): finds agent
   conversations rlord doesn't track, from the agents' own transcripts (Claude:
-  `~/.claude/projects/<cwd slug>/<uuid>.jsonl`), with no AI and nothing
+  `~/.claude/projects/<cwd slug>/<uuid>.jsonl`; Codex: rollouts under
+  `~/.codex/sessions/YYYY/MM/DD/` plus its `state_5.sqlite` thread index), with no AI and nothing
   specific to the tool that started them. `session.import_scan` pre-filters
   by file mtime, then measures activity by the last user/assistant message
   timestamp. The cwd must slugify to the transcript's folder, or
   `claude --resume` couldn't find it. It skips rlord's own folders, temp dirs,
-  headless (`sdk-*`) runs, and conversations with no typed prompt.
+  headless (`sdk-*`) runs, and conversations with no typed prompt. For
+  Codex it also skips `exec`/`mcp` runs and sub-agent threads (index
+  `thread_source`, else `session_meta.source`); the folder is the latest
+  `turn_context.cwd`. An imported Codex thread resumes in the pane
+  (`codex resume <id> --no-daemon`); a thread the index lists as an
+  app-server client's (`source` vscode) may be hosted by Codex's
+  background server, so it is flagged "maybe open elsewhere".
   `session.import` adds a stopped row with trust `hook` (the id is the
   transcript's file name, so restarts resume it) and no tmux name until it
   first runs. It can recreate a removed worktree from its branch, or import
