@@ -271,100 +271,43 @@ pub fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// One look at every rlord tmux session's agent pane (`agent_panes`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AgentPanes {
-    /// Session name to whether its agent pane's program exited. A session
-    /// not listed is gone.
-    pub dead: std::collections::HashMap<String, bool>,
-    /// The tmux server's process id, as it said.
-    pub server_pid: Option<i32>,
-}
-
-/// Each rlord tmux session's agent pane: the pinned one (`@rlord_pane`; a
-/// pin whose pane isn't there any more is a dead agent pane), else the
-/// first, as `window_pane_ids` picks it. Whether its program exited (rlord
-/// keeps a dead agent pane on screen). One `list-panes -a` for every
-/// session. `Ok(None)`: no server answered at rlord's socket ("no server
-/// running", "error connecting"): whether it is really gone is the
-/// caller's to prove (`pid_alive` on a pid it saw before). Any other
-/// failure is an error.
-pub fn agent_panes() -> Result<Option<AgentPanes>> {
-    let out = tmux_cmd()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            &format!(
-                "#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{pid}}\t#{{session_name}}"
-            ),
-        ])
-        .output()
-        .context("running tmux")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if no_answer(&err) {
-            return Ok(None);
-        }
-        bail!("tmux list-panes: {}", err.trim());
-    }
-    Ok(Some(parse_agent_panes(&String::from_utf8_lossy(
-        &out.stdout,
-    ))))
-}
-
-/// tmux found no server answering at the socket.
-fn no_answer(stderr: &str) -> bool {
-    stderr.contains("no server running") || stderr.contains("error connecting to")
-}
-
-/// Whether process `pid` is still there.
-pub fn pid_alive(pid: i32) -> bool {
-    // SAFETY: signal 0 checks for the process without signalling it.
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+/// Each rlord tmux session's agent pane, as `window_pane_ids` picks it
+/// (the pinned one, `@rlord_pane`, when it is in the session; else the
+/// first): whether its program exited (rlord keeps a dead agent pane on
+/// screen). One `list-panes -a` for every session; a session not listed
+/// is gone. Any failure, "no server running" included, is an error:
+/// nothing is concluded from it (a server that really died is for the
+/// startup reconcile).
+pub fn agent_panes() -> Result<std::collections::HashMap<String, bool>> {
+    let out = run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        &format!("#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{session_name}}"),
+    ])?;
+    Ok(parse_agent_panes(&out))
 }
 
 /// `agent_panes`' lines: pane id, dead (`1`), the session's pinned pane,
-/// the server's pid, session name.
-fn parse_agent_panes(out: &str) -> AgentPanes {
-    // Per session: its pin, its first pane's state, its pinned pane's;
-    // and every pane's state by id (a pin moved by `join-pane`).
-    let mut seen: std::collections::HashMap<String, (String, bool, Option<bool>)> =
-        Default::default();
-    let mut panes: std::collections::HashMap<String, bool> = Default::default();
-    let mut server_pid = None;
+/// session name.
+fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, bool> {
+    let mut first: std::collections::HashMap<String, bool> = Default::default();
+    let mut pinned: std::collections::HashMap<String, bool> = Default::default();
     for l in out.lines() {
-        let mut f = l.splitn(5, '\t');
-        let (Some(pane), Some(dead), Some(pin), Some(pid), Some(session)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
+        let mut f = l.splitn(4, '\t');
+        let (Some(pane), Some(dead), Some(pin), Some(session)) =
+            (f.next(), f.next(), f.next(), f.next())
         else {
             continue;
         };
-        server_pid = server_pid.or(pid.parse().ok());
         let dead = dead == "1";
-        panes.insert(pane.to_string(), dead);
-        let e = seen
-            .entry(session.to_string())
-            .or_insert_with(|| (pin.to_string(), dead, None));
+        first.entry(session.to_string()).or_insert(dead);
         if pane == pin {
-            e.2 = Some(dead);
+            pinned.insert(session.to_string(), dead);
         }
     }
-    let dead = seen
-        .into_iter()
-        .map(|(s, (pin, first, pinned))| {
-            // Pinned: that pane, in this session or moved to another;
-            // gone everywhere, the agent's pane is dead.
-            let d = if pin.is_empty() {
-                first
-            } else {
-                pinned.or_else(|| panes.get(&pin).copied()).unwrap_or(true)
-            };
-            (s, d)
-        })
-        .collect();
-    AgentPanes { dead, server_pid }
+    first.extend(pinned);
+    first
 }
 
 /// Session option naming the agent's pane. With the user's tmux profile a
@@ -499,16 +442,18 @@ pub fn new_plain_session(name: &str, cwd: &str, cmd: &str) -> Result<()> {
 pub fn respawn_pane(name: &str, cwd: &str, pane_cmd: &str) -> Result<()> {
     let (_, pane_id) = window_pane_ids(name)?;
     run(&["respawn-pane", "-k", "-c", cwd, "-t", &pane_id, pane_cmd])?;
-    // The agent runs in this pane now: pinned to it. (When the pinned pane
-    // was gone, `window_pane_ids` fell back to the first one; a pin left
-    // naming the gone pane would read the live agent as dead.)
-    run(&[
+    // The agent runs in this pane now: pinned to it (when the pinned pane
+    // was gone, `window_pane_ids` fell back to the first one). Best
+    // effort: the respawn itself went through.
+    if let Err(e) = run(&[
         "set-option",
         "-t",
         &format!("{}:", exact(name)),
         AGENT_PANE,
         &pane_id,
-    ])?;
+    ]) {
+        tracing::debug!(session = name, error = %e, "re-pinning the agent pane");
+    }
     Ok(())
 }
 
@@ -1635,31 +1580,17 @@ mod tests {
     use super::*;
 
     /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
-    /// pane decides (a pin with its pane gone is dead), else the first; a
-    /// session name may hold spaces; the server's pid comes along.
+    /// pane when it is in the session, else the first (as
+    /// `window_pane_ids`); a session name may hold spaces.
     #[test]
     fn agent_panes_are_the_pinned_ones() {
-        let out = "%0\t0\t%0\t77\ta b\n%1\t1\t%0\t77\ta b\n%2\t1\t\t77\tc\n\
-                   %3\t0\t%4\t77\td\n%4\t1\t%4\t77\td\n%5\t0\t%9\t77\te";
-        let p = parse_agent_panes(out);
-        assert_eq!(
-            p.dead.get("a b"),
-            Some(&false),
-            "the pinned pane, not the split"
+        let p = parse_agent_panes(
+            "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td\n%5\t0\t%9\te",
         );
-        assert_eq!(p.dead.get("c"), Some(&true), "none pinned: the first");
-        assert_eq!(p.dead.get("d"), Some(&true));
-        assert_eq!(p.dead.get("e"), Some(&true), "its pinned pane is gone");
-        // A pinned pane moved to another session (`join-pane`): still it.
-        let moved = parse_agent_panes("%7\t1\t%8\t77\tf\n%8\t0\t\t77\tg");
-        assert_eq!(moved.dead.get("f"), Some(&false));
-        assert_eq!(p.server_pid, Some(77));
-        assert!(no_answer("no server running on /tmp/tmux-501/x\n"));
-        assert!(no_answer(
-            "error connecting to /tmp/tmux-501/x (No such file or directory)"
-        ));
-        assert!(!no_answer("lost server"));
-        assert!(pid_alive(std::process::id() as i32));
+        assert_eq!(p.get("a b"), Some(&false), "the pinned pane, not the split");
+        assert_eq!(p.get("c"), Some(&true), "none pinned: the first");
+        assert_eq!(p.get("d"), Some(&true));
+        assert_eq!(p.get("e"), Some(&false), "its pin isn't there: the first");
     }
 
     #[test]
@@ -1748,8 +1679,8 @@ mod tests {
         respawn_pane(name, "/tmp", "sleep 30").unwrap();
         let pin = run(&["show-options", "-v", "-t", &format!("={name}:"), AGENT_PANE]).unwrap();
         assert_eq!(pin, window_pane_ids(name).unwrap().1);
-        let panes = agent_panes().unwrap().unwrap();
-        assert_eq!(panes.dead.get(name), Some(&false));
+        let panes = agent_panes().unwrap();
+        assert_eq!(panes.get(name), Some(&false));
 
         // Key hints: a slim bar of rlord's own without a profile...
         let opt = |o: &str| run(&["show-options", "-v", "-t", &format!("={name}:"), o]).unwrap();

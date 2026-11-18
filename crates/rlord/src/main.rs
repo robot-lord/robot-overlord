@@ -2212,7 +2212,7 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::background::start(&daemon);
         // OpenCode sessions: status from its background server's events.
         rlord_daemon::opencode::start(&daemon);
-        // Stored statuses re-checked against the pane and the transcript.
+        // Sessions whose agent pane died without a SessionEnd: stopped.
         rlord_daemon::recheck::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
         // before the first launch needs it.

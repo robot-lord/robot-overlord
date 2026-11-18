@@ -131,13 +131,7 @@ pub(crate) fn pane_looks(s: &Session, gone: &mut HashMap<String, u8>) -> u8 {
         .tmux_session
         .as_deref()
         .is_some_and(|t| !tmux::has_session(t) || tmux::format(t, "#{pane_dead}") == "1");
-    count_look(&s.id, gone, dead)
-}
-
-/// Count one look at session `id`'s pane in `gone`: the looks in a row it
-/// has looked gone.
-pub(crate) fn count_look(id: &str, gone: &mut HashMap<String, u8>, dead: bool) -> u8 {
-    let looks = gone.entry(id.to_string()).or_default();
+    let looks = gone.entry(s.id.clone()).or_default();
     *looks = if dead { looks.saturating_add(1) } else { 0 };
     *looks
 }
