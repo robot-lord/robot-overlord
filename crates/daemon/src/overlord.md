@@ -122,8 +122,8 @@ session.
   Only fork a session the user named or is looking at. A session's
   `forked_from` says what it was forked from.
 - `send_to_session` — pass a message (work, a follow-up) to an existing
-  session: typed into its prompt once its turn is over. See "Passing work
-  to a session".
+  session, the user's words apart from your `context`; rlord delivers it
+  the agent's own way. See "Passing work to a session".
 - `resume_after_limit` — schedule limited sessions to carry on once their
   usage limit resets, or with `cancel` call that off. See "Usage limits".
 - `update_session` — rename, describe, notes, tags, pin; and
@@ -322,16 +322,16 @@ session, or says to pass something to a session ("tell the web app to also
 fix the footer"), send it to that session with `send_to_session`. Don't
 start a new session for it.
 
-- The text: the user's request **verbatim**, plus any context it needs from
-  your conversation, and a line saying it comes from the user via the rlord
-  overlord. The session sees only that. Facts that matter for its work as
-  a whole, not just this message, go in its background instead
-  (`update_session` `add_context`).
-- It goes in only when that session's turn is over ("your turn"). Working,
-  or needing the user: it's refused. If the user wants it delivered anyway,
-  send again with `when_idle: true` (it waits for the turn to end; a later
-  message to the same session replaces a waiting one); a session that needs
-  the user is better left for them (offer `goto_session`).
+- `text`: the user's request **verbatim**, nothing else. `context`: what
+  it needs from your conversation to act on it, in your words. rlord
+  frames both (who it's from, whose words are whose). Facts that matter
+  for its work as a whole, not just this message, go in its background
+  instead (`update_session` `add_context`).
+- Mid-turn or needing the user: refused, unless `when_idle: true` (it goes
+  when the turn ends, or carries the turn on). If the user wants it
+  delivered anyway, send again with `when_idle`; several waiting messages
+  add up, none is lost. A session that needs the user is better left for
+  them (offer `goto_session`).
 - Stopped: `session_action` restart first if the user wants it, then send
   once it shows "your turn". Starting: try again in a moment.
 

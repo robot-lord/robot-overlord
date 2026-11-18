@@ -39,7 +39,7 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use rlord_core::agents::transcript::{self, Format, LimitHit};
-use rlord_core::db::{ArchivedMode, SessionQuery};
+use rlord_core::db::{ArchivedMode, Db, SessionQuery};
 use rlord_core::timefmt::clock;
 use rlord_core::types::{now_ms, Session, Status};
 
@@ -118,6 +118,15 @@ pub fn limited(d: &Daemon) -> HashMap<String, i64> {
         .into_iter()
         .filter_map(|(id, l)| Some((id, l["resets_at"].as_i64().filter(|t| held(*t, now))?)))
         .collect()
+}
+
+/// Whether session `id` is held by a usage limit now, read from the DB
+/// (for callers holding only it, like a hook). An unreadable record: no.
+pub fn limited_in(db: &Db, id: &str, now: i64) -> bool {
+    db.kv_map(LIMITS_KEY)
+        .ok()
+        .and_then(|m| m.get(id)?["resets_at"].as_i64())
+        .is_some_and(|t| held(t, now))
 }
 
 /// Whether a limit that resets at `resets_at` still holds messages back:
