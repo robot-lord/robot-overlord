@@ -73,6 +73,10 @@ pub struct ScanOpts {
     /// Only conversations whose id starts with one of these (full ids or
     /// prefixes; ignores `since_ms`).
     pub only: Vec<String>,
+    /// rlord's own Codex sessions that haven't learned their thread id
+    /// yet: (folder, created at ms). A thread started in that folder after
+    /// that is maybe the session's own, so the scan doesn't list it.
+    pub unbound_codex: Vec<(String, i64)>,
 }
 
 /// How recently a transcript must have been written to count as possibly open.
@@ -652,6 +656,9 @@ pub fn scan_codex_in(
         if opts.only.is_empty() && c.last_active_at < opts.since_ms {
             continue;
         }
+        if maybe_rlords_own(&c, &opts.unbound_codex) {
+            continue;
+        }
         out.push(c);
     }
     out.sort_by_key(|c| std::cmp::Reverse(c.last_active_at));
@@ -734,6 +741,15 @@ fn session_meta(path: &Path, head: &[Value]) -> Result<SessionMeta, String> {
     ))
 }
 
+/// Maybe the thread of one of rlord's own Codex sessions that hasn't bound
+/// its id yet: same folder, started after that session was created.
+fn maybe_rlords_own(c: &Candidate, unbound: &[(String, i64)]) -> bool {
+    let started = c.started_at.unwrap_or(c.last_active_at);
+    unbound
+        .iter()
+        .any(|(dir, created)| *dir == c.cwd && started >= *created)
+}
+
 fn is_headless_source(s: &str) -> bool {
     matches!(s, "exec" | "mcp")
 }
@@ -778,12 +794,16 @@ fn codex_candidate(
     let originator = meta.str("originator");
     // Headless runs (`codex exec`, the SDK, an MCP server) and sub-agents'
     // threads aren't the user's conversations.
-    let source = indexed
+    // Both the index's and the rollout's own source count.
+    let sources: Vec<String> = indexed
         .and_then(|i| i.source.clone())
-        .or_else(|| meta.str("source"));
-    if let Some(s) = source.as_deref().filter(|s| is_headless_source(s)) {
+        .into_iter()
+        .chain(meta.str("source"))
+        .collect();
+    if let Some(s) = sources.iter().find(|s| is_headless_source(s)) {
         return Err(format!("a headless run (source {s}), not a conversation"));
     }
+    let source = sources.first().cloned();
     if let Some(o) = originator.as_deref().filter(|o| o.contains("exec")) {
         return Err(format!(
             "a headless run (originator {o}), not a conversation"
@@ -878,7 +898,7 @@ fn codex_candidate(
         // editor, the Codex app, or Codex's background server) and written
         // lately may still be held there; resuming it in the pane
         // (`--no-daemon`) would run it twice.
-        maybe_held_by_codex_server: source.as_deref() == Some("vscode")
+        maybe_held_by_codex_server: sources.iter().any(|s| s == "vscode")
             && (recently_written || codex_server_running(procs)),
         recently_written,
     })
@@ -962,9 +982,8 @@ pub fn add_git_info(c: &mut Candidate) {
         // Codex records the branch only at the start: the checkout says
         // what it is now.
         if c.agent == "codex" {
-            if let Some(b) = git::checked_out_branch(&c.cwd) {
-                c.branch = Some(b);
-            }
+            // (None: detached, so no branch.)
+            c.branch = git::checked_out_branch(&c.cwd);
         }
         // A worktree has its own top level; a subfolder of the main checkout
         // shares the main one.
@@ -1591,6 +1610,50 @@ mod tests {
         };
         assert!(!scan(""));
         assert!(scan("codex app-server"));
+    }
+
+    #[test]
+    fn rlords_unbound_codex_sessions_and_meta_sources() {
+        let home = tempfile::tempdir().unwrap();
+        rollout(
+            home.path(),
+            CX_A,
+            json!({"id": CX_A, "cwd": "/src/app"}),
+            &codex_turn("/src/app", "hello there", "hi"),
+        );
+        let started = transcript::parse_iso_ms("2026-11-11T21:55:59.000Z").unwrap();
+        let scan = |unbound: Vec<(String, i64)>| {
+            let opts = ScanOpts {
+                unbound_codex: unbound,
+                ..Default::default()
+            };
+            scan_codex_in(home.path(), &opts, &|_| false, "", &[]).len()
+        };
+        assert_eq!(scan(vec![]), 1);
+        // Created before the thread started, in its folder: maybe its own.
+        assert_eq!(scan(vec![("/src/app".into(), started - 1)]), 0);
+        // Created after, or elsewhere: not.
+        assert_eq!(scan(vec![("/src/app".into(), started + 1)]), 1);
+        assert_eq!(scan(vec![("/src/web".into(), 0)]), 1);
+
+        // The rollout says exec though the index says cli: headless.
+        rollout(
+            home.path(),
+            CX_B,
+            json!({"id": CX_B, "cwd": "/src/app", "source": "exec"}),
+            &codex_turn("/src/app", "hello there", "hi"),
+        );
+        let c = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, thread_source TEXT, source TEXT);
+             INSERT INTO threads VALUES ('{CX_B}', '/src/app', 'user', 'cli');"
+        ))
+        .unwrap();
+        drop(c);
+        let why = explain_codex_in(home.path(), CX_B, &|_| false)
+            .reason()
+            .unwrap();
+        assert!(why.contains("headless"), "{why}");
     }
 
     #[test]

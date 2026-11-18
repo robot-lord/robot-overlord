@@ -21,6 +21,14 @@ const HOUR_MS: i64 = 3_600_000;
 pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
     // Only the tracked set needs the DB; the file scan runs without the lock.
     let tracked = d.db().agent_session_ids()?;
+    // rlord's own Codex sessions still waiting to learn their thread.
+    let unbound_codex: Vec<(String, i64)> = d
+        .db()
+        .list_sessions(false)?
+        .into_iter()
+        .filter(|s| s.agent == "codex" && s.agent_session.is_none())
+        .map(|s| (s.project_path, s.created_at))
+        .collect();
     let window_ms = match params["since_hours"].as_i64() {
         Some(h) => h.max(0) * HOUR_MS,
         None => params["since_days"].as_i64().unwrap_or(30).max(0) * 24 * HOUR_MS,
@@ -43,6 +51,7 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
             0
         },
         only: only.clone(),
+        unbound_codex,
     };
     let mut found = scan_all(&opts, &|id| tracked.contains(id));
     // Asked for by id but not importable at all (judged before query and
