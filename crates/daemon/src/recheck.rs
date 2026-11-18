@@ -56,11 +56,33 @@ pub fn start(d: &Arc<Daemon>) {
     });
 }
 
+/// Per session: answered looks in a row its pane looked gone, and its
+/// `last_state_change_at` when the first of them was made.
+pub(crate) type Gone = HashMap<String, (u8, Option<i64>)>;
+
+/// Count one look at session `s`'s pane. The count starts again when the
+/// look isn't dead, and when the status changed since the first dead look
+/// (a restart or a respawn in between: that pane isn't the one seen dead).
+fn count_look(s: &Session, gone: &mut Gone, dead: bool) -> u8 {
+    let e = gone
+        .entry(s.id.clone())
+        .or_insert((0, s.last_state_change_at));
+    if !dead {
+        *e = (0, s.last_state_change_at);
+    } else if e.0 == 0 || e.1 != s.last_state_change_at {
+        *e = (1, s.last_state_change_at);
+    } else {
+        e.0 = e.0.saturating_add(1);
+    }
+    e.0
+}
+
 /// What passes remember.
 #[derive(Default)]
 pub(crate) struct Memo {
-    /// How many answered looks in a row each session's pane looked gone.
-    gone: HashMap<String, u8>,
+    /// How many answered looks in a row each session's pane looked gone,
+    /// and its status change time at the first of them.
+    gone: Gone,
     /// The tmux server's pid, as it last said: when no server answers, it
     /// is gone only if that process is.
     server_pid: Option<i32>,
@@ -87,6 +109,9 @@ pub(crate) struct Evidence {
     pub state_since: Option<i64>,
     /// Passes in a row its pane has looked gone (None: not checked).
     pub pane_gone: Option<u8>,
+    /// Someone other than the session's own conversation is named as
+    /// waiting (a sub-agent, another thread): `methods::needs_you_key`.
+    pub others_waiting: bool,
     /// The transcript's tail (None: not read, or nothing to read).
     pub tail: Option<Tail>,
     pub now: i64,
@@ -122,6 +147,10 @@ pub(crate) fn verdict(e: &Evidence) -> Option<(Status, &'static str)> {
         // the prompt (an interrupt written after the wait began), or a
         // prompt of theirs after it whose turn ended. Anything still going:
         // the next pass decides.
+        // (A sub-agent or another thread waiting: theirs to clear.)
+        if e.others_waiting {
+            return None;
+        }
         let escaped = tail.turn == Some(TurnTail::Interrupted) && after(tail.turn_at);
         let moved = after(tail.prompt_at) && ended(tail.turn).is_some() && after(tail.turn_at);
         return (quiet && (escaped || moved)).then_some((Status::Idle, "moved_on"));
@@ -190,7 +219,7 @@ fn check(
     d: &Daemon,
     s: &Session,
     panes: Option<&HashMap<String, bool>>,
-    gone: &mut HashMap<String, u8>,
+    gone: &mut Gone,
     now: i64,
 ) -> Result<bool> {
     // (Codex's background server runs the turn without the pane:
@@ -199,7 +228,7 @@ fn check(
         (Some(p), Some(t)) if !s.codex_daemon => {
             // Not listed: its tmux session is gone.
             let dead = p.get(t).copied().unwrap_or(true);
-            Some(crate::discover::count_look(&s.id, gone, dead))
+            Some(count_look(s, gone, dead))
         }
         _ => None,
     };
@@ -212,11 +241,20 @@ fn check(
     } else {
         None
     };
+    let others_waiting = s.status == Status::WaitingInput && {
+        let named: Vec<String> = d
+            .db()
+            .kv_get(&crate::methods::needs_you_key(&s.id))?
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        named.iter().any(|p| !p.is_empty())
+    };
     let e = Evidence {
         status: s.status,
         status_age,
         state_since: s.last_state_change_at,
         pane_gone: pane,
+        others_waiting,
         tail,
         now,
     };
@@ -238,10 +276,16 @@ fn check(
         .and_then(|t| t.turn_at);
     let done = apply(&db, s, to, why, now, ended_at)?;
     // The user moved on: their prompt is their latest message (forward
-    // only).
+    // only). Only a prompt shown to be theirs: one they typed (not a
+    // Codex turn start), with no prompt of rlord's since the wait began
+    // (`own.rs`: rlord types into sessions too). Else left as it is.
+    let since = s.last_state_change_at;
+    let rlord_typed = s
+        .last_rlord_msg_at
+        .is_some_and(|r| since.is_some_and(|st| r > st));
     let prompted = tail
-        .and_then(|t| t.prompt_at)
-        .filter(|at| why == "moved_on" && s.last_state_change_at.is_some_and(|st| *at > st));
+        .and_then(|t| t.typed_prompt_at)
+        .filter(|at| why == "moved_on" && !rlord_typed && since.is_some_and(|st| *at > st));
     if let Some(at) = prompted.filter(|at| done && s.last_user_msg_at.is_none_or(|m| *at > m)) {
         db.touch_last_user_msg(&s.id, at)?;
     }
@@ -313,6 +357,7 @@ mod tests {
             status_age,
             state_since: Some(100 * MIN - status_age),
             pane_gone: Some(0),
+            others_waiting: false,
             tail,
             now: 100 * MIN,
         }
@@ -325,6 +370,7 @@ mod tests {
             turn: Some(turn),
             turn_at: Some(100 * MIN - ago),
             prompt_at: prompt_ago.map(|p| 100 * MIN - p),
+            typed_prompt_at: prompt_ago.map(|p| 100 * MIN - p),
             last_at: Some(100 * MIN - ago),
         })
     }
@@ -394,6 +440,14 @@ mod tests {
             )),
             None
         );
+        // A sub-agent or another thread named as waiting: theirs, even
+        // when the user moved on in the main conversation.
+        let mut other = ev(WaitingInput, long, tail_p(Ended, 3 * MIN, Some(4 * MIN)));
+        other.others_waiting = true;
+        assert_eq!(verdict(&other), None);
+        let mut esc = ev(WaitingInput, 5 * MIN, tail(Interrupted, 3 * MIN));
+        esc.others_waiting = true;
+        assert_eq!(verdict(&esc), None);
         // Working: its turn's end, written after the status change, and
         // quiet since.
         assert_eq!(
@@ -422,6 +476,7 @@ mod tests {
             turn: None,
             turn_at: None,
             prompt_at: None,
+            typed_prompt_at: None,
             last_at: Some(0),
         });
         assert_eq!(verdict(&ev(Working, 5 * MIN, no_turn)), None);
@@ -531,6 +586,25 @@ mod tests {
                 t0,
                 &open_at("2026-11-10T00:00:10Z"),
             );
+            // The same, but a sub-agent is named as waiting: left alone.
+            let moved_sub = open_at("2026-11-10T00:00:05Z")
+                + &line(json!({"type": "user", "timestamp": "2026-11-10T00:01:00Z",
+                    "message": {"role": "user", "content": "never mind"}}))
+                + &line(
+                    json!({"type": "assistant", "timestamp": "2026-11-10T00:02:00Z",
+                    "message": {"stop_reason": "end_turn", "content": []}}),
+                );
+            add(
+                &db,
+                dir.path(),
+                "subwait",
+                "claude",
+                Status::WaitingInput,
+                t0,
+                &moved_sub,
+            );
+            db.kv_set(&crate::methods::needs_you_key("subwait"), r#"["agent-7"]"#)
+                .unwrap();
             // Needs you, then the user typed a new prompt (its hooks lost)
             // and that turn ended: they moved on.
             let moved = open_at("2026-11-10T00:00:05Z")
@@ -609,6 +683,7 @@ mod tests {
         let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
         assert_eq!(status("stale"), Status::WaitingInput);
         assert_eq!(status("asking"), Status::WaitingInput);
+        assert_eq!(status("subwait"), Status::WaitingInput);
         assert_eq!(status("moved"), Status::Idle);
         assert_eq!(status("esc"), Status::Idle);
         assert_eq!(status("cxh"), Status::Idle);
@@ -651,11 +726,13 @@ mod tests {
         // Every agent pane alive but one; "vanished" isn't listed.
         let panes = || -> Result<Option<tmux::AgentPanes>> {
             Ok(Some(tmux::AgentPanes {
-                dead: ["stale", "asking", "moved", "esc", "oc", "cx", "cxh"]
-                    .iter()
-                    .map(|t| (t.to_string(), false))
-                    .chain([("dead".to_string(), true)])
-                    .collect(),
+                dead: [
+                    "stale", "asking", "subwait", "moved", "esc", "oc", "cx", "cxh",
+                ]
+                .iter()
+                .map(|t| (t.to_string(), false))
+                .chain([("dead".to_string(), true)])
+                .collect(),
                 server_pid: Some(4242),
             }))
         };
@@ -725,6 +802,63 @@ mod tests {
         assert_eq!(status(), Status::Idle);
         pass(&d, &mut memo, &no_answer, &|_| false, 50).unwrap();
         assert_eq!(status(), Status::Stopped);
+    }
+
+    /// The look count starts again when the status changed since the first
+    /// dead look (a restart or respawn in between).
+    #[test]
+    fn a_restart_between_looks_starts_the_count_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        add(&db, dir.path(), "s", "claude", Status::Idle, 5, "");
+        let mut gone = Gone::new();
+        let s1 = db.resolve_ref("s").unwrap();
+        assert_eq!(count_look(&s1, &mut gone, true), 1);
+        // Restarted: a new status change.
+        db.set_status("s", Status::Starting, 9).unwrap();
+        db.set_status("s", Status::Idle, 10).unwrap();
+        let s2 = db.resolve_ref("s").unwrap();
+        assert_eq!(
+            count_look(&s2, &mut gone, true),
+            1,
+            "not the pane seen dead"
+        );
+        assert_eq!(count_look(&s2, &mut gone, true), 2);
+        assert_eq!(count_look(&s2, &mut gone, false), 0);
+    }
+
+    /// Moving on dates the user's last message only from a prompt shown to
+    /// be theirs: not when rlord typed into the session since the wait
+    /// began.
+    #[test]
+    fn rlords_prompts_dont_date_the_users_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let t0 = transcript::parse_iso_ms("2026-11-10T00:00:10Z").unwrap();
+        let body = open_at("2026-11-10T00:00:05Z")
+            + &line(json!({"type": "user", "timestamp": "2026-11-10T00:01:00Z",
+                "message": {"role": "user", "content": "continue"}}))
+            + &line(
+                json!({"type": "assistant", "timestamp": "2026-11-10T00:02:00Z",
+                "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}),
+            );
+        add(
+            &d.db(),
+            dir.path(),
+            "r",
+            "claude",
+            Status::WaitingInput,
+            t0,
+            &body,
+        );
+        // rlord typed "continue" (a resume after a limit) after the wait.
+        d.db().touch_last_rlord_msg("r", t0 + 40_000).unwrap();
+        let s = d.db().resolve_ref("r").unwrap();
+        let now = t0 + 3_600_000;
+        assert!(check(&d, &s, None, &mut Gone::new(), now).unwrap());
+        let after = d.db().resolve_ref("r").unwrap();
+        assert_eq!(after.status, Status::Idle, "the status fix still applies");
+        assert_eq!(after.last_user_msg_at, None, "not the user's");
     }
 
     /// A turn's end found later never moves the last message back.

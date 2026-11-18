@@ -245,6 +245,9 @@ pub struct Tail {
     /// When the latest prompt the user typed was written (ms): a human
     /// prompt (Claude), a prompt or a turn started (Codex).
     pub prompt_at: Option<i64>,
+    /// The same, counting only a prompt line (or a custom command): never
+    /// a Codex turn start, which says a turn began, not who began it.
+    pub typed_prompt_at: Option<i64>,
     /// When the last stamped line was written (ms): the agent's latest
     /// sign of life in the file.
     pub last_at: Option<i64>,
@@ -273,32 +276,42 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
     let mut local_after = false;
     let mut turn: Option<(TurnTail, Option<i64>)> = None;
     let mut prompt_at: Option<Option<i64>> = None;
+    let mut typed_prompt_at: Option<Option<i64>> = None;
     let mut last_at = None;
     for l in lines.iter().rev().map(|v| format.line(v)) {
         let at = l.at().and_then(parse_iso_ms);
         last_at = last_at.or(at);
         // This line about the turn, and whether the user started one.
-        let (says, starts) = if l.command_wrapper() {
+        let (says, starts, typed) = if l.command_wrapper() {
             // A built-in command (its output follows): nothing; that
             // output covers this one command only. A custom command or a
             // skill: a turn of the model's, started by the user.
             let local = std::mem::take(&mut local_after);
-            (if local { None } else { Some(TurnTail::Open) }, !local)
+            (
+                if local { None } else { Some(TurnTail::Open) },
+                !local,
+                !local,
+            )
         } else if l.local_output() {
             local_after |= l.local_command_output();
-            (None, false)
+            (None, false, false)
         } else if l.interrupted() {
             local_after = false;
-            (Some(TurnTail::Interrupted), false)
+            (Some(TurnTail::Interrupted), false, false)
         } else {
-            // (A local command's output covers the wrapper right before it
-            // only: any other line in between ends that.)
-            local_after = false;
             let ended = l.turn_ended();
-            let starts = l.prompt().is_some() || (format == Format::Codex && ended == Some(false));
+            let typed = l.prompt().is_some();
+            // (A local command's output covers the wrapper right before it
+            // only: a turn line in between ends that; bookkeeping lines,
+            // a compaction's boundary say, don't.)
+            if ended.is_some() || typed {
+                local_after = false;
+            }
+            let starts = typed || (format == Format::Codex && ended == Some(false));
             (
                 ended.map(|e| if e { TurnTail::Ended } else { TurnTail::Open }),
                 starts,
+                typed,
             )
         };
         if turn.is_none() {
@@ -307,7 +320,10 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
         if prompt_at.is_none() && starts {
             prompt_at = Some(at);
         }
-        if turn.is_some() && prompt_at.is_some() && last_at.is_some() {
+        if typed_prompt_at.is_none() && typed {
+            typed_prompt_at = Some(at);
+        }
+        if turn.is_some() && prompt_at.is_some() && typed_prompt_at.is_some() && last_at.is_some() {
             break;
         }
     }
@@ -315,6 +331,7 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
         turn: turn.map(|t| t.0),
         turn_at: turn.and_then(|t| t.1),
         prompt_at: prompt_at.flatten(),
+        typed_prompt_at: typed_prompt_at.flatten(),
         last_at,
     }
 }
@@ -1152,6 +1169,21 @@ mod tests {
             ),
         ]);
         assert_eq!(custom.turn, Some(TurnTail::Open));
+        // /compact: its wrapper, the compaction's boundary (bookkeeping),
+        // its summary: still the built-in command's, not a turn.
+        let boundary = json!({"type": "system", "subtype": "compact_boundary", "timestamp": "2026-11-12T10:00:31Z"});
+        let mut summary = user("2026-11-12T10:00:32Z", "This session is being continued");
+        summary["isCompactSummary"] = json!(true);
+        let compact = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:30Z",
+                "<command-name>/compact</command-name>",
+            ),
+            boundary,
+            summary,
+        ]);
+        assert_eq!(compact.turn, Some(TurnTail::Ended));
         // Output, then a reply, then a wrapper before both: the output is
         // not that wrapper's (it belongs to none): the wrapper is a turn.
         let apart = t(&[
@@ -1196,6 +1228,11 @@ mod tests {
         assert!(tail_of(Format::Codex, &[ev("turn_started")])
             .prompt_at
             .is_some());
+        // ... but no prompt typed: a turn start doesn't say who began it.
+        assert_eq!(
+            tail_of(Format::Codex, &[ev("turn_started")]).typed_prompt_at,
+            None
+        );
         // From a file: its tail, the same answer.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("abc.jsonl");

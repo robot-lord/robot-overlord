@@ -431,7 +431,8 @@ trusted hooks) against what is there to see:
 
 - **Agent pane gone** on two answered looks in a row: `stopped`, through
   `discover`'s stop (`session_end` from the pane). One `list-panes -a` a
-  pass looks at each session's pinned agent pane (`@rlord_pane`, set
+  pass (two looks of the same pane: a status change in between, a
+  restart say, starts the count again) looks at each session's pinned agent pane (`@rlord_pane`, set
   again to the pane every respawn uses; a pin whose pane is gone
   everywhere is dead; no pin: the first pane): its program
   exited, or the session isn't listed. When no server answers at the
@@ -451,9 +452,11 @@ trusted hooks) against what is there to see:
   Only when the user clearly moved on and what followed is over and
   quiet: `idle` (`moved_on`). Moved on is Escape at the prompt (an
   interrupt written after the wait began), or a prompt of theirs after it
-  (typed, or a custom command or skill) whose turn ended; that prompt
-  moves their last message forward. Anything still going is left to the
-  next pass.
+  (typed, or a custom command or skill) whose turn ended. Not while a
+  sub-agent or another thread is named as waiting. That prompt moves their
+  last message forward only if it is shown to be theirs (a typed prompt,
+  not a Codex turn start, and rlord typed nothing since the wait began).
+  Anything still going is left to the next pass.
 
 A "needs you" with no activity since (a stray notification after a turn
 ended) is left for the user to clear: a new prompt in that session, or
