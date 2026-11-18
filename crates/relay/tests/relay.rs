@@ -507,13 +507,15 @@ async fn rendezvous_admit_pairing_devices() {
     );
     // No mailbox on a pairing link.
     p.send_bin(FromDevice::Mailbox(vec![1]).encode()).await;
-    assert!(matches!(p.ctl().await, FromRelay::Err { n: 0, code } if code == code::BAD));
+    assert!(
+        matches!(p.ctl().await, FromRelay::Refused { code, device: None } if code == code::BAD)
+    );
     // One pairing link at a time.
     let e = connect(&r, &id(), As::Pair(rid)).await.err().unwrap();
     assert_eq!(e.code, Some(close::LIMIT));
     // The host drops it.
     h.ok(|n| ToRelay::Drop { n, link }).await;
-    assert_eq!(p.closed().await, Some(1000));
+    assert_eq!(p.closed().await, Some(close::RESET));
     assert_eq!(h.ctl().await, FromRelay::Unlink { id: link });
     h.refused(code::UNKNOWN, |n| ToRelay::Drop { n, link })
         .await;
@@ -590,7 +592,8 @@ async fn mailbox_queues_in_order_until_acked() {
     let mut h = host(&r).await;
     let dk = id();
     let dev = dk.fingerprint();
-    // Not on the list: refused (`err` with `n` 0 answers a binary frame).
+    // Not on the list: refused (`refused`, naming the device, answers a
+    // lane-2 frame).
     h.send_bin(
         FromHost::Mailbox {
             device: dev,
@@ -601,12 +604,13 @@ async fn mailbox_queues_in_order_until_acked() {
     .await;
     assert_eq!(
         h.ctl().await,
-        FromRelay::Err {
-            n: 0,
-            code: code::UNKNOWN.into()
+        FromRelay::Refused {
+            code: code::UNKNOWN.into(),
+            device: Some(b64(&dev)),
         }
     );
     h.allow(&[dev]).await;
+    // Each accepted one is answered `queued` with its number, in order.
     for i in 1..=3u8 {
         h.send_bin(
             FromHost::Mailbox {
@@ -616,6 +620,13 @@ async fn mailbox_queues_in_order_until_acked() {
             .encode(),
         )
         .await;
+        assert_eq!(
+            h.ctl().await,
+            FromRelay::Queued {
+                seq: i as u64,
+                device: Some(b64(&dev)),
+            }
+        );
     }
     // Sent while the device is away; delivered after `ready`, in order.
     let mut d = connect(&r, &dk, As::Device(h.fp())).await.unwrap();
@@ -655,6 +666,20 @@ async fn mailbox_queues_in_order_until_acked() {
         .encode(),
     )
     .await;
+    // (The device's earlier `link`s and `unlink`s come first.)
+    let answer = loop {
+        match h.ctl().await {
+            FromRelay::Link { .. } | FromRelay::Unlink { .. } => {}
+            other => break other,
+        }
+    };
+    assert_eq!(
+        answer,
+        FromRelay::Queued {
+            seq: 4,
+            device: Some(b64(&dev)),
+        }
+    );
     assert_eq!(
         ToDevice::decode(&d.bin().await).unwrap(),
         ToDevice::Mailbox {
@@ -671,6 +696,10 @@ async fn mailbox_queues_in_order_until_acked() {
         .await;
     d.send_bin(FromDevice::Mailbox(b"ask2".to_vec()).encode())
         .await;
+    // A device's are answered too, without a device.
+    for seq in 1..=2 {
+        assert_eq!(d.ctl().await, FromRelay::Queued { seq, device: None });
+    }
     d.quiet(Duration::from_millis(100)).await;
     let mut h = connect(&r, &hk, As::Host(None)).await.unwrap();
     // The link and both queued messages, in order (link first).
@@ -721,16 +750,25 @@ async fn full_queues_refuse_and_never_drop() {
         }
         .encode()
     };
+    let dev = Some(b64(&dk.fingerprint()));
+    let full = FromRelay::Refused {
+        code: code::FULL.into(),
+        device: dev.clone(),
+    };
     h.send_bin(send(vec![1; 10])).await;
     h.send_bin(send(vec![2; 10])).await;
     h.send_bin(send(vec![3; 10])).await;
-    assert_eq!(
-        h.ctl().await,
-        FromRelay::Err {
-            n: 0,
-            code: code::FULL.into()
-        }
-    );
+    // Answered in order: the third is refused, nothing older dropped.
+    for seq in 1..=2 {
+        assert_eq!(
+            h.ctl().await,
+            FromRelay::Queued {
+                seq,
+                device: dev.clone()
+            }
+        );
+    }
+    assert_eq!(h.ctl().await, full);
     let mut d = connect(&r, &dk, As::Device(h.fp())).await.unwrap();
     expect_link(&mut h, &dk.fingerprint(), LinkKind::Device).await;
     assert_eq!(d.ready.queued, Some(2));
@@ -751,11 +789,12 @@ async fn full_queues_refuse_and_never_drop() {
     h.send_bin(send(vec![5; 60])).await;
     assert_eq!(
         h.ctl().await,
-        FromRelay::Err {
-            n: 0,
-            code: code::FULL.into()
+        FromRelay::Queued {
+            seq: 3,
+            device: dev.clone()
         }
     );
+    assert_eq!(h.ctl().await, full);
     assert_eq!(
         ToDevice::decode(&d.bin().await).unwrap(),
         ToDevice::Mailbox {
@@ -799,17 +838,17 @@ async fn queues_can_be_off() {
     .await;
     assert_eq!(
         h.ctl().await,
-        FromRelay::Err {
-            n: 0,
-            code: code::NO_QUEUE.into()
+        FromRelay::Refused {
+            code: code::NO_QUEUE.into(),
+            device: Some(b64(&d.fp())),
         }
     );
     d.send_bin(FromDevice::Mailbox(vec![1]).encode()).await;
     assert_eq!(
         d.ctl().await,
-        FromRelay::Err {
-            n: 0,
-            code: code::NO_QUEUE.into()
+        FromRelay::Refused {
+            code: code::NO_QUEUE.into(),
+            device: None,
         }
     );
 }

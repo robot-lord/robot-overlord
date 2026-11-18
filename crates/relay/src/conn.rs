@@ -3,11 +3,12 @@
 //! that waits for room at another peer never stops its own outgoing
 //! messages (two peers forwarding to each other can't deadlock).
 //!
-//! Backpressure, never dropping: a live frame waits for one of the
-//! receiver's [`OUT_FRAMES`](crate::hub::OUT_FRAMES) permits, and while it
-//! waits this connection is not read. A receiver that takes nothing for
-//! `stall` is closed (`bye` `idle`, then 4408) and the sender told
-//! `undeliverable`.
+//! Backpressure per link, never dropping silently: a device's live frame
+//! waits for one of its link's [`LINK_FRAMES`](crate::hub::LINK_FRAMES)
+//! permits, and while it waits that device is not read. A link whose host
+//! takes nothing for `stall` closes the device (4205, "reconnect now"), not
+//! the host. A host's frame to a device never waits (`hub.rs`): a device
+//! that can't keep up is closed (4205) and the host told `undeliverable`.
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
@@ -388,7 +389,11 @@ async fn prove(hub: &Hub, stream: &mut Stream, out: &Outbox) -> Result<Hello, Re
     Ok(hello)
 }
 
-/// Bytes per second with a burst: a peer over it is read more slowly.
+/// Bytes per second with a burst: a peer over it is read more slowly. A
+/// host's rate and burst are multiplied by `1 + its links` (`take`'s
+/// `scale`): one host connection carries every device's traffic. Fairness
+/// between those links is the host's job (its writer takes turns between
+/// per-link queues).
 struct Bucket {
     rate: f64,
     burst: f64,
@@ -406,17 +411,19 @@ impl Bucket {
         }
     }
 
-    /// Takes `n` bytes; how long to wait before reading on.
-    fn take(&mut self, n: usize) -> Duration {
+    /// Takes `n` bytes at `scale` times the rate and burst; how long to
+    /// wait before reading on.
+    fn take(&mut self, n: usize, scale: f64) -> Duration {
         let now = Instant::now();
-        self.tokens =
-            (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.burst);
+        let rate = self.rate * scale;
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * rate)
+            .min(self.burst * scale);
         self.at = now;
         self.tokens -= n as f64;
         if self.tokens >= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(-self.tokens / self.rate)
+            Duration::from_secs_f64(-self.tokens / rate)
         }
     }
 }
@@ -461,7 +468,11 @@ async fn serve(hub: &Hub, p: &Peer, stream: &mut Stream, kill: &mut watch::Recei
         };
         if len > 0 {
             p.tally.received(len);
-            let wait = bucket.take(len);
+            let scale = match p.role {
+                Role::Host => 1 + hub.host_links(&p.fp, &p.out),
+                Role::Device | Role::Pair => 1,
+            };
+            let wait = bucket.take(len, scale as f64);
             if !wait.is_zero() {
                 tokio::select! {
                     _ = kill.changed() => return,
@@ -483,22 +494,21 @@ async fn serve(hub: &Hub, p: &Peer, stream: &mut Stream, kill: &mut watch::Recei
             Message::Binary(b) => match hub.binary(p, &b) {
                 Route::Nothing => {}
                 Route::Reply(r) => p.out.send(&r),
-                Route::Forward {
-                    to,
-                    frame,
-                    undeliverable,
-                } => {
+                Route::ToHost { to, permits, frame } => {
                     let permit = tokio::select! {
                         biased;
                         _ = kill.changed() => return,
-                        r = tokio::time::timeout(t.stall, to.permits.clone().acquire_owned()) => r,
+                        r = tokio::time::timeout(t.stall, permits.acquire_owned()) => r,
                     };
                     match permit {
                         Ok(Ok(permit)) => to.frame(frame, Some(permit)),
                         _ => {
-                            tracing::info!(from = %short(&p.fp), "link stalled; closing its receiver");
-                            to.kill(close::TOO_SLOW, "stalled", Some((code::IDLE, None)));
-                            p.out.send(&undeliverable);
+                            // The host isn't taking this link's frames: this
+                            // link ends, the host's connection and its other
+                            // links don't.
+                            tracing::info!(from = %short(&p.fp), "link stalled; closing the device");
+                            p.out.kill(close::RESET, "stalled", None);
+                            return;
                         }
                     }
                 }
@@ -564,4 +574,34 @@ async fn write_loop(
     let _ = sink.close().await;
     // The reader stops too.
     out.kill_quietly();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hosts_bucket_scales_with_its_links() {
+        // One link's worth: a second burst waits a second.
+        let mut one = Bucket::new(1000, 1000);
+        assert_eq!(one.take(1000, 1.0), Duration::ZERO);
+        let w = one.take(1000, 1.0);
+        assert!(
+            w > Duration::from_millis(900) && w <= Duration::from_secs(1),
+            "{w:?}"
+        );
+        // Four links: four times the rate.
+        let mut four = Bucket::new(1000, 1000);
+        assert_eq!(four.take(1000, 4.0), Duration::ZERO);
+        let w = four.take(1000, 4.0);
+        assert!(
+            w > Duration::from_millis(200) && w <= Duration::from_millis(250),
+            "{w:?}"
+        );
+        // And four times the burst, once refilled.
+        let mut b = Bucket::new(1000, 1000);
+        b.tokens = 0.0;
+        b.at -= Duration::from_secs(1);
+        assert_eq!(b.take(4000, 4.0), Duration::ZERO);
+    }
 }

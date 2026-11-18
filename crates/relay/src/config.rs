@@ -34,7 +34,8 @@ pub struct Timeouts {
     pub ping: Duration,
     /// ... and closed after this long with nothing received.
     pub idle: Duration,
-    /// A link whose receiver takes no frame for this long is closed.
+    /// A device whose link to its host has no room for this long is closed
+    /// (4205); the host's connection never is.
     pub stall: Duration,
     /// Certificate files are re-read this often.
     pub tls_reload: Duration,

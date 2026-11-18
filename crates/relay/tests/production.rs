@@ -11,8 +11,9 @@ use std::time::Duration;
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use rlord_relay::{Admin, Authorizer, Decision, HostRequest, Limits};
-use rlord_relay_proto::frame::{FromDevice, ToHost};
-use rlord_relay_proto::msg::{close, code, FromRelay, HostState, LinkKind};
+use rlord_relay_proto::frame::{FromDevice, FromHost, ToDevice, ToHost};
+use rlord_relay_proto::msg::{close, code, FromRelay, LinkKind, ToRelay};
+use rlord_relay_proto::B64;
 use tokio_tungstenite::tungstenite::Message;
 
 async fn device_of(r: &Relay, h: &mut Client) -> Client {
@@ -78,17 +79,30 @@ async fn suspended_hosts_and_their_devices_get_4402() {
     assert_eq!(e.code, Some(close::NOT_ALLOWED));
 }
 
+/// The link id in the next `link` the host reads.
+async fn link_of(h: &mut Client) -> u32 {
+    match h.ctl().await {
+        FromRelay::Link { id, .. } => id,
+        other => panic!("expected link, got {other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn a_slow_receiver_stops_the_sender_and_nothing_is_dropped() {
+async fn a_stalled_link_closes_its_device_not_the_host() {
     let stall = Duration::from_secs(2);
     let r = relay(|c| c.timeouts.stall = stall).await;
     let mut h = host(&r).await;
-    let d = device_of(&r, &mut h).await;
-    let dfp = d.fp();
-    let (mut tx, mut rx) = d.ws.split();
+    let (k1, k2) = (id(), id());
+    h.allow(&[k1.fingerprint(), k2.fingerprint()]).await;
+    let d1 = connect(&r, &k1, As::Device(h.fp())).await.unwrap();
+    let link1 = link_of(&mut h).await;
+    let mut d2 = connect(&r, &k2, As::Device(h.fp())).await.unwrap();
+    let link2 = link_of(&mut h).await;
+    let dfp = d1.fp();
+    let (mut tx, mut rx) = d1.ws.split();
 
-    // The device sends far more than any buffer holds; the host reads
-    // nothing.
+    // The first device sends far more than any buffer holds; the host
+    // reads nothing.
     const FRAME: usize = 19_000;
     const COUNT: u32 = 2000;
     let sender = tokio::spawn(async move {
@@ -104,7 +118,7 @@ async fn a_slow_receiver_stops_the_sender_and_nothing_is_dropped() {
             }
         }
     });
-    // The relay stops reading the device: its received bytes stop growing
+    // The relay stops reading that device: its received bytes stop growing
     // well short of what was sent.
     let meter = |r: &Relay| r.running.meter().identity(&dfp).bytes_in;
     let mut last = 0;
@@ -124,45 +138,167 @@ async fn a_slow_receiver_stops_the_sender_and_nothing_is_dropped() {
         "read {last} bytes"
     );
 
-    // After the stall limit the host is closed; the device hears its host
-    // go and is told its frames are undeliverable.
-    let mut offline = false;
-    let mut undeliverable = false;
+    // After the stall limit that device is closed with "reconnect now";
+    // the host isn't.
     let start = std::time::Instant::now();
-    while !(offline && undeliverable) {
+    let code = loop {
         match tokio::time::timeout(stall * 3, rx.next()).await.unwrap() {
+            Some(Ok(Message::Close(c))) => break c.map(|c| u16::from(c.code)),
+            Some(Ok(_)) => {}
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(code, Some(close::RESET));
+    assert!(start.elapsed() < stall * 3);
+    sender.abort();
+
+    // The host gets a gapless prefix of that device's frames, then its
+    // `unlink`, and stays connected.
+    let mut next = 0u32;
+    loop {
+        match h.recv().await {
+            Got::Bin(b) => {
+                let ToHost::Live { payload, link } = ToHost::decode(&b).unwrap() else {
+                    panic!()
+                };
+                assert_eq!(link, link1);
+                let i = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                assert_eq!(i, next, "a frame was dropped or reordered");
+                next += 1;
+            }
+            Got::Ctl(FromRelay::Unlink { id }) => {
+                assert_eq!(id, link1);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(next > 0 && next < COUNT, "{next}");
+    // The other device's link still works both ways.
+    d2.send_bin(FromDevice::Live(b"still here".to_vec()).encode())
+        .await;
+    assert_eq!(
+        ToHost::decode(&h.bin().await).unwrap(),
+        ToHost::Live {
+            link: link2,
+            payload: b"still here".to_vec()
+        }
+    );
+    h.send_bin(
+        FromHost::Live {
+            link: link2,
+            payload: b"and you".to_vec(),
+        }
+        .encode(),
+    )
+    .await;
+    assert_eq!(
+        ToDevice::decode(&d2.bin().await).unwrap(),
+        ToDevice::Live(b"and you".to_vec())
+    );
+    h.ok(|n| ToRelay::Devices {
+        n,
+        allow: vec![B64(k2.fingerprint().to_vec())],
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_device_that_doesnt_read_is_closed_alone() {
+    // A long stall limit: nothing below may wait for it.
+    let stall = Duration::from_secs(5);
+    let r = relay(|c| c.timeouts.stall = stall).await;
+    let mut h = host(&r).await;
+    let (k1, k2) = (id(), id());
+    h.allow(&[k1.fingerprint(), k2.fingerprint()]).await;
+    let d1 = connect(&r, &k1, As::Device(h.fp())).await.unwrap();
+    let link1 = link_of(&mut h).await;
+    let d2 = connect(&r, &k2, As::Device(h.fp())).await.unwrap();
+    let link2 = link_of(&mut h).await;
+    let (mut htx, mut hrx) = h.ws.split();
+
+    // The second device reads everything, counting.
+    let (_, mut rx2) = d2.ws.split();
+    let got2 = Arc::new(AtomicUsize::new(0));
+    let counter = got2.clone();
+    let reader2 = tokio::spawn(async move {
+        while let Some(Ok(m)) = rx2.next().await {
+            if let Message::Binary(b) = m {
+                assert_eq!(ToDevice::decode(&b).unwrap(), ToDevice::Live(vec![2; 100]));
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // The host sends the first device (which reads nothing) far more than
+    // its buffer holds, and the second a frame every so often.
+    const FRAME: usize = 19_000;
+    const COUNT: usize = 2000;
+    let start = std::time::Instant::now();
+    let sender = tokio::spawn(async move {
+        let mut to2 = 0;
+        for i in 0..COUNT {
+            let f = FromHost::Live {
+                link: link1,
+                payload: vec![1; FRAME],
+            };
+            htx.send(Message::binary(f.encode())).await.unwrap();
+            if i % 50 == 0 {
+                let f = FromHost::Live {
+                    link: link2,
+                    payload: vec![2; 100],
+                };
+                htx.send(Message::binary(f.encode())).await.unwrap();
+                to2 += 1;
+            }
+        }
+        (to2, htx)
+    });
+    // The host hears the first device's frames are undeliverable, then
+    // its `unlink`.
+    let mut undeliverable = false;
+    loop {
+        match tokio::time::timeout(WAIT, hrx.next()).await.unwrap() {
             Some(Ok(Message::Text(t))) => match FromRelay::parse(&t).unwrap() {
-                FromRelay::Host {
-                    state: HostState::Offline,
-                } => offline = true,
-                FromRelay::Undeliverable { link: None } => undeliverable = true,
+                FromRelay::Undeliverable { link } => {
+                    assert_eq!(link, Some(link1));
+                    undeliverable = true;
+                }
+                FromRelay::Unlink { id } => {
+                    assert_eq!(id, link1);
+                    break;
+                }
                 other => panic!("{other:?}"),
             },
             Some(Ok(_)) => {}
             other => panic!("{other:?}"),
         }
     }
-    assert!(start.elapsed() < stall * 3);
-    sender.abort();
+    assert!(undeliverable);
+    // That device is closed with "reconnect now" after what it was sent.
+    let mut d1 = d1;
+    assert_eq!(d1.closed().await, Some(close::RESET));
+    // The host's reader never waited on it: everything went through well
+    // inside the stall limit, and the other device got all of its frames.
+    let (to2, _htx) = sender.await.unwrap();
+    assert!(start.elapsed() < stall, "{:?}", start.elapsed());
+    eventually("the second device's frames", || {
+        got2.load(Ordering::Relaxed) == to2
+    })
+    .await;
+    reader2.abort();
+}
 
-    // The host got a gapless prefix of the device's frames, then the close.
-    let mut next = 0u32;
-    loop {
-        match h.recv().await {
-            Got::Bin(b) => {
-                let ToHost::Live { payload, .. } = ToHost::decode(&b).unwrap() else {
-                    panic!()
-                };
-                let i = u32::from_be_bytes(payload[..4].try_into().unwrap());
-                assert_eq!(i, next, "a frame was dropped or reordered");
-                next += 1;
-            }
-            Got::Ctl(FromRelay::Bye { code: c, .. }) => assert_eq!(c, code::IDLE),
-            Got::Ctl(other) => panic!("{other:?}"),
-            Got::Closed(_) => break,
-        }
-    }
-    assert!(next > 0 && next < COUNT, "{next}");
+#[tokio::test]
+async fn a_dropped_link_tells_its_device_to_reconnect_now() {
+    let r = relay(|_| {}).await;
+    let mut h = host(&r).await;
+    let mut d = device_of(&r, &mut h).await;
+    let link = 1;
+    h.ok(|n| ToRelay::Drop { n, link }).await;
+    assert_eq!(d.closed().await, Some(close::RESET));
+    assert!(!close::is_final(close::RESET));
+    assert_eq!(h.ctl().await, FromRelay::Unlink { id: link });
 }
 
 #[tokio::test]

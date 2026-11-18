@@ -3,8 +3,20 @@
 //! forgets it (and `ready.boot` changes, which a device reads as "fetch").
 //!
 //! Every operation takes the one lock briefly and never awaits under it.
-//! What must wait (forwarding a live frame to a full receiver) is done by
-//! the connection task after the lock is released (`conn.rs`).
+//! What must wait (a device's live frame for a host whose share for that
+//! link is full) is done by the connection task after the lock is released
+//! (`conn.rs`).
+//!
+//! **Flow control is per link.** A device's frames to its host take one of
+//! that link's [`LINK_FRAMES`] permits, so one device can fill only its own
+//! share of the host's buffer; the device's reader waits for room, and a
+//! link that stays full for `stall` closes the device ([`close::RESET`]),
+//! never the host. A host's frames to a device take one of the device
+//! connection's [`DEVICE_FRAMES`] permits without waiting: the host's
+//! connection carries all its links, so it is never held up by one; a
+//! device whose buffer is full is closed ([`close::RESET`]) and the host told
+//! `undeliverable`. Nothing is dropped silently: a link that can't keep up
+//! is closed, and both ends start a fresh session.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -22,8 +34,13 @@ use crate::meter::{Meter, Tally};
 use crate::policy::{Authorizer, Limits};
 use crate::registry::{Fp, Registry, Status};
 
-/// Frames a connection's outgoing buffer holds before a sender waits.
-pub const OUT_FRAMES: usize = 64;
+/// Live frames a device's (or pairing device's) connection buffers from
+/// its host; one more closes it. Room for a whole 1 MiB control message
+/// (about 65 frames) and more.
+pub const DEVICE_FRAMES: usize = 128;
+/// Live frames one link may have waiting in its host's buffer; its device
+/// is not read while they are all taken.
+pub const LINK_FRAMES: usize = 64;
 /// Control messages queued to a peer that doesn't read before it is closed.
 const MAX_PENDING_TEXT: usize = 1024;
 
@@ -32,8 +49,8 @@ pub type RendezvousId = [u8; 16];
 /// What a connection's writer sends.
 pub enum Out {
     Text(String),
-    /// A binary frame; a live frame holds one of the receiver's
-    /// [`OUT_FRAMES`] permits until it is written.
+    /// A binary frame; a live frame holds one permit (the link's, or the
+    /// device connection's) until it is written.
     Frame(Vec<u8>, Option<OwnedSemaphorePermit>),
     Close(u16, &'static str),
 }
@@ -63,7 +80,7 @@ impl Outbox {
             Outbox {
                 id,
                 tx,
-                permits: Arc::new(Semaphore::new(OUT_FRAMES)),
+                permits: Arc::new(Semaphore::new(DEVICE_FRAMES)),
                 pending: pending.clone(),
                 kill: Arc::new(kill_tx),
             },
@@ -127,6 +144,8 @@ struct LinkEnd {
     device: Fp,
     kind: LinkKind,
     out: Outbox,
+    /// This link's share of the host's buffer ([`LINK_FRAMES`]).
+    to_host: Arc<Semaphore>,
 }
 
 struct HostConn {
@@ -225,6 +244,7 @@ impl Inner {
                 device: *device,
                 kind,
                 out,
+                to_host: Arc::new(Semaphore::new(LINK_FRAMES)),
             },
         );
         Some(id)
@@ -271,12 +291,13 @@ impl Inner {
 pub enum Route {
     Nothing,
     Reply(FromRelay),
-    /// Forward `frame` to `to` (waiting for room); answer `undeliverable`
-    /// if the link stalls.
-    Forward {
+    /// A device's live frame: forward `frame` to its host `to` once one of
+    /// the link's `permits` is free; if none frees within `stall`, close the
+    /// device ([`close::RESET`]).
+    ToHost {
         to: Outbox,
+        permits: Arc<Semaphore>,
         frame: Vec<u8>,
-        undeliverable: FromRelay,
     },
 }
 
@@ -299,6 +320,14 @@ fn err(n: u64, c: &str) -> FromRelay {
     FromRelay::Err {
         n,
         code: c.to_string(),
+    }
+}
+
+/// A lane-2 frame's refusal.
+fn refused(c: &str, device: Option<&Fp>) -> FromRelay {
+    FromRelay::Refused {
+        code: c.to_string(),
+        device: device.map(|d| B64(d.to_vec())),
     }
 }
 
@@ -663,7 +692,8 @@ impl Hub {
                 let g = self.lock();
                 match g.hosts.get(&p.fp).and_then(|h| h.links.get(&link)) {
                     Some(l) => {
-                        l.out.kill(1000, "dropped by the host", None);
+                        // Its session is gone: the device reconnects at once.
+                        l.out.kill(close::RESET, "dropped by the host", None);
                         FromRelay::Ok { n }
                     }
                     None => err(n, code::UNKNOWN),
@@ -735,22 +765,34 @@ impl Hub {
                 Ok(FromHost::Live { link, payload }) => {
                     let g = self.lock();
                     let undeliverable = FromRelay::Undeliverable { link: Some(link) };
-                    match g.hosts.get(&p.fp).and_then(|h| h.links.get(&link)) {
-                        Some(l) => Route::Forward {
-                            to: l.out.clone(),
-                            frame: ToDevice::Live(payload).encode(),
-                            undeliverable,
-                        },
-                        None => Route::Reply(undeliverable),
+                    let Some(l) = g.hosts.get(&p.fp).and_then(|h| h.links.get(&link)) else {
+                        return Route::Reply(undeliverable);
+                    };
+                    // Never wait here: the host's connection carries every
+                    // link, and one slow device must not hold up the rest.
+                    match l.out.permits.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            l.out.frame(ToDevice::Live(payload).encode(), Some(permit));
+                            Route::Nothing
+                        }
+                        Err(_) => {
+                            tracing::info!(
+                                host = %short(&p.fp),
+                                device = %short(&l.device),
+                                "a device isn't keeping up; closing its link"
+                            );
+                            l.out.kill(close::RESET, "stalled", None);
+                            Route::Reply(undeliverable)
+                        }
                     }
                 }
                 Ok(FromHost::Mailbox { device, payload }) => {
                     match self.registry.is_device(&p.fp, &device) {
                         Ok(true) => {}
-                        Ok(false) => return Route::Reply(err(0, code::UNKNOWN)),
+                        Ok(false) => return Route::Reply(refused(code::UNKNOWN, Some(&device))),
                         Err(e) => {
                             tracing::warn!("store: {e:#}");
-                            return Route::Reply(err(0, code::BAD));
+                            return Route::Reply(refused(code::BAD, Some(&device)));
                         }
                     }
                     let mut g = self.lock();
@@ -758,13 +800,16 @@ impl Hub {
                     let seq =
                         match enqueue(g.to_device.entry(pair).or_default(), &p.limits, &payload) {
                             Ok(seq) => seq,
-                            Err(c) => return Route::Reply(err(0, c)),
+                            Err(c) => return Route::Reply(refused(c, Some(&device))),
                         };
                     if let Some(d) = g.devices.get(&device).filter(|d| d.host == p.fp) {
                         d.out
                             .frame(ToDevice::Mailbox { seq, payload }.encode(), None);
                     }
-                    Route::Nothing
+                    Route::Reply(FromRelay::Queued {
+                        seq,
+                        device: Some(B64(device.to_vec())),
+                    })
                 }
             },
             Role::Device | Role::Pair => match FromDevice::decode(b) {
@@ -783,25 +828,28 @@ impl Hub {
                             .and_then(|d| d.link)
                     };
                     let undeliverable = FromRelay::Undeliverable { link: None };
-                    match link.and_then(|l| Some((l, g.hosts.get(&p.host)?))) {
-                        Some((link, h)) => Route::Forward {
+                    match link.and_then(|l| {
+                        let h = g.hosts.get(&p.host)?;
+                        Some((l, h, h.links.get(&l)?))
+                    }) {
+                        Some((link, h, end)) => Route::ToHost {
                             to: h.out.clone(),
+                            permits: end.to_host.clone(),
                             frame: ToHost::Live { link, payload }.encode(),
-                            undeliverable,
                         },
                         None => Route::Reply(undeliverable),
                     }
                 }
                 Ok(FromDevice::Mailbox(payload)) => {
                     if p.role == Role::Pair {
-                        return Route::Reply(err(0, code::BAD));
+                        return Route::Reply(refused(code::BAD, None));
                     }
                     let mut g = self.lock();
                     let pair = (p.host, p.fp);
                     let seq = match enqueue(g.to_host.entry(pair).or_default(), &p.limits, &payload)
                     {
                         Ok(seq) => seq,
-                        Err(c) => return Route::Reply(err(0, c)),
+                        Err(c) => return Route::Reply(refused(c, None)),
                     };
                     if let Some(h) = g.hosts.get(&p.host) {
                         h.out.frame(
@@ -814,10 +862,20 @@ impl Hub {
                             None,
                         );
                     }
-                    Route::Nothing
+                    Route::Reply(FromRelay::Queued { seq, device: None })
                 }
             },
         }
+    }
+
+    /// How many links a host's connection `out` carries now (0 when it is
+    /// not the host's current connection).
+    pub fn host_links(&self, host: &Fp, out: &Outbox) -> usize {
+        self.lock()
+            .hosts
+            .get(host)
+            .filter(|h| h.out.id == out.id)
+            .map_or(0, |h| h.links.len())
     }
 
     /// Housekeeping: expired queue messages and rendezvous, and hosts

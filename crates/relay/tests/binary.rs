@@ -228,12 +228,14 @@ async fn no_payload_reaches_the_database_or_the_log() {
         .encode(),
     )
     .await;
+    assert!(matches!(h.ctl().await, FromRelay::Queued { .. }));
     assert!(matches!(
         ToDevice::decode(&d.bin().await).unwrap(),
         ToDevice::Mailbox { .. }
     ));
     d.send_bin(FromDevice::Mailbox(MARKER.to_vec()).encode())
         .await;
+    assert!(matches!(d.ctl().await, FromRelay::Queued { .. }));
     assert!(matches!(
         ToHost::decode(&h.bin().await).unwrap(),
         ToHost::Mailbox { .. }
@@ -243,6 +245,7 @@ async fn no_payload_reaches_the_database_or_the_log() {
     assert!(matches!(d.ctl().await, FromRelay::Host { .. }));
     d.send_bin(FromDevice::Mailbox(MARKER.to_vec()).encode())
         .await;
+    assert!(matches!(d.ctl().await, FromRelay::Queued { .. }));
     d.quiet(Duration::from_millis(200)).await;
     // Stopped by SIGTERM: clients get `bye` and 4503.
     signal(&s.child, libc::SIGTERM);

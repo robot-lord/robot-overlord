@@ -26,7 +26,8 @@ use crate::store::now;
 pub struct Limits {
     /// Devices on one host's allow-list.
     pub devices_per_host: usize,
-    /// Bytes a connection may send per second, on average.
+    /// Bytes a connection may send per second, on average (a host's, times
+    /// one plus the number of devices linked to it).
     pub bytes_per_sec: u64,
     /// ... and in one burst.
     pub burst_bytes: u64,

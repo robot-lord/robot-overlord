@@ -157,19 +157,37 @@ All under `[limits]` in `relay.toml`, with these defaults:
 | `max_connections` | 10000 | open connections; past it, HTTP 503 with `Retry-After` |
 | `devices_per_host` | 16 | devices on one host's list |
 | `unauthenticated_per_address` | 8 | connections from one address still connecting |
-| `bytes_per_second`, `burst_bytes` | 262144, 1048576 | per connection; a faster sender is read more slowly |
+| `bytes_per_second`, `burst_bytes` | 262144, 1048576 | per connection, times (1 + its links) for a host; a faster sender is read more slowly |
 | `mailbox_messages`, `mailbox_bytes`, `mailbox_ttl` | 32, 131072, 600 | each mailbox queue (per device and direction); `mailbox_ttl = 0` turns queues off |
 | `rendezvous_per_host`, `rendezvous_ttl`, `rendezvous_attempts` | 4, 300, 3 | pairings a host has open, their longest life in seconds, and attempts each |
 | `auth_timeout` | 5 | seconds to finish connecting |
 | `ping_interval`, `idle_timeout` | 25, 60 | seconds; a silent connection is closed |
-| `stall_timeout` | 10 | seconds a receiver may take no data before it is closed |
+| `stall_timeout` | 10 | seconds a device may wait for room at its host before its link is closed |
 | `host_expiry_days` | 90 | forget unused hosts (0 = never) |
 
-A full queue refuses new messages; it never drops older ones. The relay
-never drops a live message either: when a receiver is slow it stops
-reading the sender, and closes a receiver that takes nothing for
-`stall_timeout`. Before closing for load, a limit or idleness it tells
-the client how long to wait (`bye`).
+A full queue refuses new messages; it never drops older ones. Every
+mailbox message a client sends is answered, in order: `queued` with its
+number, or `refused` with why (`full`, `no_queue`, `unknown`).
+
+The relay never drops a live message silently, and one device can't hold
+up its host's other devices; flow control is per link:
+
+- **Device to host.** Each link has its own share of the host's buffer
+  (64 frames). A device whose share is full is not read until there is
+  room; if its host takes none of that link's frames for
+  `stall_timeout`, the device's connection is closed with 4205 ("your
+  link broke: reconnect now"), never the host's.
+- **Host to device.** The host's one connection carries all its links, so
+  the relay never stops reading it for one of them. Each device has a
+  buffer of 128 frames (a whole 1 MiB message fits); a device that lets
+  it fill is closed with 4205 and the host told `undeliverable`.
+- **Rate.** A host's rate and burst are its account's per-connection
+  limit times (1 + the number of devices linked to it), since it carries
+  all their traffic. Sharing that fairly between its devices is the
+  host's job (`rlord-web` takes turns between per-link queues).
+
+A host's `drop` closes the device with 4205 too. Before closing for load,
+a limit or idleness the relay tells the client how long to wait (`bye`).
 
 ## Backup
 
