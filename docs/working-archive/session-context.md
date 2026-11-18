@@ -46,6 +46,11 @@ gets the text.
   in that window can claim the same parts again.
 - Later messages: every Stop and prompt of a session does a kv delete
   (`stop_claims:<id>`) on the hook's hot path.
+- Later messages, cleanups (review of #79): `stop_claim`'s status and
+  archive checks repeat `refusal()`; `framed()` builds each part by
+  stripping `frame_message`'s header (`strip_prefix`) rather than sharing
+  a body helper; the pending kv map is parsed twice on some paths
+  (`claim_out` then `pending_parts`, `stop_claim` then `first_waiting`).
 - Codex Stop-hook claim: off (`send::CODEX_STOP_CLAIM = false`) until its
   block is checked live; Codex takes held messages at its idle prompt.
 - `limits::limited_in` reads kv `limits` beside the daemon's in-memory

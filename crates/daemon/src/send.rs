@@ -561,8 +561,16 @@ fn pending_parts(db: &Db, id: &str) -> Result<Vec<Value>> {
         .map_or_else(Vec::new, parts_of))
 }
 
+/// A pending entry's messages. One written before parts existed (only
+/// `text`, maybe `context`) is one message, so taking it clears it.
 fn parts_of(entry: &Value) -> Vec<Value> {
-    entry["parts"].as_array().cloned().unwrap_or_default()
+    if let Some(parts) = entry["parts"].as_array() {
+        return parts.clone();
+    }
+    match entry["text"].as_str() {
+        Some(text) => vec![json!({"text": text, "context": entry["context"].as_str()})],
+        None => Vec::new(),
+    }
 }
 
 /// Hold message `part` for session `id` until it can take it, after any
@@ -1303,6 +1311,25 @@ mod tests {
         assert_eq!(pending_parts(&db, &id).unwrap().len(), 2);
         db.kv_set_map(PENDING_KEY, &serde_json::Map::new()).unwrap();
         assert!(db.kv_get(PENDING_KEY).unwrap().is_none());
+    }
+
+    /// An entry from before `parts` (text only) is one message: taking
+    /// it clears it, so it isn't typed again and again.
+    #[test]
+    fn an_entry_without_parts_is_one_message() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        let mut m = serde_json::Map::new();
+        m.insert(id.clone(), json!({"text": "old one", "at": 1}));
+        db.kv_set_map(PENDING_KEY, &m).unwrap();
+        let parts = pending_parts(&db, &id).unwrap();
+        assert_eq!(parts, vec![json!({"text": "old one", "context": null})]);
+        take(&db, &id, &parts).unwrap();
+        assert!(db.kv_map(PENDING_KEY).unwrap().is_empty());
+        // A newer message joins it instead of losing it.
+        db.kv_set_map(PENDING_KEY, &m).unwrap();
+        assert_eq!(queue(&db, &id, &msg("new")).unwrap(), 1);
+        assert_eq!(pending_parts(&db, &id).unwrap().len(), 2);
     }
 
     #[test]
