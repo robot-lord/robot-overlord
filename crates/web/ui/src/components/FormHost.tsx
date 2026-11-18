@@ -5,6 +5,7 @@ import { Fork } from "../forms/Fork";
 import { Keys } from "../forms/Keys";
 import { NewSession } from "../forms/NewSession";
 import { CodeFolder } from "../forms/CodeFolder";
+import { Devices } from "../views/Devices";
 import type { Store } from "../store";
 import { formOf } from "../ui";
 
@@ -15,6 +16,7 @@ const NAMES: Record<string, string> = {
   fork: "fork",
   setup: "code folder",
   keys: "keys",
+  devices: "devices",
 };
 
 export function FormHost({ store }: { store: Store }) {
@@ -51,6 +53,7 @@ export function FormHost({ store }: { store: Store }) {
         <Keys store={store} row={form.cmd?.cmd === "keys" ? form.cmd.row : ""} />
       )}
       {form?.kind === "fork" && form.session && <Fork store={store} s={form.session} />}
+      {form?.kind === "devices" && <Devices store={store} />}
     </>
   );
 }

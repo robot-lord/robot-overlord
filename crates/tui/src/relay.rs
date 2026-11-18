@@ -12,12 +12,15 @@ use rlord_core::qr::Qr;
 
 use super::*;
 
+/// How long an offer stands before the plugin's reports must show it.
+const OFFER_GRACE: Duration = Duration::from_secs(3);
+
 pub(crate) struct Devices {
     /// The daemon's `relay.status`.
     status: Value,
-    /// The pairing offer this screen made: its code's terminal lines and
-    /// when it ends (Unix seconds).
-    offer: Option<(Vec<String>, Option<i64>)>,
+    /// The pairing offer this screen made: its code's terminal lines,
+    /// when it ends (Unix seconds), and when it was made.
+    offer: Option<(Vec<String>, Option<i64>, Instant)>,
     sel: usize,
     /// "Unpair this one?": the device's id and name, until y or n.
     revoking: Option<(String, String)>,
@@ -55,11 +58,16 @@ impl Devices {
         Some(&self.status["pending"]).filter(|p| p.is_object())
     }
 
-    /// A fresh `relay.status`. The offer goes once the plugin no longer
-    /// has it open (a device took it, it ran out, or it was cancelled).
+    /// A fresh `relay.status`. The offer goes once a device took it, or
+    /// the plugin no longer has it open (it ran out, or was cancelled; a
+    /// report a moment older than the offer doesn't count).
     pub(crate) fn set_status(&mut self, status: Value) {
         self.status = status;
-        if self.pending().is_some() || !self.status["pairing"].is_object() {
+        let reported = |made: &Instant| made.elapsed() >= OFFER_GRACE;
+        if self.pending().is_some()
+            || (!self.status["pairing"].is_object()
+                && self.offer.as_ref().is_some_and(|o| reported(&o.2)))
+        {
             self.offer = None;
         }
         self.sel = self.sel.min(self.devices().len().saturating_sub(1));
@@ -70,7 +78,7 @@ impl Devices {
         self.offer = offer["qr"]
             .as_str()
             .and_then(|q| Qr::new(q).ok())
-            .map(|q| (q.half_blocks(2), offer["expires"].as_i64()));
+            .map(|q| (q.half_blocks(2), offer["expires"].as_i64(), Instant::now()));
         self.msg = Some("scan the code on the device you are pairing".into());
     }
 
@@ -293,7 +301,7 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
         let lines = s.lines();
-        let code = s.offer.as_ref().map(|(l, _)| l.as_slice()).unwrap_or(&[]);
+        let code = s.offer.as_ref().map(|o| o.0.as_slice()).unwrap_or(&[]);
         let code_h = if code.is_empty() {
             0
         } else {
@@ -323,7 +331,7 @@ impl App {
                     height: h.min(code_area.height),
                 },
             );
-            let ends = s.offer.as_ref().and_then(|(_, e)| *e).map(|e| {
+            let ends = s.offer.as_ref().and_then(|o| o.1).map(|e| {
                 let left = (e - rlord_core::types::now_ms() / 1000).max(0);
                 format!(
                     "scan it on the device you are pairing: one device, {}m {:02}s left",
@@ -434,9 +442,15 @@ mod tests {
         assert!(t.contains("\"laptop\" wants to pair, code 123 456"), "{t}");
         assert_eq!(s.key(key(KeyCode::Char('y'))), Some(Act::Confirm));
         assert_eq!(s.key(key(KeyCode::Char('n'))), Some(Act::Reject));
-        // An offer the plugin no longer has: gone too.
+        // An offer the plugin no longer has: gone too (once the plugin
+        // has had a moment to report it).
         let mut s = Devices::new(status(Value::Null, json!({"expires": 9})));
         s.set_offer(&json!({"qr": "RLORD1:x", "expires": 9}));
+        s.set_status(status(Value::Null, Value::Null));
+        assert!(s.offer.is_some(), "a report older than the offer");
+        if let Some(o) = s.offer.as_mut() {
+            o.2 = Instant::now() - OFFER_GRACE;
+        }
         s.set_status(status(Value::Null, Value::Null));
         assert!(s.offer.is_none());
     }

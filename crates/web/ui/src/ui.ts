@@ -10,7 +10,7 @@ import type { ListView, SessionBase, UiCmd } from "./proto";
 import type { Route } from "./route";
 
 /** The forms a page can have open (`page.report`'s `form`). */
-export type FormKind = "describe" | "confirm" | "manual" | "fork" | "setup" | "keys";
+export type FormKind = "describe" | "confirm" | "manual" | "fork" | "setup" | "keys" | "devices";
 
 /** The open form: its kind, the command that opened it, and whether the user typed into it. */
 export interface OpenForm {
