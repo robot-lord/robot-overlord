@@ -9,7 +9,10 @@
 //!   `--target web`) into `crates/e2e-wasm/pkg/` (not committed). No
 //!   wasm-pack, no wasm-opt: no tool is downloaded during a build.
 //! - `test-wasm` builds it, then runs the page's separate Vitest project
-//!   (`crates/web/ui/test/e2e/`): the vectors in Node, byte for byte.
+//!   (`crates/web/ui/test/e2e/`): the vectors in Node, byte for byte, and
+//!   an interop run (pairing, reconnect, frames both ways) between the
+//!   WASM core as the device and the native core as the host
+//!   (`rlord-device interop-host`).
 
 use std::path::{Path, PathBuf};
 
@@ -103,14 +106,18 @@ fn wasm() -> Result<PathBuf> {
 }
 
 fn test_wasm() -> Result<()> {
+    // The native half of the interop test.
+    cmd::run(cmd::cargo().args(["build", "-p", "robot-overlord-e2e-device"]))?;
+    let device = std::fs::canonicalize("target/debug/rlord-device")?;
     let ui = Path::new(UI);
     if !ui.join("node_modules").exists() {
         crate::web::main(&["install".to_string()])?;
     }
-    let vitest = ui.join("node_modules/.bin/vitest");
+    // (Relative to the child's folder, `ui`.)
     cmd::run(
-        std::process::Command::new(&vitest)
+        std::process::Command::new("node_modules/.bin/vitest")
             .args(["run", "--config", "vitest.e2e.config.ts"])
+            .env("RLORD_DEVICE_BIN", device)
             .current_dir(ui),
     )
 }

@@ -6,6 +6,10 @@
 //! - `rlord-device check --state FILE`: the cheap "anything for me?"
 //! - `rlord-device snapshot --state FILE`
 //! - `rlord-device ask <text> --state FILE`
+//! - `rlord-device interop-host`: a native host core on stdin/stdout, one
+//!   JSON object per line, for the WASM interop test (`cargo xtask e2e
+//!   test-wasm`): it prints a QR, answers a pairing and a reconnect, and
+//!   echoes every frame back encrypted.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -81,7 +85,53 @@ fn load(path: &PathBuf) -> Result<Device> {
     Ok(d)
 }
 
+/// The native half of the WASM interop test.
+fn interop_host() -> Result<()> {
+    use rlord_e2e::{QrPayload, RelayId, Responder, Session};
+    use std::io::{BufRead, Write};
+    let relay = RelayId::new("http://127.0.0.1:1", [7; 32]);
+    let host = StaticKey::generate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let qr = QrPayload::new(relay.clone(), *host.public()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut out = std::io::stdout();
+    let mut say = |v: Value| -> Result<()> {
+        writeln!(out, "{v}")?;
+        out.flush()?;
+        Ok(())
+    };
+    say(
+        json!({"qr": qr.encode(), "origin": relay.origin, "fingerprint": b64(&relay.fingerprint)}),
+    )?;
+    let mut session: Option<Session> = None;
+    for line in std::io::stdin().lock().lines() {
+        let v: Value = serde_json::from_str(&line?)?;
+        let e = |e: rlord_e2e::Error| anyhow::anyhow!("{e}");
+        if let Some(m1) = v["pair"].as_str() {
+            let (est, m2) = Responder::pair(&host, &qr, &relay, &unb64(m1)?, None).map_err(e)?;
+            say(json!({"msg2": b64(&m2), "code": est.short_code()}))?;
+            session = Some(est.into_session().map_err(e)?);
+        } else if let Some(m1) = v["reconnect"].as_str() {
+            let dev: [u8; 32] = unb64(v["device"].as_str().unwrap_or(""))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("device key"))?;
+            let (est, m2) =
+                Responder::reconnect(&host, &dev, &relay, &unb64(m1)?, None).map_err(e)?;
+            say(json!({"msg2": b64(&m2)}))?;
+            session = Some(est.into_session().map_err(e)?);
+        } else if let Some(f) = v["frame"].as_str() {
+            let s = session.as_mut().context("no session")?;
+            let p = s.decrypt(&unb64(f)?).map_err(e)?;
+            say(json!({"frame": b64(&s.encrypt(&p).map_err(e)?)}))?;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn run(args: Vec<String>) -> Result<()> {
+    if args.first().map(String::as_str) == Some("interop-host") {
+        return interop_host();
+    }
     let state = PathBuf::from(flag(&args, "--state").context(USAGE)?);
     match args.first().map(String::as_str) {
         Some("pair") => {
