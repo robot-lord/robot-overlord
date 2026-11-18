@@ -454,10 +454,9 @@ rlord can't always tell, and may type a message (or a usage-limit
 "continue") into that turn. Daemon mode has been checked on macOS only
 so far.
 
-Not yet: importing Codex conversations started outside rlord, sub-agent
-tracking. Remote Control is Claude Code only: Codex's waits until Codex
-makes it official. A session blocked on a permission prompt shows "needs
-you" only with trusted hooks.
+Not yet: sub-agent tracking. Remote Control is Claude Code only: Codex's
+waits until Codex makes it official. A session blocked on a permission
+prompt shows "needs you" only with trusted hooks.
 
 ## OpenCode sessions
 
@@ -586,11 +585,12 @@ from disk on first view.
 
 rlord can adopt agent conversations you started elsewhere: in a terminal,
 another session manager, or the desktop app. It finds them in the agents' own
-files (`~/.claude/projects/`), so it doesn't matter what started them.
+files (Claude Code's `~/.claude/projects/`, Codex's `~/.codex/sessions/`
+and thread index), so it doesn't matter what started them.
 
 - **Offered on first run**: while rlord has no sessions besides the
-  overlord and Claude Code conversations exist (the only agent importable
-  so far), it offers this once the code-folder form closes. `y` opens the
+  overlord and Claude Code or Codex conversations exist, it offers this
+  once the code-folder form closes. `y` opens the
   overlord and asks it to import your sessions, `d` stops asking, Esc asks
   again next start.
 - **Ask the overlord**: "import my sessions from the last month". It proposes
@@ -608,7 +608,9 @@ files (`~/.claude/projects/`), so it doesn't matter what started them.
   copies running at once fork the transcript. The listing flags
   conversations that look open elsewhere.
 
-Only Claude Code conversations for now.
+Claude Code and Codex conversations can be imported; OpenCode's can't yet.
+Headless runs (`claude -p`, `codex exec`) and Codex sub-agent threads
+aren't listed.
 
 ## Archived sessions and past work
 

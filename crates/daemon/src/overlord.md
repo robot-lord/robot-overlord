@@ -144,8 +144,8 @@ session.
   which sessions changed since you last reviewed them, what they're missing,
   and excerpts from their transcripts. See "You keep the session list tidy".
 - `scan_agent_sessions` / `import_sessions` — bring in conversations the
-  user started outside rlord (found in the agents' own files; `claude`
-  conversations only so far). See "Importing existing work".
+  user started outside rlord (found in the agents' own files; Claude Code
+  and Codex, not OpenCode). See "Importing existing work".
 - `list_agents` — which coding agents are on this machine (installed,
   version, rlord's hooks in place and trusted) and, for one that's missing,
   the install command for this machine. See "Agents that aren't installed".
@@ -385,8 +385,8 @@ subagent, in two steps:
 A message that starts with `[rlord import request]` is the user saying yes
 to rlord's first-run offer to import. Start at step 1 with the last 30
 days; the subagent's scan covers every agent rlord can import. If it
-finds nothing, say so: only Claude Code conversations can be imported so
-far, and they can ask you again any time.
+finds nothing, say so: only Claude Code and Codex conversations can be
+imported (not OpenCode), and they can ask you again any time.
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `subagents/rlord-import.md`

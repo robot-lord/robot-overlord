@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_core::git;
-use rlord_core::import::{add_git_info, explain_claude, scan_claude, ScanOpts};
+use rlord_core::import::{add_git_info, explain, scan_all, ScanOpts};
 use rlord_core::types::now_ms;
 
 use crate::methods::{self, p_str, str_list};
@@ -21,6 +21,14 @@ const HOUR_MS: i64 = 3_600_000;
 pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
     // Only the tracked set needs the DB; the file scan runs without the lock.
     let tracked = d.db().agent_session_ids()?;
+    // rlord's own Codex sessions still waiting to learn their thread.
+    let unbound_codex: Vec<(String, i64)> = d
+        .db()
+        .list_sessions(false)?
+        .into_iter()
+        .filter(|s| s.agent == "codex" && s.agent_session.is_none())
+        .map(|s| (s.project_path, s.created_at))
+        .collect();
     let window_ms = match params["since_hours"].as_i64() {
         Some(h) => h.max(0) * HOUR_MS,
         None => params["since_days"].as_i64().unwrap_or(30).max(0) * 24 * HOUR_MS,
@@ -43,8 +51,9 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
             0
         },
         only: only.clone(),
+        unbound_codex,
     };
-    let mut found = scan_claude(&opts, &|id| tracked.contains(id));
+    let mut found = scan_all(&opts, &|id| tracked.contains(id));
     // Asked for by id but not importable at all (judged before query and
     // limit, which only narrow the listing): say why.
     let rejected: Vec<Value> = opts
@@ -56,8 +65,7 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
                 .any(|c| c.agent_session.starts_with(id.as_str()))
         })
         .map(|id| {
-            let why =
-                explain_claude(id, &|i| tracked.contains(i)).unwrap_or_else(|| "unknown".into());
+            let why = explain(id, &|i| tracked.contains(i));
             json!({"id": id, "reason": why})
         })
         .collect();
@@ -88,12 +96,13 @@ pub fn scan(d: &Daemon, params: &Value) -> Result<Value> {
 /// lock; only the insert holds it.
 pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
     let sid = p_str(params, "agent_session")?.trim().to_string();
-    let agent = rlord_core::agents::Agent::named(params["agent"].as_str().unwrap_or("claude"))?;
-    if !agent.importable() {
-        bail!(
-            "importing {} conversations isn't supported yet",
-            agent.label()
-        );
+    // Optional: the id alone finds the conversation in any importable agent.
+    let agent = match params["agent"].as_str().filter(|a| !a.is_empty()) {
+        Some(a) => Some(rlord_core::agents::Agent::named(a)?),
+        None => None,
+    };
+    if let Some(a) = agent.filter(|a| !a.importable()) {
+        bail!("importing {} conversations isn't supported yet", a.label());
     }
     if sid.len() != 36 {
         bail!("give the full conversation id");
@@ -105,12 +114,13 @@ pub fn import(d: &Daemon, params: &Value) -> Result<Value> {
         only: vec![sid.clone()],
         ..Default::default()
     };
-    let mut c = scan_claude(&opts, &|_| false)
+    let mut c = scan_all(&opts, &|_| false)
         .into_iter()
+        // An `agent` hint that doesn't match is ignored: the id decides.
         .next()
         .ok_or_else(|| {
-            let why = explain_claude(&sid, &|_| false).unwrap_or_else(|| "unknown".into());
-            anyhow::anyhow!("can't import Claude conversation {sid}: {why}")
+            let why = explain(&sid, &|_| false);
+            anyhow::anyhow!("can't import conversation {sid}: {why}")
         })?;
     add_git_info(&mut c);
     let mut recreated = false;

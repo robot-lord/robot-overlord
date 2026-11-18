@@ -200,7 +200,7 @@ impl App {
                 theme::muted(),
             )),
             Line::from(Span::styled(
-                "  Only Claude Code conversations can be imported so far.",
+                "  Claude Code and Codex conversations can be imported (not OpenCode).",
                 theme::muted(),
             )),
             Line::from(Span::styled(format!("  Later: {LATER}."), theme::faint())),

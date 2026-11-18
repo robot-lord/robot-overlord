@@ -1543,14 +1543,18 @@ fn import_cmd(
             if c["open_elsewhere"] == true || c["recently_written"] == true {
                 flags.push("maybe open elsewhere");
             }
+            if c["maybe_held_by_codex_server"] == true {
+                flags.push("may be held by Codex's app/server");
+            }
             let flags = if flags.is_empty() {
                 String::new()
             } else {
                 format!("  [{}]", flags.join(", "))
             };
             println!(
-                "{}  {:>9}  {}{}\n          {}",
-                &c["agent_session"].as_str().unwrap_or("")[..8],
+                "{}  {:<6}  {:>9}  {}{}\n    {}",
+                c["agent_session"].as_str().unwrap_or(""),
+                c["agent"].as_str().unwrap_or("?"),
                 rel_age(c["last_active_at"].as_i64()),
                 dir,
                 flags,
@@ -1578,7 +1582,7 @@ fn import_cmd(
             Ok(s) => {
                 println!(
                     "imported {} as {}{}",
-                    &full[..8],
+                    full,
                     s["name"].as_str().unwrap_or("?"),
                     if archive { " (archived)" } else { "" }
                 );
@@ -1588,7 +1592,7 @@ fn import_cmd(
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("{}: {e:#}", &full[..8]);
+                eprintln!("{}: {e:#}", full);
             }
         }
     }
