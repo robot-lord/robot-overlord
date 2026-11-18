@@ -1210,6 +1210,17 @@ port = 47811     # fixed: the browser keeps the token per address (0 = any)
 # terminal and the web page are both open: "auto" (the one you used
 # last), "terminal" or "web".
 ui_target = "auto"
+
+# Remote access: your devices reach this machine through one relay you
+# pick, end-to-end encrypted (the relay sees only ciphertext). Needs the web
+# plugin. `rlord relay setup <relay address>` sets the first three;
+# `rlord relay pair` adds a device. Nothing dials out until then.
+[remote]
+enabled = false        # true: rlord-web keeps a connection to the relay below
+relay = ""             # https://relay.example.com (set by `rlord relay setup`)
+relay_key = ""         # the relay's key fingerprint, base64url (same command)
+ca_file = ""           # extra root certificate (PEM) for a private relay
+device_expiry_days = 90   # a device unused this long is unpaired (0 = never)
 "##;
 
 #[cfg(test)]
@@ -1297,6 +1308,7 @@ mod tests {
         assert!(c.session.scan_roots().is_empty());
         assert!(!c.web.enabled);
         assert_eq!(c.web.port, 47811);
+        assert_eq!(c.remote, RemoteConfig::default());
     }
 
     #[test]
