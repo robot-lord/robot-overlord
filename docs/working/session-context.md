@@ -765,6 +765,23 @@ Owed (round 4): `apply_first_prompt` / `apply_deferred` dedupe; the dead
 `Way::Argv` arm in `place`; triage reads `launch_words` under the DB
 lock (one query per row).
 
+### Review round 5 (PR #73)
+
+1. "First prompt goes first" lives in `send::type_message` (rlord's own
+   texts wait; the first prompt itself is exempt). `tick` no longer
+   skips messages: one for a stopped or failed session is dropped as
+   before; one that must wait is held (logged once).
+2. A POST that went out while the hold changed still marks the prompt
+   sent (`mark_sent`), so it isn't POSTed again.
+3. A session whose pane is gone (stopped or in error) has its held first
+   prompt marked `stopped`, and `waiting` ignores such a hold.
+
+Owed (round 5): the POST's 10s timeout (the route admits asynchronously
+per the binary's description, so it should answer quickly; unverified
+live); `message_held` as the kind for a held first prompt; triage cost;
+`apply_*` dedupe; the restart's words check repeating
+`fork::restart_prompt`; the dead `Way::Argv` arm.
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;

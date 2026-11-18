@@ -774,6 +774,10 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
             .is_some_and(|h| h["file"] == held["file"]);
         let same = same_file && std::fs::read_to_string(&file).unwrap_or_default() == text;
         if !same {
+            // (Sent all the same: the hold left is a different prompt.)
+            if outcome["sent"] == true {
+                crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
+            }
             db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
             continue;
         }
@@ -815,7 +819,10 @@ fn settle_stopped_first_prompts(d: &Daemon) -> Result<()> {
             let row = db.resolve_ref(&id).ok();
             let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
             match &row {
-                Some(s) if s.archived_at.is_none() && s.status != Status::Stopped => {}
+                // (A pane that is gone shows as stopped or in error.)
+                Some(s)
+                    if s.archived_at.is_none()
+                        && !matches!(s.status, Status::Stopped | Status::Error) => {}
                 Some(s) if s.archived_at.is_none() => {
                     if held["stopped"] != true {
                         held["stopped"] = json!(true);

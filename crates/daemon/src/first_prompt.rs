@@ -219,8 +219,13 @@ pub fn mark_sent(db: &Db, id: &str, at: i64) -> Result<()> {
 /// Whether session `id`'s first prompt is still on its way: held for its
 /// server, or POSTed within `SENT_SETTLE_MS` of `now`.
 pub fn waiting(db: &Db, id: &str, now: i64) -> Result<bool> {
-    if db.kv_get(&pending_key(id))?.is_some() {
-        return Ok(true);
+    // (Held for a stopped session: it goes with the restart, and nothing
+    // waits for it meanwhile.)
+    if let Some(raw) = db.kv_get(&pending_key(id))? {
+        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if held["stopped"] != true {
+            return Ok(true);
+        }
     }
     let sent = db
         .kv_get(&sent_key(id))?
@@ -356,6 +361,10 @@ mod tests {
         assert!(!waiting(&db, "s", 1_000).unwrap());
         hold(&db, "s", Some(Path::new("/x/prompt.md")), 1_000).unwrap();
         assert!(waiting(&db, "s", 1_000_000).unwrap());
+        // Marked stopped: nothing waits for it.
+        db.kv_set(&pending_key("s"), r#"{"file":"/x","at":1,"stopped":true}"#)
+            .unwrap();
+        assert!(!waiting(&db, "s", 2).unwrap());
         hold(&db, "s", None, 0).unwrap();
         mark_sent(&db, "s", 1_000).unwrap();
         assert!(waiting(&db, "s", 1_000 + SENT_SETTLE_MS - 1).unwrap());

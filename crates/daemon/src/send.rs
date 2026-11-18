@@ -271,6 +271,14 @@ pub(crate) fn type_message(
     text: &str,
     source: Option<Source>,
 ) -> Result<Typed> {
+    // Its first prompt goes before anything rlord types (`source`); the
+    // first prompt itself (None) is exempt.
+    if source.is_some() && first_waiting(&d.db(), &s.id)? {
+        return Ok(Typed::NotNow(format!(
+            "{}'s first prompt hasn't gone in yet",
+            s.name
+        )));
+    }
     let pane = agent_pane(s)?;
     // On Codex's daemon another client may have started a turn rlord's
     // status doesn't show: the daemon says.
@@ -337,11 +345,6 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     }
     if s.status != Status::Idle {
         let why = format!("{} is {} (mid-turn)", s.name, s.status.label());
-        return not_now(d, &s, text, when_idle, &why);
-    }
-    // Its first prompt goes first.
-    if first_waiting(&d.db(), &s.id)? {
-        let why = format!("{}'s first prompt hasn't been typed in yet", s.name);
         return not_now(d, &s, text, when_idle, &why);
     }
     // (tmux without the DB lock.)
@@ -484,18 +487,11 @@ fn tick(d: &Daemon) -> Result<()> {
     let mut due: Vec<(String, &'static str)> = Vec::new();
     {
         let db = d.db();
-        let firsts = db.kv_map(FIRST_KEY)?;
         for key in [FIRST_KEY, PENDING_KEY] {
             let mut m = db.kv_map(key)?;
             let now = now_ms();
             let mut dropped = false;
             for id in m.keys().cloned().collect::<Vec<_>>() {
-                // (A session's first prompt goes before its messages.)
-                if key == PENDING_KEY
-                    && (firsts.contains_key(&id) || crate::first_prompt::waiting(&db, &id, now)?)
-                {
-                    continue;
-                }
                 let s = db.resolve_ref(&id).ok();
                 match next(s.as_ref(), limited.get(&id).copied(), now) {
                     Next::Wait => {}
