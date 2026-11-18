@@ -3087,3 +3087,8 @@ it; 10 to 12 need 2, 3, 5, 7 and 9; 13 needs 12; 14 to 16 need 9 and 11;
     flushed to periodic usage records; per-device figures stay in
     memory only (less kept about each device). The actual tiers and
     whether anything is paid are yours to set.
+
+### Slice 3 answers (user, 2026-11-17)
+
+All 18 open questions: the recommended defaults, "for now". Questions 12–18
+(the production relay) stay revisitable when the hosted relay is planned.
