@@ -817,11 +817,21 @@ impl Db {
     /// Every tag on live (unarchived) sessions with its session count, most
     /// used first; the overlord is never tagged.
     pub fn tag_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        self.tag_counts_in(false)
+    }
+
+    /// As `tag_counts`, archived sessions counted too when `archived`.
+    pub fn tag_counts_in(&self, archived: bool) -> Result<Vec<(String, i64)>> {
+        let live = if archived {
+            ""
+        } else {
+            "s.archived_at IS NULL AND "
+        };
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.tag, COUNT(*) FROM tags t JOIN sessions s ON s.id = t.session_id \
-             WHERE s.archived_at IS NULL AND s.role = '' \
-             GROUP BY t.tag ORDER BY COUNT(*) DESC, t.tag",
-        )?;
+             WHERE {live}s.role = '' \
+             GROUP BY t.tag ORDER BY COUNT(*) DESC, t.tag"
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1816,6 +1826,7 @@ mod tests {
         assert_eq!(db.untagged_count().unwrap(), 0);
         db.rename_tag("web", "frontend").unwrap();
         assert_eq!(db.tag_counts().unwrap(), vec![("frontend".to_string(), 1)]);
+        assert_eq!(db.tag_counts_in(true).unwrap(), db.tag_counts().unwrap());
     }
 
     #[test]

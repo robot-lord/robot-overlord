@@ -202,11 +202,14 @@ pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 
-/// Tags are rlord's groups: `{groups: [{tag, count}], untagged}` over live
-/// sessions.
-pub fn tag_list(db: &Db) -> Result<Value> {
+/// Tags are rlord's groups: `{groups: [{tag, count}], untagged, order}`
+/// over live sessions. `{archived: true}` counts archived sessions in
+/// `groups` too (the TUI's tags editor suggests from those); `untagged`
+/// stays live only.
+pub fn tag_list(db: &Db, params: &Value) -> Result<Value> {
+    let archived = params["archived"].as_bool().unwrap_or(false);
     let groups: Vec<Value> = db
-        .tag_counts()?
+        .tag_counts_in(archived)?
         .into_iter()
         .map(|(tag, count)| json!({"tag": tag, "count": count}))
         .collect();

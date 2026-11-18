@@ -27,6 +27,7 @@ mod record;
 mod setupform;
 /// A session's status in words (also `rlord show`).
 pub mod statustext;
+mod tagsform;
 mod theme;
 use groups::Tab;
 use newform::NewForm;
@@ -177,8 +178,8 @@ enum Mode {
     Filter(String),
     Rename(String),
     Describe(String),
-    /// Editing the selected session's tags (space-separated).
-    Tags(String),
+    /// The tags editor (`#`).
+    Tags(Box<tagsform::TagEditor>),
     /// Renaming a group (tag) on every session: (from, buffer).
     RenameGroup(String),
     NewSession(Box<NewForm>),
@@ -934,7 +935,7 @@ impl App {
             Mode::Filter(buf) => self.handle_input(k, buf, InputKind::Filter, terminal)?,
             Mode::Rename(buf) => self.handle_input(k, buf, InputKind::Rename, terminal)?,
             Mode::Describe(buf) => self.handle_input(k, buf, InputKind::Describe, terminal)?,
-            Mode::Tags(buf) => self.handle_input(k, buf, InputKind::Tags, terminal)?,
+            Mode::Tags(ed) => self.handle_tags_form(k, ed),
             Mode::RenameGroup(buf) => {
                 self.handle_input(k, buf, InputKind::RenameGroup, terminal)?
             }
@@ -1133,20 +1134,7 @@ impl App {
                 Tab::Sessions => Tab::Groups,
                 Tab::Groups => Tab::Sessions,
             }),
-            Action::Tags => {
-                if let Some(s) = self.selected() {
-                    let cur = s["tags"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default();
-                    self.mode = Mode::Tags(cur);
-                }
-            }
+            Action::Tags => self.open_tags_form(),
             Action::New => self.open_new_form(newform::FormKind::Overlord),
             Action::NewManual => self.open_new_form(newform::FormKind::Manual),
             Action::Fork => self.open_fork_form(),
@@ -1252,7 +1240,6 @@ impl App {
                         self.dirty = true;
                     }
                 }
-                InputKind::Tags => self.save_tags(&buf),
                 InputKind::RenameGroup => {
                     let to = buf.trim().trim_start_matches('#').to_string();
                     if let Some(from) = self.group_sel.clone().filter(|g| *g != to) {
@@ -1304,32 +1291,16 @@ impl App {
         Ok(())
     }
 
-    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
-    /// Replace the selected session's tags with `buf` (space/comma separated).
-    fn save_tags(&mut self, buf: &str) {
-        let Some(s) = self.selected().cloned() else {
-            return;
-        };
-        let new: Vec<String> = buf
-            .split([' ', ','])
-            .map(|t| t.trim().trim_start_matches('#').to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
-        let old: Vec<String> = s["tags"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let add: Vec<&String> = new.iter().filter(|t| !old.contains(t)).collect();
-        let remove: Vec<&String> = old.iter().filter(|t| !new.contains(t)).collect();
-        if add.is_empty() && remove.is_empty() {
-            return;
-        }
-        let id = s["id"].as_str().unwrap_or("");
+    /// Save the tags editor's result: `new` is the full set, `add` and
+    /// `remove` the change from what the session had.
+    fn save_tags(
+        &mut self,
+        id: &str,
+        name: &str,
+        new: &[String],
+        add: &[String],
+        remove: &[String],
+    ) {
         if self
             .call(
                 "session.tag",
@@ -1355,11 +1326,10 @@ impl App {
                 }
             }
             self.status_line = if new.is_empty() {
-                format!("{}: untagged", s["name"].as_str().unwrap_or("?"))
+                format!("{name}: untagged")
             } else {
                 format!(
-                    "{}: {}",
-                    s["name"].as_str().unwrap_or("?"),
+                    "{name}: {}",
                     new.iter()
                         .map(|t| format!("#{t}"))
                         .collect::<Vec<_>>()
@@ -1370,6 +1340,7 @@ impl App {
         self.dirty = true;
     }
 
+    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
     fn edit_notes(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(s) = self.selected().cloned() else {
             return Ok(());
@@ -1574,6 +1545,7 @@ impl App {
             Mode::OverlordSetup(s) => self.draw_setup(f, s),
             Mode::Setup(s) => self.draw_setup_form(f, s),
             Mode::Fork(s) => self.draw_fork_form(f, s),
+            Mode::Tags(ed) => self.draw_tags_form(f, ed),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
@@ -2497,9 +2469,7 @@ impl App {
             )),
             Mode::Rename(b) => Some(format!("rename: {b}▏")),
             Mode::Describe(b) => Some(format!("description: {b}▏   (enter: save · esc: cancel)")),
-            Mode::Tags(b) => Some(format!(
-                "tags (= groups): {b}▏   (space-separated · enter: save · esc: cancel)"
-            )),
+            Mode::Tags(_) => Some("tags — see dialog".to_string()),
             Mode::RenameGroup(b) => Some(format!(
                 "rename group (on every session): #{b}▏   (enter: save · esc: cancel)"
             )),
@@ -2734,7 +2704,6 @@ enum InputKind {
     Filter,
     Rename,
     Describe,
-    Tags,
     RenameGroup,
 }
 
@@ -2744,7 +2713,6 @@ impl InputKind {
             InputKind::Filter => Mode::Filter(buf),
             InputKind::Rename => Mode::Rename(buf),
             InputKind::Describe => Mode::Describe(buf),
-            InputKind::Tags => Mode::Tags(buf),
             InputKind::RenameGroup => Mode::RenameGroup(buf),
         }
     }
