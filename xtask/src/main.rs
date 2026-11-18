@@ -13,6 +13,7 @@ mod check_deps;
 mod cmd;
 mod demo_wrap;
 mod dev_daemon;
+mod e2e;
 mod fresh_install;
 mod preflight;
 mod publish;
@@ -43,6 +44,8 @@ usage: cargo xtask <task>
       fail if the rlord binary depends on network code (the web plugin's)
   web install|check|build|watch
       the web plugin's page (crates/web/ui): install its pinned tools, check, build
+  e2e vectors [--check] | wasm | test-wasm
+      the end-to-end crypto core's test vectors and WASM build (crates/e2e)
   check-version-bump [BASE] [REV]
       fail unless REV bumps the version above BASE's (origin/main, HEAD)
   update-tap VERSION SHA256SUMS [TAP_REPO]
@@ -99,6 +102,7 @@ fn main() -> ExitCode {
         "check-version-bump" => bump::main(rest),
         "check-deps" => check_deps::main(rest),
         "web" => web::main(rest),
+        "e2e" => e2e::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),

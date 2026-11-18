@@ -1,0 +1,43 @@
+# rlord's end-to-end crypto core (`rlord_e2e`): sans-IO, used by the web
+# plugin (the host), the WASM build (a WebView or browser device) and the
+# test device. No tokio, sockets, files or clock (`cargo xtask check-deps`
+# holds it to that). Never in the `rlord` binary. See
+# docs/working/e2e-crypto.md and docs/working/web-ui-remote.md.
+[package]
+name = "robot-overlord-e2e"
+description = "rlord's end-to-end encryption core. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_e2e"
+
+[features]
+# The test-vector runner (JSON in, JSON out), shared by native tests, xtask
+# and the WASM build.
+vectors = ["dep:serde", "dep:serde_json", "dep:hex"]
+
+[dependencies]
+# Exact pins: the protocol's bytes depend on them (the vectors check it).
+# Only the pure-Rust primitives; snow's `std` feature would pull ring.
+# `risky-raw-split` gives the mailbox its two raw keys (mailbox.rs).
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom", "risky-raw-split"] }
+# The versions snow resolves, so no duplicates.
+sha2 = { version = "=0.10.9", default-features = false }
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+curve25519-dalek = { version = "=4.1.3", default-features = false }
+getrandom = { version = "=0.3.4", default-features = false }
+zeroize = { version = "=1.9.2", default-features = false, features = ["derive", "alloc"] }
+base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { version = "=0.4.3", optional = true }
+
+[dev-dependencies]
+robot-overlord-e2e = { path = ".", features = ["vectors"] }
+serde_json.workspace = true

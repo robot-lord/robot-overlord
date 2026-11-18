@@ -867,6 +867,52 @@ Decided 2026-11-17 (user):
   the spec, and in the plan what slice 3 leaves room for and what waits
   for a production-relay slice. Eighteen open questions wait for the
   user.
+- Slice 3 build (Opus implementer, 2026-11-17, `feat/web-ui-3`):
+  - Step 1 gates all pass. (a) `snow` 0.10.0's raw split (feature
+    `risky-raw-split`) plus our own ChaCha20-Poly1305 cipher state gives
+    the same frames as its `TransportState` with `rekey_outgoing` after
+    every message: checked inside the vectors run itself
+    (`vectors::run` fails on any difference), so it stays checked. (b)
+    `rustls` 0.23 (ring), `tokio-rustls` 0.26, `p256` 0.14 (ecdsa),
+    `rusqlite` 0.42 (bundled) and `webpki-roots` 1 cross-build with
+    `cargo zigbuild` to static binaries for both musl targets (a scratch
+    crate). (c) The spike's core builds natively and for
+    `wasm32-unknown-unknown` inside the main workspace (edition 2021,
+    resolver 2, the spike's exact pins next to the workspace's own
+    `sha2` 0.10.9 and `getrandom` 0.3.4: no duplicates).
+  - **Naming collision found** (the plan breaks here, by name only):
+    rlord already has a `remote.*` RPC family, `crates/daemon/src/remote.rs`,
+    `rlord remote <session> on|off` and per-session `remote` fields, all
+    for Claude Code's Remote Control, and the MCP server calls
+    `remote.status` and `remote.set`. The plan's `remote.*` user-only
+    commands, `daemon/src/remote.rs` and `rlord remote setup|pair|…`
+    would collide. Taken instead (rename is cheap if the user prefers
+    another word): RPC family `relay.*` (`daemon/src/relay.rs`), CLI
+    `rlord relay setup|pair|confirm|reject|devices|revoke|status|disable`,
+    TUI `:relay` (Devices screen `tui/src/relay.rs`), snapshot key
+    `relay`. Config stays `[remote]` and the plugin's module stays
+    `crates/web/src/remote/` (no collision there).
+  - Steps 2 and 3 done (`crates/e2e`, lib `rlord_e2e`): the spike's core
+    ported to edition 2021, libcrux only (the RustCrypto backend, the
+    classical baseline and the `pq-*` features dropped); `Kind` (1
+    pairing, 2 reconnect, 3 mailbox keying); `Established::into_session`
+    (kinds 1 and 2) and `into_mailbox` (kind 3 only, over the raw
+    split); a `Session` poisons itself on any decrypt failure
+    (malformed frames included) and every later call returns
+    `Error::Decrypt`; `stream.rs` (stream id and `MORE` flag,
+    `fragment`, `Reassembler` per stream with the 1 MiB limit, `single`
+    for one-frame messages); `mailbox.rs` (`MailboxSession`, Noise's
+    cipher state and `REKEY` by hand over `chacha20poly1305` =0.10.1,
+    Padmé padding, `export`/`import` of 81 bytes, poisoned on any
+    failure); `device_id`. Vectors in `crates/e2e/vectors/v1.json` (88 KB,
+    was 232 KB) by `cargo xtask e2e vectors [--check]`; the protocol test
+    fails when the file is stale. New vector cases: the kind-3
+    handshake, a mailbox sequence both ways (equal to snow's transport,
+    and with export and import between every message), an export
+    mid-sequence, fragment headers, one 16 KiB frame by hash, and the
+    failures (wrong kind both ways, mailbox as live and live as mailbox,
+    tampered message 1 and 2, a frame after poisoning, oversized frame,
+    mailbox gap, replay, tamper, export after poison, bad stream flags).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

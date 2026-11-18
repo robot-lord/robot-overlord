@@ -1,0 +1,23 @@
+# The `wasm-bindgen` surface of rlord's end-to-end crypto core, for a
+# WebView or browser device. WASM only; built by `cargo xtask e2e wasm`
+# into `pkg/` (not committed). Never in the `rlord` binary.
+[package]
+name = "robot-overlord-e2e-wasm"
+description = "WASM bindings of rlord's end-to-end encryption core. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_e2e_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rlord-e2e = { package = "robot-overlord-e2e", path = "../e2e", features = ["vectors"] }
+wasm-bindgen = "=0.2.130"
+# Only to switch on the browser random source (crypto.getRandomValues);
+# the build also sets `--cfg getrandom_backend="wasm_js"`.
+getrandom = { version = "=0.3.4", features = ["wasm_js"] }
