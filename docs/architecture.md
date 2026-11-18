@@ -431,22 +431,28 @@ trusted hooks) against what is there to see:
 
 - **Agent pane gone** on two answered looks in a row: `stopped`, through
   `discover`'s stop (`session_end` from the pane). One `list-panes -a` a
-  pass looks at each session's pinned agent pane (`@rlord_pane`, else
-  the first): its program exited, or the session isn't listed. Any tmux
-  failure, "no server running" included, gives no pane verdict that pass
-  and starts the counts again (a server that really died is for the
-  startup reconcile and `discover`).
+  pass looks at each session's pinned agent pane (`@rlord_pane`; a pin
+  whose pane is gone is dead; no pin: the first pane): its program
+  exited, or the session isn't listed. When no server answers at the
+  socket, every session is gone only if the server process seen before
+  (`#{pid}`) has exited: a deleted socket file with the server alive
+  proves nothing. Any other tmux failure gives no pane verdict that pass
+  and starts the counts again.
 - **`working`**, unchanged for 2 minutes, while the transcript's last
   turn line ended it (a final reply: `turn_ended`) or interrupted it
   (Claude's `[Request interrupted by user…]` line, Codex's
-  `turn_aborted`: `interrupted`), written after the status change, and
+  `turn_aborted`: `interrupted`; Codex's v2 `turn_started` /
+  `turn_complete` read like `task_*`), written after the status change, and
   nothing written for 2 minutes: `idle`. A final reply moves the
   session's last message forward to it, as a `Stop` would.
 - **`waiting_input`** is never cleared from the transcript alone: a real
   prompt can wait silently for hours, on the main agent or a sub-agent.
-  Only when the user clearly moved on, a prompt of theirs written after
-  the wait began: `idle` if that turn is over and quiet, else `working`
-  (`moved_on`).
+  Only when the user clearly moved on and what followed is over and
+  quiet: `idle` (`moved_on`). Moved on is Escape at the prompt (an
+  interrupt written after the wait began), or a prompt of theirs after it
+  (typed, or a custom command or skill) whose turn ended; that prompt
+  moves their last message forward. Anything still going is left to the
+  next pass.
 
 A "needs you" with no activity since (a stray notification after a turn
 ended) is left for the user to clear: a new prompt in that session, or

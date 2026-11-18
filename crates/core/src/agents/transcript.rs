@@ -268,38 +268,50 @@ pub fn tail(path: &Path) -> Option<Tail> {
 
 /// `tail` over lines already parsed (oldest first).
 pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
-    let lines = || lines.iter().rev().map(|v| format.line(v));
-    // (Read backwards: whether a local command's output came after.)
+    // Read backwards, once: whether a local command's output came after a
+    // line decides what a command's wrapper line is.
     let mut local_after = false;
-    let turn = lines().find_map(|l| {
+    let mut turn: Option<(TurnTail, Option<i64>)> = None;
+    let mut prompt_at: Option<Option<i64>> = None;
+    let mut last_at = None;
+    for l in lines.iter().rev().map(|v| format.line(v)) {
         let at = l.at().and_then(parse_iso_ms);
-        if l.command_wrapper() {
+        last_at = last_at.or(at);
+        // This line about the turn, and whether the user started one.
+        let (says, starts) = if l.command_wrapper() {
             // A built-in command (its output follows): nothing; that
             // output covers this one command only. A custom command or a
-            // skill: the model's turn.
+            // skill: a turn of the model's, started by the user.
             let local = std::mem::take(&mut local_after);
-            return (!local).then_some((TurnTail::Open, at));
-        }
-        if l.local_output() {
+            (if local { None } else { Some(TurnTail::Open) }, !local)
+        } else if l.local_output() {
             local_after |= l.local_command_output();
-            return None;
+            (None, false)
+        } else if l.interrupted() {
+            (Some(TurnTail::Interrupted), false)
+        } else {
+            let ended = l.turn_ended();
+            let starts = l.prompt().is_some() || (format == Format::Codex && ended == Some(false));
+            (
+                ended.map(|e| if e { TurnTail::Ended } else { TurnTail::Open }),
+                starts,
+            )
+        };
+        if turn.is_none() {
+            turn = says.map(|t| (t, at));
         }
-        if l.interrupted() {
-            return Some((TurnTail::Interrupted, at));
+        if prompt_at.is_none() && starts {
+            prompt_at = Some(at);
         }
-        l.turn_ended()
-            .map(|e| (if e { TurnTail::Ended } else { TurnTail::Open }, at))
-    });
-    let starts = |l: &Line| {
-        l.prompt().is_some() || (format == Format::Codex && l.turn_ended() == Some(false))
-    };
+        if turn.is_some() && prompt_at.is_some() && last_at.is_some() {
+            break;
+        }
+    }
     Tail {
         turn: turn.map(|t| t.0),
         turn_at: turn.and_then(|t| t.1),
-        prompt_at: lines()
-            .filter(starts)
-            .find_map(|l| l.at().and_then(parse_iso_ms)),
-        last_at: lines().find_map(|l| l.at().and_then(parse_iso_ms)),
+        prompt_at: prompt_at.flatten(),
+        last_at,
     }
 }
 
@@ -1125,6 +1137,9 @@ mod tests {
             ),
         ]);
         assert_eq!(custom.turn, Some(TurnTail::Open));
+        // ... which the user started; a built-in command starts none.
+        assert_eq!(custom.prompt_at, at("2026-11-12T10:00:20Z"));
+        assert_eq!(builtin.prompt_at, None);
         // Nothing about a turn: unknown.
         assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
         let ev = |kind: &str| json!({"timestamp": "2026-11-12T10:00:00Z", "type": "event_msg", "payload": {"type": kind}});
@@ -1140,6 +1155,15 @@ mod tests {
             Some(TurnTail::Ended)
         );
         assert!(tail_of(Format::Codex, &[ev("task_started")])
+            .prompt_at
+            .is_some());
+        // v2 names.
+        assert_eq!(codex(&[ev("turn_started")]), Some(TurnTail::Open));
+        assert_eq!(
+            codex(&[ev("turn_started"), ev("turn_complete")]),
+            Some(TurnTail::Ended)
+        );
+        assert!(tail_of(Format::Codex, &[ev("turn_started")])
             .prompt_at
             .is_some());
         // From a file: its tail, the same answer.

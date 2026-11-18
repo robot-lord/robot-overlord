@@ -35,11 +35,16 @@ pub(crate) const QUIET_MS: i64 = 120_000;
 pub fn start(d: &Arc<Daemon>) {
     let d = Arc::clone(d);
     std::thread::spawn(move || {
-        // How many passes in a row each session's pane has looked gone.
-        let mut gone: HashMap<String, u8> = HashMap::new();
+        let mut memo = Memo::default();
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pass(&d, &mut gone, &tmux::agent_panes_dead, now_ms())
+                pass(
+                    &d,
+                    &mut memo,
+                    &tmux::agent_panes,
+                    &tmux::pid_alive,
+                    now_ms(),
+                )
             }));
             match r {
                 Ok(Err(e)) => tracing::debug!(error = %e, "re-checking stored statuses"),
@@ -49,6 +54,16 @@ pub fn start(d: &Arc<Daemon>) {
             std::thread::sleep(PASS);
         }
     });
+}
+
+/// What passes remember.
+#[derive(Default)]
+pub(crate) struct Memo {
+    /// How many answered looks in a row each session's pane looked gone.
+    gone: HashMap<String, u8>,
+    /// The tmux server's pid, as it last said: when no server answers, it
+    /// is gone only if that process is.
+    server_pid: Option<i32>,
 }
 
 /// The sessions checked here: live, on an agent whose hooks report its
@@ -103,15 +118,13 @@ pub(crate) fn verdict(e: &Evidence) -> Option<(Status, &'static str)> {
     if e.status == Status::WaitingInput {
         // Never from the transcript alone: a prompt can wait silently for
         // hours (on the main agent or a sub-agent). Only once the user
-        // clearly moved on: a prompt of theirs after the wait began.
-        if !after(tail.prompt_at) {
-            return None;
-        }
-        // (The turn that prompt started: over, or still going.)
-        return Some(match ended(tail.turn) {
-            Some(_) if quiet => (Status::Idle, "moved_on"),
-            _ => (Status::Working, "moved_on"),
-        });
+        // clearly moved on, and what followed is over and quiet: Escape at
+        // the prompt (an interrupt written after the wait began), or a
+        // prompt of theirs after it whose turn ended. Anything still going:
+        // the next pass decides.
+        let escaped = tail.turn == Some(TurnTail::Interrupted) && after(tail.turn_at);
+        let moved = after(tail.prompt_at) && ended(tail.turn).is_some() && after(tail.turn_at);
+        return (quiet && (escaped || moved)).then_some((Status::Idle, "moved_on"));
     }
     // Working: its turn's end (written after the status change: else it
     // is the previous turn's), and quiet since.
@@ -119,16 +132,18 @@ pub(crate) fn verdict(e: &Evidence) -> Option<(Status, &'static str)> {
     (quiet && after(tail.turn_at)).then_some((Status::Idle, why))
 }
 
-/// One pass. `gone` counts each session's gone-looking panes across
-/// passes; `panes` is one look at every session's agent pane
-/// (`tmux::agent_panes_dead`; tests pass their own). When tmux can't say,
-/// no pane verdict is made this pass (nothing is stopped on a guess); the
-/// transcript checks go on. One session's failure is logged and the pass
-/// goes on. Returns how many statuses were corrected.
+/// One pass. `panes` is one look at every session's agent pane
+/// (`tmux::agent_panes`), `alive` asks whether a process is there (tests
+/// pass their own). With no server answering, the sessions are gone only
+/// if the server process seen before is gone too (a deleted socket file
+/// with the server alive proves nothing). Any other tmux failure: no pane
+/// verdict this pass. One session's failure is logged and the pass goes
+/// on. Returns how many statuses were corrected.
 pub(crate) fn pass(
     d: &Daemon,
-    gone: &mut HashMap<String, u8>,
-    panes: &dyn Fn() -> Result<HashMap<String, bool>>,
+    memo: &mut Memo,
+    panes: &dyn Fn() -> Result<Option<tmux::AgentPanes>>,
+    alive: &dyn Fn(i32) -> bool,
     now: i64,
 ) -> Result<usize> {
     let sessions: Vec<Session> = d
@@ -137,19 +152,28 @@ pub(crate) fn pass(
         .into_iter()
         .filter(checked)
         .collect();
-    gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
-    let panes = match panes() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!(error = %e, "tmux couldn't say: no pane verdicts this pass");
+    memo.gone
+        .retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    let dead = match panes() {
+        Ok(Some(p)) => {
+            memo.server_pid = p.server_pid.or(memo.server_pid);
+            Some(p.dead)
+        }
+        // No server answers, and the one seen before has exited: every
+        // session is gone.
+        Ok(None) if memo.server_pid.is_some_and(|pid| !alive(pid)) => Some(HashMap::new()),
+        r => {
+            if let Err(e) = r {
+                tracing::debug!(error = %e, "tmux couldn't say: no pane verdicts this pass");
+            }
             // (Two looks in a row means two that were answered.)
-            gone.clear();
+            memo.gone.clear();
             None
         }
     };
     let mut fixed = 0;
     for s in &sessions {
-        match check(d, s, panes.as_ref(), gone, now) {
+        match check(d, s, dead.as_ref(), &mut memo.gone, now) {
             Ok(true) => fixed += 1,
             Ok(false) => {}
             Err(e) => tracing::debug!(session = %s.id, error = %e, "re-checking a status"),
@@ -208,7 +232,16 @@ fn check(
     let ended_at = tail
         .filter(|t| to == Status::Idle && t.turn == Some(TurnTail::Ended))
         .and_then(|t| t.turn_at);
-    apply(&db, s, to, why, now, ended_at)
+    let done = apply(&db, s, to, why, now, ended_at)?;
+    // The user moved on: their prompt is their latest message (forward
+    // only).
+    let prompted = tail
+        .and_then(|t| t.prompt_at)
+        .filter(|at| why == "moved_on" && s.last_state_change_at.is_some_and(|st| *at > st));
+    if let Some(at) = prompted.filter(|at| done && s.last_user_msg_at.is_none_or(|m| *at > m)) {
+        db.touch_last_user_msg(&s.id, at)?;
+    }
+    Ok(done)
 }
 
 /// Write the corrected status, only if the session's status is still the
@@ -293,9 +326,16 @@ mod tests {
         // ago) is left for the user; so is a prompt waiting silently on a
         // sub-agent, and a real question waiting for hours.
         assert_eq!(verdict(&ev(WaitingInput, long, tail(Ended, long))), None);
+        // An interrupt from before the wait: not this one.
         assert_eq!(
-            verdict(&ev(WaitingInput, 5 * MIN, tail(Interrupted, 5 * MIN))),
+            verdict(&ev(WaitingInput, 5 * MIN, tail(Interrupted, 6 * MIN))),
             None
+        );
+        // Escape at the prompt: an interrupt written after the wait began,
+        // quiet since: the user moved on.
+        assert_eq!(
+            verdict(&ev(WaitingInput, 5 * MIN, tail(Interrupted, 3 * MIN))),
+            Some((Idle, "moved_on"))
         );
         assert_eq!(
             verdict(&ev(WaitingInput, 7 * 60 * MIN, tail(Open, 7 * 60 * MIN))),
@@ -310,8 +350,9 @@ mod tests {
             )),
             None
         );
-        // The user moved on: a prompt of theirs after the wait began. Its
-        // turn over and quiet: idle; still going: working.
+        // The user moved on: a prompt of theirs after the wait began, and
+        // its turn over and quiet: idle. Still going, or not quiet yet:
+        // nothing (the next pass decides).
         assert_eq!(
             verdict(&ev(
                 WaitingInput,
@@ -321,8 +362,20 @@ mod tests {
             Some((Idle, "moved_on"))
         );
         assert_eq!(
-            verdict(&ev(WaitingInput, long, tail_p(Open, MIN, Some(4 * MIN)))),
-            Some((Working, "moved_on"))
+            verdict(&ev(
+                WaitingInput,
+                long,
+                tail_p(Open, 3 * MIN, Some(4 * MIN))
+            )),
+            None
+        );
+        assert_eq!(
+            verdict(&ev(
+                WaitingInput,
+                long,
+                tail_p(Ended, MIN / 2, Some(4 * MIN))
+            )),
+            None
         );
         // Working: its turn's end, written after the status change, and
         // quiet since.
@@ -532,9 +585,10 @@ mod tests {
             add(&db, dir.path(), "vanished", "claude", Status::Idle, t0, "");
         }
         // tmux couldn't say: no pane verdicts, the transcript checks go on.
-        let broken = || -> Result<HashMap<String, bool>> { anyhow::bail!("lost server") };
-        let mut gone = HashMap::new();
-        assert_eq!(pass(&d, &mut gone, &broken, now).unwrap(), 3);
+        let broken = || -> Result<Option<tmux::AgentPanes>> { anyhow::bail!("lost server") };
+        let mut memo = Memo::default();
+        let alive = |_: i32| true;
+        assert_eq!(pass(&d, &mut memo, &broken, &alive, now).unwrap(), 3);
         let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
         assert_eq!(status("stale"), Status::WaitingInput);
         assert_eq!(status("asking"), Status::WaitingInput);
@@ -545,6 +599,11 @@ mod tests {
         // would have; an interrupt (Claude's, or Codex's turn_aborted)
         // doesn't.
         let at = |id: &str| d.db().resolve_ref(id).unwrap().last_agent_msg_at;
+        // Moving on dates the user's last message from their prompt.
+        assert_eq!(
+            d.db().resolve_ref("moved").unwrap().last_user_msg_at,
+            transcript::parse_iso_ms("2026-11-10T00:01:00Z")
+        );
         assert_eq!(
             at("moved"),
             transcript::parse_iso_ms("2026-11-10T00:02:00Z")
@@ -555,7 +614,7 @@ mod tests {
         assert_eq!(status("cx"), Status::Working);
         // No look at the panes so far.
         assert_eq!(status("dead"), Status::Idle);
-        assert!(gone.is_empty());
+        assert!(memo.gone.is_empty());
         // The blocked set went with the wait, and the fix is logged.
         let db = d.db();
         assert_eq!(
@@ -573,23 +632,35 @@ mod tests {
         assert_eq!(log.last().unwrap().payload["why"], "interrupted");
         drop(db);
         // Every agent pane alive but one; "vanished" isn't listed.
-        let panes = || -> Result<HashMap<String, bool>> {
-            Ok(["stale", "asking", "moved", "esc", "oc", "cx", "cxh"]
-                .iter()
-                .map(|t| (t.to_string(), false))
-                .chain([("dead".to_string(), true)])
-                .collect())
+        let panes = || -> Result<Option<tmux::AgentPanes>> {
+            Ok(Some(tmux::AgentPanes {
+                dead: ["stale", "asking", "moved", "esc", "oc", "cx", "cxh"]
+                    .iter()
+                    .map(|t| (t.to_string(), false))
+                    .chain([("dead".to_string(), true)])
+                    .collect(),
+                server_pid: Some(4242),
+            }))
         };
-        assert_eq!(pass(&d, &mut gone, &panes, now + 30_000).unwrap(), 0);
+        assert_eq!(
+            pass(&d, &mut memo, &panes, &alive, now + 30_000).unwrap(),
+            0
+        );
         assert_eq!(status("dead"), Status::Idle, "one look isn't proof");
         // A failed look in between starts the count again.
-        let broken = || -> Result<HashMap<String, bool>> { anyhow::bail!("lost server") };
-        pass(&d, &mut gone, &broken, now + 40_000).unwrap();
-        assert!(gone.is_empty());
-        assert_eq!(pass(&d, &mut gone, &panes, now + 50_000).unwrap(), 0);
+        let broken = || -> Result<Option<tmux::AgentPanes>> { anyhow::bail!("lost server") };
+        pass(&d, &mut memo, &broken, &alive, now + 40_000).unwrap();
+        assert!(memo.gone.is_empty());
+        assert_eq!(
+            pass(&d, &mut memo, &panes, &alive, now + 50_000).unwrap(),
+            0
+        );
         // The second look stops both, by `discover`'s stop; nothing else
         // changes again.
-        assert_eq!(pass(&d, &mut gone, &panes, now + 60_000).unwrap(), 2);
+        assert_eq!(
+            pass(&d, &mut memo, &panes, &alive, now + 60_000).unwrap(),
+            2
+        );
         assert_eq!(status("dead"), Status::Stopped);
         assert_eq!(status("vanished"), Status::Stopped);
         let last = d.db().list_events("dead", 1).unwrap();
@@ -597,7 +668,46 @@ mod tests {
             (last[0].kind.as_str(), &last[0].payload["from"]),
             ("session_end", &json!("pane"))
         );
-        assert_eq!(pass(&d, &mut gone, &panes, now + 120_000).unwrap(), 0);
+        assert_eq!(
+            pass(&d, &mut memo, &panes, &alive, now + 120_000).unwrap(),
+            0
+        );
+    }
+
+    /// No server answers: the sessions are gone only if the server process
+    /// seen before has exited (a deleted socket file with the server
+    /// alive proves nothing).
+    #[test]
+    fn a_dead_server_is_proven_before_anything_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        add(&d.db(), dir.path(), "a", "claude", Status::Idle, 1, "");
+        let mut memo = Memo::default();
+        let up = || -> Result<Option<tmux::AgentPanes>> {
+            Ok(Some(tmux::AgentPanes {
+                dead: [("a".to_string(), false)].into(),
+                server_pid: Some(4242),
+            }))
+        };
+        let no_answer = || -> Result<Option<tmux::AgentPanes>> { Ok(None) };
+        let status = || d.db().resolve_ref("a").unwrap().status;
+        // Never seen a server: nothing to prove.
+        for _ in 0..3 {
+            pass(&d, &mut memo, &no_answer, &|_| false, 10).unwrap();
+        }
+        assert_eq!(status(), Status::Idle);
+        pass(&d, &mut memo, &up, &|_| true, 20).unwrap();
+        // Its process still there (the socket file gone): no verdict.
+        for _ in 0..3 {
+            pass(&d, &mut memo, &no_answer, &|pid| pid == 4242, 30).unwrap();
+        }
+        assert_eq!(status(), Status::Idle);
+        assert!(memo.gone.is_empty());
+        // Its process gone: every session gone, on two looks.
+        pass(&d, &mut memo, &no_answer, &|_| false, 40).unwrap();
+        assert_eq!(status(), Status::Idle);
+        pass(&d, &mut memo, &no_answer, &|_| false, 50).unwrap();
+        assert_eq!(status(), Status::Stopped);
     }
 
     /// A turn's end found later never moves the last message back.

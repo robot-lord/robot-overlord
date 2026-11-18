@@ -820,9 +820,10 @@ pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     if v["type"] != "event_msg" {
         return None;
     }
+    // (`turn_started` / `turn_complete`: their names in v2.)
     match v["payload"]["type"].as_str()? {
-        "task_started" => Some(false),
-        "task_complete" | "turn_aborted" => Some(true),
+        "task_started" | "turn_started" => Some(false),
+        "task_complete" | "turn_complete" | "turn_aborted" => Some(true),
         _ => None,
     }
 }
