@@ -940,6 +940,28 @@ pub fn models(home: &Path) -> Vec<String> {
     listed.into_iter().map(|(_, slug)| slug).collect()
 }
 
+/// The effort levels Codex's catalog (`models_cache.json`) lists for
+/// model `slug`, in its order; empty when it has none or no catalog.
+pub fn efforts(home: &Path, slug: &str) -> Vec<String> {
+    let Some(v) = std::fs::read_to_string(home.join("models_cache.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["slug"].as_str() == Some(slug))
+        .and_then(|m| m["supported_reasoning_levels"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["effort"].as_str().or_else(|| l.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
 // ---- archive summaries ----
 
 /// `codex exec` flags for a one-shot answer that saves nothing

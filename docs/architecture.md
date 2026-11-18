@@ -1085,7 +1085,13 @@ wired to rlord's MCP server. There can be one per agent, with exactly one
 active ("One per agent, one active", below); what follows holds for each.
 A strong model at medium effort
 (`[overlord] model` / `effort`; the effort is a launch flag, per agent:
-`overlord::effort_args`): it does light work itself and sends the rest to
+`overlord::effort_args`). On Codex with no model set, the setup form and
+a newly created overlord take the best-priority "astra" model in Codex's
+catalog (`models_cache.json`; the `opus` equivalent, else its priority-1
+entry, else Codex's default) and offer that model's
+`supported_reasoning_levels`. It is resolved when the overlord is
+created and stored on its session, so a catalog update never changes a
+running overlord's model behind the user's back. It does light work itself and sends the rest to
 subagents and new sessions, which `overlord.md` states first. It lives in
 `<data>/overlord/` (an overlord that began as the "mastermind" of the
 former two-session design keeps `<data>/mastermind/`, so its conversation
