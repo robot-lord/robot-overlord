@@ -229,9 +229,10 @@ impl TagEditor {
     pub fn key(&mut self, k: KeyEvent) -> Option<bool> {
         if self.confirm_discard {
             self.confirm_discard = false;
-            // y or esc again: discard. Anything else: back to editing.
+            // Only y discards; ctrl-s saves; anything else: back to editing.
             return match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Esc => Some(false),
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(false),
+                KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(true),
                 _ => None,
             };
         }
@@ -441,7 +442,8 @@ impl App {
                 Style::default().fg(theme::yellow()).bold(),
             )));
             lines.push(keys_line(&[
-                ("y/esc", "discard", Cap::Context),
+                ("y", "discard", Cap::Context),
+                ("^s", "save", Cap::Global),
                 ("n", "keep editing", Cap::Global),
             ]));
         } else if let Some(t) = &ed.confirm_new {
@@ -658,10 +660,19 @@ mod tests {
         press(&mut e, KeyCode::Delete);
         assert_eq!(e.tags, ["web"]);
         assert_eq!(e.diff(), (vec![], vec!["wip".into(), "ui".into()]));
-        // Changes made: esc asks first; esc again discards.
+        // Changes made: esc asks first; esc again goes back; y discards.
         assert_eq!(press(&mut e, KeyCode::Esc), None);
         assert!(e.confirm_discard);
-        assert_eq!(press(&mut e, KeyCode::Esc), Some(false));
+        assert_eq!(press(&mut e, KeyCode::Esc), None);
+        assert!(!e.confirm_discard);
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(press(&mut e, KeyCode::Char('y')), Some(false));
+        // ctrl-s at the prompt saves.
+        let mut e = ed(&["web"]);
+        press(&mut e, KeyCode::Up);
+        press(&mut e, KeyCode::Delete);
+        press(&mut e, KeyCode::Esc);
+        assert_eq!(ctrl_s(&mut e), Some(true));
     }
 
     #[test]
