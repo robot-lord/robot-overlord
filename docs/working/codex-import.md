@@ -107,3 +107,13 @@ no `turn_context` (a long last turn); per-id lookup; helper dedupe with
 `agents::codex`; reject rules kept in three places (index, meta,
 candidate) merged into one; the offer's Codex check stats every rollout
 before sorting; `add_git_info`'s Codex-only branch special case.
+
+## Live check (2026-11-18, Codex 0.169.0)
+
+Passed on a scratch rlord: a Codex conversation started outside rlord
+was listed by `rlord import`, imported, and `rlord restart` ran
+`codex resume <id> --no-daemon`, which reopened that thread; status
+followed from the transcript. Seen: a conversation whose TUI exited a
+minute earlier still lists "maybe open elsewhere" (mtime heuristic), and
+a folder under a repo's `.worktrees/` that isn't a worktree is filed
+under the parent repo on `main`.

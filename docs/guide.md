@@ -29,7 +29,9 @@ runs the overlord" below for what differs. You can have one on each agent
 and switch between them: see "An overlord per agent" below.
 
 - **A strong model at medium effort** (`opus` / `medium` by default on
-  Claude Code; Codex's own default model at `medium`; OpenCode's default model, which
+  Claude Code; on Codex, the best-priority "astra" model in its own
+  catalog at `medium`, or Codex's own default when none matches or your
+  Codex config sets `model`; OpenCode's default model, which
   has no effort setting). It does
   light work itself, in seconds: find and jump to sessions (`goto_session`,
   `show_list`), shape the list (`set_list_view`, groups), edit names, tags,

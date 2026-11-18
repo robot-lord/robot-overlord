@@ -44,6 +44,11 @@ struct AgentChoice {
     /// Effort choices ("" = the agent's default); empty: it has none.
     efforts: Vec<String>,
     effort: usize,
+    /// Each model's own efforts (Codex's catalog), shown when the Model
+    /// row moves to it; a model not listed keeps `efforts`.
+    efforts_by: std::collections::HashMap<String, Vec<String>>,
+    /// The default effort, kept across model changes when offered.
+    effort_default: String,
     /// It has Remote Control.
     remote: bool,
     /// family → latest id, for the "→ resolves to" hint.
@@ -182,7 +187,28 @@ impl AgentChoice {
             e if e.is_empty() => (e, 0),
             e => with(e, a["effort"].as_str().unwrap_or("")),
         };
+        let efforts_by = a["efforts_by_model"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let e = v
+                            .as_array()
+                            .map(|l| {
+                                l.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (k.clone(), e)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         AgentChoice {
+            efforts_by,
+            effort_default: a["effort"].as_str().unwrap_or("").to_string(),
             name: a["name"].as_str().unwrap_or("claude").to_string(),
             label: a["label"].as_str().unwrap_or("Claude Code").to_string(),
             models,
@@ -192,6 +218,13 @@ impl AgentChoice {
             remote: a["remote_control"] == true,
             catalog: catalog_of(a),
         }
+    }
+}
+
+impl AgentChoice {
+    /// The effort it starts on, by name (its index is into `efforts`).
+    fn start_effort(&self) -> String {
+        self.efforts.get(self.effort).cloned().unwrap_or_default()
     }
 }
 
@@ -235,6 +268,8 @@ impl Setup {
             none_installed,
             error: None,
         };
+        let keep = s.choice().start_effort();
+        s.refit_efforts(&keep);
         // Start on the first row there is something to pick in.
         s.row = usize::from(s.agents.len() < 2);
         s
@@ -248,7 +283,7 @@ impl Setup {
     /// one, Remote Control only where this machine and the agent can.
     fn rows(&self) -> Vec<SetupRow> {
         let mut v = vec![SetupRow::Agent, SetupRow::Model];
-        if !self.choice().efforts.is_empty() {
+        if !self.efforts().is_empty() {
             v.push(SetupRow::Effort);
         }
         if self.remote.is_some() && self.choice().remote {
@@ -262,7 +297,31 @@ impl Setup {
     }
 
     fn effort(&self) -> &str {
-        self.choice().efforts.get(self.effort).map_or("", |e| e)
+        self.efforts().get(self.effort).map_or("", |e| e)
+    }
+
+    /// The effort choices for the current model: its own (Codex's catalog,
+    /// `efforts_by`), else the agent's list. Never changes the choice's
+    /// lists, so switching agents and back finds them as sent.
+    fn efforts(&self) -> &[String] {
+        let c = self.choice();
+        c.efforts_by
+            .get(self.model())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(&c.efforts)
+    }
+
+    /// The model changed: point the effort at the same level in the new
+    /// list if offered, else the default, else the first.
+    fn refit_efforts(&mut self, keep: &str) {
+        let e = self.efforts();
+        let dflt = &self.choice().effort_default;
+        let at = e
+            .iter()
+            .position(|x| x == keep)
+            .or_else(|| e.iter().position(|x| x == dflt))
+            .unwrap_or(0);
+        self.effort = at;
     }
 
     /// ← / →: the focused row's next or previous choice. Another agent
@@ -283,11 +342,16 @@ impl Setup {
                 if to != self.agent {
                     self.agent = to;
                     self.model = self.choice().model;
-                    self.effort = self.choice().effort;
+                    let keep = self.choice().start_effort();
+                    self.refit_efforts(&keep);
                 }
             }
-            Some(SetupRow::Model) => self.model = next(self.model, self.choice().models.len()),
-            Some(SetupRow::Effort) => self.effort = next(self.effort, self.choice().efforts.len()),
+            Some(SetupRow::Model) => {
+                let keep = self.effort().to_string();
+                self.model = next(self.model, self.choice().models.len());
+                self.refit_efforts(&keep);
+            }
+            Some(SetupRow::Effort) => self.effort = next(self.effort, self.efforts().len()),
             Some(SetupRow::Remote) => self.remote = self.remote.map(|on| !on),
             None => {}
         }
@@ -1147,6 +1211,49 @@ mod tests {
             s.rows(),
             [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
         );
+    }
+
+    fn codex_choice() -> Value {
+        json!({"name": "codex", "label": "Codex", "model": "gpt-a",
+            "effort": "medium", "models": ["gpt-a", "gpt-b", ""],
+            "efforts": ["low", "medium", "xhigh"],
+            "efforts_by_model": {"gpt-a": ["low", "medium", "xhigh"],
+                                 "gpt-b": ["low", "high"], "": ["low", "medium", "high"]}})
+    }
+
+    /// Codex: the effort row follows the model (its catalog's levels),
+    /// keeping the chosen effort where offered.
+    #[test]
+    fn setup_efforts_follow_the_codex_model() {
+        let mut s = Setup::from_status(&status(json!([codex_choice()]), false));
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        s.row = 1; // Model
+        s.step(true);
+        assert_eq!(s.model(), "gpt-b");
+        assert_eq!(s.efforts(), ["low", "high"]);
+        assert_eq!(s.effort(), "low");
+        s.step(true);
+        // "low" is offered here too: kept.
+        assert_eq!((s.model(), s.effort()), ("", "low"));
+        // Lists are never replaced: back on gpt-a its own list again.
+        s.step(true);
+        assert_eq!(s.model(), "gpt-a");
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
+        // Agent row: to Claude and back resets Codex to its default.
+        let mut s = Setup::from_status(&status(json!([claude(), codex_choice()]), false));
+        s.row = 0;
+        s.step(true);
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("codex", "gpt-a", "medium")
+        );
+        s.row = 1;
+        s.step(true);
+        s.row = 0;
+        s.step(true);
+        s.step(true);
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
     }
 
     #[test]

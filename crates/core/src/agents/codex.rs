@@ -851,6 +851,29 @@ pub(crate) fn limit_ended(v: &Value) -> bool {
         .is_some_and(|p| p["error"]["codex_error_info"] == "usage_limit_exceeded")
 }
 
+/// Whether the conversation's last finished turn, with none started since,
+/// ended on an error (a usage limit included): Codex has no `StopFailure`,
+/// so a Stop hook can't tell. Only a failed `task_complete` newer than the
+/// latest `task_started` counts; when the newest marker is a start (the
+/// completion not written yet when the Stop runs), it is unknown and not
+/// held against the claim (`limits::limited_in` still applies). Whether
+/// Codex writes `task_complete` before running Stop is not checked live.
+/// Reads the file's tail only.
+pub fn last_turn_failed(path: &Path) -> bool {
+    let (_, tail) = super::transcript::read_head_tail(path);
+    tail.iter()
+        .rev()
+        .find_map(|v| {
+            if event(v, "task_started").is_some() || event(v, "turn_started").is_some() {
+                return Some(false);
+            }
+            event(v, "task_complete")
+                .or_else(|| event(v, "turn_complete"))
+                .map(|p| !p["error"].is_null())
+        })
+        .unwrap_or(false)
+}
+
 /// When the limit that ended the turn at `before.len()` resets (ms), and
 /// which window it was (`five_hour`, `seven_day`, …), from the
 /// `token_count` lines before it (oldest first; `at`: when it hit, ms).
@@ -938,6 +961,40 @@ pub fn models(home: &Path) -> Vec<String> {
         .collect();
     listed.sort();
     listed.into_iter().map(|(_, slug)| slug).collect()
+}
+
+/// The `model` the user set in Codex's own `config.toml` (top level), if
+/// any. Reads that one key; nothing else of the file is used.
+pub fn configured_model(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    let doc: toml::Table = text.parse().ok()?;
+    doc.get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// The effort levels Codex's catalog (`models_cache.json`) lists for
+/// model `slug`, in its order; empty when it has none or no catalog.
+pub fn efforts(home: &Path, slug: &str) -> Vec<String> {
+    let Some(v) = std::fs::read_to_string(home.join("models_cache.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["slug"].as_str() == Some(slug))
+        .and_then(|m| m["supported_reasoning_levels"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["effort"].as_str().or_else(|| l.as_str()))
+        .map(str::to_string)
+        .collect()
 }
 
 // ---- archive summaries ----
@@ -1568,6 +1625,36 @@ mod tests {
         assert!(threads_started_in(dir.path(), "/src/none", 0, false).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0, false).is_empty());
+    }
+
+    #[test]
+    fn the_users_codex_model_is_read_from_its_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(configured_model(tmp.path()), None);
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "model = \"m1\"\n[x]\nmodel = \"no\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured_model(tmp.path()).as_deref(), Some("m1"));
+        std::fs::write(tmp.path().join("config.toml"), "[x]\nmodel = \"no\"\n").unwrap();
+        assert_eq!(configured_model(tmp.path()), None);
+    }
+
+    #[test]
+    fn a_failed_last_turn_is_told_from_its_task_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("r.jsonl");
+        let ok = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        let bad = r#"{"type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":"usage_limit_exceeded"}}}"#;
+        let start = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        std::fs::write(&f, format!("{start}\n{bad}\n")).unwrap();
+        assert!(last_turn_failed(&f));
+        std::fs::write(&f, format!("{bad}\n{start}\n")).unwrap();
+        assert!(!last_turn_failed(&f));
+        std::fs::write(&f, format!("{start}\n{ok}\n")).unwrap();
+        assert!(!last_turn_failed(&f));
+        assert!(!last_turn_failed(&tmp.path().join("none.jsonl")));
     }
 
     #[test]
