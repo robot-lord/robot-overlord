@@ -16,9 +16,20 @@
 //! plaintext `u16 BE length | content | zero fill`) padded to a Padmé bucket,
 //! since a mailbox message's size would otherwise name its type.
 //!
-//! **Order and failure.** The relay's queue is ordered, so the counters stay
-//! in step. A frame that fails to decrypt (tampered, replayed, a gap) poisons
-//! the session; both ends discard it and the next live link keys a new one.
+//! **Order, gaps and failure.** The relay's queue is ordered, but it can
+//! lose messages: a relay restart forgets its queues, a message expires
+//! unread, a sender's frame is refused (`full`) after its state advanced, or
+//! a sender crashes after saving and before sending. So the receiver
+//! tolerates a forward gap: [`MailboxSession::decrypt`] tries the next
+//! counter, then each later one up to [`MAX_SKIP`] missing messages, stepping
+//! counter and `REKEY` exactly as a received message would. The counter only
+//! moves forward: the keys of skipped messages are discarded (never kept),
+//! so a lost message that turns up later fails like a replay. A frame that
+//! fails to decrypt (tampered, replayed, older than the last one accepted, or
+//! more than `MAX_SKIP` ahead) poisons the session; both ends discard it and
+//! the next live link keys a new one. Nothing is redelivered by the cipher:
+//! what a lost message carried is recovered above it, by the device resending
+//! its request under the same id.
 //!
 //! **Save order** (the owner's job): the sender saves the advanced state
 //! before handing the frame out; the receiver saves after it has acted on
@@ -31,6 +42,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::session::{ciphertext, pad_into, padme_len, unpad};
 use crate::{Error, Result, MAX_PLAINTEXT, TAG_LEN, VERSION};
+
+/// The most messages a receiver skips to reach a frame (lost on the way:
+/// see "Order, gaps and failure"). At least the relay's queue limit (32), so
+/// a relay restart that drops a full queue is survived.
+pub const MAX_SKIP: u64 = 64;
 
 /// Length of [`MailboxSession::export`]'s bytes: version, the id, then key
 /// and counter for each direction.
@@ -153,7 +169,9 @@ impl MailboxSession {
         Ok(frame)
     }
 
-    /// Decrypt the next message. Any failure poisons the session.
+    /// Decrypt the next message, or one up to [`MAX_SKIP`] messages later
+    /// (those in between were lost; their keys are discarded). Any failure,
+    /// an older or replayed frame included, poisons the session.
     pub fn decrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         if self.poisoned {
             return Err(Error::Decrypt);
@@ -165,11 +183,28 @@ impl MailboxSession {
         r
     }
 
+    /// The next message, or a later one up to [`MAX_SKIP`] messages on:
+    /// each trial steps a scratch copy of the state as a received message
+    /// would (counter, then `REKEY`), so the real state moves only past a
+    /// frame that decrypts, and the skipped keys go with the copy.
     fn try_decrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         let ct = ciphertext(frame)?;
-        let plain = self.recv.decrypt(ct)?;
-        self.recv.rekey();
+        let mut st = self.recv.clone();
+        let mut skipped = 0u64;
+        let plain = loop {
+            match st.decrypt(ct) {
+                Ok(p) => break p,
+                Err(Error::Decrypt) if skipped < MAX_SKIP && st.n < u64::MAX - 1 => {
+                    st.n += 1;
+                    st.rekey();
+                    skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        st.rekey();
         let n = unpad(&plain, padme_len)?;
+        self.recv = st;
         Ok(plain[2..2 + n].to_vec())
     }
 
@@ -235,16 +270,78 @@ mod tests {
         assert!(MailboxSession::import(&e).is_err());
     }
 
+    fn pair() -> (MailboxSession, MailboxSession) {
+        (
+            MailboxSession::from_keys([5; 8], [1; 32], [2; 32]),
+            MailboxSession::from_keys([5; 8], [2; 32], [1; 32]),
+        )
+    }
+
+    /// `a` sends `lost` messages nobody gets, then one more.
+    fn after_gap(a: &mut MailboxSession, lost: u64) -> Vec<u8> {
+        for _ in 0..lost {
+            a.encrypt(b"lost").unwrap();
+        }
+        a.encrypt(b"after").unwrap()
+    }
+
     #[test]
-    fn a_gap_poisons() {
-        let mut a = MailboxSession::from_keys([5; 8], [1; 32], [2; 32]);
-        let mut b = MailboxSession::from_keys([5; 8], [2; 32], [1; 32]);
-        let _lost = a.encrypt(b"one").unwrap();
-        let two = a.encrypt(b"two").unwrap();
-        assert_eq!(b.decrypt(&two), Err(Error::Decrypt));
+    fn a_forward_gap_up_to_max_skip_is_skipped() {
+        for lost in [1, 2, MAX_SKIP] {
+            let (mut a, mut b) = pair();
+            let f = after_gap(&mut a, lost);
+            assert_eq!(b.decrypt(&f).unwrap(), b"after", "gap {lost}");
+            assert_eq!(b.counters(), (0, lost + 1));
+            // In step afterwards.
+            let g = a.encrypt(b"next").unwrap();
+            assert_eq!(b.decrypt(&g).unwrap(), b"next");
+        }
+    }
+
+    #[test]
+    fn a_gap_over_max_skip_poisons() {
+        let (mut a, mut b) = pair();
+        let f = after_gap(&mut a, MAX_SKIP + 1);
+        assert_eq!(b.decrypt(&f), Err(Error::Decrypt));
         assert!(b.is_poisoned());
         assert!(b.export().is_err());
         assert_eq!(b.encrypt(b"x"), Err(Error::Decrypt));
+    }
+
+    #[test]
+    fn older_and_replayed_frames_poison() {
+        // Newer first (the older one skipped), then the older one.
+        let (mut a, mut b) = pair();
+        let one = a.encrypt(b"one").unwrap();
+        let two = a.encrypt(b"two").unwrap();
+        assert_eq!(b.decrypt(&two).unwrap(), b"two");
+        assert_eq!(b.decrypt(&one), Err(Error::Decrypt));
+        assert!(b.is_poisoned());
+        // The same frame twice.
+        let (mut a, mut b) = pair();
+        let one = a.encrypt(b"one").unwrap();
+        b.decrypt(&one).unwrap();
+        assert_eq!(b.decrypt(&one), Err(Error::Decrypt));
+        assert!(b.is_poisoned());
+        // A tampered frame isn't skipped past either.
+        let (mut a, mut b) = pair();
+        let mut one = a.encrypt(b"one").unwrap();
+        one[5] ^= 1;
+        assert_eq!(b.decrypt(&one), Err(Error::Decrypt));
+        assert!(b.is_poisoned());
+    }
+
+    #[test]
+    fn export_and_import_across_a_skip() {
+        let (mut a, mut b) = pair();
+        let f = after_gap(&mut a, 3);
+        b = MailboxSession::import(&b.export().unwrap()).unwrap();
+        assert_eq!(b.decrypt(&f).unwrap(), b"after");
+        let mut b = MailboxSession::import(&b.export().unwrap()).unwrap();
+        assert_eq!(b.counters(), (0, 4));
+        let g = after_gap(&mut a, 2);
+        assert_eq!(b.decrypt(&g).unwrap(), b"after");
+        assert_eq!(b.counters(), (0, 7));
     }
 
     #[test]

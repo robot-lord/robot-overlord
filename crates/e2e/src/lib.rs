@@ -36,7 +36,7 @@ pub mod vectors;
 
 pub use handshake::{Established, FixedRandom, Initiator, Kind, Responder};
 pub use kem::{KEM_BACKEND, KEM_CT_LEN, KEM_EK_LEN};
-pub use mailbox::{MailboxSession, MAILBOX_EXPORT_LEN};
+pub use mailbox::{MailboxSession, MAILBOX_EXPORT_LEN, MAX_SKIP};
 pub use qr::QrPayload;
 pub use session::{live_padded_len, live_wire_len, mailbox_wire_len, padme_len, Session};
 

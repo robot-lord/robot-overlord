@@ -440,7 +440,9 @@ mod tests {
             code: code::FULL.into(),
             device: Some(B64(vec![1; 32])),
         };
-        assert!(q.to_json().starts_with(r#"{"t":"refused","code":"full","device":""#));
+        assert!(q
+            .to_json()
+            .starts_with(r#"{"t":"refused","code":"full","device":""#));
         assert_eq!(FromRelay::parse(&q.to_json()).unwrap(), q);
         let l = FromRelay::Link {
             id: 7,

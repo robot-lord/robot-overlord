@@ -11,7 +11,7 @@ use crate::session::{pad_into, padme_len};
 use crate::stream::{self, Reassembler, CHUNK, CONTROL};
 use crate::{
     channel_id, device_id, sha256, Error, Established, Initiator, Kind, MailboxSession, QrPayload,
-    RelayId, Responder, Session, StaticKey, MAX_PLAINTEXT, TAG_LEN,
+    RelayId, Responder, Session, StaticKey, MAX_PLAINTEXT, MAX_SKIP, TAG_LEN,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -72,6 +72,10 @@ pub struct Outputs {
     pub mb_frames_h2d: Vec<String>,
     /// The device's mailbox exported after three messages each way.
     pub mb_export_device: String,
+    /// Forward gaps the host's mailbox skips: name to the frame after the
+    /// gap (device to host) and the host's export once it decrypted it.
+    /// `gap_1` and `gap_max` lose 1 and `MAX_SKIP` messages.
+    pub mb_gaps: BTreeMap<String, String>,
     /// `stream id | flags | chunk length` of each fragment of a message of
     /// `2 * CHUNK + 5` bytes.
     pub fragments: Vec<String>,
@@ -297,6 +301,28 @@ pub fn run(i: &Inputs) -> Result<Outputs, String> {
         }
     }
 
+    // Forward gaps the receiver skips: the frame after the gap decrypts,
+    // and the state lands past it.
+    let mut mb_gaps = BTreeMap::new();
+    for (name, lost) in [("gap_1", 1u64), ("gap_max", MAX_SKIP)] {
+        let (mut sd, mut sh) = p.mailbox()?;
+        for i in 0..lost {
+            sd.encrypt(&frames[i as usize % frames.len()]).map_err(e)?;
+        }
+        let w = sd.encrypt(&frames[3]).map_err(e)?;
+        if sh.decrypt(&w).map_err(e)? != frames[3] || sh.counters() != (0, lost + 1) {
+            return Err(format!("mailbox {name} not skipped"));
+        }
+        let next = sd.encrypt(&frames[4]).map_err(e)?;
+        if sh.decrypt(&next).map_err(e)? != frames[4] {
+            return Err(format!("mailbox out of step after {name}"));
+        }
+        mb_gaps.insert(
+            name.to_string(),
+            format!("{} {}", x(&w), x(&sh.export().map_err(e)?)),
+        );
+    }
+
     // Fragments.
     let msg: Vec<u8> = (0..2 * CHUNK + 5).map(|i| i as u8).collect();
     let parts = stream::fragment(CONTROL, &msg).map_err(e)?;
@@ -339,6 +365,7 @@ pub fn run(i: &Inputs) -> Result<Outputs, String> {
         mb_frames_d2h: mb_d2h,
         mb_frames_h2d: mb_h2d,
         mb_export_device: export,
+        mb_gaps,
         fragments,
         failures,
     })
@@ -506,7 +533,16 @@ fn failures(
         let (mut d, mut h) = p.mailbox()?;
         let w1 = d.encrypt(&frames[1]).map_err(e)?;
         let w2 = d.encrypt(&frames[2]).map_err(e)?;
-        failures.insert("mailbox_gap".into(), err(h.decrypt(&w2)));
+        // Newer first (the older one skipped), then the older one.
+        h.decrypt(&w2).map_err(e)?;
+        failures.insert("mailbox_reordered".into(), err(h.decrypt(&w1)));
+        // More than MAX_SKIP lost.
+        let (mut d, mut h) = p.mailbox()?;
+        for _ in 0..=MAX_SKIP {
+            d.encrypt(&frames[0]).map_err(e)?;
+        }
+        let far = d.encrypt(&frames[0]).map_err(e)?;
+        failures.insert("mailbox_gap_over_max".into(), err(h.decrypt(&far)));
         let (_, mut h) = p.mailbox()?;
         h.decrypt(&w1).map_err(e)?;
         failures.insert("mailbox_replayed".into(), err(h.decrypt(&w1)));
