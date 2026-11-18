@@ -125,18 +125,13 @@ fn pass(d: &Daemon, gone: &mut HashMap<String, u8>) -> Result<()> {
 
 /// How many looks in a row session `s`'s pane has looked gone (its tmux
 /// session missing, or its program exited), counted in `gone`. One failed
-/// look isn't proof (tmux busy, a restart in between): act on two. (Here
-/// a look tmux couldn't answer counts as gone; `recheck` skips its pass
-/// instead.)
+/// look isn't proof (tmux busy, a restart in between): act on two.
 pub(crate) fn pane_looks(s: &Session, gone: &mut HashMap<String, u8>) -> u8 {
-    count_look(&s.id, gone, pane_looks_gone(s).unwrap_or(true))
-}
-
-/// One look at session `s`'s pane, the one dead-pane rule
-/// (`tmux::pane_gone`): Err when tmux couldn't say. A session with no
-/// tmux session yet isn't gone.
-pub(crate) fn pane_looks_gone(s: &Session) -> Result<bool> {
-    s.tmux_session.as_deref().map_or(Ok(false), tmux::pane_gone)
+    let dead = s
+        .tmux_session
+        .as_deref()
+        .is_some_and(|t| !tmux::has_session(t) || tmux::format(t, "#{pane_dead}") == "1");
+    count_look(&s.id, gone, dead)
 }
 
 /// Count one look at session `id`'s pane in `gone`: the looks in a row it

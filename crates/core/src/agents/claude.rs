@@ -411,8 +411,9 @@ pub(crate) fn interrupted(v: &Value) -> bool {
 }
 
 /// A user line that is local output, not a turn: a `!` shell command and
-/// its output, a slash command's wrapper and output, a compaction's
-/// summary, a meta line. Claude writes these without the model running; a
+/// its output, a local command's output, a compaction's summary, a meta
+/// line. (A slash command's own wrapper is `command_wrapper`: local only
+/// when local output follows it.) Claude writes these without the model running; a
 /// reply, if one follows, is its own line. Not a Stop hook's feedback
 /// (`Stop hook feedback:`, a meta line): that sends the agent on.
 pub(crate) fn local_output(v: &Value) -> bool {
@@ -442,9 +443,6 @@ pub(crate) fn local_output(v: &Value) -> bool {
             "<bash-stdout>",
             "<bash-stderr>",
             "<local-command-",
-            "<command-name>",
-            "<command-message>",
-            "<command-args>",
         ]
         .iter()
         .any(|p| t.starts_with(p))
@@ -458,6 +456,45 @@ pub(crate) fn local_output(v: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// The text of a user line (a string, or its text blocks), if it is one.
+fn user_text(v: &Value) -> Option<String> {
+    if v["type"] != "user" {
+        return None;
+    }
+    match &v["message"]["content"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => Some(
+            a.iter()
+                .filter(|x| x["type"] == "text")
+                .filter_map(|x| x["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
+}
+
+/// A slash command's wrapper line (`<command-name>`, `<command-message>`,
+/// `<command-args>`). A built-in local command (`/model`, `/compact`) is
+/// followed by its local output; a custom command or a skill by a turn of
+/// the model's.
+pub(crate) fn command_wrapper(v: &Value) -> bool {
+    user_text(v).is_some_and(|t| {
+        let t = t.trim_start();
+        ["<command-name>", "<command-message>", "<command-args>"]
+            .iter()
+            .any(|p| t.starts_with(p))
+    })
+}
+
+/// A local command's output, or a compaction's summary: what follows a
+/// built-in command that ran no turn.
+pub(crate) fn local_command_output(v: &Value) -> bool {
+    v["type"] == "user"
+        && (v["isCompactSummary"] == true
+            || user_text(v).is_some_and(|t| t.trim_start().starts_with("<local-command-stdout>")))
 }
 
 /// A usage limit stopped the turn: Claude Code writes a synthetic

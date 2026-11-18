@@ -261,6 +261,21 @@ fn task_list(v: &[Task]) -> Value {
         .collect()
 }
 
+/// How many async sub-agents of session `id` are believed open: started,
+/// not finished, and the session (its transcript or their output) wrote
+/// within `STALE_MS` (as the status shows them).
+pub(crate) fn open_agents(d: &Daemon, id: &str) -> usize {
+    let shown = d.background.shown.lock().unwrap_or_else(|e| e.into_inner());
+    shown.get(id).map_or(0, |s| s.agent_count)
+}
+
+/// Tests: session `id` shown with `n` open sub-agents.
+#[cfg(test)]
+pub(crate) fn set_open_agents(d: &Daemon, id: &str, n: usize) {
+    let mut shown = d.background.shown.lock().unwrap_or_else(|e| e.into_inner());
+    shown.entry(id.to_string()).or_default().agent_count = n;
+}
+
 /// Annotate rows with background work:
 /// - `async_tasks`: how many subagents still run for a session whose
 ///   turn is over (stored status `idle`), else null; `async_work`:

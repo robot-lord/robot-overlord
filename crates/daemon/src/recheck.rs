@@ -41,6 +41,7 @@ use serde_json::json;
 use rlord_core::agents::transcript::{self, Tail, TurnTail};
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
+use rlord_core::tmux;
 use rlord_core::types::{now_ms, Session, Status};
 
 use crate::Daemon;
@@ -62,7 +63,7 @@ pub fn start(d: &Arc<Daemon>) {
         let mut gone: HashMap<String, u8> = HashMap::new();
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pass(&d, &mut gone, &crate::discover::pane_looks_gone, now_ms())
+                pass(&d, &mut gone, &tmux::agent_panes_dead, now_ms())
             }));
             match r {
                 Ok(Err(e)) => tracing::debug!(error = %e, "re-checking stored statuses"),
@@ -139,14 +140,15 @@ pub(crate) fn verdict(e: &Evidence) -> Option<(Status, &'static str)> {
 }
 
 /// One pass. `gone` counts each session's gone-looking panes across
-/// passes; `pane_gone` looks (`discover::pane_looks_gone`; tests pass
-/// their own). A look tmux couldn't answer skips the whole pass: nothing
-/// is stopped or corrected on a guess. Returns how many statuses were
-/// corrected.
+/// passes; `panes` is one look at every session's agent pane
+/// (`tmux::agent_panes_dead`; tests pass their own). When tmux can't say,
+/// no pane verdict is made this pass (nothing is stopped on a guess); the
+/// transcript checks go on. One session's failure is logged and the pass
+/// goes on. Returns how many statuses were corrected.
 pub(crate) fn pass(
     d: &Daemon,
     gone: &mut HashMap<String, u8>,
-    pane_gone: &dyn Fn(&Session) -> Result<bool>,
+    panes: &dyn Fn() -> Result<HashMap<String, bool>>,
     now: i64,
 ) -> Result<usize> {
     let sessions: Vec<Session> = d
@@ -156,58 +158,19 @@ pub(crate) fn pass(
         .filter(checked)
         .collect();
     gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
-    // (Codex's background server runs the turn without the pane:
-    // `discover` watches those panes.)
-    let mut looks: HashMap<&str, bool> = HashMap::new();
-    for s in sessions.iter().filter(|s| !s.codex_daemon) {
-        match pane_gone(s) {
-            Ok(dead) => {
-                looks.insert(&s.id, dead);
-            }
-            Err(e) => {
-                tracing::debug!(session = %s.id, error = %e, "tmux couldn't say: re-check skipped");
-                return Ok(0);
-            }
+    let panes = match panes() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::debug!(error = %e, "tmux couldn't say: no pane verdicts this pass");
+            None
         }
-    }
+    };
     let mut fixed = 0;
     for s in &sessions {
-        let pane = looks
-            .get(s.id.as_str())
-            .map(|dead| crate::discover::count_look(&s.id, gone, *dead));
-        let status_age = now - s.last_state_change_at.unwrap_or(now);
-        let quiet =
-            matches!(s.status, Status::WaitingInput | Status::Working) && status_age >= QUIET_MS;
-        let tail = if quiet {
-            let path = d.db().transcript_source(&s.id)?;
-            path.and_then(|p| transcript::tail(std::path::Path::new(&p)))
-        } else {
-            None
-        };
-        let db = d.db();
-        let e = Evidence {
-            status: s.status,
-            status_age,
-            state_since: s.last_state_change_at,
-            pane_gone: pane,
-            tail,
-            subagent_may_block: quiet && subagent_may_block(&db, &s.id, now)?,
-            now,
-        };
-        let Some((to, why)) = verdict(&e) else {
-            continue;
-        };
-        // (The one stop path for a gone pane: `discover`'s.)
-        let done = if to == Status::Stopped {
-            crate::discover::stop_from_pane(&db, s)?
-        } else {
-            let ended_at = (why == "turn_ended")
-                .then(|| tail.and_then(|t| t.turn_at))
-                .flatten();
-            apply(&db, s, to, why, now, ended_at)?
-        };
-        if done {
-            fixed += 1;
+        match check(d, s, panes.as_ref(), gone, now) {
+            Ok(true) => fixed += 1,
+            Ok(false) => {}
+            Err(e) => tracing::debug!(session = %s.id, error = %e, "re-checking a status"),
         }
     }
     if fixed > 0 {
@@ -216,26 +179,70 @@ pub(crate) fn pass(
     Ok(fixed)
 }
 
+/// One session's check (`pass`). Returns whether its status was corrected.
+fn check(
+    d: &Daemon,
+    s: &Session,
+    panes: Option<&HashMap<String, bool>>,
+    gone: &mut HashMap<String, u8>,
+    now: i64,
+) -> Result<bool> {
+    // (Codex's background server runs the turn without the pane:
+    // `discover` watches those panes.)
+    let pane = match (panes, s.tmux_session.as_deref()) {
+        (Some(p), Some(t)) if !s.codex_daemon => {
+            // Not listed: its tmux session is gone.
+            let dead = p.get(t).copied().unwrap_or(true);
+            Some(crate::discover::count_look(&s.id, gone, dead))
+        }
+        _ => None,
+    };
+    let status_age = now - s.last_state_change_at.unwrap_or(now);
+    let quiet =
+        matches!(s.status, Status::WaitingInput | Status::Working) && status_age >= QUIET_MS;
+    let tail = if quiet {
+        let path = d.db().transcript_source(&s.id)?;
+        path.and_then(|p| transcript::tail(std::path::Path::new(&p)))
+    } else {
+        None
+    };
+    let subagent_may_block = quiet && subagent_may_block(d, &s.id)?;
+    let e = Evidence {
+        status: s.status,
+        status_age,
+        state_since: s.last_state_change_at,
+        pane_gone: pane,
+        tail,
+        subagent_may_block,
+        now,
+    };
+    let Some((to, why)) = verdict(&e) else {
+        return Ok(false);
+    };
+    let db = d.db();
+    // (The one stop path for a gone pane: `discover`'s.)
+    if to == Status::Stopped {
+        return crate::discover::stop_from_pane(&db, s);
+    }
+    let ended_at = (why == "turn_ended")
+        .then(|| tail.and_then(|t| t.turn_at))
+        .flatten();
+    apply(&db, s, to, why, now, ended_at)
+}
+
 /// Whether a sub-agent of session `id` may be the one blocked on the user:
 /// one is named as waiting (`methods::needs_you_key`), or a background
 /// sub-agent is still open (its prompt, an `agent_needs_input`
-/// notification, can come after the main turn). Open only as long as
-/// `background.rs` believes open work: started within its `STALE_MS`
-/// (Claude doesn't always record a sub-agent's end).
-fn subagent_may_block(db: &Db, id: &str, now: i64) -> Result<bool> {
-    let named: Vec<String> = db
+/// notification, can come after the main turn). Open as `background.rs`
+/// believes it: unfinished, with a write within its `STALE_MS` (Claude
+/// doesn't always record a sub-agent's end).
+fn subagent_may_block(d: &Daemon, id: &str) -> Result<bool> {
+    let named: Vec<String> = d
+        .db()
         .kv_get(&crate::methods::needs_you_key(id))?
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default();
-    if named.iter().any(|p| !p.is_empty()) {
-        return Ok(true);
-    }
-    Ok(db.subagents(id)?.iter().any(|a| {
-        a.background
-            && a.finished_at.is_none()
-            && a.started_at
-                .is_some_and(|t| now - t < crate::background::STALE_MS)
-    }))
+    Ok(named.iter().any(|p| !p.is_empty()) || crate::background::open_agents(d, id) > 0)
 }
 
 /// Write the corrected status, only if the session's status is still the
@@ -257,7 +264,8 @@ fn apply(
         _ => return Ok(false),
     }
     db.set_status(&s.id, to, now)?;
-    if let Some(at) = ended_at {
+    // (Never moved back: a later message already recorded stands.)
+    if let Some(at) = ended_at.filter(|at| s.last_agent_msg_at.is_none_or(|m| *at > m)) {
         db.touch_last_agent_msg(&s.id, at)?;
     }
     // Nobody is blocked once it no longer waits.
@@ -279,7 +287,6 @@ fn apply(
 mod tests {
     use super::*;
     use rlord_core::config::Config;
-    use rlord_core::types::Subagent;
     use serde_json::Value;
 
     const MIN: i64 = 60_000;
@@ -469,10 +476,10 @@ mod tests {
                 t0,
                 &open_at("2026-11-10T00:00:10Z"),
             );
-            // Stale, but a background sub-agent started lately is still
-            // open: it may be the one asking. One open for days is no
-            // longer believed (`background::STALE_MS`).
-            for (id, started) in [("bgsub", now - 10 * 60_000), ("bgold", t0)] {
+            // Stale, but a background sub-agent is believed open (it
+            // wrote lately: `background`): it may be the one asking. One
+            // not believed open any more doesn't hold the fix back.
+            for id in ["bgsub", "bgold"] {
                 add(
                     &db,
                     dir.path(),
@@ -482,22 +489,6 @@ mod tests {
                     t0,
                     &ended_at("2026-11-10T00:00:10Z"),
                 );
-                db.upsert_subagent(&Subagent {
-                    agent_id: format!("a-{id}"),
-                    session_id: id.into(),
-                    agent_type: "general-purpose".into(),
-                    description: String::new(),
-                    tool_use_id: None,
-                    spawn_depth: 1,
-                    background: true,
-                    started_at: Some(started),
-                    finished_at: None,
-                    transcript_path: None,
-                    result: String::new(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                })
-                .unwrap();
             }
             // Interrupted, reads working.
             let interrupted = open_at("2026-11-10T00:00:05Z")
@@ -547,12 +538,15 @@ mod tests {
                 ),
             );
             db.set_agent_session("cxh", "cxh", "hook").unwrap();
-            // Idle with a dead pane.
+            // Idle with a dead pane; idle with its tmux session gone.
             add(&db, dir.path(), "dead", "claude", Status::Idle, t0, "");
+            add(&db, dir.path(), "vanished", "claude", Status::Idle, t0, "");
         }
-        let dead = |s: &Session| Ok(s.id == "dead");
+        crate::background::set_open_agents(&d, "bgsub", 1);
+        // tmux couldn't say: no pane verdicts, the transcript checks go on.
+        let broken = || -> Result<HashMap<String, bool>> { anyhow::bail!("lost server") };
         let mut gone = HashMap::new();
-        assert_eq!(pass(&d, &mut gone, &dead, now).unwrap(), 4);
+        assert_eq!(pass(&d, &mut gone, &broken, now).unwrap(), 4);
         let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
         assert_eq!(status("stale"), Status::Idle);
         assert_eq!(status("esc"), Status::Idle);
@@ -567,8 +561,9 @@ mod tests {
         assert_eq!(at("esc"), None);
         assert_eq!(status("oc"), Status::WaitingInput);
         assert_eq!(status("cx"), Status::Working);
-        // One look at the dead pane so far.
+        // No look at the panes so far.
         assert_eq!(status("dead"), Status::Idle);
+        assert!(gone.is_empty());
         // The blocked set went with the wait, and the fix is logged.
         let db = d.db();
         assert_eq!(
@@ -581,21 +576,41 @@ mod tests {
         assert_eq!(last.payload["from"], "waiting_input");
         assert_eq!(last.payload["why"], "turn_ended");
         drop(db);
-        // tmux couldn't say: the pass is skipped, nothing stopped (and the
-        // dead pane's count isn't moved).
-        let broken = |_: &Session| -> Result<bool> { anyhow::bail!("no server running") };
-        assert_eq!(pass(&d, &mut gone, &broken, now + 30_000).unwrap(), 0);
-        assert_eq!(status("dead"), Status::Idle);
-        // The second look stops it, by `discover`'s stop; nothing else
+        // Every agent pane alive but one; "vanished" isn't listed.
+        let panes = || -> Result<HashMap<String, bool>> {
+            Ok([
+                "stale", "asking", "bgsub", "bgold", "esc", "oc", "cx", "cxh",
+            ]
+            .iter()
+            .map(|t| (t.to_string(), false))
+            .chain([("dead".to_string(), true)])
+            .collect())
+        };
+        assert_eq!(pass(&d, &mut gone, &panes, now + 30_000).unwrap(), 0);
+        assert_eq!(status("dead"), Status::Idle, "one look isn't proof");
+        // The second look stops both, by `discover`'s stop; nothing else
         // changes again.
-        assert_eq!(pass(&d, &mut gone, &dead, now + 60_000).unwrap(), 1);
+        assert_eq!(pass(&d, &mut gone, &panes, now + 60_000).unwrap(), 2);
         assert_eq!(status("dead"), Status::Stopped);
+        assert_eq!(status("vanished"), Status::Stopped);
         let last = d.db().list_events("dead", 1).unwrap();
         assert_eq!(
             (last[0].kind.as_str(), &last[0].payload["from"]),
             ("session_end", &json!("pane"))
         );
-        assert_eq!(pass(&d, &mut gone, &dead, now + 120_000).unwrap(), 0);
+        assert_eq!(pass(&d, &mut gone, &panes, now + 120_000).unwrap(), 0);
+    }
+
+    /// A turn's end found later never moves the last message back.
+    #[test]
+    fn the_last_message_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        add(&db, dir.path(), "s", "claude", Status::Working, 5, "");
+        db.touch_last_agent_msg("s", 50).unwrap();
+        let seen = db.resolve_ref("s").unwrap();
+        assert!(apply(&db, &seen, Status::Idle, "turn_ended", 60, Some(40)).unwrap());
+        assert_eq!(db.resolve_ref("s").unwrap().last_agent_msg_at, Some(50));
     }
 
     #[test]

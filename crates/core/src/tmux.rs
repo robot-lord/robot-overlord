@@ -271,44 +271,59 @@ pub fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether session `name`'s agent is gone: its tmux session missing, or
-/// the program in its pane exited (rlord keeps a dead pane on screen). An
-/// error when tmux couldn't say (no server reached, a failed call): never
-/// read as gone.
-pub fn pane_gone(name: &str) -> Result<bool> {
+/// Each rlord tmux session's agent pane (the pinned one, `@rlord_pane`,
+/// else the first, as `window_pane_ids` picks it): whether its program
+/// exited (rlord keeps a dead agent pane on screen). One `list-panes -a`
+/// for every session. A session not in the map is gone; no server running
+/// means every session is gone (an empty map). Any other failure is an
+/// error: nothing can be concluded from it.
+pub fn agent_panes_dead() -> Result<std::collections::HashMap<String, bool>> {
     let out = tmux_cmd()
-        .args(["has-session", "-t", &exact(name)])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            &format!("#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{session_name}}"),
+        ])
         .output()
         .context("running tmux")?;
-    if !session_found(out.status.success(), &String::from_utf8_lossy(&out.stderr))? {
-        return Ok(true);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if no_server(&err) {
+            return Ok(Default::default());
+        }
+        bail!("tmux list-panes: {}", err.trim());
     }
-    // (tmux 3.8 answers a target it can't find with nothing, and success.)
-    match run(&[
-        "display-message",
-        "-p",
-        "-t",
-        &format!("={name}:"),
-        "#{pane_dead}",
-    ])?
-    .as_str()
-    {
-        "1" => Ok(true),
-        "0" => Ok(false),
-        other => bail!("tmux: no pane state for {name} ({other:?})"),
-    }
+    Ok(parse_agent_panes(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// `has-session`'s answer: found, not found (`can't find session`), or an
-/// error (anything else: `no server running`, `error connecting to …`).
-fn session_found(ok: bool, stderr: &str) -> Result<bool> {
-    if ok {
-        Ok(true)
-    } else if stderr.contains("can't find session") {
-        Ok(false)
-    } else {
-        bail!("tmux: {}", stderr.trim())
+/// tmux said no server is running on rlord's socket (no socket file, or
+/// nothing listening): every session is gone.
+fn no_server(stderr: &str) -> bool {
+    stderr.contains("no server running")
+        || (stderr.contains("error connecting to") && stderr.contains("No such file or directory"))
+}
+
+/// `agent_panes_dead`'s lines: pane id, dead (`1`), the session's pinned
+/// pane, session name.
+fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, bool> {
+    let mut first: std::collections::HashMap<String, bool> = Default::default();
+    let mut pinned: std::collections::HashMap<String, bool> = Default::default();
+    for l in out.lines() {
+        let mut f = l.splitn(4, '\t');
+        let (Some(pane), Some(dead), Some(pin), Some(session)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let dead = dead == "1";
+        first.entry(session.to_string()).or_insert(dead);
+        if pane == pin {
+            pinned.insert(session.to_string(), dead);
+        }
     }
+    first.extend(pinned);
+    first
 }
 
 /// Session option naming the agent's pane. With the user's tmux profile a
@@ -1568,17 +1583,24 @@ mod tests {
 
     use super::*;
 
-    /// As tmux 3.8 answered on a scratch socket (2026-11-18).
+    /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
+    /// pane decides, else the first; a session name may hold spaces; no
+    /// server is every session gone, anything else an error.
     #[test]
-    fn a_missing_session_is_told_from_a_tmux_failure() {
-        assert!(session_found(true, "").unwrap());
-        assert!(!session_found(false, "can't find session: nope\n").unwrap());
-        assert!(session_found(false, "no server running on /tmp/tmux-501/x\n").is_err());
-        assert!(session_found(
-            false,
+    fn agent_panes_are_the_pinned_ones() {
+        let out = "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td";
+        let m = parse_agent_panes(out);
+        assert_eq!(m.get("a b"), Some(&false), "the pinned pane, not the split");
+        assert_eq!(m.get("c"), Some(&true), "none pinned: the first");
+        assert_eq!(m.get("d"), Some(&true));
+        assert!(no_server("no server running on /tmp/tmux-501/x\n"));
+        assert!(no_server(
             "error connecting to /tmp/tmux-501/x (No such file or directory)"
-        )
-        .is_err());
+        ));
+        assert!(!no_server(
+            "error connecting to /tmp/tmux-501/x (Permission denied)"
+        ));
+        assert!(!no_server("lost server"));
     }
 
     #[test]

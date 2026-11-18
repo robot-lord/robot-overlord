@@ -194,6 +194,23 @@ impl Line<'_> {
         }
     }
 
+    /// A slash command's wrapper line (Claude): a turn unless local output
+    /// follows it (`tail_of`).
+    pub fn command_wrapper(&self) -> bool {
+        match self.format {
+            Format::Claude => claude::command_wrapper(self.v),
+            Format::Codex | Format::OpenCode => false,
+        }
+    }
+
+    /// A local command's output or a compaction's summary (Claude).
+    pub fn local_command_output(&self) -> bool {
+        match self.format {
+            Format::Claude => claude::local_command_output(self.v),
+            Format::Codex | Format::OpenCode => false,
+        }
+    }
+
     /// Local output the user's own commands wrote (Claude's `!` shell
     /// commands, local commands' output): no turn of the agent's.
     pub fn local_output(&self) -> bool {
@@ -248,11 +265,19 @@ pub fn tail(path: &Path) -> Option<Tail> {
 /// `tail` over lines already parsed (oldest first).
 pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
     let lines = || lines.iter().rev().map(|v| format.line(v));
+    // (Read backwards: whether a local command's output came after.)
+    let mut local_after = false;
     let turn = lines().find_map(|l| {
+        let at = l.at().and_then(parse_iso_ms);
+        if l.command_wrapper() {
+            // A built-in command (its output follows): nothing. A custom
+            // command or a skill: the model's turn.
+            return (!local_after).then_some((TurnTail::Open, at));
+        }
         if l.local_output() {
+            local_after |= l.local_command_output();
             return None;
         }
-        let at = l.at().and_then(parse_iso_ms);
         if l.interrupted() {
             return Some((TurnTail::Interrupted, at));
         }
@@ -1048,6 +1073,28 @@ mod tests {
         feedback["isMeta"] = json!(true);
         let fed = t(&[reply("2026-11-12T10:00:05Z", "end_turn"), feedback]);
         assert_eq!(fed.turn, Some(TurnTail::Open));
+        // A built-in command with its output: nothing about the turn.
+        let builtin = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:20Z",
+                "<command-name>/model</command-name>",
+            ),
+            user(
+                "2026-11-12T10:00:21Z",
+                "<local-command-stdout>Set model to opus</local-command-stdout>",
+            ),
+        ]);
+        assert_eq!(builtin.turn, Some(TurnTail::Ended));
+        // A custom command or a skill, no reply yet: the model's turn.
+        let custom = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:20Z",
+                "<command-message>review</command-message>\n<command-name>/review</command-name>",
+            ),
+        ]);
+        assert_eq!(custom.turn, Some(TurnTail::Open));
         // Nothing about a turn: unknown.
         assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
         // Codex: an aborted turn is a turn ended.

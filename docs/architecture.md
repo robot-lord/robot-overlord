@@ -429,27 +429,32 @@ live status. Once at daemon start and then every minute, plain code
 checks the sessions that follow hooks (Claude, and Codex with trusted
 hooks) against what is there to see:
 
-- pane gone (tmux session missing, or a dead pane) on two looks in a row:
-  `stopped`, through `discover`'s stop (`session_end` from the pane). A
-  look tmux can't answer (no server reached, a failed call) skips the
-  whole pass: nothing is stopped or corrected on a guess;
+- agent pane gone on two looks in a row: `stopped`, through `discover`'s
+  stop (`session_end` from the pane). One `list-panes -a` a pass looks at
+  each session's pinned agent pane (`@rlord_pane`, else the first): its
+  program exited, or the session isn't listed; no server running means
+  every session is gone. When tmux can't say otherwise, no pane verdict
+  is made that pass (nothing is stopped on a guess);
 - `waiting_input` or `working` unchanged for 2 minutes while the
   transcript's tail says the last turn ended (a final reply, Codex's
   `turn_aborted`) or was interrupted (Claude's `[Request interrupted by
   user…]` line), and nothing was written for 2 minutes: `idle`. For
   `working`, that line must be later than the status change (else it is
-  the previous turn's). A turn found ended dates the session's last
-  message, as a `Stop` would. The user's own `!` shell commands, slash
-  command wrappers, a compaction's summary and meta lines after the reply
-  say nothing about the turn; a Stop hook's feedback reopens it.
+  the previous turn's). A turn found ended moves the session's last
+  message forward to it, as a `Stop` would. Lines the user's own commands
+  wrote after the reply say nothing about the turn: `!` shell commands, a
+  built-in slash command followed by its local output, a compaction's
+  summary, meta lines. A custom command or skill with no output after it
+  is the model's turn, and a Stop hook's feedback reopens one.
 
 A turn still open (a tool call waiting on a prompt or running) is never
 touched, however long it waits. Nor is "needs you" while a sub-agent may
-be the one asking: named as waiting, or a background sub-agent still
-open and started within `background.rs`'s `STALE_MS`. Sessions
-`discover` or `opencode.rs` follow are theirs. A fix is written only if
-the status hasn't moved since it was read, and is logged as a
-`status_rechecked` event (`from`, `to`, `why`).
+be the one asking: named as waiting, or a background sub-agent
+`background.rs` believes open (it wrote within `STALE_MS`). Sessions
+`discover` or `opencode.rs` follow are theirs. One session's failure
+doesn't stop the pass. A fix is written only if the status hasn't moved
+since it was read, and is logged as a `status_rechecked` event (`from`,
+`to`, `why`).
 
 ### Usage limits (`daemon/src/limits.rs`)
 
