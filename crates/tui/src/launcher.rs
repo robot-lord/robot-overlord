@@ -34,6 +34,8 @@ enum Cmd {
     CancelResume,
     /// Open the web UI in the browser (as `rlord web`, once installed).
     Web,
+    /// The Devices screen: remote access through a relay.
+    Relay,
 }
 
 /// (name, what it does, command)
@@ -92,6 +94,11 @@ const COMMANDS: &[(&str, &str, Cmd)] = &[
     ),
     ("search", "filter the list", Cmd::Act(Action::Filter)),
     ("web", "open the web UI in your browser", Cmd::Web),
+    (
+        "relay",
+        "remote access: paired devices, pair one, confirm or unpair",
+        Cmd::Relay,
+    ),
     (
         "archive",
         "archive the selected session (asks first)",
@@ -271,6 +278,7 @@ impl App {
             Cmd::ResumeAfterLimit => self.resume_after_limit(),
             Cmd::CancelResume => self.cancel_resume(),
             Cmd::Web => self.open_web(),
+            Cmd::Relay => self.open_devices(),
             Cmd::Summarize => {
                 if let Some(id) = self.selected_id() {
                     if let Some(v) = self.call(

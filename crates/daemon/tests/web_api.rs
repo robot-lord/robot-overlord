@@ -1414,6 +1414,18 @@ fn the_mirror_and_the_confirmation_notice() {
     let r = start();
     let mut stream = WebStream::open(&r.sock);
     ok(&r.sock, "web.pages", json!({"pages": ["p1-aaaa"]}));
+    // A TUI too: the terminal's surface.
+    let tui = UnixStream::connect(&r.sock).unwrap();
+    tui.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tw = tui.try_clone().unwrap();
+    writeln!(
+        tw,
+        "{}",
+        json!({"id": 1, "method": "events.subscribe", "params": {"client": "tui"}})
+    )
+    .unwrap();
+    let mut tui_lines = BufReader::new(tui).lines();
+    tui_lines.next().unwrap().unwrap();
     let state = |pending: Value| {
         json!({
             "relay": "https://relay.example.com", "connected": true, "error": null,
@@ -1438,6 +1450,19 @@ fn the_mirror_and_the_confirmation_notice() {
         text.contains("tablet") && text.contains("123456") && text.contains("Devices"),
         "{text}"
     );
+    // The terminal's own words, on its status line.
+    let n = loop {
+        let v: Value = serde_json::from_str(&tui_lines.next().unwrap().unwrap()).unwrap();
+        if v["notify"] == "ui" {
+            break v;
+        }
+    };
+    assert_eq!(
+        (&n["to"], &n["cmd"]["cmd"]),
+        (&json!("terminal"), &json!("notice"))
+    );
+    let text = n["cmd"]["text"].as_str().unwrap();
+    assert!(text.contains("tablet") && text.contains(":relay"), "{text}");
     // The same state again: no second notice; another device: its own.
     ok(
         &r.sock,
