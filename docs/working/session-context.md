@@ -647,7 +647,9 @@ Still owed:
 
 - [x] V1 passed (2026-11-17, Claude Code 2.1.327): `exec claude < prompt.md`
   ran the prompt and kept the terminal for typed input; `--resume …
-  --fork-session` with stdin also worked. `CLAUDE_STDIN = true` (1.10.0).
+  --fork-session` with stdin also worked, and so did a folder Claude
+  hadn't trusted (the prompt ran after the trust dialog was accepted).
+  `CLAUDE_STDIN = true` (1.10.0).
 
 - [x] `daemon/src/first_prompt.rs`: `Way { Argv, Stdin, Server, Pointer }`
   per agent; `place` writes the first prompt (user's words, with the
@@ -676,9 +678,7 @@ Still owed:
   Codex is still launched with a prompt).
 
 Owed from PR 3:
-- V1 not yet run in a folder Claude hasn't trusted (trust dialog shown
-  before the composer): does the stdin prompt survive the dialog? Also
-  untested on Linux and other Claude Code versions.
+- V1 on Linux and other Claude Code versions is untested.
 - Live-check the OpenCode POST (V4) on a scratch server: that the TUI
   opened with `-s` shows the posted turn, and that the 30s fallback is
   long enough.
