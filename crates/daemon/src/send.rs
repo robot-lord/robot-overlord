@@ -671,7 +671,7 @@ pub(crate) fn stop_claim(
     // transcript's last `task_complete` says).
     let claims = match agent {
         Agent::Claude => true,
-        Agent::Codex => CODEX_STOP_CLAIM && codex_claims(db, s),
+        Agent::Codex => CODEX_STOP_CLAIM,
         Agent::OpenCode => false,
     };
     if !claims
@@ -679,6 +679,7 @@ pub(crate) fn stop_claim(
         || s.archived_at.is_some()
         || matches!(s.status, Status::Stopped | Status::Starting | Status::Error)
         || crate::limits::limited_in(db, &s.id, now)
+        || (agent == Agent::Codex && !codex_claims(db, s))
     {
         return Ok(None);
     }
@@ -1382,6 +1383,11 @@ mod tests {
             assert_eq!(c.output["reason"], framed(&[msg("also the footer")]));
             assert!(c.ack.starts_with(CLAIM_PREFIX), "{}", c.ack);
             db.kv_delete(&claims_key(&id)).unwrap();
+            // On Codex's daemon: not claimed (not checked live there).
+            let spec = json!({"codex_host": rlord_core::agents::codex::HOST_DAEMON});
+            db.set_launch_spec(&id, &spec.to_string()).unwrap();
+            assert!(stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_none());
+            db.set_launch_spec(&id, "{}").unwrap();
         }
         let r = stop_claim(&db, &s, Agent::Claude, 2).unwrap().unwrap();
         assert_eq!(r.output["decision"], "block");

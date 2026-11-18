@@ -221,6 +221,13 @@ impl AgentChoice {
     }
 }
 
+impl AgentChoice {
+    /// The effort it starts on, by name (its index is into `efforts`).
+    fn start_effort(&self) -> String {
+        self.efforts.get(self.effort).cloned().unwrap_or_default()
+    }
+}
+
 impl Setup {
     fn from_status(st: &Value) -> Self {
         let mut agents: Vec<AgentChoice> = st["agents"]
@@ -261,6 +268,8 @@ impl Setup {
             none_installed,
             error: None,
         };
+        let keep = s.choice().start_effort();
+        s.refit_efforts(&keep);
         // Start on the first row there is something to pick in.
         s.row = usize::from(s.agents.len() < 2);
         s
@@ -274,7 +283,7 @@ impl Setup {
     /// one, Remote Control only where this machine and the agent can.
     fn rows(&self) -> Vec<SetupRow> {
         let mut v = vec![SetupRow::Agent, SetupRow::Model];
-        if !self.choice().efforts.is_empty() {
+        if !self.efforts().is_empty() {
             v.push(SetupRow::Effort);
         }
         if self.remote.is_some() && self.choice().remote {
@@ -288,25 +297,30 @@ impl Setup {
     }
 
     fn effort(&self) -> &str {
-        self.choice().efforts.get(self.effort).map_or("", |e| e)
+        self.efforts().get(self.effort).map_or("", |e| e)
     }
 
-    /// The Model row moved: offer that model's own efforts (Codex's
-    /// catalog), keeping the chosen effort if it is offered, else the
-    /// default, else the first.
-    fn refit_efforts(&mut self) {
-        let model = self.model().to_string();
-        let keep = self.effort().to_string();
-        let c = &mut self.agents[self.agent];
-        let Some(e) = c.efforts_by.get(&model).filter(|e| !e.is_empty()).cloned() else {
-            return;
-        };
+    /// The effort choices for the current model: its own (Codex's catalog,
+    /// `efforts_by`), else the agent's list. Never changes the choice's
+    /// lists, so switching agents and back finds them as sent.
+    fn efforts(&self) -> &[String] {
+        let c = self.choice();
+        c.efforts_by
+            .get(self.model())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(&c.efforts)
+    }
+
+    /// The model changed: point the effort at the same level in the new
+    /// list if offered, else the default, else the first.
+    fn refit_efforts(&mut self, keep: &str) {
+        let e = self.efforts();
+        let dflt = &self.choice().effort_default;
         let at = e
             .iter()
-            .position(|x| *x == keep)
-            .or_else(|| e.iter().position(|x| *x == c.effort_default))
+            .position(|x| x == keep)
+            .or_else(|| e.iter().position(|x| x == dflt))
             .unwrap_or(0);
-        c.efforts = e;
         self.effort = at;
     }
 
@@ -328,14 +342,16 @@ impl Setup {
                 if to != self.agent {
                     self.agent = to;
                     self.model = self.choice().model;
-                    self.effort = self.choice().effort;
+                    let keep = self.choice().start_effort();
+                    self.refit_efforts(&keep);
                 }
             }
             Some(SetupRow::Model) => {
+                let keep = self.effort().to_string();
                 self.model = next(self.model, self.choice().models.len());
-                self.refit_efforts();
+                self.refit_efforts(&keep);
             }
-            Some(SetupRow::Effort) => self.effort = next(self.effort, self.choice().efforts.len()),
+            Some(SetupRow::Effort) => self.effort = next(self.effort, self.efforts().len()),
             Some(SetupRow::Remote) => self.remote = self.remote.map(|on| !on),
             None => {}
         }
@@ -1197,25 +1213,47 @@ mod tests {
         );
     }
 
+    fn codex_choice() -> Value {
+        json!({"name": "codex", "label": "Codex", "model": "gpt-a",
+            "effort": "medium", "models": ["gpt-a", "gpt-b", ""],
+            "efforts": ["low", "medium", "xhigh"],
+            "efforts_by_model": {"gpt-a": ["low", "medium", "xhigh"],
+                                 "gpt-b": ["low", "high"], "": ["low", "medium", "high"]}})
+    }
+
     /// Codex: the effort row follows the model (its catalog's levels),
     /// keeping the chosen effort where offered.
     #[test]
     fn setup_efforts_follow_the_codex_model() {
-        let codex = json!({"name": "codex", "label": "Codex", "model": "gpt-a",
-            "effort": "medium", "models": ["gpt-a", "gpt-b", ""],
-            "efforts": ["low", "medium", "xhigh"],
-            "efforts_by_model": {"gpt-a": ["low", "medium", "xhigh"],
-                                 "gpt-b": ["low", "high"], "": ["low", "medium", "high"]}});
-        let mut s = Setup::from_status(&status(json!([codex]), false));
+        let mut s = Setup::from_status(&status(json!([codex_choice()]), false));
         assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
         s.row = 1; // Model
         s.step(true);
         assert_eq!(s.model(), "gpt-b");
-        assert_eq!(s.choice().efforts, ["low", "high"]);
+        assert_eq!(s.efforts(), ["low", "high"]);
         assert_eq!(s.effort(), "low");
         s.step(true);
         // "low" is offered here too: kept.
         assert_eq!((s.model(), s.effort()), ("", "low"));
+        // Lists are never replaced: back on gpt-a its own list again.
+        s.step(true);
+        assert_eq!(s.model(), "gpt-a");
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
+        // Agent row: to Claude and back resets Codex to its default.
+        let mut s = Setup::from_status(&status(json!([claude(), codex_choice()]), false));
+        s.row = 0;
+        s.step(true);
+        assert_eq!(
+            (s.choice().name.as_str(), s.model(), s.effort()),
+            ("codex", "gpt-a", "medium")
+        );
+        s.row = 1;
+        s.step(true);
+        s.row = 0;
+        s.step(true);
+        s.step(true);
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        assert_eq!(s.efforts(), ["low", "medium", "xhigh"]);
     }
 
     #[test]

@@ -1087,9 +1087,11 @@ A strong model at medium effort
 (`[overlord] model` / `effort`; the effort is a launch flag, per agent:
 `overlord::effort_args`). On Codex with no model set, the setup form and
 a newly created overlord take the best-priority "astra" model in Codex's
-catalog (`models_cache.json`; the `opus` equivalent, else its priority-1
-entry, else Codex's default) and offer that model's
-`supported_reasoning_levels`. It is resolved when the overlord is
+catalog (`models_cache.json`; the `opus` equivalent: a slug ending
+`-astra` first, then a variant such as `-astra-mini`). With no match, or
+when the user's Codex `config.toml` sets `model`, it stays "" (Codex's
+own default), which is always a choice in the form. The form offers each
+model's `supported_reasoning_levels` and follows the Model row. It is resolved when the overlord is
 created and stored on its session, so a catalog update never changes a
 running overlord's model behind the user's back. It does light work itself and sends the rest to
 subagents and new sessions, which `overlord.md` states first. It lives in

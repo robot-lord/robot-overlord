@@ -853,7 +853,12 @@ pub(crate) fn limit_ended(v: &Value) -> bool {
 
 /// Whether the conversation's last finished turn, with none started since,
 /// ended on an error (a usage limit included): Codex has no `StopFailure`,
-/// so a Stop hook can't tell. Reads the file's tail only.
+/// so a Stop hook can't tell. Only a failed `task_complete` newer than the
+/// latest `task_started` counts; when the newest marker is a start (the
+/// completion not written yet when the Stop runs), it is unknown and not
+/// held against the claim (`limits::limited_in` still applies). Whether
+/// Codex writes `task_complete` before running Stop is not checked live.
+/// Reads the file's tail only.
 pub fn last_turn_failed(path: &Path) -> bool {
     let (_, tail) = super::transcript::read_head_tail(path);
     tail.iter()
@@ -956,6 +961,18 @@ pub fn models(home: &Path) -> Vec<String> {
         .collect();
     listed.sort();
     listed.into_iter().map(|(_, slug)| slug).collect()
+}
+
+/// The `model` the user set in Codex's own `config.toml` (top level), if
+/// any. Reads that one key; nothing else of the file is used.
+pub fn configured_model(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    let doc: toml::Table = text.parse().ok()?;
+    doc.get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
 }
 
 /// The effort levels Codex's catalog (`models_cache.json`) lists for
@@ -1608,6 +1625,20 @@ mod tests {
         assert!(threads_started_in(dir.path(), "/src/none", 0, false).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0, false).is_empty());
+    }
+
+    #[test]
+    fn the_users_codex_model_is_read_from_its_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(configured_model(tmp.path()), None);
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "model = \"m1\"\n[x]\nmodel = \"no\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured_model(tmp.path()).as_deref(), Some("m1"));
+        std::fs::write(tmp.path().join("config.toml"), "[x]\nmodel = \"no\"\n").unwrap();
+        assert_eq!(configured_model(tmp.path()), None);
     }
 
     #[test]

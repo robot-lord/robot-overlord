@@ -220,7 +220,8 @@ fn model_effort_in(cfg: &Config, agent: Agent, codex_home: &Path) -> (String, St
         let (m, e) = rlord_core::config::OverlordConfig::defaults_for(agent.name());
         (m.to_string(), e.to_string())
     };
-    if agent == Agent::Codex && m.is_empty() {
+    // (The user's own Codex `model` wins: keep "" so Codex uses it.)
+    if agent == Agent::Codex && m.is_empty() && codex::configured_model(codex_home).is_none() {
         return (codex_top_model(codex_home), e);
     }
     (m, e)
@@ -245,8 +246,11 @@ fn codex_top_model(home: &Path) -> String {
 
 /// The setup form's model choices for `agent`: Codex's catalog with ""
 /// (Codex's own default) kept as a choice.
-fn models_in(cfg: &Config, agent: Agent) -> Vec<String> {
-    let mut m = cfg.session.models_for(agent);
+fn models_in(cfg: &Config, agent: Agent, codex_home: &Path) -> Vec<String> {
+    let mut m = match agent {
+        Agent::Codex => codex::models(codex_home),
+        _ => cfg.session.models_for(agent),
+    };
     if agent == Agent::Codex && !m.iter().any(String::is_empty) {
         m.push(String::new());
     }
@@ -255,12 +259,12 @@ fn models_in(cfg: &Config, agent: Agent) -> Vec<String> {
 
 /// Each Codex catalog model's efforts, for the form to switch the effort
 /// row when the model changes (`efforts_in`). Empty for other agents.
-fn efforts_by_model(cfg: &Config, agent: Agent, codex_home: &Path) -> Value {
+fn efforts_by_model(agent: Agent, codex_home: &Path) -> Value {
     if agent != Agent::Codex {
         return json!({});
     }
     let mut out = serde_json::Map::new();
-    for m in cfg.session.models_for(agent) {
+    for m in codex::models(codex_home) {
         out.insert(m.clone(), json!(efforts_in(agent, &m, codex_home)));
     }
     out.insert(String::new(), json!(efforts_in(agent, "", codex_home)));
@@ -955,17 +959,18 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         out["exists"] = json!(false);
         // The agents it can run on (installed ones), each with what the
         // dialog offers: its default model and effort, and the choices.
+        let home = codex::home();
         let agents: Vec<Value> = Agent::ALL
             .into_iter()
             .filter(|a| rlord_core::agents::install::missing(*a).is_none())
             .map(|a| {
-                let (model, effort) = model_effort_for(cfg, a);
+                let (model, effort) = model_effort_in(cfg, a, &home);
                 json!({
                     "name": a.name(), "label": a.label(),
                     "model": model, "effort": effort,
-                    "models": models_in(cfg, a),
-                    "efforts": efforts_in(a, &model, &codex::home()),
-                    "efforts_by_model": efforts_by_model(cfg, a, &codex::home()),
+                    "models": models_in(cfg, a, &home),
+                    "efforts": efforts_in(a, &model, &home),
+                    "efforts_by_model": efforts_by_model(a, &home),
                     "remote_control": a.has_remote_control(),
                     "catalog": catalog(a.name()),
                 })
@@ -1227,6 +1232,17 @@ mod tests {
             model_effort_in(&cfg, Agent::Codex, astra.path()).0,
             "gpt-6.2-astra"
         );
+        // Every model's efforts, and "" kept as a model choice.
+        let by = efforts_by_model(Agent::Codex, tmp.path());
+        assert_eq!(by["gpt-new"], json!(["low", "medium", "high", "xhigh"]));
+        assert_eq!(by[""], json!(["low", "medium", "high"]));
+        assert_eq!(
+            models_in(&cfg, Agent::Codex, tmp.path()),
+            ["gpt-new", "gpt-old", ""]
+        );
+        // The user's own Codex model wins: "" so Codex uses it.
+        std::fs::write(astra.path().join("config.toml"), "model = \"gpt-mine\"\n").unwrap();
+        assert_eq!(model_effort_in(&cfg, Agent::Codex, astra.path()).0, "");
         // Only a variant: that, over the fast model.
         let mini = tempfile::tempdir().unwrap();
         std::fs::write(

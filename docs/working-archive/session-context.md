@@ -106,3 +106,8 @@ gets the text.
   `context.md` of linking sessions is refreshed on a rename, not on the
   linked session's status changes; `get_session` shows any session's
   background to any session with plain `rlord mcp`.
+- Codex Stop claim (#80): whether Codex writes the turn's
+  `task_complete` (with its error) before running the Stop hook is not
+  checked live. Until then `codex::last_turn_failed` only holds a failed
+  completion newer than the latest `task_started` against a claim; a
+  limit or error not yet written is caught only by `limits::limited_in`.
