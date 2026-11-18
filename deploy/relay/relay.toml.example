@@ -1,0 +1,77 @@
+# rlord-relay's config: /etc/rlord-relay/relay.toml by default (`--config`
+# picks another). Unknown keys are errors. `rlord-relay check` loads it,
+# makes the key if there is none, and says what is wrong.
+#
+# The relay only ever sees ciphertext and metadata. See docs/relay.md.
+
+# How hosts and devices reach this relay, as they will pin it: https, the
+# host name in lower case, no path, no default port. Required unless
+# `listen` is a loopback address. Set it to your relay's DNS name.
+origin = "https://relay.example.com"
+
+# Where the relay listens. Default: 127.0.0.1:8080 in proxy mode, 0.0.0.0:443
+# in files mode. `rlord-relay serve --listen IP:PORT` overrides it (the
+# container image listens on 0.0.0.0:8080 inside its own network).
+listen = "127.0.0.1:8080"
+
+# The relay's key (relay.key) and database (relay.db). Back both up: losing
+# relay.key means every host has to set up the relay again.
+data_dir = "/var/lib/rlord-relay"
+
+[tls]
+# "proxy": plain HTTP behind a reverse proxy (Caddy, nginx) that terminates
+# TLS and sets X-Forwarded-For. Keep `listen` reachable by the proxy only.
+mode = "proxy"
+
+# Or terminate TLS here: replace the line above with these three. The PEM
+# files are re-read on SIGHUP (systemctl reload rlord-relay) and twice a
+# day, so a renewed certificate is picked up without a restart. Comment out
+# `listen` above to take 0.0.0.0:443.
+#mode = "files"
+#cert = "/etc/rlord-relay/fullchain.pem"
+#key = "/etc/rlord-relay/privkey.pem"
+
+[hosts]
+# Who may register a host: "token" (a token from `rlord-relay token new`,
+# the default), "open" (anyone), "closed" (only `rlord-relay host add`).
+registration = "token"
+
+[limits]
+# Every limit is optional; the defaults are shown.
+
+# Registered hosts, and open connections (past it an upgrade gets HTTP 503).
+#max_hosts = 1000
+#max_connections = 10000
+# Devices on one host's allow-list.
+#devices_per_host = 16
+# Connections from one address that haven't authenticated yet.
+#unauthenticated_per_address = 8
+
+# What one connection may send: bytes per second on average, and in one
+# burst.
+#bytes_per_second = 262144
+#burst_bytes = 1048576
+
+# One mailbox queue (per device and direction, for a peer that is away):
+# messages, bytes, and how many seconds a message waits (0 turns mailbox
+# queues off).
+#mailbox_messages = 32
+#mailbox_bytes = 131072
+#mailbox_ttl = 600
+
+# Pairing: rendezvous a host may have open at once, how many seconds one
+# lives, and the pairing attempts one may take.
+#rendezvous_per_host = 4
+#rendezvous_ttl = 300
+#rendezvous_attempts = 3
+
+# Timers, in seconds: authenticating after the upgrade, pings, closing a
+# silent connection (must be longer than ping_interval), closing a link
+# whose receiver takes nothing.
+#auth_timeout = 5
+#ping_interval = 25
+#idle_timeout = 60
+#stall_timeout = 10
+
+# Forget a host not seen for this many days (0: never).
+#host_expiry_days = 90

@@ -836,31 +836,56 @@ impl Hub {
             g.to_host.retain(|_, q| !q.msgs.is_empty());
             g.hosts.keys().copied().collect()
         };
-        for h in hosts {
-            if let Ok(Some((rec, _))) = self.registry.host(&h) {
-                if rec.status == Status::Suspended {
-                    self.close_host(&h, close::SUSPENDED);
+        for h in &hosts {
+            match self.registry.host(h) {
+                Ok(Some((rec, _))) if rec.status == Status::Suspended => {
+                    self.close_host(h, close::SUSPENDED);
                 }
+                // Every admitted host has a record, so a missing one was
+                // removed (`rlord-relay host remove`).
+                Ok(None) => self.close_host(h, close::NOT_ALLOWED),
+                _ => {}
             }
+        }
+        if let Err(e) = self.expire_hosts(&hosts) {
+            tracing::warn!("store: {e:#}");
         }
         if let Err(e) = self.registry.store.purge_expired() {
             tracing::warn!("store: {e:#}");
         }
     }
 
+    /// Forgets hosts not seen for `host_expiry`, and their device lists.
+    /// Connected hosts are seen now.
+    fn expire_hosts(&self, connected: &[Fp]) -> anyhow::Result<()> {
+        let Some(expiry) = self.cfg.host_expiry else {
+            return Ok(());
+        };
+        let now = crate::store::now();
+        for (fp, h) in self.registry.hosts()? {
+            if !connected.contains(&fp) && now.saturating_sub(h.last_seen) > expiry.as_secs() {
+                tracing::info!(host = %short(&fp), "forgetting an unused host");
+                self.registry.remove_host(&fp)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Closes a host's connection and its devices' and pairing devices':
     /// 4402 (with `bye` `suspended`) for a suspension, 4403 for a removal.
     pub fn close_host(&self, host: &Fp, close_code: u16) {
         let g = self.lock();
-        let bye = (close_code == close::SUSPENDED).then_some((code::SUSPENDED, None));
+        let suspended = close_code == close::SUSPENDED;
+        let bye = suspended.then_some((code::SUSPENDED, None));
+        let reason = if suspended { "suspended" } else { "removed" };
         if let Some(h) = g.hosts.get(host) {
-            h.out.kill(close_code, "suspended", bye);
+            h.out.kill(close_code, reason, bye);
         }
         for d in g.devices.values().filter(|d| d.host == *host) {
-            d.out.kill(close_code, "suspended", bye);
+            d.out.kill(close_code, reason, bye);
         }
         for d in g.pairs.values().filter(|d| d.host == *host) {
-            d.out.kill(close_code, "suspended", bye);
+            d.out.kill(close_code, reason, bye);
         }
     }
 }

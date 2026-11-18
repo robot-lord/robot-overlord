@@ -17,6 +17,10 @@
 //! after it is hashed. The page is built once, before any target
 //! (`cargo xtask web build`), or taken from `RLORD_WEB_DIST` (the release
 //! workflow builds it in its own job, so Node stays off the build jobs).
+//!
+//! Linux targets also get the relay server, `rlord-relay`, in its own
+//! tarball with an example config and a systemd unit. It is not a plugin
+//! of `rlord`, so no hash of it is compiled in anywhere.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -131,6 +135,17 @@ pub fn build(platform: Platform, dist: &Path) -> Result<()> {
                 if is_native_linux(t) {
                     check_install(&ver, t, &bin, &dist)?;
                 }
+                // Its own invocation, like the plugin's, so its
+                // dependencies' features don't unify into rlord's.
+                cmd::run(tool("zigbuild").args(relay_args(t)))?;
+                let relay = relay_binary(&target_dir, t);
+                if is_native_linux(t) {
+                    let reported = cmd::output(Command::new(&relay).arg("--version"))?;
+                    if reported != format!("rlord-relay {ver}") {
+                        bail!("built rlord-relay reports the wrong version ({reported})");
+                    }
+                }
+                pack_relay(&ver, t, &relay, stage.path(), &dist)?;
             }
             // Distro packages: the same static binaries, requiring tmux.
             let out_dir = format!("{}/", dist.display());
@@ -194,7 +209,7 @@ const WEB_DIST: &str = "crates/web/ui/dist";
 const WEB_LICENSES: &str = "THIRD-PARTY-LICENSES.md";
 
 /// SHA-256 of a file, lowercase hex.
-fn sha256(path: &Path) -> Result<String> {
+pub fn sha256(path: &Path) -> Result<String> {
     let out = cmd::output(Command::new("shasum").args(["-a", "256", "--"]).arg(path))?;
     let sum = out.split_whitespace().next().unwrap_or("");
     if sum.len() != 64 || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -285,6 +300,44 @@ fn plugin_args(target: Target) -> [&'static str; 6] {
 
 fn plugin_binary(target_dir: &Path, target: Target) -> PathBuf {
     target_dir.join(target.triple).join("release/rlord-web")
+}
+
+const RELAY_PACKAGE: &str = "robot-overlord-relay";
+/// What a self-hoster installs beside the binary.
+const RELAY_EXAMPLE: &str = "deploy/relay/relay.toml.example";
+const RELAY_UNIT: &str = "deploy/relay/rlord-relay.service";
+
+/// The relay server's build (Linux only).
+fn relay_args(target: Target) -> [&'static str; 6] {
+    [
+        "--release",
+        "--locked",
+        "-p",
+        RELAY_PACKAGE,
+        "--target",
+        target.triple,
+    ]
+}
+
+fn relay_binary(target_dir: &Path, target: Target) -> PathBuf {
+    target_dir.join(target.triple).join("release/rlord-relay")
+}
+
+/// The relay's tarball: the binary, both licenses, the example config and
+/// the systemd unit.
+fn pack_relay(ver: &Version, target: Target, bin: &Path, stage: &Path, dist: &Path) -> Result<()> {
+    tar(
+        &ver.relay_tarball_stem(target),
+        &[
+            bin,
+            Path::new("LICENSE-MIT"),
+            Path::new("LICENSE-APACHE"),
+            Path::new(RELAY_EXAMPLE),
+            Path::new(RELAY_UNIT),
+        ],
+        stage,
+        &dist.join(ver.relay_tarball(target)),
+    )
 }
 
 /// The plugin's tarball: the binary, both licenses, and the bundled npm

@@ -27,4 +27,15 @@ grep -q '(verified)' /tmp/web-status
 rlord web url >/tmp/web-url
 grep -q '^http://127.0.0.1:' /tmp/web-url
 rlord web stop
+# The relay server from its own tarball (not installed by get.sh): the
+# example config as shipped, with only the data dir moved to scratch.
+relay_tgz=$(ls /dist/rlord-relay-v*-"$(uname -m)"-unknown-linux-musl.tar.gz)
+mkdir -p /tmp/relay && tar -xzf "$relay_tgz" -C /tmp/relay
+relay=$(ls /tmp/relay/*/rlord-relay)
+"$relay" --version
+sed 's|^data_dir = .*|data_dir = "/tmp/relay/data"|' "$(dirname "$relay")/relay.toml.example" >/tmp/relay/relay.toml
+grep -q '^data_dir = "/tmp/relay/data"$' /tmp/relay/relay.toml
+"$relay" check --config /tmp/relay/relay.toml
+"$relay" address --config /tmp/relay/relay.toml >/tmp/relay/address && cat /tmp/relay/address
+grep -Eq '^https://.*#k=[A-Za-z0-9_-]{43}$' /tmp/relay/address
 echo OK

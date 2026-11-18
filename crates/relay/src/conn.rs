@@ -82,14 +82,23 @@ pub async fn run(hub: Arc<Hub>, ws: WebSocket, ip: IpAddr, guard: ConnGuard) {
     // Ends the writer after what is queued (a no-op after a kill, whose
     // close frame is already queued).
     out.kill(1000, "", None);
-    // Let the writer send what is queued (the close frame last), then go.
+    // Let the writer send what is queued (the close frame last), then
+    // wait a moment for the peer's close reply before dropping the socket:
+    // a peer still writing (a pong) to a closed socket would get a reset
+    // and lose the `bye` and close code unread.
     let abort = writer.abort_handle();
-    if tokio::time::timeout(Duration::from_secs(1), writer)
-        .await
-        .is_err()
-    {
+    let linger = Duration::from_secs(1);
+    if tokio::time::timeout(linger, writer).await.is_err() {
         abort.abort();
     }
+    let _ = tokio::time::timeout(linger, async {
+        while let Some(Ok(m)) = stream.next().await {
+            if matches!(m, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
     drop(guard);
 }
 
@@ -435,7 +444,14 @@ async fn serve(hub: &Hub, p: &Peer, stream: &mut Stream, kill: &mut watch::Recei
         };
         let msg = match msg {
             Some(Ok(m)) => m,
-            _ => return,
+            Some(Err(e)) => {
+                // Over the frame limit (20 KiB) or not websocket at all.
+                let too_big = e.to_string().contains("too long");
+                p.out
+                    .kill(if too_big { 1009 } else { 1002 }, "bad frame", None);
+                return;
+            }
+            None => return,
         };
         let len = match &msg {
             Message::Text(t) => t.len(),

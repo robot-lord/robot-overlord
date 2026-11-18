@@ -150,10 +150,17 @@ after the checks, so rehearse that with a manual dry run of the workflow
   made. `cargo xtask release` pushes the `vX.Y.Z` tag, which starts the workflow. A
   preflight job fails fast unless the tag is on `main`, stable and matches
   `Cargo.toml`. Then a macOS runner builds `aarch64-apple-darwin`; a Linux runner cross-compiles
-  the static musl builds (`cargo zigbuild`) and packages `.deb`/`.rpm`; both
+  the static musl builds (`cargo zigbuild`), the relay server's
+  (`rlord-relay-v<ver>-<target>.tar.gz`, Linux only) among them, and
+  packages `.deb`/`.rpm`; both
   architectures are smoke-tested in Docker on Ubuntu, Debian, Fedora and
-  Amazon Linux (`cargo xtask smoke-linux`); the last job writes `SHA256SUMS`,
-  attests build provenance and creates the release as a **draft**.
+  Amazon Linux (`cargo xtask smoke-linux`); the release job writes `SHA256SUMS`,
+  attests build provenance and creates the release as a **draft**. Then
+  the `relay-image` job builds the relay's container image for
+  `linux/amd64` and `linux/arm64` from those relay tarballs (`cargo xtask
+  relay-image`, `deploy/relay/Dockerfile`), pushes it to
+  `ghcr.io/robot-lord/rlord-relay` as `<version>` and `latest`, and
+  attests it; a dry run only builds it.
   `cargo xtask release` waits for the run, checks the assets against `SHA256SUMS`
   and `gh attestation verify`, publishes the draft, then does what still needs
   local credentials: the Homebrew tap (`cargo xtask update-tap`) and crates.io
@@ -200,7 +207,10 @@ on origin and locally (`git push origin :refs/tags/vX.Y.Z; git tag -d
 vX.Y.Z`) and any draft release CI left (`gh release delete vX.Y.Z --yes`),
 then `cargo xtask release --local`. Creating that release pushes
 the tag again, which starts the workflow; its preflight sees the release
-is already published and skips the build, so the two never race. If no
+is already published and skips the build, so the two never race. That
+skips the relay image too: push it from the published release with
+`docker login ghcr.io`, then `cargo xtask relay-image --push` (needs
+`docker buildx`; the image then has no GitHub attestation). If no
 run shows up for a pushed tag, `cargo xtask release` also cancels any run queued
 for it before suggesting `--local`. One-time setup for that:
 

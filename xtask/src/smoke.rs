@@ -1,7 +1,8 @@
 //! `cargo xtask smoke-linux DIST [IMAGE…]`: smoke-test release files on
 //! Linux distros, in Docker (colima on the Mac). Each container installs
 //! with get.sh from the local files (it installs tmux too), then runs the
-//! daemon and a few commands on a scratch tmux socket
+//! daemon and a few commands on a scratch tmux socket, and checks the relay
+//! server from its tarball against its example config
 //! (`smoke_in_container.sh`, compiled in and written to a scratch folder
 //! for the container, as fresh-install does; POSIX sh since the image has
 //! nothing else).

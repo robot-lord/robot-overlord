@@ -51,13 +51,14 @@ pub fn router(hub: Arc<Hub>) -> Router {
 /// the proxy itself added); otherwise the socket's peer.
 fn client_ip(hub: &Hub, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     if hub.cfg.tls == Tls::Proxy {
+        // Only the last entry: earlier ones are whatever the client sent.
         let last = headers
             .get_all("x-forwarded-for")
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-            .last();
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|s| s.trim().parse::<IpAddr>().ok());
         if let Some(ip) = last {
             return ip;
         }

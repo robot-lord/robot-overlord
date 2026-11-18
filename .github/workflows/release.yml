@@ -215,7 +215,8 @@ jobs:
           if-no-files-found: error
 
   # Install each build with get.sh on several distros, natively per arch,
-  # and the web plugin beside it with `rlord web install --from`.
+  # and the web plugin beside it with `rlord web install --from`; check the
+  # relay server from its tarball against its example config.
   smoke-linux:
     needs: build-linux
     strategy:
@@ -263,6 +264,12 @@ jobs:
             [[ -f dist/$f ]] || { echo "::error::missing $f"; ls dist; exit 1; }
           done
       - run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      # The relay-image job checks its tarballs against these sums.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sha256sums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
       - if: env.DRY_RUN == 'false'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -282,3 +289,53 @@ jobs:
             gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes
           fi
           gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --verify-tag --draft --title "$TAG" --generate-notes
+
+  # The relay's container image (ghcr.io/robot-lord/rlord-relay), built by
+  # `cargo xtask relay-image` (xtask/src/relay_image.rs) from the relay
+  # tarballs above, checked against the release's SHA256SUMS: no compiling
+  # here. Every run builds it; a publishing run also pushes and attests it.
+  # It runs after the draft exists, and `cargo xtask release` publishes the
+  # draft only when this whole run passed, so a release never goes out
+  # without its image.
+  relay-image:
+    needs: [smoke-linux, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-linux
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sha256sums
+          path: dist
+      # The toolchain, components and targets in rust-toolchain.toml (for xtask).
+      - run: rustup toolchain install
+      # Built before logging in and run directly (not through cargo), so no
+      # crate build script runs with the registry token on disk.
+      - run: cargo build --locked --package xtask
+      - name: Log in to ghcr.io
+        if: env.DRY_RUN == 'false'
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - id: image
+        run: target/debug/xtask relay-image --dist dist ${{ env.DRY_RUN == 'false' && '--push' || '' }}
+      - if: env.DRY_RUN == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - if: always()
+        run: docker logout ghcr.io
