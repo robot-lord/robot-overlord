@@ -2,7 +2,7 @@
 -- (facts, pointers, answers the user gave) and links to related sessions.
 -- Pushed to the agent by its SessionStart / UserPromptSubmit hook
 -- (`seen_at`), or read from <data>/sessions/<id>/context.md.
--- See docs/working/session-context.md.
+-- See docs/architecture.md, "Session background".
 CREATE TABLE session_context (
   id         INTEGER PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

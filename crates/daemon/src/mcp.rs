@@ -307,10 +307,11 @@ pub fn tools() -> Value {
                 "recreate_worktree": b("Its folder is gone but recreatable: recreate the worktree there"),
             }, "required": ["id"]}}}), &["sessions"]),
         tool("send_to_session",
-            "Pass a message to an existing session: typed into its agent's prompt and submitted, as if the user had typed it. Use it to hand a session work or a follow-up. Only a session whose turn is over (your turn) takes it now; a working one or one that needs the user is refused unless `when_idle` (then it is delivered when that turn ends; one pending message per session, a newer one replaces it). Stopped, starting and archived sessions are refused; so is one stopped on a usage limit (with `when_idle`, held until the limit resets). Right before typing rlord also checks the session's screen: while a dialog is up there, its input holds the user's unsent text, it was typed into in the last few seconds, or the user is typing in it, it is not typed into (queued with `when_idle`, else refused with the reason).",
+            "Pass the user's message to an existing session. rlord frames it (a line saying the overlord passes it on for the user, the text, then `context` labelled as yours) and delivers it the agent's own way: OpenCode's server queues it behind the current turn, whatever the session's state; Claude and Codex take it typed in at their idle prompt, or with `when_idle` mid-turn, at the end of the turn (their Stop hook carries it on in the same turn). Answers `sent` (with `via`) or `queued`. A working session or one that needs the user is refused unless `when_idle`. Messages waiting for one session add up: a later one joins them (`with_pending` counts them), and a message sent directly takes them with it. Stopped, starting and archived sessions are refused; so is one stopped on a usage limit (with `when_idle`, held until the limit resets). Right before typing rlord also checks the session's screen: while a dialog is up there, its input holds the user's unsent text, it was typed into in the last few seconds, or the user is typing in it, it is not typed into (queued with `when_idle`, else refused with the reason).",
             json!({
                 "session": s(SESSION_REF),
-                "text": s("The message, complete: the session sees only this"),
+                "text": s("The user's words, verbatim (no framing: rlord adds it)"),
+                "context": s("Optional: what the session needs from your conversation to act on this message, in your words. Sent with it, labelled as yours, not the user's. Facts for its work as a whole go in its background instead (update_session add_context)"),
                 "when_idle": b("Session mid-turn: deliver when its turn is over instead of refusing (default false)"),
             }), &["session", "text"]),
         tool("resume_after_limit",
@@ -1047,6 +1048,7 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             "session.send",
             json!({"ref": session_ref(args)?,
                    "text": args.get("text").and_then(Value::as_str).context("missing 'text'")?,
+                   "context": arg_str(args, "context"),
                    "when_idle": args.get("when_idle").and_then(Value::as_bool).unwrap_or(false)}),
         ),
         "resume_after_limit" => {

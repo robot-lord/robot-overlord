@@ -1,17 +1,32 @@
 //! Passing a message to an existing session: the overlord's
 //! `send_to_session` tool (`session.send`). Any agent the overlord runs on
-//! can use it, and any agent's session can receive it: the text is typed
-//! into the session's agent pane as one bracketed paste, then Enter, the
-//! same way `overlord.ask` reaches the overlord.
+//! can use it, and any agent's session can receive it. The text is framed
+//! by code (`context::frame_message`): the user's words, then the
+//! overlord's optional `context`, labelled as not the user's.
+//!
+//! How it gets there, per agent:
+//!
+//! - **OpenCode:** POSTed to its server with `delivery: "queue"`
+//!   (`Service::queue_prompt`), whatever its turn: OpenCode's inbox runs
+//!   it once the current turn is over. Only a POST that surely failed
+//!   falls back to typing, below.
+//! - **Claude, Codex, mid-turn** (with `when_idle`): held, and claimed by
+//!   the session's own Stop hook (`stop_claim`): the hook answers
+//!   `decision: block` with the message as its reason, so the agent
+//!   carries on with it instead of ending its turn. At most `CLAIMS_MAX`
+//!   in a row; then the turn ends and it is typed in.
+//! - **Idle:** typed into the agent pane as one bracketed paste, then
+//!   Enter, the same way `overlord.ask` reaches the overlord.
 //!
 //! Only a session whose turn is over ("your turn") is typed into. One that
 //! is working, or waiting on the user (where the text would answer its
 //! permission prompt), is refused, or with `when_idle` the message waits
-//! for its turn to end: one pending message per session (a newer one
-//! replaces it, and a message sent directly drops it), kept in kv
-//! `send_pending` and delivered by a slow tick (`start`). A session that
-//! stops, is archived or goes away drops its pending message. Every send,
-//! queue, delivery and drop is in the session's log.
+//! for its turn to end. Messages that wait add up: a later one joins the
+//! pending ones (kept in kv `send_pending`, framed as one), and a message
+//! sent directly takes them with it. A slow tick (`start`) types them in
+//! once the turn is over. A session that stops, is archived or goes away
+//! drops its pending messages. Every send, queue, delivery and drop is in
+//! the session's log.
 //!
 //! Right before each paste (`type_into`), under the session's lock
 //! (locks.rs: a restart, stop or archive waits for it, and it for them),
@@ -42,6 +57,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use rlord_core::agents::opencode_service::{Posted, Service};
 use rlord_core::agents::{strip_ansi, Agent};
 use rlord_core::db::Db;
 use rlord_core::tmux;
@@ -50,8 +66,22 @@ use rlord_core::types::{now_ms, Session, Status};
 use crate::own::{self, Source};
 use crate::Daemon;
 
-/// kv key: pending messages, `{session id: {"text", "at"}}`.
+/// kv key: pending messages, `{session id: {"parts": [{"text",
+/// "context"}], "text", "at"}}`: `parts` are the messages that wait, in
+/// order; `text` is all of them framed as one (what is delivered). While
+/// a Stop hook's answer carries them, `claim` (its ack id) and `claimed`
+/// (how many parts it carried).
 pub const PENDING_KEY: &str = "send_pending";
+
+/// How many Stop hooks in a row may carry a held message on: then the
+/// turn ends, and what is left is typed in at the idle prompt.
+pub const CLAIMS_MAX: u64 = 3;
+
+/// kv key: how many Stop hooks in a row carried a held message on, for
+/// session `id`. Cleared by a prompt and by a Stop that carries nothing.
+fn claims_key(id: &str) -> String {
+    format!("stop_claims:{id}")
+}
 
 /// kv key: first prompts that couldn't go another way (an OpenCode launch
 /// whose server POST surely failed), `{session id: {"text", "at"}}`. Their
@@ -302,7 +332,7 @@ pub(crate) fn type_message(
     type_into(d, &s.id, &pane, text, &checks)
 }
 
-/// `session.send {ref, text, when_idle}`.
+/// `session.send {ref, text, context, when_idle}`.
 pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     let r = params
         .get("ref")
@@ -314,8 +344,15 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .context("nothing to send")?;
-    if text.chars().count() > MAX_CHARS {
-        bail!("message too long ({MAX_CHARS} characters at most)");
+    let background = params
+        .get("context")
+        .and_then(Value::as_str)
+        .map(crate::context::clean)
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    let part = json!({"text": text, "context": background});
+    if framed(std::slice::from_ref(&part)).chars().count() > MAX_CHARS {
+        bail!("message too long ({MAX_CHARS} characters at most, with its context)");
     }
     let when_idle = params.get("when_idle").and_then(Value::as_bool) == Some(true);
     let id = d.db().resolve_ref(r)?.id;
@@ -339,68 +376,310 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
                     s.name
                 ),
             };
-            return not_now(d, &s, text, true, &why);
+            return not_now(d, &s, &part, true, &why);
         }
         bail!("not sent: {why}");
     }
+    // Messages still waiting for it go first, with this one, as one.
+    let waiting = pending_parts(&d.db(), &s.id)?;
+    let mut parts = waiting.clone();
+    parts.push(part.clone());
+    let whole = framed(&parts);
+    if whole.chars().count() > MAX_CHARS {
+        bail!(
+            "not sent: with the {} message(s) waiting for {} it would be too long \
+             ({MAX_CHARS} characters at most)",
+            waiting.len(),
+            s.name
+        );
+    }
+    // OpenCode: its server's inbox takes it whatever its turn (first
+    // prompt first). Only a POST that surely failed goes the pane's way.
+    if Agent::named(&s.agent)? == Agent::OpenCode {
+        if first_waiting(&d.db(), &s.id)? {
+            let why = format!("{}'s first prompt hasn't gone in yet", s.name);
+            return not_now(d, &s, &part, when_idle, &why);
+        }
+        match post(d, &s, &whole) {
+            Some(Posted::Refused(why)) => {
+                tracing::info!(session = %s.id, why, "OpenCode refused a message: typing it");
+            }
+            None => {}
+            Some(p) => return sent(d, &s, &waiting, &whole, Via::Server(p)),
+        }
+    }
     if s.status != Status::Idle {
         let why = format!("{} is {} (mid-turn)", s.name, s.status.label());
-        return not_now(d, &s, text, when_idle, &why);
+        return not_now(d, &s, &part, when_idle, &why);
     }
     // (tmux without the DB lock.)
-    if let Typed::NotNow(why) = type_message(d, &s, text, Some(Source::Send))? {
-        return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
+    if let Typed::NotNow(why) = type_message(d, &s, &whole, Some(Source::Send))? {
+        return not_now(d, &s, &part, when_idle, &format!("{}: {why}", s.name));
     }
+    sent(d, &s, &waiting, &whole, Via::Typed)
+}
+
+/// How a message went in.
+enum Via {
+    Typed,
+    /// POSTed to OpenCode's server (`Sent`, or `Unknown`: it may have
+    /// been admitted, so it is never sent again).
+    Server(Posted),
+}
+
+/// `whole` went in (`via`), carrying `taken`, the messages that were
+/// waiting: those leave the queue, and the log says so.
+fn sent(d: &Daemon, s: &Session, taken: &[Value], whole: &str, via: Via) -> Result<Value> {
     let db = d.db();
-    // Sent directly: a message still waiting for this session is older,
-    // and must not arrive after this one.
-    let replaced = unqueue(&db, &s.id, "replaced by a newer message, sent directly")?;
+    take(&db, &s.id, taken)?;
+    let (how, unknown) = match &via {
+        Via::Typed => ("typed", None),
+        Via::Server(Posted::Unknown(why)) => ("server", Some(why.clone())),
+        Via::Server(_) => ("server", None),
+    };
     db.insert_event(
         &s.id,
         now_ms(),
         "message_sent",
-        &json!({"from": "overlord", "chars": text.chars().count(),
-                "replaced_pending": replaced})
+        &json!({"from": "overlord", "chars": whole.chars().count(), "via": how,
+                "with_pending": taken.len(), "unknown": unknown})
         .to_string(),
     )?;
     drop(db);
     d.changed();
-    Ok(json!({"sent": true, "session": s.name, "replaced_pending": replaced}))
+    let mut v = json!({"sent": true, "session": s.name, "via": how,
+                       "with_pending": taken.len()});
+    if let Some(why) = unknown {
+        v["sent"] = json!("unknown");
+        v["why"] = json!(format!(
+            "OpenCode didn't answer; it may have taken it, so it isn't sent again: {why}"
+        ));
+    } else if how == "server" {
+        v["note"] = json!("in its inbox: it runs once the current turn is over");
+    }
+    Ok(v)
+}
+
+/// POST `text` to OpenCode session `s`'s server, queued behind its turn
+/// (`Service::queue_prompt`), marked as rlord's first (`own::mark`, taken
+/// back if surely refused). None: no server or session id to post to, or
+/// the marker couldn't be written; it goes the pane's way.
+fn post(d: &Daemon, s: &Session, text: &str) -> Option<Posted> {
+    let id = s.agent_session.as_deref()?;
+    let svc = Service::read(&rlord_core::agents::opencode::service_file())?;
+    let at = own::mark(&d.db(), &s.id, text, Source::Send, now_ms()).ok()?;
+    let r = svc.queue_prompt(id, text);
+    if matches!(r, Posted::Refused(_)) {
+        let _ = own::unmark(&d.db(), &s.id, at);
+    }
+    Some(r)
 }
 
 /// Not typed now (`why`): held for later with `when_idle`, else refused.
-fn not_now(d: &Daemon, s: &Session, text: &str, when_idle: bool, why: &str) -> Result<Value> {
+fn not_now(d: &Daemon, s: &Session, part: &Value, when_idle: bool, why: &str) -> Result<Value> {
     if !when_idle {
         bail!(
             "not sent: {why}. Pass when_idle: true to deliver it when it can take it, or tell \
              the user"
         );
     }
-    let replaced = queue(&d.db(), &s.id, text)?;
+    let earlier = queue(&d.db(), &s.id, part)?;
     d.changed();
     Ok(
         json!({"queued": true, "session": s.name, "status": s.status.label(),
-              "why": why, "replaced_pending": replaced}),
+              "why": why, "with_pending": earlier}),
     )
 }
 
-/// Hold `text` for session `id` until its turn is over. Returns whether it
-/// replaced one already waiting.
-fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
+/// All `parts` framed as one message (`context::frame_message`): the
+/// user's words in order, then the overlord's background for them.
+pub(crate) fn framed(parts: &[Value]) -> String {
+    let join = |k: &str| {
+        parts
+            .iter()
+            .filter_map(|p| p[k].as_str().map(str::trim).filter(|t| !t.is_empty()))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let background = join("context");
+    crate::context::frame_message(&join("text"), Some(&background))
+}
+
+/// The messages waiting for session `id`, in order.
+fn pending_parts(db: &Db, id: &str) -> Result<Vec<Value>> {
+    Ok(db
+        .kv_map(PENDING_KEY)?
+        .get(id)
+        .map_or_else(Vec::new, parts_of))
+}
+
+fn parts_of(entry: &Value) -> Vec<Value> {
+    entry["parts"].as_array().cloned().unwrap_or_default()
+}
+
+/// Hold message `part` for session `id` until it can take it, after any
+/// already waiting (all framed as one). Returns how many were waiting.
+pub(crate) fn queue(db: &Db, id: &str, part: &Value) -> Result<usize> {
     let mut m = db.kv_map(PENDING_KEY)?;
     let now = now_ms();
-    let replaced = m
-        .insert(id.to_string(), json!({"text": text, "at": now}))
-        .is_some();
+    let mut parts = m.get(id).map_or_else(Vec::new, parts_of);
+    let earlier = parts.len();
+    parts.push(part.clone());
+    let text = framed(&parts);
+    if text.chars().count() > MAX_CHARS {
+        bail!(
+            "not queued: with the {earlier} message(s) already waiting it would be too long \
+             ({MAX_CHARS} characters at most)"
+        );
+    }
+    // (A Stop hook's claim on the earlier ones stays: `claimed` counts
+    // them.)
+    let entry = m.entry(id.to_string()).or_insert_with(|| json!({}));
+    entry["parts"] = json!(parts);
+    entry["text"] = json!(text);
+    entry["at"] = json!(now);
+    if let Some(e) = entry.as_object_mut() {
+        e.remove("held");
+    }
     db.kv_set_map(PENDING_KEY, &m)?;
     db.insert_event(
         id,
         now,
         "message_queued",
-        &json!({"from": "overlord", "chars": text.chars().count(), "replaced": replaced})
-            .to_string(),
+        &json!({"from": "overlord", "chars": part["text"].as_str().map_or(0, |t| t.chars().count()),
+                "with_pending": earlier})
+        .to_string(),
     )?;
-    Ok(replaced)
+    Ok(earlier)
+}
+
+/// `taken` (the first of session `id`'s waiting messages, as read) went
+/// in: they leave the queue. Messages added since stay, framed anew; if
+/// the queue no longer starts with them (another path took them), it is
+/// left alone.
+fn take(db: &Db, id: &str, taken: &[Value]) -> Result<()> {
+    if taken.is_empty() {
+        return Ok(());
+    }
+    let mut m = db.kv_map(PENDING_KEY)?;
+    let Some(entry) = m.get(id) else {
+        return Ok(());
+    };
+    let parts = parts_of(entry);
+    if !parts.starts_with(taken) {
+        return Ok(());
+    }
+    let rest = &parts[taken.len()..];
+    if rest.is_empty() {
+        m.remove(id);
+    } else {
+        let at = entry["at"].clone();
+        m.insert(
+            id.to_string(),
+            json!({"parts": rest, "text": framed(rest), "at": at}),
+        );
+    }
+    db.kv_set_map(PENDING_KEY, &m)
+}
+
+/// A Stop hook of session `s`'s own conversation (Claude, Codex) while
+/// messages wait for it: claim them. The answer blocks the stop
+/// (`decision: block`) with them as its reason, so the agent goes on with
+/// them in the same turn. They leave the queue only when the hook client
+/// acknowledges it printed the answer (`claim_ack`); unacknowledged, the
+/// next Stop (or the idle prompt) carries them again. At most
+/// `CLAIMS_MAX` in a row: then the turn ends, and they are typed in.
+/// None (and the count cleared) when nothing waits, or its first prompt
+/// hasn't gone in.
+pub(crate) fn stop_claim(
+    db: &Db,
+    s: &Session,
+    agent: Agent,
+    now: i64,
+) -> Result<Option<crate::context::Reply>> {
+    if !matches!(agent, Agent::Claude | Agent::Codex)
+        || crate::overlord::is_overlord_role(&s.role)
+        || s.archived_at.is_some()
+    {
+        return Ok(None);
+    }
+    let key = claims_key(&s.id);
+    let in_row: u64 = db.kv_get(&key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut m = db.kv_map(PENDING_KEY)?;
+    let waits = m.get(&s.id).is_some_and(|e| !parts_of(e).is_empty());
+    if !waits || in_row >= CLAIMS_MAX || first_waiting(db, &s.id)? {
+        if in_row > 0 {
+            db.kv_delete(&key)?;
+        }
+        return Ok(None);
+    }
+    let Some(entry) = m.get_mut(&s.id).and_then(Value::as_object_mut) else {
+        return Ok(None);
+    };
+    let ack = format!("{CLAIM_PREFIX}{}:{now}", s.id);
+    let claimed = entry
+        .get("parts")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let text = entry
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    entry.insert("claim".into(), json!(ack));
+    entry.insert("claimed".into(), json!(claimed));
+    db.kv_set_map(PENDING_KEY, &m)?;
+    db.kv_set(&key, &(in_row + 1).to_string())?;
+    Ok(Some(crate::context::Reply {
+        output: json!({"decision": "block", "reason": text}),
+        ack,
+    }))
+}
+
+/// What a Stop-hook claim's ack id starts with (`hook.ack` tells them
+/// from the background's).
+pub const CLAIM_PREFIX: &str = "send:";
+
+/// A prompt went in (the user's or rlord's): the Stop hooks that carried
+/// messages on are no longer "in a row".
+pub(crate) fn claims_reset(db: &Db, id: &str) -> Result<()> {
+    if db.kv_get(&claims_key(id))?.is_some() {
+        db.kv_delete(&claims_key(id))?;
+    }
+    Ok(())
+}
+
+/// The hook client printed the Stop-hook answer `ack` names: the messages
+/// it carried leave the queue (those added since stay) and the log says
+/// they were delivered. Returns whether `ack` was still the claim.
+pub(crate) fn claim_ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
+    let Some(id) = ack
+        .strip_prefix(CLAIM_PREFIX)
+        .and_then(|rest| rest.rsplit_once(':'))
+        .map(|(id, _)| id)
+    else {
+        return Ok(false);
+    };
+    let entry = db.kv_map(PENDING_KEY)?.get(id).cloned();
+    let Some(entry) = entry.filter(|e| e["claim"] == ack) else {
+        return Ok(false);
+    };
+    let parts = parts_of(&entry);
+    let n = entry["claimed"]
+        .as_u64()
+        .map_or(parts.len(), |n| n as usize)
+        .min(parts.len());
+    let taken = &parts[..n];
+    take(db, id, taken)?;
+    db.insert_event(
+        id,
+        now,
+        "message_delivered",
+        &json!({"from": "overlord", "via": "stop_hook", "messages": n,
+                "chars": framed(taken).chars().count()})
+        .to_string(),
+    )?;
+    Ok(true)
 }
 
 /// Whether session `id`'s first prompt hasn't reached it yet: held for its
@@ -419,23 +698,6 @@ pub(crate) fn queue_first(db: &Db, id: &str, text: &str) -> Result<()> {
     let mut m = db.kv_map(FIRST_KEY)?;
     m.insert(id.to_string(), json!({"text": text, "at": now_ms()}));
     db.kv_set_map(FIRST_KEY, &m)
-}
-
-/// Drop session `id`'s pending message, if it has one (logged as dropped,
-/// `why`, replaced). Returns whether there was one.
-fn unqueue(db: &Db, id: &str, why: &str) -> Result<bool> {
-    let mut m = db.kv_map(PENDING_KEY)?;
-    if m.remove(id).is_none() {
-        return Ok(false);
-    }
-    db.kv_set_map(PENDING_KEY, &m)?;
-    db.insert_event(
-        id,
-        now_ms(),
-        "message_dropped",
-        &json!({"reason": why, "replaced": true}).to_string(),
-    )?;
-    Ok(true)
 }
 
 /// What to do with one pending message now.
@@ -540,23 +802,47 @@ fn dropped_kind(key: &str) -> &'static str {
 fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
     let _session = d.sessions.lock(id);
     let limited = crate::limits::limited(d).get(id).copied();
-    let (s, text) = {
+    let (s, text, parts) = {
         let db = d.db();
         let Ok(s) = db.resolve_ref(id) else {
             return Ok(()); // (gone: the next tick drops it)
         };
-        let Some(text) = db
-            .kv_map(key)?
-            .get(id)
-            .and_then(|v| v["text"].as_str())
-            .map(str::to_string)
-        else {
+        let Some(entry) = db.kv_map(key)?.get(id).cloned() else {
             return Ok(()); // (sent directly meanwhile)
         };
-        (s, text)
+        let Some(text) = entry["text"].as_str().map(str::to_string) else {
+            return Ok(());
+        };
+        (s, text, parts_of(&entry))
     };
     if next(Some(&s), limited, now_ms()) != Next::Deliver {
         return Ok(());
+    }
+    // An OpenCode session's messages wait here only when its server
+    // refused them: tried there again first.
+    if key == PENDING_KEY && s.agent == Agent::OpenCode.name() {
+        match post(d, &s, &text) {
+            None | Some(Posted::Refused(_)) => {}
+            Some(p) => {
+                let db = d.db();
+                take(&db, id, &parts)?;
+                let unknown = match p {
+                    Posted::Unknown(why) => Some(why),
+                    _ => None,
+                };
+                db.insert_event(
+                    id,
+                    now_ms(),
+                    "message_delivered",
+                    &json!({"from": "overlord", "chars": text.chars().count(),
+                            "via": "server", "unknown": unknown})
+                    .to_string(),
+                )?;
+                drop(db);
+                d.changed();
+                return Ok(());
+            }
+        }
     }
     // Without the DB lock: tmux.
     // (A first prompt is the user's own words: its prompt is theirs.)
@@ -581,8 +867,11 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
             }
         }
     }
-    // (Queued and sent under this lock: still this text.)
-    if m.get(id).and_then(|v| v["text"].as_str()) == Some(text.as_str()) {
+    // The messages it carried leave the queue; any added meanwhile (a Stop
+    // hook's claim, no session lock) stay.
+    if key == PENDING_KEY {
+        take(&db, id, &parts)?;
+    } else if m.get(id).and_then(|v| v["text"].as_str()) == Some(text.as_str()) {
         m.remove(id);
         db.kv_set_map(key, &m)?;
     }
@@ -823,27 +1112,39 @@ mod tests {
         assert!(user_active(&busy, "rlord_s1", Some("/dev/ttys009"), now));
     }
 
+    fn msg(text: &str) -> Value {
+        json!({"text": text, "context": null})
+    }
+
+    fn pending_text(db: &Db, id: &str) -> String {
+        db.kv_map(PENDING_KEY).unwrap()[id]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     /// A queued message held back is logged once, with why; a newer one
     /// is logged again.
     #[test]
     fn a_held_message_is_logged_once() {
         let db = Db::open_in_memory().unwrap();
         let id = insert(&db);
-        queue(&db, &id, "first").unwrap();
+        queue(&db, &id, &msg("first")).unwrap();
+        let first = pending_text(&db, &id);
         let d = Daemon::new(db, rlord_core::config::Config::default());
         let held_count = || {
             let log = d.db().list_events(&id, 20).unwrap();
             log.iter().filter(|e| e.kind == "message_held").count()
         };
-        held(&d, &id, "first", "a dialog is up", PENDING_KEY).unwrap();
-        held(&d, &id, "first", "a dialog is up", PENDING_KEY).unwrap();
+        held(&d, &id, &first, "a dialog is up", PENDING_KEY).unwrap();
+        held(&d, &id, &first, "a dialog is up", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
-        assert_eq!(d.db().kv_map(PENDING_KEY).unwrap()[&id]["text"], "first");
         // (Not this message's text: nothing.)
         held(&d, &id, "other", "x", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
-        queue(&d.db(), &id, "second").unwrap();
-        held(&d, &id, "second", "a draft", PENDING_KEY).unwrap();
+        queue(&d.db(), &id, &msg("second")).unwrap();
+        let both = pending_text(&d.db(), &id);
+        held(&d, &id, &both, "a draft", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 2);
         let log = d.db().list_events(&id, 20).unwrap();
         let e = log.iter().find(|e| e.kind == "message_held").unwrap();
@@ -855,25 +1156,118 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = insert(&db);
         queue_first(&db, &id, "the task").unwrap();
-        queue(&db, &id, "a note").unwrap();
+        queue(&db, &id, &msg("a note")).unwrap();
         // The overlord's messages neither replace nor drop it.
-        queue(&db, &id, "a newer note").unwrap();
-        assert!(unqueue(&db, &id, "replaced").unwrap());
+        queue(&db, &id, &msg("a newer note")).unwrap();
+        let parts = pending_parts(&db, &id).unwrap();
+        take(&db, &id, &parts).unwrap();
         assert_eq!(db.kv_map(FIRST_KEY).unwrap()[&id]["text"], "the task");
         assert_eq!(dropped_kind(FIRST_KEY), "first_prompt_dropped");
     }
 
+    /// Messages framed by code: the user's words, then the overlord's
+    /// background, labelled; several waiting ones as one.
     #[test]
-    fn a_direct_send_drops_the_pending_message() {
+    fn messages_are_framed_and_add_up() {
+        let one = framed(&[json!({"text": "fix the footer", "context": "web/footer.tsx"})]);
+        assert_eq!(
+            one,
+            crate::context::frame_message("fix the footer", Some("web/footer.tsx"))
+        );
+        let two = framed(&[
+            json!({"text": "fix the footer", "context": "web/footer.tsx"}),
+            msg("and the header"),
+        ]);
+        assert!(two.contains("fix the footer\n\nand the header"), "{two}");
+        assert!(two.ends_with("web/footer.tsx"), "{two}");
+        assert!(!framed(&[msg("go")]).contains("Background"));
+    }
+
+    /// A message sent directly takes the waiting ones with it; one added
+    /// meanwhile stays.
+    #[test]
+    fn a_direct_send_takes_the_pending_messages() {
         let db = Db::open_in_memory().unwrap();
         let id = insert(&db);
-        assert!(!unqueue(&db, &id, "x").unwrap());
-        queue(&db, &id, "older").unwrap();
-        assert!(unqueue(&db, &id, "replaced by a newer message, sent directly").unwrap());
+        take(&db, &id, &[msg("x")]).unwrap();
+        queue(&db, &id, &msg("older")).unwrap();
+        let read = pending_parts(&db, &id).unwrap();
+        queue(&db, &id, &msg("meanwhile")).unwrap();
+        take(&db, &id, &read).unwrap();
+        assert_eq!(pending_parts(&db, &id).unwrap(), vec![msg("meanwhile")]);
+        assert_eq!(pending_text(&db, &id), framed(&[msg("meanwhile")]));
+        // Not what is at the head of the queue any more: left alone.
+        take(&db, &id, &read).unwrap();
+        assert_eq!(pending_parts(&db, &id).unwrap().len(), 1);
+        take(&db, &id, &[msg("meanwhile")]).unwrap();
         assert!(db.kv_map(PENDING_KEY).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_messages_accumulate() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        assert_eq!(queue(&db, &id, &msg("first")).unwrap(), 0);
+        assert_eq!(queue(&db, &id, &msg("second")).unwrap(), 1);
+        let m = db.kv_map(PENDING_KEY).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(pending_parts(&db, &id).unwrap().len(), 2);
+        assert_eq!(m[&id]["text"], framed(&[msg("first"), msg("second")]));
         let log = db.list_events(&id, 10).unwrap();
-        let dropped = log.iter().find(|e| e.kind == "message_dropped").unwrap();
-        assert_eq!(dropped.payload["replaced"], true, "{}", dropped.payload);
+        assert_eq!(log.iter().filter(|e| e.kind == "message_queued").count(), 2);
+        // Too long together: refused, the waiting ones kept.
+        let big = "x".repeat(MAX_CHARS - 10);
+        assert!(queue(&db, &id, &msg(&big)).is_err());
+        assert_eq!(pending_parts(&db, &id).unwrap().len(), 2);
+        db.kv_set_map(PENDING_KEY, &serde_json::Map::new()).unwrap();
+        assert!(db.kv_get(PENDING_KEY).unwrap().is_none());
+    }
+
+    /// A Stop hook claims what waits: `decision: block` with the framed
+    /// text; it leaves the queue only on the ack; at most `CLAIMS_MAX` in
+    /// a row, and a prompt starts the count again.
+    #[test]
+    fn a_stop_hook_claims_waiting_messages() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        let s = db.resolve_ref(&id).unwrap();
+        // Nothing waits: no answer.
+        assert!(stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_none());
+        queue(&db, &id, &msg("also the footer")).unwrap();
+        // OpenCode has no Stop hook; overlords are never sent to.
+        assert!(stop_claim(&db, &s, Agent::OpenCode, 1).unwrap().is_none());
+        let r = stop_claim(&db, &s, Agent::Codex, 2).unwrap().unwrap();
+        assert_eq!(r.output["decision"], "block");
+        assert_eq!(r.output["reason"], framed(&[msg("also the footer")]));
+        assert!(r.ack.starts_with(CLAIM_PREFIX), "{}", r.ack);
+        // Unacknowledged: still waiting; the next Stop carries it again.
+        let r2 = stop_claim(&db, &s, Agent::Codex, 3).unwrap().unwrap();
+        // The older answer's ack no longer counts.
+        assert!(!claim_ack(&db, &r.ack, 4).unwrap());
+        assert_eq!(pending_parts(&db, &id).unwrap().len(), 1);
+        // One more came while the answer was out: it stays.
+        queue(&db, &id, &msg("and the header")).unwrap();
+        assert!(claim_ack(&db, &r2.ack, 5).unwrap());
+        assert_eq!(
+            pending_parts(&db, &id).unwrap(),
+            vec![msg("and the header")]
+        );
+        let log = db.list_events(&id, 20).unwrap();
+        let e = log.iter().find(|e| e.kind == "message_delivered").unwrap();
+        assert_eq!(e.payload["via"], "stop_hook", "{}", e.payload);
+        // Third in a row: still claimed; the fourth lets the turn end.
+        assert!(stop_claim(&db, &s, Agent::Claude, 6).unwrap().is_some());
+        assert!(stop_claim(&db, &s, Agent::Claude, 7).unwrap().is_none());
+        // (That cleared the count.) A prompt clears it too.
+        assert!(stop_claim(&db, &s, Agent::Claude, 8).unwrap().is_some());
+        claims_reset(&db, &id).unwrap();
+        assert!(db.kv_get(&claims_key(&id)).unwrap().is_none());
+        // Its first prompt hasn't gone in: not claimed.
+        queue_first(&db, &id, "the task").unwrap();
+        assert!(stop_claim(&db, &s, Agent::Claude, 9).unwrap().is_none());
+        // An ack that isn't a claim's: nothing.
+        assert!(!claim_ack(&db, "send:nope", 10).unwrap());
+        assert!(!claim_ack(&db, "s1.abc", 10).unwrap());
     }
 
     /// A send waits for a restart, stop or archive holding the session,
@@ -939,21 +1333,21 @@ mod tests {
         let e = send(&d, &json!({"ref": &id, "text": "one"})).unwrap_err();
         assert!(e.to_string().contains("unsent text"), "{e}");
 
-        // At its prompt again (the placeholder is dim): typed, and the
-        // queued one is dropped.
+        // At its prompt again (the placeholder is dim): typed, framed,
+        // with the queued one before it.
         let placeholder = composer("\\033[2mAsk Codex to do anything\\033[0m");
         tmux::respawn_pane("rlord_s1", "/tmp", &placeholder).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let v = send(&d, &json!({"ref": &id, "text": "two"})).unwrap();
         assert_eq!(v["sent"], true, "{v}");
-        assert_eq!(v["replaced_pending"], true, "{v}");
+        assert_eq!(v["with_pending"], 1, "{v}");
         assert!(d.db().kv_map(PENDING_KEY).unwrap().is_empty());
         std::thread::sleep(Duration::from_millis(200));
         assert!(screen().contains("two"), "{}", screen());
         // The prompt to come is marked as rlord's (durable); the agent's
         // report of it is then not the user's.
         let marked = d.db().kv_get(own::KEY).unwrap().unwrap_or_default();
-        let two = rlord_core::types::PromptMark::hash_of("two");
+        let two = rlord_core::types::PromptMark::hash_of(&framed(&[msg("one"), msg("two")]));
         assert!(marked.contains(&two), "{marked}");
         let (kind, source) = own::prompt(&d.db(), &id, None, now_ms(), own::Via::Hook).unwrap();
         assert_eq!((kind, source.as_deref()), ("rlord_prompt", Some("send")));
@@ -991,20 +1385,5 @@ mod tests {
 
         tmux::kill_session("rlord_s1").unwrap();
         tx(&["kill-server"]);
-    }
-
-    #[test]
-    fn one_pending_message_per_session() {
-        let db = Db::open_in_memory().unwrap();
-        let id = insert(&db);
-        assert!(!queue(&db, &id, "first").unwrap());
-        assert!(queue(&db, &id, "second").unwrap());
-        let m = db.kv_map(PENDING_KEY).unwrap();
-        assert_eq!(m.len(), 1);
-        assert_eq!(m[&id]["text"], "second");
-        let log = db.list_events(&id, 10).unwrap();
-        assert_eq!(log.iter().filter(|e| e.kind == "message_queued").count(), 2);
-        db.kv_set_map(PENDING_KEY, &serde_json::Map::new()).unwrap();
-        assert!(db.kv_get(PENDING_KEY).unwrap().is_none());
     }
 }

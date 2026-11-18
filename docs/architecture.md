@@ -744,14 +744,12 @@ transcript store so `rlord search` covers them.
 
 ## Inter-session messaging
 
-**Built today:** only the idle-prompt path below, as the overlord's
-`send_to_session` (see "Passing work to a session" under "The overlord"):
-typed into a session whose turn is over, or held (one message per
-session) until it is. The mailbox, pull tool and Stop-hook injection
-described here are the original design and are not built. (A session's
-background, "Session background", reaches it through its hooks; the
-work in `docs/working/session-context.md` adds Stop-hook delivery and
-OpenCode's queue.)
+**Built today:** the overlord's `send_to_session` (see "Passing work to
+a session" under "The overlord"): OpenCode's server queue, Claude's and
+Codex's Stop-hook block mid-turn (capped at 3 in a row), and the idle
+paste. The mailbox and pull tool described here are the original design
+and are not built; a session's background ("Session background") reaches
+it through its hooks.
 
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,
 keystroke injection last:
@@ -1369,15 +1367,39 @@ including when the active one hits a usage limit.
   session's lock, then the DB; never the session's lock while holding the
   DB. `TYPING` comes last.
 - **Passing work to a session** (`daemon/src/send.rs`, MCP
-  `send_to_session`, method `session.send`): the same paste into the
-  target's pinned agent pane, for any agent. Only a session whose turn is
-  over; working or needs-you is refused unless `when_idle`, which keeps one
-  pending message per session (kv `send_pending`, a newer one replaces it,
-  and a direct send drops it, logged as replaced) for a 2s tick to deliver
-  once the turn has been over 2s, re-read under the session's lock. Stopped, starting, error, archived and the
-  overlord itself are refused; a pending message is dropped when its
-  session stops or goes. Logged as `message_sent` / `message_queued` /
-  `message_held` / `message_delivered` / `message_dropped`. `overlord.new_session` formats the list's `n` form as a
+  `send_to_session`, method `session.send {ref, text, context,
+  when_idle}`): the user's `text` and the overlord's optional `context`
+  are framed by code (`send::framed` over `context::frame_message`: a
+  `[rlord]` line, the words, then the context labelled as the
+  overlord's). Delivery per agent:
+  - **OpenCode:** `POST /api/session/<id>/prompt` with `delivery:
+    "queue"` (`Service::queue_prompt`), whatever its turn; its inbox runs
+    it once the current turn is over. Marked as rlord's first
+    (`own::mark`). Only a surely refused POST (no connection, a 4xx)
+    falls back to the pane; an unanswered one is logged `unknown` and
+    never sent again.
+  - **Claude, Codex, mid-turn** (`when_idle`): held; the session's own
+    live Stop hook claims it (`send::stop_claim`) and answers
+    `{"decision": "block", "reason": <framed text>}`, so the agent goes on
+    with it in the same turn and the status stays working. It leaves the
+    queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
+    unacknowledged, the next Stop or the idle paste carries it again: at
+    most one duplicate). At most `CLAIMS_MAX` (3) Stops in a row (kv
+    `stop_claims:<id>`, cleared by a prompt or a Stop that carries
+    nothing); then the turn ends and it is typed in. Not while its first
+    prompt is still on its way.
+  - **Idle:** pasted into the target's pinned agent pane.
+
+  Working or needs-you is refused unless `when_idle`. Waiting messages
+  add up (kv `send_pending`: `parts` in order, `text` all of them framed
+  as one); a direct send takes them with it, and each path removes only
+  the parts it carried (`send::take`), so one added meanwhile stays. A 2s
+  tick pastes them once the turn has been over 2s, re-read under the
+  session's lock. Stopped, starting, error, archived and the overlord
+  itself are refused; pending messages are dropped when their session
+  stops or goes. Logged as `message_sent` / `message_queued` /
+  `message_held` / `message_delivered` (with `via`) / `message_dropped`.
+  `overlord.new_session` formats the list's `n` form as a
   `[rlord new-session request]` message: `confirmed:`, the hints with
   whether each was picked or defaulted, then the description verbatim;
   `overlord.md` defines what the overlord does with one. On a contradiction

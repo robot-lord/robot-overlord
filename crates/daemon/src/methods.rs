@@ -1694,7 +1694,13 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
 
 /// `hook.ack`: the hook client printed the answer `ack` names.
 pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
-    let acked = context::ack(db, p_str(params, "ack")?, now_ms())?;
+    let ack = p_str(params, "ack")?;
+    // A Stop hook's answer that carried held messages on, or background.
+    let acked = if ack.starts_with(crate::send::CLAIM_PREFIX) {
+        crate::send::claim_ack(db, ack, now_ms())?
+    } else {
+        context::ack(db, ack, now_ms())?
+    };
     Ok(json!({"acked": acked}))
 }
 
@@ -1954,6 +1960,22 @@ fn hook_emit_in(
         // session only comes back if its tmux session really exists.
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
+        // The session's own Stop while overlord messages wait for it: the
+        // hook's answer carries them on (`send::stop_claim`), so its turn
+        // goes on and its status stays as it is. Best effort, like the
+        // background. A prompt ends a run of such claims.
+        let mut claim = None;
+        if live && whose != Whose::Other {
+            let r = match event {
+                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
+                "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
+            }
+        }
+        let status = if claim.is_some() { None } else { status };
         if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
             db.set_status(&s.id, st, now)?;
         }
@@ -1979,7 +2001,13 @@ fn hook_emit_in(
                     detail["start"] = json!(how);
                 }
             }
+            if claim.is_some() {
+                detail["continued"] = json!("held messages");
+            }
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
+        }
+        if let Some(c) = claim {
+            return Ok(json!({"ok": true, "reply": c.output, "reply_ack": c.ack}));
         }
         return Ok(answer(json!({"ok": true})));
     } else {
