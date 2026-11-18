@@ -223,7 +223,7 @@ pub fn start(d: Daemon, cfg: RemoteConfig, rev: String) -> Handle {
 async fn report_states(d: Daemon, mut rx: watch::Receiver<Value>) {
     while rx.changed().await.is_ok() {
         let state = rx.borrow_and_update().clone();
-        if let Err(e) = d.call("web.remote_state", state).await {
+        if let Err(e) = d.remote_state(state).await {
             eprintln!("rlord-web: reporting remote state: {e}");
         }
     }
@@ -244,12 +244,8 @@ impl Actor {
             Input::Command { id, req } => {
                 let r = self.command(&req);
                 let d = self.d.clone();
-                let reply = match r {
-                    Ok(v) => json!({"id": id, "ok": v}),
-                    Err(e) => json!({"id": id, "error": e}),
-                };
                 tokio::spawn(async move {
-                    if let Err(e) = d.call("web.remote_reply", reply).await {
+                    if let Err(e) = d.remote_reply(&id, r).await {
                         eprintln!("rlord-web: replying to the daemon: {e}");
                     }
                 });

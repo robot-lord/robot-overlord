@@ -103,7 +103,6 @@ impl Daemon {
     /// `web.remote_state`: this plugin's relay state, the whole of it, on
     /// every change (`{relay, connected, error, devices, pairing,
     /// pending}`; crates/daemon/src/relay.rs `normalize`).
-    #[allow(dead_code)] // (Used by the remote module, next.)
     pub async fn remote_state(&self, state: Value) -> Result<Value, CallError> {
         self.call("web.remote_state", state).await
     }

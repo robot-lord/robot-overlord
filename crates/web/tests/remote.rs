@@ -147,11 +147,20 @@ async fn pair_confirm_then_use_it() {
         .request(&mut c, "overlord.ask", json!({"text": "hello"}))
         .await
         .unwrap();
-    assert!(ask["error"]["message"].is_string() || ask["ok"].is_object(), "{ask}");
+    assert!(
+        ask["error"]["message"].is_string() || ask["ok"].is_object(),
+        "{ask}"
+    );
     assert_ne!(ask["error"]["code"], "not_allowed", "{ask}");
 
     // What a device may not do.
-    for op in ["form.setup_save", "keys.list", "device.list", "device.confirm", "page.report"] {
+    for op in [
+        "form.setup_save",
+        "keys.list",
+        "device.list",
+        "device.confirm",
+        "page.report",
+    ] {
         let a = live.request(&mut c, op, json!({})).await.unwrap();
         assert_eq!(a["error"]["code"], "not_allowed", "{op}: {a}");
     }
@@ -246,28 +255,42 @@ async fn a_mailbox_request_waits_for_the_host() {
         .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
         .unwrap();
     c.send_mailbox(req).await.unwrap();
-    c.wait_for(WAIT, |m| matches!(m, FromRelay::Ok { .. } | FromRelay::Err { .. }))
-        .await
-        .ok();
+    c.wait_for(WAIT, |m| {
+        matches!(m, FromRelay::Ok { .. } | FromRelay::Err { .. })
+    })
+    .await
+    .ok();
     // The plugin comes back, fetches the queued request and answers it.
     w.rig.daemon.web().start(false).unwrap();
     let (seq, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
     let answer = dev.mailbox_open(&payload).unwrap();
     assert_eq!(answer["id"], "m1", "{answer}");
     assert_ne!(answer["error"]["code"], "not_allowed");
-    c.send(|n| ToRelay::Ack { n, seq, device: None }).await.unwrap();
+    c.send(|n| ToRelay::Ack {
+        n,
+        seq,
+        device: None,
+    })
+    .await
+    .unwrap();
     // The same request again is not acted on twice.
     let again = dev
         .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
         .unwrap();
     c.send_mailbox(again).await.unwrap();
     let (_, payload) = c.recv_mailbox(WAIT).await.unwrap();
-    assert_eq!(dev.mailbox_open(&payload).unwrap()["error"]["code"], "repeat");
+    assert_eq!(
+        dev.mailbox_open(&payload).unwrap()["error"]["code"],
+        "repeat"
+    );
     // Only the two ops travel by mailbox.
     let snap = dev.mailbox_request("m2", "snapshot", json!({})).unwrap();
     c.send_mailbox(snap).await.unwrap();
     let (_, payload) = c.recv_mailbox(WAIT).await.unwrap();
-    assert_eq!(dev.mailbox_open(&payload).unwrap()["error"]["code"], "not_allowed");
+    assert_eq!(
+        dev.mailbox_open(&payload).unwrap()["error"]["code"],
+        "not_allowed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,7 +300,9 @@ async fn revoking_closes_the_door() {
     let dev = pair("old-phone").await;
     let mut c = dev.connect().await.unwrap();
     let _live = dev.live(&mut c).await.unwrap();
-    rpc("relay.revoke", json!({"device": dev.id()})).await.unwrap();
+    rpc("relay.revoke", json!({"device": dev.id()}))
+        .await
+        .unwrap();
     // Its live link closes, and the relay refuses it from now on.
     let code = c.wait_closed(WAIT).await.unwrap();
     assert!(code == close::NOT_ALLOWED || code >= 1000, "{code}");
@@ -355,7 +380,10 @@ async fn a_forwarder_under_another_identity_fails_on_both_ends() {
     assert!(dev.start_pairing(&qr).await.is_err());
     assert_eq!(fwd.connections(), 1);
     let s = rpc("relay.status", json!({})).await.unwrap();
-    assert!(s["pending"].is_null() && s["devices"].as_array().unwrap().is_empty(), "{s}");
+    assert!(
+        s["pending"].is_null() && s["devices"].as_array().unwrap().is_empty(),
+        "{s}"
+    );
     // With the pin check on, the device stops at the challenge.
     dev.opts = Opts {
         url: Some(fwd.url()),
@@ -419,7 +447,9 @@ async fn replayed_and_tampered_frames_get_nothing() {
 async fn without_remote_setup_the_plugin_never_dials_out() {
     let _g = LOCK.lock().await;
     env_once("remote", "rlord-test-remote");
-    let rig = tokio::task::spawn_blocking(|| Rig::start(|_| {})).await.unwrap();
+    let rig = tokio::task::spawn_blocking(|| Rig::start(|_| {}))
+        .await
+        .unwrap();
     // Off by default, and nothing set up: no relay connection, ever.
     let s = rpc("relay.status", json!({})).await.unwrap();
     assert_eq!(s["connected"], false, "{s}");
