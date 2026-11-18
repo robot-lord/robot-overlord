@@ -473,23 +473,23 @@ fn status_of(s: &Session) -> String {
     }
 }
 
-/// The user's first prompt as rlord stored it: the launch's binding copy,
-/// else the launch spec, else the transcript.
+/// The user's first prompt as rlord stored it: the launch spec's words,
+/// else the launch's binding copy (for Codex only the line pointing at
+/// its prompt file), else the transcript.
 fn first_prompt(d: &Daemon, s: &Session) -> Option<String> {
     let stored = {
         let db = d.db();
-        let bound = db
-            .kv_get(&crate::methods::bind_prompt_key(&s.id))
-            .ok()
-            .flatten()
-            .filter(|p| !p.trim().is_empty());
-        bound.or_else(|| {
-            let spec: Value = serde_json::from_str(&db.launch_spec(&s.id).ok()?).ok()?;
-            spec["prompt"].as_str().map(str::to_string)
+        crate::first_prompt::launch_words(&db, &s.id).or_else(|| {
+            db.kv_get(&crate::methods::bind_prompt_key(&s.id))
+                .ok()
+                .flatten()
+                .filter(|p| !p.trim().is_empty())
         })
     };
     stored.or_else(|| {
-        crate::summary::transcript_of(d, s).and_then(|p| transcript_excerpts(&p).first_prompt)
+        crate::summary::transcript_of(d, s).and_then(|p| {
+            crate::first_prompt::task(&s.id, transcript_excerpts(&p).first_prompt, None)
+        })
     })
 }
 

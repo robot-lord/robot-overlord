@@ -568,7 +568,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
                 return Ok(());
             };
             let text = job["message"].as_str().unwrap_or("continue");
-            match send::type_message(d, s, text, Source::Resume)? {
+            match send::type_message(d, s, text, Some(Source::Resume))? {
                 // (Tried again next tick; `step` gives up in time.)
                 Typed::NotNow(why) => {
                     tracing::debug!(session = %id, %why, "limit resume held");

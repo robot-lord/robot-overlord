@@ -881,7 +881,14 @@ pub(crate) fn session_new_with(
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
-    let launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
+    // The user's words leave the command line (`first_prompt`).
+    let placed = crate::first_prompt::place(&base, &id, agent, first.as_deref(), prompt.is_some());
+    let launch = agent.launch(
+        &project_path,
+        placed.argv.as_deref(),
+        model.as_deref(),
+        &args,
+    );
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
@@ -896,7 +903,7 @@ pub(crate) fn session_new_with(
             agent,
             launch_spec: &launch_spec,
             launch,
-            first: first.as_deref(),
+            first: placed,
             project_path: &project_path,
             repo: repo.as_deref(),
             workspace_path: workspace_path.as_deref(),
@@ -921,6 +928,7 @@ pub(crate) fn session_new_with(
     if let Err(e) = started {
         // (Its token, MCP config and kv keys were made for it: gone too.)
         crate::session_tools::forget(db, &base, &id);
+        crate::first_prompt::forget(db, &base, &id);
         return Err(e);
     }
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
@@ -956,9 +964,10 @@ pub(crate) struct Start<'a> {
     pub launch_spec: &'a str,
     /// The agent's command, and what is known of its conversation.
     pub launch: rlord_core::agents::Launch,
-    /// The first prompt as typed (an agent that picks its own id is bound
-    /// by it).
-    pub first: Option<&'a str>,
+    /// Where its first prompt went (`first_prompt::place`): what is on
+    /// argv binds an agent that picks its own id; a file for its stdin or
+    /// its server.
+    pub first: crate::first_prompt::Placed,
     pub project_path: &'a str,
     pub repo: Option<&'a str>,
     pub workspace_path: Option<&'a str>,
@@ -1013,7 +1022,8 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
         db.upsert_transcript_source(id, &t.to_string_lossy())?;
     }
     hold_deferred(db, id, &launch)?;
-    note_first_prompt(db, id, agent, s.first, now)?;
+    note_first_prompt(db, id, agent, s.first.argv.as_deref(), now)?;
+    crate::first_prompt::hold(db, id, s.first.server.as_deref(), now)?;
     if let Some(bg) = &s.background {
         context::turn_on(db, id)?;
         if let Some((from, except)) = bg.copy_from {
@@ -1029,6 +1039,7 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     }
 
     let cmd = pane_cmd(s.base, agent, id, program.as_deref(), s.daemon, argv);
+    let cmd = crate::first_prompt::with_stdin(cmd, s.first.stdin.as_deref());
     note_launch(db, id, argv)?;
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
@@ -1338,6 +1349,21 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let first = crate::fork::restart_prompt(&spec, refork.is_some(), carried, resumed, &bg_file);
     // (What it hands over: the pointer.)
     let pointer_sent = first.is_some() && carried == Some(context::Delivery::Pointer);
+    // A re-fork's own words leave the command line, as at the fork.
+    let words = refork.is_some()
+        && spec["prompt"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty());
+    let placed = crate::first_prompt::place(&base, &s.id, agent, first.as_deref(), words);
+    // A first prompt still held from an earlier start (it carries the
+    // pointer already) goes instead of a new pointer on argv.
+    let carried_held = placed.server.is_none()
+        && !words
+        && db
+            .kv_get(&crate::first_prompt::pending_key(&s.id))?
+            .is_some();
+    let first = placed.argv.clone().filter(|_| !carried_held);
+    let pointer_sent = pointer_sent && !carried_held;
     if let Some(p) = &first {
         agent.add_first_prompt(&mut argv, p);
     }
@@ -1356,6 +1382,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         s.codex_daemon,
         &argv,
     );
+    let cmd = crate::first_prompt::with_stdin(cmd, placed.stdin.as_deref());
     note_launch(db, &s.id, &argv)?;
     // A re-fork binds its new thread as at the fork: the key that says so
     // is written before the pane starts, so it can't be lost after.
@@ -1377,6 +1404,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         }
     };
     let now = now_ms();
+    // A first prompt for the server: this start's, else one an earlier
+    // start left unsent, carried with a fresh clock.
+    logged(
+        "holding the first prompt",
+        match placed.server.as_deref() {
+            Some(f) => crate::first_prompt::hold(db, &s.id, Some(f), now),
+            None => crate::first_prompt::restamp(db, &s.id, now),
+        },
+    );
     if let Some(fallback) = fell_back {
         logged(
             "recording the mode",
@@ -1635,6 +1671,8 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     if let Err(e) = crate::session_tools::revoke(db, &paths::data_dir(), &s.id) {
         tracing::warn!(session = %s.id, error = %e, "removing the session's token");
     }
+    // Its first prompt's file and keys are done with.
+    crate::first_prompt::forget(db, &paths::data_dir(), &s.id);
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "archived", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);
@@ -2491,20 +2529,20 @@ mod tests {
         let tok = crate::session_tools::mint(&db, &base, "01s").unwrap();
         let env = pane_env(&base, Agent::Claude, "01s", None, false);
         assert!(env.contains(&(
-            "RLORD_SESSION_TOKEN_FILE".to_string(),
+            "RLORD_SESSION_LOOKUP_FILE".to_string(),
             tok.to_string_lossy().into_owned()
         )));
         assert!(pane_env(&base, Agent::Claude, "01s", None, true).is_empty());
         // OpenCode's commands run in its shared server: no token file.
         assert!(!pane_env(&base, Agent::OpenCode, "01s", None, false)
             .iter()
-            .any(|(k, _)| k == "RLORD_SESSION_TOKEN_FILE"));
+            .any(|(k, _)| k == "RLORD_SESSION_LOOKUP_FILE"));
         // ...and its pane unsets one tmux's server might hand it; a pane
         // given the file sets it and unsets nothing.
         let argv = ["opencode".to_string()];
         let cmd = pane_cmd(&base, Agent::OpenCode, "01s", None, false, &argv);
         assert!(
-            cmd.starts_with("exec env -u RLORD_SESSION_TOKEN_FILE "),
+            cmd.starts_with("exec env -u RLORD_SESSION_LOOKUP_FILE "),
             "{cmd}"
         );
         let cmd = pane_cmd(&base, Agent::Claude, "01s", None, false, &argv);
@@ -2516,7 +2554,7 @@ mod tests {
     /// start, so nothing it starts inherits it.
     #[test]
     fn the_daemon_scrubs_pane_env_from_itself() {
-        std::env::set_var("RLORD_SESSION_TOKEN_FILE", "/x/token");
+        std::env::set_var("RLORD_SESSION_LOOKUP_FILE", "/x/token");
         crate::scrub_own_env();
         for k in rlord_core::agents::PANE_ENV {
             assert!(std::env::var_os(k).is_none(), "{k}");
@@ -2532,11 +2570,11 @@ mod tests {
         let argv = ["codex".to_string()];
         assert_eq!(
             pane_cmd(none, Agent::Codex, "01s", None, true, &argv),
-            "exec env -u RLORD_SESSION_ID -u RLORD_SESSION_TOKEN_FILE codex"
+            "exec env -u RLORD_SESSION_ID -u RLORD_SESSION_LOOKUP_FILE codex"
         );
         assert_eq!(
             pane_cmd(none, Agent::Codex, "01s", None, false, &argv),
-            "exec env -u RLORD_SESSION_TOKEN_FILE RLORD_SESSION_ID=01s codex"
+            "exec env -u RLORD_SESSION_LOOKUP_FILE RLORD_SESSION_ID=01s codex"
         );
     }
 

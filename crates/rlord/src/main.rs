@@ -429,7 +429,7 @@ enum Command {
     /// A session's own read-only look-ups, for its agent: `rlord context
     /// help` lists them; `rlord context <tool> key=value…` calls one.
     Context {
-        /// The session's token file (default: $RLORD_SESSION_TOKEN_FILE)
+        /// The session's token file (default: $RLORD_SESSION_LOOKUP_FILE)
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
         /// The daemon's socket
@@ -2522,7 +2522,7 @@ fn context_cli(
                 .map(std::path::PathBuf::from)
         })
         .context(
-            "no session token: pass --token-file (rlord sets RLORD_SESSION_TOKEN_FILE in its sessions)",
+            "no session token: pass --token-file (rlord sets RLORD_SESSION_LOOKUP_FILE in its sessions)",
         )?;
     let token = std::fs::read_to_string(&file)
         .with_context(|| format!("reading {}", file.display()))?

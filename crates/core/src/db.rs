@@ -357,6 +357,11 @@ impl Db {
         }
     }
 
+    /// The session with id `id`: None only when there is no such row.
+    pub fn session_by_id(&self, id: &str) -> Result<Option<Session>> {
+        self.get_session_where("id = ?1", id)
+    }
+
     fn get_session_where(&self, cond: &str, arg: &str) -> Result<Option<Session>> {
         Ok(self.query_sessions(cond, arg)?.into_iter().next())
     }
