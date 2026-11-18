@@ -1318,7 +1318,9 @@ mod tests {
         assert_eq!(at(" quit", 2), press(Action::Quit));
         assert_eq!(at(" help", 2), press(Action::Help));
         assert_eq!(at(" restart", 2), press(Action::Restart));
-        assert_eq!(at(" archive", 2), press(Action::Archive));
+        assert_eq!(at(" fork", 2), press(Action::Fork));
+        // (Row keys past the room end on "more": the help.)
+        assert_eq!(at(" more", 2), press(Action::Help));
         // The wheel over a row turns the list, not the row.
         let (x, y) = find(&rows, ">_ image-pipe");
         assert_eq!(app.hits.wheel_at(x, y), Some(Hit::List));
@@ -1739,8 +1741,8 @@ mod tests {
         assert_eq!(
             labels(&app),
             [
-                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes", "fork"
+                "attach", "restart", "stop", "fork", "archive", "rename", "pin", "tags",
+                "describe", "notes"
             ]
         );
         // Drawn at the pointer, over everything; its entries are picks.
@@ -1853,18 +1855,18 @@ mod tests {
         assert_eq!(sel(&app), 0);
         // Over row 3: it's highlighted, and worth a redraw.
         let (x, y) = find(&rows, "archive");
-        assert_eq!(app.hits.at(x, y), Some(Hit::Pick(3)));
+        assert_eq!(app.hits.at(x, y), Some(Hit::Pick(4)));
         assert!(app.hover(x, y));
-        assert_eq!(sel(&app), 3);
+        assert_eq!(sel(&app), 4);
         // Along the same row, or off the menu: nothing changes, no redraw.
         assert!(!app.hover(x + 2, y));
         assert!(!app.hover(2, 20));
-        assert_eq!(sel(&app), 3);
+        assert_eq!(sel(&app), 4);
         // Drawn again, the highlight is on that row.
         let rows = drawn(&mut app);
         let (x, y) = find(&rows, "rename");
         assert!(app.hover(x, y));
-        assert_eq!(sel(&app), 4);
+        assert_eq!(sel(&app), 5);
         // No menu open: motion does nothing.
         app.mode = Mode::Normal;
         drawn(&mut app);

@@ -193,8 +193,9 @@ can't answer). "Don't resume X after all": cancel it with
 You can be limited too. The user may run an overlord on each coding agent
 and switch between them by hand, so you may be one of several: each has
 its own conversation, and only the one the user switched to gets their
-requests. If the user says your agent is out of usage, tell them they can
-switch overlords (the agent markers at the top of your overlay, or
+requests. When yours runs out of usage, the list offers the user a switch
+to another agent's overlord. If they ask you about it, tell them they can
+switch (that prompt, the agent markers at the top of your overlay, or
 `rlord overlord switch <agent>`). You can't switch for them. `recall`
 reads the other overlords' conversations as well as your own earlier
 ones, so after a switch look there for what the user means.
