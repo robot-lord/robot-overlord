@@ -755,6 +755,63 @@ In the list, `:web` opens it too, once it's installed.
   ui_target = "web"   # or "terminal"; "auto" (the default): the one used last
   ```
 
+## Remote access through a relay
+
+The web plugin can also let a paired device reach this machine from
+anywhere, end-to-end encrypted, through a relay you choose: one you run
+yourself (`docs/relay.md`) or one someone runs for you. This isn't
+Claude's Remote Control (above): it covers rlord's list and overlord, on
+any agent. Your machine never accepts a connection: it dials out to the
+relay, and so does the device. The phone app that uses it is still to
+come; for now the device is `rlord-device`, a test client. The protocol
+hasn't been reviewed yet: use it with your own relay only.
+
+```sh
+rlord relay setup https://relay.example.com#k=…   # the address the relay's owner gives you
+rlord relay setup <address> --token T             # a relay that needs an enrolment token
+rlord relay pair                                  # show a QR code for a device (--text: the string)
+rlord relay confirm | reject                      # answer a device waiting for you
+rlord relay devices                               # paired devices, when each was last seen
+rlord relay revoke <device>                       # by id, id prefix or name
+rlord relay status                                # connected? any error?
+rlord relay disable                               # stop dialling out; devices stay paired
+```
+
+In the list, `:relay` opens the Devices screen (`p` pair, `y`/`n`
+confirm or reject a waiting device, `d` unpair, Esc); the browser page has
+"Devices" in its header.
+
+- **The relay is pinned.** The address names the relay and its key; this
+  machine and its devices will only ever talk to that relay, and a relay
+  that can't prove it holds that key is refused. Moving to another relay
+  is `rlord relay setup --reset <address>`, after which every device
+  pairs again.
+- **Pairing needs you twice.** The QR code is good for 5 minutes and one
+  device. When a device scans it, both show the device's name and the
+  same six-digit code (rlord puts a notice on every screen); the device
+  can do nothing until you confirm on this machine. Turn away a code you
+  don't recognise.
+- **What a device can do:** what the browser page can, except change your
+  config, see the key screen or manage devices. Pairing a device gives it
+  control of your sessions; revoke one you no longer use. A device not
+  seen for 90 days is revoked on its own.
+- **What the relay sees:** your IP address and the device's, key
+  fingerprints, when and how much you talk; never what you say, session
+  names, or anything it could decrypt.
+- **Off unless set up.** Without `rlord relay setup` the plugin never
+  dials out. Once set up, it keeps a connection only while there's a
+  paired device or an open pairing. `rlord web remove` also turns it off
+  and asks before deleting the keys.
+
+```toml
+[remote]
+enabled = false        # set by `rlord relay setup` and `rlord relay disable`
+relay = ""             # the relay's origin (set by setup)
+relay_key = ""         # the relay's key fingerprint (set by setup)
+ca_file = ""           # an extra root certificate (PEM) for a relay with a private CA
+device_expiry_days = 90  # 0: devices never expire
+```
+
 ## rlord's tmux
 
 rlord runs its own private tmux server (`tmux -L rlord`) with a generated

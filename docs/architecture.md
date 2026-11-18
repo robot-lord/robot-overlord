@@ -1189,10 +1189,26 @@ what a local page may except what writes `config.toml`, the surface
 reports, the key screen and device management. A remote call has no
 `page`, never counts as use of a screen and gets no `ui` commands. To
 make an op remote, set `remote: true` on its `Op` and test it from a
-device in `web_api.rs`. The user's commands (`relay.*`) go the other
-way: the daemon forwards them to the plugin on the `web.subscribe`
-stream and keeps the plugin's `web.remote_state` as a mirror for
-`relay.status` and the Devices screens.
+device in `web_api.rs`; an op is local-only unless a device needs it.
+`overlord.messages` (both) gives the active overlord's recent
+conversation as text, read from its transcript (at most 50 messages of 4
+KiB), for a chat view.
+
+The user's commands (`relay.*`, `daemon/src/relay.rs`) go the other
+way. They are dispatched from the socket only, never through
+`Daemon::rpc`, so neither an MCP tool nor a `web.call` op can reach them
+(`relay.` is also a forbidden family). The daemon forwards each to the
+plugin on the `web.subscribe` stream as `{"notify":"remote","id","req"}`
+(never folded into `changed`, never sent to `events.subscribe`) and waits
+up to 10 s for `web.remote_reply`; it starts the plugin first when
+needed. The plugin reports its state with `web.remote_state`; the daemon
+keeps it (normalised, cleared when the plugin's stream ends) for
+`relay.status`, the Devices screens and a page's `snapshot.relay`, and
+puts a notice on every surface when a device starts waiting for
+confirmation. `rlord_core::qr` draws the pairing code (the `rlord`
+binary only ever draws a string the plugin gave it). `start_if_enabled`
+also starts the plugin for `[remote] enabled`. The page's Devices view
+is a modal (form kind `devices`).
 
 ## rlord's private tmux server (2026-11-10)
 
