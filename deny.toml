@@ -5,4 +5,10 @@ ignore = [
   # `paste` is unmaintained, not vulnerable: a compile-time proc macro
   # pulled in by ratatui 0.29. Drop this once ratatui no longer uses it.
   { id = "RUSTSEC-2024-0436", reason = "build-time proc macro via ratatui; no known vulnerability" },
+  # `proc-macro-error2` is unmaintained, not vulnerable: a compile-time
+  # proc macro pulled in by libcrux-ml-kem 0.0.11 (e2e's ML-KEM), through
+  # libcrux-intrinsics, core-models 0.0.7 and hax-lib-macros 0.3.7. The
+  # newest core-models still needs hax-lib 0.3; hax-lib-macros 0.4 dropped
+  # it. Drop this once libcrux's chain is on hax-lib 0.4 or later.
+  { id = "RUSTSEC-2026-0173", reason = "build-time proc macro via libcrux-ml-kem; no known vulnerability" },
 ]
