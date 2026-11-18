@@ -274,9 +274,10 @@ pub fn has_session(name: &str) -> bool {
 /// Each rlord tmux session's agent pane (the pinned one, `@rlord_pane`,
 /// else the first, as `window_pane_ids` picks it): whether its program
 /// exited (rlord keeps a dead agent pane on screen). One `list-panes -a`
-/// for every session. A session not in the map is gone; no server running
-/// means every session is gone (an empty map). Any other failure is an
-/// error: nothing can be concluded from it.
+/// for every session. A session not in the map is gone. Any failure is an
+/// error, "no server running" included (a server can be out of reach for a
+/// moment): nothing is concluded from it, and a server that really died
+/// is `discover`'s and the startup reconcile's to notice.
 pub fn agent_panes_dead() -> Result<std::collections::HashMap<String, bool>> {
     let out = tmux_cmd()
         .args([
@@ -289,19 +290,9 @@ pub fn agent_panes_dead() -> Result<std::collections::HashMap<String, bool>> {
         .context("running tmux")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        if no_server(&err) {
-            return Ok(Default::default());
-        }
         bail!("tmux list-panes: {}", err.trim());
     }
     Ok(parse_agent_panes(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// tmux said no server is running on rlord's socket (no socket file, or
-/// nothing listening): every session is gone.
-fn no_server(stderr: &str) -> bool {
-    stderr.contains("no server running")
-        || (stderr.contains("error connecting to") && stderr.contains("No such file or directory"))
 }
 
 /// `agent_panes_dead`'s lines: pane id, dead (`1`), the session's pinned
@@ -1584,8 +1575,7 @@ mod tests {
     use super::*;
 
     /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
-    /// pane decides, else the first; a session name may hold spaces; no
-    /// server is every session gone, anything else an error.
+    /// pane decides, else the first; a session name may hold spaces.
     #[test]
     fn agent_panes_are_the_pinned_ones() {
         let out = "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td";
@@ -1593,14 +1583,6 @@ mod tests {
         assert_eq!(m.get("a b"), Some(&false), "the pinned pane, not the split");
         assert_eq!(m.get("c"), Some(&true), "none pinned: the first");
         assert_eq!(m.get("d"), Some(&true));
-        assert!(no_server("no server running on /tmp/tmux-501/x\n"));
-        assert!(no_server(
-            "error connecting to /tmp/tmux-501/x (No such file or directory)"
-        ));
-        assert!(!no_server(
-            "error connecting to /tmp/tmux-501/x (Permission denied)"
-        ));
-        assert!(!no_server("lost server"));
     }
 
     #[test]

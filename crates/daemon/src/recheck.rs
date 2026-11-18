@@ -1,35 +1,11 @@
 //! Stored statuses re-checked against live evidence. Plain code, no AI.
+//! The rules, and why "needs you" is cleared only when the user moved on:
+//! "Stale statuses re-checked" in `docs/architecture.md`.
 //!
-//! A session's status is stored once and moved only by the events that
-//! change it (hooks, OpenCode's server, `discover`). When a clearing event
-//! never comes, the stored status stays wrong until the next one: a
-//! session read "needs you" for days after a notification that should
-//! never have set it, a turn the user interrupted reads "working" (Claude
-//! runs no `Stop` hook on Escape), and an agent that crashed without its
-//! `SessionEnd` leaves a dead pane behind a live status.
-//!
-//! Once at daemon start and then once a minute, this checks the sessions
-//! that follow hooks (Claude; Codex once its hooks are trusted) against
-//! what is there to see:
-//!
-//! - **The pane.** Its tmux session gone, or its program exited (dead
-//!   pane), on two looks in a row: stopped.
-//! - **The transcript's tail.** `waiting_input` or `working` that hasn't
-//!   moved for `QUIET_MS`, while the transcript says the last turn ended
-//!   (a final reply) or was interrupted and nothing was written since:
-//!   idle. A turn still open (a tool call waiting on a prompt, or running)
-//!   is left alone, however long it waits.
-//!
-//! Left alone, too: a session a sub-agent may be blocking (one is named as
-//! waiting, or a background sub-agent is still open: its prompt can come
-//! after the main turn ended); sessions `discover` or `opencode` follow
-//! (they read the same evidence on their own tick); a session on Codex's
-//! background server for the pane check (its turn outlives the pane).
-//!
-//! Bounded: one tmux look per live session a pass, and a transcript tail
-//! read (at most `transcript::tail`'s window) only for a session whose
-//! status has sat still for `QUIET_MS`. Nothing is read under the DB lock;
-//! a fix is written only if the status is still the one judged.
+//! Bounded: one `tmux list-panes -a` a pass, and a transcript tail read
+//! (at most `transcript::tail`'s window) only for a session whose status
+//! has sat still for `QUIET_MS`. Nothing is read under the DB lock; a fix
+//! is written only if the status is still the one judged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -98,8 +74,6 @@ pub(crate) struct Evidence {
     pub pane_gone: Option<u8>,
     /// The transcript's tail (None: not read, or nothing to read).
     pub tail: Option<Tail>,
-    /// A sub-agent may be the one blocked on the user.
-    pub subagent_may_block: bool,
     pub now: i64,
 }
 
@@ -116,27 +90,33 @@ pub(crate) fn verdict(e: &Evidence) -> Option<(Status, &'static str)> {
         return None;
     }
     let tail = e.tail?;
-    // Something was written lately: the agent is alive and the hooks will
-    // say what it is doing.
-    if tail.last_at.is_none_or(|at| e.now - at < QUIET_MS) {
-        return None;
-    }
-    let why = match tail.turn? {
-        TurnTail::Open => return None,
-        TurnTail::Ended => "turn_ended",
-        TurnTail::Interrupted => "interrupted",
+    // Written after the status began.
+    let after = |t: Option<i64>| matches!((t, e.state_since), (Some(t), Some(s)) if t > s);
+    // Nothing written lately (else the agent is alive and its hooks will
+    // say what it is doing).
+    let quiet = tail.last_at.is_some_and(|at| e.now - at >= QUIET_MS);
+    let ended = |turn: Option<TurnTail>| match turn {
+        Some(TurnTail::Ended) => Some("turn_ended"),
+        Some(TurnTail::Interrupted) => Some("interrupted"),
+        _ => None,
     };
-    // Working since a prompt: only a turn's end written after it says
-    // that turn is over (one from before is the last turn's).
-    if e.status == Status::Working
-        && !matches!((tail.turn_at, e.state_since), (Some(end), Some(since)) if end > since)
-    {
-        return None;
+    if e.status == Status::WaitingInput {
+        // Never from the transcript alone: a prompt can wait silently for
+        // hours (on the main agent or a sub-agent). Only once the user
+        // clearly moved on: a prompt of theirs after the wait began.
+        if !after(tail.prompt_at) {
+            return None;
+        }
+        // (The turn that prompt started: over, or still going.)
+        return Some(match ended(tail.turn) {
+            Some(_) if quiet => (Status::Idle, "moved_on"),
+            _ => (Status::Working, "moved_on"),
+        });
     }
-    if e.status == Status::WaitingInput && e.subagent_may_block {
-        return None;
-    }
-    Some((Status::Idle, why))
+    // Working: its turn's end (written after the status change: else it
+    // is the previous turn's), and quiet since.
+    let why = ended(tail.turn)?;
+    (quiet && after(tail.turn_at)).then_some((Status::Idle, why))
 }
 
 /// One pass. `gone` counts each session's gone-looking panes across
@@ -162,6 +142,8 @@ pub(crate) fn pass(
         Ok(p) => Some(p),
         Err(e) => {
             tracing::debug!(error = %e, "tmux couldn't say: no pane verdicts this pass");
+            // (Two looks in a row means two that were answered.)
+            gone.clear();
             None
         }
     };
@@ -206,14 +188,12 @@ fn check(
     } else {
         None
     };
-    let subagent_may_block = quiet && subagent_may_block(d, &s.id)?;
     let e = Evidence {
         status: s.status,
         status_age,
         state_since: s.last_state_change_at,
         pane_gone: pane,
         tail,
-        subagent_may_block,
         now,
     };
     let Some((to, why)) = verdict(&e) else {
@@ -224,25 +204,11 @@ fn check(
     if to == Status::Stopped {
         return crate::discover::stop_from_pane(&db, s);
     }
-    let ended_at = (why == "turn_ended")
-        .then(|| tail.and_then(|t| t.turn_at))
-        .flatten();
+    // A turn found ended: its final reply is the last message.
+    let ended_at = tail
+        .filter(|t| to == Status::Idle && t.turn == Some(TurnTail::Ended))
+        .and_then(|t| t.turn_at);
     apply(&db, s, to, why, now, ended_at)
-}
-
-/// Whether a sub-agent of session `id` may be the one blocked on the user:
-/// one is named as waiting (`methods::needs_you_key`), or a background
-/// sub-agent is still open (its prompt, an `agent_needs_input`
-/// notification, can come after the main turn). Open as `background.rs`
-/// believes it: unfinished, with a write within its `STALE_MS` (Claude
-/// doesn't always record a sub-agent's end).
-fn subagent_may_block(d: &Daemon, id: &str) -> Result<bool> {
-    let named: Vec<String> = d
-        .db()
-        .kv_get(&crate::methods::needs_you_key(id))?
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default();
-    Ok(named.iter().any(|p| !p.is_empty()) || crate::background::open_agents(d, id) > 0)
 }
 
 /// Write the corrected status, only if the session's status is still the
@@ -298,17 +264,23 @@ mod tests {
             state_since: Some(100 * MIN - status_age),
             pane_gone: Some(0),
             tail,
-            subagent_may_block: false,
             now: 100 * MIN,
         }
     }
 
-    fn tail(turn: TurnTail, ago: i64) -> Option<Tail> {
+    /// A tail whose last turn line (and last line) is `ago` old, and whose
+    /// latest prompt is `prompt_ago` old.
+    fn tail_p(turn: TurnTail, ago: i64, prompt_ago: Option<i64>) -> Option<Tail> {
         Some(Tail {
             turn: Some(turn),
             turn_at: Some(100 * MIN - ago),
+            prompt_at: prompt_ago.map(|p| 100 * MIN - p),
             last_at: Some(100 * MIN - ago),
         })
+    }
+
+    fn tail(turn: TurnTail, ago: i64) -> Option<Tail> {
+        tail_p(turn, ago, None)
     }
 
     #[test]
@@ -316,17 +288,44 @@ mod tests {
         use Status::*;
         use TurnTail::*;
         let long = 158 * 60 * MIN;
-        // The audit's case: "needs you" from an idle reminder after the
-        // turn's final reply, days later.
-        assert_eq!(
-            verdict(&ev(WaitingInput, long, tail(Ended, long))),
-            Some((Idle, "turn_ended"))
-        );
-        // Escape at the prompt, or mid-turn: the turn is over.
+        // Needs you is never cleared from the transcript alone: the
+        // audit's case (needs you set after the turn's final reply, days
+        // ago) is left for the user; so is a prompt waiting silently on a
+        // sub-agent, and a real question waiting for hours.
+        assert_eq!(verdict(&ev(WaitingInput, long, tail(Ended, long))), None);
         assert_eq!(
             verdict(&ev(WaitingInput, 5 * MIN, tail(Interrupted, 5 * MIN))),
-            Some((Idle, "interrupted"))
+            None
         );
+        assert_eq!(
+            verdict(&ev(WaitingInput, 7 * 60 * MIN, tail(Open, 7 * 60 * MIN))),
+            None
+        );
+        // A prompt from before the wait: not moving on.
+        assert_eq!(
+            verdict(&ev(
+                WaitingInput,
+                long,
+                tail_p(Ended, long, Some(long + MIN))
+            )),
+            None
+        );
+        // The user moved on: a prompt of theirs after the wait began. Its
+        // turn over and quiet: idle; still going: working.
+        assert_eq!(
+            verdict(&ev(
+                WaitingInput,
+                long,
+                tail_p(Ended, 3 * MIN, Some(4 * MIN))
+            )),
+            Some((Idle, "moved_on"))
+        );
+        assert_eq!(
+            verdict(&ev(WaitingInput, long, tail_p(Open, MIN, Some(4 * MIN)))),
+            Some((Working, "moved_on"))
+        );
+        // Working: its turn's end, written after the status change, and
+        // quiet since.
         assert_eq!(
             verdict(&ev(Working, 5 * MIN, tail(Interrupted, 3 * MIN))),
             Some((Idle, "interrupted"))
@@ -335,21 +334,13 @@ mod tests {
             verdict(&ev(Working, 5 * MIN, tail(Ended, 3 * MIN))),
             Some((Idle, "turn_ended"))
         );
-        // Working since a prompt that came after the last turn's end: that
-        // end is the last turn's, not this one's (the prompt's own lines
-        // not written yet, or out of the tail).
+        // An end from before the status change is the previous turn's.
         assert_eq!(verdict(&ev(Working, 5 * MIN, tail(Ended, 6 * MIN))), None);
         assert_eq!(
             verdict(&ev(Working, 5 * MIN, tail(Interrupted, 5 * MIN))),
             None
         );
-        // A real prompt waits with the turn open, however long (one real
-        // question waited 7 h): never touched.
-        assert_eq!(
-            verdict(&ev(WaitingInput, 7 * 60 * MIN, tail(Open, 7 * 60 * MIN))),
-            None
-        );
-        // A long tool call: open too.
+        // A long tool call: open.
         assert_eq!(verdict(&ev(Working, 30 * MIN, tail(Open, 30 * MIN))), None);
         // Too soon: a Stop may be on its way.
         assert_eq!(verdict(&ev(Working, MIN, tail(Ended, MIN))), None);
@@ -360,17 +351,10 @@ mod tests {
         let no_turn = Some(Tail {
             turn: None,
             turn_at: None,
+            prompt_at: None,
             last_at: Some(0),
         });
         assert_eq!(verdict(&ev(Working, 5 * MIN, no_turn)), None);
-        // A sub-agent may be the one asking: needs-you stays.
-        let mut sub = ev(WaitingInput, long, tail(Ended, long));
-        sub.subagent_may_block = true;
-        assert_eq!(verdict(&sub), None);
-        // (A working session's main turn ended is still idle.)
-        let mut sub = ev(Working, long, tail(Ended, long - MIN));
-        sub.subagent_may_block = true;
-        assert_eq!(verdict(&sub), Some((Idle, "turn_ended")));
         // Other statuses are the hooks' alone.
         for st in [Idle, Starting, Error] {
             assert_eq!(verdict(&ev(st, long, tail(Ended, long))), None, "{st:?}");
@@ -454,7 +438,8 @@ mod tests {
         let now = t0 + 158 * 3_600_000;
         {
             let db = d.db();
-            // Needs you, set after the turn's final reply: stale.
+            // Needs you, set after the turn's final reply, days ago: left
+            // for the user (never cleared from the transcript alone).
             add(
                 &db,
                 dir.path(),
@@ -476,20 +461,24 @@ mod tests {
                 t0,
                 &open_at("2026-11-10T00:00:10Z"),
             );
-            // Stale, but a background sub-agent is believed open (it
-            // wrote lately: `background`): it may be the one asking. One
-            // not believed open any more doesn't hold the fix back.
-            for id in ["bgsub", "bgold"] {
-                add(
-                    &db,
-                    dir.path(),
-                    id,
-                    "claude",
-                    Status::WaitingInput,
-                    t0,
-                    &ended_at("2026-11-10T00:00:10Z"),
+            // Needs you, then the user typed a new prompt (its hooks lost)
+            // and that turn ended: they moved on.
+            let moved = open_at("2026-11-10T00:00:05Z")
+                + &line(json!({"type": "user", "timestamp": "2026-11-10T00:01:00Z",
+                    "message": {"role": "user", "content": "never mind, do this instead"}}))
+                + &line(
+                    json!({"type": "assistant", "timestamp": "2026-11-10T00:02:00Z",
+                    "message": {"stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}}),
                 );
-            }
+            add(
+                &db,
+                dir.path(),
+                "moved",
+                "claude",
+                Status::WaitingInput,
+                t0,
+                &moved,
+            );
             // Interrupted, reads working.
             let interrupted = open_at("2026-11-10T00:00:05Z")
                 + &line(json!({"type": "user", "timestamp": "2026-11-10T00:00:10Z",
@@ -542,23 +531,26 @@ mod tests {
             add(&db, dir.path(), "dead", "claude", Status::Idle, t0, "");
             add(&db, dir.path(), "vanished", "claude", Status::Idle, t0, "");
         }
-        crate::background::set_open_agents(&d, "bgsub", 1);
         // tmux couldn't say: no pane verdicts, the transcript checks go on.
         let broken = || -> Result<HashMap<String, bool>> { anyhow::bail!("lost server") };
         let mut gone = HashMap::new();
-        assert_eq!(pass(&d, &mut gone, &broken, now).unwrap(), 4);
+        assert_eq!(pass(&d, &mut gone, &broken, now).unwrap(), 3);
         let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
-        assert_eq!(status("stale"), Status::Idle);
+        assert_eq!(status("stale"), Status::WaitingInput);
+        assert_eq!(status("asking"), Status::WaitingInput);
+        assert_eq!(status("moved"), Status::Idle);
         assert_eq!(status("esc"), Status::Idle);
         assert_eq!(status("cxh"), Status::Idle);
-        assert_eq!(status("asking"), Status::WaitingInput);
-        assert_eq!(status("bgsub"), Status::WaitingInput);
-        assert_eq!(status("bgold"), Status::Idle);
         // A turn found ended dates the session's last message, as a Stop
-        // would have; an interrupt doesn't.
+        // would have; an interrupt (Claude's, or Codex's turn_aborted)
+        // doesn't.
         let at = |id: &str| d.db().resolve_ref(id).unwrap().last_agent_msg_at;
-        assert_eq!(at("stale"), Some(t0));
+        assert_eq!(
+            at("moved"),
+            transcript::parse_iso_ms("2026-11-10T00:02:00Z")
+        );
         assert_eq!(at("esc"), None);
+        assert_eq!(at("cxh"), None);
         assert_eq!(status("oc"), Status::WaitingInput);
         assert_eq!(status("cx"), Status::Working);
         // No look at the panes so far.
@@ -567,27 +559,34 @@ mod tests {
         // The blocked set went with the wait, and the fix is logged.
         let db = d.db();
         assert_eq!(
-            db.kv_get(&crate::methods::needs_you_key("stale")).unwrap(),
-            None
+            db.kv_get(&crate::methods::needs_you_key("stale"))
+                .unwrap()
+                .as_deref(),
+            Some(r#"[""]"#)
         );
-        let log = db.list_events("stale", 5).unwrap();
+        let log = db.list_events("moved", 5).unwrap();
         let last = log.last().unwrap();
         assert_eq!(last.kind, "status_rechecked");
         assert_eq!(last.payload["from"], "waiting_input");
-        assert_eq!(last.payload["why"], "turn_ended");
+        assert_eq!(last.payload["why"], "moved_on");
+        let log = db.list_events("cxh", 5).unwrap();
+        assert_eq!(log.last().unwrap().payload["why"], "interrupted");
         drop(db);
         // Every agent pane alive but one; "vanished" isn't listed.
         let panes = || -> Result<HashMap<String, bool>> {
-            Ok([
-                "stale", "asking", "bgsub", "bgold", "esc", "oc", "cx", "cxh",
-            ]
-            .iter()
-            .map(|t| (t.to_string(), false))
-            .chain([("dead".to_string(), true)])
-            .collect())
+            Ok(["stale", "asking", "moved", "esc", "oc", "cx", "cxh"]
+                .iter()
+                .map(|t| (t.to_string(), false))
+                .chain([("dead".to_string(), true)])
+                .collect())
         };
         assert_eq!(pass(&d, &mut gone, &panes, now + 30_000).unwrap(), 0);
         assert_eq!(status("dead"), Status::Idle, "one look isn't proof");
+        // A failed look in between starts the count again.
+        let broken = || -> Result<HashMap<String, bool>> { anyhow::bail!("lost server") };
+        pass(&d, &mut gone, &broken, now + 40_000).unwrap();
+        assert!(gone.is_empty());
+        assert_eq!(pass(&d, &mut gone, &panes, now + 50_000).unwrap(), 0);
         // The second look stops both, by `discover`'s stop; nothing else
         // changes again.
         assert_eq!(pass(&d, &mut gone, &panes, now + 60_000).unwrap(), 2);

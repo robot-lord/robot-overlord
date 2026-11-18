@@ -810,6 +810,12 @@ pub(crate) fn model(v: &Value) -> Option<&str> {
     m.filter(|m| !m.is_empty())
 }
 
+/// The turn was interrupted (`turn_aborted`: Escape, or a new prompt
+/// over a running turn). It ends the turn too (`turn_ended`).
+pub(crate) fn interrupted(v: &Value) -> bool {
+    v["type"] == "event_msg" && v["payload"]["type"] == "turn_aborted"
+}
+
 pub(crate) fn turn_ended(v: &Value) -> Option<bool> {
     if v["type"] != "event_msg" {
         return None;

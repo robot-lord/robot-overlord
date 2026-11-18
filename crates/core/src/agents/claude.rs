@@ -489,12 +489,15 @@ pub(crate) fn command_wrapper(v: &Value) -> bool {
     })
 }
 
-/// A local command's output, or a compaction's summary: what follows a
-/// built-in command that ran no turn.
+/// A local command's output (or error output), or a compaction's
+/// summary: what follows a built-in command that ran no turn.
 pub(crate) fn local_command_output(v: &Value) -> bool {
     v["type"] == "user"
         && (v["isCompactSummary"] == true
-            || user_text(v).is_some_and(|t| t.trim_start().starts_with("<local-command-stdout>")))
+            || user_text(v).is_some_and(|t| {
+                let t = t.trim_start();
+                t.starts_with("<local-command-stdout>") || t.starts_with("<local-command-stderr>")
+            }))
 }
 
 /// A usage limit stopped the turn: Claude Code writes a synthetic

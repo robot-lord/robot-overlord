@@ -422,39 +422,44 @@ what makes the TUI live and `last_state_change_at` trustworthy.
 ### Stale statuses re-checked (`daemon/src/recheck.rs`)
 
 A stored status moves only when an event moves it, so a clearing event
-that never comes leaves it wrong: a "needs you" from a stray notification
-sat for days, Claude runs no `Stop` hook when the user interrupts a turn,
-and an agent that crashed without `SessionEnd` leaves a dead pane behind a
-live status. Once at daemon start and then every minute, plain code
-checks the sessions that follow hooks (Claude, and Codex with trusted
-hooks) against what is there to see:
+that never comes leaves it wrong: Claude runs no `Stop` hook when the user
+interrupts a turn, an agent that crashed without `SessionEnd` leaves a
+dead pane behind a live status, and a prompt typed while hooks were lost
+leaves "needs you" behind. Once at daemon start and then every minute,
+plain code checks the sessions that follow hooks (Claude, and Codex with
+trusted hooks) against what is there to see:
 
-- agent pane gone on two looks in a row: `stopped`, through `discover`'s
-  stop (`session_end` from the pane). One `list-panes -a` a pass looks at
-  each session's pinned agent pane (`@rlord_pane`, else the first): its
-  program exited, or the session isn't listed; no server running means
-  every session is gone. When tmux can't say otherwise, no pane verdict
-  is made that pass (nothing is stopped on a guess);
-- `waiting_input` or `working` unchanged for 2 minutes while the
-  transcript's tail says the last turn ended (a final reply, Codex's
-  `turn_aborted`) or was interrupted (Claude's `[Request interrupted by
-  user…]` line), and nothing was written for 2 minutes: `idle`. For
-  `working`, that line must be later than the status change (else it is
-  the previous turn's). A turn found ended moves the session's last
-  message forward to it, as a `Stop` would. Lines the user's own commands
-  wrote after the reply say nothing about the turn: `!` shell commands, a
-  built-in slash command followed by its local output, a compaction's
-  summary, meta lines. A custom command or skill with no output after it
-  is the model's turn, and a Stop hook's feedback reopens one.
+- **Agent pane gone** on two answered looks in a row: `stopped`, through
+  `discover`'s stop (`session_end` from the pane). One `list-panes -a` a
+  pass looks at each session's pinned agent pane (`@rlord_pane`, else
+  the first): its program exited, or the session isn't listed. Any tmux
+  failure, "no server running" included, gives no pane verdict that pass
+  and starts the counts again (a server that really died is for the
+  startup reconcile and `discover`).
+- **`working`**, unchanged for 2 minutes, while the transcript's last
+  turn line ended it (a final reply: `turn_ended`) or interrupted it
+  (Claude's `[Request interrupted by user…]` line, Codex's
+  `turn_aborted`: `interrupted`), written after the status change, and
+  nothing written for 2 minutes: `idle`. A final reply moves the
+  session's last message forward to it, as a `Stop` would.
+- **`waiting_input`** is never cleared from the transcript alone: a real
+  prompt can wait silently for hours, on the main agent or a sub-agent.
+  Only when the user clearly moved on, a prompt of theirs written after
+  the wait began: `idle` if that turn is over and quiet, else `working`
+  (`moved_on`).
 
-A turn still open (a tool call waiting on a prompt or running) is never
-touched, however long it waits. Nor is "needs you" while a sub-agent may
-be the one asking: named as waiting, or a background sub-agent
-`background.rs` believes open (it wrote within `STALE_MS`). Sessions
-`discover` or `opencode.rs` follow are theirs. One session's failure
-doesn't stop the pass. A fix is written only if the status hasn't moved
-since it was read, and is logged as a `status_rechecked` event (`from`,
-`to`, `why`).
+A "needs you" with no activity since (a stray notification after a turn
+ended) is left for the user to clear: a new prompt in that session, or
+restarting it (`rlord restart <session>`).
+
+Reading the tail, lines the user's own commands wrote say nothing about
+the turn: `!` shell commands, a built-in slash command followed by its
+local output (or error output), a compaction's summary, meta lines. A
+custom command or skill with no output after it is the model's turn, and
+a Stop hook's feedback reopens one. Sessions `discover` or `opencode.rs`
+follow are theirs. One session's failure doesn't stop the pass. A fix is
+written only if the status hasn't moved since it was read, and is logged
+as a `status_rechecked` event (`from`, `to`, `why`).
 
 ### Usage limits (`daemon/src/limits.rs`)
 

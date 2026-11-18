@@ -186,11 +186,12 @@ impl<'a> Line<'a> {
 
 impl Line<'_> {
     /// This line says the user interrupted the turn (Claude writes a
-    /// marker line; Codex's `turn_aborted` already reads as `turn_ended`).
+    /// marker line; Codex a `turn_aborted` event).
     pub fn interrupted(&self) -> bool {
         match self.format {
             Format::Claude => claude::interrupted(self.v),
-            Format::Codex | Format::OpenCode => false,
+            Format::Codex => codex::interrupted(self.v),
+            Format::OpenCode => false,
         }
     }
 
@@ -241,6 +242,9 @@ pub struct Tail {
     pub turn: Option<TurnTail>,
     /// When that line was written (ms).
     pub turn_at: Option<i64>,
+    /// When the latest prompt the user typed was written (ms): a human
+    /// prompt (Claude), a prompt or a turn started (Codex).
+    pub prompt_at: Option<i64>,
     /// When the last stamped line was written (ms): the agent's latest
     /// sign of life in the file.
     pub last_at: Option<i64>,
@@ -270,9 +274,11 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
     let turn = lines().find_map(|l| {
         let at = l.at().and_then(parse_iso_ms);
         if l.command_wrapper() {
-            // A built-in command (its output follows): nothing. A custom
-            // command or a skill: the model's turn.
-            return (!local_after).then_some((TurnTail::Open, at));
+            // A built-in command (its output follows): nothing; that
+            // output covers this one command only. A custom command or a
+            // skill: the model's turn.
+            let local = std::mem::take(&mut local_after);
+            return (!local).then_some((TurnTail::Open, at));
         }
         if l.local_output() {
             local_after |= l.local_command_output();
@@ -284,9 +290,15 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
         l.turn_ended()
             .map(|e| (if e { TurnTail::Ended } else { TurnTail::Open }, at))
     });
+    let starts = |l: &Line| {
+        l.prompt().is_some() || (format == Format::Codex && l.turn_ended() == Some(false))
+    };
     Tail {
         turn: turn.map(|t| t.0),
         turn_at: turn.and_then(|t| t.1),
+        prompt_at: lines()
+            .filter(starts)
+            .find_map(|l| l.at().and_then(parse_iso_ms)),
         last_at: lines().find_map(|l| l.at().and_then(parse_iso_ms)),
     }
 }
@@ -1051,19 +1063,19 @@ mod tests {
         ]);
         assert_eq!(bash.turn, Some(TurnTail::Ended));
         assert_eq!(bash.turn_at, at("2026-11-12T10:00:05Z"));
+        // The latest prompt the user typed (not the `!` lines).
+        assert_eq!(bash.prompt_at, None);
+        assert_eq!(ended.prompt_at, at("2026-11-12T10:00:00Z"));
         assert_eq!(bash.last_at, at("2026-11-12T10:00:21Z"));
         // A slash command's wrapper, or a compaction's summary: the same.
         let mut summary = user("2026-11-12T10:00:30Z", "This session is being continued");
         summary["isCompactSummary"] = json!(true);
         let cmd = t(&[
             reply("2026-11-12T10:00:05Z", "end_turn"),
+            // (One line per command, as Claude writes it.)
             user(
                 "2026-11-12T10:00:20Z",
-                "<command-name>/compact</command-name>",
-            ),
-            user(
-                "2026-11-12T10:00:21Z",
-                "<command-message>compact</command-message>",
+                "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
             ),
             summary,
         ]);
@@ -1086,6 +1098,24 @@ mod tests {
             ),
         ]);
         assert_eq!(builtin.turn, Some(TurnTail::Ended));
+        // A built-in command's error output covers it too; but only that
+        // one wrapper: an earlier custom command is still a turn.
+        let two = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:10Z",
+                "<command-name>/review</command-name>",
+            ),
+            user(
+                "2026-11-12T10:00:20Z",
+                "<command-name>/model</command-name>",
+            ),
+            user(
+                "2026-11-12T10:00:21Z",
+                "<local-command-stderr>no such model</local-command-stderr>",
+            ),
+        ]);
+        assert_eq!(two.turn, Some(TurnTail::Open));
         // A custom command or a skill, no reply yet: the model's turn.
         let custom = t(&[
             reply("2026-11-12T10:00:05Z", "end_turn"),
@@ -1097,14 +1127,21 @@ mod tests {
         assert_eq!(custom.turn, Some(TurnTail::Open));
         // Nothing about a turn: unknown.
         assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
-        // Codex: an aborted turn is a turn ended.
         let ev = |kind: &str| json!({"timestamp": "2026-11-12T10:00:00Z", "type": "event_msg", "payload": {"type": kind}});
         let codex = |lines: &[Value]| tail_of(Format::Codex, lines).turn;
         assert_eq!(codex(&[ev("task_started")]), Some(TurnTail::Open));
+        // Codex: an aborted turn was interrupted; a completed one ended.
         assert_eq!(
             codex(&[ev("task_started"), ev("turn_aborted")]),
+            Some(TurnTail::Interrupted)
+        );
+        assert_eq!(
+            codex(&[ev("task_started"), ev("task_complete")]),
             Some(TurnTail::Ended)
         );
+        assert!(tail_of(Format::Codex, &[ev("task_started")])
+            .prompt_at
+            .is_some());
         // From a file: its tail, the same answer.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("abc.jsonl");
