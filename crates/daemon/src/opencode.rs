@@ -134,7 +134,7 @@ fn live(d: &Daemon) -> Result<Vec<Session>> {
 /// One tick: about `TICK` long, most of it waiting (for events, or asleep).
 fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     let live = live(d)?;
-    settle_stopped_first_prompts(d, &live)?;
+    settle_stopped_first_prompts(d)?;
     f.gone.retain(|id, _| live.iter().any(|s| &s.id == id));
     f.blocked.retain(|id, _| live.iter().any(|s| &s.id == id));
     if live.is_empty() {
@@ -784,33 +784,57 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
     Ok(changed)
 }
 
-/// First prompts held for sessions no longer live (stopped, archived or
-/// gone before the POST): each is settled, its file removed and, for a
-/// session still there, the log says it wasn't sent.
-fn settle_stopped_first_prompts(d: &Daemon, live: &[Session]) -> Result<()> {
+/// First prompts held for sessions that aren't running. Each held id's
+/// own row is read under the same DB lock as the kv (a session that just
+/// started is running by then, so never touched):
+/// - stopped: kept, file and all, for its restart to carry
+///   (`first_prompt::restamp`); logged once, marked `stopped`;
+/// - archived or gone: settled, its file removed, logged if it is there.
+fn settle_stopped_first_prompts(d: &Daemon) -> Result<()> {
     let prefix = crate::first_prompt::pending_key("");
-    let held = d.db().kv_prefix(&prefix)?;
-    for (key, raw) in held {
-        let id = key.trim_start_matches(&prefix);
-        if live.iter().any(|s| s.id == id) {
-            continue;
-        }
+    let mut remove = Vec::new();
+    {
         let db = d.db();
-        db.kv_delete(&key)?;
-        if db.resolve_ref(id).is_ok() {
-            db.insert_event(
-                id,
-                now_ms(),
-                "first_prompt",
-                &json!({"sent": false, "why": "the session stopped before it could be sent"})
-                    .to_string(),
-            )?;
+        for (key, raw) in db.kv_prefix(&prefix)? {
+            let id = key.trim_start_matches(&prefix).to_string();
+            let row = db.resolve_ref(&id).ok();
+            let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            match &row {
+                Some(s) if s.archived_at.is_none() && s.status != Status::Stopped => {}
+                Some(s) if s.archived_at.is_none() => {
+                    if held["stopped"] != true {
+                        held["stopped"] = json!(true);
+                        db.kv_set(&key, &held.to_string())?;
+                        db.insert_event(
+                            &s.id,
+                            now_ms(),
+                            "first_prompt",
+                            &json!({"sent": false, "held": true,
+                                    "why": "the session stopped first; its restart sends it"})
+                            .to_string(),
+                        )?;
+                    }
+                }
+                _ => {
+                    db.kv_delete(&key)?;
+                    if row.is_some() {
+                        db.insert_event(
+                            &id,
+                            now_ms(),
+                            "first_prompt",
+                            &json!({"sent": false, "why": "the session was archived first"})
+                                .to_string(),
+                        )?;
+                    }
+                    if let Some(f) = held["file"].as_str().filter(|f| !f.is_empty()) {
+                        remove.push(f.to_string());
+                    }
+                }
+            }
         }
-        drop(db);
-        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-        if let Some(f) = held["file"].as_str().filter(|f| !f.is_empty()) {
-            let _ = std::fs::remove_file(f);
-        }
+    }
+    for f in remove {
+        let _ = std::fs::remove_file(f);
     }
     Ok(())
 }

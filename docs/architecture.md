@@ -268,8 +268,11 @@ facts live in its module) is what the rest of rlord asks:
   the first idle turn from its own slot (`send::queue_first`, before and
   apart from the overlord's queued messages). Sent with no answer back:
   logged as unknown, never typed again (it may have run). A session that
-  stops first: logged as not sent. The file is removed in every case,
-  and the log has a `first_prompt` event. Claude reads the file on stdin
+  stops first keeps it (file and kv, marked `stopped`) for its restart
+  to send; one archived or gone first has it settled. The file is
+  removed once it is sent, typed or settled, and the log has a
+  `first_prompt` event. The overlord's messages to the session wait
+  until the first prompt has gone. Claude reads the file on stdin
   (`exec … < prompt.md`) once live check V1 passes
   (`first_prompt::CLAUDE_STDIN`); until then its prompt stays on argv.
   Fixed text with no user words (`context::pointer_only`) stays on argv.

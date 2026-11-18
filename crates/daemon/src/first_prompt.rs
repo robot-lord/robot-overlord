@@ -70,8 +70,8 @@ const POINTER_HEAD: &str = "[rlord session ";
 /// matches by it (`discover`), so the start must tell sessions apart.
 pub fn pointer_line(id: &str, file: &Path) -> String {
     format!(
-        "{POINTER_HEAD}{id}] The user's first message for this session is in {}. Read that \
-         file and treat its contents as the user's message to you.",
+        "{POINTER_HEAD}{id}{POINTER_TAIL}{}. Read that file and treat its contents as the \
+         user's message to you.",
         file.display()
     )
 }
@@ -86,17 +86,35 @@ pub fn launch_words(db: &Db, id: &str) -> Option<String> {
         .filter(|p| !p.trim().is_empty())
 }
 
+/// What follows the id in every `pointer_line`.
+const POINTER_TAIL: &str = "] The user's first message for this session is in ";
+
 /// A conversation's task as a transcript shows it: its first prompt, or,
-/// where there is none or it is only the pointer line (Codex), the
-/// launch's own words.
-/// Only session `id`'s own pointer line counts.
+/// where there is none or it is only a pointer line (Codex), the launch's
+/// own words. A pointer line is session `id`'s own, or (a Codex fork,
+/// whose history starts with its parent's) another session's in full:
+/// a path is never shown as the task, and the fork's own words stand in.
 pub fn task(id: &str, transcript_first: Option<String>, words: Option<String>) -> Option<String> {
-    let own = format!("{POINTER_HEAD}{id}]");
     match transcript_first {
-        Some(t) if t.trim_start().starts_with(&own) => words,
+        Some(t) if is_pointer(id, &t) => words,
         None => words,
         t => t,
     }
+}
+
+fn is_pointer(id: &str, text: &str) -> bool {
+    let t = text.trim_start();
+    if t.starts_with(&format!("{POINTER_HEAD}{id}]")) {
+        return true;
+    }
+    // Another session's: its id, then the fixed text.
+    t.strip_prefix(POINTER_HEAD)
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(other, _)| {
+            !other.is_empty()
+                && other.chars().all(|c| c.is_ascii_alphanumeric())
+                && t.contains(&format!("{other}{POINTER_TAIL}"))
+        })
 }
 
 /// Where a start's first prompt went.
@@ -183,6 +201,10 @@ pub fn restamp(db: &Db, id: &str, at: i64) -> Result<()> {
     };
     let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     held["at"] = json!(at);
+    // (Running again: no longer held for a stopped session.)
+    if let Some(o) = held.as_object_mut() {
+        o.remove("stopped");
+    }
     db.kv_set(&pending_key(id), &held.to_string())
 }
 
@@ -282,8 +304,15 @@ mod tests {
             Some("own")
         );
         assert_eq!(task("01abc", None, Some("x".into())).as_deref(), Some("x"));
-        // (Another session's pointer is just text here.)
-        assert_eq!(task("01xyz", Some(line.clone()), None), Some(line));
+        // A fork's history starts with its parent's pointer: never shown.
+        assert_eq!(task("01xyz", Some(line.clone()), None), None);
+        assert_eq!(
+            task("01xyz", Some(line), Some("fork words".into())).as_deref(),
+            Some("fork words")
+        );
+        // Text that only looks like the start of one is the user's own.
+        let own = "[rlord session note] keep this".to_string();
+        assert_eq!(task("01xyz", Some(own.clone()), None), Some(own));
     }
 
     #[test]

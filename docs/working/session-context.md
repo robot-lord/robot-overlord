@@ -730,6 +730,23 @@ reads the file, asks `has_session` and scans kv `first_prompt:*`; the
 private-write helper is repeated in `context` and `first_prompt`; the
 restart's "has words" check repeats `fork::restart_prompt`'s.
 
+### Review round 3 (PR #73)
+
+1. The stopped-session sweep reads each held id's own row under the same
+   DB lock as the kv: a session that just started is never touched.
+2. A stopped session keeps its held first prompt (file and kv, marked
+   `stopped`, logged once) for its restart (`restamp` clears the mark);
+   only an archived or gone one is settled.
+3. `first_prompt::task` also drops another session's full pointer line
+   (a Codex fork's history starts with its parent's): the fork's own
+   words, or nothing; never a path.
+
+Owed (round 3): the POST on the follower thread; per-pass file read,
+`has_session` and kv scan; fold `apply_first_prompt` / `apply_deferred`;
+a held typed first prompt logs `message_held` (not a first-prompt kind);
+`tick` checks kv `first_prompt:<id>` inline rather than via
+`first_waiting`.
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;
