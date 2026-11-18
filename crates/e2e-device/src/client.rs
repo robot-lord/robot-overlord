@@ -261,6 +261,22 @@ impl Conn {
         Ok(())
     }
 
+    /// Send a lane-2 frame and wait for the relay's answer: its queue
+    /// number, or the `refused` code as an error.
+    pub async fn queue_mailbox(&mut self, payload: Vec<u8>) -> Result<u64> {
+        self.send_mailbox(payload).await?;
+        match self
+            .wait_for(Duration::from_secs(10), |m| {
+                matches!(m, FromRelay::Queued { .. } | FromRelay::Refused { .. })
+            })
+            .await?
+        {
+            FromRelay::Queued { seq, .. } => Ok(seq),
+            FromRelay::Refused { code, .. } => bail!("refused: {code}"),
+            _ => unreachable!(),
+        }
+    }
+
     /// The next live frame.
     pub async fn recv_live(&mut self, limit: Duration) -> Result<Vec<u8>> {
         let until = tokio::time::Instant::now() + limit;

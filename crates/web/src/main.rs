@@ -70,13 +70,26 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
     };
     let port = listener.local_addr()?.port();
     let d = daemon::Daemon::new(paths::socket_path());
-    if let Err(e) = d.hello(port).await {
-        eprintln!("rlord-web: the daemon refused hello: {e}");
-        if e.code == i64::from(plugin::RPC_ERR_INCOMPATIBLE) {
-            return Ok(ExitCode::from(plugin::EXIT_INCOMPATIBLE as u8));
+    let hello = match d.hello(port).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("rlord-web: the daemon refused hello: {e}");
+            if e.code == i64::from(plugin::RPC_ERR_INCOMPATIBLE) {
+                return Ok(ExitCode::from(plugin::EXIT_INCOMPATIBLE as u8));
+            }
+            return Ok(ExitCode::FAILURE);
         }
-        return Ok(ExitCode::FAILURE);
-    }
+    };
+    // The remote ops a device may repeat freely (none named: every op runs
+    // at most once per request id).
+    let idempotent: Vec<String> = hello["idempotent"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     let (rev, mut sub) = d.subscribe().await.context("subscribing to the daemon")?;
     // View sessions a bridge left behind (it died between making one and
     // attaching, or with the last plugin).
@@ -87,7 +100,7 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
             swept.len()
         );
     }
-    let remote = remote::start(d.clone(), Config::load()?.remote, rev.clone());
+    let remote = remote::start(d.clone(), Config::load()?.remote, rev.clone(), idempotent);
     let app = http::App::new(token, port, d, rev);
     // No page is open yet (a plugin before this one may have left some).
     app.report_pages().await;

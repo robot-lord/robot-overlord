@@ -12,7 +12,6 @@ use serde_json::{json, Value};
 
 use rlord_e2e::stream::{self, CONTROL};
 use rlord_e2e::{device_id, Kind, QrPayload, Responder};
-use rlord_relay_proto::frame::FromHost;
 use rlord_relay_proto::{auth, ToRelay, B64};
 
 use super::devices::{clean_name, Device};
@@ -177,10 +176,7 @@ impl Actor {
                                 device_static,
                             };
                         }
-                        self.send_frame(FromHost::Live {
-                            link: id,
-                            payload: msg2,
-                        });
+                        self.send_live(id, msg2);
                     }
                     Err(e) => self.drop_link(id, &format!("pairing handshake: {e}")),
                 }

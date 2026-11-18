@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 
 use rlord_e2e::stream::{self, Reassembler, CONTROL};
 use rlord_e2e::{Kind, MailboxSession, Responder, Session};
-use rlord_relay_proto::frame::FromHost;
 
-use super::{Actor, Input};
+use super::requests::{Next, Waiter};
+use super::Actor;
 
 /// A device may send this many ops per second, with this burst.
 const OPS_PER_SEC: f64 = 20.0;
@@ -152,7 +152,7 @@ pub(crate) fn error_answer(id: &Value, code: &str, message: &str) -> Value {
 }
 
 /// The daemon's RPC code as the control socket's error code.
-fn code_of(code: i64) -> &'static str {
+pub(crate) fn code_of(code: i64) -> &'static str {
     match code {
         0 => "daemon_unavailable",
         c if c == i64::from(rlord_core::plugin::RPC_ERR_NOT_ALLOWED) => "not_allowed",
@@ -260,10 +260,7 @@ impl Actor {
                     if let Some(l) = self.links.get_mut(&id) {
                         l.phase = Phase::AwaitHello { session, device };
                     }
-                    self.send_frame(FromHost::Live {
-                        link: id,
-                        payload: msg2,
-                    });
+                    self.send_live(id, msg2);
                 }
                 Err(e) => self.drop_link(id, &e.to_string()),
             },
@@ -295,7 +292,9 @@ impl Actor {
             }
         }
         for payload in out {
-            self.send_frame(FromHost::Live { link: id, payload });
+            if !self.send_live(id, payload) {
+                return;
+            }
         }
     }
 
@@ -311,53 +310,29 @@ impl Actor {
                 _ => {}
             };
         }
-        let rid = req["id"].clone();
-        let Some(op) = req["op"].as_str().map(str::to_string) else {
-            return self.send_control(id, &error_answer(&rid, "bad_request", "no op"));
+        let Some(l) = self.links.get_mut(&id) else {
+            return;
         };
-        let Some(Phase::Live(live)) = self.links.get_mut(&id).map(|l| &mut l.phase) else {
+        let epoch = l.epoch;
+        let Phase::Live(live) = &mut l.phase else {
             return;
         };
         if !live.take() {
             return self.send_control(
                 id,
-                &error_answer(&rid, "rate_limited", "too many requests; slow down"),
+                &error_answer(&req["id"], "rate_limited", "too many requests; slow down"),
             );
         }
         let device = live.device.clone();
-        let epoch = self.links.get(&id).map(|l| l.epoch).unwrap_or(0);
-        self.audit.log(&device, &format!("op {op}"));
-        let args = req.get("args").cloned().unwrap_or(json!({}));
-        let (d, tx) = (self.d.clone(), self.tx_clone());
-        tokio::spawn(async move {
-            let r = d
-                .call(
-                    "web.call",
-                    json!({"op": op, "args": args, "via": "remote", "device": device}),
-                )
-                .await;
-            let answer = match r {
-                Ok(v) => json!({"id": rid, "ok": v}),
-                Err(e) => error_answer(&rid, code_of(e.code), &e.message),
-            };
-            let _ = tx.send(Input::OpDone {
-                link: id,
-                epoch,
-                answer,
-            });
-        });
-    }
-
-    /// A daemon call for a live session finished: answer on that same
-    /// link, if it is still there.
-    pub(crate) fn op_done(&mut self, id: u32, epoch: u64, answer: Value) {
-        if self
-            .links
-            .get(&id)
-            .is_some_and(|l| l.epoch == epoch && l.is_live())
-        {
-            self.send_control(id, &answer);
+        let next = self.admit(&device, &req, Waiter::Live { link: id, epoch });
+        if matches!(next, Next::Run { key: Some(_), .. }) {
+            // Recorded as running before it runs: a resend by id, by any
+            // way, never runs it again.
+            if let Err(e) = self.mailboxes.save(&device) {
+                eprintln!("rlord-web: saving a request store: {e:#}");
+            }
         }
+        self.proceed(&device, next, "op");
     }
 
     /// Kind-3 message 1, on a live session: answer, and keep the mailbox
@@ -415,7 +390,7 @@ impl Actor {
         self.audit.log(&device, "mailbox keyed");
     }
 
-    pub(crate) fn tx_clone(&self) -> tokio::sync::mpsc::UnboundedSender<Input> {
+    pub(crate) fn tx_clone(&self) -> tokio::sync::mpsc::UnboundedSender<super::Input> {
         self.tx.clone()
     }
 }

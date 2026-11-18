@@ -112,7 +112,7 @@ async fn pair(name: &str) -> Device {
     assert_eq!(s["pending"]["name"], name);
     assert_eq!(s["pending"]["code"], run.code);
     // Not stored, not callable, until confirmed.
-    assert!(s["devices"].as_array().unwrap().is_empty());
+    assert!(!s["devices"].to_string().contains(&dev.id()), "{s}");
     let c = rpc("relay.confirm", json!({})).await.unwrap();
     assert_eq!(c["device"]["id"], dev.id());
     run.outcome(&mut dev, WAIT).await.unwrap();
@@ -254,18 +254,17 @@ async fn a_mailbox_request_waits_for_the_host() {
     let req = dev
         .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
         .unwrap();
-    c.send_mailbox(req).await.unwrap();
-    c.wait_for(WAIT, |m| {
-        matches!(m, FromRelay::Ok { .. } | FromRelay::Err { .. })
-    })
-    .await
-    .ok();
+    // The relay says it is queued.
+    assert_eq!(c.queue_mailbox(req).await.unwrap(), 1);
     // The plugin comes back, fetches the queued request and answers it.
     w.rig.daemon.web().start(false).unwrap();
     let (seq, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
-    let answer = dev.mailbox_open(&payload).unwrap();
+    let boot = c.ready.boot.clone();
+    let answer = dev.mailbox_receive(&boot, seq, &payload).unwrap().unwrap();
     assert_eq!(answer["id"], "m1", "{answer}");
     assert_ne!(answer["error"]["code"], "not_allowed");
+    // A frame delivered again is recognised, not opened twice.
+    assert_eq!(dev.mailbox_receive(&boot, seq, &payload).unwrap(), None);
     c.send(|n| ToRelay::Ack {
         n,
         seq,
@@ -273,16 +272,16 @@ async fn a_mailbox_request_waits_for_the_host() {
     })
     .await
     .unwrap();
-    // The same request again is not acted on twice.
+    // The same request again is not acted on twice: it gets the stored
+    // answer.
     let again = dev
         .mailbox_request("m1", "overlord.ask", json!({"text": "while you were away"}))
         .unwrap();
     c.send_mailbox(again).await.unwrap();
     let (_, payload) = c.recv_mailbox(WAIT).await.unwrap();
-    assert_eq!(
-        dev.mailbox_open(&payload).unwrap()["error"]["code"],
-        "repeat"
-    );
+    assert_eq!(dev.mailbox_open(&payload).unwrap(), answer);
+    let marker = format!("{} mailbox op overlord.ask", dev.id());
+    assert_eq!(audit().matches(&marker).count(), 1);
     // Only the two ops travel by mailbox.
     let snap = dev.mailbox_request("m2", "snapshot", json!({})).unwrap();
     c.send_mailbox(snap).await.unwrap();
@@ -550,7 +549,8 @@ async fn a_crash_in_the_mailbox_never_repeats_an_op() {
     assert_eq!(ops(), 1);
 
     // Killed after saving, before acknowledging: the relay delivers it
-    // again, the host knows it, the op never runs; a resend is a repeat.
+    // again, the host knows it, the op never runs; a resend is told it was
+    // interrupted (the host can't know whether it happened).
     w.rig.daemon.web().stop();
     let req = dev
         .mailbox_request("c2", "overlord.ask", json!({"text": "two"}))
@@ -565,6 +565,208 @@ async fn a_crash_in_the_mailbox_never_repeats_an_op() {
     c.send_mailbox(again).await.unwrap();
     let (_, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
     let a = dev.mailbox_open(&payload).unwrap();
-    assert_eq!(a["error"]["code"], "repeat", "{a}");
+    assert_eq!(a["error"]["code"], "interrupted", "{a}");
     assert_eq!(ops(), 1, "no op ran twice, and c2 not at all");
+}
+
+/// Waits until the device's mailbox is keyed at the host.
+async fn keyed(dev: &Device) {
+    let t = Instant::now();
+    while !audit().contains(&format!("{} mailbox keyed", dev.id())) {
+        assert!(t.elapsed() < WAIT, "mailbox never keyed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The next mailbox answer that isn't `in_progress`.
+async fn mailbox_answer(dev: &mut Device, c: &mut rlord_e2e_device::Conn) -> Value {
+    loop {
+        let (seq, payload) = c.recv_mailbox(Duration::from_secs(20)).await.unwrap();
+        let boot = c.ready.boot.clone();
+        let Some(a) = dev.mailbox_receive(&boot, seq, &payload).unwrap() else {
+            continue;
+        };
+        c.send(|n| ToRelay::Ack {
+            n,
+            seq,
+            device: None,
+        })
+        .await
+        .unwrap();
+        if a["error"]["code"] != "in_progress" {
+            return a;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_resent_by_mailbox_after_its_link_died_runs_once() {
+    let _g = LOCK.lock().await;
+    let _w = world(1).await;
+    let mut dev = pair("commuter").await;
+    let mut c = dev.connect().await.unwrap();
+    let mut live = dev.live(&mut c).await.unwrap();
+    dev.key_mailbox(&mut c, &mut live).await.unwrap();
+    keyed(&dev).await;
+    let live_ops = format!("{} op overlord.ask", dev.id());
+    let mailbox_ops = format!("{} mailbox op overlord.ask", dev.id());
+    let count = |m: &str| audit().matches(m).count();
+
+    // Asked live, and the link dies before the answer is read.
+    live.send_json(
+        &mut c,
+        &json!({"id": "x1", "op": "overlord.ask", "args": {"text": "on the train"}}),
+    )
+    .await
+    .unwrap();
+    let t = Instant::now();
+    while count(&live_ops) == 0 {
+        assert!(t.elapsed() < WAIT, "the op never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    c.close().await;
+
+    // Resent by mailbox with the same id: the host's store answers it.
+    let mut c = dev.connect().await.unwrap();
+    let req = dev
+        .mailbox_request("x1", "overlord.ask", json!({"text": "on the train"}))
+        .unwrap();
+    c.queue_mailbox(req).await.unwrap();
+    let a = mailbox_answer(&mut dev, &mut c).await;
+    assert_eq!(a["id"], "x1", "{a}");
+    assert!(
+        a.get("ok").is_some() || a["error"]["code"] != "interrupted",
+        "{a}"
+    );
+
+    // And live again, same id: the same answer, still one run.
+    let mut live = dev.live(&mut c).await.unwrap();
+    live.send_json(
+        &mut c,
+        &json!({"id": "x1", "op": "overlord.ask", "args": {"text": "on the train"}}),
+    )
+    .await
+    .unwrap();
+    let again = live.answer(&mut c, "x1", WAIT).await.unwrap();
+    assert_eq!(again, a);
+    // Without an id, an op that changes something is refused, not run.
+    live.send_json(
+        &mut c,
+        &json!({"op": "overlord.ask", "args": {"text": "no id"}}),
+    )
+    .await
+    .unwrap();
+    let v = loop {
+        let v = live.recv_json(&mut c, WAIT).await.unwrap();
+        if v.get("error").is_some() {
+            break v;
+        }
+    };
+    assert_eq!(v["error"]["code"], "bad_request", "{v}");
+    assert_eq!(count(&live_ops), 1, "ran once");
+    assert_eq!(count(&mailbox_ops), 0, "never by mailbox");
+    assert!(audit().contains(&format!("{} repeat overlord.ask", dev.id())));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_restart_loses_the_queue_and_a_resend_still_works() {
+    let _g = LOCK.lock().await;
+    let World {
+        rig,
+        relay,
+        _relay_dir: relay_dir,
+    } = world(1).await;
+    let mut dev = pair("restart").await;
+    let mut c = dev.connect().await.unwrap();
+    let mut live = dev.live(&mut c).await.unwrap();
+    dev.key_mailbox(&mut c, &mut live).await.unwrap();
+    keyed(&dev).await;
+    c.close().await;
+
+    // The host is away; a request waits at the relay...
+    rig.daemon.web().stop();
+    let mut c = dev.connect().await.unwrap();
+    let req = dev
+        .mailbox_request("r1", "overlord.ask", json!({"text": "lost"}))
+        .unwrap();
+    c.queue_mailbox(req).await.unwrap();
+    let boot = c.ready.boot.clone();
+    // ... and the relay restarts (same port, same key), forgetting it.
+    let addr = relay.addr();
+    relay.shutdown().await;
+    let mut cfg = rlord_relay::Config::new(relay_dir.path());
+    cfg.listen = addr;
+    let relay = rlord_relay::start(cfg).await.unwrap();
+    let mut c = dev.connect().await.unwrap();
+    assert_ne!(c.ready.boot, boot);
+    assert_eq!(c.ready.queued, Some(0));
+    // The device sees the new boot with r1 unanswered: it resends r1 (a
+    // newer counter; the host skips the lost one).
+    let req = dev
+        .mailbox_request("r1", "overlord.ask", json!({"text": "lost"}))
+        .unwrap();
+    c.queue_mailbox(req).await.unwrap();
+    rig.daemon.web().start(false).unwrap();
+    let a = mailbox_answer(&mut dev, &mut c).await;
+    assert_eq!(a["id"], "r1", "{a}");
+    assert_eq!(
+        audit()
+            .matches(&format!("{} mailbox op overlord.ask", dev.id()))
+            .count(),
+        1
+    );
+    assert!(!audit().contains(&format!("{} mailbox discarded", dev.id())));
+    drop(relay);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_flooding_its_link_never_breaks_anothers() {
+    let _g = LOCK.lock().await;
+    // Snapshots of several frames each.
+    let w = world(300).await;
+    let flood = pair("flood").await;
+    let calm = pair("calm").await;
+    let mut cf = flood.connect().await.unwrap();
+    let mut lf = flood.live(&mut cf).await.unwrap();
+    let mut cc = calm.connect().await.unwrap();
+    let mut lc = calm.live(&mut cc).await.unwrap();
+
+    // One device asks for far more than it reads (it reads nothing).
+    let spam = tokio::spawn(async move {
+        for i in 0..200 {
+            let r = json!({"id": format!("s{i}"), "op": "snapshot", "args": {}});
+            if lf.send_json(&mut cf, &r).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cf
+    });
+    // Meanwhile the other's session keeps working, promptly.
+    for _ in 0..5 {
+        let t = Instant::now();
+        let snap = lc.request(&mut cc, "snapshot", json!({})).await.unwrap();
+        assert_eq!(snap["ok"]["rows"].as_array().map(Vec::len), Some(300));
+        assert!(t.elapsed() < WAIT, "{:?}", t.elapsed());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // The flooding device's link is the one that ends: told to reconnect
+    // (4205), or, since it read nothing, cut off before that close frame
+    // could reach it (1006).
+    let mut cf = spam.await.unwrap();
+    let code = cf.wait_closed(Duration::from_secs(30)).await.unwrap();
+    assert!(code == close::RESET || code == 1006, "{code}");
+    // The host's relay connection never dropped: the calm session is the
+    // same one, still answering and still told of changes.
+    let snap = lc.request(&mut cc, "snapshot", json!({})).await.unwrap();
+    assert!(snap["ok"]["rows"].is_array(), "{snap}");
+    lc.inbox.clear();
+    rpc(
+        "session.rename",
+        json!({"ref": format!("session-0002-{}", "x".repeat(40)), "name": "still"}),
+    )
+    .await
+    .unwrap();
+    lc.event(&mut cc, "changed", WAIT).await.unwrap();
+    drop(w);
 }

@@ -14,20 +14,32 @@
 //! calls and a one-second tick. Calls to the daemon run in their own tasks
 //! (an `overlord.ask` may take a while); their answers come back to the
 //! actor, which alone encrypts, so each session's frames stay in order.
+//!
+//! **Delivery.** One relay connection carries one Noise session per device
+//! link, with implicit nonces, so in-connection delivery must be lossless
+//! and in order: nothing is ever dropped quietly (`outq.rs`). A link whose
+//! queue overflows is dropped (only that device's session ends); a
+//! connection that can't take a control message, sends a frame we can't
+//! parse, goes silent, or outlives a sleep of this machine is closed and
+//! dialled again. Every reconnect is a fresh handshake per device; the
+//! device catches up by the snapshot's `rev` and resends what it hasn't had
+//! an answer to by request id (`requests.rs`).
 
 mod audit;
 mod devices;
 mod keys;
 pub mod link;
 mod mailbox;
+mod outq;
 mod pairing;
+mod requests;
 mod session;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
@@ -35,7 +47,7 @@ use tokio_tungstenite::tungstenite::Message;
 use rlord_core::config::RemoteConfig;
 use rlord_core::plugin;
 use rlord_relay_proto::address::{b64_fingerprint, fingerprint_from_b64};
-use rlord_relay_proto::frame::{FromHost, ToHost};
+use rlord_relay_proto::frame::ToHost;
 use rlord_relay_proto::msg::{Enroll, LinkKind};
 use rlord_relay_proto::{FromRelay, Role, ToRelay, B64};
 
@@ -43,6 +55,7 @@ use crate::daemon::Daemon;
 use audit::Audit;
 use devices::Devices;
 use keys::Keys;
+use outq::{Full, OutQ};
 use pairing::Pairing;
 use session::Link;
 
@@ -56,8 +69,13 @@ pub fn now() -> u64 {
 
 /// Reconnect backoff: 1 s doubling to 60 s, never given up while enabled.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// A relay that says nothing (not even a ping) for this long is gone.
-const SILENCE: Duration = Duration::from_secs(70);
+/// A relay that says nothing (not a ping, not a pong to ours) for this long
+/// is gone. We ping every 15 s and it every 25 s.
+const SILENCE: Duration = Duration::from_secs(45);
+/// A tick this much later than due, by the wall clock or the monotonic
+/// one, means this machine slept (or stalled): the connection is likely
+/// dead, so it is dialled again at once rather than waiting out `SILENCE`.
+const WOKE: Duration = Duration::from_secs(10);
 /// At most one "something for you" per device per this long.
 const SIGNAL_EVERY: Duration = Duration::from_secs(30);
 /// Unused devices are looked for at start and once a day.
@@ -83,15 +101,12 @@ pub enum Input {
         attempt: u64,
         msg: RelayIn,
     },
-    /// A daemon call made for a live session finished.
-    OpDone {
-        link: u32,
-        epoch: u64,
-        answer: Value,
-    },
-    /// A daemon call made for a mailbox request finished.
-    MailboxDone {
+    /// A daemon call made for a device's request finished.
+    Done {
         device: String,
+        /// The request id, when the device's store recorded it.
+        key: Option<String>,
+        from: requests::Waiter,
         answer: Value,
     },
     Tick,
@@ -134,7 +149,7 @@ enum Conn {
     },
     Up {
         attempt: u64,
-        tx: mpsc::Sender<Message>,
+        q: OutQ,
         last_rx: Instant,
     },
 }
@@ -165,13 +180,21 @@ pub(crate) struct Actor {
     pub(crate) links: HashMap<u32, Link>,
     pub(crate) pairing: Option<Pairing>,
     pub(crate) mailboxes: mailbox::Mailboxes,
+    /// Running requests' waiters (`requests.rs`).
+    pub(crate) waiting: requests::Waiting,
+    /// Remote ops the daemon says are safe to run twice (`web.hello`).
+    pub(crate) idempotent: Vec<String>,
+    /// The last tick, by both clocks (sleep detection).
+    last_tick: Option<(Instant, SystemTime)>,
+    last_mailbox_retry: Instant,
     last_signal: HashMap<String, Instant>,
     last_expiry: Option<Instant>,
     state_tx: watch::Sender<Value>,
 }
 
-/// Start the remote-access task. `rev` is the daemon's state now.
-pub fn start(d: Daemon, cfg: RemoteConfig, rev: String) -> Handle {
+/// Start the remote-access task. `rev` is the daemon's state now;
+/// `idempotent` the remote ops the daemon says may run twice.
+pub fn start(d: Daemon, cfg: RemoteConfig, rev: String, idempotent: Vec<String>) -> Handle {
     let dir = plugin::remote_dir();
     let (tx, rx) = mpsc::unbounded_channel();
     let (state_tx, state_rx) = watch::channel(Value::Null);
@@ -203,6 +226,10 @@ pub fn start(d: Daemon, cfg: RemoteConfig, rev: String) -> Handle {
         n: 0,
         links: HashMap::new(),
         pairing: None,
+        waiting: HashMap::new(),
+        idempotent,
+        last_tick: None,
+        last_mailbox_retry: Instant::now(),
         last_signal: HashMap::new(),
         last_expiry: None,
         state_tx,
@@ -278,12 +305,12 @@ impl Actor {
                     RelayIn::Closed(f) => self.disconnected(f),
                 }
             }
-            Input::OpDone {
-                link,
-                epoch,
+            Input::Done {
+                device,
+                key,
+                from,
                 answer,
-            } => self.op_done(link, epoch, answer),
-            Input::MailboxDone { device, answer } => self.mailbox_done(&device, answer),
+            } => self.done(&device, key, from, answer),
             Input::Tick => self.tick(),
         }
     }
@@ -317,6 +344,18 @@ impl Actor {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        let wall = SystemTime::now();
+        let woke = self
+            .last_tick
+            .is_some_and(|(m, w)| slept((m, w), (now, wall)));
+        self.last_tick = Some((now, wall));
+        if woke && self.wanted() && self.stopped.is_none() {
+            self.reconnect_now("this machine slept; dialling the relay again");
+        }
+        if now.duration_since(self.last_mailbox_retry) >= mailbox::RETRY_EVERY {
+            self.last_mailbox_retry = now;
+            self.mailbox_retry(None);
+        }
         if self
             .last_expiry
             .is_none_or(|t| now.duration_since(t) >= EXPIRY_EVERY)
@@ -340,6 +379,22 @@ impl Actor {
             Conn::Waiting { at } if wanted && *at <= now => self.connect(),
             Conn::Waiting { .. } if !wanted => self.conn = Conn::Off,
             _ => {}
+        }
+    }
+
+    /// Close the connection (if up) and dial again at once, backoff reset:
+    /// after a sleep the old one is most likely dead already.
+    fn reconnect_now(&mut self, why: &str) {
+        eprintln!("rlord-web: {why}");
+        if let Conn::Up { q, .. } = &self.conn {
+            q.close_with(link::close_frame());
+        }
+        if matches!(self.conn, Conn::Up { .. } | Conn::Waiting { .. }) {
+            self.drop_links();
+            self.mailboxes.connection_lost();
+            self.backoff = Duration::from_secs(1);
+            self.conn = Conn::Off;
+            self.connect();
         }
     }
 
@@ -411,17 +466,9 @@ impl Actor {
         self.boot = ready.boot;
         self.error = None;
         self.backoff = Duration::from_secs(1);
-        let (mut sink, mut stream) = ws.split();
-        let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);
-        tokio::spawn(async move {
-            while let Some(m) = out_rx.recv().await {
-                let close = matches!(m, Message::Close(_));
-                if sink.send(m).await.is_err() || close {
-                    break;
-                }
-            }
-            let _ = sink.close().await;
-        });
+        let (sink, mut stream) = ws.split();
+        let q = OutQ::default();
+        tokio::spawn(outq::write(q.clone(), sink));
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let closed = loop {
@@ -433,11 +480,16 @@ impl Actor {
                             continue;
                         }
                     },
+                    // A frame we can't parse may have carried one of a
+                    // session's frames: skipping it would break that
+                    // session unseen, so the connection ends instead.
                     Some(Ok(Message::Binary(b))) => match ToHost::decode(&b) {
                         Ok(f) => RelayIn::Binary(f),
                         Err(e) => {
-                            eprintln!("rlord-web: relay sent a bad frame: {e}");
-                            continue;
+                            break link::Failure::Retry {
+                                after: None,
+                                why: format!("the relay sent a bad frame ({e})"),
+                            }
                         }
                     },
                     Some(Ok(Message::Close(c))) => {
@@ -474,7 +526,7 @@ impl Actor {
         });
         self.conn = Conn::Up {
             attempt,
-            tx: out_tx,
+            q,
             last_rx: Instant::now(),
         };
         let origin = self
@@ -485,11 +537,16 @@ impl Actor {
         eprintln!("rlord-web: connected to the relay {origin}");
         self.send_allow();
         self.pairing_connected();
+        self.mailbox_retry(None);
     }
 
     /// The connection ended (or never came up).
     fn disconnected(&mut self, f: link::Failure) {
+        if let Conn::Up { q, .. } = &self.conn {
+            q.shut();
+        }
         self.drop_links();
+        self.mailboxes.connection_lost();
         let now = Instant::now();
         match &f {
             link::Failure::WrongRelay(_) | link::Failure::Final { .. } => {
@@ -514,10 +571,11 @@ impl Actor {
 
     /// Close the connection on purpose (not wanted any more).
     fn close(&mut self) {
-        if let Conn::Up { tx, .. } = &self.conn {
-            let _ = tx.try_send(link::close_frame());
+        if let Conn::Up { q, .. } = &self.conn {
+            q.close_with(link::close_frame());
         }
         self.drop_links();
+        self.mailboxes.connection_lost();
         self.conn = Conn::Off;
     }
 
@@ -531,23 +589,51 @@ impl Actor {
         self.pairing_link_gone();
     }
 
-    /// Send a control message to the relay.
-    pub(crate) fn send_relay(&mut self, m: impl FnOnce(u64) -> ToRelay) {
-        self.n += 1;
-        let msg = m(self.n);
-        if let Conn::Up { tx, .. } = &self.conn {
-            if tx.try_send(Message::Text(msg.to_json().into())).is_err() {
-                eprintln!("rlord-web: the relay link is backed up; dropping the connection");
-            }
+    /// The current connection's queues.
+    pub(crate) fn queue(&self) -> Option<OutQ> {
+        match &self.conn {
+            Conn::Up { q, .. } => Some(q.clone()),
+            _ => None,
         }
     }
 
-    /// Send a binary frame to the relay.
-    pub(crate) fn send_frame(&mut self, f: FromHost) {
-        if let Conn::Up { tx, .. } = &self.conn {
-            if tx.try_send(Message::Binary(f.encode().into())).is_err() {
-                eprintln!("rlord-web: the relay link is backed up");
+    /// Send a control message to the relay. If it can't be queued the
+    /// connection is backed up beyond use: it is closed and dialled again.
+    pub(crate) fn send_relay(&mut self, m: impl FnOnce(u64) -> ToRelay) {
+        self.n += 1;
+        let msg = m(self.n);
+        let Some(q) = self.queue() else {
+            return;
+        };
+        let text = Message::Text(msg.to_json().into());
+        let r = match &msg {
+            ToRelay::Drop { link, .. } => q.after_link(*link, text),
+            _ => q.control(text),
+        };
+        if r.is_err() {
+            eprintln!("rlord-web: the relay link is backed up; closing it");
+            self.disconnected(link::Failure::Retry {
+                after: None,
+                why: "the relay link backed up".into(),
+            });
+        }
+    }
+
+    /// Send a lane-1 frame on a link. False when the link's queue
+    /// overflowed: the link is dropped (its session can't survive a lost
+    /// frame), and the device reconnects.
+    pub(crate) fn send_live(&mut self, link: u32, payload: Vec<u8>) -> bool {
+        let Some(q) = self.queue() else {
+            return false;
+        };
+        let frame = rlord_relay_proto::frame::FromHost::Live { link, payload }.encode();
+        match q.link(link, frame) {
+            Ok(()) => true,
+            Err(Full::Link(_)) => {
+                self.drop_link(link, "its queue overflowed (the device isn't keeping up)");
+                false
             }
+            Err(_) => false,
         }
     }
 
@@ -569,11 +655,27 @@ impl Actor {
                     return self.send_relay(|n| ToRelay::Drop { n, link: id });
                 };
                 match kind {
-                    LinkKind::Device => self.device_link(id, fp),
+                    LinkKind::Device => {
+                        self.device_link(id, fp);
+                        // It is connected: its queue at the relay drains.
+                        if let Some(d) = self.devices.by_fp(&fp).map(|d| d.id.clone()) {
+                            self.mailbox_retry(Some(&d));
+                        }
+                    }
                     LinkKind::Pair => self.pair_link(id, fp, rendezvous),
                 }
             }
             FromRelay::Unlink { id } => self.unlink(id),
+            FromRelay::Queued {
+                device: Some(fp), ..
+            } => self.mailbox_reply(&fp.0, None),
+            FromRelay::Refused {
+                code,
+                device: Some(fp),
+            } => {
+                eprintln!("rlord-web: the relay refused a mailbox answer: {code}");
+                self.mailbox_reply(&fp.0, Some(&code));
+            }
             FromRelay::Err { n, code } => eprintln!("rlord-web: relay refused request {n}: {code}"),
             FromRelay::Bye { code, retry_after } => {
                 if let Some(s) = retry_after {
@@ -609,8 +711,13 @@ impl Actor {
         }
     }
 
-    /// Close one link at the relay.
+    /// Close one link at the relay (the relay closes the device with 4205,
+    /// "reconnect now").
     pub(crate) fn drop_link(&mut self, id: u32, why: &str) {
+        // Its session failed: what is still queued for it is no use.
+        if let Some(q) = self.queue() {
+            q.forget(id);
+        }
         if let Some(l) = self.links.remove(&id) {
             eprintln!("rlord-web: dropping link {id}: {why}");
             if l.is_pair() {
@@ -811,5 +918,39 @@ impl Actor {
                 true
             }
         });
+    }
+}
+
+/// Did this machine sleep (or stall) between two ticks a second apart?
+/// `Instant` doesn't advance while macOS or Linux sleeps (it is
+/// `CLOCK_UPTIME_RAW` and `CLOCK_MONOTONIC`), so a sleep shows as the wall
+/// clock running ahead of it; where it does advance, as a long gap between
+/// ticks. A wall clock set back counts too (one needless reconnect).
+fn slept(prev: (Instant, SystemTime), now: (Instant, SystemTime)) -> bool {
+    let mono = now.0.saturating_duration_since(prev.0);
+    match now.1.duration_since(prev.1) {
+        Ok(wall) => mono > WOKE || wall.saturating_sub(mono) > WOKE,
+        Err(back) => back.duration() > WOKE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sleep_shows_on_either_clock() {
+        let (m, w) = (Instant::now(), SystemTime::now());
+        let s = Duration::from_secs;
+        // A normal tick.
+        assert!(!slept((m, w), (m + s(1), w + s(1))));
+        // macOS and Linux: Instant stood still while the wall clock ran.
+        assert!(slept((m, w), (m + s(1), w + s(3600))));
+        // A clock that counts sleep: both jumped.
+        assert!(slept((m, w), (m + s(3600), w + s(3600))));
+        // The wall clock set back.
+        assert!(slept((m, w), (m + s(1), w - s(60))));
+        // Small NTP slews are not a sleep.
+        assert!(!slept((m, w), (m + s(1), w + s(4))));
     }
 }

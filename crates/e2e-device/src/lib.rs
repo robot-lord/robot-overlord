@@ -53,6 +53,10 @@ pub struct Device {
     pub relay_key: Identity,
     pub host: Option<Host>,
     pub mailbox: Option<MailboxSession>,
+    /// The relay boot and queue number of the last mailbox frame opened:
+    /// one the relay delivers again (we didn't acknowledge it in time) is
+    /// recognised and not decrypted twice, as the host does.
+    pub mailbox_seen: Option<(String, u64)>,
     pub opts: Opts,
 }
 
@@ -69,6 +73,7 @@ impl Device {
             relay_key,
             host: None,
             mailbox: None,
+            mailbox_seen: None,
             opts: Opts::default(),
         })
     }
@@ -183,6 +188,7 @@ impl Device {
         )
         .await?;
         self.mailbox = Some(m);
+        self.mailbox_seen = None;
         Ok(())
     }
 
@@ -198,6 +204,27 @@ impl Device {
         let mut p = m.id().to_vec();
         p.extend_from_slice(&frame);
         Ok(p)
+    }
+
+    /// A lane-2 frame the relay delivered (`boot` from this connection's
+    /// `ready`): None when it was opened already (delivered again), else
+    /// the host's message.
+    pub fn mailbox_receive(
+        &mut self,
+        boot: &str,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<Option<Value>> {
+        if self
+            .mailbox_seen
+            .as_ref()
+            .is_some_and(|(b, s)| !boot.is_empty() && b == boot && seq <= *s)
+        {
+            return Ok(None);
+        }
+        let v = self.mailbox_open(payload)?;
+        self.mailbox_seen = Some((boot.to_string(), seq));
+        Ok(Some(v))
     }
 
     /// A lane-2 payload from the host, opened.

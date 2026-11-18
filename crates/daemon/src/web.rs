@@ -87,12 +87,19 @@ impl std::error::Error for NotAllowed {}
 /// here), the only arguments passed on (any others are dropped, so a
 /// browser can't set what a method takes from its trusted callers, such
 /// as `session.stop`'s `interrupt` or `session.restart`'s `hooks_work`),
-/// and whether a paired device may call it through the relay (`remote`).
+/// whether a paired device may call it through the relay (`remote`), and
+/// whether running it twice is the same as once (`idempotent`).
 pub struct Op {
     pub op: &'static str,
     pub method: &'static str,
     pub args: &'static [&'static str],
     pub remote: bool,
+    /// Safe to repeat: a look-up that changes nothing. The plugin runs such
+    /// a device request as often as it is asked; any other it runs at most
+    /// once per request id, answering a resend from its store
+    /// (`docs/working/e2e-protocol.md`, "Delivery and recovery"). Told to
+    /// the plugin in `web.hello`'s answer.
+    pub idempotent: bool,
 }
 
 /// An op for local pages and paired devices alike.
@@ -102,6 +109,7 @@ const fn op(op: &'static str, method: &'static str, args: &'static [&'static str
         method,
         args,
         remote: true,
+        idempotent: false,
     }
 }
 
@@ -113,6 +121,17 @@ const fn local(op: &'static str, method: &'static str, args: &'static [&'static 
         method,
         args,
         remote: false,
+        idempotent: false,
+    }
+}
+
+impl Op {
+    /// Marks a look-up: running it twice is the same as once.
+    const fn idempotent(self) -> Op {
+        Op {
+            idempotent: true,
+            ..self
+        }
     }
 }
 
@@ -121,10 +140,10 @@ const fn local(op: &'static str, method: &'static str, args: &'static [&'static 
 /// a paired device has a reason to call it: then `op`, and a test that it
 /// reaches its method from a device.
 pub const OPS: &[Op] = &[
-    op("snapshot", "", &["view", "rev"]),
-    op("session.get", "session.get", &["ref"]),
+    op("snapshot", "", &["view", "rev"]).idempotent(),
+    op("session.get", "session.get", &["ref"]).idempotent(),
     // Opening the overlord's pane when the user asks (never by itself).
-    op("overlord.ensure", "overlord.ensure", &[]),
+    op("overlord.ensure", "overlord.ensure", &[]).idempotent(),
     // A stopped session's Resume: started on its conversation (an
     // overlord is ensured), as Enter in the list does.
     op("session.resume", "", &["ref"]),
@@ -154,14 +173,14 @@ pub const OPS: &[Op] = &[
     // A UI command that never reached its page (asked on connecting).
     local("page.pending", "", &[]),
     // The list view a page with none of its own starts from.
-    op("view.default", "", &[]),
+    op("view.default", "", &[]).idempotent(),
     // The key screen, read-only (keys change only in a terminal).
-    local("keys.list", "keys.list", &[]),
+    local("keys.list", "keys.list", &[]).idempotent(),
     // The forms' look-ups: agents, models and defaults; the repo finder;
     // the code folder as set now and rlord's suggestion.
-    op("form.defaults", "session.defaults", &[]),
-    op("form.repos", "repo.find", &[]),
-    local("form.setup", "", &[]),
+    op("form.defaults", "session.defaults", &[]).idempotent(),
+    op("form.repos", "repo.find", &[]).idempotent(),
+    local("form.setup", "", &[]).idempotent(),
     // The code-folder form's save: what the user confirmed there.
     local(
         "form.setup_save",
@@ -226,11 +245,11 @@ pub const OPS: &[Op] = &[
     // The overlord's recent conversation as text (a chat view beside
     // `overlord.ask`), read from its transcript; `before`: a message's
     // `line`, for the ones before it.
-    op("overlord.messages", "", &["before", "limit"]),
+    op("overlord.messages", "", &["before", "limit"]).idempotent(),
     // Remote access, from the page's Devices view (relay.rs): the state,
     // a pairing offer and its cancel, the waiting device's confirmation,
     // unpairing a device.
-    local("device.list", "", &[]),
+    local("device.list", "", &[]).idempotent(),
     local("device.pair", "", &[]),
     local("device.pair_cancel", "", &[]),
     local("device.confirm", "", &[]),
@@ -280,7 +299,17 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
     if let (Some(pid), Some(port)) = (pid, port) {
         d.web().hello(pid, port);
     }
-    Ok(json!({"protocol": plugin::WEB_PROTOCOL, "version": env!("CARGO_PKG_VERSION")}))
+    Ok(json!({
+        "protocol": plugin::WEB_PROTOCOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        // The remote ops a device may repeat freely; the plugin runs any
+        // other at most once per request id.
+        "idempotent": OPS
+            .iter()
+            .filter(|o| o.remote && o.idempotent)
+            .map(|o| o.op)
+            .collect::<Vec<_>>(),
+    }))
 }
 
 /// Who sent a `web.call`.
@@ -1244,6 +1273,57 @@ mod tests {
 
     fn op_named(name: &str) -> &'static Op {
         OPS.iter().find(|o| o.op == name).unwrap()
+    }
+
+    /// Only look-ups are idempotent: anything that changes something runs
+    /// at most once per request id from a device, so a resend after a lost
+    /// link can't repeat it. `web.hello` tells the plugin which are.
+    #[test]
+    fn only_look_ups_are_idempotent() {
+        let idem: Vec<&str> = OPS.iter().filter(|o| o.idempotent).map(|o| o.op).collect();
+        assert_eq!(
+            idem,
+            [
+                "snapshot",
+                "session.get",
+                "overlord.ensure",
+                "view.default",
+                "keys.list",
+                "form.defaults",
+                "form.repos",
+                "form.setup",
+                "overlord.messages",
+                "device.list",
+            ]
+        );
+        for o in [
+            "overlord.ask",
+            "overlord.new_session",
+            "session.new",
+            "session.stop",
+        ] {
+            assert!(!op_named(o).idempotent, "{o}");
+        }
+        let d = Daemon::new(
+            rlord_core::db::Db::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        let h = hello(
+            &d,
+            &json!({"protocol": plugin::WEB_PROTOCOL, "version": "x"}),
+        )
+        .unwrap();
+        let told: Vec<&str> = h["idempotent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Remote ones only: a device never sends the others.
+        assert!(
+            told.contains(&"snapshot") && !told.contains(&"keys.list"),
+            "{told:?}"
+        );
     }
 
     /// A browser can't set what only trusted callers set: the overlord's
