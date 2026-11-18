@@ -775,7 +775,7 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         let same = same_file && std::fs::read_to_string(&file).unwrap_or_default() == text;
         if !same {
             // (Sent all the same: the hold left is a different prompt.)
-            if outcome["sent"] == true {
+            if outcome["sent"] == true || outcome["sent"] == "unknown" {
                 crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
             }
             db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
@@ -785,7 +785,8 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         if outcome["queued"] == true {
             crate::send::queue_first(&db, &s.id, &text)?;
         }
-        if outcome["sent"] == true {
+        // (Unknown too: it may be running.)
+        if outcome["sent"] == true || outcome["sent"] == "unknown" {
             crate::first_prompt::mark_sent(&db, &s.id, now_ms())?;
         }
         db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;

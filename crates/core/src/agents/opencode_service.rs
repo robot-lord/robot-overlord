@@ -353,7 +353,12 @@ impl Service {
         let mut r = BufReader::new(stream);
         match read_head(&mut r) {
             Ok((status, _)) if (200..300).contains(&status) => Posted::Sent,
-            Ok((status, _)) => Posted::Refused(format!("POST {path}: {status}")),
+            // A 4xx: the server turned it down. Anything else (a 5xx, a
+            // proxy's answer) may come after it was admitted.
+            Ok((status, _)) if (400..500).contains(&status) => {
+                Posted::Refused(format!("POST {path}: {status}"))
+            }
+            Ok((status, _)) => Posted::Unknown(format!("POST {path}: {status}")),
             Err(e) => Posted::Unknown(format!("{e:#}")),
         }
     }

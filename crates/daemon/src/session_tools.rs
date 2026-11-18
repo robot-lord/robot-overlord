@@ -487,7 +487,9 @@ fn first_prompt(d: &Daemon, s: &Session) -> Option<String> {
         })
     };
     stored.or_else(|| {
-        crate::summary::transcript_of(d, s).and_then(|p| transcript_excerpts(&p).first_prompt)
+        crate::summary::transcript_of(d, s).and_then(|p| {
+            crate::first_prompt::task(&s.id, transcript_excerpts(&p).first_prompt, None)
+        })
     })
 }
 

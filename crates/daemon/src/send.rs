@@ -586,6 +586,11 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
         m.remove(id);
         db.kv_set_map(key, &m)?;
     }
+    // A typed first prompt: what rlord types next waits for its turn to
+    // show as started.
+    if r.is_ok() && key == FIRST_KEY {
+        crate::first_prompt::mark_sent(&db, id, now_ms())?;
+    }
     let (kind, detail) = match &r {
         Ok(_) if key == FIRST_KEY => (
             "first_prompt",

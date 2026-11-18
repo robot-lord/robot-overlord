@@ -227,10 +227,15 @@ pub fn waiting(db: &Db, id: &str, now: i64) -> Result<bool> {
             return Ok(true);
         }
     }
-    let sent = db
-        .kv_get(&sent_key(id))?
-        .and_then(|v| v.parse::<i64>().ok());
-    Ok(sent.is_some_and(|t| now - t < SENT_SETTLE_MS))
+    let Some(raw) = db.kv_get(&sent_key(id))? else {
+        return Ok(false);
+    };
+    let recent = raw.parse::<i64>().is_ok_and(|t| now - t < SENT_SETTLE_MS);
+    if !recent {
+        // (Over: nothing left to wait for.)
+        db.kv_delete(&sent_key(id))?;
+    }
+    Ok(recent)
 }
 
 /// Give a held first prompt (if any) a fresh clock: a restart carries it
@@ -248,9 +253,17 @@ pub fn restamp(db: &Db, id: &str, at: i64) -> Result<()> {
     db.kv_set(&pending_key(id), &held.to_string())
 }
 
-/// Remove what a start that failed left: its prompt file and held POST.
+/// Remove what a session's first prompt left (a start that failed, an
+/// archive): its file, a held POST, the sent marker, a typed-fallback
+/// entry.
 pub fn forget(db: &Db, base: &Path, id: &str) {
     let _ = db.kv_delete(&pending_key(id));
+    let _ = db.kv_delete(&sent_key(id));
+    if let Ok(mut m) = db.kv_map(crate::send::FIRST_KEY) {
+        if m.remove(id).is_some() {
+            let _ = db.kv_set_map(crate::send::FIRST_KEY, &m);
+        }
+    }
     let _ = std::fs::remove_file(file_path(base, id));
 }
 
@@ -369,6 +382,8 @@ mod tests {
         mark_sent(&db, "s", 1_000).unwrap();
         assert!(waiting(&db, "s", 1_000 + SENT_SETTLE_MS - 1).unwrap());
         assert!(!waiting(&db, "s", 1_000 + SENT_SETTLE_MS).unwrap());
+        // (Past its window the marker is gone.)
+        assert!(db.kv_get(&sent_key("s")).unwrap().is_none());
     }
 
     #[test]

@@ -1671,6 +1671,8 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     if let Err(e) = crate::session_tools::revoke(db, &paths::data_dir(), &s.id) {
         tracing::warn!(session = %s.id, error = %e, "removing the session's token");
     }
+    // Its first prompt's file and keys are done with.
+    crate::first_prompt::forget(db, &paths::data_dir(), &s.id);
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "archived", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);

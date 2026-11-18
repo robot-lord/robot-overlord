@@ -782,6 +782,26 @@ live); `message_held` as the kind for a held first prompt; triage cost;
 `apply_*` dedupe; the restart's words check repeating
 `fork::restart_prompt`; the dead `Way::Argv` arm.
 
+### Review round 6 (PR #73, merged main at 1.7.0; now 1.8.0)
+
+1. Only a 4xx answer to the POST is `Refused`; 5xx and anything else
+   is `Unknown` (never typed again).
+2. `Unknown` sets the sent marker too (15s settle).
+3. A typed first prompt sets the sent marker, so nothing rlord types
+   lands right after it.
+4. Archive removes `prompt.md`, the held POST, the sent marker and a
+   typed-fallback entry (`first_prompt::forget`); the sent marker is
+   deleted once its window is over. Declined: removing Codex's file on
+   binding, since Codex binds (SessionStart, the thread index) before
+   it has read the file. Owed: remove it after its first turn ends.
+5. `session_brief`'s transcript fallback goes through
+   `first_prompt::task`.
+
+Owed (round 6): recovery when a `stopped` mark is left on a session that
+runs again without a restart through rlord; the restart's words check
+and the never-taken server arm on restart; `Placed` as an enum; the POST
+on the follower thread.
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;
