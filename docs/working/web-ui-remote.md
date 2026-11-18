@@ -1093,13 +1093,12 @@ Decided 2026-11-17 (user):
   - `advisories`: `proc-macro-error2` (RUSTSEC-2026-0173, unmaintained)
     comes with `libcrux-ml-kem` through `hax-lib-macros` 0.3.7; no newer
     `core-models` moves off it. Ignored in `deny.toml` with a reason.
+  - Trailing signal: a change inside a device's 30 s signal window was
+    dropped, so the device missed it until a later change. The host now
+    owes it one signal when the window ends (`remote/signals.rs`), still
+    at most one per window, and forgets it if the device went live or was
+    revoked meanwhile.
 - Owed after slice 3:
-  - **Signals miss a change soon after an ack.** The host signals a
-    device at most once per 30 s and drops a change inside that window,
-    so a device that fetched and acked, then misses a change within 30 s
-    of the last signal, isn't told until a later change. Needs a trailing
-    signal (send one when the window ends if a change was dropped); the
-    user's call whether it lands before the phone slice.
   - **The phone slice must** (the device side of the rule above;
     `e2e-protocol.md` §4): reconnect in a loop with backoff, at once on
     4205 (backing off if it repeats), on a network change and on coming

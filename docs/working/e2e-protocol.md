@@ -297,7 +297,9 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    that decrypts the host saves the mailbox (replacing any older one).
    A device keys a mailbox when it has none.
 5. While a device has no live session and the daemon's `rev` moves, the
-   host sends the relay `signal` for it, at most once per 30 s. A move of
+   host sends the relay `signal` for it, at most once per 30 s; a move
+   inside that window is owed one more, sent when the window ends (unless
+   the device went live or was revoked meanwhile). A move of
    the relay status alone (the mirror below: a pairing, a device's link
    coming or going) signals no one: no device sees it.
 

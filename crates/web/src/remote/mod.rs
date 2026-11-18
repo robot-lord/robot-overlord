@@ -34,6 +34,7 @@ mod outq;
 mod pairing;
 mod requests;
 mod session;
+mod signals;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,6 +59,7 @@ use keys::Keys;
 use outq::{Full, OutQ};
 use pairing::Pairing;
 use session::Link;
+use signals::Signals;
 
 /// Unix seconds.
 pub fn now() -> u64 {
@@ -76,8 +78,6 @@ const SILENCE: Duration = Duration::from_secs(45);
 /// one, means this machine slept (or stalled): the connection is likely
 /// dead, so it is dialled again at once rather than waiting out `SILENCE`.
 const WOKE: Duration = Duration::from_secs(10);
-/// At most one "something for you" per device per this long.
-const SIGNAL_EVERY: Duration = Duration::from_secs(30);
 /// Unused devices are looked for at start and once a day.
 const EXPIRY_EVERY: Duration = Duration::from_secs(86_400);
 
@@ -191,7 +191,8 @@ pub(crate) struct Actor {
     /// The last tick, by both clocks (sleep detection).
     last_tick: Option<(Instant, SystemTime)>,
     last_mailbox_retry: Instant,
-    last_signal: HashMap<String, Instant>,
+    /// When to signal devices without a live session (`signals.rs`).
+    signals: Signals,
     last_expiry: Option<Instant>,
     state_tx: watch::Sender<Value>,
 }
@@ -234,7 +235,7 @@ pub fn start(d: Daemon, cfg: RemoteConfig, rev: String, idempotent: Vec<String>)
         idempotent,
         last_tick: None,
         last_mailbox_retry: Instant::now(),
-        last_signal: HashMap::new(),
+        signals: Signals::default(),
         last_expiry: None,
         state_tx,
     };
@@ -377,6 +378,7 @@ impl Actor {
             self.expire_devices();
         }
         self.pairing_tick();
+        self.signal_owed();
         let wanted = self.wanted();
         match &self.conn {
             Conn::Up { last_rx, .. } if !wanted || now.duration_since(*last_rx) > SILENCE => {
@@ -767,20 +769,38 @@ impl Actor {
             .filter_map(|l| l.live_device())
             .collect();
         let now = Instant::now();
-        let to_signal: Vec<(String, B64)> = self
-            .devices
-            .list
-            .iter()
-            .filter(|d| !live_devices.contains(&d.id))
-            .filter(|d| {
-                self.last_signal
-                    .get(&d.id)
-                    .is_none_or(|t| now.duration_since(*t) >= SIGNAL_EVERY)
-            })
-            .map(|d| (d.id.clone(), d.relay_fp.clone()))
+        let mut to_signal: Vec<B64> = Vec::new();
+        for d in &self.devices.list {
+            if !live_devices.contains(&d.id) && self.signals.change(&d.id, now) {
+                to_signal.push(d.relay_fp.clone());
+            }
+        }
+        for fp in to_signal {
+            self.send_relay(|n| ToRelay::Signal { n, device: fp });
+        }
+    }
+
+    /// Signal the devices owed one (a change came inside their window)
+    /// whose window has ended, unless they caught up live or are gone.
+    fn signal_owed(&mut self) {
+        if !self.connected_now() {
+            return;
+        }
+        let live_devices: Vec<String> = self
+            .links
+            .values()
+            .filter_map(|l| l.live_device())
             .collect();
-        for (id, fp) in to_signal {
-            self.last_signal.insert(id, now);
+        let devices = &self.devices.list;
+        let due = self.signals.due(Instant::now(), |id| {
+            live_devices.iter().any(|l| l == id) || !devices.iter().any(|d| d.id == id)
+        });
+        let fps: Vec<B64> = due
+            .iter()
+            .filter_map(|id| devices.iter().find(|d| &d.id == id))
+            .map(|d| d.relay_fp.clone())
+            .collect();
+        for fp in fps {
             self.send_relay(|n| ToRelay::Signal { n, device: fp });
         }
     }
