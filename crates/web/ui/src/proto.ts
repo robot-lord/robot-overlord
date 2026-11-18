@@ -27,6 +27,30 @@ export interface Reply {
   error?: { code: ErrorCode; message: string };
 }
 
+/**
+ * What a paired device gets on its control stream or by mailbox: the same
+ * shape, with more codes (crates/web/src/remote/; docs/working/e2e-protocol.md,
+ * "Delivery and recovery"). A device gives every request an id unique for
+ * that device and reuses it when it resends: an op that changes something
+ * runs at most once per id, and a resend gets the stored answer.
+ */
+export type RemoteErrorCode =
+  | ErrorCode
+  /** Over 20 requests a second (burst 40). */
+  | "rate_limited"
+  /** This id is still running; its answer follows, by every way it was asked. */
+  | "in_progress"
+  /** This id was running when the host stopped: it may or may not have happened. */
+  | "interrupted"
+  /** Done, but the answer was too large to keep or to send by mailbox. */
+  | "too_large";
+
+export interface RemoteReply {
+  id: string | number;
+  ok?: unknown;
+  error?: { code: RemoteErrorCode; message: string };
+}
+
 /** A UI command from the overlord, for this page (`UiCmd`). */
 export interface UiEvent {
   event: "ui";

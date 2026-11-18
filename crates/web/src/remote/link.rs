@@ -74,6 +74,7 @@ pub fn closed(code: u16, reason: &str) -> Failure {
         close::OVERLOADED => "the relay is overloaded".to_string(),
         close::LIMIT => "over a limit at the relay".to_string(),
         close::TOO_SLOW => "the relay timed the connection out".to_string(),
+        close::RESET => "the relay reset the connection's link".to_string(),
         _ if reason.is_empty() => format!("the relay closed the connection ({code})"),
         _ => format!("the relay closed the connection ({code}: {reason})"),
     };

@@ -67,6 +67,11 @@ struct World {
 /// A daemon with `n` sessions, its plugin, and a relay; the host set up
 /// for that relay (from scratch: earlier tests' keys are reset).
 async fn world(n: usize) -> World {
+    world_with(n, |_| {}).await
+}
+
+/// `world`, with the relay's config adjusted by `f`.
+async fn world_with(n: usize, f: impl FnOnce(&mut rlord_relay::Config)) -> World {
     env_once("remote", "rlord-test-remote");
     let rig = tokio::task::spawn_blocking(move || {
         Rig::start(move |db| {
@@ -78,9 +83,9 @@ async fn world(n: usize) -> World {
     .await
     .unwrap();
     let relay_dir = tempfile::tempdir().unwrap();
-    let relay = rlord_relay::start(rlord_relay::Config::new(relay_dir.path()))
-        .await
-        .unwrap();
+    let mut cfg = rlord_relay::Config::new(relay_dir.path());
+    f(&mut cfg);
+    let relay = rlord_relay::start(cfg).await.unwrap();
     let token = relay
         .admin()
         .token_new(1, Duration::from_secs(600), "local")
@@ -769,4 +774,67 @@ async fn a_device_flooding_its_link_never_breaks_anothers() {
     .unwrap();
     lc.event(&mut cc, "changed", WAIT).await.unwrap();
     drop(w);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_refused_by_a_full_queue_is_sent_again() {
+    let _g = LOCK.lock().await;
+    // Queues of one message: the second answer finds the device's full.
+    let _w = world_with(1, |c| c.limits.mailbox_messages = 1).await;
+    let mut dev = pair("full").await;
+    let mut c = dev.connect().await.unwrap();
+    let mut live = dev.live(&mut c).await.unwrap();
+    dev.key_mailbox(&mut c, &mut live).await.unwrap();
+    keyed(&dev).await;
+    c.close().await;
+
+    let mut c = dev.connect().await.unwrap();
+    let boot = c.ready.boot.clone();
+    let req = dev
+        .mailbox_request("f1", "overlord.ask", json!({"text": "one"}))
+        .unwrap();
+    c.queue_mailbox(req).await.unwrap();
+    // f1's answer arrives; the device doesn't acknowledge it yet, so it
+    // fills its queue at the relay.
+    let (s1, p1) = c.recv_mailbox(WAIT).await.unwrap();
+    assert_eq!(
+        dev.mailbox_receive(&boot, s1, &p1).unwrap().unwrap()["id"],
+        "f1"
+    );
+    let req = dev
+        .mailbox_request("f2", "overlord.ask", json!({"text": "two"}))
+        .unwrap();
+    c.queue_mailbox(req).await.unwrap();
+    // f2 ran; its answer was refused (`full`) and is kept.
+    let t = Instant::now();
+    let ran = || {
+        audit()
+            .matches(&format!("{} mailbox op overlord.ask", dev.id()))
+            .count()
+    };
+    while ran() < 2 {
+        assert!(t.elapsed() < WAIT, "f2 never ran");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        c.quiet(Duration::from_millis(500)).await,
+        "f2's answer got through a full queue"
+    );
+    // The device acknowledges f1 and comes back: the host offers f2's
+    // answer again when it links, the same bytes.
+    c.send(|n| ToRelay::Ack {
+        n,
+        seq: s1,
+        device: None,
+    })
+    .await
+    .unwrap();
+    c.wait_for(WAIT, |m| matches!(m, FromRelay::Ok { .. }))
+        .await
+        .unwrap();
+    c.close().await;
+    let mut c = dev.connect().await.unwrap();
+    let a = mailbox_answer(&mut dev, &mut c).await;
+    assert_eq!(a["id"], "f2", "{a}");
+    assert!(!audit().contains("not delivered"));
 }
