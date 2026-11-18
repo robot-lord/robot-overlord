@@ -136,6 +136,95 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
     out
 }
 
+/// Whether any Claude Code conversation exists that `scan_claude` would
+/// list with the same `since_ms` and `tracked`: for the first-run offer.
+/// The same checks (`is_conversation_file`, mtime, `candidate`), but
+/// bounded: the newest `MAX_DIRS` project dirs (rlord's own and temp ones
+/// skipped by name before any read), at most `MAX_READS` transcripts read,
+/// stopping at the first. If the budget runs out on rejects, it answers
+/// true: in-window untracked transcripts exist, and the overlord's scan
+/// gives the exact answer.
+pub fn has_claude_conversations(since_ms: i64, tracked: &dyn Fn(&str) -> bool) -> bool {
+    let projects = claude::config_dir().join("projects");
+    has_claude_conversations_in(&projects, since_ms, tracked, &excluded_dirs())
+}
+
+const MAX_DIRS: usize = 500;
+const MAX_READS: usize = 50;
+
+/// `has_claude_conversations` over an explicit projects dir (tests).
+pub fn has_claude_conversations_in(
+    projects: &Path,
+    since_ms: i64,
+    tracked: &dyn Fn(&str) -> bool,
+    excluded: &[PathBuf],
+) -> bool {
+    let Ok(dirs) = std::fs::read_dir(projects) else {
+        return false;
+    };
+    // Skipped by name: the slug of a folder under an excluded one starts
+    // with its slug (lossy, so `candidate` still checks the real cwd).
+    let excluded_slugs: Vec<String> = excluded
+        .iter()
+        .map(|e| claude::project_slug(&e.to_string_lossy()))
+        .collect();
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut dirs: Vec<(Option<SystemTime>, PathBuf, String)> = dirs
+        .flatten()
+        .filter(|d| d.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|d| (d.path(), d.file_name().to_string_lossy().into_owned()))
+        .filter(|(_, slug)| {
+            !slug.ends_with("-robot-overlord-overlord")
+                && !excluded_slugs.iter().any(|e| slug.starts_with(e.as_str()))
+        })
+        .map(|(p, slug)| (mtime(&p), p, slug))
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    let mut reads = 0;
+    for (_, dir, slug) in dirs.into_iter().take(MAX_DIRS) {
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            let Some(id) = is_conversation_file(&path) else {
+                continue;
+            };
+            if tracked(id) {
+                continue;
+            }
+            let mtime = f.metadata().and_then(|m| m.modified()).ok().map(ms_epoch);
+            if mtime.is_some_and(|m| m < since_ms) {
+                continue;
+            }
+            // Budget spent on rejects: in-window untracked transcripts
+            // exist, so offer; the overlord's scan has the exact answer.
+            if reads >= MAX_READS {
+                return true;
+            }
+            reads += 1;
+            // (No process list: whether it's open elsewhere doesn't matter.)
+            if candidate(&path, id, &slug, mtime, "", excluded)
+                .is_ok_and(|c| c.last_active_at >= since_ms)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The conversation id when `path` is a Claude transcript: `<uuid>.jsonl`.
+/// Conversations are named by uuid; anything else is not one.
+fn is_conversation_file(path: &Path) -> Option<&str> {
+    if path.extension().is_none_or(|e| e != "jsonl") {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
 /// `scan_claude` over an explicit projects dir, process list and excluded
 /// folders (tests).
 pub fn scan_claude_in(
@@ -156,14 +245,10 @@ pub fn scan_claude_in(
         let slug = dir.file_name().to_string_lossy().into_owned();
         for f in files.flatten() {
             let path = f.path();
-            if path.extension().is_none_or(|e| e != "jsonl") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(id) = is_conversation_file(&path) else {
                 continue;
             };
-            // Conversations are named by uuid; anything else is not one.
-            if uuid::Uuid::parse_str(id).is_err() || tracked(id) {
+            if tracked(id) {
                 continue;
             }
             if !opts.only.is_empty() && !opts.only.iter().any(|o| id.starts_with(o.as_str())) {
@@ -484,6 +569,35 @@ mod tests {
                    "timestamp": "2026-11-09T00:00:00.000Z"}),
             json!({"type": "pr-link", "prUrl": "https://example.test/pr/7"}),
         ]
+    }
+
+    #[test]
+    fn has_conversations_skips_excluded_and_non_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let excl = [PathBuf::from("/rlord/data")];
+        let none = |_: &str| false;
+        let has = |since, tracked: &dyn Fn(&str) -> bool| {
+            has_claude_conversations_in(&projects, since, tracked, &excl)
+        };
+        assert!(!has(0, &none));
+        let last = "2026-11-05T12:00:00.000Z";
+        write(
+            &projects,
+            "/src/app",
+            "notes",
+            &convo("/src/app", "hi", last),
+        );
+        // Excluded by its cwd, as the scan does.
+        let own = "/rlord/data/x";
+        write(&projects, own, ID_A, &convo(own, "hi", last));
+        assert!(!has(0, &none));
+        write(&projects, "/src/app", ID_B, &convo("/src/app", "hi", last));
+        assert!(has(0, &none));
+        assert!(!has(0, &|id| id == ID_B));
+        // Older than the window (by last exchange): not counted.
+        let after = ms_epoch(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        assert!(!has(after, &none));
     }
 
     #[test]

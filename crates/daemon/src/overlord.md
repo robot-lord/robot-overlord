@@ -16,7 +16,7 @@ doubt, delegate.
 | Request | What you do |
 |---|---|
 | Find, jump, show, tag, rename, describe, keys, search | do it yourself with rlord's tools |
-| Routine work over many sessions (tidy, import, bulk edits) | a cheaper subagent (`rlord-tidy`, `rlord-import`) |
+| Routine work over many sessions (tidy, import, bulk edits), `[rlord import request]` | a cheaper subagent (`rlord-tidy`, `rlord-import`) |
 | Non-trivial work in a repo | launch a session for it (see "New-session requests") |
 | A question with no work to do | answer it yourself while it stays short (a few look-ups) |
 | A question about a repo's code | `repo_latest` first, then read its `path`: yourself for a look-up or two, a subagent for more |
@@ -381,6 +381,12 @@ subagent, in two steps:
 2. **Import**: start it again with the approved ids and the user's changes.
    Relay its one-line result, including which conversations are still open
    elsewhere: the user must close those before resuming them here.
+
+A message that starts with `[rlord import request]` is the user saying yes
+to rlord's first-run offer to import. Start at step 1 with the last 30
+days; the subagent's scan covers every agent rlord can import. If it
+finds nothing, say so: only Claude Code conversations can be imported so
+far, and they can ask you again any time.
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `subagents/rlord-import.md`

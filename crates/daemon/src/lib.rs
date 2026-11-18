@@ -7,6 +7,7 @@ pub mod discover;
 pub mod first_prompt;
 pub mod fork;
 pub mod import;
+mod import_offer;
 pub mod limits;
 pub mod locks;
 pub mod mcp;
@@ -931,6 +932,8 @@ impl Daemon {
             "setup.status" => setup::status(self),
             "setup.suggest" => setup::suggest(self, params),
             "setup.apply" => setup::apply(self, params),
+            "setup.import_offer" => import_offer::offer(self),
+            "setup.import_answer" => import_offer::answer(self, params),
             "ui.confirm_setup" => setup::confirm(self, params),
             "overlord.setup_request" => ask::setup_request(self, params),
             "keys.list" => ui::keys_list(self),
