@@ -71,7 +71,7 @@ was dropped in review round 7: `overlord.md` is rewritten at every
 overlord start, and the user wants no compatibility code.
 
 **Prompt off argv (PR 3).** `FirstPrompt { Stdin, Server, Pointer, Typed
-}`: Claude from a 0600 file on stdin (if V1 passes), OpenCode POSTed to
+}`: Claude from a 0600 file on stdin (V1 passed, 1.10.0), OpenCode POSTed to
 its server, Codex a fixed pointer line to `prompt.md` (user's decision),
 `Typed` as the last resort.
 
@@ -85,7 +85,7 @@ by code (`context::frame_message`).
 | Need | Claude | Codex | OpenCode |
 |---|---|---|---|
 | Background at start | SessionStart `additionalContext` (fallback `--append-system-prompt-file`) | SessionStart `additionalContext` when hooks are trusted (fallback pointer line) | pointer line (V4 may find an API field) |
-| First prompt off argv (PR 3) | stdin file if V1 passes, else typed | pointer to `prompt.md` | server POST, else typed |
+| First prompt off argv (PR 3) | stdin file (1.10.0) | pointer to `prompt.md` | server POST, else typed |
 | Later message (PR 4) | Stop-hook block mid-turn; paste when idle | same | POST `delivery: queue` |
 | Scoped tools (PR 2) | `--mcp-config` + `--allowedTools` | `-c mcp_servers.rlord_session.*` in pane; CLI in daemon mode | CLI `rlord context` |
 
@@ -645,6 +645,12 @@ Still owed:
 
 ## PR 3 progress (1.4.0)
 
+- [x] V1 passed (2026-11-17, Claude Code 2.1.327): `exec claude < prompt.md`
+  ran the prompt and kept the terminal for typed input; `--resume …
+  --fork-session` with stdin also worked, and so did a folder Claude
+  hadn't trusted (the prompt ran after the trust dialog was accepted).
+  `CLAUDE_STDIN = true` (1.10.0).
+
 - [x] `daemon/src/first_prompt.rs`: `Way { Argv, Stdin, Server, Pointer }`
   per agent; `place` writes the first prompt (user's words, with the
   background pointer line when there is one) to 0600
@@ -663,9 +669,7 @@ Still owed:
   within 30s: queued with `send::queue` (typed at the first idle turn).
   Event `first_prompt` either way; the file is removed after.
 - [x] Claude: stdin (`exec … < prompt.md`, `first_prompt::with_stdin`)
-  wired but off (`CLAUDE_STDIN = false`): V1 was not run in this PR (the
-  live check was refused by the agent's permission gate). Claude's
-  prompt stays on argv until V1 passes.
+  wired; turned on in 1.10.0 after V1 passed (see above).
 - [x] #70 owed: the pane env var is `RLORD_SESSION_LOOKUP_FILE` (Codex's
   default env policy drops `*TOKEN*`, `*KEY*`, `*SECRET*`; test); the
   OpenCode module doc no longer says the prompt rides on argv.
@@ -674,8 +678,7 @@ Still owed:
   Codex is still launched with a prompt).
 
 Owed from PR 3:
-- Run V1 (Claude interactive with the prompt file on stdin, also with
-  `--resume … --fork-session`), then set `CLAUDE_STDIN = true`.
+- V1 on Linux and other Claude Code versions is untested.
 - Live-check the OpenCode POST (V4) on a scratch server: that the TUI
   opened with `-s` shows the posted turn, and that the 30s fallback is
   long enough.
@@ -846,7 +849,7 @@ newer hold; the dedupe items above.
     fork's id. `bind_prompt` doesn't apply to forks (`bind_fork`).
 - Follow-up, not in this effort: the guard rail above.
 - The first prompt left argv in PR 3 for Codex and OpenCode; Claude's
-  waits on V1 (see "PR 3 progress").
+  followed in 1.10.0 (stdin).
 - `get_session` (a read-only tool) shows any session's background to any
   session that added plain `rlord mcp`, like its notes. PR 2's scoped
   tools are the real surface for workers.
