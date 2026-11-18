@@ -771,10 +771,19 @@ impl Daemon {
             // "Not now" to switching away from an overlord out of usage:
             // not asked again for this limit (`resets_at`, ms).
             "overlord.decline_limit_switch" => {
-                let at = params["resets_at"].as_i64().unwrap_or(0);
-                self.db()
+                let Some(at) = params["resets_at"].as_i64() else {
+                    return Some(Err(anyhow::anyhow!(
+                        "resets_at (ms, an integer) is required"
+                    )));
+                };
+                let r = self
+                    .db()
                     .kv_set(overlord::LIMIT_OFFER_DECLINED, &at.to_string())
-                    .map(|_| json!({"declined": true}))
+                    .map(|_| json!({"declined": true}));
+                if r.is_ok() {
+                    self.changed();
+                }
+                r
             }
             // Make another agent's overlord the active one (starting or
             // creating it). Not while something is being pasted into the

@@ -422,7 +422,20 @@ impl App {
     /// `:overlord <agent>`): started, or created the first time. The one
     /// it replaces keeps running with its conversation.
     pub(crate) fn switch_overlord(&mut self, agent: &str) {
-        if let Some(v) = self.call("overlord.switch", json!({"agent": agent})) {
+        if let Err(e) = self.try_switch_overlord(agent) {
+            self.status_line = format!("error: {e:#}");
+        }
+    }
+
+    /// `switch_overlord`, handing a failure back (the limit offer keeps
+    /// its dialog open on one).
+    pub(crate) fn try_switch_overlord(&mut self, agent: &str) -> Result<()> {
+        {
+            let v = client_call(
+                &paths::socket_path(),
+                "overlord.switch",
+                json!({"agent": agent}),
+            )?;
             let label = rlord_core::agents::Agent::parse(agent).map_or(agent, |a| a.label());
             self.status_line = match (v["switched"] == true, v["created"] == true) {
                 (false, _) => format!("the overlord is already on {label}"),
@@ -433,6 +446,7 @@ impl App {
             };
             self.dirty = true;
         }
+        Ok(())
     }
 
     /// Schedule the selected session to carry on once its usage limit
@@ -2623,6 +2637,26 @@ impl App {
         self.hits.spans(left.x, left.y, global_hits);
         // (After the divider, "│  ".)
         let mut ctx_hits = vec![(3, None)];
+        // Too many row keys for the room: keep what fits and end on
+        // "? more" (the help lists every key), never a key cut in half.
+        let cap_w = |k: &str, l: &str| -> usize {
+            keycap(k, l, Cap::Context).iter().map(|s| s.width()).sum()
+        };
+        let room = usize::from(right.width).saturating_sub(3);
+        let total: usize = ctx.iter().map(|(k, l, _)| cap_w(k, l)).sum();
+        if total > room {
+            let help = self.keys.label(Action::Help);
+            let mut used = cap_w(&help, "more");
+            let keep = ctx
+                .iter()
+                .take_while(|(k, l, _)| {
+                    used += cap_w(k, l);
+                    used <= room
+                })
+                .count();
+            ctx.truncate(keep);
+            ctx.push((help, "more", press(Action::Help)));
+        }
         let ctx_line = context_line(
             ctx.into_iter()
                 .map(|(k, label, hit)| {
@@ -3537,6 +3571,10 @@ fn context_legend(
         // Its row is fixed: no name, pin, tags, description, notes, archive.
         return v;
     }
+    // (A conversation to copy.) Early: a narrow footer drops the last keys.
+    if resumable {
+        v.push((Action::Fork, "fork"));
+    }
     if archived {
         v.push((Action::Unarchive, "unarchive"));
     } else {
@@ -3554,10 +3592,6 @@ fn context_legend(
     v.push((Action::Tags, "tags"));
     v.push((Action::Describe, "describe"));
     v.push((Action::Notes, "notes"));
-    // (A conversation to copy.)
-    if resumable {
-        v.push((Action::Fork, "fork"));
-    }
     v
 }
 
@@ -3645,8 +3679,8 @@ mod tests {
         assert_eq!(
             labels(&context_legend(false, None, Some(&running))),
             [
-                "attach", "restart", "stop", "archive", "rename", "pin", "tags", "describe",
-                "notes", "fork"
+                "attach", "restart", "stop", "fork", "archive", "rename", "pin", "tags",
+                "describe", "notes"
             ]
         );
         let archived = json!({"status": "stopped", "agent": "claude", "agent_session": "x",
@@ -3888,8 +3922,17 @@ mod tests {
         );
         assert!(!right.contains("unarchive"), "{running}");
 
-        // Narrower than both halves: the global keys stay whole.
+        // A normal width: fork shows, and keys that don't fit end on
+        // "more" (the help), never a cut-off label.
         app.table.select(Some(1));
+        let mid = footer_row(&app, 160);
+        assert!(mid.contains(" fork "), "{mid}");
+        let (_, right) = mid.split_once('│').unwrap();
+        assert!(right.trim_end().ends_with("more"), "{mid}");
+        let wide = footer_row(&app, 200);
+        assert!(wide.contains(" fork "), "{wide}");
+
+        // Narrower than both halves: the global keys stay whole.
         let narrow = footer_row(&app, 120);
         assert!(
             narrow.contains(" new ") && narrow.contains(" quit ") && narrow.contains(" overlord "),

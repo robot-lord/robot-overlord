@@ -123,6 +123,23 @@ impl LimitSwitch {
     }
 }
 
+impl LimitSwitch {
+    /// Take a newer reading of the offer, keeping the pick on the same
+    /// agent where it is still offered, and when it opened.
+    fn refresh(&mut self, new: LimitSwitch) {
+        let picked = self.to.get(self.pick).map(|t| t.0.clone());
+        let pick = picked
+            .and_then(|a| new.to.iter().position(|t| t.0 == a))
+            .unwrap_or(0);
+        *self = LimitSwitch {
+            pick,
+            opened: self.opened,
+            error: self.error.take(),
+            ..new
+        };
+    }
+}
+
 /// An existing overlord on an old model.
 pub(crate) struct Upgrade {
     note: String,
@@ -873,13 +890,26 @@ impl App {
 
     /// Open the limit-switch offer if the overlord row (`overlord.get`)
     /// asks for it and nothing else is open.
+    /// Already open: brought up to date, or closed once the offer no
+    /// longer applies (switched elsewhere, the limit reset, no target left).
     pub(crate) fn offer_limit_switch(&mut self, o: &Value) {
-        if !matches!(self.mode, Mode::Normal) {
-            return;
+        let fresh = LimitSwitch::from_overlord(o);
+        match (&mut self.mode, fresh) {
+            (Mode::Normal, Some(l)) => self.mode = Mode::LimitSwitch(Box::new(l)),
+            (Mode::LimitSwitch(_), None) => self.mode = Mode::Normal,
+            (Mode::LimitSwitch(l), Some(new)) => l.refresh(new),
+            _ => {}
         }
-        if let Some(l) = LimitSwitch::from_overlord(o) {
-            self.mode = Mode::LimitSwitch(Box::new(l));
-        }
+    }
+
+    /// Tell the daemon this limit's offer was answered (`resets_at`).
+    fn answer_limit_switch(l: &LimitSwitch) -> anyhow::Result<()> {
+        client_call(
+            &paths::socket_path(),
+            "overlord.decline_limit_switch",
+            json!({"resets_at": l.resets_at}),
+        )
+        .map(drop)
     }
 
     pub(crate) fn handle_limit_switch(&mut self, k: KeyEvent, mut l: Box<LimitSwitch>) {
@@ -891,14 +921,10 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Esc => match client_call(
-                &paths::socket_path(),
-                "overlord.decline_limit_switch",
-                json!({"resets_at": l.resets_at}),
-            ) {
-                Ok(_) => {
+            KeyCode::Esc => match Self::answer_limit_switch(&l) {
+                Ok(()) => {
                     self.status_line = format!(
-                        "overlord stays on {} until {}; switch any time with :overlord <agent>",
+                        "overlord stays on {} (out of usage until {})",
                         l.from, l.until
                     );
                 }
@@ -916,14 +942,18 @@ impl App {
                 self.mode = Mode::LimitSwitch(l);
             }
             KeyCode::Char('y') => {
-                // Answered: this limit isn't offered again either way.
-                let _ = client_call(
-                    &paths::socket_path(),
-                    "overlord.decline_limit_switch",
-                    json!({"resets_at": l.resets_at}),
-                );
                 let agent = l.to[l.pick].0.clone();
-                self.switch_overlord(&agent);
+                match self.try_switch_overlord(&agent) {
+                    // Answered: this limit isn't offered again. (Only once
+                    // switched: a failed switch keeps the offer.)
+                    Ok(()) => {
+                        let _ = Self::answer_limit_switch(&l);
+                    }
+                    Err(e) => {
+                        l.error = Some(format!("{e:#}"));
+                        self.mode = Mode::LimitSwitch(l);
+                    }
+                }
             }
             _ => self.mode = Mode::LimitSwitch(l),
         }
