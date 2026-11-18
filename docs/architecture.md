@@ -1013,7 +1013,9 @@ box's text, parsed by the daemon with the TUI's
 `SessionQuery::apply_search_text` (`tag:`, `status:`, …), so the page
 never parses it, and its `usage` picks the usage measure; `rev` is `<boot id>-<changes>`, and a current
 `rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
-most every 100 ms. `web.pane_target` names a pane's tmux session and
+most every 100 ms, with `"relay": true` when all it folds in is the
+plugin's own relay status (`changed_relay`): the plugin wakes no device
+for that. `web.pane_target` names a pane's tmux session and
 starts nothing. Adding an op: put it on `OPS` with its arguments, add it to
 `OPS` in `crates/web/ui/src/proto.ts` (a test holds the two lists
 together), and test it in `crates/daemon/tests/web_api.rs`.

@@ -57,7 +57,9 @@ pub struct Daemon {
     /// `repo_latest`: fetches, per-repo locks (`repo_latest.rs`).
     pub(crate) latest: repo_latest::Latest,
     /// Push stream to subscribers, one JSON line per message:
-    /// `{"notify":"changed"}` — coarse tick, refetch what you display;
+    /// `{"notify":"changed"}` — coarse tick, refetch what you display
+    /// (`{"notify":"changed","relay":true}` when only the plugin's relay
+    /// status moved);
     /// `{"notify":"ui","to":"terminal","cmd":{...}}` — a UI command for
     /// the TUI (set_view, new_session) issued by the overlord;
     /// `{"notify":"ui","to":"web","page":"<id>","cmd":{...}}` — one for a
@@ -187,7 +189,15 @@ impl Daemon {
 
     pub(crate) fn changed(&self) {
         self.changes.fetch_add(1, Ordering::SeqCst);
-        let _ = self.notify.send(r#"{"notify":"changed"}"#.to_string());
+        let _ = self.notify.send(CHANGED.to_string());
+    }
+
+    /// Only the plugin's relay status moved (`relay.rs`): the local page
+    /// and the TUI show it, a device doesn't, so `web.subscribe` marks it
+    /// and the plugin wakes no device for it.
+    pub(crate) fn changed_relay(&self) {
+        self.changes.fetch_add(1, Ordering::SeqCst);
+        let _ = self.notify.send(CHANGED_RELAY.to_string());
     }
 
     /// The web plugin's supervisor.
@@ -541,14 +551,14 @@ impl Daemon {
     /// A subscription's push stream, until the client hangs up or the
     /// daemon goes. `events.subscribe` gets every notify line as sent;
     /// `web.subscribe` gets `{"notify":"changed","rev"}`, at most one per
-    /// 100 ms (the changes in between folded into it), and the UI commands
+    /// 100 ms (the changes in between folded into it; `"relay": true` when
+    /// all of them were `changed_relay`), and the UI commands
     /// addressed to web pages (`{"notify":"ui","page","cmd"}`), never
     /// folded or dropped by the folding. A lagged receiver counts as a
     /// change (and may lose a command: `page.pending` has the last one).
     async fn push_loop(&self, mut w: tokio::net::unix::OwnedWriteHalf, kind: Push) -> Result<()> {
         use tokio::sync::broadcast::error::{RecvError, TryRecvError};
         const WEB_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
-        const CHANGED: &str = r#"{"notify":"changed"}"#;
         let mut rx = self.notify.subscribe();
         let tui = matches!(kind, Push::Events { tui: true });
         if tui {
@@ -570,7 +580,7 @@ impl Daemon {
             }
             let mut out = vec![line];
             if let Push::Web = kind {
-                if out[0] != CHANGED {
+                if out[0] != CHANGED && out[0] != CHANGED_RELAY {
                     // A UI command (through at once if it is the web's) or
                     // a relay command.
                     match web_line(&out[0]) {
@@ -586,19 +596,26 @@ impl Daemon {
                     }
                     // Whatever came meanwhile: changes are folded into this
                     // one, the web's UI commands kept (in order, after it).
+                    let mut relay_only = out[0] == CHANGED_RELAY;
                     out = vec![String::new()];
                     loop {
                         match rx.try_recv() {
-                            Ok(l) if l != CHANGED => {
+                            Ok(l) if l == CHANGED_RELAY => {}
+                            Ok(l) if l == CHANGED => relay_only = false,
+                            Ok(l) => {
                                 if let Some(l) = web_line(&l) {
                                     out.push(l);
                                 }
                             }
-                            Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+                            Err(TryRecvError::Lagged(_)) => relay_only = false,
                             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                         }
                     }
-                    out[0] = json!({"notify": "changed", "rev": self.rev()}).to_string();
+                    let mut changed = json!({"notify": "changed", "rev": self.rev()});
+                    if relay_only {
+                        changed["relay"] = json!(true);
+                    }
+                    out[0] = changed.to_string();
                     last_web = Some(std::time::Instant::now());
                 }
             }
@@ -1169,6 +1186,11 @@ impl Daemon {
         Some(r)
     }
 }
+
+/// A change (`Daemon::changed`), and one only of the relay status
+/// (`Daemon::changed_relay`), on the push stream.
+const CHANGED: &str = r#"{"notify":"changed"}"#;
+const CHANGED_RELAY: &str = r#"{"notify":"changed","relay":true}"#;
 
 /// A broadcast line as `web.subscribe` passes it on: a UI command for a
 /// web page (`{"notify":"ui","page","cmd"}`), or a relay command for the

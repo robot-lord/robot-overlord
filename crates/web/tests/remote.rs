@@ -189,10 +189,31 @@ async fn a_signal_wakes_a_device_and_a_snapshot_spans_frames() {
     // Enough sessions that the snapshot is several 16 KiB frames.
     let _w = world(300).await;
     let dev = pair("tablet").await;
-    // Nothing for it yet.
-    let c = dev.connect().await.unwrap();
+    // Nothing for it yet. The pairing moved the daemon's rev (its relay
+    // status lists the device now), and so does this device's own live
+    // session coming and going, but no device sees that: no signal, given
+    // time for the plugin to hear of each.
+    status_until("the device listed", |s| {
+        s["devices"].to_string().contains(&dev.id()) && s["pending"].is_null()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut c = dev.connect().await.unwrap();
     assert_eq!(c.ready.signal, Some(0));
     let boot = c.ready.boot.clone();
+    dev.live(&mut c).await.unwrap();
+    status_until("its link listed", |s| {
+        s["devices"].to_string().contains(r#""linked":true"#)
+    })
+    .await;
+    c.close().await;
+    status_until("its link gone", |s| {
+        !s["devices"].to_string().contains(r#""linked":true"#)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c = dev.connect().await.unwrap();
+    assert_eq!(c.ready.signal, Some(0));
     c.close().await;
     // A change while it has no live session: the host signals it.
     rpc(

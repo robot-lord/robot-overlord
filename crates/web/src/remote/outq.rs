@@ -14,10 +14,19 @@
 //! frame per link in turn, so a device that asks for a lot can't hold up
 //! the others (the relay's flow control and rate limit are per connection
 //! on its side of the host).
+//!
+//! **Pacing.** The relay reads a host at its `ready.limits` rate and burst,
+//! times one plus the host's links, and reads more slowly past that. Taking
+//! turns only works while the backlog is here: written faster than the
+//! relay reads, it moves into the sockets' buffers between us, first in,
+//! first out, where one link's backlog holds up every other link's frames
+//! for as long as those buffers take to drain at the relay's rate (several
+//! seconds on Linux, whose buffers grow to megabytes). So the writer keeps
+//! just under the relay's rate itself.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
@@ -36,6 +45,9 @@ pub const LINK_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 /// The host pings its relay this often (the relay pings too); any message
 /// from the relay, a pong included, says it is still there.
 pub const PING_EVERY: Duration = Duration::from_secs(15);
+/// The share of the relay's rate and burst the writer uses, so the relay's
+/// own bucket never runs dry (it counts time a little differently).
+const PACE: f64 = 0.9;
 
 /// Which queue was full.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +74,11 @@ struct Inner {
     /// No more sending: the writer ends once the control queue (a close
     /// frame, say) is out.
     closed: bool,
+    /// The relay's rate and burst for this connection, per (1 + links)
+    /// (None: it didn't say, so no pacing).
+    limit: Option<(u64, u64)>,
+    /// The links the relay counts for us.
+    link_count: usize,
 }
 
 impl Inner {
@@ -201,8 +218,34 @@ impl OutQ {
         self.wake.notify_one();
     }
 
+    /// The relay's limit for this connection, from its `ready`.
+    pub fn set_limit(&self, bytes_per_sec: Option<u64>, burst_bytes: Option<u64>) {
+        self.lock().limit = match (bytes_per_sec, burst_bytes) {
+            (Some(r), Some(b)) if r > 0 && b > 0 => Some((r, b)),
+            _ => None,
+        };
+    }
+
+    /// How many links this connection carries now (the relay's limit
+    /// scales with them).
+    pub fn set_links(&self, n: usize) {
+        self.lock().link_count = n;
+    }
+
     fn next(&self) -> Option<Message> {
         self.lock().pop()
+    }
+
+    /// Count `n` bytes sent; how long to wait before sending more.
+    fn spent(&self, bucket: &mut Bucket, n: usize) -> Duration {
+        let (limit, links) = {
+            let g = self.lock();
+            (g.limit, g.link_count)
+        };
+        match limit {
+            Some((rate, burst)) => bucket.take(n, rate, burst, 1 + links, Instant::now()),
+            None => Duration::ZERO,
+        }
     }
 
     fn done(&self) -> bool {
@@ -211,16 +254,61 @@ impl OutQ {
     }
 }
 
-/// The writer: sends what is queued, pings every [`PING_EVERY`], and closes
-/// the socket when the queues are shut or the socket fails.
+/// The relay's token bucket for a host, as the writer keeps it (`PACE`
+/// of the rate and burst): it starts full, like the relay's.
+#[derive(Default)]
+struct Bucket {
+    /// Tokens and when they were counted; None before the first send.
+    state: Option<(f64, Instant)>,
+}
+
+impl Bucket {
+    /// Take `n` bytes at `scale` times `rate` and `burst`; how long to
+    /// wait before the next send.
+    fn take(&mut self, n: usize, rate: u64, burst: u64, scale: usize, now: Instant) -> Duration {
+        let scale = scale as f64 * PACE;
+        let (rate, burst) = (rate as f64 * scale, burst as f64 * scale);
+        let tokens = match self.state {
+            Some((t, at)) => (t + now.duration_since(at).as_secs_f64() * rate).min(burst),
+            None => burst,
+        } - n as f64;
+        self.state = Some((tokens, now));
+        if tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-tokens / rate)
+        }
+    }
+}
+
+/// The relay counts these bytes against a host's rate.
+fn counted(m: &Message) -> usize {
+    match m {
+        Message::Text(t) => t.len(),
+        Message::Binary(b) => b.len(),
+        _ => 0,
+    }
+}
+
+/// The writer: sends what is queued, no faster than the relay reads it,
+/// pings every [`PING_EVERY`], and closes the socket when the queues are
+/// shut or the socket fails.
 pub async fn write(q: OutQ, mut sink: SplitSink<Ws, Message>) {
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut bucket = Bucket::default();
     loop {
         if let Some(m) = q.next() {
             let close = matches!(m, Message::Close(_));
+            let n = counted(&m);
             if sink.send(m).await.is_err() || close {
                 break;
+            }
+            // Wait here, not with the next frame popped: whichever link's
+            // turn it is then goes next.
+            let wait = q.spent(&mut bucket, n);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
             }
             continue;
         }
@@ -296,6 +384,36 @@ mod tests {
             q.mailbox(vec![1]).unwrap();
         }
         assert_eq!(q.mailbox(vec![1]), Err(Full::Mailbox));
+    }
+
+    #[test]
+    fn the_writer_keeps_under_the_relays_rate() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut b = Bucket::default();
+        // It starts full: 90% of a burst of 1000 goes at once.
+        assert_eq!(b.take(800, 1000, 1000, 1, t0), Duration::ZERO);
+        // 100 bytes over 900: a wait at 900 bytes a second.
+        let w = b.take(200, 1000, 1000, 1, t0);
+        assert!((w.as_secs_f64() - 100.0 / 900.0).abs() < 1e-9, "{w:?}");
+        // Refilled meanwhile, but never past the burst.
+        assert_eq!(b.take(900, 1000, 1000, 1, at(10_000)), Duration::ZERO);
+        assert!(b.take(1, 1000, 1000, 1, at(10_000)) > Duration::ZERO);
+        // More links: the relay reads faster, and so does the writer.
+        let mut one = Bucket::default();
+        let mut three = Bucket::default();
+        one.take(900, 1000, 1000, 1, t0);
+        three.take(2700, 1000, 1000, 3, t0);
+        assert_eq!(
+            one.take(900, 1000, 1000, 1, t0),
+            three.take(2700, 1000, 1000, 3, t0)
+        );
+        // No limit from the relay: no pacing.
+        let q = OutQ::default();
+        assert_eq!(q.spent(&mut Bucket::default(), 1 << 30), Duration::ZERO);
+        q.set_limit(Some(1000), Some(1000));
+        q.set_links(1);
+        assert!(q.spent(&mut Bucket::default(), 1 << 20) > Duration::from_secs(500));
     }
 
     #[test]

@@ -353,7 +353,7 @@ pub fn remote_state(d: &Daemon, p: &Value) -> Result<Value> {
         );
     }
     if old.as_ref() != Some(&new) {
-        d.changed();
+        d.changed_relay();
     }
     Ok(json!({"ok": true}))
 }

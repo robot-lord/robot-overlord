@@ -110,8 +110,8 @@ async fn serve_on(port: u16) -> Result<ExitCode> {
     tokio::spawn(async move {
         while let Some(e) = sub.next().await {
             match e {
-                daemon::Event::Changed(rev) => {
-                    remote.changed(rev.clone());
+                daemon::Event::Changed { rev, relay } => {
+                    remote.changed(rev.clone(), relay);
                     pump.changed(rev)
                 }
                 daemon::Event::Ui { page, cmd } => pump.ui(&page, cmd).await,

@@ -508,6 +508,53 @@ fn web_subscribe_coalesces_changes_and_carries_the_rev() {
     }
 }
 
+/// The plugin's own relay status moves the rev, marked `relay` so the
+/// plugin wakes no device for it; any other change folded in with it
+/// unmarks it.
+#[test]
+fn web_subscribe_marks_a_relay_status_change() {
+    let r = start();
+    let s = UnixStream::connect(&r.sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut w = s.try_clone().unwrap();
+    writeln!(w, "{}", json!({"id": 1, "method": "web.subscribe"})).unwrap();
+    let mut lines = BufReader::new(s).lines();
+    lines.next().unwrap().unwrap();
+    let mut until_rev = |rev: String| -> Value {
+        loop {
+            let v: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            if v["rev"] == rev.as_str() {
+                return v;
+            }
+        }
+    };
+    let state =
+        |connected: bool| json!({"relay": "https://relay.example.com", "connected": connected});
+    ok(&r.sock, "web.remote_state", state(true));
+    let v = until_rev(r.daemon.rev());
+    assert_eq!(v["relay"], true, "{v}");
+    // The same state again: nothing moved.
+    let rev = r.daemon.rev();
+    ok(&r.sock, "web.remote_state", state(true));
+    assert_eq!(r.daemon.rev(), rev);
+    ok(
+        &r.sock,
+        "session.describe",
+        json!({"ref": "alpha", "description": "d"}),
+    );
+    let v = until_rev(r.daemon.rev());
+    assert!(v.get("relay").is_none(), "{v}");
+    // Both, folded or not: the last notice isn't marked.
+    ok(&r.sock, "web.remote_state", state(false));
+    ok(
+        &r.sock,
+        "session.describe",
+        json!({"ref": "alpha", "description": "e"}),
+    );
+    let v = until_rev(r.daemon.rev());
+    assert!(v.get("relay").is_none(), "{v}");
+}
+
 #[test]
 fn pane_target_finds_the_pane_and_starts_nothing() {
     let r = start();

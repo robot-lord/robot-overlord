@@ -1074,7 +1074,32 @@ Decided 2026-11-17 (user):
     flooding device never breaks another's session, an answer refused by
     a full queue is sent again; relay tests for per-link stalls, a
     non-reading device closed alone, `drop` 4205, `queued`/`refused`.
+- Linux CI fixes on #77 (2026-11-18). Two `web/tests/remote.rs` failures
+  on ubuntu runners, both real:
+  - A flooding device held another's snapshot up 12 s (2 s on macOS).
+    The relay reads a host at its rate times (1 + links); the host wrote
+    as fast as the socket took it, so the backlog moved out of the
+    per-link queues into the kernel's socket buffers (megabytes on Linux
+    loopback), first in, first out, and turn-taking no longer applied.
+    The writer now paces itself at 90% of the relay's rate and burst
+    (`ready.limits` gains `burst_bytes`). Reproduced and checked in a
+    Linux container: 12.9 s before, 1.2 s after.
+  - Pairing signalled the new device: the mirror's change (`web.remote_state`)
+    moved `rev`, and the host signals every device without a live session
+    on any move, so a pairing, or a device's own live session ending,
+    woke it (and used up its 30 s signal window). The daemon now marks a
+    relay-status-only change (`changed_relay`, `"relay": true` on
+    `web.subscribe`) and the host signals no one for it.
+  - `advisories`: `proc-macro-error2` (RUSTSEC-2026-0173, unmaintained)
+    comes with `libcrux-ml-kem` through `hax-lib-macros` 0.3.7; no newer
+    `core-models` moves off it. Ignored in `deny.toml` with a reason.
 - Owed after slice 3:
+  - **Signals miss a change soon after an ack.** The host signals a
+    device at most once per 30 s and drops a change inside that window,
+    so a device that fetched and acked, then misses a change within 30 s
+    of the last signal, isn't told until a later change. Needs a trailing
+    signal (send one when the window ends if a change was dropped); the
+    user's call whether it lands before the phone slice.
   - **The phone slice must** (the device side of the rule above;
     `e2e-protocol.md` §4): reconnect in a loop with backoff, at once on
     4205 (backing off if it repeats), on a network change and on coming

@@ -65,6 +65,7 @@ impl Limits {
         rlord_relay_proto::msg::Limits {
             devices: Some(self.devices_per_host as u32),
             bytes_per_sec: Some(self.bytes_per_sec),
+            burst_bytes: Some(self.burst_bytes),
             live_panes: None,
         }
     }

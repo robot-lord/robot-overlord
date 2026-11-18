@@ -88,8 +88,12 @@ pub enum Input {
         id: String,
         req: Value,
     },
-    /// The daemon's state moved.
-    Changed(String),
+    /// The daemon's state moved (`relay`: only its relay status, which
+    /// no device sees).
+    Changed {
+        rev: String,
+        relay: bool,
+    },
     /// A connect attempt finished.
     Connected {
         attempt: u64,
@@ -131,8 +135,8 @@ impl Handle {
         let _ = self.tx.send(Input::Command { id, req });
     }
 
-    pub fn changed(&self, rev: String) {
-        let _ = self.tx.send(Input::Changed(rev));
+    pub fn changed(&self, rev: String, relay: bool) {
+        let _ = self.tx.send(Input::Changed { rev, relay });
     }
 }
 
@@ -265,6 +269,10 @@ impl Actor {
         self.report();
         while let Some(input) = rx.recv().await {
             self.handle(input);
+            // The relay's limit for us scales with our links.
+            if let Some(q) = self.queue() {
+                q.set_links(self.links.len());
+            }
             self.report();
         }
     }
@@ -280,9 +288,15 @@ impl Actor {
                     }
                 });
             }
-            Input::Changed(rev) => {
+            Input::Changed { rev, relay } => {
                 self.rev = rev;
-                self.changed();
+                // Our own report (a pairing, a device's link coming or
+                // going) moves the rev too, but nothing a device sees:
+                // waking a device for it, even the one that just left,
+                // would only use up its signal.
+                if !relay {
+                    self.changed();
+                }
             }
             Input::Connected { attempt, result } => self.connected(attempt, *result),
             Input::Enroll(p) => {
@@ -468,6 +482,10 @@ impl Actor {
         self.backoff = Duration::from_secs(1);
         let (sink, mut stream) = ws.split();
         let q = OutQ::default();
+        if let Some(l) = &ready.limits {
+            q.set_limit(l.bytes_per_sec, l.burst_bytes);
+        }
+        q.set_links(self.links.len());
         tokio::spawn(outq::write(q.clone(), sink));
         let tx = self.tx.clone();
         tokio::spawn(async move {

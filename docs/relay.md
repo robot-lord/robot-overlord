@@ -184,7 +184,13 @@ up its host's other devices; flow control is per link:
 - **Rate.** A host's rate and burst are its account's per-connection
   limit times (1 + the number of devices linked to it), since it carries
   all their traffic. Sharing that fairly between its devices is the
-  host's job (`rlord-web` takes turns between per-link queues).
+  host's job: `rlord-web` takes turns between per-link queues, and keeps
+  just under the rate and burst `ready.limits` gives it
+  (`bytes_per_sec`, `burst_bytes`), so its backlog stays in those queues.
+  Written faster, the backlog would sit in the sockets' buffers, first
+  in, first out, and one device's would hold up the others' frames for
+  as long as those take to drain at the relay's rate (seconds, with
+  Linux's megabyte buffers).
 
 A host's `drop` closes the device with 4205 too. Before closing for load,
 a limit or idleness the relay tells the client how long to wait (`bye`).

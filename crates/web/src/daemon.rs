@@ -130,8 +130,9 @@ fn remote_reply_params(id: &str, answer: Result<Value, String>) -> Value {
 /// What the daemon's push stream says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Something changed; the state's new rev.
-    Changed(String),
+    /// Something changed; the state's new rev. `relay`: only the relay
+    /// status (the page shows it, a device doesn't).
+    Changed { rev: String, relay: bool },
     /// A UI command for one page (`crates/daemon/src/ui.rs`).
     Ui { page: String, cmd: Value },
     /// The user's relay command (`crates/daemon/src/relay.rs`): answer it
@@ -165,7 +166,10 @@ impl Subscription {
 fn event(line: &str) -> Option<Event> {
     let v: Value = serde_json::from_str(line).ok()?;
     match v["notify"].as_str()? {
-        "changed" => Some(Event::Changed(v["rev"].as_str().unwrap_or("").to_string())),
+        "changed" => Some(Event::Changed {
+            rev: v["rev"].as_str().unwrap_or("").to_string(),
+            relay: v["relay"] == true,
+        }),
         "ui" => Some(Event::Ui {
             page: v["page"].as_str()?.to_string(),
             cmd: v.get("cmd")?.clone(),
@@ -210,7 +214,17 @@ mod tests {
     fn stream_lines_are_events() {
         assert_eq!(
             event(r#"{"notify":"changed","rev":"b-3"}"#),
-            Some(Event::Changed("b-3".into()))
+            Some(Event::Changed {
+                rev: "b-3".into(),
+                relay: false
+            })
+        );
+        assert_eq!(
+            event(r#"{"notify":"changed","rev":"b-4","relay":true}"#),
+            Some(Event::Changed {
+                rev: "b-4".into(),
+                relay: true
+            })
         );
         assert_eq!(
             event(r#"{"notify":"ui","page":"p1-ab","cmd":{"cmd":"show_list"}}"#),

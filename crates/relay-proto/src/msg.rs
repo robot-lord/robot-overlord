@@ -185,6 +185,9 @@ pub struct Limits {
     pub devices: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_per_sec: Option<u64>,
+    /// ... and in one burst (a host's both times one plus its links).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_panes: Option<u32>,
 }

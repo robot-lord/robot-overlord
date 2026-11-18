@@ -170,9 +170,11 @@ frame parses without knowing its lane in advance.)
   each device's buffer holds 128 frames (a whole 1 MiB control message
   fits), and a device that lets it fill is closed (4205) and the host told
   `undeliverable {link}`. A host's read rate and burst are its
-  per-connection limit times (1 + its linked devices); sharing them fairly
+  per-connection limit times (1 + its linked devices), both in
+  `ready.limits` (`bytes_per_sec`, `burst_bytes`); sharing them fairly
   between links is the host's job (its writer takes turns between
-  per-link queues).
+  per-link queues, and keeps under that rate so its backlog stays in
+  them rather than in the sockets' buffers).
 - **Mailbox queues** (in memory only; never on disk): per device and
   direction, at most 32 messages, 128 KiB and 600 s each
   (`mailbox_ttl = 0` turns queues off: `refused` `no_queue`). A full queue
@@ -295,7 +297,9 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    that decrypts the host saves the mailbox (replacing any older one).
    A device keys a mailbox when it has none.
 5. While a device has no live session and the daemon's `rev` moves, the
-   host sends the relay `signal` for it, at most once per 30 s.
+   host sends the relay `signal` for it, at most once per 30 s. A move of
+   the relay status alone (the mirror below: a pairing, a device's link
+   coming or going) signals no one: no device sees it.
 
 ### Requests by mailbox
 
@@ -416,8 +420,9 @@ The daemon holds no keys and does no crypto.
   connected, error, devices: [{id, name, paired_at, last_seen, linked}],
   pairing: {expires} | null, pending: {name, code, expires} | null}` on
   every change. The daemon keeps it, answers `relay.status` and
-  `relay.devices` from it, calls `changed()`, and sends a notice to every
-  surface when a new `pending` appears.
+  `relay.devices` from it, calls `changed_relay()` (moves `rev`; the
+  `web.subscribe` line says `"relay": true` when nothing else changed),
+  and sends a notice to every surface when a new `pending` appears.
 - **Local page ops** (`remote: false`): `device.list`, `device.pair`,
   `device.pair_cancel`, `device.confirm`, `device.reject`,
   `device.revoke`, answered by the same path.
