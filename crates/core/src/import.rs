@@ -139,15 +139,18 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
 /// Whether any Claude Code conversation exists that `scan_claude` would
 /// list with the same `since_ms` and `tracked`: for the first-run offer.
 /// The same checks (`is_conversation_file`, mtime, `candidate`), but
-/// bounded: at most `MAX_DIRS` project dirs and `MAX_READS` transcripts
-/// read, stopping at the first.
+/// bounded: the newest `MAX_DIRS` project dirs (rlord's own and temp ones
+/// skipped by name before any read), at most `MAX_READS` transcripts read,
+/// stopping at the first. If the budget runs out on rejects, it answers
+/// true: in-window untracked transcripts exist, and the overlord's scan
+/// gives the exact answer.
 pub fn has_claude_conversations(since_ms: i64, tracked: &dyn Fn(&str) -> bool) -> bool {
     let projects = claude::config_dir().join("projects");
     has_claude_conversations_in(&projects, since_ms, tracked, &excluded_dirs())
 }
 
 const MAX_DIRS: usize = 500;
-const MAX_READS: usize = 20;
+const MAX_READS: usize = 50;
 
 /// `has_claude_conversations` over an explicit projects dir (tests).
 pub fn has_claude_conversations_in(
@@ -159,12 +162,29 @@ pub fn has_claude_conversations_in(
     let Ok(dirs) = std::fs::read_dir(projects) else {
         return false;
     };
+    // Skipped by name: the slug of a folder under an excluded one starts
+    // with its slug (lossy, so `candidate` still checks the real cwd).
+    let excluded_slugs: Vec<String> = excluded
+        .iter()
+        .map(|e| claude::project_slug(&e.to_string_lossy()))
+        .collect();
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut dirs: Vec<(Option<SystemTime>, PathBuf, String)> = dirs
+        .flatten()
+        .filter(|d| d.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|d| (d.path(), d.file_name().to_string_lossy().into_owned()))
+        .filter(|(_, slug)| {
+            !slug.ends_with("-robot-overlord-overlord")
+                && !excluded_slugs.iter().any(|e| slug.starts_with(e.as_str()))
+        })
+        .map(|(p, slug)| (mtime(&p), p, slug))
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
     let mut reads = 0;
-    for dir in dirs.flatten().take(MAX_DIRS) {
-        let Ok(files) = std::fs::read_dir(dir.path()) else {
+    for (_, dir, slug) in dirs.into_iter().take(MAX_DIRS) {
+        let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let slug = dir.file_name().to_string_lossy().into_owned();
         for f in files.flatten() {
             let path = f.path();
             let Some(id) = is_conversation_file(&path) else {
@@ -177,8 +197,10 @@ pub fn has_claude_conversations_in(
             if mtime.is_some_and(|m| m < since_ms) {
                 continue;
             }
+            // Budget spent on rejects: in-window untracked transcripts
+            // exist, so offer; the overlord's scan has the exact answer.
             if reads >= MAX_READS {
-                return false;
+                return true;
             }
             reads += 1;
             // (No process list: whether it's open elsewhere doesn't matter.)

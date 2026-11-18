@@ -295,6 +295,8 @@ struct App {
     import_offer_ready: bool,
     /// A `y` on its way to the overlord (`poll_import_offer`).
     import_send: Option<mpsc::Receiver<Result<(), String>>>,
+    /// `setup.import_offer` on its way (None inside: not reached).
+    import_offer_rx: Option<mpsc::Receiver<Option<Value>>>,
     /// Why the last `y` wasn't sent, shown when the offer reopens.
     import_offer_error: Option<String>,
     /// The first-run overlay waits for the offer to close.
@@ -405,6 +407,7 @@ impl App {
             import_offer_checked: false,
             import_offer_ready: false,
             import_send: None,
+            import_offer_rx: None,
             import_offer_error: None,
             import_then_overlord: false,
             startup_chain: false,

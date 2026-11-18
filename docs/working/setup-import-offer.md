@@ -10,12 +10,13 @@ until now only the overlord offered when asked.
 1. When the code-folder form closes (first run or `:setup`; saved or Ctrl-D;
    not Esc; a description sent to the overlord closes nothing yet: the
    offer follows when the form it reopens is closed), or at startup when
-   setup is already answered, the TUI calls `setup.import_offer`.
+   setup is already answered, the TUI calls `setup.import_offer` off the UI thread (errors: no offer, asked again at the next trigger).
 2. The daemon offers only while kv `setup_import_offer` is unset, an
    overlord exists, there are no sessions besides overlords (archived ones
    count), and `import::has_claude_conversations` finds one the overlord's
    scan would list in its first 30 days (same file, mtime, cwd and
-   exclusion checks; at most 500 dirs and 20 transcripts read, stops at
+   exclusion checks; newest 500 dirs, rlord's own and temp ones skipped by name;
+   at most 50 transcripts read, true if that budget runs out on rejects; stops at
    the first). Only Claude Code can be imported so far.
 3. The dialog explains import: `y` import my sessions, `d` don't ask
    again, Esc later. Keys in its first 800ms are dropped; quitting and

@@ -29,10 +29,14 @@ impl App {
         if cfg!(test) {
             return;
         }
-        // Cheap: one kv row and the session list.
-        self.import_offer_ready = self
-            .call("setup.import_offer", Value::Null)
-            .is_some_and(|v| v["offer"] == true);
+        // Off this thread: it may read a few transcripts. Errors are
+        // silent (no offer); `poll_import_offer` takes the answer.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ =
+                tx.send(client_call(&paths::socket_path(), "setup.import_offer", Value::Null).ok());
+        });
+        self.import_offer_rx = Some(rx);
     }
 
     /// Open a pending offer once nothing else is open, and say how a
@@ -40,9 +44,24 @@ impl App {
     /// overlord can take a while). True when the screen changed.
     pub(crate) fn poll_import_offer(&mut self) -> bool {
         let mut changed = false;
+        if let Some(rx) = &self.import_offer_rx {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                r => {
+                    self.import_offer_rx = None;
+                    match r.ok().flatten() {
+                        Some(v) => self.import_offer_ready = v["offer"] == true,
+                        // Not reached: not checked, so the next trigger asks.
+                        None => self.import_offer_checked = false,
+                    }
+                }
+            }
+        }
         // The offer left the screen some way other than its own keys (a
-        // pushed form, say): the overlay it held back opens now.
+        // pushed form, say), or turned out not to apply: the overlay it
+        // held back opens now.
         if self.import_then_overlord
+            && self.import_offer_rx.is_none()
             && !self.import_offer_ready
             && !matches!(self.mode, Mode::ImportOffer(_) | Mode::ConfirmQuit)
         {
@@ -150,7 +169,7 @@ impl App {
     /// Show the overlay unless the import offer is about to open: then
     /// it opens once the offer closes (`overlay_after_offer`), not under it.
     pub(crate) fn show_overlord_after_offer(&mut self) {
-        if self.import_offer_ready {
+        if self.import_offer_ready || self.import_offer_rx.is_some() {
             self.import_then_overlord = true;
         } else {
             self.show_overlord();

@@ -3,7 +3,10 @@
 //! and offers it once. `yes` hands the overlord a fixed request that starts
 //! its import flow (`overlord.md` "Importing existing work": it checks
 //! which agents have conversations, proposes a list, the user approves).
-//! Plain code: one kv row and one session list; no scan, no AI.
+//! Plain code, no AI: a kv row, the session list and, only once those
+//! pass, a bounded existence check of Claude Code's transcripts
+//! (`import::has_claude_conversations`: the scan's own checks, stopping
+//! at the first match).
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -27,19 +30,20 @@ pub(crate) const REQUEST: &str = "[rlord import request] I'm new to rlord. \
 /// there are Claude Code conversations to import (the only agent rlord can
 /// import so far).
 pub(crate) fn offer(d: &Daemon) -> Result<Value> {
-    let tracked = d.db().agent_session_ids()?;
-    // The window the overlord's flow scans first (`scan_agent_sessions`'s
-    // default).
-    let since = now_ms() - SINCE_DAYS * 24 * 3_600_000;
     offer_with(d, &|| {
-        has_claude_conversations(since, &|id| tracked.contains(id))
+        // Only once the cheap gate passed.
+        let tracked = d.db().agent_session_ids()?;
+        // The window the overlord's flow scans first (`scan_agent_sessions`'s
+        // default).
+        let since = now_ms() - SINCE_DAYS * 24 * 3_600_000;
+        Ok(has_claude_conversations(since, &|id| tracked.contains(id)))
     })
 }
 
 /// Matches the 30 days `overlord.md` starts the import with.
 const SINCE_DAYS: i64 = 30;
 
-fn offer_with(d: &Daemon, has_conversations: &dyn Fn() -> bool) -> Result<Value> {
+fn offer_with(d: &Daemon, has_conversations: &dyn Fn() -> Result<bool>) -> Result<Value> {
     let initial = {
         let db = d.db();
         // (No overlord, nobody to send it to: asked once there is one.)
@@ -51,7 +55,7 @@ fn offer_with(d: &Daemon, has_conversations: &dyn Fn() -> bool) -> Result<Value>
                 .any(|s| !overlord::is_overlord_role(&s.role))
     };
     // The file check runs without the DB lock.
-    Ok(json!({"offer": initial && has_conversations()}))
+    Ok(json!({"offer": initial && has_conversations()?}))
 }
 
 /// `setup.import_answer`: `{"answer": "yes"|"no"}`. Recorded either way,
@@ -84,14 +88,14 @@ mod tests {
     fn offered_until_answered() {
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         // No overlord yet: not offered.
-        assert_eq!(offer_with(&d, &|| true).unwrap()["offer"], false);
+        assert_eq!(offer_with(&d, &|| Ok(true)).unwrap()["offer"], false);
         // (Nothing to send to: a yes isn't recorded.)
         assert!(answer(&d, &json!({"answer": "yes"})).is_err());
         assert!(d.db().kv_get(KV).unwrap().is_none());
         assert!(answer(&d, &json!({"answer": "maybe"})).is_err());
         // (`no` sends nothing: no overlord, no model call.)
         answer(&d, &json!({"answer": "no"})).unwrap();
-        assert_eq!(offer_with(&d, &|| true).unwrap()["offer"], false);
+        assert_eq!(offer_with(&d, &|| Ok(true)).unwrap()["offer"], false);
         assert!(d.db().kv_get(KV).unwrap().unwrap().starts_with("no:"));
     }
 
@@ -117,15 +121,15 @@ mod tests {
     fn offered_with_only_an_overlord() {
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         row(&d.db(), "o1", overlord::ROLE);
-        assert_eq!(offer_with(&d, &|| true).unwrap()["offer"], true);
+        assert_eq!(offer_with(&d, &|| Ok(true)).unwrap()["offer"], true);
         // Nothing to import: not offered.
-        assert_eq!(offer_with(&d, &|| false).unwrap()["offer"], false);
+        assert_eq!(offer_with(&d, &|| Ok(false)).unwrap()["offer"], false);
         // Already answered yes: a second yes sends nothing (no tmux here).
         d.db().kv_set(KV, "yes:1").unwrap();
         answer(&d, &json!({"answer": "yes"})).unwrap();
         d.db().kv_delete(KV).unwrap();
         row(&d.db(), "s1", "");
-        assert_eq!(offer_with(&d, &|| true).unwrap()["offer"], false);
+        assert_eq!(offer_with(&d, &|| Ok(true)).unwrap()["offer"], false);
     }
 
     #[test]
