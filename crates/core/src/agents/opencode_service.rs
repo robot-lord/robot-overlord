@@ -110,7 +110,19 @@ impl Service {
         accept: &str,
         read_timeout: Duration,
     ) -> Result<(u16, Body<BufReader<TcpStream>>)> {
-        let mut stream = self.connect(read_timeout)?;
+        let stream = self.connect(read_timeout)?;
+        self.send_over(stream, method, path, body, accept)
+    }
+
+    /// `send` on a connection already made.
+    fn send_over(
+        &self,
+        mut stream: TcpStream,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        accept: &str,
+    ) -> Result<(u16, Body<BufReader<TcpStream>>)> {
         let auth = base64(format!("opencode:{}", self.password).as_bytes());
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {auth}\r\n\
@@ -315,18 +327,26 @@ impl Service {
     /// Send session `id` a message as the user's (`POST
     /// /api/session/{id}/prompt`, body `{text}`): OpenCode admits it and
     /// runs a turn on it. A new session's first prompt goes this way, off
-    /// the TUI's command line.
-    pub fn prompt(&self, id: &str, text: &str) -> Result<()> {
+    /// the TUI's command line. Says whether it surely went, surely didn't
+    /// (no connection, or an error status), or can't be told (the request
+    /// went out, the answer didn't come back): a message that may have
+    /// been admitted must not be sent again another way.
+    pub fn prompt(&self, id: &str, text: &str) -> Posted {
         if !is_session_id(id) {
-            bail!("not an OpenCode session id");
+            return Posted::Refused("not an OpenCode session id".into());
         }
-        self.json(
-            "POST",
-            &format!("/api/session/{id}/prompt"),
-            Some(&serde_json::json!({ "text": text })),
-            Duration::from_secs(10),
-        )
-        .map(|_| ())
+        let limit = Duration::from_secs(10);
+        let stream = match self.connect(limit) {
+            Ok(s) => s,
+            Err(e) => return Posted::Refused(format!("{e:#}")),
+        };
+        let body = serde_json::json!({ "text": text });
+        let path = format!("/api/session/{id}/prompt");
+        match self.send_over(stream, "POST", &path, Some(&body), "application/json") {
+            Ok((status, _)) if (200..300).contains(&status) => Posted::Sent,
+            Ok((status, _)) => Posted::Refused(format!("POST {path}: {status}")),
+            Err(e) => Posted::Unknown(format!("{e:#}")),
+        }
     }
 
     /// Text generated from session `id`'s context without adding to its
@@ -347,6 +367,16 @@ impl Service {
             .map(str::to_string)
             .context("no text in OpenCode's answer")
     }
+}
+
+/// How a `Service::prompt` went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Posted {
+    Sent,
+    /// Surely not admitted (why).
+    Refused(String),
+    /// Sent, but no answer: it may have been admitted (why).
+    Unknown(String),
 }
 
 /// `GET /api/model`'s answer as `provider/model` names, in its order.
@@ -1064,16 +1094,19 @@ mod tests {
         let (svc, asked) = serve(vec![
             ok(r#"{"data":{"id":"msg_1"}}"#),
             "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into(),
+            // Read, then closed with no answer: it may have been admitted.
+            String::new(),
         ]);
-        svc.prompt("ses_1a", "fix \"it\"").unwrap();
+        assert_eq!(svc.prompt("ses_1a", "fix \"it\""), Posted::Sent);
         let req = asked.recv().unwrap();
         assert!(
             req.starts_with("POST /api/session/ses_1a/prompt HTTP/1.1\r\n"),
             "{req}"
         );
         assert!(req.ends_with(r#"{"text":"fix \"it\""}"#), "{req}");
-        assert!(svc.prompt("ses_1a", "x").is_err());
-        assert!(svc.prompt("ses_1a/../x", "x").is_err());
+        assert!(matches!(svc.prompt("ses_1a", "x"), Posted::Refused(_)));
+        assert!(matches!(svc.prompt("ses_1a", "y"), Posted::Unknown(_)));
+        assert!(matches!(svc.prompt("ses_1a/../x", "x"), Posted::Refused(_)));
     }
 
     #[test]

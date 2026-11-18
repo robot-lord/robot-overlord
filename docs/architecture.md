@@ -256,13 +256,20 @@ facts live in its module) is what the rest of rlord asks:
   `<data>/sessions/<id>/prompt.md` (0600), so they never show in `ps`,
   the pane command, `launched_args` or the `launched` event, and aren't
   bound by the argument limit. Codex gets a fixed line naming the file as
-  its prompt (`first_prompt::pointer_line`; that line is what its
-  conversation is bound by). OpenCode's is POSTed to its server
-  (`POST /api/session/<id>/prompt`, `{text}`) once the session exists and
-  its model is settled (kv `first_prompt:<id>`,
-  `opencode::apply_first_prompt`); after 30s, or a failed POST, it is
-  queued and typed in at the first idle turn (`send::queue`), and the log
-  has a `first_prompt` event either way. Claude reads the file on stdin
+  its prompt (`first_prompt::pointer_line`, starting `[rlord session
+  <id>]` so a clipped first message still tells sessions apart; that line
+  is what its conversation is bound by). Anything that shows a
+  conversation's task (triage, summaries, `session_brief`) reads the
+  launch spec's words in its place (`first_prompt::task`). OpenCode's is
+  POSTed to its server (`POST /api/session/<id>/prompt`, `{text}`) once
+  the session exists and its model is settled (kv `first_prompt:<id>`,
+  carried over a restart, `opencode::apply_first_prompt`). Refused (no
+  connection, an error status) or not there after 30s: it is typed in at
+  the first idle turn from its own slot (`send::queue_first`, before and
+  apart from the overlord's queued messages). Sent with no answer back:
+  logged as unknown, never typed again (it may have run). A session that
+  stops first: logged as not sent. The file is removed in every case,
+  and the log has a `first_prompt` event. Claude reads the file on stdin
   (`exec … < prompt.md`) once live check V1 passes
   (`first_prompt::CLAUDE_STDIN`); until then its prompt stays on argv.
   Fixed text with no user words (`context::pointer_only`) stays on argv.

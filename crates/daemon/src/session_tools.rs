@@ -479,13 +479,7 @@ fn status_of(s: &Session) -> String {
 fn first_prompt(d: &Daemon, s: &Session) -> Option<String> {
     let stored = {
         let db = d.db();
-        let words = db
-            .launch_spec(&s.id)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|v| v["prompt"].as_str().map(str::to_string))
-            .filter(|p| !p.trim().is_empty());
-        words.or_else(|| {
+        crate::first_prompt::launch_words(&db, &s.id).or_else(|| {
             db.kv_get(&crate::methods::bind_prompt_key(&s.id))
                 .ok()
                 .flatten()

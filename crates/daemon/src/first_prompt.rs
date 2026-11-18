@@ -61,14 +61,40 @@ pub fn file_path(base: &Path, id: &str) -> PathBuf {
     crate::context::session_dir(base, id).join("prompt.md")
 }
 
-/// The line Codex is started with instead of the prompt. Fixed text: only
-/// the path varies.
-pub fn pointer_line(file: &Path) -> String {
+/// How every `pointer_line` starts.
+const POINTER_HEAD: &str = "[rlord session ";
+
+/// The line Codex is started with instead of the prompt (session `id`).
+/// Fixed text: only the id and path vary. The id comes first: Codex's
+/// thread index may keep only the start of a first message, and binding
+/// matches by it (`discover`), so the start must tell sessions apart.
+pub fn pointer_line(id: &str, file: &Path) -> String {
     format!(
-        "[rlord] The user's first message for this session is in {}. Read that file and \
-         treat its contents as the user's message to you.",
+        "{POINTER_HEAD}{id}] The user's first message for this session is in {}. Read that \
+         file and treat its contents as the user's message to you.",
         file.display()
     )
+}
+
+/// The user's words a session was launched with (its launch spec).
+pub fn launch_words(db: &Db, id: &str) -> Option<String> {
+    let raw = db.launch_spec(id).ok()?;
+    let spec: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    spec["prompt"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|p| !p.trim().is_empty())
+}
+
+/// A conversation's task as a transcript shows it: its first prompt, or,
+/// where there is none or it is only the pointer line (Codex), the
+/// launch's own words.
+pub fn task(transcript_first: Option<String>, words: Option<String>) -> Option<String> {
+    match transcript_first {
+        Some(t) if t.trim_start().starts_with(POINTER_HEAD) => words,
+        None => words,
+        t => t,
+    }
 }
 
 /// Where a start's first prompt went.
@@ -116,7 +142,7 @@ pub fn place(base: &Path, id: &str, agent: Agent, typed: Option<&str>, words: bo
             ..Placed::default()
         },
         Way::Pointer => Placed {
-            argv: Some(pointer_line(&file)),
+            argv: Some(pointer_line(id, &file)),
             ..Placed::default()
         },
     }
@@ -145,6 +171,23 @@ pub fn hold(db: &Db, id: &str, file: Option<&Path>, at: i64) -> Result<()> {
         ),
         None => db.kv_delete(&pending_key(id)),
     }
+}
+
+/// Give a held first prompt (if any) a fresh clock: a restart carries it
+/// over rather than dropping it.
+pub fn restamp(db: &Db, id: &str, at: i64) -> Result<()> {
+    let Some(raw) = db.kv_get(&pending_key(id))? else {
+        return Ok(());
+    };
+    let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    held["at"] = json!(at);
+    db.kv_set(&pending_key(id), &held.to_string())
+}
+
+/// Remove what a start that failed left: its prompt file and held POST.
+pub fn forget(db: &Db, base: &Path, id: &str) {
+    let _ = db.kv_delete(&pending_key(id));
+    let _ = std::fs::remove_file(file_path(base, id));
 }
 
 /// The pane command with `file` on the agent's stdin (`exec … < file`).
@@ -220,6 +263,23 @@ mod tests {
         std::fs::write(b.path().join("sessions"), "").unwrap();
         let p = place(b.path(), "01a", Agent::Codex, Some("go"), true);
         assert_eq!(p.argv.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn the_pointer_starts_with_its_session_and_hides_the_task_from_no_one() {
+        let b = base();
+        let p = place(b.path(), "01abc", Agent::Codex, Some("do x"), true);
+        let line = p.argv.unwrap();
+        assert!(line.starts_with("[rlord session 01abc] "), "{line}");
+        assert_eq!(
+            task(Some(line), Some("do x".into())).as_deref(),
+            Some("do x")
+        );
+        assert_eq!(
+            task(Some("own".into()), Some("x".into())).as_deref(),
+            Some("own")
+        );
+        assert_eq!(task(None, Some("x".into())).as_deref(), Some("x"));
     }
 
     #[test]

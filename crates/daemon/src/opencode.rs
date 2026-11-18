@@ -38,7 +38,7 @@
 //! TUI's command line), POSTed once the session exists and its model is
 //! settled (`apply_first_prompt`). When that can't be done within
 //! `FIRST_PROMPT_WAIT_MS`, or the POST fails, the prompt is queued to be
-//! typed in at the session's first idle turn (`send::queue`), never lost.
+//! typed in at the session's first idle turn (`send::queue_first`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -48,7 +48,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use rlord_core::agents::opencode::{self, Turn};
-use rlord_core::agents::opencode_service::{map_event, Events, Service, Signal, EVENT_TYPES};
+use rlord_core::agents::opencode_service::{
+    map_event, Events, Posted, Service, Signal, EVENT_TYPES,
+};
 use rlord_core::agents::Agent;
 use rlord_core::db::Db;
 use rlord_core::types::{now_ms, PromptMark, Session, Status};
@@ -132,6 +134,7 @@ fn live(d: &Daemon) -> Result<Vec<Session>> {
 /// One tick: about `TICK` long, most of it waiting (for events, or asleep).
 fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     let live = live(d)?;
+    settle_stopped_first_prompts(d, &live)?;
     f.gone.retain(|id, _| live.iter().any(|s| &s.id == id));
     f.blocked.retain(|id, _| live.iter().any(|s| &s.id == id));
     if live.is_empty() {
@@ -705,8 +708,9 @@ const FIRST_PROMPT_WAIT_MS: i64 = 30_000;
 /// POSTed when OpenCode has the session and its model is settled (no
 /// `Deferred` left, or that has run out of time). A POST that fails, or a
 /// session not there within `FIRST_PROMPT_WAIT_MS`: the prompt is queued
-/// for the session's first idle turn (`send::queue`). Either way the file
-/// goes and the log says how it went.
+/// for the session's first idle turn (`send::queue_first`). A POST whose
+/// answer never came may have been admitted: logged, never typed again.
+/// Either way the file goes and the log says how it went.
 fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> Result<bool> {
     let waiting: Vec<(&Session, String)> = {
         let db = d.db();
@@ -748,9 +752,11 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
             FirstStep::Wait => continue,
             FirstStep::Lost => json!({"sent": false, "why": "its file was gone or empty"}),
             FirstStep::Post => match svc.map(|svc| svc.prompt(id, &text)) {
-                Some(Ok(())) => json!({"sent": true, "via": "server"}),
-                Some(Err(e)) => json!({"sent": false, "queued": true,
-                                       "why": format!("{e:#}")}),
+                Some(Posted::Sent) => json!({"sent": true, "via": "server"}),
+                Some(Posted::Refused(why)) => json!({"sent": false, "queued": true, "why": why}),
+                // It may have been admitted: never typed in again.
+                Some(Posted::Unknown(why)) => json!({"sent": "unknown", "via": "server",
+                    "why": format!("no answer from OpenCode, it may have run: {why}")}),
                 None => continue,
             },
             FirstStep::Queue => json!({"sent": false, "queued": true, "why": match svc {
@@ -761,7 +767,7 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         let db = d.db();
         db.kv_delete(&crate::first_prompt::pending_key(&s.id))?;
         if outcome["queued"] == true {
-            crate::send::queue(&db, &s.id, &text)?;
+            crate::send::queue_first(&db, &s.id, &text)?;
         }
         db.insert_event(&s.id, now_ms(), "first_prompt", &outcome.to_string())?;
         drop(db);
@@ -776,6 +782,37 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         changed = true;
     }
     Ok(changed)
+}
+
+/// First prompts held for sessions no longer live (stopped, archived or
+/// gone before the POST): each is settled, its file removed and, for a
+/// session still there, the log says it wasn't sent.
+fn settle_stopped_first_prompts(d: &Daemon, live: &[Session]) -> Result<()> {
+    let prefix = crate::first_prompt::pending_key("");
+    let held = d.db().kv_prefix(&prefix)?;
+    for (key, raw) in held {
+        let id = key.trim_start_matches(&prefix);
+        if live.iter().any(|s| s.id == id) {
+            continue;
+        }
+        let db = d.db();
+        db.kv_delete(&key)?;
+        if db.resolve_ref(id).is_ok() {
+            db.insert_event(
+                id,
+                now_ms(),
+                "first_prompt",
+                &json!({"sent": false, "why": "the session stopped before it could be sent"})
+                    .to_string(),
+            )?;
+        }
+        drop(db);
+        let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if let Some(f) = held["file"].as_str().filter(|f| !f.is_empty()) {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+    Ok(())
 }
 
 /// What to do about a launch's first prompt.

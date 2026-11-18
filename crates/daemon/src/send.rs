@@ -53,6 +53,12 @@ use crate::Daemon;
 /// kv key: pending messages, `{session id: {"text", "at"}}`.
 pub const PENDING_KEY: &str = "send_pending";
 
+/// kv key: first prompts that couldn't go another way (an OpenCode launch
+/// whose server POST surely failed), `{session id: {"text", "at"}}`. Their
+/// own slot: delivered before, and never replaced by, the overlord's
+/// messages.
+pub const FIRST_KEY: &str = "send_pending_first";
+
 /// How often pending messages are looked at.
 const TICK: Duration = Duration::from_secs(2);
 
@@ -327,6 +333,11 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         let why = format!("{} is {} (mid-turn)", s.name, s.status.label());
         return not_now(d, &s, text, when_idle, &why);
     }
+    // Its first prompt goes first.
+    if d.db().kv_map(FIRST_KEY)?.contains_key(&s.id) {
+        let why = format!("{}'s first prompt hasn't been typed in yet", s.name);
+        return not_now(d, &s, text, when_idle, &why);
+    }
     // (tmux without the DB lock.)
     if let Typed::NotNow(why) = type_message(d, &s, text, Source::Send)? {
         return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
@@ -366,7 +377,7 @@ fn not_now(d: &Daemon, s: &Session, text: &str, when_idle: bool, why: &str) -> R
 
 /// Hold `text` for session `id` until its turn is over. Returns whether it
 /// replaced one already waiting.
-pub(crate) fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
+fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
     let mut m = db.kv_map(PENDING_KEY)?;
     let now = now_ms();
     let replaced = m
@@ -381,6 +392,14 @@ pub(crate) fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
             .to_string(),
     )?;
     Ok(replaced)
+}
+
+/// Hold first prompt `text` of session `id` for its first idle turn (its
+/// own slot, `FIRST_KEY`).
+pub(crate) fn queue_first(db: &Db, id: &str, text: &str) -> Result<()> {
+    let mut m = db.kv_map(FIRST_KEY)?;
+    m.insert(id.to_string(), json!({"text": text, "at": now_ms()}));
+    db.kv_set_map(FIRST_KEY, &m)
 }
 
 /// Drop session `id`'s pending message, if it has one (logged as dropped,
@@ -446,48 +465,60 @@ pub fn start(d: &Arc<Daemon>) {
 
 fn tick(d: &Daemon) -> Result<()> {
     let limited = crate::limits::limited(d);
-    let due: Vec<String> = {
+    let mut due: Vec<(String, &'static str)> = Vec::new();
+    {
         let db = d.db();
-        let mut m = db.kv_map(PENDING_KEY)?;
-        if m.is_empty() {
-            return Ok(());
-        }
-        let now = now_ms();
-        let mut due = Vec::new();
-        let mut dropped = false;
-        for id in m.keys().cloned().collect::<Vec<_>>() {
-            let s = db.resolve_ref(&id).ok();
-            match next(s.as_ref(), limited.get(&id).copied(), now) {
-                Next::Wait => {}
-                Next::Deliver => due.push(id),
-                Next::Drop(why) => {
-                    m.remove(&id);
-                    dropped = true;
-                    if s.is_some() {
-                        db.insert_event(
-                            &id,
-                            now,
-                            "message_dropped",
-                            &json!({"reason": why}).to_string(),
-                        )?;
+        let firsts = db.kv_map(FIRST_KEY)?;
+        for key in [FIRST_KEY, PENDING_KEY] {
+            let mut m = db.kv_map(key)?;
+            let now = now_ms();
+            let mut dropped = false;
+            for id in m.keys().cloned().collect::<Vec<_>>() {
+                // (A session's first prompt goes before its messages.)
+                if key == PENDING_KEY && firsts.contains_key(&id) {
+                    continue;
+                }
+                let s = db.resolve_ref(&id).ok();
+                match next(s.as_ref(), limited.get(&id).copied(), now) {
+                    Next::Wait => {}
+                    Next::Deliver => due.push((id, key)),
+                    Next::Drop(why) => {
+                        m.remove(&id);
+                        dropped = true;
+                        if s.is_some() {
+                            db.insert_event(
+                                &id,
+                                now,
+                                dropped_kind(key),
+                                &json!({"reason": why}).to_string(),
+                            )?;
+                        }
                     }
                 }
             }
+            if dropped {
+                db.kv_set_map(key, &m)?;
+            }
         }
-        if dropped {
-            db.kv_set_map(PENDING_KEY, &m)?;
-        }
-        due
-    };
-    for id in due {
-        deliver(d, &id)?;
+    }
+    for (id, key) in due {
+        deliver(d, &id, key)?;
     }
     Ok(())
 }
 
+/// The log entry for a pending text that is dropped.
+fn dropped_kind(key: &str) -> &'static str {
+    if key == FIRST_KEY {
+        "first_prompt_dropped"
+    } else {
+        "message_dropped"
+    }
+}
+
 /// Deliver session `id`'s pending message if it is still due: looked at
 /// again under the session's lock, right before typing.
-fn deliver(d: &Daemon, id: &str) -> Result<()> {
+fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
     let _session = d.sessions.lock(id);
     let limited = crate::limits::limited(d).get(id).copied();
     let (s, text) = {
@@ -496,7 +527,7 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
             return Ok(()); // (gone: the next tick drops it)
         };
         let Some(text) = db
-            .kv_map(PENDING_KEY)?
+            .kv_map(key)?
             .get(id)
             .and_then(|v| v["text"].as_str())
             .map(str::to_string)
@@ -512,21 +543,25 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
     let r = type_message(d, &s, &text, Source::Send);
     if let Ok(Typed::NotNow(why)) = &r {
         // A later tick; said once, so a stuck queue is visible.
-        return held(d, id, &text, why);
+        return held(d, id, &text, why, key);
     }
     let db = d.db();
-    let mut m = db.kv_map(PENDING_KEY)?;
+    let mut m = db.kv_map(key)?;
     // (Queued and sent under this lock: still this text.)
     if m.get(id).and_then(|v| v["text"].as_str()) == Some(text.as_str()) {
         m.remove(id);
-        db.kv_set_map(PENDING_KEY, &m)?;
+        db.kv_set_map(key, &m)?;
     }
     let (kind, detail) = match &r {
+        Ok(_) if key == FIRST_KEY => (
+            "first_prompt",
+            json!({"sent": true, "via": "typed", "chars": text.chars().count()}),
+        ),
         Ok(_) => (
             "message_delivered",
             json!({"from": "overlord", "chars": text.chars().count()}),
         ),
-        Err(e) => ("message_dropped", json!({"reason": format!("{e:#}")})),
+        Err(e) => (dropped_kind(key), json!({"reason": format!("{e:#}")})),
     };
     db.insert_event(id, now_ms(), kind, &detail.to_string())?;
     drop(db);
@@ -536,9 +571,9 @@ fn deliver(d: &Daemon, id: &str) -> Result<()> {
 
 /// Log, once per queued message, why it wasn't delivered yet (its entry
 /// is marked `held`; a newer message starts unmarked).
-fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
+fn held(d: &Daemon, id: &str, text: &str, why: &str, key: &str) -> Result<()> {
     let db = d.db();
-    let mut m = db.kv_map(PENDING_KEY)?;
+    let mut m = db.kv_map(key)?;
     let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -546,7 +581,7 @@ fn held(d: &Daemon, id: &str, text: &str, why: &str) -> Result<()> {
         return Ok(());
     }
     entry.insert("held".into(), json!(true));
-    db.kv_set_map(PENDING_KEY, &m)?;
+    db.kv_set_map(key, &m)?;
     db.insert_event(
         id,
         now_ms(),
@@ -761,19 +796,32 @@ mod tests {
             let log = d.db().list_events(&id, 20).unwrap();
             log.iter().filter(|e| e.kind == "message_held").count()
         };
-        held(&d, &id, "first", "a dialog is up").unwrap();
-        held(&d, &id, "first", "a dialog is up").unwrap();
+        held(&d, &id, "first", "a dialog is up", PENDING_KEY).unwrap();
+        held(&d, &id, "first", "a dialog is up", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
         assert_eq!(d.db().kv_map(PENDING_KEY).unwrap()[&id]["text"], "first");
         // (Not this message's text: nothing.)
-        held(&d, &id, "other", "x").unwrap();
+        held(&d, &id, "other", "x", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
         queue(&d.db(), &id, "second").unwrap();
-        held(&d, &id, "second", "a draft").unwrap();
+        held(&d, &id, "second", "a draft", PENDING_KEY).unwrap();
         assert_eq!(held_count(), 2);
         let log = d.db().list_events(&id, 20).unwrap();
         let e = log.iter().find(|e| e.kind == "message_held").unwrap();
         assert!(e.payload["reason"].as_str().is_some(), "{}", e.payload);
+    }
+
+    #[test]
+    fn a_first_prompt_has_its_own_slot() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        queue_first(&db, &id, "the task").unwrap();
+        queue(&db, &id, "a note").unwrap();
+        // The overlord's messages neither replace nor drop it.
+        queue(&db, &id, "a newer note").unwrap();
+        assert!(unqueue(&db, &id, "replaced").unwrap());
+        assert_eq!(db.kv_map(FIRST_KEY).unwrap()[&id]["text"], "the task");
+        assert_eq!(dropped_kind(FIRST_KEY), "first_prompt_dropped");
     }
 
     #[test]

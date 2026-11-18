@@ -681,9 +681,35 @@ Owed from PR 3:
   long enough.
 - Live-check that Codex reads `prompt.md` from the pointer line in its
   default sandbox (the plan's Codex pointer-read check).
-- The queued fallback is logged as an overlord message (`message_queued`
-  from `overlord`); its prompt is marked rlord's, not the user's.
+- The typed fallback's prompt is marked rlord's (`Source::Send`), not
+  the user's.
 - `launch_spec.prompt` still holds the words in the DB (not argv).
+- (Review round 1) A Pointer-mode session's background rows are marked
+  seen at launch, before an OpenCode POST has gone (`methods.rs` start).
+- (Review round 1) The POST runs on the OpenCode follower thread; a slow
+  server delays that tick's event reading (10s limit).
+- (Review round 1) `apply_first_prompt` and `apply_deferred` share their
+  shape (held kv, late clock, service lookup): fold into one; `Placed`
+  could be an enum (exactly one of argv / stdin / server).
+
+### Review round 1 (PR #73)
+
+1. `Service::prompt` returns `Posted { Sent, Refused, Unknown }`: only
+   no connection or an error status falls back to typing; a request sent
+   with no answer back is logged as unknown, never typed again.
+2. A restart keeps a held first prompt (fresh clock, set once the pane
+   is up) instead of deleting it.
+3. The typed fallback has its own slot (`send::FIRST_KEY`,
+   `queue_first`): delivered before the overlord's queued messages, never
+   replaced or dropped by them; a direct send waits while it is there.
+4. `first_prompt::task` / `launch_words`: triage, archive summaries and
+   `session_brief` show the launch's words where a Codex transcript's
+   first prompt is the pointer line. (`recall` reads overlords' own
+   transcripts, which never get one.)
+5. A failed `session.new` removes `prompt.md` and kv `first_prompt`.
+6. Held first prompts of sessions no longer live are settled each
+   OpenCode tick: logged as not sent, file removed.
+7. The pointer line starts `[rlord session <id>]`.
 
 ## Owed / deferred
 

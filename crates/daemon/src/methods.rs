@@ -925,6 +925,7 @@ pub(crate) fn session_new_with(
     if let Err(e) = started {
         // (Its token, MCP config and kv keys were made for it: gone too.)
         crate::session_tools::forget(db, &base, &id);
+        crate::first_prompt::forget(db, &base, &id);
         return Err(e);
     }
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
@@ -1371,8 +1372,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         &argv,
     );
     let cmd = crate::first_prompt::with_stdin(cmd, placed.stdin.as_deref());
-    // (A first prompt an earlier start left for the server is over.)
-    crate::first_prompt::hold(db, &s.id, placed.server.as_deref(), now_ms())?;
     note_launch(db, &s.id, &argv)?;
     // A re-fork binds its new thread as at the fork: the key that says so
     // is written before the pane starts, so it can't be lost after.
@@ -1394,6 +1393,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         }
     };
     let now = now_ms();
+    // A first prompt for the server: this start's, else one an earlier
+    // start left unsent, carried with a fresh clock.
+    logged(
+        "holding the first prompt",
+        match placed.server.as_deref() {
+            Some(f) => crate::first_prompt::hold(db, &s.id, Some(f), now),
+            None => crate::first_prompt::restamp(db, &s.id, now),
+        },
+    );
     if let Some(fallback) = fell_back {
         logged(
             "recording the mode",
