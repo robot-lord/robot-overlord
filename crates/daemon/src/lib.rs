@@ -2298,6 +2298,66 @@ mod tests {
             .contains("PR is #12"));
     }
 
+    /// A session's own Stop hook carries a held message on: its answer
+    /// blocks the stop with the framed text; the ack sets it working again
+    /// and takes the message off the queue.
+    #[test]
+    fn a_stop_hook_carries_a_held_message_on() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01st",
+            name: "web-footer",
+            agent: "claude",
+            agent_session: Some("u-1"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01st_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let emit = |event: &str| {
+            methods::hook_emit(
+                &db,
+                &json!({"instance": "01st", "agent": "claude", "event": event,
+                        "payload": {"session_id": "u-1", "hook_event_name": event}}),
+            )
+            .unwrap()
+        };
+        emit("UserPromptSubmit");
+        // Nothing held: the turn ends as usual.
+        assert!(emit("Stop")["reply"].is_null());
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+        emit("UserPromptSubmit");
+        crate::send::queue(&db, "01st", &json!({"text": "also the footer"})).unwrap();
+        let r = emit("Stop");
+        assert_eq!(r["reply"]["decision"], "block", "{r}");
+        assert!(r["reply"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("also the footer"));
+        // Idle as usual until the ack: a lost one leaves nothing stuck.
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+        let ack = r["reply_ack"].as_str().unwrap();
+        assert_eq!(
+            methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
+            json!({"acked": true})
+        );
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Working);
+        assert!(db
+            .kv_map(crate::send::PENDING_KEY)
+            .unwrap()
+            .get("01st")
+            .is_none());
+        // Its next Stop ends the turn.
+        assert!(emit("Stop")["reply"].is_null());
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+    }
+
     /// "Needs you" is a block mid-turn, cleared when the agent moves on;
     /// Claude's idle reminder leaves a finished session "your turn".
     #[test]

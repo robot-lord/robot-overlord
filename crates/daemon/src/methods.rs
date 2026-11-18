@@ -1694,7 +1694,13 @@ pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
 
 /// `hook.ack`: the hook client printed the answer `ack` names.
 pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
-    let acked = context::ack(db, p_str(params, "ack")?, now_ms())?;
+    let ack = p_str(params, "ack")?;
+    // A Stop hook's answer that carried held messages on, or background.
+    let acked = if ack.starts_with(crate::send::CLAIM_PREFIX) {
+        crate::send::claim_ack(db, ack, now_ms())?
+    } else {
+        context::ack(db, ack, now_ms())?
+    };
     Ok(json!({"acked": acked}))
 }
 
@@ -1980,6 +1986,26 @@ fn hook_emit_in(
                 }
             }
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
+        }
+        // The session's own Stop while overlord messages wait for it: the
+        // hook's answer carries them on (`send::stop_claim`). Last, after
+        // every fallible step: an event that failed leaves no claim. The
+        // status went idle as usual; the ack (`send::claim_ack`) sets it
+        // working again, so a lost ack never leaves it working. Best
+        // effort, like the background. A prompt ends a run of claims.
+        let mut claim = None;
+        if live && whose != Whose::Other {
+            let r = match event {
+                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
+                "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
+            }
+        }
+        if let Some(c) = claim {
+            return Ok(json!({"ok": true, "reply": c.output, "reply_ack": c.ack}));
         }
         return Ok(answer(json!({"ok": true})));
     } else {

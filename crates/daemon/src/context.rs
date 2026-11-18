@@ -431,8 +431,8 @@ pub fn launch_prompt(prompt: Option<&str>, mode: Option<Delivery>, file: &Path) 
 
 /// A message passed on to a session for the user, framed by code so the
 /// agent can tell whose words are whose: the user's text, then (optional)
-/// the overlord's background, labelled. (Used by `send_to_session` from
-/// PR 4 of session context on.)
+/// the overlord's background, labelled. `send_to_session` frames every
+/// message this way (`send::framed`).
 pub fn frame_message(text: &str, context: Option<&str>) -> String {
     let mut out = format!(
         "[rlord] Passed on by the rlord overlord for the user:\n\n{}",

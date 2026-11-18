@@ -333,6 +333,18 @@ impl Service {
     /// went out, the answer didn't come back): a message that may have
     /// been admitted must not be sent again another way.
     pub fn prompt(&self, id: &str, text: &str) -> Posted {
+        self.post_prompt(id, text, None)
+    }
+
+    /// `prompt` for a later message: `delivery: "queue"` (OpenCode's
+    /// inbox), so a session mid-turn takes it once that turn is over
+    /// rather than having it steered into the turn; an idle one runs it
+    /// at once.
+    pub fn queue_prompt(&self, id: &str, text: &str) -> Posted {
+        self.post_prompt(id, text, Some("queue"))
+    }
+
+    fn post_prompt(&self, id: &str, text: &str, delivery: Option<&str>) -> Posted {
         if !is_session_id(id) {
             return Posted::Refused("not an OpenCode session id".into());
         }
@@ -341,7 +353,10 @@ impl Service {
             Ok(s) => s,
             Err(e) => return Posted::Refused(format!("{e:#}")),
         };
-        let body = serde_json::json!({ "text": text });
+        let mut body = serde_json::json!({ "text": text });
+        if let Some(how) = delivery {
+            body["delivery"] = serde_json::json!(how);
+        }
         let path = format!("/api/session/{id}/prompt");
         // (Not all written: the server can't have taken an incomplete
         // request.)
@@ -1121,6 +1136,21 @@ mod tests {
         assert!(matches!(svc.prompt("ses_1a", "x"), Posted::Refused(_)));
         assert!(matches!(svc.prompt("ses_1a", "y"), Posted::Unknown(_)));
         assert!(matches!(svc.prompt("ses_1a/../x", "x"), Posted::Refused(_)));
+    }
+
+    #[test]
+    fn a_later_message_is_queued_on_the_server() {
+        let (svc, asked) = serve(vec![ok(r#"{"data":{"id":"msg_2"}}"#)]);
+        assert_eq!(svc.queue_prompt("ses_1a", "and the footer"), Posted::Sent);
+        let req = asked.recv().unwrap();
+        assert!(
+            req.starts_with("POST /api/session/ses_1a/prompt HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(
+            req.ends_with(r#"{"delivery":"queue","text":"and the footer"}"#),
+            "{req}"
+        );
     }
 
     #[test]

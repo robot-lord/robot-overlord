@@ -130,13 +130,17 @@ runs a command.
   like any OpenCode session.
 - **Passing work to a session** ("tell the web app to also fix the
   footer"): the overlord sends it with `send_to_session`, whichever agent
-  runs the overlord and whichever the session runs. rlord types it into
-  that session's prompt, as if you had, once its turn is over. A session
-  that is working, or waiting on you, isn't typed into: the overlord says
-  so, or (when you want it delivered anyway) it waits for that turn to end
-  and goes in then (one waiting message per session; a newer one replaces
-  it, and one sent directly drops it). Stopped and archived sessions are
-  refused. Each send is in the session's log.
+  runs the overlord and whichever the session runs. Your words go as you
+  said them, with the overlord's notes after them, labelled as its own.
+  An OpenCode session gets it through OpenCode's own queue: it runs once
+  the current turn is over. A Claude or Codex session gets it typed into
+  its prompt, as if you had, once its turn is over. One that is working,
+  or waiting on you, isn't typed into: the overlord says so, or (when you
+  want it delivered anyway) it waits; a Claude session that is
+  working then picks it up as its turn ends and carries on with it (at
+  most three in a row, then it is typed in). Messages that wait add up;
+  none replaces another. Stopped and archived sessions are refused. Each
+  send is in the session's log.
 - Right before typing, rlord looks at the session's screen. It holds off
   (the message waits, or is refused) while a dialog is up there (a
   permission prompt, a question: Enter would pick an answer), while its
