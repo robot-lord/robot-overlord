@@ -129,7 +129,7 @@ jobs:
           bin=$(find "$tmp" -type f -name rlord | head -n1)
           [[ -n $bin ]] || { echo "::error::no rlord binary in the tarball"; exit 1; }
           codesign --verify --strict "$bin"
-          info=$(codesign -dv "$bin" 2>&1)
+          info=$(codesign -dvv "$bin" 2>&1)
           echo "$info"
           grep -q '^Authority=Developer ID Application: ' <<<"$info" || { echo "::error::not signed with a Developer ID"; exit 1; }
           grep -qx 'Identifier=com.robot-lord.rlord' <<<"$info" || { echo "::error::wrong signing identifier"; exit 1; }
