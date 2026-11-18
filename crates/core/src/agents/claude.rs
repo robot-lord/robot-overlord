@@ -410,6 +410,38 @@ pub(crate) fn interrupted(v: &Value) -> bool {
     }
 }
 
+/// A user line that is local output, not a turn: a `!` shell command and
+/// its output, a local command's output, a meta line. Claude writes these
+/// without the model running; a reply, if one follows, is its own line.
+pub(crate) fn local_output(v: &Value) -> bool {
+    if v["type"] != "user" {
+        return false;
+    }
+    if v["isMeta"] == true {
+        return true;
+    }
+    let local = |t: &str| {
+        let t = t.trim_start();
+        [
+            "<bash-input>",
+            "<bash-stdout>",
+            "<bash-stderr>",
+            "<local-command-",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
+    };
+    match &v["message"]["content"] {
+        Value::String(s) => local(s),
+        Value::Array(a) => {
+            !a.is_empty()
+                && a.iter()
+                    .all(|x| x["type"] == "text" && x["text"].as_str().is_some_and(local))
+        }
+        _ => false,
+    }
+}
+
 /// A usage limit stopped the turn: Claude Code writes a synthetic
 /// assistant line for it (`"You've hit your 5-hour limit · resets 1:30pm
 /// (America/Los_Angeles)"`) with `isApiErrorMessage: true`, `apiError:

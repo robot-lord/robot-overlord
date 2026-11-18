@@ -434,7 +434,9 @@ hooks) against what is there to see:
 - `waiting_input` or `working` unchanged for 2 minutes while the
   transcript's tail says the last turn ended (a final reply, Codex's
   `turn_aborted`) or was interrupted (Claude's `[Request interrupted by
-  user…]` line), and nothing was written for 2 minutes: `idle`.
+  user…]` line), and nothing was written for 2 minutes: `idle`. The
+  user's own `!` shell commands and local command output after the reply
+  say nothing about the turn.
 
 A turn still open (a tool call waiting on a prompt or running) is never
 touched, however long it waits. Nor is "needs you" while a sub-agent may

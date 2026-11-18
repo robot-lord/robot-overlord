@@ -193,6 +193,15 @@ impl Line<'_> {
             Format::Codex | Format::OpenCode => false,
         }
     }
+
+    /// Local output the user's own commands wrote (Claude's `!` shell
+    /// commands, local commands' output): no turn of the agent's.
+    pub fn local_output(&self) -> bool {
+        match self.format {
+            Format::Claude => claude::local_output(self.v),
+            Format::Codex | Format::OpenCode => false,
+        }
+    }
 }
 
 /// How a transcript's last turn stands, read from its tail.
@@ -239,6 +248,9 @@ pub fn tail_of(format: Format, lines: &[Value]) -> Tail {
     let lines = || lines.iter().rev().map(|v| format.line(v));
     Tail {
         turn: lines().find_map(|l| {
+            if l.local_output() {
+                return None;
+            }
             if l.interrupted() {
                 return Some(TurnTail::Interrupted);
             }
@@ -994,6 +1006,21 @@ mod tests {
             "why [Request interrupted by user]?",
         )]);
         assert_eq!(quoted.turn, Some(TurnTail::Open));
+        // A `!` shell command after the reply: still ended (it is the
+        // user's, not a turn; a reply would be a line of its own).
+        let bash = t(&[
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user(
+                "2026-11-12T10:00:20Z",
+                "<bash-input>rlord update</bash-input>",
+            ),
+            user(
+                "2026-11-12T10:00:21Z",
+                "<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>",
+            ),
+        ]);
+        assert_eq!(bash.turn, Some(TurnTail::Ended));
+        assert_eq!(bash.last_at, at("2026-11-12T10:00:21Z"));
         // Nothing about a turn: unknown.
         assert_eq!(t(&[meta("2026-11-12T10:00:06Z")]).turn, None);
         // Codex: an aborted turn is a turn ended.
