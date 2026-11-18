@@ -190,6 +190,8 @@ enum Mode {
     Fork(Box<forkform::ForkForm>),
     OverlordUpgrade(Box<overlord::Upgrade>),
     RemoteOffer(Box<overlord::RemoteOffer>),
+    /// The active overlord is out of usage: switch to another agent's?
+    LimitSwitch(Box<overlord::LimitSwitch>),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -545,6 +547,8 @@ impl App {
                     .call("overlord.get", json!({}))
                     .filter(|o| !o.is_null())
                 {
+                    // Out of usage: offer another agent's (once a limit).
+                    self.offer_limit_switch(&o);
                     self.sessions.insert(0, o);
                     self.overlord_rows = 1;
                 }
@@ -930,6 +934,7 @@ impl App {
             Mode::Fork(f) => self.handle_fork_form(k, f),
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
+            Mode::LimitSwitch(l) => self.handle_limit_switch(k, l),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
@@ -1557,6 +1562,7 @@ impl App {
             Mode::Fork(s) => self.draw_fork_form(f, s),
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
+            Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
@@ -2487,7 +2493,10 @@ impl App {
             Mode::ConfirmQuit => {
                 Some("quit rlord?  y / enter: quit · any other key: stay".to_string())
             }
-            Mode::OverlordSetup(_) | Mode::OverlordUpgrade(_) | Mode::RemoteOffer(_) => {
+            Mode::OverlordSetup(_)
+            | Mode::OverlordUpgrade(_)
+            | Mode::RemoteOffer(_)
+            | Mode::LimitSwitch(_) => {
                 Some("overlord — see dialog".to_string())
             }
             Mode::Setup(_) => Some("code folder — see form".to_string()),

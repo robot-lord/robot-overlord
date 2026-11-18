@@ -1180,6 +1180,19 @@ overlord with that agent's defaults (`model_effort_for`), later ones find
 it as it was (started again if it had stopped). Nothing switches by itself,
 including when the active one hits a usage limit.
 
+- **Out of usage: offered, not done.** When the active overlord's row
+  carries a `limit` (the same transcript detection as any session,
+  `limits::annotate`), `overlord.get` adds `limit.switch_to` (installed
+  agents other than the active one whose overlord, if any, isn't limited
+  too) and `limit.offer` (`overlord::limit_offer`: plain data over the
+  roster, no tmux of its own). The list opens a dialog on a refresh that
+  sees `offer` (enter switches through `overlord.switch`; esc calls
+  `overlord.decline_limit_switch`, which stores that limit's `resets_at`
+  in kv `overlord_limit_offer_declined`, so the same limit isn't asked
+  again but the next one is). Not offered once the limit has reset, or
+  with nowhere to go. The overlay's top row says "out of usage until …"
+  as before.
+
 - **In the DB** every overlord has role `overlord`, so `is_overlord_role`
   and every refusal built on it (rename, tags, notes, archive, stop from a
   tool, `send_to_session`) hold for all of them without knowing which is

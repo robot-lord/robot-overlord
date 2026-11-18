@@ -746,9 +746,35 @@ impl Daemon {
                     // so (the user may switch to another agent's).
                     let mut rows = [v];
                     annotate_status(self, &mut rows, false);
-                    let [v] = rows;
+                    let [mut v] = rows;
+                    // Out of usage: offer the other agents' overlords (the
+                    // list asks; the user decides).
+                    if !v["limit"].is_null() {
+                        let declined = self
+                            .db()
+                            .kv_get(overlord::LIMIT_OFFER_DECLINED)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse().ok());
+                        let o = overlord::limit_offer(
+                            &v["overlords"],
+                            &v["limit"],
+                            &limits::limited(self),
+                            declined,
+                        );
+                        v["limit"]["switch_to"] = o["switch_to"].clone();
+                        v["limit"]["offer"] = o["offer"].clone();
+                    }
                     v
                 })
+            }
+            // "Not now" to switching away from an overlord out of usage:
+            // not asked again for this limit (`resets_at`, ms).
+            "overlord.decline_limit_switch" => {
+                let at = params["resets_at"].as_i64().unwrap_or(0);
+                self.db()
+                    .kv_set(overlord::LIMIT_OFFER_DECLINED, &at.to_string())
+                    .map(|_| json!({"declined": true}))
             }
             // Make another agent's overlord the active one (starting or
             // creating it). Not while something is being pasted into the

@@ -65,6 +65,57 @@ pub(crate) struct RemoteOffer {
     error: Option<String>,
 }
 
+/// The active overlord ran out of usage: switch it to another agent's?
+/// Asked once per limit (`overlord.get`'s `limit.offer`); only the user
+/// switches.
+pub(crate) struct LimitSwitch {
+    /// The limited overlord's agent, as shown ("Claude Code").
+    from: String,
+    /// When its limit resets, as shown ("3:00pm").
+    until: String,
+    /// Its reset time (ms): what "not now" declines.
+    resets_at: i64,
+    /// The agents to switch to: (name, label, has an overlord already).
+    to: Vec<(String, String, bool)>,
+    /// Which of `to` enter picks.
+    pick: usize,
+    error: Option<String>,
+}
+
+impl LimitSwitch {
+    /// The offer in an `overlord.get` answer, if it asks now.
+    pub(crate) fn from_overlord(o: &Value) -> Option<Self> {
+        let l = &o["limit"];
+        if l["offer"] != true {
+            return None;
+        }
+        let to: Vec<_> = l["switch_to"]
+            .as_array()?
+            .iter()
+            .filter_map(|a| {
+                let name = a["agent"].as_str()?.to_string();
+                let label = a["label"].as_str().unwrap_or(&name).to_string();
+                Some((name, label, a["exists"] == true))
+            })
+            .collect();
+        if to.is_empty() {
+            return None;
+        }
+        let agent = o["agent"].as_str().unwrap_or("");
+        let from = rlord_core::agents::Agent::parse(agent)
+            .map(|a| a.label().to_string())
+            .unwrap_or_else(|| agent.to_string());
+        Some(Self {
+            from,
+            until: l["until"].as_str().unwrap_or("later").to_string(),
+            resets_at: l["resets_at"].as_i64().unwrap_or(0),
+            to,
+            pick: 0,
+            error: None,
+        })
+    }
+}
+
 /// An existing overlord on an old model.
 pub(crate) struct Upgrade {
     note: String,
@@ -813,6 +864,125 @@ impl App {
         }
     }
 
+    /// Open the limit-switch offer if the overlord row (`overlord.get`)
+    /// asks for it and nothing else is open.
+    pub(crate) fn offer_limit_switch(&mut self, o: &Value) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        if let Some(l) = LimitSwitch::from_overlord(o) {
+            self.mode = Mode::LimitSwitch(Box::new(l));
+        }
+    }
+
+    pub(crate) fn handle_limit_switch(&mut self, k: KeyEvent, mut l: Box<LimitSwitch>) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                let _ = client_call(
+                    &paths::socket_path(),
+                    "overlord.decline_limit_switch",
+                    json!({"resets_at": l.resets_at}),
+                );
+                self.status_line = format!(
+                    "overlord stays on {} until {}; switch any time with :overlord <agent>",
+                    l.from, l.until
+                );
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down | KeyCode::Char('j') => {
+                l.pick = (l.pick + 1) % l.to.len();
+                self.mode = Mode::LimitSwitch(l);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up | KeyCode::Char('k') => {
+                l.pick = (l.pick + l.to.len() - 1) % l.to.len();
+                self.mode = Mode::LimitSwitch(l);
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let (agent, label, _) = l.to[l.pick].clone();
+                match client_call(
+                    &paths::socket_path(),
+                    "overlord.switch",
+                    json!({"agent": agent}),
+                ) {
+                    Ok(_) => {
+                        self.status_line = format!("overlord: now on {label}");
+                        self.dirty = true;
+                    }
+                    Err(e) => {
+                        l.error = Some(format!("{e:#}"));
+                        self.mode = Mode::LimitSwitch(l);
+                    }
+                }
+            }
+            _ => self.mode = Mode::LimitSwitch(l),
+        }
+    }
+
+    pub(crate) fn draw_limit_switch(&self, f: &mut Frame, l: &LimitSwitch) {
+        let h = 9 + l.to.len() as u16 + u16::from(l.error.is_some());
+        let area = newform::centered(f.area(), 72, h);
+        f.render_widget(Clear, area);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "  Your {} overlord is out of usage until {}.",
+                    l.from, l.until
+                ),
+                Style::default().bold(),
+            )),
+            Line::from(Span::styled(
+                "  Switch the active overlord to another agent? The old one keeps its",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  conversation: switch back any time (:overlord <agent>).",
+                theme::muted(),
+            )),
+            Line::from(""),
+        ];
+        for (i, (_, label, exists)) in l.to.iter().enumerate() {
+            let mark = if i == l.pick { "▸" } else { " " };
+            let note = if *exists {
+                ""
+            } else {
+                "  (set up on first switch)"
+            };
+            let style = if i == l.pick {
+                Style::default().bold()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark} {label}"), style),
+                Span::styled(note.to_string(), theme::faint()),
+            ]));
+        }
+        lines.push(Line::from(""));
+        let mut keys = vec![("enter", "switch", Cap::Context)];
+        if l.to.len() > 1 {
+            keys.push(("tab", "next agent", Cap::Context));
+        }
+        lines.push(keys_line(&keys));
+        lines.push(keys_line(&[(
+            "esc",
+            "not now (won't ask again for this limit)",
+            Cap::Global,
+        )]));
+        if let Some(e) = &l.error {
+            lines.push(Line::from(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(theme::red()),
+            )));
+        }
+        self.modal_hits(f.area(), area, &lines);
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(theme::modal("Overlord out of usage")),
+            area,
+        );
+    }
+
     pub(crate) fn draw_remote_offer(&self, f: &mut Frame, o: &RemoteOffer) {
         let area = newform::centered(f.area(), 72, 12);
         f.render_widget(Clear, area);
@@ -867,6 +1037,24 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The limit offer opens only when the daemon says to ask, and lists
+    /// where to go.
+    #[test]
+    fn the_limit_offer_reads_the_overlord_row() {
+        let mut o = json!({
+            "agent": "claude",
+            "limit": {"until": "3:00pm", "resets_at": 42, "offer": true,
+                "switch_to": [{"agent": "codex", "label": "Codex", "exists": true}]},
+        });
+        let l = LimitSwitch::from_overlord(&o).unwrap();
+        assert_eq!(l.from, "Claude Code");
+        assert_eq!((l.until.as_str(), l.resets_at), ("3:00pm", 42));
+        assert_eq!(l.to, [("codex".into(), "Codex".into(), true)]);
+        o["limit"]["offer"] = json!(false);
+        assert!(LimitSwitch::from_overlord(&o).is_none());
+        assert!(LimitSwitch::from_overlord(&json!({"agent": "claude"})).is_none());
+    }
 
     fn status(agents: Value, remote: bool) -> Value {
         json!({"exists": false, "default_agent": "claude", "default_model": "opus",
