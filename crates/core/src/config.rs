@@ -678,6 +678,7 @@ pub struct Config {
     pub update: UpdateConfig,
     pub limits: LimitsConfig,
     pub web: WebConfig,
+    pub remote: RemoteConfig,
 }
 
 /// The opt-in web UI (the `rlord-web` plugin). Read by the daemon, which
@@ -718,6 +719,42 @@ impl Default for WebConfig {
             enabled: false,
             port: DEFAULT_WEB_PORT,
             ui_target: UiTarget::Auto,
+        }
+    }
+}
+
+/// Remote access through one pinned relay (`rlord relay setup`). Read by
+/// the daemon (to start the plugin) and by `rlord-web`, which alone holds
+/// the keys and dials out. Nothing dials out unless `enabled`, a pin is set
+/// and there is a paired device or an open pairing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// true: rlord-web keeps a connection to the relay below.
+    pub enabled: bool,
+    /// The relay's origin, `https://relay.example.com` (set by `rlord relay
+    /// setup`). There is no default relay.
+    pub relay: String,
+    /// The relay's key fingerprint, base64url (same command).
+    pub relay_key: String,
+    /// An extra root certificate (PEM) for a relay with a private CA.
+    pub ca_file: String,
+    /// A device unused for this many days is revoked; 0 = never.
+    pub device_expiry_days: u32,
+}
+
+impl RemoteConfig {
+    pub const DEFAULT_DEVICE_EXPIRY_DAYS: u32 = 90;
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        RemoteConfig {
+            enabled: false,
+            relay: String::new(),
+            relay_key: String::new(),
+            ca_file: String::new(),
+            device_expiry_days: Self::DEFAULT_DEVICE_EXPIRY_DAYS,
         }
     }
 }
@@ -806,6 +843,7 @@ impl Default for Config {
             update: UpdateConfig::default(),
             limits: LimitsConfig::default(),
             web: WebConfig::default(),
+            remote: RemoteConfig::default(),
         }
     }
 }
@@ -1172,6 +1210,17 @@ port = 47811     # fixed: the browser keeps the token per address (0 = any)
 # terminal and the web page are both open: "auto" (the one you used
 # last), "terminal" or "web".
 ui_target = "auto"
+
+# Remote access: your devices reach this machine through one relay you
+# pick, end-to-end encrypted (the relay sees only ciphertext). Needs the web
+# plugin. `rlord relay setup <relay address>` sets the first three;
+# `rlord relay pair` adds a device. Nothing dials out until then.
+[remote]
+enabled = false        # true: rlord-web keeps a connection to the relay below
+relay = ""             # https://relay.example.com (set by `rlord relay setup`)
+relay_key = ""         # the relay's key fingerprint, base64url (same command)
+ca_file = ""           # extra root certificate (PEM) for a private relay
+device_expiry_days = 90   # a device unused this long is unpaired (0 = never)
 "##;
 
 #[cfg(test)]
@@ -1259,6 +1308,7 @@ mod tests {
         assert!(c.session.scan_roots().is_empty());
         assert!(!c.web.enabled);
         assert_eq!(c.web.port, 47811);
+        assert_eq!(c.remote, RemoteConfig::default());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; next: the relay and the phone app)
+**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; slice 3, the e2e core and the relay, is built on `feat/web-ui-3` and not yet reviewed or merged; then the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -68,6 +68,37 @@ What it found that still matters:
 - Efficient polling: a tiny "do I have something for you?" signal
   (announce/lookup by either side) once trust is established; heavier
   transfer only after that.
+
+### Production relay (user, 2026-11-17)
+
+Needed before the relay runs as a production service. Not all of it is
+slice 3's; "Production relay: requirements and where they land" in the
+slice 3 plan says what slice 3 leaves room for and what waits for a later
+production-relay slice. The user decides the shape of the richer relay;
+the design choices are open questions there, not settled.
+
+1. **Modular deployment.** The relay should ship on different backends.
+   Proposed: durable storage behind a simple key-value abstraction, so a
+   backend can be DynamoDB, Redis, S3 or anything else. Durable state is
+   probably just session information. Where it is deployed is undecided.
+2. **Identity monitoring.** The relay can't read payloads, but it must
+   know which client and which account each connection belongs to, so it
+   can meter throughput (at least per account), ban or allow users, and
+   offer tiers of functionality. Content stays zero-trust; what metadata
+   the relay learns as a result is a privacy trade-off to document.
+3. **Load shedding.** The relay is a network proxy: per-account limits,
+   backpressure, global shedding.
+4. **Account registration and login.** Something more identifiable than
+   the tokens rlord instances present, for account management. It need
+   not be in the relay; it can be a separate service. The hosted public
+   service and an on-prem or self-hosted setup are to be told apart
+   (does self-host need accounts at all; one code path or a pluggable
+   one). Once logged in, a user registers their rlord hosts almost
+   entirely from their rlord instance (CLI, TUI or web flow). The
+   network invariants hold: no network code in `rlord` (the flow lives
+   in `rlord-web` or another plugin), the host only dials out, and the
+   device-to-host E2E trust never depends on the account service
+   (accounts govern access to the relay, not the keys).
 
 ## Network invariant: everyone dials out to the relay
 
@@ -826,6 +857,286 @@ Decided 2026-11-17 (user):
     still names `Alt-O` and the manual form's `N` (`ask::send`); in the
     page the form shows it as is. Worth a web-neutral wording later.
   - The relay and the phone app (the rest of this effort).
+- Slice 3 planned ("Slice 3 plan: e2e core and the relay" at the end;
+  Fable planning agent, 2026-11-17, branch `feat/web-ui-3`): `crates/e2e`,
+  `e2e-wasm`, `relay-proto`, `relay` (`rlord-relay`) and a test client;
+  `rlord-web` dials out to one pinned relay; pairing with the host's
+  confirmation; remote ops through `web::OPS` with a remote column.
+  Nothing built. Also recorded: the user's production-relay requirements
+  (storage backends, identity and metering, load shedding, accounts) in
+  the spec, and in the plan what slice 3 leaves room for and what waits
+  for a production-relay slice. Eighteen open questions wait for the
+  user.
+- Slice 3 build (Opus implementer, 2026-11-17, `feat/web-ui-3`):
+  - Step 1 gates all pass. (a) `snow` 0.10.0's raw split (feature
+    `risky-raw-split`) plus our own ChaCha20-Poly1305 cipher state gives
+    the same frames as its `TransportState` with `rekey_outgoing` after
+    every message: checked inside the vectors run itself
+    (`vectors::run` fails on any difference), so it stays checked. (b)
+    `rustls` 0.23 (ring), `tokio-rustls` 0.26, `p256` 0.14 (ecdsa),
+    `rusqlite` 0.42 (bundled) and `webpki-roots` 1 cross-build with
+    `cargo zigbuild` to static binaries for both musl targets (a scratch
+    crate). (c) The spike's core builds natively and for
+    `wasm32-unknown-unknown` inside the main workspace (edition 2021,
+    resolver 2, the spike's exact pins next to the workspace's own
+    `sha2` 0.10.9 and `getrandom` 0.3.4: no duplicates).
+  - **Naming collision found** (the plan breaks here, by name only):
+    rlord already has a `remote.*` RPC family, `crates/daemon/src/remote.rs`,
+    `rlord remote <session> on|off` and per-session `remote` fields, all
+    for Claude Code's Remote Control, and the MCP server calls
+    `remote.status` and `remote.set`. The plan's `remote.*` user-only
+    commands, `daemon/src/remote.rs` and `rlord remote setup|pair|…`
+    would collide. Taken instead (rename is cheap if the user prefers
+    another word): RPC family `relay.*` (`daemon/src/relay.rs`), CLI
+    `rlord relay setup|pair|confirm|reject|devices|revoke|status|disable`,
+    TUI `:relay` (Devices screen `tui/src/relay.rs`), snapshot key
+    `relay`. Config stays `[remote]` and the plugin's module stays
+    `crates/web/src/remote/` (no collision there).
+  - Steps 2 and 3 done (`crates/e2e`, lib `rlord_e2e`): the spike's core
+    ported to edition 2021, libcrux only (the RustCrypto backend, the
+    classical baseline and the `pq-*` features dropped); `Kind` (1
+    pairing, 2 reconnect, 3 mailbox keying); `Established::into_session`
+    (kinds 1 and 2) and `into_mailbox` (kind 3 only, over the raw
+    split); a `Session` poisons itself on any decrypt failure
+    (malformed frames included) and every later call returns
+    `Error::Decrypt`; `stream.rs` (stream id and `MORE` flag,
+    `fragment`, `Reassembler` per stream with the 1 MiB limit, `single`
+    for one-frame messages); `mailbox.rs` (`MailboxSession`, Noise's
+    cipher state and `REKEY` by hand over `chacha20poly1305` =0.10.1,
+    Padmé padding, `export`/`import` of 81 bytes, poisoned on any
+    failure); `device_id`. Vectors in `crates/e2e/vectors/v1.json` (88 KB,
+    was 232 KB) by `cargo xtask e2e vectors [--check]`; the protocol test
+    fails when the file is stale. New vector cases: the kind-3
+    handshake, a mailbox sequence both ways (equal to snow's transport,
+    and with export and import between every message), an export
+    mid-sequence, fragment headers, one 16 KiB frame by hash, and the
+    failures (wrong kind both ways, mailbox as live and live as mailbox,
+    tampered message 1 and 2, a frame after poisoning, oversized frame,
+    mailbox gap, replay, tamper, export after poison, bad stream flags).
+  - Added to the core while building: a **mailbox id** (8 bytes from the
+    keying handshake's hash, part of the export, 89 bytes now), sent in
+    clear before each lane-2 frame, so a frame queued under a replaced
+    mailbox is dropped by id instead of poisoning the new one.
+  - Step 4 done: `crates/e2e-wasm` (the spike's wrapper without the
+    benchmark-only calls, plus `E2eMailbox`, mailbox handshakes,
+    `fragment`, `Reassembler`, `device_id`, `run_vectors`); `cargo xtask
+    e2e wasm|test-wasm` (O3, `+simd128`, bindgen in process into
+    `crates/e2e-wasm/pkg/`, 562 KB raw with the vector runner); a
+    separate Vitest project (`vitest.e2e.config.ts`, `test/e2e/`,
+    excluded from `web check` and from `tsc`, since the page has no Node
+    types): the vectors byte for byte, fragmenting, and an interop run.
+    `rust-toolchain.toml` gains `wasm32-unknown-unknown`; CI's `web` job
+    runs `cargo xtask e2e test-wasm`. Deviation: the interop run is the
+    WASM core as a device against the native core as host over stdio
+    (`rlord-device interop-host`), not through the relay: a WASM host
+    would need the relay link's P-256 signing in JS, which no WASM build
+    has yet. The relay path is covered natively (below).
+  - Step 5 done: `crates/relay-proto` (`msg`, `frame`, `auth`,
+    `address`, `check_challenge`). Transcript fields are length-prefixed
+    (the plan wrote plain concatenation). Binary frames put the lane
+    first (the plan put the address first) so a frame parses without
+    knowing its lane. p256 0.14 needs getrandom 0.4's `wasm_js` on wasm32
+    (a target-only dependency). `docs/working/e2e-protocol.md` written as
+    the shared spec (to be reviewed, then promoted).
+  - Steps 6, 7 and the relay half of 17: built in parallel by another
+    Opus agent on `feat/web-ui-3-relay`, merged here (see its entry
+    below).
+  - Step 8 done: `check-deps` gains the longer `rlord` deny list, the
+    relay tree check, the e2e sans-IO check, the plugin-listener source
+    check and the bind-to-every-interface source check, each with a
+    planted-name test.
+  - Step 9, 14, 15, 16: built in parallel by another Opus agent on
+    `feat/web-ui-3-daemon`, merged here. As built: `web::Op.remote`
+    (`op()`/`local()`), `via` required, `relay.*` dispatched from the
+    socket only (never `Daemon::rpc`, so never MCP or `web.call`),
+    `WEB_PROTOCOL` 3, `overlord.messages`, the `device.*` ops, the
+    mirror with `notice_all`, `rlord_core::qr` (`qrcode` 0.14.1, no
+    default features), `rlord relay …`, `:relay` (TUI Devices screen),
+    the page's Devices modal. Its deviations: the page's Devices is a
+    modal (form kind `devices`), not a route (`page.report` only takes
+    route kinds); `snapshot.relay.devices` is a count; every forwarded
+    command starts the plugin if needed (not only setup);
+    `relay.pair` checks setup first; `setup --reset --yes`; `revoke`
+    takes an id, id prefix or name; `rlord web remove` also turns
+    `[remote] enabled` off; a fresh QR survives a state report up to 3 s
+    older than it. The overlord: nothing new (it can see
+    `web.form = "devices"` in `get_ui_state` while the modal is open,
+    and no device data), so `overlord.md` and `mcp.rs` are unchanged.
+  - Steps 10 to 12 done (`crates/web/src/remote/`): one actor task owns
+    keys, devices, the relay connection, links, sessions and the
+    pairing; daemon calls run in their own tasks and come back to it.
+    `keys.rs`, `link.rs` (TLS with ring and webpki roots plus `ca_file`;
+    no redirects, no extensions; close codes mapped to final or retry),
+    `pairing.rs`, `devices.rs`, `session.rs` (20 ops/s, burst 40),
+    `mailbox.rs`, `audit.rs`. Off unless enabled, pinned, and a device
+    or a pairing exists; "wrong relay" and final close codes stop it
+    until a command or restart; `bye`'s `retry_after` honoured with up to
+    20% jitter. Deviation found by the crash tests: the mailbox's state,
+    request ids and the last handled `(boot, seq)` are one atomic file
+    (`mailbox-<id>.json`), saved before acting and acknowledging;
+    otherwise a crash between saving and acknowledging made the
+    redelivered frame fail to decrypt and discard the mailbox.
+  - Step 13 done: `crates/e2e-device` (lib `rlord_e2e_device`, bin
+    `rlord-device`: pair, check, snapshot, ask, interop-host) with hostile
+    relays in `testing.rs` (a relay claiming the pinned key, a faithful
+    forwarder under its own identity, a redirect). Tests:
+    `e2e-device/tests/pin.rs` (claimed key, other key, other origin,
+    redirect: nothing sent after the failed check, no other address
+    tried) and `web/tests/remote.rs` against the real plugin, daemon and
+    relay: pair and confirm, the cheap check, snapshot, `changed`,
+    `overlord.ask` reaching the daemon, the local-only ops refused, a
+    signal waking a device, a snapshot of several frames, a mailbox
+    request answered after the plugin returns, `repeat`, ops refused by
+    mailbox, revocation (link closed, 4403 after), reject, a spent QR,
+    three wrong secrets closing the rendezvous, a forwarder failing on
+    both ends, replayed and tampered frames, no dialling without setup
+    or after `disable` across a restart, both mailbox crash points
+    (`RLORD_WEB_TEST_CRASH`, debug builds only), and a mailbox frame
+    whose save fails (`RLORD_WEB_TEST_FAIL`, debug builds only: memory
+    is put back, so the frame the relay delivers again is handled).
+  - Step 18 (docs): `docs/architecture.md` "Remote access (through a
+    relay)", `docs/guide.md` "Remote access through a relay",
+    `SECURITY.md`, `CLAUDE.md`'s rules and Releases, `docs/relay.md`
+    (the relay agent).
+  - Relay (steps 6, 7, the relay half of 17), as built: `crates/relay`
+    (lib `rlord_relay` with `start`/`Running`/`Admin` for in-process
+    tests, bin `rlord-relay`), `Store` trait with SQLite and its
+    conformance suite, `StaticAuthorizer`, the `Meter`, backpressure by
+    64 frame permits per connection (the sender isn't read while a
+    frame waits; `bye idle` and 4408 after `stall`), files and proxy TLS
+    (SIGHUP reload in files mode; ignored in proxy mode), the release
+    tarballs, `deploy/relay/`, `cargo xtask relay-image` and a
+    `relay-image` job in `release.yml`. Its deviations: a refused binary
+    frame is answered `err` with `n: 0` (a binary frame has no number;
+    clients number requests from 1); a pairing attempt counts when it
+    connects (the relay can't tell success from failure; the host
+    closes the rendezvous on success); a second pairing device gets 4429;
+    `drop` closes with 1000; shutdown sends `bye overloaded` (retry 5 s)
+    then 4503; the per-address limit closes after the upgrade (`bye
+    limit`, 4429); a peer leaving over 1024 control messages unread is
+    closed (4408); the relay waits up to 1 s for a close reply; every
+    admitted host gets a store record; mailbox deliveries are bounded by
+    the queue limits, not the frame permits; the binary caps
+    tungstenite/axum/hyper/rustls logs at `info` (at trace they print
+    payloads); `ready.limits` is sent to hosts; the image is pushed by
+    the publishing run just before the release is published (the
+    workflow only makes a draft), `--local` releases get no image.
+  - `check-deps` deviation: `wasm-bindgen` is not on `rlord`'s deny list:
+    `ulid` (through `web-time`) depends on it for wasm32 targets only,
+    which `cargo tree --target all` shows; rlord is never built for
+    wasm32. `robot-overlord-e2e-wasm` stays denied by name.
+- Slice 3 reliability pass (Opus implementer, 2026-11-17, `feat/web-ui-3`;
+  the relay and e2e-core parts by two forks of it). The rule, now stated
+  in `e2e-protocol.md` §4 and `docs/architecture.md`: one websocket link
+  is one Noise session per device link with implicit nonces; delivery in
+  a connection is lossless and in order; any reconnect is a fresh
+  `KKpsk2`; recovery is resync by snapshot `rev` plus resend by request
+  id. No explicit nonces. What changed:
+  - Host never drops a frame quietly (`remote/outq.rs`): bounded queues
+    per kind and per link, a writer that sends control first and takes
+    turns between links; a link that overflows is dropped (only that
+    device's session ends), a control message that can't be queued closes
+    the connection, a binary frame the host can't parse closes it (it used
+    to be skipped). A link's `drop` waits behind its frames (a pairing's
+    `done` arrives before the close).
+  - One request store per device for both paths (`remote/requests.rs`,
+    `mailbox.rs`): an op that changes something needs an id and runs at
+    most once per id; a resend gets the stored answer or `in_progress`
+    and then the answer (by the live link it came on and the mailbox if a
+    resend came that way); a request running when the plugin stopped is
+    `interrupted` (was `repeat`). `web::Op.idempotent` marks the look-ups;
+    `web.hello`'s answer lists the remote ones. `proto.ts` gains
+    `RemoteErrorCode` and `RemoteReply`.
+  - Mailbox gaps: the receiver skips up to `MAX_SKIP` = 64 lost messages
+    (vectors: `mailbox_gap_over_max`, `mailbox_reordered`, `mb_gaps`
+    replace `mailbox_gap`). The relay answers each lane-2 frame `queued`
+    or `refused` (was `err n:0` on refusal only); the host sends one
+    mailbox answer per device at a time and resends one refused `full`
+    (same bytes) when the device links and every 30 s. `rlord-device`
+    drops mailbox frames by `(boot, seq)` as the host does.
+  - Relay: flow control per link; device to host waits only that device
+    and a stall closes the device (4205), never the host; host to device
+    never blocks the host (128-frame device buffer; overflow closes the
+    device with 4205 and tells the host `undeliverable`); `drop` closes
+    with 4205 (was 1000); a host's read bucket scales with 1 + its links.
+    New close code 4205 "reset: reconnect now" in `relay-proto`.
+  - Detection: the host pings every 15 s and gives up after 45 s of
+    silence (was 70 s, relay pings only). Rust's `Instant` on macOS is
+    `CLOCK_UPTIME_RAW`, checked on this machine: it stood 13.6 h behind
+    `CLOCK_MONOTONIC` (time asleep), so it doesn't advance in sleep, and
+    Linux's `CLOCK_MONOTONIC` doesn't count suspend either. The host
+    compares wall and monotonic clocks each second and reconnects at once
+    when either jumped 10 s (covers both kinds of clock).
+  - Tests: `outq` unit tests (order, overflow, close), the request store
+    and outbox bounds, sleep detection, `only_look_ups_are_idempotent`;
+    in `web/tests/remote.rs` a resend by mailbox after the live link died
+    runs once, a relay restart losing the queue then a resend works, a
+    flooding device never breaks another's session, an answer refused by
+    a full queue is sent again; relay tests for per-link stalls, a
+    non-reading device closed alone, `drop` 4205, `queued`/`refused`.
+- Linux CI fixes on #77 (2026-11-18). Two `web/tests/remote.rs` failures
+  on ubuntu runners, both real:
+  - A flooding device held another's snapshot up 12 s (2 s on macOS).
+    The relay reads a host at its rate times (1 + links); the host wrote
+    as fast as the socket took it, so the backlog moved out of the
+    per-link queues into the kernel's socket buffers (megabytes on Linux
+    loopback), first in, first out, and turn-taking no longer applied.
+    The writer now paces itself at 90% of the relay's rate and burst
+    (`ready.limits` gains `burst_bytes`). Reproduced and checked in a
+    Linux container: 12.9 s before, 1.2 s after.
+  - Pairing signalled the new device: the mirror's change (`web.remote_state`)
+    moved `rev`, and the host signals every device without a live session
+    on any move, so a pairing, or a device's own live session ending,
+    woke it (and used up its 30 s signal window). The daemon now marks a
+    relay-status-only change (`changed_relay`, `"relay": true` on
+    `web.subscribe`) and the host signals no one for it.
+  - `advisories`: `proc-macro-error2` (RUSTSEC-2026-0173, unmaintained)
+    comes with `libcrux-ml-kem` through `hax-lib-macros` 0.3.7; no newer
+    `core-models` moves off it. Ignored in `deny.toml` with a reason.
+  - Trailing signal: a change inside a device's 30 s signal window was
+    dropped, so the device missed it until a later change. The host now
+    owes it one signal when the window ends (`remote/signals.rs`), still
+    at most one per window, and forgets it if the device went live or was
+    revoked meanwhile.
+- Owed after slice 3:
+  - **The phone slice must** (the device side of the rule above;
+    `e2e-protocol.md` §4): reconnect in a loop with backoff, at once on
+    4205 (backing off if it repeats), on a network change and on coming
+    to the foreground; run `KKpsk2` each time its host comes online
+    (`host online`, `ready.host`); compare the snapshot's `rev` and fetch
+    when it differs; give every request an id unique for the device and
+    resend unanswered ones by id after any reconnect; when the relay's
+    `boot` changes, resend every mailbox request it has no answer to (the
+    queue is gone); answer `queued`/`refused` (resend a refused frame
+    later, before newer ones); drop mailbox frames by `(boot, seq)` and
+    answers by request id it already has; treat `in_progress` as "wait",
+    `interrupted` as "check, then ask anew".
+  - **The protocol review** (`docs/working/e2e-protocol.md`), before
+    anyone but the user runs a relay. Then promote that doc.
+  - By hand: `rlord-relay` in Docker compose on a real host with a real
+    certificate, a host behind NAT, `rlord-device` on another network;
+    pair, confirm, ask the overlord, revoke. The multi-platform `docker
+    buildx` build, push and attestation and the release workflow's
+    `relay-image` job have not run (no buildx here); the new ghcr.io
+    package starts private and must be made public once.
+  - Adversarial cases not automated end to end: a relay that lets a
+    revoked device through (the core's vectors and the host's
+    allow-list check cover it: `kk_revoked_device_host`,
+    `device_link`), a relay that invents `link` for a device not on the
+    list (covered by `device_link`'s own check, untested through a
+    hostile relay), a relay that swaps two devices' frames, a mailbox
+    frame replayed or skipped through the relay (the core's vectors
+    cover replay, gap and tamper), a recorded pairing replayed after the
+    rendezvous closed. Client-side `bye` `retry_after` and `enroll`
+    handling in the plugin are built but tested only on the relay's side.
+  - Not built: TLS channel binding (open question 9, no), mTLS (5,
+    later), ACME (2, later), compression (provisional in `e2e-crypto.md`;
+    real snapshot sizes still to record), the phone app, panes over the
+    relay (streams 1 and up close the link).
+  - Owed from the spike: phone benchmarks, Firefox.
+  - The CLI's pairing flow against a live daemon has no end-to-end test
+    (the CLI autostarts a real daemon); its logic is unit-tested and the
+    same daemon commands are exercised by `web/tests/remote.rs`.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
@@ -2019,3 +2330,1035 @@ page; 6 needs 3; 7 needs 6; 8 and 9 need 5 and 7.
 5. Defaults taken, not asked: a browser adopts the daemon's default view
    only when it has no saved one; the one-line notice on the other surface
    stays; the filter syntax change already landed (`1a2d5b6`).
+
+## Slice 3 plan: e2e core and the relay
+
+Planned 2026-11-17 (Fable planning agent), on `feat/web-ui-3` from
+`feature/web`. Nothing below is built. Goal: a paired device reaches the
+overlord and the session list of a host behind NAT, through a relay that
+sees only ciphertext, with both network invariants at the top of this doc
+holding and tested. The remote client in this slice is a Rust test client;
+the phone app is the next slice. No remote browser client. No live panes
+yet (the stream ids leave room). No network code in `rlord`.
+
+The user's decisions this plan takes as fixed: `e2e-crypto.md`'s table,
+answers and "Decision after the spike"; the scope given for this slice
+(sans-IO `crates/e2e` from the spike, a separate `rlord-relay`,
+`rlord-web` dialling out to one pinned relay, per-device keys by QR with
+host confirmation, chat and state first). **Compression stays provisional
+and is not built**: nothing below compresses anything, no frame has a
+compression flag, and the relay link refuses transport compression.
+
+Crate versions below were read from crates.io on 2026-11-17: `snow`
+0.10.0, `libcrux-ml-kem` 0.0.11, `wasm-bindgen` 0.2.130, `rustls` 0.23.46,
+`tokio-rustls` 0.26.6, `tokio-tungstenite` 0.30.0 (the plugin's lockfile
+has 0.29.0 as a dev-dependency), `axum` 0.8.9, `webpki-roots` 1.0.12,
+`p256` 0.14.0, `rcgen` 0.14.10, `qrcode` 0.14.1, `rustls-acme` 0.15.4,
+`uniffi` 0.32.2.
+
+What exists today (read from the code, for the implementer):
+
+- The spike (`spikes/e2e/` on its own branch, never merged; read-only at
+  `.claude/worktrees/agent-affb15205011d80a4/spikes/e2e/`): `core/src/`
+  `lib.rs` (`StaticKey`, `RelayId`, `QrPayload`, `channel_id`,
+  `short_code`, `Error`), `handshake.rs` (`Initiator`, `Responder`,
+  `Established`, `prologue`, `pair_psk`, `kk_psk`, `FixedRandom`),
+  `kem.rs`, `session.rs` (`Mode`, `Session`, `padme_len`,
+  `live_padded_len`), `vectors.rs`; `wasm/src/lib.rs` (`E2eSession`,
+  `DeviceHandshake`, `HostAnswer`); `peer/` and `relay/` (a forwarder that
+  only announces its identity); `xtask/` (`vectors`, `wasm`, `sizes`). It
+  is edition 2024 in its own workspace; the main workspace is 2021.
+- `snow` 0.10.0 has `HandshakeState::dangerously_get_raw_split`
+  (`handshakestate.rs`), and no way to save or restore a `TransportState`.
+- `crates/web/src/daemon.rs`: the plugin calls the daemon
+  (`Daemon::call`), and the daemon reaches the plugin only by lines on
+  the `web.subscribe` stream (`Subscription::next` yields `Changed` or
+  `Ui`).
+- `crates/daemon/src/web.rs`: `OPS` (`Op {op, method, args}`), `PASSIVE`,
+  `FORBIDDEN`, `call`, `filtered`; `web.call` takes `{op, args, page}`.
+  `plugin::WEB_PROTOCOL` is 2.
+- `xtask/src/check_deps.rs`: `DENIED`, `denied_in_tree`, `MAIN_CRATES`.
+  `rlord`'s tree already has `sha2`, `getrandom` and `rand`; it has no
+  `ring`, `p256` or `base64`.
+- `xtask/src/version.rs`: `Version::web_tarball`, `tarballs`,
+  `workflow_assets`, `dev_assets`; `LINUX` and `MAC` targets.
+
+### Decisions
+
+#### Crates
+
+| Crate | Package, output | Depends on | Notes |
+| --- | --- | --- | --- |
+| `crates/e2e` | `robot-overlord-e2e`, lib `rlord_e2e` | `snow`, `libcrux-ml-kem`, `chacha20poly1305`, `sha2`, `curve25519-dalek`, `getrandom`, `zeroize`, `base64` (the spike's exact pins) | Sans-IO: no tokio, sockets, files or clock. `forbid(unsafe_code)`. Builds native and `wasm32-unknown-unknown`. |
+| `crates/e2e-wasm` | `robot-overlord-e2e-wasm`, `cdylib` | `rlord_e2e`, `wasm-bindgen` =0.2.130, `getrandom` with `wasm_js` | The spike's wrapper minus the benchmark-only calls (`encrypt_copy`, `LoopbackPair`). WASM only. |
+| `crates/relay-proto` | `robot-overlord-relay-proto`, lib `rlord_relay_proto` | `p256` (ECDSA), `sha2`, `serde`, `serde_json`, `base64` | The relay link's messages, frame headers, the two signed transcripts, the relay address. No Noise, no KEM. Sans-IO; builds to WASM too. |
+| `crates/relay` | `robot-overlord-relay`, bin `rlord-relay` | `rlord_relay_proto`, `axum` (ws), `tokio`, `tokio-rustls`, `rustls` (ring provider), `rusqlite`, `toml`, `serde`, `anyhow`, `tracing` | **Not** `rlord_e2e`, not `rlord-core`, not `rlord-daemon`. |
+| `crates/web` (existing) | `rlord-web` | adds `rlord_e2e`, `rlord_relay_proto`, `tokio-tungstenite` (rustls, ring, `webpki-roots`) | New module tree `src/remote/`. |
+| `crates/e2e-device` | `robot-overlord-e2e-device`, lib + bin `rlord-device` | `rlord_e2e`, `rlord_relay_proto`, `tokio-tungstenite` | The test client: a library the integration tests drive, and a small CLI for pairing by hand. Never released or packaged. |
+
+- All `publish = false`, in `members`, not in `default-members`, not in
+  `version::CRATES`.
+- `crates/e2e-ffi` (UniFFI) is not created. **UniFFI-ready** means the
+  public surface of `rlord_e2e` keeps to what UniFFI's macros can export
+  later without a rewrite: owned arguments and returns (`Vec<u8>`,
+  `String`, fixed arrays wrapped in structs), no lifetimes or generics in
+  public signatures, constructors returning `Result`, one flat `Error`
+  enum, state machines as owned objects consumed or mutated by methods.
+  A doc comment at the top of `lib.rs` states the rule; the WASM wrapper
+  is the first consumer held to it.
+- `crates/e2e/src/`: `lib.rs` (constants, `Error`, `StaticKey`,
+  `DeviceId`), `qr.rs` (`QrPayload`), `handshake.rs`, `kem.rs` (libcrux
+  only; the RustCrypto backend and the classical baseline are dropped,
+  the `pq-*` features with them), `session.rs` (live `Session`),
+  `mailbox.rs` (new, below), `stream.rs` (new: stream ids and
+  fragmenting), `vectors.rs` behind the `vectors` feature. Ported to
+  edition 2021.
+- **The relay needs no crypto core** is kept as a checked property: the
+  P-256 signing it does need lives in `relay-proto`, not in `rlord_e2e`
+  (this replaces `e2e-crypto.md`'s "relay-identity signing behind a
+  feature" of `crates/e2e`).
+- `rust-toolchain.toml` gains the `wasm32-unknown-unknown` target.
+
+#### The e2e core beyond the spike
+
+- **Handshake kinds** in the prologue: 1 pairing (`IKpsk2`), 2 live
+  reconnect (`KKpsk2`), 3 mailbox keying (`KKpsk2`, new). The prologue
+  stays `label | VERSION | kind | origin | relay key fingerprint | id`,
+  with the relay identity **this connection proved** (below), and the id
+  the rendezvous id (pairing) or `channel_id` (the others).
+- **A session exists only after the device's first transport frame
+  decrypts**, for all three kinds (the spike's rule for pairing). A
+  replayed message 1 gets a message 2 and nothing else.
+- **Any decrypt failure ends the session** (`Session` poisons itself and
+  every later call returns `Error::Decrypt`); the owner closes the link.
+- **Streams** (`stream.rs`): the first plaintext byte of a live frame is
+  a stream id. `0` is control; `1..` are reserved for panes and unused.
+  The second byte is a flags byte whose bit 0 means "more follows", so a
+  control message larger than one 16 KiB frame (a snapshot) is sent as
+  fragments and reassembled (`Reassembler`, 1 MiB limit, the local
+  control socket's). Other flag bits must be zero and are rejected.
+- **Mailbox** (`mailbox.rs`, `MailboxSession`): keyed by a kind-3
+  handshake run over a live link; the two raw keys come from
+  `dangerously_get_raw_split`, and the mailbox runs its own cipher state
+  over them (`chacha20poly1305`, the version `snow` resolves; counter
+  nonce; Noise's `REKEY` after every message; Padmé padding). That is
+  what makes it saveable: `export() -> Vec<u8>` and `import(&[u8])`
+  (version byte, both keys, both counters), which the owner stores.
+  Vectors prove its frames equal `snow`'s own transport frames for the
+  same keys, rekeys included. A decrypt failure or a gap discards the
+  state on both ends; the next live link keys a new one.
+  - Advance-then-save order is fixed: the sender saves the advanced
+    state before handing the frame out; the receiver saves after it has
+    acted. A crash between loses at most that message, which the sender
+    resends by id.
+- **Vectors**: `crates/e2e/vectors/v1.json`, written by `cargo xtask e2e
+  vectors` and checked by `--check` (a test fails when the committed file
+  differs). Added to the spike's set: the kind-3 handshake, a mailbox
+  sequence with rekeys, export and import mid-sequence, fragmenting, and
+  the new failures (wrong kind, a poisoned session, a mailbox gap). The
+  two 16 KiB frames go (the spike's file was 232 KB); one 16 KiB frame's
+  hash stays.
+
+#### WASM build
+
+`cargo xtask e2e wasm` (`xtask/src/e2e.rs`): `cargo build --release
+--target wasm32-unknown-unknown -p robot-overlord-e2e-wasm` with
+`--cfg getrandom_backend="wasm_js"` and `-C target-feature=+simd128` at
+O3, then bindgen in process (`wasm-bindgen-cli-support` =0.2.130, `--target
+web`), into `crates/e2e-wasm/pkg/` (not committed). No `wasm-pack`, no
+`wasm-opt`.
+
+Nothing loads it in the page in this slice (no remote browser client; the
+local page needs no E2E). It is kept alive by tests: `cargo xtask e2e
+test-wasm` runs Vitest (`crates/web/ui/test/e2e/`, a separate Vitest
+project so `web check` doesn't need the WASM) over the vectors in Node and
+one interop run against the native test client. The worker, Trusted Types
+policy and CSP change of `e2e-crypto.md` belong to the slice that ships a
+WASM client (the phone's WebView).
+
+#### The relay link (relay ⇄ host, relay ⇄ device)
+
+One websocket per peer, `wss://<host>/v1`, opened by the peer. Control
+messages are JSON text frames (at most 4 KiB); data is binary frames (at
+most 20 KiB). All of it is defined in `relay-proto` (`msg.rs`, `frame.rs`,
+`auth.rs`, `address.rs`) and used by all three parties.
+
+**Relay identity.** A P-256 key made on the relay's first start
+(`<data dir>/relay.key`, 0600). Its fingerprint is SHA-256 of the SEC1
+uncompressed public key (32 bytes, the QR's field). The **relay address**
+is one string, `https://relay.example.com#k=<base64url fingerprint>`,
+printed by `rlord-relay address` and pasted into `rlord remote setup`: the
+pin travels with the origin. The origin is normalised (lower-case host,
+no path, no default port) and at most 255 bytes.
+
+**Connecting** (5 s limit from upgrade to `ready`):
+
+1. Peer: `{"t":"hello","v":1,"role":"host"|"device"|"pair","key":<P-256
+   public>,"nonce":<32 bytes>,"host"?,"rendezvous"?,"enroll"?}`.
+   A device names its host's fingerprint; a pairing device names the
+   rendezvous id; a host enrolling for the first time gives `enroll`,
+   an object (`{"kind":"token","token"}`; other kinds are reserved for
+   account login, "Production relay" below).
+2. Relay: `{"t":"challenge","origin","key","nonce","sig"}`. `sig` is
+   ECDSA P-256 over `"rlord-relay/1 relay" | origin | relay key | peer
+   key | peer nonce | relay nonce`.
+3. The peer checks, in this order and before sending anything else: the
+   origin is byte-for-byte its pin; the key's fingerprint is its pin; the
+   signature verifies. Any miss closes the socket and is reported as
+   "wrong relay" (never retried against anything else). Then:
+   `{"t":"auth","sig"}` over `"rlord-relay/1 peer" | role | origin |
+   relay key | peer key | relay nonce | peer nonce | host or rendezvous`.
+4. Relay: `{"t":"ready","boot","host":"online"|"offline","signal":n,
+   "queued":n}` (the last three for a device), or a close code: 4401 bad
+   signature, 4403 not registered or not on the host's list, 4408 too
+   slow, 4409 replaced by a newer connection of the same identity, 4426
+   unsupported `v`, 4429 over a limit, 4402 suspended, 4503 overloaded
+   (the last two, `bye` and `enroll`: "Production relay" below).
+
+- The proved origin and key are what go into every Noise prologue.
+- **No channel binding to TLS** in v1 (the signed transcript does not
+  include a TLS exporter), so that a self-hoster can put a proxy in
+  front. A middlebox that passes TLS validation for the pinned origin and
+  forwards the challenge faithfully learns what the relay learns
+  (metadata) and nothing more; it cannot become a different relay. Open
+  question 9.
+- **No redirects, no fallbacks**: a 3xx on the upgrade is a failed
+  connection; the client has exactly one URL, built from the pin.
+  `permessage-deflate` is never offered or accepted.
+- **TLS**: the certificate must validate for the origin's host against
+  `webpki-roots`, plus the PEM in `[remote] ca_file` when set (a private
+  CA on premises). Plain `http://127.0.0.1:<port>` origins are allowed,
+  loopback only, so the tests run the real binaries.
+
+**After `ready`**, control messages carry a number `n` and are answered
+`{"t":"ok","n"}` or `{"t":"err","n","code"}`:
+
+| From | Message | Meaning |
+| --- | --- | --- |
+| host | `devices {allow: [fingerprints]}` | The whole allow-list, on every connect and every change (heals drift, as `web.pages` does). A device not on it is refused and its queue dropped. |
+| host | `rendezvous {id, ttl}` / `rendezvous_close {id}` | Open a pairing rendezvous (at most 300 s, 4 at once). |
+| host | `signal {device}` | "Something for you": sets that device's flag. No content. |
+| host | `drop {link}` | Close a device's link (decrypt failure, revocation). |
+| relay → host | `link {id, device, kind}` / `unlink {id}` | A device (or a pairing device, with its rendezvous id) connected or went. |
+| device | `ack_signal` | Clears its flag after it has re-synced. |
+| either | `ack {seq, device?}` | Deletes queued mailbox messages up to `seq`. |
+| relay → device | `host {state}` | Its host came or went. |
+
+Binary frames: device side `lane | payload`; host side `link (u32) | lane
+| payload`. Lane 1 is live: forwarded at once to the other end of the
+link, dropped with `{"t":"undeliverable"}` when there is none. Lane 2 is
+the mailbox: host frames carry the device's fingerprint instead of a link
+(the device may be away), and frames from the relay carry a sequence
+number. The payload is `rlord_e2e`'s bytes, untouched and unparsed.
+
+**"Anything for me?"** is the `ready` message: a device that connects,
+authenticates and reads `signal: 0`, `queued: 0` and an unchanged `boot`
+has nothing to fetch and has run no Noise handshake. A new `boot` (the
+relay restarted and forgot its flags) counts as "yes". The host signals a
+device when the daemon's `rev` moves while that device has no live link,
+at most once per 30 s per device. The phone's platform push hangs off
+this same flag in the next slice.
+
+#### What the relay keeps, and its limits
+
+- **On disk**, all through the `Store` trait ("Production relay" below;
+  slice 3's one backend is `<data dir>/relay.db`, SQLite, 0600,
+  `rusqlite` bundled, which this repo already cross-builds static):
+  hosts (fingerprint, account, status, first seen, last seen), devices
+  (host, fingerprint), enrolment tokens (hashed, with their account).
+  And `relay.key`. Nothing else.
+- **In memory only**: connections, links, rendezvous, signal flags,
+  mailbox queues. A restart forgets them; senders resend by id. No
+  ciphertext is ever written to disk.
+- **Never**: content keys, names, plaintext, logs of payloads. The log
+  has connection events with fingerprints shortened to 8 hex characters.
+- **Registration** (`[hosts] registration`): `"token"` (default: a host's
+  first connection must carry a token from `rlord-relay token new`),
+  `"open"` (any host key, up to `max_hosts`), `"closed"` (only
+  `rlord-relay host add <fingerprint>`). A relay refuses a host it has
+  not registered (the spec's relay-side enforcement).
+- A host makes its relay-identity key for one relay and never reuses it
+  (below), so "registered with two relays" cannot happen by accident.
+- **Defaults**, all in `relay.toml` under `[limits]`:
+
+  | Limit | Default |
+  | --- | --- |
+  | Hosts (`max_hosts`) | 1000 |
+  | Devices per host | 16 |
+  | Connections per identity | 1 (a newer one replaces the older, 4409) |
+  | Unauthenticated connections per address | 8 |
+  | Bytes per connection | 256 KiB/s, burst 1 MiB (live panes will raise it) |
+  | Mailbox queue, per device and direction | 32 messages, 128 KiB, 600 s; `mailbox_ttl = 0` turns queues off |
+  | Rendezvous | 300 s, 4 per host, 3 failed attempts closes it |
+  | Idle | ping every 25 s, closed after 60 s of silence |
+  | Unused host (`host_expiry_days`) | 90 (0 = never) |
+
+  A full queue refuses the new message (`err`, code `full`); it never
+  drops an older one, since the mailbox cipher needs order.
+- **Push-only holds for the relay too**: it listens and never dials a
+  host or a device. In this slice it makes no outbound connection at all.
+
+#### `rlord-relay`: commands and config
+
+`rlord-relay serve [--config PATH]`, `address`, `token new [--uses N]
+[--ttl DURATION]`, `host list|add|remove`, `check` (loads the config,
+opens the store, proves the key signs and verifies, exits), `--version`.
+
+```toml
+origin = "https://relay.example.com"   # what peers pin; must be how they reach it
+listen = "0.0.0.0:443"
+data_dir = "/var/lib/rlord-relay"
+
+[tls]
+mode = "files"          # "files" | "proxy"
+cert = "/etc/rlord-relay/fullchain.pem"
+key = "/etc/rlord-relay/privkey.pem"
+
+[hosts]
+registration = "token"  # "token" | "open" | "closed"
+
+[limits]                # the table above
+```
+
+- `mode = "files"`: the relay terminates TLS (`rustls`, ring provider,
+  TLS 1.3 and 1.2); the files are re-read on SIGHUP and every 12 hours,
+  so a renewal needs no restart.
+- `mode = "proxy"`: plain HTTP for a reverse proxy that terminates TLS
+  (Caddy in the shipped compose file). It binds loopback unless `listen`
+  says otherwise; the client address for the per-address limit then comes
+  from `X-Forwarded-For`.
+- Built-in ACME and mTLS are not in this slice (open questions 2 and 5).
+
+#### The host side: `rlord-web` dials out
+
+`crates/web/src/remote/`: `mod.rs` (the task: start, backoff, state),
+`keys.rs`, `link.rs` (the relay connection and its auth), `pairing.rs`,
+`devices.rs`, `session.rs` (a device's live session and its ops),
+`mailbox.rs`, `audit.rs`.
+
+- **Off unless asked.** The plugin opens a relay connection only when
+  `[remote] enabled = true`, a pin is set, and there is at least one
+  paired device or an open pairing. A user of the local web UI who never
+  runs `rlord remote setup` has a plugin that never dials out. The
+  listener stays `127.0.0.1` only: nothing remote is ever accepted.
+- **Keys** in `<data dir>/remote/` (0700; files 0600 through
+  `rlord_core::private::write`): `host.key` (X25519 static), `relay.key`
+  (the host's P-256 relay identity), `pin.json` (the origin and
+  fingerprint these keys were made for), `devices.json`, and
+  `mailbox-<device id>.bin`. The `rlord` binary and the daemon never read
+  them.
+- **The pin is part of the keys.** `rlord remote setup <relay address>`
+  writes `[remote] relay` and `relay_key` and makes the keys. If the
+  config's relay later differs from `pin.json`, the plugin refuses to
+  connect and says so (`rlord remote status`). Moving to another relay
+  is `rlord remote setup --reset <address>`: it deletes `remote/` (host
+  keys and every device), so every device pairs again. There is no other
+  way to change the relay.
+- **Connection**: one socket, reconnect with the supervisor's backoff
+  shape (1 s doubling to 60 s, never given up while enabled). A "wrong
+  relay" result (origin, key or signature) is not retried until the
+  config or the plugin restarts, and is shown in `rlord remote status`.
+- **Audit** (`<data dir>/remote.log`, 0600, rotated at 1 MiB): one line
+  per pairing, confirmation, revocation, link and remote op (time, device
+  id, op name; never arguments).
+- A device may send 20 ops per second (burst 40); over that the op fails
+  with `rate_limited`.
+
+#### Pairing and the host's confirmation
+
+Pairing, confirming and revoking are user-only: never an MCP tool, never
+reachable by a remote device.
+
+1. **Start**: `rlord remote pair`, `:remote` in the list, or "Devices" in
+   the local page. The plugin makes a rendezvous id and a pairing secret,
+   opens the rendezvous at the relay (connecting first if this is the
+   first device), and returns the QR string (`RLORD1:…`, the spike's
+   payload). It is valid for 300 s and for one device.
+2. **Show**: the terminal draws the QR from the string
+   (`rlord_core::qr`, new, on the `qrcode` crate, half-block characters;
+   not network code); the page draws the same matrix, which the daemon's
+   answer carries (`qr_rows`). `rlord remote pair --text` prints the
+   string for the test client.
+3. **Handshake**: the device connects with role `pair`, runs `IKpsk2`
+   with the ML-KEM step, and its first transport frame carries its name
+   (clipped to 40 characters, control characters removed) and its relay
+   public key. A wrong secret counts as a failed attempt; three close
+   the rendezvous.
+4. **Confirm**: the host shows the device's name and the six-digit code
+   (`short_code`); the device shows the same code. The pairing link
+   stays open while it waits; the host tells the device `waiting`. Until
+   the user confirms, the device is not stored, not on the relay's
+   allow-list and can call nothing.
+   - CLI: `rlord remote pair` waits, prints name and code, asks `[y/N]`.
+     `rlord remote confirm` / `reject` do the same for a pairing started
+     elsewhere.
+   - TUI: a pairing waiting for confirmation puts a notice on the status
+     line of every surface; `:remote` opens the Devices screen
+     (`crates/tui/src/remote.rs`), where the waiting device shows its
+     name and code with confirm and reject keys.
+   - Local page: "Devices" in the header (`ui/src/views/Devices.tsx`):
+     the same list, QR, code and buttons. Local pages only.
+5. **Done**: on confirm the plugin stores the device (`devices.json`: id,
+   name, static public key, relay key fingerprint, paired at, last
+   seen), sends the relay the new allow-list, tells the device `done`
+   with the host's name, and destroys the secret and the rendezvous. On
+   reject, on 120 s without an answer, or if the device's link drops
+   first: `rejected`, nothing stored, start again.
+
+The device id is the first 8 bytes (hex) of a labelled hash of its
+static key; it names the device in the CLI, the log and `web.call`.
+
+#### Revocation and expiry
+
+- `rlord remote revoke <device>` (and the Devices screens): the plugin
+  deletes the record and its mailbox file, drops its live link, and
+  sends the relay the shorter allow-list. `KKpsk2` with a deleted key
+  cannot complete; the relay refuses the device before that.
+- `rlord remote devices` lists them (name, id, paired, last seen, linked
+  now).
+- A device unused for `[remote] device_expiry_days` (default 90, 0 =
+  never) is revoked by the plugin at start and once a day.
+- `rlord remote disable` sets `enabled = false` and closes the relay
+  connection; devices stay paired. `rlord remote setup --reset` is the
+  only thing that removes the host's keys.
+- `rlord web remove` also deletes `remote/` after asking, since the
+  plugin that could use it is gone.
+
+#### How remote ops reach the daemon
+
+A live session's control stream carries the local control socket's
+messages unchanged: requests `{"id","op","args"}`, answers `{"id","ok"}`
+or `{"id","error":{"code","message"}}`, events
+`{"event":"hello","version","rev","device"}` and
+`{"event":"changed","rev"}`. The plugin passes each request to the daemon
+as `web.call {op, args, via: "remote", device: "<id>"}`.
+
+- **One allow-list.** `web::Op` gains `remote: bool`. `web::call` reads
+  `via` (`"local"` or `"remote"`; missing or anything else is refused)
+  and refuses an op whose `remote` is false with `NotAllowed` when it
+  came from a device. `"remote."` joins `FORBIDDEN`.
+  `plugin::WEB_PROTOCOL` becomes 3.
+
+  | Remote: yes | Remote: no (local pages only) |
+  | --- | --- |
+  | `snapshot`, `session.get`, `view.default`, `overlord.ensure`, `overlord.ask`, `overlord.switch`, `overlord.new_session`, `overlord.messages` (new), `session.resume`, `session.restart`, `session.stop`, `session.archive`, `session.unarchive`, `session.rename`, `session.describe`, `session.notes`, `session.tag`, `session.pin`, `session.new`, `session.fork`, `form.defaults`, `form.repos` | `page.report`, `page.pending`, `keys.list`, `form.setup`, `form.setup_save`, `overlord.setup_request`, and the new `device.*` ops |
+
+  Direct launches are remote too (slice 2 answer 4). What writes
+  `config.toml` or manages devices is not.
+- **New op `overlord.messages {before, limit}`** (both): the active
+  overlord's recent conversation as text, read by plain code from its
+  transcript (`rlord_core::agents::transcript`, as `recall.rs` does), at
+  most 50 messages, each clipped to 4 KiB. It is what a chat view needs
+  beside `overlord.ask`; `proto.ts` `OPS` gains it with its test.
+- **New local-only ops**, answered in `web.rs` by asking the plugin
+  (below): `device.list`, `device.pair`, `device.pair_cancel`,
+  `device.confirm`, `device.reject`, `device.revoke`. They are what the
+  page's Devices view calls.
+- **Not a surface yet.** A remote call carries no `page`, never counts
+  as use of a screen, and gets no `ui` commands: `ui::target` is
+  unchanged. A describe form sent from a device is answered on the
+  host's own screen. Making the phone a third surface is the phone
+  slice's.
+- **Panes**: the plugin answers anything on streams 1 and up by closing
+  the link. `web.pane_target` is never called for a device.
+- **Mailbox**: only `overlord.ask` and `overlord.new_session` may travel
+  by the mailbox, each in one frame, when the device finds its host
+  offline or the live link down. The host answers by the mailbox with
+  the usual answer, keeps the last 64 request ids per device and drops a
+  repeat. Everything else needs a live link. Open question 1.
+
+**User-only commands** (`crates/daemon/src/remote.rs`): `remote.status`,
+`remote.setup`, `remote.pair`, `remote.pair_cancel`, `remote.confirm`,
+`remote.reject`, `remote.devices`, `remote.revoke`, `remote.disable`,
+called by the CLI and the TUI over the socket, never on `OPS`, never in
+`mcp.rs`.
+
+- The daemon holds no keys and does no crypto. It forwards each command
+  to the plugin as a line on the `web.subscribe` stream,
+  `{"notify":"remote","id","req"}` (never coalesced, like `ui` lines),
+  and waits up to 10 s for the plugin's `web.remote_reply {id, ok |
+  error}`. `crates/web/src/daemon.rs`'s `Subscription::next` gains
+  `Event::Remote {id, req}`.
+- The plugin reports changes with `web.remote_state {relay, connected,
+  error, devices: [{id, name, paired_at, last_seen, linked}], pending:
+  {name, code, expires} | null}`. The daemon keeps that mirror
+  (`Daemon::remote_state`), answers `remote.status` and `remote.devices`
+  from it, calls `Daemon::changed()`, and sends the confirmation notice
+  (`notice_others`' path, to every surface). `snapshot` for a local page
+  gains `remote: {enabled, connected, devices, pending}`; a device's
+  snapshot does not.
+- `web::start_if_enabled` also starts the plugin when `[remote] enabled`
+  is true; `rlord remote …` without the plugin names `rlord web install`.
+
+#### Config
+
+```toml
+[remote]
+enabled = false        # true: rlord-web keeps a connection to the relay below
+relay = ""             # https://relay.example.com (set by `rlord remote setup`)
+relay_key = ""         # the relay's key fingerprint, base64url (same command)
+ca_file = ""           # extra root certificate (PEM) for a private relay
+device_expiry_days = 90
+```
+
+`crates/core/src/config.rs` `RemoteConfig`; the template gets the section
+with the same comments. There is no default relay. `rlord remote setup`
+writes the first three with `Config::set_*` (the code `rlord web remove`
+uses for `[web] enabled`).
+
+#### The overlord
+
+Nothing new for it: no MCP tool, no meta-context, no list concept, and
+devices are not visible to it. `overlord.md` and `mcp.rs` are unchanged.
+A daemon test asserts no MCP tool reaches a `remote.*` method.
+
+#### `check-deps`
+
+`xtask/src/check_deps.rs` gets three checks, each with a planted-name
+test like today's:
+
+1. **`rlord`** (existing): `DENIED` gains `robot-overlord-e2e`,
+   `robot-overlord-e2e-wasm`, `robot-overlord-relay`,
+   `robot-overlord-relay-proto`, `robot-overlord-e2e-device`, `snow`,
+   `libcrux-ml-kem`, `chacha20poly1305`, `curve25519-dalek`, `p256`,
+   `ecdsa`, `ring`, `aws-lc-rs`, `tokio-rustls`, `webpki-roots`,
+   `wasm-bindgen`. `qrcode` is allowed (it draws a string).
+2. **`rlord-relay` holds no content crypto and none of rlord**: its tree
+   must not name `robot-overlord-e2e`, `snow`, `libcrux-ml-kem`,
+   `ml-kem`, `chacha20poly1305`, `curve25519-dalek`, `x25519-dalek`,
+   `robot-overlord-core`, `robot-overlord-daemon`, `robot-overlord-web`.
+3. **`rlord_e2e` is sans-IO**: its tree must not name `tokio`, `mio`,
+   `axum`, `hyper`, `tungstenite`, `rustls`, `socket2`.
+
+A fourth, source-level: no file under `crates/web/src/` other than
+`main.rs` names `TcpListener` (the plugin's one listener stays the
+loopback one), and `crates/relay` is the only crate with a non-loopback
+bind.
+
+#### Release and packaging of `rlord-relay`
+
+- **Tarballs**: `rlord-relay-v<ver>-<target>.tar.gz` for the two Linux
+  targets (static musl): the binary, both licences, `relay.toml.example`,
+  `rlord-relay.service`. `Version::relay_tarball(target)` in
+  `xtask/src/version.rs`, added to `tarballs()` and `workflow_assets()`
+  for `LINUX` only, so `SHA256SUMS`, the attestations, preflight and
+  `verify_and_publish` cover it. No macOS tarball (a relay is a server; a
+  Mac runs it from a checkout), so a dev build's `dev_assets()` has none.
+- **Build** (`xtask/src/build.rs`): `cargo zigbuild -p
+  robot-overlord-relay` per Linux target in `build-release linux`; no
+  compiled-in hash (it is not a plugin of `rlord`; its users verify with
+  `SHA256SUMS` and `gh attestation verify`).
+- **Image**: `ghcr.io/robot-lord/rlord-relay:<version>` and `:latest`
+  (stable releases only), `linux/amd64` and `linux/arm64`, `FROM scratch`
+  with the static binary and a non-root user id, built from the release's
+  own tarballs by `cargo xtask relay-image` (plain `docker buildx`, no
+  marketplace action) in a new `relay-image` job of `release.yml` after
+  `smoke-linux`; pushed and attested only when the release is published.
+  The job needs `packages: write`.
+- **Self-hosting files** in `deploy/relay/`: `Dockerfile`, `compose.yml`
+  (the relay in `proxy` mode behind Caddy, which gets the certificate),
+  `Caddyfile`, `relay.toml.example`, `rlord-relay.service` (systemd, for
+  the tarball with `files` mode).
+- **Smoke** (`smoke-linux`, each distro): `rlord-relay --version`,
+  `rlord-relay check` against the example config, and `rlord-relay
+  address` printing a parseable address.
+- **Docs**: a new official doc `docs/relay.md` (indexed from
+  `docs/README.md`): what the relay sees and never sees, running it
+  (Docker compose, or tarball and systemd), DNS and TLS, registration
+  modes and tokens, limits, backup (the key and the database), upgrades,
+  and that losing `relay.key` means every host sets up again.
+- Not on crates.io, not in Homebrew, not in the deb or rpm.
+- **Versions**: the relay shares the workspace version. The link's `v`
+  is separate (1); a relay refuses another `v` with 4426, and the host
+  shows "the relay speaks another protocol version" rather than
+  retrying.
+
+#### Production relay: requirements and where they land
+
+The user's four requirements ("Production relay" in the spec above),
+checked one by one. Each says what slice 3 builds or reserves now, what
+waits for a later **production-relay slice**, and where this plan
+disagrees with the proposal as given. The design choices are open
+questions 12 to 18; nothing here settles them. This subsection amends
+the relay decisions above where it says so.
+
+**The rule that bounds all four: accounts govern access to the relay,
+never the keys.** The account, the tier and the store never appear in
+the QR, a Noise prologue or a device record. A device is authorised by
+its host (the allow-list the host sends, and the host's own
+`devices.json` and static keys), never by an account login. So a
+compromised or hostile account service can refuse service, or register
+hosts of its own under an account; it cannot add a device to an existing
+host, read anything, or move a host. The adversarial tests already hold
+the relay to that ("a relay that invents `link` for a device not on the
+allow-list").
+
+**1. Modular deployment, storage behind an abstraction.**
+
+- *Agreed in part.* All durable access in `crates/relay` goes through
+  one trait from the start (`src/store.rs`, `trait Store`), with SQLite
+  as slice 3's only backend. Other backends come later behind cargo
+  features, so a self-hoster's binary never links a cloud SDK.
+- *Pushback: plain get/put/delete is not enough, and "durable state is
+  session information" is the wrong way round.*
+  - Sessions are the one thing that must **not** be durable: connections,
+    links, rendezvous, signal flags and mailbox queues live in a relay
+    process's memory. What is durable is registration: host key →
+    account and status, a host's device allow-list, enrolment tokens,
+    and later account records and usage totals.
+  - The trait needs four things a bare KV lacks: a **conditional write**
+    (a version per record: token use-once, replacing an allow-list,
+    two relays writing the same host), a **prefix scan** (a host's
+    devices, an account's hosts), **expiry** (as an `expires_at` field
+    the reader checks; a backend's own TTL is only cleanup), and
+    nothing else. Proposed shape: `get(ns, key) -> (bytes, version)`,
+    `put(ns, key, bytes, expect: Option<version>)`, `delete(ns, key,
+    expect)`, `scan(ns, prefix)`.
+  - **No durable counters.** Metering a proxy with a store write per
+    frame, or per second per connection, is the wrong cost. Counters
+    live in memory per account and are flushed as periodic usage records
+    (approximate by one flush interval after a crash). Quota checks read
+    memory.
+  - **S3 is a poor fit** for anything but rarely-changing records:
+    conditional writes exist, but there is no scan-by-prefix that is
+    cheap or consistent enough for an allow-list on every connect, and
+    no usable expiry. DynamoDB, Redis and Postgres all fit the four
+    operations.
+- *Pushback: the store does not make the relay multi-node.* Two relay
+  processes sharing a store still can't splice a host on one to a device
+  on the other. That needs routing (a load balancer that sends a host
+  and its devices to the same process, or relay-to-relay forwarding),
+  and it is where queues and signal flags would have to move too. Moving
+  mailbox queues into a shared store would also end "no ciphertext on
+  disk" and put it with a third party. Recommended: one process first
+  (a proxy for kilobytes per second per link goes a long way on one
+  machine), routing designed when it is needed. Open questions 12 and
+  13.
+- *Slice 3:* the `Store` trait and its SQLite backend; a conformance
+  test suite any backend must pass (`crates/relay/tests/store.rs`);
+  records as versioned JSON values under namespaces `host`, `device`,
+  `token`. The pairing `done` message also gives the device the host's
+  relay key fingerprint (it needs it for `hello.host`; a later routing
+  key would be derived from it).
+- *Later:* the chosen backend(s); routing between processes; a
+  migration command between stores.
+
+**2. Identity monitoring: which client, which account.**
+
+- *No new identity on the wire is needed.* Every connection already
+  proves a P-256 key. The relay maps host key → account at registration;
+  a device belongs to its host's account through the allow-list. "Which
+  client" is the fingerprint; "which account" is a lookup.
+- *Slice 3 (amends "What the relay keeps"):* a host record has `account`
+  and `status` (`active`, `suspended`); an enrolment token is made for
+  an account (`rlord-relay token new --account NAME`; a self-hosted relay
+  with no accounts uses the one account `local`). Every connection's
+  state carries its account and the limits that apply; an in-memory
+  `Meter` counts bytes each way, messages and connections per account
+  and per identity. `rlord-relay host suspend|resume` sets the status; a
+  suspended host and its devices are refused with close code 4402, which
+  clients show and do not retry.
+- *Reserved in link v1 now:* `ready` may carry `limits` (what this
+  account's tier allows: devices, bytes per second, live panes), so a
+  client can say why something is refused; `err` and the new `bye`
+  message (below) carry a machine-readable `code`.
+- *Later:* durable usage records, tiers as named limit sets, an admin
+  interface for ban and allow, usage shown to the user.
+- *The privacy trade-off, to state in `docs/relay.md` and
+  `SECURITY.md`.* A relay with accounts learns, beyond the list in
+  `e2e-crypto.md` ("What the relay sees"): which person or organisation
+  (as far as the login identifies one) owns which hosts; how many hosts
+  and devices they have; each one's addresses, times online and volume;
+  and with billing, who pays. It still learns no content, names of
+  sessions or devices, or content keys. A self-hosted relay without
+  accounts sees only key fingerprints. Hosted is therefore less private
+  than self-hosted in metadata, equal in content.
+- *Pushback:* devices should not log in to an account. The phone is
+  paired by QR and authorised by its host; an account login on the phone
+  would tie E2E reachability to the account service and add a second
+  identity to protect, for nothing the allow-list doesn't already give.
+
+**3. Load shedding.**
+
+- *A constraint the crypto sets:* a live lane frame can never be
+  dropped. The Noise session counts frames; one missing frame poisons
+  it. So shedding is done by **backpressure** (stop reading from the
+  sender) and by **closing connections**, never by dropping frames. The
+  mailbox lane refuses a new message when full (already planned).
+- *Slice 3 (amends the limits):* every per-link buffer is bounded (64
+  frames; the spike's forwarder used unbounded channels). A full buffer
+  stops the relay reading from the sender; a link stalled for 10 s is
+  closed. Limits are looked up per account (`Limits` from the
+  `Authorizer`, below), not read from one global table. A global
+  `max_connections`: at the cap an upgrade is refused with HTTP 503 and
+  `Retry-After` before any signature work. Before closing for load or
+  rate, the relay sends `{"t":"bye","code","retry_after"}`; close code
+  4503 means overloaded. The host and the test client honour
+  `retry_after` with jitter and never reconnect faster than it says.
+- *Later:* shedding order under pressure (unauthenticated first, then
+  pairing, then by tier); per-account aggregate throughput and
+  connection caps tied to tiers; a health endpoint and metrics on a
+  separate loopback listener; draining for a deploy (`bye` to everyone
+  with a spread of `retry_after`).
+
+**4. Accounts and login.**
+
+- *The key stays the identity; an account is a binding of keys to a
+  person.* "More identifiable than tokens" is met by binding a host's
+  relay key to an account once, not by giving the host a password or a
+  long-lived bearer token. After binding, the host authenticates as in
+  slice 3: its key, signed challenge. Nothing account-related is stored
+  on the host besides the key it already has.
+- *Pluggable, one code path.* The relay asks an `Authorizer`
+  (`crates/relay/src/policy.rs`) one question when an unknown or known
+  key connects: admit (account, limits), refuse (code), or pending
+  (below). Slice 3 ships `StaticAuthorizer`: the `token`, `open` and
+  `closed` modes, accounts as plain labels. A hosted service plugs in an
+  authorizer that asks the account service. Self-hosting needs no
+  account service and no login (open question 16).
+- *Registering a host from rlord, keeping the invariants.* The host may
+  only ever dial its one pinned relay, so the login must not introduce a
+  second server the plugin talks to. Proposed: a **device-authorisation
+  flow over the relay link itself**. `rlord remote login` (CLI, TUI or
+  local page, through the daemon to `rlord-web`, as every `remote.*`
+  command) connects to the pinned relay with the not-yet-registered key;
+  the relay proves its identity as always, then answers `enroll {url,
+  code, expires}` instead of `ready`; rlord shows the address and code;
+  the user approves in any browser, signed in to the account service;
+  the relay then sends `ready`. The plugin makes no HTTP request, holds
+  no account credential, and the `rlord` binary only draws a string.
+- *Reserved in link v1 now:* `hello.enroll` is an object (`{"kind":
+  "token","token"}` in slice 3; other kinds later), and the relay
+  message `enroll {url, code, expires}` is defined and handled by the
+  client (shown to the user, then wait) even though `StaticAuthorizer`
+  never sends it.
+- *Later:* the account service (sign-up, login, the approval page,
+  listing and removing hosts, tiers, billing if any), the authorizer
+  that talks to it, `rlord remote login` and `logout` (a signed
+  de-registration), and the hosted relay's terms and abuse handling.
+- *Pushback:* keep passwords out of this entirely (delegate login to an
+  identity provider or passkeys; open question 15), and keep the account
+  service off the E2E path: it is never in the QR, never dialled by a
+  device, and never able to confirm a pairing.
+
+| | Slice 3 | Production-relay slice |
+| --- | --- | --- |
+| Storage | `Store` trait (versioned get/put/delete, prefix scan, `expires_at`), SQLite, conformance tests | other backends behind features, migration, multi-process routing |
+| Identity | key → account and status on the host record, per-account and per-identity `Meter` in memory, suspend and resume, close code 4402, `ready.limits` reserved | durable usage, tiers, admin ban and allow, usage shown to users |
+| Load | bounded buffers and backpressure, per-account `Limits`, `max_connections` with 503, `bye` with `retry_after`, 4503, clients honour it | shedding order, tier caps, metrics and health, drain |
+| Accounts | `Authorizer` trait, `StaticAuthorizer`, `hello.enroll` as an object, `enroll` message handled by clients | account service, login over the link, `rlord remote login`, hosted terms |
+
+#### Tests
+
+Never `tmux -L rlord` or the default server; no real agent; no network
+beyond loopback. Every relay in a test is the real `rlord-relay` on
+`127.0.0.1:0`.
+
+- **`rlord_e2e` unit and vectors**: the spike's `tests/protocol.rs` and
+  vectors, plus the kind-3 handshake, mailbox export and import, the
+  mailbox against `snow`'s transport for the same keys, fragment
+  reassembly (limit, bad flags), a poisoned session, QR round trip and
+  rejects. `cargo xtask e2e vectors --check`.
+- **WASM** (`cargo xtask e2e test-wasm`): the vectors in Node from the
+  built module, byte-identical; one interop pairing and reconnect
+  against the native test client through the real relay.
+- **`relay-proto`**: transcripts sign and verify; a signature over
+  another origin, key, nonce or role fails; address parse and
+  normalisation; frame headers.
+- **Relay integration** (`crates/relay/tests/`): auth both ways; each
+  close code; registration modes (token used once, expired, `closed`);
+  allow-list replace; link and unlink; splice both ways; a newer
+  connection replaces the older; every limit in the table; queue order,
+  ack, expiry, `full`; signal flags and `boot`; no
+  `Sec-WebSocket-Extensions` in the upgrade answer; `files` mode with an
+  `rcgen` certificate and a SIGHUP reload; the database holds no payload
+  bytes after a run (a marker string sent as payload is not found in
+  `relay.db` or the log).
+- **Relay, room for production**: the `Store` conformance suite
+  (versions, a lost conditional write, scan, expiry) against SQLite; a
+  suspended host and its devices get 4402 and the clients don't retry;
+  a slow receiver stops the sender being read and the link closes after
+  the stall limit, with no frame dropped before that; at
+  `max_connections` an upgrade gets 503 with `Retry-After`; a client
+  told `bye` with `retry_after` waits at least that long; a client sent
+  `enroll {url, code}` reports it and waits for `ready`; per-account
+  counters add up across a host and its devices.
+- **Daemon** (`web_api.rs`): `via` required; each `remote: false` op
+  refused from a device and each `remote: true` op reaching its method
+  with only its arguments; `remote.*` unreachable through `web.call` and
+  through `mcp.call`; the forwarded command and its reply; the mirror
+  and the confirmation notice; `overlord.messages` bounded;
+  `the_pages_ops_are_the_daemons` still holds.
+- **End to end** (`crates/web/tests/remote.rs`: the real `rlord-web`
+  under an in-memory daemon, the real relay, `rlord-e2e-device` as the
+  device): setup, pair, confirm, `snapshot`, a change gives `changed`,
+  `overlord.ask` reaches the daemon, reconnect with a fresh session,
+  the cheap check (no handshake when nothing is waiting, a handshake
+  after a signal), a mailbox `overlord.ask` sent while the plugin is
+  stopped and answered when it returns, a snapshot larger than one
+  frame.
+- **Adversarial** (same harness; a "hostile relay" is a small test
+  forwarder in `crates/e2e-device/src/testing.rs`, built on
+  `relay-proto`):
+  - *Wrong relay*: a relay with another key at the pinned origin; the
+    pinned key claimed without the private key; a faithful forwarder to
+    the real relay under its own identity (handshake fails on both
+    ends); a 3xx redirect; a device given a QR whose relay differs from
+    the one it reaches. In each, nothing is sent after the failed check
+    and no other address is tried.
+  - *Replay*: a recorded message 1 (pairing and reconnect) replayed
+    gives no session and no op; a recorded transport frame replayed,
+    reordered or dropped poisons the session; a recorded mailbox frame
+    replayed or skipped discards the mailbox and the next link heals it;
+    a recorded pairing replayed after the rendezvous closed is refused
+    by the relay and by the host.
+  - *Revoked device*: its relay connection is refused (4403); with a
+    relay that lets it through anyway, `KKpsk2` fails at the host; its
+    queued mailbox frames are dropped; its live link closes at
+    revocation.
+  - *Tampering*: a flipped bit in message 1, in the KEM ciphertext, in
+    message 2, in a transport frame and in a mailbox frame each fail
+    closed; a truncated or oversized frame; a relay that swaps two
+    devices' frames; a relay that invents `link` for a device not on the
+    allow-list (the host's own check refuses it).
+  - *Pairing*: a wrong secret three times closes the rendezvous; a
+    second device using a used QR is refused; an unconfirmed device can
+    call nothing and is gone after a reject or the timeout; a remote
+    device calling `device.confirm` or `device.pair` is refused.
+  - *Crash points*: the plugin killed between advancing and saving the
+    mailbox, and between acting and saving, each heals without a
+    repeated op (the request id check).
+- **`check-deps`**: the three trees and a planted name in each.
+- **CLI and TUI**: `rlord remote` without the plugin names the install;
+  `rlord_core::qr` renders a known string to a known matrix; the Devices
+  screen's keys; the notice.
+- **Page** (Vitest): the Devices view against a fixture the daemon
+  writes (`device_list.json`).
+- **By hand**: `rlord-relay` in Docker compose on a real host with a real
+  certificate, a host behind NAT, `rlord-device` on another network;
+  pair, confirm, ask the overlord, revoke.
+
+### Implementation steps
+
+For an Opus implementer at high effort. One commit each; the PR bumps
+the version to the next `-dev.N` and regenerates `Cargo.lock`. Record
+each step in "Progress".
+
+1. **Gates, before anything is built on them.** (a) `snow` 0.10.0's raw
+   split plus our cipher state gives the same frames as its
+   `TransportState`, rekeys included (a scratch test). (b) `rustls` with
+   the ring provider, `p256` and `rusqlite` cross-build for both musl
+   targets with `cargo zigbuild`. (c) The spike's core builds for native
+   and WASM inside the main workspace (edition 2021, resolver 2, the
+   exact pins beside the workspace's own `sha2` and `getrandom`). If (a)
+   fails, use the fallback under "Risks" and tell the user.
+2. **`crates/e2e`**: the port, `stream.rs`, kind 3, the poisoning rule,
+   vectors and `cargo xtask e2e vectors`.
+3. **Mailbox** (`mailbox.rs`): cipher state, export and import, vectors.
+4. **`crates/e2e-wasm`**, `cargo xtask e2e wasm|test-wasm`, the toolchain
+   target, CI's `web` job.
+5. **`crates/relay-proto`**: messages, frames, transcripts, address.
+6. **Relay, part 1** (`crates/relay`): config, key, `store.rs` (the
+   `Store` trait, SQLite, the conformance suite), `policy.rs`
+   (`Authorizer`, `StaticAuthorizer`, `Limits`), `serve` with `proxy`
+   and `files` TLS, the connect sequence with `enroll`, `bye` and the
+   close codes, registration, accounts as labels, the commands.
+7. **Relay, part 2**: allow-lists, links and splicing over bounded
+   buffers with backpressure, rendezvous, queues, signals, the `Meter`,
+   per-account limits, `max_connections`. Integration tests.
+8. **`check-deps`**: the new lists and checks.
+9. **Daemon** (`web.rs`, `remote.rs`, `lib.rs`, `config.rs`): `via` and
+   `Op.remote`, `WEB_PROTOCOL` 3, `[remote]`, the forwarded commands,
+   the mirror, `overlord.messages`, the `device.*` ops, `snapshot`'s
+   `remote`. Tests.
+10. **Plugin: keys and link** (`remote/{mod,keys,link}.rs`): setup,
+    the pin check, connect, auth, backoff, state reports.
+11. **Plugin: pairing, devices, revocation** (`pairing.rs`,
+    `devices.rs`, `audit.rs`).
+12. **Plugin: sessions** (`session.rs`, `mailbox.rs`): `KKpsk2`, the
+    control stream to `web.call`, `changed`, signals, the mailbox path.
+13. **Test client** (`crates/e2e-device`) and the end-to-end and
+    adversarial tests.
+14. **CLI** (`crates/rlord/src/remote_cmd.rs`, `core/src/qr.rs`):
+    `rlord remote setup|pair|confirm|reject|devices|revoke|status|
+    disable`.
+15. **TUI** (`tui/src/remote.rs`, `launcher.rs`): `:remote`, the Devices
+    screen, the notice.
+16. **Local page** (`views/Devices.tsx`, `proto.ts`, fixtures).
+17. **Release** (`version.rs`, `build.rs`, `release.rs`,
+    `smoke_in_container.sh`, `release.yml`, `deploy/relay/`): tarballs,
+    the image job, smoke. A dry run of the workflow.
+18. **Docs**: `docs/relay.md`; `docs/architecture.md` "Web UI" gains
+    "Remote access" (the invariants, the three parties, the link, the
+    pin, pairing, `via` and the remote column) and its crate list;
+    `docs/guide.md`; `SECURITY.md` (what the relay sees, what a paired
+    device can do, reporting scope for the relay); `CLAUDE.md`'s network
+    rule (the relay and e2e crates, the three `check-deps` checks, how to
+    make an op remote); the config template; `e2e-crypto.md` and this doc
+    updated. The protocol written out in one place for the reviewer
+    (`docs/working/e2e-protocol.md`, promoted when reviewed).
+
+Steps 2 to 5 need nothing else; 6 and 7 need 5; 9 needs nothing before
+it; 10 to 12 need 2, 3, 5, 7 and 9; 13 needs 12; 14 to 16 need 9 and 11;
+17 needs 7.
+
+### Risks
+
+- **A protocol of our own, now carrying real sessions.** The hybrid
+  step, the mailbox cipher over raw split keys and the relay link's
+  transcripts are ours. Bounded by vectors, the adversarial tests, a
+  written protocol, and no use beyond the user's own relay before a
+  review (open question 8).
+- **The mailbox cipher leaves `snow`'s transport.** It is the one place
+  the core handles raw keys and nonces itself. Gate 1(a) checks it
+  against `snow`. Fallback if the raw split is unusable: the mailbox
+  session lives in memory only and is keyed again on every live link;
+  messages queued across a restart of either end are lost and resent by
+  id. Same wire shape, weaker delivery.
+- **Two paths for two ops** (live and mailbox). A request can arrive
+  twice or out of order with its live twin; the request id check is the
+  only guard. Kept to `overlord.ask` and `overlord.new_session`.
+- **Pairing grants a shell.** A paired device can type into agents and
+  launch sessions. Guards: the QR's one use and short life, the code and
+  the host's confirmation, the allow-list with its remote column, the
+  audit log, expiry, revocation.
+- **The relay is a public server.** Unauthenticated connections, token
+  guessing, queue filling and slow peers are what its limits and tests
+  are for; `open` registration invites abuse and is not the default.
+- **Metadata.** The relay sees addresses, fingerprints, who reaches
+  whom, when and how much (to the padding bucket). Stated in
+  `docs/relay.md` and `SECURITY.md`, not fixed.
+- **No TLS channel binding.** A party that can pass TLS validation for
+  the pinned origin can sit in front of the relay and see its metadata.
+  It cannot read or redirect content.
+- **`rlord-web` gets a TLS client and outbound connections.** The opt-in
+  promise now rests on `[remote] enabled`, the pin and at least one
+  device; a bug there dials out for a user who only wanted the local
+  page. Tested: with no `[remote]` the plugin opens no outbound socket.
+- **A wrong origin setting on a self-hosted relay** (the relay's
+  `origin` not being how peers reach it) fails every connection with
+  "wrong relay". `rlord-relay check` and the docs say so first.
+- **Three processes and two version axes** (`WEB_PROTOCOL`, the link's
+  `v`). A relay is upgraded on its own schedule; 4426 and a clear
+  message, not a parse error.
+- **Build weight**: `ring` and `libcrux` in the plugin, `ring` and
+  SQLite in the relay, a WASM target and `wasm-bindgen-cli-support` in
+  xtask. Gate 1(b) and 1(c) check the cross-builds before the rest.
+- **Compression stays open.** A snapshot is JSON and can be tens of
+  kilobytes per fetch; uncompressed is the v1 cost. `rev` keeps repeats
+  off the wire. Owed to the exploration in `e2e-crypto.md`: record real
+  snapshot sizes, before and after padding, from the end-to-end test.
+- **Owed from the spike, still**: phone benchmarks, Firefox.
+
+### Open questions for the user
+
+1. **How much of the mailbox in this slice?** Planned: the core's
+   saveable mailbox session and the relay's short queue (32 messages,
+   128 KiB, 10 minutes) are built and tested, and `rlord-web` uses them
+   for two ops only, `overlord.ask` and `overlord.new_session`, when the
+   host is briefly unreachable; everything else needs a live link.
+   Alternative: live link plus the contentless signal only, and the
+   mailbox waits for the phone slice (less code of our own handling
+   keys now, but a message typed while the laptop reconnects fails
+   instead of arriving). Recommended: as planned.
+2. **TLS on the relay.** Planned: certificate files (re-read on renewal)
+   or plain HTTP behind a proxy, with a Docker compose file that puts
+   Caddy in front to get the certificate. Alternative: ACME built into
+   `rlord-relay` (`rustls-acme`), one binary and nothing else to run,
+   at the cost of an outbound connection from the relay and more
+   dependencies. Recommended: files and proxy now, built-in ACME later
+   if self-hosters ask.
+3. **Who may register a host on a relay.** Planned: `token` by default
+   (the relay's owner makes a token, `rlord remote setup` uses it once),
+   with `open` and `closed` as settings. Is `token` right for your
+   hosted relay too, or should that one be `open` with a host cap?
+   Recommended: `token` everywhere until the protocol is reviewed.
+4. **The hosted relay.** Planned: not stood up in this slice; it ships
+   the binary, the image and the self-host docs, and you run one
+   yourself for the by-hand pass. A project-run relay (domain, machine,
+   who pays, abuse handling) comes with the phone slice. Recommended:
+   as planned; there is no default relay in the config either way.
+5. **mTLS.** The spec says "TLS or mTLS, configurable"; the earlier
+   answer made mTLS optional. Planned: signed challenge only in this
+   slice, mTLS later for native clients. Recommended: defer.
+6. **Where the host confirms a device.** Planned: the CLI (`rlord remote
+   pair` waits and asks), the TUI's Devices screen, and the local page's
+   Devices view, all three; never a remote device, never the overlord.
+   Should the local page be allowed to start a pairing and show the QR
+   (the pairing secret then passes through the browser), or only to
+   confirm and revoke? Recommended: allow all of it on the local page.
+7. **What a remote device may do.** Planned: everything a local page can
+   except what writes `config.toml` (`form.setup_save`,
+   `overlord.setup_request`), the surface reports, the key screen and
+   device management; no panes yet. Recommended: as planned.
+8. **Review before use.** Planned: you may use it on your own relay
+   before a review; nobody else is offered a relay, and the docs say the
+   protocol is unreviewed, until someone has read
+   `docs/working/e2e-protocol.md`. Who reviews (paid, informal, none for
+   now) is still open from `e2e-crypto.md`. Recommended: informal review
+   before the phone slice ships, paid before a public relay.
+9. **Binding the relay's proof to the TLS session.** Planned: no, so a
+   relay can sit behind a proxy or CDN. With it, a middlebox holding a
+   valid certificate for the relay's name could not even forward; without
+   it, such a middlebox sees the relay's metadata and nothing else.
+   Recommended: no binding in v1; add it as an option for `files` mode
+   if a reviewer asks.
+10. **Unused devices.** Planned: a device not seen for 90 days is
+    revoked (`[remote] device_expiry_days`, 0 = never). Recommended: 90.
+11. **Where the relay ships.** Planned: Linux tarballs (both
+    architectures) in the same GitHub release, and a `ghcr.io` image;
+    no macOS build, no crates.io, no Homebrew, no deb or rpm.
+    Recommended: as planned.
+12. **The relay's storage abstraction.** You proposed a plain
+    key-value interface (DynamoDB, Redis, S3, anything). Planned: a
+    slightly richer trait (versioned conditional writes, prefix scan,
+    an expiry field), SQLite now, other backends behind features later;
+    counters and all session state stay in memory. Options: (a) that;
+    (b) strictly get/put/delete, with allow-lists and tokens packed into
+    single values and races accepted; (c) no abstraction until a second
+    backend is real. S3 fits only (b) and poorly. Recommended: (a), and
+    pick the first hosted backend when you pick where it runs.
+13. **One relay process or several.** A shared store does not let two
+    processes splice each other's connections. Options: (a) one process
+    per relay, scaled up, restarts handled by reconnects; (b) a load
+    balancer that keeps a host and its devices on one process (needs a
+    routing key in the URL, a link v2); (c) relay-to-relay forwarding
+    with shared presence (Redis or similar), which also moves queues
+    and flags out of memory. Recommended: (a) first, (b) when one
+    machine is not enough, never queues in a third-party store.
+14. **Where accounts live.** Options: (a) a separate account service
+    the hosted relay asks through the `Authorizer` interface, self-host
+    using the static one; (b) accounts built into `rlord-relay` behind a
+    setting; (c) an off-the-shelf identity product in front. Recommended:
+    (a): the relay stays small and self-hostable, and the account
+    service can change without touching the protocol.
+15. **How a person logs in.** Options: an identity provider (GitHub or
+    another OAuth/OIDC login), email links, passkeys, or passwords we
+    store. Recommended: an identity provider first (rlord's users have
+    GitHub accounts), no passwords of our own, passkeys later if wanted.
+16. **Accounts on a self-hosted relay.** Options: (a) none: tokens,
+    `open` or `closed`, every host in the one account `local`; (b)
+    account labels on tokens for per-team metering and suspension, no
+    login; (c) the full account service, self-hosted too. Recommended:
+    (a) as the default with (b) available (slice 3 builds both, they are
+    the same code); (c) only if a company asks.
+17. **Registering a host from rlord.** Planned for the later slice:
+    `rlord remote login` shows an address and a code that arrive over
+    the pinned relay link, you approve in a browser, and the host's key
+    is bound to your account; rlord keeps no account credential.
+    Alternative: `rlord-web` talks to the account service directly over
+    HTTPS (a second pinned server, a stored token, more to protect).
+    Recommended: over the relay link, so "one pinned relay" stays
+    literally true.
+18. **What tiers differ in, and what is metered.** Candidates: number of
+    hosts and devices, bytes per second and per month, live panes,
+    mailbox size. Recommended: tiers are named sets of the limits the
+    relay already enforces, metered per account as in-memory counters
+    flushed to periodic usage records; per-device figures stay in
+    memory only (less kept about each device). The actual tiers and
+    whether anything is paid are yours to set.
+
+### Slice 3 answers (user, 2026-11-17)
+
+All 18 open questions: the recommended defaults, "for now". Questions 12–18
+(the production relay) stay revisitable when the hosted relay is planned.

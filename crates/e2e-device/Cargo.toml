@@ -1,0 +1,34 @@
+# rlord's test device (`rlord-device`): a library the remote-access tests
+# drive (pairing, live sessions, the mailbox, and a hostile relay for the
+# adversarial tests), and a small CLI for pairing by hand. Never released
+# or packaged.
+[package]
+name = "robot-overlord-e2e-device"
+description = "rlord's test device for remote access. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_e2e_device"
+
+[[bin]]
+name = "rlord-device"
+path = "src/main.rs"
+
+[dependencies]
+rlord-e2e = { package = "robot-overlord-e2e", path = "../e2e" }
+rlord-relay-proto = { package = "robot-overlord-relay-proto", path = "../relay-proto" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+getrandom = "0.3"
+base64 = "0.22"

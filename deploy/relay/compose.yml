@@ -1,0 +1,47 @@
+# rlord-relay behind Caddy, which gets and renews the certificate. The relay
+# runs in proxy mode on the compose network only; Caddy is the one thing
+# published.
+#
+#   cp relay.toml.example relay.toml   # set origin; keep [tls] mode = "proxy"
+#   # set the same host name in Caddyfile; point its DNS A/AAAA records here
+#   docker compose up -d
+#   docker compose exec relay /rlord-relay token new     # a host enrolment token
+#   docker compose exec relay /rlord-relay address       # what `rlord relay setup` takes
+#
+# Back up the relay-data volume (relay.key and relay.db). Losing relay.key
+# means every host has to set up the relay again.
+services:
+  relay:
+    image: ghcr.io/robot-lord/rlord-relay:latest
+    restart: unless-stopped
+    # The config's `listen` is loopback; in its own container the relay
+    # must listen where Caddy can reach it.
+    command: ["serve", "--config", "/etc/rlord-relay/relay.toml", "--listen", "0.0.0.0:8080"]
+    volumes:
+      - ./relay.toml:/etc/rlord-relay/relay.toml:ro
+      - relay-data:/var/lib/rlord-relay
+    # Not published: proxy mode trusts X-Forwarded-For, so only Caddy may
+    # reach it.
+    expose:
+      - "8080"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  caddy:
+    image: caddy:2.10@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+    restart: unless-stopped
+    depends_on: [relay]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

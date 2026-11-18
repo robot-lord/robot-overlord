@@ -643,7 +643,7 @@ fn the_surface_used_last_gets_the_command() {
         let r = call(
             &dir,
             "web.call",
-            json!({"op": "page.report", "page": "p1-aa", "args": {"input": true}}),
+            json!({"op": "page.report", "via": "local", "page": "p1-aa", "args": {"input": true}}),
         );
         assert!(r["error"].is_null(), "{r}");
     };

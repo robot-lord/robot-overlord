@@ -27,6 +27,30 @@ export interface Reply {
   error?: { code: ErrorCode; message: string };
 }
 
+/**
+ * What a paired device gets on its control stream or by mailbox: the same
+ * shape, with more codes (crates/web/src/remote/; docs/working/e2e-protocol.md,
+ * "Delivery and recovery"). A device gives every request an id unique for
+ * that device and reuses it when it resends: an op that changes something
+ * runs at most once per id, and a resend gets the stored answer.
+ */
+export type RemoteErrorCode =
+  | ErrorCode
+  /** Over 20 requests a second (burst 40). */
+  | "rate_limited"
+  /** This id is still running; its answer follows, by every way it was asked. */
+  | "in_progress"
+  /** This id was running when the host stopped: it may or may not have happened. */
+  | "interrupted"
+  /** Done, but the answer was too large to keep or to send by mailbox. */
+  | "too_large";
+
+export interface RemoteReply {
+  id: string | number;
+  ok?: unknown;
+  error?: { code: RemoteErrorCode; message: string };
+}
+
 /** A UI command from the overlord, for this page (`UiCmd`). */
 export interface UiEvent {
   event: "ui";
@@ -67,6 +91,13 @@ export const OPS = [
   "overlord.setup_request",
   "session.new",
   "session.fork",
+  "overlord.messages",
+  "device.list",
+  "device.pair",
+  "device.pair_cancel",
+  "device.confirm",
+  "device.reject",
+  "device.revoke",
 ] as const;
 
 export type Op = (typeof OPS)[number];
@@ -213,6 +244,25 @@ export interface Snapshot {
   overlord: Overlord | null;
   /** Every status, in the list's order, with its label. */
   statuses: { status: Status; label: string }[];
+  /** Remote access, for the header (a local page's snapshot only). */
+  relay: RelaySummary;
+}
+
+/** A device that scanned a pairing code and waits for the user (times: Unix seconds). */
+export interface PendingDevice {
+  name: string;
+  /** Six digits; the device shows the same. */
+  code: string;
+  expires: number | null;
+}
+
+/** Remote access in a snapshot (crates/daemon/src/relay.rs `summary`). */
+export interface RelaySummary {
+  enabled: boolean;
+  connected: boolean;
+  /** How many devices are paired. */
+  devices: number;
+  pending: PendingDevice | null;
 }
 
 /** The answer when the asked `rev` is still current. */
@@ -394,4 +444,61 @@ export interface KeyRow {
   key: string;
   default: string;
   findings: { level: string; text: string }[];
+}
+
+// Remote access (crates/daemon/src/relay.rs; test/fixtures/device_*.json,
+// written by a daemon test).
+
+/** A paired device (times: Unix seconds). */
+export interface Device {
+  /** 16 hex characters. */
+  id: string;
+  name: string;
+  paired_at: number | null;
+  /** Null: never seen since pairing. */
+  last_seen: number | null;
+  /** Connected through the relay now. */
+  linked: boolean;
+}
+
+/** Remote access as it is now (op `device.list`). */
+export interface DeviceList {
+  enabled: boolean;
+  /** The relay's origin ("" before `rlord relay setup`). */
+  relay: string;
+  relay_key: string;
+  plugin: { installed: boolean; state: string; problem: string | null };
+  /** The rest is the plugin's word (false: it isn't running, or hasn't said). */
+  reported: boolean;
+  connected: boolean;
+  error: string | null;
+  devices: Device[];
+  /** A pairing code is open (until `expires`). */
+  pairing: { expires: number | null } | null;
+  pending: PendingDevice | null;
+}
+
+/** A pairing offer (op `device.pair`): the QR's text, and its modules to draw. */
+export interface PairOffer {
+  qr: string;
+  /** Unix seconds. */
+  expires: number;
+  /** Rows of "1" (dark) and "0" (light), square, without the quiet zone. */
+  qr_rows: string[];
+}
+
+/** One message of the overlord's conversation (op `overlord.messages`). */
+export interface OverlordMessage {
+  /** Its place in the transcript: pass as `before` for the ones before it. */
+  line: number;
+  who: "you" | "agent" | "tool";
+  at: string | null;
+  text: string;
+}
+
+export interface OverlordMessages {
+  overlord: { id: string; agent: string; conversation: string | null } | null;
+  messages: OverlordMessage[];
+  /** Earlier ones are left. */
+  more: boolean;
 }

@@ -5,10 +5,16 @@
 //!
 //! - `web.hello {protocol, version, pid, port}`: its first call. Another
 //!   protocol is refused with `plugin::RPC_ERR_INCOMPATIBLE`.
-//! - `web.call {op, args}`: the only way a browser request reaches the
-//!   daemon. `op` comes from a fixed list (`OPS`), not a pass-through: the
-//!   list lives here, on the always-installed side, so a parsing bug in
-//!   the plugin can't reach a method the web was never meant to have.
+//! - `web.call {op, args, via, page | device}`: the only way a browser's or
+//!   a paired device's request reaches the daemon. `op` comes from a fixed
+//!   list (`OPS`), not a pass-through: the list lives here, on the
+//!   always-installed side, so a parsing bug in the plugin can't reach a
+//!   method the web was never meant to have. `via` says who asked: a local
+//!   page (`"local"`, with its `page`) or a device through the relay
+//!   (`"remote"`, with its `device` id); an op not marked `remote` is
+//!   refused from a device.
+//! - `web.remote_reply` and `web.remote_state`: the plugin's side of remote
+//!   access (`relay.rs`).
 //! - `web.subscribe`: a push stream of `{"notify":"changed","rev"}`, at
 //!   most one per 100 ms (`Daemon::push_loop`).
 //! - `web.pane_target {target}`: which tmux session a pane shows. Starts
@@ -56,40 +62,88 @@ impl fmt::Display for Incompatible {
 
 impl std::error::Error for Incompatible {}
 
-/// A browser op that isn't on `OPS`. Answered with RPC code
-/// `plugin::RPC_ERR_NOT_ALLOWED`.
+/// A browser op that isn't on `OPS`, one a device may not call, or a call
+/// that doesn't say who asked. Answered with RPC code
+/// `plugin::RPC_ERR_NOT_ALLOWED`; the message says which.
 #[derive(Debug)]
 pub struct NotAllowed(pub String);
 
+impl NotAllowed {
+    /// An op that isn't on `OPS`.
+    fn op(op: &str) -> NotAllowed {
+        NotAllowed(format!("{op}: not available to the web UI"))
+    }
+}
+
 impl fmt::Display for NotAllowed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: not available to the web UI", self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for NotAllowed {}
 
 /// One browser op: the daemon method it calls ("" when it is answered
-/// here) and the only arguments passed on (any others are dropped, so a
+/// here), the only arguments passed on (any others are dropped, so a
 /// browser can't set what a method takes from its trusted callers, such
-/// as `session.stop`'s `interrupt` or `session.restart`'s `hooks_work`).
+/// as `session.stop`'s `interrupt` or `session.restart`'s `hooks_work`),
+/// whether a paired device may call it through the relay (`remote`), and
+/// whether running it twice is the same as once (`idempotent`).
 pub struct Op {
     pub op: &'static str,
     pub method: &'static str,
     pub args: &'static [&'static str],
+    pub remote: bool,
+    /// Safe to repeat: a look-up that changes nothing. The plugin runs such
+    /// a device request as often as it is asked; any other it runs at most
+    /// once per request id, answering a resend from its store
+    /// (`docs/working/e2e-protocol.md`, "Delivery and recovery"). Told to
+    /// the plugin in `web.hello`'s answer.
+    pub idempotent: bool,
 }
 
+/// An op for local pages and paired devices alike.
 const fn op(op: &'static str, method: &'static str, args: &'static [&'static str]) -> Op {
-    Op { op, method, args }
+    Op {
+        op,
+        method,
+        args,
+        remote: true,
+        idempotent: false,
+    }
+}
+
+/// An op for local pages only: what writes `config.toml`, manages
+/// devices, or is about a page (its reports, its parked commands).
+const fn local(op: &'static str, method: &'static str, args: &'static [&'static str]) -> Op {
+    Op {
+        op,
+        method,
+        args,
+        remote: false,
+        idempotent: false,
+    }
+}
+
+impl Op {
+    /// Marks a look-up: running it twice is the same as once.
+    const fn idempotent(self) -> Op {
+        Op {
+            idempotent: true,
+            ..self
+        }
+    }
 }
 
 /// The browser's ops. Each new op comes with a test
-/// (`crates/daemon/tests/web_api.rs`).
+/// (`crates/daemon/tests/web_api.rs`). A new op is local (`local`) unless
+/// a paired device has a reason to call it: then `op`, and a test that it
+/// reaches its method from a device.
 pub const OPS: &[Op] = &[
-    op("snapshot", "", &["view", "rev"]),
-    op("session.get", "session.get", &["ref"]),
+    op("snapshot", "", &["view", "rev"]).idempotent(),
+    op("session.get", "session.get", &["ref"]).idempotent(),
     // Opening the overlord's pane when the user asks (never by itself).
-    op("overlord.ensure", "overlord.ensure", &[]),
+    op("overlord.ensure", "overlord.ensure", &[]).idempotent(),
     // A stopped session's Resume: started on its conversation (an
     // overlord is ensured), as Enter in the list does.
     op("session.resume", "", &["ref"]),
@@ -111,24 +165,24 @@ pub const OPS: &[Op] = &[
     // Make another agent's overlord the active one.
     op("overlord.switch", "overlord.switch", &["agent"]),
     // What the page shows (answered here; see `WebUi`).
-    op(
+    local(
         "page.report",
         "",
         &["route", "view", "visible", "form", "input"],
     ),
     // A UI command that never reached its page (asked on connecting).
-    op("page.pending", "", &[]),
+    local("page.pending", "", &[]),
     // The list view a page with none of its own starts from.
-    op("view.default", "", &[]),
+    op("view.default", "", &[]).idempotent(),
     // The key screen, read-only (keys change only in a terminal).
-    op("keys.list", "keys.list", &[]),
+    local("keys.list", "keys.list", &[]).idempotent(),
     // The forms' look-ups: agents, models and defaults; the repo finder;
     // the code folder as set now and rlord's suggestion.
-    op("form.defaults", "session.defaults", &[]),
-    op("form.repos", "repo.find", &[]),
-    op("form.setup", "", &[]),
+    op("form.defaults", "session.defaults", &[]).idempotent(),
+    op("form.repos", "repo.find", &[]).idempotent(),
+    local("form.setup", "", &[]).idempotent(),
     // The code-folder form's save: what the user confirmed there.
-    op(
+    local(
         "form.setup_save",
         "",
         &["code_dir", "roots", "create", "allow_home"],
@@ -153,7 +207,7 @@ pub const OPS: &[Op] = &[
         ],
     ),
     // The code-folder form with a description: a request to the overlord.
-    op(
+    local(
         "overlord.setup_request",
         "overlord.setup_request",
         &[
@@ -188,6 +242,19 @@ pub const OPS: &[Op] = &[
         "session.fork",
         &["ref", "prompt", "name", "workspace"],
     ),
+    // The overlord's recent conversation as text (a chat view beside
+    // `overlord.ask`), read from its transcript; `before`: a message's
+    // `line`, for the ones before it.
+    op("overlord.messages", "", &["before", "limit"]).idempotent(),
+    // Remote access, from the page's Devices view (relay.rs): the state,
+    // a pairing offer and its cancel, the waiting device's confirmation,
+    // unpairing a device.
+    local("device.list", "", &[]).idempotent(),
+    local("device.pair", "", &[]),
+    local("device.pair_cancel", "", &[]),
+    local("device.confirm", "", &[]),
+    local("device.reject", "", &[]),
+    local("device.revoke", "", &["device"]),
 ];
 
 /// Ops that don't count as the user doing something on the page (look-ups
@@ -203,11 +270,13 @@ const PASSIVE: &[&str] = &[
     "form.defaults",
     "form.repos",
     "form.setup",
+    "overlord.messages",
+    "device.list",
 ];
 
 /// Method families no op may name, whatever `OPS` says: a second check.
 const FORBIDDEN: &[&str] = &[
-    "admin.", "mcp.", "hook.", "web.", "config.", "ui.", "tmux.", "setup.",
+    "admin.", "mcp.", "hook.", "web.", "config.", "ui.", "tmux.", "setup.", "relay.",
 ];
 
 /// `web.hello`: the plugin's first call. From the plugin this daemon
@@ -230,29 +299,86 @@ pub fn hello(d: &Daemon, params: &Value) -> Result<Value> {
     if let (Some(pid), Some(port)) = (pid, port) {
         d.web().hello(pid, port);
     }
-    Ok(json!({"protocol": plugin::WEB_PROTOCOL, "version": env!("CARGO_PKG_VERSION")}))
+    Ok(json!({
+        "protocol": plugin::WEB_PROTOCOL,
+        "version": env!("CARGO_PKG_VERSION"),
+        // The remote ops a device may repeat freely; the plugin runs any
+        // other at most once per request id.
+        "idempotent": OPS
+            .iter()
+            .filter(|o| o.remote && o.idempotent)
+            .map(|o| o.op)
+            .collect::<Vec<_>>(),
+    }))
 }
 
-/// `web.call {op, args, page}`: one browser request, from the page with
-/// that id (the plugin's, never the browser's).
+/// Who sent a `web.call`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Via<'a> {
+    /// A local page, by the id the plugin gave it.
+    Local(&'a str),
+    /// A paired device through the relay, by its id.
+    Remote(&'a str),
+}
+
+impl<'a> Via<'a> {
+    /// `via` and `page` or `device` from `web.call`'s parameters (the
+    /// plugin's, never the browser's or the device's).
+    fn of(params: &'a Value) -> std::result::Result<Via<'a>, NotAllowed> {
+        match params["via"].as_str() {
+            Some("local") => Ok(Via::Local(params["page"].as_str().unwrap_or(""))),
+            Some("remote") => params["device"]
+                .as_str()
+                .filter(|d| !d.is_empty())
+                .map(Via::Remote)
+                .ok_or_else(|| NotAllowed("web.call via remote needs the device's id".into())),
+            _ => Err(NotAllowed(
+                "web.call needs via: \"local\" (a page) or \"remote\" (a device)".into(),
+            )),
+        }
+    }
+}
+
+/// `web.call {op, args, via, page | device}`: one request, from a local
+/// page with that id or from a paired device (the plugin's word, never
+/// the browser's or the device's). A device's request carries no page,
+/// never counts as use of a screen, and is refused for an op that isn't
+/// `remote`.
 pub fn call(d: &Daemon, params: &Value) -> Result<Value> {
     let op = params["op"].as_str().unwrap_or("");
     let Some(found) = OPS.iter().find(|o| o.op == op) else {
-        return Err(NotAllowed(op.to_string()).into());
+        return Err(NotAllowed::op(op).into());
     };
-    let page = params["page"].as_str().unwrap_or("");
-    if !PASSIVE.contains(&op) {
-        d.web_ui().used(page);
-    }
-    // Anything from the page a command was for: it is alive and has it
-    // (the page says so after each command), so it isn't handed on.
-    arrived(d, page);
+    let via = Via::of(params)?;
     if FORBIDDEN.iter().any(|f| found.method.starts_with(f)) {
-        return Err(NotAllowed(op.to_string()).into());
+        return Err(NotAllowed::op(op).into());
     }
+    let page = match via {
+        Via::Local(page) => {
+            if !PASSIVE.contains(&op) {
+                d.web_ui().used(page);
+            }
+            // Anything from the page a command was for: it is alive and
+            // has it (the page says so after each command), so it isn't
+            // handed on.
+            arrived(d, page);
+            page
+        }
+        Via::Remote(_) if !found.remote => {
+            return Err(NotAllowed(format!("{op}: not available to a remote device")).into());
+        }
+        Via::Remote(_) => "",
+    };
     let args = filtered(found, &params["args"]);
     match op {
-        "snapshot" => snapshot(d, &args),
+        "snapshot" => snapshot(d, &args, via),
+        "overlord.messages" => overlord_messages(d, &args),
+        "device.list" => crate::relay::status(d),
+        "device.pair" => crate::relay::pair(d),
+        "device.pair_cancel" => crate::relay::pair_cancel(d),
+        "device.confirm" => crate::relay::confirm(d),
+        "device.reject" => crate::relay::reject(d),
+        "device.revoke" => crate::relay::revoke(d, &args),
         "session.resume" => resume(d, &args),
         "page.report" => d.web_ui().report(page, &args),
         "page.pending" => Ok(pending(d)),
@@ -348,8 +474,9 @@ fn launch_params(d: &Daemon, mut args: Value) -> Result<Value> {
 /// filter box's text, with the TUI's tokens (`search_tokens`), and whose
 /// `usage` picks the usage measure; a `rev` that is still current gets
 /// `{"unchanged": true}`. Grouping and labels are worked out here: the
-/// page only draws.
-pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
+/// page only draws. A local page's also has `relay` (remote access, for
+/// its header); a device's doesn't.
+pub fn snapshot(d: &Daemon, args: &Value, via: Via) -> Result<Value> {
     // Read first: a change while this is built moves it again, and the
     // page then asks once more.
     let rev = d.rev();
@@ -421,13 +548,82 @@ pub fn snapshot(d: &Daemon, args: &Value) -> Result<Value> {
     .into_iter()
     .map(|s| json!({"status": s, "label": s.label()}))
     .collect();
-    Ok(json!({
+    let mut out = json!({
         "rev": rev,
         "rows": rows,
         "groups": groups,
         "overlord": o,
         "statuses": statuses,
-    }))
+    });
+    if let Via::Local(_) = via {
+        out["relay"] = crate::relay::summary(d);
+    }
+    Ok(out)
+}
+
+/// At most this many messages per `overlord.messages`, each at most this
+/// many bytes.
+const MESSAGES_MAX: usize = 50;
+const MESSAGE_BYTES: usize = 4096;
+
+/// Op `overlord.messages {before, limit}`: the active overlord's current
+/// conversation as text, oldest first: the last `limit` messages (at most
+/// 50), or with `before` (a message's `line`) the ones before it. Read by
+/// plain code from its transcript (`history::read`, as `recall` reads
+/// one); `more` says whether earlier ones are left. No overlord, or no
+/// conversation yet: no messages.
+pub fn overlord_messages(d: &Daemon, args: &Value) -> Result<Value> {
+    let limit = args["limit"]
+        .as_u64()
+        .map_or(MESSAGES_MAX, |l| (l as usize).clamp(1, MESSAGES_MAX));
+    let before = args["before"].as_u64().filter(|b| *b > 0);
+    let (o, path) = {
+        let db = d.db();
+        let Some(o) = overlord::session(&db)? else {
+            return Ok(json!({"overlord": null, "messages": [], "more": false}));
+        };
+        let path = db.transcript_source(&o.id)?;
+        (o, path)
+    };
+    let head = json!({"id": o.id, "agent": o.agent, "conversation": o.agent_session});
+    let path = path
+        .map(PathBuf::from)
+        .filter(|p| rlord_core::agents::transcript::exists(p));
+    let Some(path) = path else {
+        return Ok(json!({"overlord": head, "messages": [], "more": false}));
+    };
+    // One more than asked: whether there are earlier ones.
+    let mut msgs =
+        rlord_core::history::read(&path, before, limit + 1, 0, (limit + 1) * 4 * MESSAGE_BYTES)
+            .with_context(|| format!("reading the overlord's transcript ({})", path.display()))?;
+    let more = msgs.len() > limit;
+    if more {
+        msgs.drain(..msgs.len() - limit);
+    }
+    let messages: Vec<Value> = msgs
+        .into_iter()
+        .map(|m| {
+            json!({
+                "line": m.line,
+                "who": m.who,
+                "at": m.at,
+                "text": clip_bytes(&m.text, MESSAGE_BYTES),
+            })
+        })
+        .collect();
+    Ok(json!({"overlord": head, "messages": messages, "more": more}))
+}
+
+/// `s` cut to at most `n` bytes, on a character boundary.
+fn clip_bytes(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// The filter box's text, read as the TUI reads its filter
@@ -528,7 +724,9 @@ pub struct Page {
 }
 
 /// The forms a page may say it has open.
-const FORMS: &[&str] = &["describe", "confirm", "manual", "fork", "setup", "keys"];
+const FORMS: &[&str] = &[
+    "describe", "confirm", "manual", "fork", "setup", "keys", "devices",
+];
 
 impl WebUi {
     /// `web.pages`: the pages open now. New ones are added, missing ones
@@ -1043,16 +1241,18 @@ pub fn rotate(d: &Daemon) -> Result<Value> {
     start(d)
 }
 
-/// At daemon start: start the plugin when `[web] enabled` (in the
-/// background; a failure is logged and never stops the daemon).
+/// At daemon start: start the plugin when `[web] enabled` or `[remote]
+/// enabled` (in the background; a failure is logged and never stops the
+/// daemon).
 pub fn start_if_enabled(d: &Arc<Daemon>) {
-    if !d.config().web.enabled {
+    let cfg = d.config();
+    if !cfg.web.enabled && !cfg.remote.enabled {
         return;
     }
     let d = Arc::clone(d);
     std::thread::spawn(move || {
         if let Err(e) = start(&d) {
-            tracing::warn!(error = %e, "[web] enabled, but rlord-web didn't start");
+            tracing::warn!(error = %e, "[web] or [remote] enabled, but rlord-web didn't start");
         }
     });
 }
@@ -1073,6 +1273,57 @@ mod tests {
 
     fn op_named(name: &str) -> &'static Op {
         OPS.iter().find(|o| o.op == name).unwrap()
+    }
+
+    /// Only look-ups are idempotent: anything that changes something runs
+    /// at most once per request id from a device, so a resend after a lost
+    /// link can't repeat it. `web.hello` tells the plugin which are.
+    #[test]
+    fn only_look_ups_are_idempotent() {
+        let idem: Vec<&str> = OPS.iter().filter(|o| o.idempotent).map(|o| o.op).collect();
+        assert_eq!(
+            idem,
+            [
+                "snapshot",
+                "session.get",
+                "overlord.ensure",
+                "view.default",
+                "keys.list",
+                "form.defaults",
+                "form.repos",
+                "form.setup",
+                "overlord.messages",
+                "device.list",
+            ]
+        );
+        for o in [
+            "overlord.ask",
+            "overlord.new_session",
+            "session.new",
+            "session.stop",
+        ] {
+            assert!(!op_named(o).idempotent, "{o}");
+        }
+        let d = Daemon::new(
+            rlord_core::db::Db::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        let h = hello(
+            &d,
+            &json!({"protocol": plugin::WEB_PROTOCOL, "version": "x"}),
+        )
+        .unwrap();
+        let told: Vec<&str> = h["idempotent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Remote ones only: a device never sends the others.
+        assert!(
+            told.contains(&"snapshot") && !told.contains(&"keys.list"),
+            "{told:?}"
+        );
     }
 
     /// A browser can't set what only trusted callers set: the overlord's

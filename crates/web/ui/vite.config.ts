@@ -22,6 +22,9 @@ export default defineConfig({
   },
   test: {
     include: ["test/**/*.test.ts"],
+    // The WASM crypto core's tests need its build (`cargo xtask e2e
+    // test-wasm` runs them with vitest.e2e.config.ts).
+    exclude: ["test/e2e/**", "node_modules/**"],
     environment: "node",
   },
 });

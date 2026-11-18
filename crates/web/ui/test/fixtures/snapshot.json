@@ -106,6 +106,12 @@
     "tmux_session": "overlord-rlord",
     "workspace_path": null
   },
+  "relay": {
+    "connected": false,
+    "devices": 0,
+    "enabled": false,
+    "pending": null
+  },
   "rev": "6d41535f7fe9-0",
   "rows": [
     {

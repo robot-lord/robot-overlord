@@ -945,8 +945,10 @@ serve a session over a socket.
 has no HTTP server, websocket, TLS or network-client crate. `cargo xtask
 check-deps` (CI's `check` job, and the start of every release build) fails
 when `cargo tree -p robot-overlord` names one (axum, hyper, h2, http,
-tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate)
-or when the four main crates' source names a TCP or UDP socket type. One
+tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate,
+and the remote-access and crypto crates: the e2e and relay crates, snow,
+libcrux, P-256, ring, webpki-roots; `qrcode` is allowed, it
+only draws a string) or when the four main crates' source names a TCP or UDP socket type. One
 file is exempt, by name and with its reason: `core/src/agents/opencode_service.rs`,
 the OpenCode adapter's HTTP client for OpenCode's own background server
 on a local address. tokio's `net` feature compiles its TCP types (it has
@@ -1011,7 +1013,9 @@ box's text, parsed by the daemon with the TUI's
 `SessionQuery::apply_search_text` (`tag:`, `status:`, …), so the page
 never parses it, and its `usage` picks the usage measure; `rev` is `<boot id>-<changes>`, and a current
 `rev` gets `{"unchanged": true}`. `web.subscribe` pushes `changed` at
-most every 100 ms. `web.pane_target` names a pane's tmux session and
+most every 100 ms, with `"relay": true` when all it folds in is the
+plugin's own relay status (`changed_relay`): the plugin wakes no device
+for that. `web.pane_target` names a pane's tmux session and
 starts nothing. Adding an op: put it on `OPS` with its arguments, add it to
 `OPS` in `crates/web/ui/src/proto.ts` (a test holds the two lists
 together), and test it in `crates/daemon/tests/web_api.rs`.
@@ -1118,8 +1122,118 @@ control socket).
   drift shows as a wrong label, never a wrong launch, since the daemon
   checks every launch argument again.
 
-Remote access (an end-to-end encrypted relay, a phone app) is planned in
-`docs/working/web-ui-remote.md` and `docs/working/e2e-crypto.md`.
+### Remote access (through a relay)
+
+A paired device reaches the overlord and the session list of a host
+behind NAT through a relay that sees only ciphertext. The protocol is
+written out in `docs/working/e2e-protocol.md` (unreviewed: nobody but the
+user runs it before a review); the relay itself is `docs/relay.md`.
+
+**Two invariants, both tested.**
+
+- *Everyone dials out.* The host (`rlord-web`) and every device open
+  outbound connections to the relay; the relay is the only listener on the
+  network. The plugin's one listener stays `127.0.0.1` in its `main.rs`
+  (`cargo xtask check-deps` fails on a `TcpListener` anywhere else under
+  `crates/web/src/`, and on a bind to every interface outside
+  `crates/relay`).
+- *One pinned relay per host.* `rlord relay setup <address>` takes
+  `https://relay.example.com#k=<fingerprint>`: the origin and the SHA-256
+  of the relay's P-256 key. On every connection the relay signs a
+  transcript over both nonces; the peer checks origin, key and signature
+  before sending anything else, and a miss is "wrong relay", never
+  retried elsewhere. The proved origin and key go into every Noise
+  prologue, so a handshake through any other relay fails on both ends.
+  The pin is part of the host's keys (`remote/pin.json`): another relay
+  is `setup --reset`, and every device pairs again. No redirects, no
+  fallbacks, no `permessage-deflate`.
+
+**Three parties, three crate families.**
+
+| Party | Crates | Holds |
+| --- | --- | --- |
+| Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request store per device; `remote.log` (audit) |
+| Device (the phone app, next; `rlord-device` for tests, `crates/e2e-device`) | `rlord_e2e` (natively or as WASM, `crates/e2e-wasm`), `rlord_relay_proto` | its keys, the host's static key and the pin |
+| Relay (`rlord-relay`, `crates/relay`) | `rlord_relay_proto` only | its key, registrations; queues in memory |
+
+`rlord_e2e` is sans-IO (`check-deps` holds its tree free of tokio,
+sockets and TLS) and builds to `wasm32-unknown-unknown`; its test vectors
+(`crates/e2e/vectors/v1.json`, `cargo xtask e2e vectors`) are checked
+natively and in Node from the WASM build (`cargo xtask e2e test-wasm`).
+The relay's tree names no content crypto and no part of rlord. The
+`rlord` binary names none of these crates: the daemon holds no keys and
+does no crypto.
+
+**The content layer.** Pairing is `Noise_IKpsk2`, reconnect and mailbox
+keying `Noise_KKpsk2`, all `25519_ChaChaPoly_SHA256` with an ML-KEM-768
+step mixed in through the PSK slot (post-quantum forward secrecy). The
+device always initiates; the host treats a handshake as a session only
+once the device's first frame decrypts, and any decrypt failure ends the
+session. A live session carries streams (0 is control; panes later),
+fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
+`overlord.new_session` while the host is away) is its own saveable
+cipher state over the kind-3 handshake's raw keys, rekeyed after every
+message; its receiver skips up to 64 lost messages (counters only move
+forward), since the relay's queue can lose some.
+
+**Delivery and recovery: one rule.** One websocket link carries one Noise
+session per device link, with implicit nonces (no counter on the wire),
+so delivery within a connection must be lossless and in order: nothing
+is ever dropped quietly. Overflow fails safe instead: the host's
+outgoing queues are bounded per link (`remote/outq.rs`), a link that
+overflows is dropped (only that device's session dies), and a control
+message that can't be queued, a frame the host can't parse, a silent
+relay (the host pings every 15 s) or a sleep of the host machine closes
+the connection. The relay keeps flow control per link and never stops
+reading a host for one device (`docs/relay.md`). Any reconnect is a fresh
+`KKpsk2` handshake; nothing resumes a broken session. Recovery is the
+device's: it resyncs by the snapshot's `rev` and resends what is
+unanswered by request id. The host's per-device request store (shared by
+the live and mailbox paths, saved with the mailbox state) runs an op
+that changes something at most once per id: a resend gets the stored
+answer, or `in_progress` and then the answer. `web::Op.idempotent`
+marks the look-ups that may simply run again; `web.hello`'s answer lists
+the remote ones for the plugin. Don't switch to explicit nonces to make
+sessions survive a lost frame: the reconnect is cheap and the rule keeps
+both ends simple.
+
+**Pairing is user-only and confirmed.** `rlord relay pair` (or the TUI's
+Devices screen, or the local page's) shows a QR: the pin, a one-use
+rendezvous id, the host's static key and a pairing secret, valid 300 s
+for one device. Both sides then show a six-digit code from the handshake
+hash; the device is stored, put on the relay's allow-list and able to
+call anything only after the user confirms on the host. Never an MCP
+tool, never reachable from a device.
+
+**How a device's request reaches the daemon.** The plugin passes the
+control stream's `{id, op, args}` on as `web.call {op, args, via:
+"remote", device}`. `web::OPS` has a `remote` column: a device may call
+what a local page may except what writes `config.toml`, the surface
+reports, the key screen and device management. A remote call has no
+`page`, never counts as use of a screen and gets no `ui` commands. To
+make an op remote, set `remote: true` on its `Op` and test it from a
+device in `web_api.rs`; an op is local-only unless a device needs it.
+Mark it `.idempotent()` only if running it twice is the same as once (a
+look-up); anything else is deduplicated by request id.
+`overlord.messages` (both) gives the active overlord's recent
+conversation as text, read from its transcript (at most 50 messages of 4
+KiB), for a chat view.
+
+The user's commands (`relay.*`, `daemon/src/relay.rs`) go the other
+way. They are dispatched from the socket only, never through
+`Daemon::rpc`, so neither an MCP tool nor a `web.call` op can reach them
+(`relay.` is also a forbidden family). The daemon forwards each to the
+plugin on the `web.subscribe` stream as `{"notify":"remote","id","req"}`
+(never folded into `changed`, never sent to `events.subscribe`) and waits
+up to 10 s for `web.remote_reply`; it starts the plugin first when
+needed. The plugin reports its state with `web.remote_state`; the daemon
+keeps it (normalised, cleared when the plugin's stream ends) for
+`relay.status`, the Devices screens and a page's `snapshot.relay`, and
+puts a notice on every surface when a device starts waiting for
+confirmation. `rlord_core::qr` draws the pairing code (the `rlord`
+binary only ever draws a string the plugin gave it). `start_if_enabled`
+also starts the plugin for `[remote] enabled`. The page's Devices view
+is a modal (form kind `devices`).
 
 ## rlord's private tmux server (2026-11-10)
 

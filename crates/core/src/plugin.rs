@@ -13,7 +13,7 @@ use crate::paths;
 
 /// Bumped whenever a `web.*` daemon method the plugin uses changes shape.
 /// The plugin's `web.hello` carries it; the daemon refuses another one.
-pub const WEB_PROTOCOL: u32 = 2;
+pub const WEB_PROTOCOL: u32 = 3;
 
 /// The plugin's executable name.
 pub const BIN_NAME: &str = "rlord-web";
@@ -108,6 +108,21 @@ pub fn open_in_browser(url: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The plugin's remote-access keys and device records (0700; files 0600):
+/// `host.key`, `relay.key`, `pin.json`, `devices.json`,
+/// `mailbox-<device id>.json`. Only `rlord-web` reads them; the `rlord`
+/// binary and the daemon never do (`rlord web remove` deletes the folder).
+pub fn remote_dir() -> PathBuf {
+    paths::data_dir().join("remote")
+}
+
+/// The plugin's remote-access audit log (0600, rotated at 1 MiB): one line
+/// per pairing, confirmation, revocation, link and remote op, never
+/// arguments.
+pub fn remote_log_path() -> PathBuf {
+    paths::data_dir().join("remote.log")
 }
 
 /// Where the daemon appends the plugin's output.

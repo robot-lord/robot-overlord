@@ -1,0 +1,10 @@
+# Caddy in front of rlord-relay (compose.yml). Replace the host name with
+# your relay's: the same as `origin` in relay.toml, which hosts and devices
+# pin. Caddy gets and renews its certificate.
+#
+# reverse_proxy passes WebSocket upgrades through as they are, and sets
+# X-Forwarded-For to the client's address, which the relay's proxy mode
+# reads for its per-address limits.
+relay.example.com {
+	reverse_proxy relay:8080
+}

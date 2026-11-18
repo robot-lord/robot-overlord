@@ -32,8 +32,10 @@
 //!
 //! Assets: rlord-v<ver>-<target>.tar.gz (rlord, install.sh, licenses),
 //! rlord-web-v<ver>-<target>.tar.gz (the opt-in web plugin, its licenses),
-//! SHA256SUMS; stable also rlord_<ver>-1_<arch>.deb and
-//! rlord-<ver>-1.<arch>.rpm.
+//! SHA256SUMS; stable also rlord-relay-v<ver>-<target>.tar.gz (the relay
+//! server, Linux only), rlord_<ver>-1_<arch>.deb and
+//! rlord-<ver>-1.<arch>.rpm. The relay's container image is release.yml's
+//! (`cargo xtask relay-image`): `--local` doesn't build it.
 //!
 //! Needs: gh; push access to robot-lord/homebrew-tap and `cargo login` for
 //! a stable release. `--local` also needs what `build-release linux` needs
@@ -259,7 +261,7 @@ pub fn main(args: &[String]) -> Result<()> {
                 );
                 println!("dry run: not run: {}", shown(&create, &dist));
                 if mode != Mode::Dev {
-                    println!("dry run: not run: update-tap, publish-crates");
+                    println!("dry run: not run: update-tap, publish-crates, relay-image --push");
                 }
                 return Ok(());
             }
@@ -270,6 +272,9 @@ pub fn main(args: &[String]) -> Result<()> {
                 println!("released: {}", release_url(&tag));
                 return Ok(());
             }
+            // The workflow run this release starts skips every job, the
+            // image's too.
+            eprintln!("note: the relay image isn't built by --local; after docker login ghcr.io: cargo xtask relay-image --push");
         }
         Mode::StableCi { resume } => {
             if opts.dry_run {

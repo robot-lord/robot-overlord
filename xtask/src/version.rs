@@ -19,6 +19,10 @@ pub const CRATES: [&str; 4] = [
     "robot-overlord",
 ];
 
+/// The relay's container image (`cargo xtask relay-image`), built from
+/// the Linux relay tarballs.
+pub const RELAY_IMAGE: &str = "ghcr.io/robot-lord/rlord-relay";
+
 /// A platform rlord is released for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -33,6 +37,14 @@ pub const MAC: Target = Target {
     deb_arch: "",
     rpm_arch: "",
 };
+
+impl Target {
+    /// The container platform of a Linux target, `linux/<arch>`: Docker
+    /// names these architectures as Debian does.
+    pub fn oci_platform(self) -> String {
+        format!("linux/{}", self.deb_arch)
+    }
+}
 
 pub const LINUX: [Target; 2] = [
     Target {
@@ -137,6 +149,29 @@ impl Version {
         format!("rlord-web-{}-{}", self.tag(), target.triple)
     }
 
+    /// `rlord-relay-v<ver>-<target>.tar.gz`: the relay server, its
+    /// licenses, an example config and a systemd unit. Linux only: a relay
+    /// is a server.
+    pub fn relay_tarball(&self, target: Target) -> String {
+        format!("{}.tar.gz", self.relay_tarball_stem(target))
+    }
+
+    /// The relay tarball's name without `.tar.gz`: also its top-level
+    /// folder.
+    pub fn relay_tarball_stem(&self, target: Target) -> String {
+        format!("rlord-relay-{}-{}", self.tag(), target.triple)
+    }
+
+    /// The relay image's tags: the version, and `latest` for a stable
+    /// release only (never for a dev build).
+    pub fn relay_image_tags(&self) -> Vec<String> {
+        let mut tags = vec![format!("{RELAY_IMAGE}:{}", self.raw)];
+        if !self.is_dev() {
+            tags.push(format!("{RELAY_IMAGE}:latest"));
+        }
+        tags
+    }
+
     pub fn deb(&self, target: Target) -> String {
         format!("rlord_{}-1_{}.deb", self.package_version(), target.deb_arch)
     }
@@ -146,12 +181,13 @@ impl Version {
     }
 
     /// The tarballs every stable release has: rlord's and the web
-    /// plugin's, for each target.
+    /// plugin's for each target, then the relay's for each Linux target.
     pub fn tarballs(&self) -> Vec<String> {
         let targets = || std::iter::once(MAC).chain(LINUX);
         targets()
             .map(|t| self.tarball(t))
             .chain(targets().map(|t| self.web_tarball(t)))
+            .chain(LINUX.iter().map(|t| self.relay_tarball(*t)))
             .collect()
     }
 
@@ -353,6 +389,15 @@ mod tests {
             "rlord-web-v1.0.0-aarch64-apple-darwin.tar.gz"
         );
         assert_eq!(
+            s.relay_tarball(LINUX[0]),
+            "rlord-relay-v1.0.0-x86_64-unknown-linux-musl.tar.gz"
+        );
+        assert_eq!(
+            s.relay_tarball_stem(LINUX[1]),
+            "rlord-relay-v1.0.0-aarch64-unknown-linux-musl"
+        );
+        // A dev build is macOS only, so it has no relay tarball.
+        assert_eq!(
             v("0.23.0-dev.8").dev_assets(),
             [
                 "rlord-v0.23.0-dev.8-aarch64-apple-darwin.tar.gz",
@@ -372,12 +417,31 @@ mod tests {
                 "rlord-web-v1.0.0-aarch64-apple-darwin.tar.gz",
                 "rlord-web-v1.0.0-x86_64-unknown-linux-musl.tar.gz",
                 "rlord-web-v1.0.0-aarch64-unknown-linux-musl.tar.gz",
+                "rlord-relay-v1.0.0-x86_64-unknown-linux-musl.tar.gz",
+                "rlord-relay-v1.0.0-aarch64-unknown-linux-musl.tar.gz",
                 "rlord_1.0.0-1_amd64.deb",
                 "rlord_1.0.0-1_arm64.deb",
                 "rlord-1.0.0-1.x86_64.rpm",
                 "rlord-1.0.0-1.aarch64.rpm",
             ]
         );
+    }
+
+    #[test]
+    fn relay_image_tags_and_platforms() {
+        assert_eq!(
+            v("1.3.0").relay_image_tags(),
+            [
+                "ghcr.io/robot-lord/rlord-relay:1.3.0",
+                "ghcr.io/robot-lord/rlord-relay:latest"
+            ]
+        );
+        assert_eq!(
+            v("1.3.0-dev.4").relay_image_tags(),
+            ["ghcr.io/robot-lord/rlord-relay:1.3.0-dev.4"]
+        );
+        assert_eq!(LINUX[0].oci_platform(), "linux/amd64");
+        assert_eq!(LINUX[1].oci_platform(), "linux/arm64");
     }
 
     #[test]

@@ -707,3 +707,27 @@ textarea {
 .field-value button.on {
   border-color: var(--accent);
 }
+
+/* Devices (remote access). */
+.attention {
+  color: var(--warn);
+}
+.devices h3 {
+  margin: 12px 0 0;
+  font-size: 14px;
+}
+.devices .pending .code {
+  font-family: ui-monospace, monospace;
+  font-size: 18px;
+  letter-spacing: 2px;
+}
+.qr {
+  margin: 12px auto;
+  text-align: center;
+}
+.qr svg {
+  width: min(280px, 70vw);
+  height: auto;
+  display: block;
+  margin: 0 auto 6px;
+}

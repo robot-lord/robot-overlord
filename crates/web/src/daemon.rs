@@ -89,6 +89,24 @@ impl Daemon {
         self.call("web.pages", json!({"pages": ids})).await
     }
 
+    /// `web.remote_reply`: the answer to the user's relay command `id`
+    /// (an `Event::Remote`), `ok` or an error message.
+    pub async fn remote_reply(
+        &self,
+        id: &str,
+        answer: Result<Value, String>,
+    ) -> Result<Value, CallError> {
+        self.call("web.remote_reply", remote_reply_params(id, answer))
+            .await
+    }
+
+    /// `web.remote_state`: this plugin's relay state, the whole of it, on
+    /// every change (`{relay, connected, error, devices, pairing,
+    /// pending}`; crates/daemon/src/relay.rs `normalize`).
+    pub async fn remote_state(&self, state: Value) -> Result<Value, CallError> {
+        self.call("web.remote_state", state).await
+    }
+
     /// `web.subscribe`: the current rev, and the stream of later ones.
     pub async fn subscribe(&self) -> Result<(String, Subscription), CallError> {
         let s = self.connect().await?;
@@ -101,13 +119,27 @@ impl Daemon {
     }
 }
 
+/// `web.remote_reply`'s parameters.
+fn remote_reply_params(id: &str, answer: Result<Value, String>) -> Value {
+    match answer {
+        Ok(v) => json!({"id": id, "ok": v}),
+        Err(e) => json!({"id": id, "error": e}),
+    }
+}
+
 /// What the daemon's push stream says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Something changed; the state's new rev.
-    Changed(String),
+    /// Something changed; the state's new rev. `relay`: only the relay
+    /// status (the page shows it, a device doesn't).
+    Changed { rev: String, relay: bool },
     /// A UI command for one page (`crates/daemon/src/ui.rs`).
     Ui { page: String, cmd: Value },
+    /// The user's relay command (`crates/daemon/src/relay.rs`): answer it
+    /// with `Daemon::remote_reply(id, …)` within 10 s. `req` is
+    /// `{"cmd": "setup" | "pair" | "pair_cancel" | "confirm" | "reject" |
+    /// "revoke" | "disable", …}`.
+    Remote { id: String, req: Value },
 }
 
 /// The daemon's push stream.
@@ -134,10 +166,17 @@ impl Subscription {
 fn event(line: &str) -> Option<Event> {
     let v: Value = serde_json::from_str(line).ok()?;
     match v["notify"].as_str()? {
-        "changed" => Some(Event::Changed(v["rev"].as_str().unwrap_or("").to_string())),
+        "changed" => Some(Event::Changed {
+            rev: v["rev"].as_str().unwrap_or("").to_string(),
+            relay: v["relay"] == true,
+        }),
         "ui" => Some(Event::Ui {
             page: v["page"].as_str()?.to_string(),
             cmd: v.get("cmd")?.clone(),
+        }),
+        "remote" => Some(Event::Remote {
+            id: v["id"].as_str()?.to_string(),
+            req: v.get("req").filter(|r| r.is_object())?.clone(),
         }),
         _ => None,
     }
@@ -175,7 +214,17 @@ mod tests {
     fn stream_lines_are_events() {
         assert_eq!(
             event(r#"{"notify":"changed","rev":"b-3"}"#),
-            Some(Event::Changed("b-3".into()))
+            Some(Event::Changed {
+                rev: "b-3".into(),
+                relay: false
+            })
+        );
+        assert_eq!(
+            event(r#"{"notify":"changed","rev":"b-4","relay":true}"#),
+            Some(Event::Changed {
+                rev: "b-4".into(),
+                relay: true
+            })
         );
         assert_eq!(
             event(r#"{"notify":"ui","page":"p1-ab","cmd":{"cmd":"show_list"}}"#),
@@ -185,6 +234,23 @@ mod tests {
             })
         );
         assert_eq!(event(r#"{"notify":"ui","cmd":{"cmd":"show_list"}}"#), None);
+        assert_eq!(
+            event(r#"{"id":"r1","notify":"remote","req":{"cmd":"pair"}}"#),
+            Some(Event::Remote {
+                id: "r1".into(),
+                req: json!({"cmd": "pair"})
+            })
+        );
+        assert_eq!(event(r#"{"notify":"remote","req":{"cmd":"pair"}}"#), None);
+        assert_eq!(event(r#"{"notify":"remote","id":"r1","req":"pair"}"#), None);
+        assert_eq!(
+            remote_reply_params("r1", Ok(json!({"qr": "q"}))),
+            json!({"id": "r1", "ok": {"qr": "q"}})
+        );
+        assert_eq!(
+            remote_reply_params("r2", Err("no".into())),
+            json!({"id": "r2", "error": "no"})
+        );
         assert_eq!(event(r#"{"notify":"other"}"#), None);
         assert_eq!(event("not json"), None);
     }

@@ -12,3 +12,8 @@ anyhow.workspace = true
 serde_json.workspace = true
 # Ctrl-C handling (cmd::on_interrupt).
 libc.workspace = true
+# `cargo xtask e2e vectors`: the vectors come from the core itself.
+rlord-e2e = { package = "robot-overlord-e2e", path = "../crates/e2e", features = ["vectors"] }
+# `cargo xtask e2e wasm`: bindgen in process, pinned to the same version as
+# `wasm-bindgen` in crates/e2e-wasm, so no tool is downloaded at build time.
+wasm-bindgen-cli-support = "=0.2.130"

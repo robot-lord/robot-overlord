@@ -159,6 +159,7 @@ function App() {
             <button type="button" class="dim" onClick={() => openForm(store, "keys")}>
               Keys
             </button>
+            <DevicesButton />
           </span>
         )}
       </header>
@@ -179,6 +180,22 @@ function App() {
         </main>
       </div>
     </div>
+  );
+}
+
+/** "Devices" (remote access), marked while a device waits for the user. */
+function DevicesButton() {
+  const relay = store.snapshot.value?.relay;
+  const waiting = relay?.pending ?? null;
+  return (
+    <button
+      type="button"
+      class={waiting ? "attention" : "dim"}
+      title={waiting ? `"${waiting.name}" wants to pair` : "remote access: paired devices"}
+      onClick={() => openForm(store, "devices")}
+    >
+      Devices{waiting ? " •" : ""}
+    </button>
   );
 }
 
