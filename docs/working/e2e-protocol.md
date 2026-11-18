@@ -88,9 +88,11 @@ seconds (plus jitter) before reconnecting.
 
 ### After `ready`
 
-Requests carry a number `n`, answered `{"t":"ok","n"}` or
+Requests carry a number `n` (from 1), answered `{"t":"ok","n"}` or
 `{"t":"err","n","code"}` (codes in `msg::code`: `full`, `no_queue`,
-`limit`, `bad`, `unknown`, `rate`).
+`limit`, `bad`, `unknown`, `rate`). A refused binary frame (a mailbox
+message that is `full`, say) is answered `err` with `n: 0`: a binary
+frame carries no number, so a sender matches refusals by order.
 
 | From | Message | Meaning |
 | --- | --- | --- |

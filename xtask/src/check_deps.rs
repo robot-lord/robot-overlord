@@ -63,7 +63,9 @@ pub const DENIED: &[&str] = &[
     "aws-lc-rs",
     "tokio-rustls",
     "webpki-roots",
-    "wasm-bindgen",
+    // Not `wasm-bindgen`: `ulid` (through `web-time`) depends on it for
+    // wasm32 targets only, which rlord is never built for. The WASM
+    // crypto build is denied by name above.
 ];
 
 /// The relay's package, and what it must never depend on: content crypto

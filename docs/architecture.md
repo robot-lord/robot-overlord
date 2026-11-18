@@ -947,7 +947,7 @@ check-deps` (CI's `check` job, and the start of every release build) fails
 when `cargo tree -p robot-overlord` names one (axum, hyper, h2, http,
 tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate,
 and the remote-access and crypto crates: the e2e and relay crates, snow,
-libcrux, P-256, ring, webpki-roots, wasm-bindgen; `qrcode` is allowed, it
+libcrux, P-256, ring, webpki-roots; `qrcode` is allowed, it
 only draws a string) or when the four main crates' source names a TCP or UDP socket type. One
 file is exempt, by name and with its reason: `core/src/agents/opencode_service.rs`,
 the OpenCode adapter's HTTP client for OpenCode's own background server

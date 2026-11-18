@@ -157,6 +157,8 @@ Every PR merged to `main` ships as a release, cut by `cargo xtask release`
 (`.github/workflows/release.yml`, started by the tag push); the build
 commands live in `cargo xtask build-release`, shared with the local
 fallback. Dev builds are built on the maintainer's Apple Silicon Mac.
+A stable release also ships the relay (`rlord-relay` Linux tarballs and
+the `ghcr.io/robot-lord/rlord-relay` image, `cargo xtask relay-image`).
 CONTRIBUTING.md has the full setup.
 
 - **In each PR:** bump `[workspace.package] version` in `Cargo.toml` and

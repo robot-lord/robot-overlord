@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; slice 3, the e2e core and the relay, is planned below and waits on the user's answers; then the phone app)
+**Status:** in progress (slices 1 and 2, the local web UI and the web as a UI target, are built; slice 3, the e2e core and the relay, is built on `feat/web-ui-3` and not yet reviewed or merged; then the phone app)
 
 # rlord web UI and end-to-end encrypted relay
 
@@ -994,7 +994,62 @@ Decided 2026-11-17 (user):
     (`RLORD_WEB_TEST_CRASH`, debug builds only).
   - Step 18 (docs): `docs/architecture.md` "Remote access (through a
     relay)", `docs/guide.md` "Remote access through a relay",
-    `SECURITY.md`, `CLAUDE.md`'s rules, `docs/relay.md` (the relay agent).
+    `SECURITY.md`, `CLAUDE.md`'s rules and Releases, `docs/relay.md`
+    (the relay agent).
+  - Relay (steps 6, 7, the relay half of 17), as built: `crates/relay`
+    (lib `rlord_relay` with `start`/`Running`/`Admin` for in-process
+    tests, bin `rlord-relay`), `Store` trait with SQLite and its
+    conformance suite, `StaticAuthorizer`, the `Meter`, backpressure by
+    64 frame permits per connection (the sender isn't read while a
+    frame waits; `bye idle` and 4408 after `stall`), files and proxy TLS
+    (SIGHUP reload in files mode; ignored in proxy mode), the release
+    tarballs, `deploy/relay/`, `cargo xtask relay-image` and a
+    `relay-image` job in `release.yml`. Its deviations: a refused binary
+    frame is answered `err` with `n: 0` (a binary frame has no number;
+    clients number requests from 1); a pairing attempt counts when it
+    connects (the relay can't tell success from failure; the host
+    closes the rendezvous on success); a second pairing device gets 4429;
+    `drop` closes with 1000; shutdown sends `bye overloaded` (retry 5 s)
+    then 4503; the per-address limit closes after the upgrade (`bye
+    limit`, 4429); a peer leaving over 1024 control messages unread is
+    closed (4408); the relay waits up to 1 s for a close reply; every
+    admitted host gets a store record; mailbox deliveries are bounded by
+    the queue limits, not the frame permits; the binary caps
+    tungstenite/axum/hyper/rustls logs at `info` (at trace they print
+    payloads); `ready.limits` is sent to hosts; the image is pushed by
+    the publishing run just before the release is published (the
+    workflow only makes a draft), `--local` releases get no image.
+  - `check-deps` deviation: `wasm-bindgen` is not on `rlord`'s deny list:
+    `ulid` (through `web-time`) depends on it for wasm32 targets only,
+    which `cargo tree --target all` shows; rlord is never built for
+    wasm32. `robot-overlord-e2e-wasm` stays denied by name.
+- Owed after slice 3:
+  - **The protocol review** (`docs/working/e2e-protocol.md`), before
+    anyone but the user runs a relay. Then promote that doc.
+  - By hand: `rlord-relay` in Docker compose on a real host with a real
+    certificate, a host behind NAT, `rlord-device` on another network;
+    pair, confirm, ask the overlord, revoke. The multi-platform `docker
+    buildx` build, push and attestation and the release workflow's
+    `relay-image` job have not run (no buildx here); the new ghcr.io
+    package starts private and must be made public once.
+  - Adversarial cases not automated end to end: a relay that lets a
+    revoked device through (the core's vectors and the host's
+    allow-list check cover it: `kk_revoked_device_host`,
+    `device_link`), a relay that invents `link` for a device not on the
+    list (covered by `device_link`'s own check, untested through a
+    hostile relay), a relay that swaps two devices' frames, a mailbox
+    frame replayed or skipped through the relay (the core's vectors
+    cover replay, gap and tamper), a recorded pairing replayed after the
+    rendezvous closed. Client-side `bye` `retry_after` and `enroll`
+    handling in the plugin are built but tested only on the relay's side.
+  - Not built: TLS channel binding (open question 9, no), mTLS (5,
+    later), ACME (2, later), compression (provisional in `e2e-crypto.md`;
+    real snapshot sizes still to record), the phone app, panes over the
+    relay (streams 1 and up close the link).
+  - Owed from the spike: phone benchmarks, Firefox.
+  - The CLI's pairing flow against a live daemon has no end-to-end test
+    (the CLI autostarts a real daemon); its logic is unit-tested and the
+    same daemon commands are exercised by `web/tests/remote.rs`.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 

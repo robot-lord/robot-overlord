@@ -1,4 +1,4 @@
-**Status:** in progress (design settled 2026-11-17; spike built in `spikes/e2e/` on its own branch, results in "Spike results"; building it for real, the core crates and the relay, is planned as slice 3 in `web-ui-remote.md` and not started. Still owed: phone benchmarks, Firefox, the protocol review. Compression is provisional and not part of slice 3)
+**Status:** in progress (design settled 2026-11-17; spike built in `spikes/e2e/` on its own branch, results in "Spike results"; built for real as slice 3 in `web-ui-remote.md` (`crates/e2e`, `e2e-wasm`, `relay-proto`, `relay`; the protocol as built is `e2e-protocol.md`). Still owed: phone benchmarks, Firefox, the protocol review. Compression is provisional and not part of slice 3)
 
 # End-to-end encryption for the relay: crypto core and the frontend path
 
