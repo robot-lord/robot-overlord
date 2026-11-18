@@ -148,9 +148,18 @@ struct LinkEnd {
     to_host: Arc<Semaphore>,
 }
 
+impl LinkEnd {
+    /// Whether this link belongs to the connection `conn` of `device` (in
+    /// role `kind`). A link id a connection remembers may have been given
+    /// to someone else since (its host reconnected), so every use of a
+    /// remembered id checks it is still that connection's.
+    fn is(&self, device: &Fp, kind: LinkKind, conn: u64) -> bool {
+        self.device == *device && self.kind == kind && self.out.id == conn
+    }
+}
+
 struct HostConn {
     out: Outbox,
-    next_link: u32,
     links: HashMap<u32, LinkEnd>,
 }
 
@@ -217,6 +226,10 @@ struct Inner {
     to_device: HashMap<Pair, Queue>,
     to_host: HashMap<Pair, Queue>,
     unauth: HashMap<IpAddr, usize>,
+    /// The last link id given. One counter for the whole relay, so a host
+    /// that reconnects never sees an id its last connection used (a stale
+    /// id held by a dying connection can't name a new link).
+    next_link: u32,
 }
 
 impl Inner {
@@ -230,8 +243,12 @@ impl Inner {
         rendezvous: Option<RendezvousId>,
     ) -> Option<u32> {
         let h = self.hosts.get_mut(host)?;
-        let id = h.next_link;
-        h.next_link = h.next_link.wrapping_add(1).max(1);
+        let id = loop {
+            self.next_link = self.next_link.wrapping_add(1).max(1);
+            if !h.links.contains_key(&self.next_link) {
+                break self.next_link;
+            }
+        };
         h.out.send(&FromRelay::Link {
             id,
             device: B64(device.to_vec()),
@@ -250,11 +267,22 @@ impl Inner {
         Some(id)
     }
 
-    fn unlink(&mut self, host: &Fp, id: u32) {
+    /// Ends link `id` of `host` if it is still the one of `device`'s
+    /// connection `conn` (as [`LinkEnd::is`]), and tells the host.
+    fn unlink(&mut self, host: &Fp, id: u32, device: &Fp, kind: LinkKind, conn: u64) {
         if let Some(h) = self.hosts.get_mut(host) {
-            if h.links.remove(&id).is_some() {
+            if h.links.get(&id).is_some_and(|l| l.is(device, kind, conn)) {
+                h.links.remove(&id);
                 h.out.send(&FromRelay::Unlink { id });
             }
+        }
+    }
+
+    /// A host's connection ended or was replaced: its pairing devices'
+    /// links went with it (they are being closed).
+    fn forget_pair_links(&mut self, host: &Fp) {
+        for pc in self.pairs.values_mut().filter(|pc| pc.host == *host) {
+            pc.link = None;
         }
     }
 
@@ -281,7 +309,7 @@ impl Inner {
             d.out
                 .kill(close::NOT_ALLOWED, "not on the host's list", None);
             if let Some(l) = d.link {
-                self.unlink(host, l);
+                self.unlink(host, l, device, LinkKind::Device, d.out.id);
             }
         }
     }
@@ -424,6 +452,7 @@ impl Hub {
                     }
                     None => false,
                 };
+                g.forget_pair_links(&p.fp);
                 p.out.send(&FromRelay::Ready(Ready {
                     limits: Some(p.limits.wire()),
                     ..self.ready()
@@ -432,7 +461,6 @@ impl Hub {
                     p.fp,
                     HostConn {
                         out: p.out.clone(),
-                        next_link: 1,
                         links: HashMap::new(),
                     },
                 );
@@ -475,10 +503,22 @@ impl Hub {
                 }
             }
             Role::Device => {
+                // Checked again under the lock: an allow-list change that
+                // removed this device since `connect` checked it either is
+                // seen here, or comes after and closes it (`devices` writes
+                // the store before it takes the lock).
+                match self.registry.is_device(&p.host, &p.fp) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(close::NOT_ALLOWED),
+                    Err(e) => {
+                        tracing::warn!("store: {e:#}");
+                        return Err(close::OVERLOADED);
+                    }
+                }
                 if let Some(old) = g.devices.remove(&p.fp) {
                     old.out.kill(close::REPLACED, "replaced", None);
                     if let Some(l) = old.link {
-                        g.unlink(&old.host, l);
+                        g.unlink(&old.host, l, &p.fp, LinkKind::Device, old.out.id);
                     }
                 }
                 let pair = (p.host, p.fp);
@@ -521,7 +561,7 @@ impl Hub {
                 if let Some(old) = g.pairs.remove(&p.fp) {
                     old.out.kill(close::REPLACED, "replaced", None);
                     if let Some(l) = old.link {
-                        g.unlink(&old.host, l);
+                        g.unlink(&old.host, l, &p.fp, LinkKind::Pair, old.out.id);
                     }
                     if let Some(r) = g.rendezvous.get_mut(&old.rendezvous) {
                         if r.active == Some(old.out.id) {
@@ -583,6 +623,7 @@ impl Hub {
                         LinkKind::Pair => l.out.kill(1000, "host gone", None),
                     }
                 }
+                g.forget_pair_links(&p.fp);
                 g.rendezvous.retain(|_, r| r.host != p.fp);
                 drop(g);
                 let _ = self.registry.touch_host(&p.fp);
@@ -593,7 +634,7 @@ impl Hub {
                 }
                 let d = g.devices.remove(&p.fp).unwrap();
                 if let Some(l) = d.link {
-                    g.unlink(&d.host, l);
+                    g.unlink(&d.host, l, &p.fp, LinkKind::Device, d.out.id);
                 }
             }
             Role::Pair => {
@@ -602,7 +643,7 @@ impl Hub {
                 }
                 let pc = g.pairs.remove(&p.fp).unwrap();
                 if let Some(l) = pc.link {
-                    g.unlink(&pc.host, l);
+                    g.unlink(&pc.host, l, &p.fp, LinkKind::Pair, pc.out.id);
                 }
                 if let Some(r) = g.rendezvous.get_mut(&pc.rendezvous) {
                     if r.active == Some(p.out.id) {
@@ -828,9 +869,15 @@ impl Hub {
                             .and_then(|d| d.link)
                     };
                     let undeliverable = FromRelay::Undeliverable { link: None };
+                    let kind = if p.role == Role::Device {
+                        LinkKind::Device
+                    } else {
+                        LinkKind::Pair
+                    };
                     match link.and_then(|l| {
                         let h = g.hosts.get(&p.host)?;
-                        Some((l, h, h.links.get(&l)?))
+                        let end = h.links.get(&l).filter(|e| e.is(&p.fp, kind, p.out.id))?;
+                        Some((l, h, end))
                     }) {
                         Some((link, h, end)) => Route::ToHost {
                             to: h.out.clone(),
@@ -845,6 +892,16 @@ impl Hub {
                         return Route::Reply(refused(code::BAD, None));
                     }
                     let mut g = self.lock();
+                    // Still this host's device: one taken off its list is
+                    // forgotten (under this lock) before its connection
+                    // closes, and must not queue anything after that.
+                    if !g
+                        .devices
+                        .get(&p.fp)
+                        .is_some_and(|d| d.out.id == p.out.id && d.host == p.host)
+                    {
+                        return Route::Reply(refused(code::UNKNOWN, None));
+                    }
                     let pair = (p.host, p.fp);
                     let seq = match enqueue(g.to_host.entry(pair).or_default(), &p.limits, &payload)
                     {
@@ -996,5 +1053,224 @@ impl Drop for UnauthGuard {
                 g.unauth.remove(&self.ip);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Registration, StaticAuthorizer};
+    use crate::store::{SqliteStore, Store};
+
+    fn hub() -> (Hub, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dir.path());
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::open(&dir.path().join("relay.db")).unwrap());
+        let registry = Registry::new(store);
+        let auth = Arc::new(StaticAuthorizer {
+            registry: registry.clone(),
+            registration: Registration::Open,
+            limits: cfg.limits.clone(),
+            max_hosts: 10,
+            host_expiry: None,
+        });
+        let (_, shutdown) = watch::channel(false);
+        let hub = Hub::new(
+            cfg,
+            crate::key::generate().unwrap(),
+            "http://127.0.0.1:1".into(),
+            "boot".into(),
+            registry,
+            auth,
+            shutdown,
+        );
+        (hub, dir)
+    }
+
+    struct Conn {
+        peer: Peer,
+        ends: OutboxEnds,
+    }
+
+    fn conn(hub: &Hub, role: Role, fp: Fp, host: Fp, rendezvous: Option<RendezvousId>) -> Conn {
+        let (out, ends) = Outbox::new(hub.next_id());
+        Conn {
+            peer: Peer {
+                role,
+                fp,
+                host,
+                rendezvous,
+                account: "local".into(),
+                limits: hub.cfg.limits.clone(),
+                out,
+                tally: hub.meter.open("local", &fp),
+            },
+            ends,
+        }
+    }
+
+    impl Conn {
+        /// The control messages sent to it so far.
+        fn texts(&mut self) -> Vec<FromRelay> {
+            let mut v = Vec::new();
+            while let Ok(o) = self.ends.rx.try_recv() {
+                if let Out::Text(t) = o {
+                    v.push(FromRelay::parse(&t).unwrap());
+                }
+            }
+            v
+        }
+
+        fn links(&mut self) -> Vec<u32> {
+            self.texts()
+                .into_iter()
+                .filter_map(|m| match m {
+                    FromRelay::Link { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn killed(&self) -> bool {
+            *self.ends.kill.borrow()
+        }
+    }
+
+    /// The link a device's live frame reaches its host on, if any.
+    fn live_link(hub: &Hub, c: &Conn) -> Option<u32> {
+        match hub.binary(&c.peer, &FromDevice::Live(b"x".to_vec()).encode()) {
+            Route::ToHost { frame, .. } => match ToHost::decode(&frame).unwrap() {
+                ToHost::Live { link, .. } => Some(link),
+                _ => panic!("not a live frame"),
+            },
+            Route::Reply(FromRelay::Undeliverable { .. }) => None,
+            _ => panic!("unexpected route"),
+        }
+    }
+
+    #[test]
+    fn a_pairing_devices_old_link_never_touches_a_reconnected_hosts_links() {
+        let (hub, _dir) = hub();
+        let (hfp, dfp, pfp, rid) = ([1; 32], [2; 32], [3; 32], [9; 16]);
+        hub.registry.set_devices(&hfp, &[dfp]).unwrap();
+        let mut h1 = conn(&hub, Role::Host, hfp, hfp, None);
+        hub.register(&h1.peer).unwrap();
+        let ttl = 60;
+        let ok = hub.control(
+            &h1.peer,
+            ToRelay::Rendezvous {
+                n: 1,
+                id: B64(rid.to_vec()),
+                ttl,
+            },
+        );
+        assert_eq!(ok, FromRelay::Ok { n: 1 });
+        let p = conn(&hub, Role::Pair, pfp, hfp, Some(rid));
+        hub.register(&p.peer).unwrap();
+        let d = conn(&hub, Role::Device, dfp, hfp, None);
+        hub.register(&d.peer).unwrap();
+        let old = h1.links();
+        assert_eq!(old.len(), 2);
+
+        // The host reconnects: the pairing device is being closed, the
+        // device relinked under an id the old connection never used.
+        let mut h2 = conn(&hub, Role::Host, hfp, hfp, None);
+        hub.register(&h2.peer).unwrap();
+        assert!(p.killed());
+        let relinked = h2.links();
+        assert_eq!(relinked.len(), 1);
+        assert!(!old.contains(&relinked[0]), "{old:?} {relinked:?}");
+        assert_eq!(live_link(&hub, &d), Some(relinked[0]));
+
+        // A frame the pairing device sent before its close is not
+        // delivered; its unregister leaves the device's link alone.
+        assert_eq!(live_link(&hub, &p), None);
+        hub.unregister(&p.peer);
+        assert!(h2.texts().is_empty());
+        assert_eq!(live_link(&hub, &d), Some(relinked[0]));
+    }
+
+    #[test]
+    fn a_stale_link_id_that_names_another_link_is_ignored() {
+        // Defence in depth: even if a pairing device's remembered id were
+        // reused for a device's link, it neither unlinks nor speaks for it.
+        let (hub, _dir) = hub();
+        let (hfp, dfp, pfp, rid) = ([1; 32], [2; 32], [3; 32], [9; 16]);
+        hub.registry.set_devices(&hfp, &[dfp]).unwrap();
+        let mut h = conn(&hub, Role::Host, hfp, hfp, None);
+        hub.register(&h.peer).unwrap();
+        hub.control(
+            &h.peer,
+            ToRelay::Rendezvous {
+                n: 1,
+                id: B64(rid.to_vec()),
+                ttl: 60,
+            },
+        );
+        let p = conn(&hub, Role::Pair, pfp, hfp, Some(rid));
+        hub.register(&p.peer).unwrap();
+        let d = conn(&hub, Role::Device, dfp, hfp, None);
+        hub.register(&d.peer).unwrap();
+        let links = h.links();
+        let (pair_link, device_link) = (links[0], links[1]);
+        {
+            let mut g = hub.lock();
+            g.hosts.get_mut(&hfp).unwrap().links.remove(&pair_link);
+            g.pairs.get_mut(&pfp).unwrap().link = Some(device_link);
+        }
+        assert_eq!(live_link(&hub, &p), None);
+        hub.unregister(&p.peer);
+        assert!(h.texts().is_empty());
+        assert_eq!(live_link(&hub, &d), Some(device_link));
+    }
+
+    #[test]
+    fn a_device_removed_while_it_connects_is_not_admitted() {
+        let (hub, _dir) = hub();
+        let (hfp, dfp) = ([1; 32], [2; 32]);
+        hub.registry.set_devices(&hfp, &[dfp]).unwrap();
+        let mut h = conn(&hub, Role::Host, hfp, hfp, None);
+        hub.register(&h.peer).unwrap();
+        // `connect` saw the device on the list; then the host removed it
+        // before the device registered.
+        assert!(hub.registry.is_device(&hfp, &dfp).unwrap());
+        let ok = hub.control(
+            &h.peer,
+            ToRelay::Devices {
+                n: 1,
+                allow: vec![],
+            },
+        );
+        assert_eq!(ok, FromRelay::Ok { n: 1 });
+        let d = conn(&hub, Role::Device, dfp, hfp, None);
+        assert_eq!(hub.register(&d.peer), Err(close::NOT_ALLOWED));
+        assert!(h.links().is_empty());
+        assert!(hub.lock().devices.is_empty());
+    }
+
+    #[test]
+    fn a_removed_devices_late_mailbox_frame_is_refused() {
+        let (hub, _dir) = hub();
+        let (hfp, dfp) = ([1; 32], [2; 32]);
+        hub.registry.set_devices(&hfp, &[dfp]).unwrap();
+        let h = conn(&hub, Role::Host, hfp, hfp, None);
+        hub.register(&h.peer).unwrap();
+        let d = conn(&hub, Role::Device, dfp, hfp, None);
+        hub.register(&d.peer).unwrap();
+        hub.control(
+            &h.peer,
+            ToRelay::Devices {
+                n: 1,
+                allow: vec![],
+            },
+        );
+        assert!(d.killed());
+        // A frame its reader had already taken in.
+        let r = hub.binary(&d.peer, &FromDevice::Mailbox(b"m".to_vec()).encode());
+        assert!(
+            matches!(r, Route::Reply(FromRelay::Refused { ref code, .. }) if code == code::UNKNOWN)
+        );
+        assert!(hub.lock().to_host.is_empty());
     }
 }

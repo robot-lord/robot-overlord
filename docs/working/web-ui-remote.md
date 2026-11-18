@@ -990,8 +990,10 @@ Decided 2026-11-17 (user):
     mailbox, revocation (link closed, 4403 after), reject, a spent QR,
     three wrong secrets closing the rendezvous, a forwarder failing on
     both ends, replayed and tampered frames, no dialling without setup
-    or after `disable` across a restart, and both mailbox crash points
-    (`RLORD_WEB_TEST_CRASH`, debug builds only).
+    or after `disable` across a restart, both mailbox crash points
+    (`RLORD_WEB_TEST_CRASH`, debug builds only), and a mailbox frame
+    whose save fails (`RLORD_WEB_TEST_FAIL`, debug builds only: memory
+    is put back, so the frame the relay delivers again is handled).
   - Step 18 (docs): `docs/architecture.md` "Remote access (through a
     relay)", `docs/guide.md` "Remote access through a relay",
     `SECURITY.md`, `CLAUDE.md`'s rules and Releases, `docs/relay.md`

@@ -288,7 +288,14 @@ impl Actor {
             paired_at: now(),
             last_seen: None,
         };
-        self.devices.add(device).map_err(|e| format!("{e:#}"))?;
+        if let Err(e) = self.devices.add(device) {
+            // Not stored: the device still waits, so confirming can be
+            // tried again (or the pairing rejected).
+            if let Some(p) = self.pairing.as_mut() {
+                p.pending = Some(w);
+            }
+            return Err(format!("{e:#}"));
+        }
         self.audit.log(&id, &format!("paired ({})", w.name));
         self.send_allow();
         let host_key = self

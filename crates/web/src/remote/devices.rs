@@ -87,12 +87,18 @@ impl Devices {
         self.list.iter().map(|d| d.relay_fp.clone()).collect()
     }
 
-    /// Adds or replaces (the same static key pairing again).
+    /// Adds or replaces (the same static key pairing again). If it can't
+    /// be saved, the list stays as it was.
     pub fn add(&mut self, d: Device) -> Result<()> {
+        let before = self.list.clone();
         self.list
             .retain(|x| x.id != d.id && x.relay_fp != d.relay_fp);
         self.list.push(d);
-        self.save()
+        let r = self.save();
+        if r.is_err() {
+            self.list = before;
+        }
+        r
     }
 
     /// Removes a device; its record, if it was there.
@@ -159,6 +165,19 @@ mod tests {
         assert!(d2.remove("a").unwrap().is_some());
         assert!(d2.remove("a").unwrap().is_none());
         assert_eq!(Devices::load(&dir).unwrap().list.len(), 1);
+    }
+
+    #[test]
+    fn a_device_that_cant_be_saved_isnt_added() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The folder can't be made: a file is in the way.
+        std::fs::write(tmp.path().join("remote"), b"").unwrap();
+        let mut d = Devices {
+            path: tmp.path().join("remote").join("devices.json"),
+            list: Vec::new(),
+        };
+        assert!(d.add(dev("a", 1)).is_err());
+        assert!(d.list.is_empty());
     }
 
     #[test]

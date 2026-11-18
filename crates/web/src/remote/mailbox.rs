@@ -75,7 +75,7 @@ struct Req {
 
 /// A device's mailbox and what has been handled through it, saved
 /// together in one file so a crash never leaves them out of step.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Saved {
     /// `MailboxSession::export`, base64url; None after a failure.
     #[serde(default)]
@@ -113,6 +113,15 @@ struct Entry {
     session: Option<MailboxSession>,
     saved: Saved,
     outbox: Outbox,
+}
+
+/// A device's mailbox and saved state as they were before a frame was
+/// handled, put back if saving the result fails ([`Mailboxes::restore`]).
+pub(crate) struct Snapshot {
+    saved: Saved,
+    /// `MailboxSession::export` (None: no mailbox, or one that can't be
+    /// exported, which is put back as none).
+    session: Option<Vec<u8>>,
 }
 
 /// What the store says about a request id.
@@ -213,6 +222,24 @@ impl Mailboxes {
         private::dir(&dir)?;
         private::write(&path, &bytes)?;
         Ok(())
+    }
+
+    /// The device's mailbox and saved state now, for [`Mailboxes::restore`].
+    pub fn snapshot(&mut self, id: &str) -> Snapshot {
+        let e = self.entry(id);
+        Snapshot {
+            saved: e.saved.clone(),
+            session: e.session.as_ref().and_then(|m| m.export().ok()),
+        }
+    }
+
+    /// Put back what [`Mailboxes::snapshot`] took: memory again matches
+    /// what is on disk (a save failed), so a frame left unacknowledged at
+    /// the relay is handled afresh when it comes again.
+    pub fn restore(&mut self, id: &str, s: Snapshot) {
+        let e = self.entry(id);
+        e.saved = s.saved;
+        e.session = s.session.and_then(|b| MailboxSession::import(&b).ok());
     }
 
     /// The mailbox failed (a gap past what the cipher skips, a replay,
@@ -344,6 +371,15 @@ fn crash_point(name: &str) {
     }
 }
 
+/// For the tests only (debug builds): true once, the first time the named
+/// point is reached, when `RLORD_WEB_TEST_FAIL` names it.
+fn fail_point(name: &str) -> bool {
+    static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    cfg!(debug_assertions)
+        && std::env::var("RLORD_WEB_TEST_FAIL").is_ok_and(|v| v == name)
+        && !FAILED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A request's id as text (a device may send a number or a string).
 pub(crate) fn request_id(v: &Value) -> Option<String> {
     match v {
@@ -371,6 +407,11 @@ impl Actor {
         if self.mailboxes.handled(&device, &boot, seq) {
             return ack(self);
         }
+        // Until the save below, everything here changes memory only (the
+        // mailbox's counter, the frame's number, the request as running);
+        // a failed save puts it back, so the frame, left at the relay, is
+        // handled afresh when it comes again rather than taken for done.
+        let before = self.mailboxes.snapshot(&device);
         let Some(m) = self.mailboxes.get(&device) else {
             return ack(self);
         };
@@ -394,6 +435,14 @@ impl Actor {
             .ok()
             .filter(|m| m.stream == CONTROL)
             .and_then(|m| serde_json::from_slice::<Value>(&m.body).ok());
+        // The request's waiters before `admit`, to put back with the rest.
+        let waiting_key = req
+            .as_ref()
+            .and_then(|r| request_id(&r["id"]))
+            .map(|k| (device.clone(), k));
+        let waiting_before = waiting_key
+            .as_ref()
+            .and_then(|k| self.waiting.get(k).cloned());
         let next = match &req {
             None => Next::Answer(
                 Waiter::Mailbox,
@@ -411,8 +460,26 @@ impl Actor {
         };
         // The advanced state, the request as running and this frame's
         // number, in one write, before acting: never done twice.
-        if let Err(e) = self.mailboxes.save(&device) {
+        let saved = if fail_point("mailbox_frame_save") {
+            Err(anyhow::anyhow!(
+                "failing at mailbox_frame_save (RLORD_WEB_TEST_FAIL)"
+            ))
+        } else {
+            self.mailboxes.save(&device)
+        };
+        if let Err(e) = saved {
             eprintln!("rlord-web: saving a mailbox: {e:#}");
+            self.mailboxes.restore(&device, before);
+            if let Some(k) = waiting_key {
+                match waiting_before {
+                    Some(w) => self.waiting.insert(k, w),
+                    None => self.waiting.remove(&k),
+                };
+            }
+            self.audit.log(
+                &device,
+                &format!("mailbox frame not saved; left at the relay ({e})"),
+            );
             return;
         }
         crash_point("mailbox_saved");
@@ -598,6 +665,31 @@ mod tests {
         assert_eq!(request_id(&json!(5)), Some("5".into()));
         assert_eq!(request_id(&json!("")), None);
         assert_eq!(request_id(&json!(null)), None);
+    }
+
+    #[test]
+    fn a_failed_save_is_undone_by_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = Mailboxes::new(tmp.path().to_path_buf());
+        m.begin("d", "r0");
+        m.mark("d", "b1", 3);
+        m.save("d").unwrap();
+        // Handling a frame: its number and request, then the save fails
+        // (the folder is now a file).
+        let before = m.snapshot("d");
+        m.mark("d", "b1", 4);
+        m.begin("d", "r1");
+        std::fs::remove_dir_all(tmp.path()).unwrap();
+        std::fs::write(tmp.path(), b"").unwrap();
+        assert!(m.save("d").is_err());
+        m.restore("d", before);
+        // As before the frame: it is new again when redelivered, and so is
+        // its request.
+        assert!(!m.handled("d", "b1", 4));
+        assert!(m.handled("d", "b1", 3));
+        assert_eq!(m.lookup("d", "r1"), Lookup::New);
+        assert_eq!(m.lookup("d", "r0"), Lookup::Running);
+        std::fs::remove_file(tmp.path()).unwrap();
     }
 
     #[test]

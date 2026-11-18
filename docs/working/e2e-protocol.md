@@ -156,10 +156,10 @@ frame parses without knowing its lane in advance.)
   host; one pairing link at a time per rendezvous; the third attempt
   closes the rendezvous; it expires after its `ttl`.
 - **Links.** While a host and one of its devices (or a pairing device) are
-  both connected, the relay gives the pair a link id (unique per host
-  connection) and tells the host `link`; when either goes, `unlink`. Lane-1
-  frames are forwarded at once to the other end of the link, or answered
-  `undeliverable`.
+  both connected, the relay gives the pair a link id (never reused while
+  the relay runs, even across a host's reconnects) and tells the host
+  `link`; when either goes, `unlink`. Lane-1 frames are forwarded at once
+  to the other end of the link, or answered `undeliverable`.
 - **Backpressure per link, never dropping silently.** A live frame can't
   be dropped (a missing frame ends the Noise session), and one device must
   not hold up its host's others. Device to host: each link has its own

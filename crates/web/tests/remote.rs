@@ -574,6 +574,57 @@ async fn a_crash_in_the_mailbox_never_repeats_an_op() {
     assert_eq!(ops(), 1, "no op ran twice, and c2 not at all");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mailbox_frame_that_cant_be_saved_is_handled_when_it_comes_again() {
+    let _g = LOCK.lock().await;
+    let w = world(1).await;
+    let mut dev = pair("unsaved").await;
+    let mut c = dev.connect().await.unwrap();
+    let mut live = dev.live(&mut c).await.unwrap();
+    dev.key_mailbox(&mut c, &mut live).await.unwrap();
+    keyed(&dev).await;
+    c.close().await;
+    let marker = format!("{} mailbox op", dev.id());
+    let ops = || audit().matches(&marker).count();
+
+    // Queued while the plugin is off; the plugin's first save of it fails,
+    // so it is left unacknowledged at the relay.
+    w.rig.daemon.web().stop();
+    let mut c = dev.connect().await.unwrap();
+    let req = dev
+        .mailbox_request("u1", "overlord.ask", json!({"text": "one"}))
+        .unwrap();
+    c.send_mailbox(req).await.unwrap();
+    // Safety: under LOCK; the daemon passes its environment to the plugin.
+    std::env::set_var("RLORD_WEB_TEST_FAIL", "mailbox_frame_save");
+    w.rig.daemon.web().start(false).unwrap();
+    std::env::remove_var("RLORD_WEB_TEST_FAIL");
+    let t = Instant::now();
+    while !audit().contains(&format!("{} mailbox frame not saved", dev.id())) {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "the save never failed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(ops(), 0);
+
+    // The same plugin reconnects: the relay delivers the frame again, and
+    // it is handled as new (not taken for done and dropped), once.
+    rpc("relay.disable", json!({})).await.unwrap();
+    status_until("disconnected", |s| s["connected"] == false).await;
+    rpc(
+        "relay.setup",
+        json!({"address": w.relay.address().to_string()}),
+    )
+    .await
+    .unwrap();
+    let a = mailbox_answer(&mut dev, &mut c).await;
+    assert_eq!(a["id"], "u1", "{a}");
+    assert_ne!(a["error"]["code"], "interrupted", "{a}");
+    assert_eq!(ops(), 1);
+}
+
 /// Waits until the device's mailbox is keyed at the host.
 async fn keyed(dev: &Device) {
     let t = Instant::now();
