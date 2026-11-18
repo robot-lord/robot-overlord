@@ -734,6 +734,22 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         let Some(id) = s.agent_session.as_deref() else {
             continue;
         };
+        // Its lock (locks.rs: before the DB) for the look and the POST: a
+        // restart, stop or archive waits, and one that came first is seen.
+        let _session = d.sessions.lock(&s.id);
+        {
+            let db = d.db();
+            let still = db
+                .kv_get(&crate::first_prompt::pending_key(&s.id))?
+                .as_deref()
+                == Some(raw.as_str());
+            let running = db
+                .session_by_id(&s.id)?
+                .is_some_and(|r| r.archived_at.is_none() && r.status != Status::Stopped);
+            if !still || !running {
+                continue;
+            }
+        }
         let held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
         let file = std::path::PathBuf::from(held["file"].as_str().unwrap_or(""));
         let late = now_ms() - held["at"].as_i64().unwrap_or(0) > FIRST_PROMPT_WAIT_MS;
@@ -742,7 +758,15 @@ fn apply_first_prompt(d: &Daemon, linked: Option<&Service>, up: &[&Session]) -> 
         if model_held && !late {
             continue;
         }
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        // (Gone: lost. Unreadable for another reason: kept, tried again.)
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                tracing::warn!(session = %s.id, error = %e, "reading the first prompt's file");
+                continue;
+            }
+        };
         let step = first_prompt_step(
             text.trim().is_empty(),
             svc.and_then(|svc| svc.has_session(id)),
@@ -817,13 +841,18 @@ fn settle_stopped_first_prompts(d: &Daemon) -> Result<()> {
         let db = d.db();
         for (key, raw) in db.kv_prefix(&prefix)? {
             let id = key.trim_start_matches(&prefix).to_string();
-            let row = db.resolve_ref(&id).ok();
+            // (Only no row at all is gone; a failed read is tried again.)
+            let row = match db.session_by_id(&id) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "reading a session row");
+                    continue;
+                }
+            };
             let mut held: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
             match &row {
-                // (A pane that is gone shows as stopped or in error.)
-                Some(s)
-                    if s.archived_at.is_none()
-                        && !matches!(s.status, Status::Stopped | Status::Error) => {}
+                // (A pane that is gone shows as stopped: `discover`.)
+                Some(s) if s.archived_at.is_none() && s.status != Status::Stopped => {}
                 Some(s) if s.archived_at.is_none() => {
                     if held["stopped"] != true {
                         held["stopped"] = json!(true);

@@ -802,6 +802,24 @@ runs again without a restart through rlord; the restart's words check
 and the never-taken server arm on restart; `Placed` as an enum; the POST
 on the follower thread.
 
+### Review round 7 (PR #73)
+
+1. The POST is made under the session's lock, after re-checking that
+   the hold is unchanged and the session is neither stopped nor archived.
+2. The sweep counts a session as gone only when its row is missing
+   (`Db::session_by_id`); a failed read keeps the hold.
+3. A prompt file that can't be read (other than missing) keeps the hold
+   for the next pass.
+4. Only `Stopped` marks a hold stopped (a session in error may still
+   have its pane).
+5. `docs/architecture.md` matches the code.
+
+Owed (round 7): a restart with a prompt queued for typing
+(`FIRST_KEY`) but no held POST may put a pointer on argv as well
+(`carried_held` checks only the POST hold); when the hold changed
+under a POST (`!same`), the event is logged but nothing ties it to the
+newer hold; the dedupe items above.
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;

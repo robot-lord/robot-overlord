@@ -263,16 +263,21 @@ facts live in its module) is what the rest of rlord asks:
   launch spec's words in its place (`first_prompt::task`). OpenCode's is
   POSTed to its server (`POST /api/session/<id>/prompt`, `{text}`) once
   the session exists and its model is settled (kv `first_prompt:<id>`,
-  carried over a restart, `opencode::apply_first_prompt`). Refused (no
-  connection, an error status) or not there after 30s: it is typed in at
-  the first idle turn from its own slot (`send::queue_first`, before and
-  apart from the overlord's queued messages). Sent with no answer back:
+  carried over a restart, `opencode::apply_first_prompt`). The POST is
+  made under the session's lock, after checking the hold is unchanged and
+  the session is neither stopped nor archived. Refused (no connection,
+  the request not fully written, a 4xx answer) or not there after 30s:
+  it is typed in at the first idle turn from its own slot
+  (`send::queue_first`, before and apart from the overlord's queued
+  messages). Sent with no answer back, or any other non-2xx answer:
   logged as unknown, never typed again (it may have run). A session that
   stops first keeps it (file and kv, marked `stopped`) for its restart
-  to send; one archived or gone first has it settled. The file is
-  removed once it is sent, typed or settled, and the log has a
-  `first_prompt` event. The overlord's messages to the session wait
-  until the first prompt has gone. Claude reads the file on stdin
+  to send; one archived or with no row has it settled (a failed read
+  or an unreadable file keeps it for the next pass). The file is removed
+  once it is sent, typed or settled, and on archive; the log has a
+  `first_prompt` event. Whatever rlord types into the session waits
+  until the first prompt has gone, and 15s after it is sent or typed.
+  A pointer-only first prompt (no words of the user's) stays on argv. Claude reads the file on stdin
   (`exec … < prompt.md`) once live check V1 passes
   (`first_prompt::CLAUDE_STDIN`); until then its prompt stays on argv.
   Fixed text with no user words (`context::pointer_only`) stays on argv.
