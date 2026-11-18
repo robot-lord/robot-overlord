@@ -1,11 +1,12 @@
 //! The tags editor (`#`): a modal listing the session's tags, with an input
-//! that suggests known tags (every group in use) and asks before creating a
-//! new one, so a half-typed tag isn't saved by accident.
+//! that suggests known tags (every tag in use, archived sessions included)
+//! and asks before creating a new one, so a half-typed tag isn't saved by
+//! accident.
 
 use super::*;
 use ratatui::widgets::Clear;
 
-/// How many suggestions show under the input.
+/// How many known-tag suggestions show under the input.
 const MAX_SUGGESTIONS: usize = 6;
 
 /// A tag as rlord stores it: no `#`, lower case, no spaces or commas.
@@ -18,9 +19,10 @@ pub(crate) fn normalize(t: &str) -> String {
         .collect()
 }
 
-/// Known tags matching `query`, best first: prefix matches, then substring,
-/// then in-order (fuzzy) matches; ties by how many sessions use the tag,
-/// then by name. Tags in `exclude` (already on the session) are left out.
+/// Known tags matching `query`, best first: the exact tag, then prefix
+/// matches, then substring, then in-order (fuzzy) matches; ties by how many
+/// sessions use the tag, then by name. Tags in `exclude` (already on the
+/// session) are left out.
 pub(crate) fn suggest(query: &str, known: &[(String, usize)], exclude: &[String]) -> Vec<String> {
     let q = normalize(query);
     if q.is_empty() {
@@ -30,12 +32,14 @@ pub(crate) fn suggest(query: &str, known: &[(String, usize)], exclude: &[String]
         .iter()
         .filter(|(t, _)| !t.is_empty() && !exclude.contains(t))
         .filter_map(|(t, n)| {
-            let rank = if t.starts_with(&q) {
+            let rank = if *t == q {
                 0
-            } else if t.contains(&q) {
+            } else if t.starts_with(&q) {
                 1
-            } else if subsequence(&q, t) {
+            } else if t.contains(&q) {
                 2
+            } else if subsequence(&q, t) {
+                3
             } else {
                 return None;
             };
@@ -54,15 +58,21 @@ fn subsequence(q: &str, t: &str) -> bool {
     q.chars().all(|c| it.any(|x| x == c))
 }
 
-/// What `enter` on the input does with a typed tag.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum AddOutcome {
-    /// Nothing typed, or the session already has it.
-    Nothing,
-    /// A known tag: added.
-    Added,
-    /// Not a tag any session uses: ask first.
-    AskNew(String),
+/// A row under the input: what `enter` adds when it is highlighted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// A tag some session uses (or this one had).
+    Known(String),
+    /// The text as typed, a tag nobody uses: adding it asks first.
+    New(String),
+}
+
+impl Choice {
+    pub fn tag(&self) -> &str {
+        match self {
+            Choice::Known(t) | Choice::New(t) => t,
+        }
+    }
 }
 
 pub(crate) struct TagEditor {
@@ -75,15 +85,19 @@ pub(crate) struct TagEditor {
     /// Every tag in use, with how many sessions have it.
     pub known: Vec<(String, usize)>,
     pub input: String,
-    /// Highlighted suggestion (input non-empty) or tag (input empty).
+    /// Highlighted row under the input (while typing).
     pub sel: usize,
+    /// Highlighted tag in the list, picked with ↑↓ on an empty input;
+    /// `d`/Delete removes it. None until the user picks one.
+    pub tag_sel: Option<usize>,
     /// A new tag waiting for y/n.
     pub confirm_new: Option<String>,
+    /// Save once the pending new tag is answered (ctrl-s with text typed).
+    pub save_after: bool,
 }
 
 impl TagEditor {
     pub fn new(session: &str, name: &str, tags: Vec<String>, known: Vec<(String, usize)>) -> Self {
-        let sel = tags.len().saturating_sub(1);
         TagEditor {
             session: session.into(),
             name: name.into(),
@@ -91,37 +105,56 @@ impl TagEditor {
             tags,
             known,
             input: String::new(),
-            sel,
+            sel: 0,
+            tag_sel: None,
             confirm_new: None,
+            save_after: false,
         }
-    }
-
-    pub fn suggestions(&self) -> Vec<String> {
-        suggest(&self.input, &self.known, &self.tags)
     }
 
     fn is_known(&self, t: &str) -> bool {
-        self.known.iter().any(|(k, _)| k == t)
+        self.known.iter().any(|(k, _)| k == t) || self.original.iter().any(|k| k == t)
     }
 
-    /// Add the typed tag if known; a new one waits for confirmation.
-    pub fn submit(&mut self) -> AddOutcome {
+    /// The rows under the input, in order. The typed text comes first when
+    /// it isn't a known tag (as "new"), so the first row is always what the
+    /// text itself would add.
+    pub fn choices(&self) -> Vec<Choice> {
         let t = normalize(&self.input);
         if t.is_empty() {
-            return AddOutcome::Nothing;
+            return Vec::new();
         }
-        if self.tags.contains(&t) {
+        let mut known = self.known.clone();
+        // An original tag removed this session can come back without asking.
+        for o in &self.original {
+            if !known.iter().any(|(k, _)| k == o) {
+                known.push((o.clone(), 0));
+            }
+        }
+        let mut v: Vec<Choice> = suggest(&t, &known, &self.tags)
+            .into_iter()
+            .map(Choice::Known)
+            .collect();
+        if !self.is_known(&t) && !self.tags.contains(&t) {
+            v.insert(0, Choice::New(t));
+        }
+        v
+    }
+
+    /// Add the highlighted row: a known tag goes straight in, a new one
+    /// waits for y/n. False when there was nothing to add.
+    fn take_choice(&mut self) -> bool {
+        let Some(c) = self.choices().into_iter().nth(self.sel) else {
+            // Typed a tag the session already has: just clear the input.
             self.input.clear();
-            return AddOutcome::Nothing;
+            self.sel = 0;
+            return false;
+        };
+        match c {
+            Choice::Known(t) => self.add(t),
+            Choice::New(t) => self.confirm_new = Some(t),
         }
-        // The original tags count as known: re-adding one is no surprise.
-        if self.is_known(&t) || self.original.contains(&t) {
-            self.add(t);
-            AddOutcome::Added
-        } else {
-            self.confirm_new = Some(t.clone());
-            AddOutcome::AskNew(t)
-        }
+        true
     }
 
     pub fn add(&mut self, t: String) {
@@ -129,23 +162,19 @@ impl TagEditor {
             self.tags.push(t);
         }
         self.input.clear();
+        self.sel = 0;
         self.confirm_new = None;
-        self.sel = self.tags.len() - 1;
     }
 
-    /// Remove the highlighted tag.
+    /// Remove the tag picked in the list.
     pub fn remove_selected(&mut self) {
-        if self.sel < self.tags.len() {
-            self.tags.remove(self.sel);
-            self.sel = self.sel.min(self.tags.len().saturating_sub(1));
-        }
-    }
-
-    /// Fill the input with the highlighted suggestion.
-    pub fn accept_suggestion(&mut self) {
-        if let Some(s) = self.suggestions().get(self.sel) {
-            self.input = s.clone();
-            self.sel = 0;
+        if let Some(i) = self.tag_sel.filter(|i| *i < self.tags.len()) {
+            self.tags.remove(i);
+            self.tag_sel = if self.tags.is_empty() {
+                None
+            } else {
+                Some(i.min(self.tags.len() - 1))
+            };
         }
     }
 
@@ -179,57 +208,70 @@ impl TagEditor {
     pub fn key(&mut self, k: KeyEvent) -> Option<bool> {
         if let Some(t) = self.confirm_new.clone() {
             match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.add(t),
-                // n / esc: back to the input to fix it.
-                _ => self.confirm_new = None,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.add(t);
+                    if std::mem::take(&mut self.save_after) {
+                        return Some(true);
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_new = None;
+                    self.save_after = false;
+                }
+                // Anything else waits for the answer.
+                _ => {}
             }
             return None;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let typing = !self.input.is_empty();
         match k.code {
             KeyCode::Esc => return Some(false),
-            KeyCode::Char('s') if ctrl => return Some(true),
-            KeyCode::Enter if self.input.trim().is_empty() => return Some(true),
-            KeyCode::Enter => {
-                // A highlighted suggestion other than the first wins over
-                // the typed text; else the text as typed.
-                let sugg = self.suggestions();
-                if self.sel > 0 {
-                    if let Some(s) = sugg.get(self.sel) {
-                        self.add(s.clone());
-                        return None;
-                    }
+            // Save: typed text is resolved first, never dropped.
+            KeyCode::Char('s') if ctrl => {
+                if typing && self.take_choice() && self.confirm_new.is_some() {
+                    self.save_after = true;
+                    return None;
                 }
-                self.submit();
+                return Some(true);
             }
-            KeyCode::Tab => self.accept_suggestion(),
-            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
-            KeyCode::Down => {
-                let n = if self.input.is_empty() {
-                    self.tags.len()
-                } else {
-                    self.suggestions().len()
-                };
-                if self.sel + 1 < n {
+            KeyCode::Enter if !typing => return Some(true),
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char(',') if typing && !ctrl => {
+                self.take_choice();
+            }
+            KeyCode::Tab if typing => {
+                if let Some(c) = self.choices().get(self.sel) {
+                    self.input = c.tag().to_string();
+                    self.sel = 0;
+                }
+            }
+            KeyCode::Up if typing => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down if typing => {
+                if self.sel + 1 < self.choices().len() {
                     self.sel += 1;
                 }
             }
-            KeyCode::Backspace | KeyCode::Delete if self.input.is_empty() => self.remove_selected(),
+            KeyCode::Up if !self.tags.is_empty() => {
+                let last = self.tags.len() - 1;
+                self.tag_sel = Some(self.tag_sel.map_or(last, |i| i.saturating_sub(1)));
+            }
+            KeyCode::Down if !self.tags.is_empty() => {
+                let last = self.tags.len() - 1;
+                self.tag_sel = Some(self.tag_sel.map_or(0, |i| (i + 1).min(last)));
+            }
+            // Removing takes its own key on a tag picked with ↑↓, so a held
+            // backspace never eats tags.
+            KeyCode::Delete if !typing => self.remove_selected(),
+            KeyCode::Char('d') if !typing && !ctrl && self.tag_sel.is_some() => {
+                self.remove_selected()
+            }
             KeyCode::Backspace => {
                 self.input.pop();
                 self.sel = 0;
             }
-            // Space or comma ends a tag, like enter.
-            KeyCode::Char(' ') | KeyCode::Char(',') if !ctrl => {
-                if !self.input.trim().is_empty() {
-                    self.submit();
-                }
-            }
-            KeyCode::Char('#') if !ctrl && self.input.is_empty() => {}
-            KeyCode::Char(c) if !ctrl => {
-                if self.input.is_empty() {
-                    self.sel = 0;
-                }
+            KeyCode::Char('#') if !ctrl && !typing => {}
+            KeyCode::Char(c) if !ctrl && c != ' ' && c != ',' => {
+                self.tag_sel = None;
                 self.input.push(c);
                 self.sel = 0;
             }
@@ -245,44 +287,34 @@ impl App {
         let Some(s) = self.selected() else {
             return;
         };
-        let tags: Vec<String> = s["tags"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let ed = TagEditor::new(
-            s["id"].as_str().unwrap_or(""),
-            s["name"].as_str().unwrap_or("?"),
-            tags,
-            self.known_tags(),
+        let (id, name) = (
+            s["id"].as_str().unwrap_or("").to_string(),
+            s["name"].as_str().unwrap_or("?").to_string(),
         );
-        self.mode = Mode::Tags(Box::new(ed));
+        let tags = groups::tags_of(s).into_iter().map(str::to_string).collect();
+        let known = self.known_tags();
+        self.mode = Mode::Tags(Box::new(TagEditor::new(&id, &name, tags, known)));
     }
 
-    /// Every tag in use across the sessions rlord has loaded, with counts.
-    fn known_tags(&self) -> Vec<(String, usize)> {
+    /// Every tag in use, with how many sessions have it: all sessions,
+    /// archived ones too and regardless of the filter (one `session.list`
+    /// when the editor opens); the loaded list if that call fails.
+    fn known_tags(&mut self) -> Vec<(String, usize)> {
+        let everything = self
+            .call("session.list", json!({"archived": "all"}))
+            .and_then(|v| v.as_array().cloned());
+        let sessions = everything.as_deref().unwrap_or(&self.all);
         let mut m: std::collections::BTreeMap<String, usize> = Default::default();
-        for s in &self.all {
-            for t in s["tags"].as_array().into_iter().flatten() {
-                if let Some(t) = t.as_str() {
-                    *m.entry(t.to_string()).or_default() += 1;
-                }
-            }
-        }
-        for (t, n) in &self.groups {
-            if t != groups::UNTAGGED {
-                let e = m.entry(t.clone()).or_default();
-                *e = (*e).max(*n);
+        for s in sessions {
+            for t in groups::tags_of(s) {
+                *m.entry(t.to_string()).or_default() += 1;
             }
         }
         m.into_iter().collect()
     }
 
-    pub(crate) fn handle_tags_form(&mut self, k: KeyEvent, mut ed: Box<TagEditor>) {
+    pub(crate) fn handle_tags_form(&mut self, k: KeyEvent, ed: Box<TagEditor>) {
+        let mut ed = ed;
         match ed.key(k) {
             None => self.mode = Mode::Tags(ed),
             Some(false) => {}
@@ -296,10 +328,16 @@ impl App {
     }
 
     pub(crate) fn draw_tags_form(&self, f: &mut Frame, ed: &TagEditor) {
-        let sugg = ed.suggestions();
-        let h = (ed.tags.len().max(1) + sugg.len() + 10) as u16;
-        let area = newform::centered(f.area(), 60, h.min(f.area().height));
+        let choices = ed.choices();
+        // Fixed rows: title, blank, input, choices, blank, hints (2),
+        // borders (2). The tag list gets what's left and scrolls.
+        let fixed = 7 + choices.len() as u16;
+        let screen = f.area();
+        let want = fixed + ed.tags.len().max(1) as u16;
+        let h = want.min(screen.height);
+        let area = newform::centered(screen, 60, h);
         f.render_widget(Clear, area);
+        let room = (h.saturating_sub(fixed) as usize).max(1);
         let mut lines = vec![Line::from(Span::styled(
             "  Tags (= groups)",
             Style::default().bold(),
@@ -307,9 +345,13 @@ impl App {
         if ed.tags.is_empty() {
             lines.push(Line::from(Span::styled("    no tags", theme::faint())));
         }
-        let list_focus = ed.input.is_empty() && ed.confirm_new.is_none();
-        for (i, t) in ed.tags.iter().enumerate() {
-            let on = list_focus && i == ed.sel;
+        // Scroll so the picked tag (else the newest) stays in view.
+        let focus = ed.tag_sel.unwrap_or(ed.tags.len().saturating_sub(1));
+        let top = (focus + 1).saturating_sub(room);
+        let more_above = top > 0;
+        let more_below = top + room < ed.tags.len();
+        for (i, t) in ed.tags.iter().enumerate().skip(top).take(room) {
+            let on = ed.tag_sel == Some(i) && ed.confirm_new.is_none();
             let mut spans = vec![Span::raw(if on { "  ▸ " } else { "    " })];
             spans.push(Span::styled(
                 format!("#{t}"),
@@ -318,23 +360,35 @@ impl App {
             if !ed.original.contains(t) {
                 spans.push(Span::styled("  (added)", theme::faint()));
             }
-            let mut l = Line::from(spans);
-            if on {
-                l = l.style(theme::selected());
+            if (i == top && more_above) || (i + 1 == top + room && more_below) {
+                spans.push(Span::styled(
+                    if i == top && more_above {
+                        "  ↑ more"
+                    } else {
+                        "  ↓ more"
+                    },
+                    theme::faint(),
+                ));
             }
-            lines.push(l);
+            let l = Line::from(spans);
+            lines.push(if on { l.style(theme::selected()) } else { l });
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  add: #", theme::muted()),
             Span::styled(format!("{}▏", ed.input), Style::default().fg(theme::text())),
         ]));
-        for (i, s) in sugg.iter().enumerate() {
+        for (i, c) in choices.iter().enumerate() {
             let on = i == ed.sel;
-            let l = Line::from(vec![
+            let t = c.tag();
+            let mut spans = vec![
                 Span::raw(if on { "    ▸ " } else { "      " }),
-                Span::styled(format!("#{s}"), Style::default().fg(theme::tag_color(s))),
-            ]);
+                Span::styled(format!("#{t}"), Style::default().fg(theme::tag_color(t))),
+            ];
+            if matches!(c, Choice::New(_)) {
+                spans.push(Span::styled("  (new tag)", theme::faint()));
+            }
+            let l = Line::from(spans);
             lines.push(if on { l.style(theme::selected()) } else { l });
         }
         lines.push(Line::from(""));
@@ -348,20 +402,27 @@ impl App {
                 ("n", "back", Cap::Global),
             ]));
         } else if ed.input.is_empty() {
-            lines.push(keys_line(&[
-                ("enter", "save", Cap::Context),
-                ("⌫", "remove tag", Cap::Context),
-                ("↑↓", "choose", Cap::Global),
-                ("esc", "cancel", Cap::Global),
-            ]));
+            let mut keys = vec![("enter", "save", Cap::Context)];
+            if ed.tag_sel.is_some() {
+                keys.push(("d", "remove tag", Cap::Context));
+            }
+            keys.push(("↑↓", "pick a tag", Cap::Global));
+            keys.push(("esc", "cancel", Cap::Global));
+            lines.push(keys_line(&keys));
+            lines.push(Line::from(Span::styled(
+                "  type to add a tag",
+                theme::faint(),
+            )));
         } else {
             lines.push(keys_line(&[
                 ("enter", "add", Cap::Context),
                 ("tab", "complete", Cap::Global),
                 ("↑↓", "choose", Cap::Global),
+            ]));
+            lines.push(keys_line(&[
+                ("ctrl-s", "add and save", Cap::Global),
                 ("esc", "cancel", Cap::Global),
             ]));
-            lines.push(keys_line(&[("ctrl-s", "save", Cap::Global)]));
         }
         f.render_widget(
             Paragraph::new(lines).block(theme::modal(&format!("# {}", ed.name))),
@@ -381,6 +442,7 @@ mod tests {
             ("release", 1),
             ("tooling", 2),
             ("ui", 1),
+            ("we", 1),
         ]
         .into_iter()
         .map(|(t, n)| (t.to_string(), n))
@@ -400,6 +462,10 @@ mod tests {
         e.key(KeyEvent::new(c, KeyModifiers::NONE))
     }
 
+    fn ctrl_s(e: &mut TagEditor) -> Option<bool> {
+        e.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+    }
+
     fn typ(e: &mut TagEditor, s: &str) {
         for c in s.chars() {
             press(e, KeyCode::Char(c));
@@ -407,29 +473,50 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_rank_prefix_then_substring_then_fuzzy() {
-        // "w": prefix wip (5) before web (3); "tooling"? no w.
-        assert_eq!(suggest("w", &known(), &[]), ["wip", "web"]);
-        // "l": no prefix; substring release, tooling (count 2 first).
+    fn suggestions_rank_exact_prefix_substring_fuzzy() {
+        // "w": prefix, most used first.
+        assert_eq!(suggest("w", &known(), &[]), ["wip", "web", "we"]);
+        // An exact match beats more-used prefix matches.
+        assert_eq!(suggest("we", &known(), &[]), ["we", "web"]);
         assert_eq!(suggest("l", &known(), &[]), ["tooling", "release"]);
-        // "tlg": only in order.
         assert_eq!(suggest("tlg", &known(), &[]), ["tooling"]);
-        assert_eq!(suggest("#WE", &known(), &[]), ["web"]);
+        assert_eq!(suggest("#WE", &known(), &[]), ["we", "web"]);
         assert!(suggest("", &known(), &[]).is_empty());
         assert!(suggest("zzz", &known(), &[]).is_empty());
-        // Tags the session already has aren't offered.
-        assert_eq!(suggest("w", &known(), &["wip".into()]), ["web"]);
+        assert_eq!(suggest("w", &known(), &["wip".into()]), ["web", "we"]);
+    }
+
+    #[test]
+    fn first_row_is_what_enter_adds() {
+        let mut e = ed(&[]);
+        typ(&mut e, "too");
+        // Unknown text: it heads the rows as new, ahead of completions.
+        assert_eq!(
+            e.choices(),
+            [Choice::New("too".into()), Choice::Known("tooling".into())]
+        );
+        // Known exact text: it is the first row.
+        let mut e = ed(&[]);
+        typ(&mut e, "we");
+        assert_eq!(e.choices()[0], Choice::Known("we".into()));
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.tags, ["we"]);
     }
 
     #[test]
     fn known_tag_adds_unknown_asks() {
         let mut e = ed(&[]);
         typ(&mut e, "web");
-        assert_eq!(e.submit(), AddOutcome::Added);
+        press(&mut e, KeyCode::Enter);
         assert_eq!(e.tags, ["web"]);
         typ(&mut e, "#Newthing");
-        assert_eq!(e.submit(), AddOutcome::AskNew("newthing".into()));
-        assert!(e.tags == ["web"]);
+        press(&mut e, KeyCode::Enter);
+        assert_eq!(e.confirm_new.as_deref(), Some("newthing"));
+        // Other keys are ignored while asking: nothing typed, nothing lost.
+        typ(&mut e, "xz");
+        press(&mut e, KeyCode::Backspace);
+        assert_eq!(e.input, "Newthing");
+        assert!(e.confirm_new.is_some());
         // n goes back to the input with the text kept.
         press(&mut e, KeyCode::Char('n'));
         assert!(e.confirm_new.is_none());
@@ -438,52 +525,89 @@ mod tests {
         press(&mut e, KeyCode::Char('y'));
         assert_eq!(e.tags, ["web", "newthing"]);
         assert!(e.input.is_empty());
-        // Duplicate: nothing.
+        // Already on the session: input cleared, nothing added.
         typ(&mut e, "web");
-        assert_eq!(e.submit(), AddOutcome::Nothing);
+        press(&mut e, KeyCode::Enter);
         assert_eq!(e.tags.len(), 2);
+        assert!(e.input.is_empty());
     }
 
     #[test]
     fn partial_tag_is_never_saved_silently() {
         let mut e = ed(&["web"]);
         typ(&mut e, "too");
-        // Enter on a partial unknown tag asks; it doesn't save.
         assert_eq!(press(&mut e, KeyCode::Enter), None);
         assert_eq!(e.confirm_new.as_deref(), Some("too"));
-        // Esc in the question backs out, not the whole editor.
         assert_eq!(press(&mut e, KeyCode::Esc), None);
-        // Tab completes it to the known tag.
+        press(&mut e, KeyCode::Tab);
+        // Tab on the "new" row keeps the text; ↓ then tab completes.
+        assert_eq!(e.input, "too");
+        press(&mut e, KeyCode::Down);
         press(&mut e, KeyCode::Tab);
         assert_eq!(e.input, "tooling");
         press(&mut e, KeyCode::Enter);
         assert_eq!(e.tags, ["web", "tooling"]);
-        // Empty input + enter saves.
         assert_eq!(press(&mut e, KeyCode::Enter), Some(true));
         assert_eq!(e.diff(), (vec!["tooling".into()], vec![]));
+    }
+
+    #[test]
+    fn ctrl_s_resolves_typed_text_first() {
+        // Known: added, then saved.
+        let mut e = ed(&[]);
+        typ(&mut e, "ui");
+        assert_eq!(ctrl_s(&mut e), Some(true));
+        assert_eq!(e.tags, ["ui"]);
+        // New: asks; y saves, n stays open without saving.
+        let mut e = ed(&[]);
+        typ(&mut e, "fresh");
+        assert_eq!(ctrl_s(&mut e), None);
+        assert_eq!(press(&mut e, KeyCode::Char('n')), None);
+        assert!(e.tags.is_empty());
+        assert_eq!(ctrl_s(&mut e), None);
+        assert_eq!(press(&mut e, KeyCode::Char('y')), Some(true));
+        assert_eq!(e.tags, ["fresh"]);
     }
 
     #[test]
     fn arrows_pick_a_suggestion() {
         let mut e = ed(&[]);
         typ(&mut e, "w");
+        // Rows: new "w", wip, web, we.
         press(&mut e, KeyCode::Down);
-        press(&mut e, KeyCode::Enter);
+        press(&mut e, KeyCode::Down);
+        press(&mut e, KeyCode::Char(' '));
         assert_eq!(e.tags, ["web"]);
     }
 
     #[test]
-    fn remove_and_cancel() {
+    fn removing_needs_a_picked_tag_and_its_own_key() {
         let mut e = ed(&["web", "wip", "ui"]);
+        // Held backspace on an empty input removes nothing.
+        for _ in 0..5 {
+            press(&mut e, KeyCode::Backspace);
+        }
+        assert_eq!(e.tags, ["web", "wip", "ui"]);
+        // d with nothing picked starts typing instead.
+        press(&mut e, KeyCode::Char('d'));
+        assert_eq!(e.input, "d");
+        press(&mut e, KeyCode::Backspace);
+        // ↑ picks the last, ↑ again the one before; d removes it.
         press(&mut e, KeyCode::Up);
-        press(&mut e, KeyCode::Backspace);
+        press(&mut e, KeyCode::Up);
+        press(&mut e, KeyCode::Char('d'));
         assert_eq!(e.tags, ["web", "ui"]);
-        assert!(e.changed());
-        assert_eq!(e.diff(), (vec![], vec!["wip".into()]));
+        press(&mut e, KeyCode::Delete);
+        assert_eq!(e.tags, ["web"]);
+        assert_eq!(e.diff(), (vec![], vec!["wip".into(), "ui".into()]));
         assert_eq!(press(&mut e, KeyCode::Esc), Some(false));
-        // Re-adding an original tag needs no confirmation.
+    }
+
+    #[test]
+    fn removed_original_comes_back_without_asking() {
         let mut e = ed(&["oddone"]);
-        press(&mut e, KeyCode::Backspace);
+        press(&mut e, KeyCode::Up);
+        press(&mut e, KeyCode::Delete);
         typ(&mut e, "oddone ");
         assert_eq!(e.tags, ["oddone"]);
         assert!(!e.changed());

@@ -361,11 +361,15 @@ impl App {
         if !right && !double {
             self.last_click = Some((Instant::now(), self.clicked(&hit)));
         }
-        // Typing in the footer (search, rename, …): a click elsewhere
-        // doesn't throw the text away.
+        // Typing in the footer (search, rename, …) or the tags editor: a
+        // click elsewhere doesn't throw the text away.
         if matches!(
             self.mode,
-            Mode::Filter(_) | Mode::Rename(_) | Mode::Describe(_) | Mode::RenameGroup(_)
+            Mode::Filter(_)
+                | Mode::Rename(_)
+                | Mode::Describe(_)
+                | Mode::Tags(_)
+                | Mode::RenameGroup(_)
         ) {
             return Ok(false);
         }

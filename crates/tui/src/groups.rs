@@ -39,7 +39,7 @@ impl Tab {
 /// The "untagged" pseudo-group (tags are never empty).
 pub(crate) const UNTAGGED: &str = "";
 
-fn tags_of(s: &Value) -> Vec<&str> {
+pub(crate) fn tags_of(s: &Value) -> Vec<&str> {
     s["tags"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())

@@ -1272,7 +1272,6 @@ impl App {
         Ok(())
     }
 
-    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
     /// Save the tags editor's result: `new` is the full set, `add` and
     /// `remove` the change from what the session had.
     fn save_tags(
@@ -1322,6 +1321,7 @@ impl App {
         self.dirty = true;
     }
 
+    /// Edit the selected session's notes in $EDITOR (vi fallback), then save.
     fn edit_notes(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let Some(s) = self.selected().cloned() else {
             return Ok(());
