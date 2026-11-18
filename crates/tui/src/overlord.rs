@@ -125,15 +125,17 @@ impl LimitSwitch {
 
 impl LimitSwitch {
     /// Take a newer reading of the offer, keeping the pick on the same
-    /// agent where it is still offered, and when it opened.
+    /// agent where it is still offered. When it opened is kept only if
+    /// what it says is the same: a changed dialog gets a new grace.
     fn refresh(&mut self, new: LimitSwitch) {
         let picked = self.to.get(self.pick).map(|t| t.0.clone());
         let pick = picked
             .and_then(|a| new.to.iter().position(|t| t.0 == a))
             .unwrap_or(0);
+        let same = (&self.from, self.resets_at, &self.to) == (&new.from, new.resets_at, &new.to);
         *self = LimitSwitch {
             pick,
-            opened: self.opened,
+            opened: if same { self.opened } else { new.opened },
             error: self.error.take(),
             ..new
         };
@@ -903,10 +905,10 @@ impl App {
     }
 
     /// Tell the daemon this limit's offer was answered (`resets_at`).
-    fn answer_limit_switch(l: &LimitSwitch) -> anyhow::Result<()> {
+    fn answer_limit_offer(l: &LimitSwitch) -> anyhow::Result<()> {
         client_call(
             &paths::socket_path(),
-            "overlord.decline_limit_switch",
+            "overlord.answer_limit_offer",
             json!({"resets_at": l.resets_at}),
         )
         .map(drop)
@@ -920,19 +922,23 @@ impl App {
             self.mode = Mode::LimitSwitch(l);
             return;
         }
+        // The quit key is never trapped here.
+        if self.keys.action(&k) == Some(Action::Quit) {
+            self.mode = Mode::ConfirmQuit;
+            return;
+        }
         match k.code {
-            KeyCode::Esc => match Self::answer_limit_switch(&l) {
-                Ok(()) => {
-                    self.status_line = format!(
+            // Always closes; an answer that didn't reach the daemon is
+            // said in the status line (it may ask again).
+            KeyCode::Esc => {
+                self.status_line = match Self::answer_limit_offer(&l) {
+                    Ok(()) => format!(
                         "overlord stays on {} (out of usage until {})",
                         l.from, l.until
-                    );
-                }
-                Err(e) => {
-                    l.error = Some(format!("{e:#}"));
-                    self.mode = Mode::LimitSwitch(l);
-                }
-            },
+                    ),
+                    Err(e) => format!("error: {e:#}"),
+                };
+            }
             KeyCode::Tab | KeyCode::Right | KeyCode::Down | KeyCode::Char('j') => {
                 l.pick = (l.pick + 1) % l.to.len();
                 self.mode = Mode::LimitSwitch(l);
@@ -947,7 +953,7 @@ impl App {
                     // Answered: this limit isn't offered again. (Only once
                     // switched: a failed switch keeps the offer.)
                     Ok(()) => {
-                        let _ = Self::answer_limit_switch(&l);
+                        let _ = Self::answer_limit_offer(&l);
                     }
                     Err(e) => {
                         l.error = Some(format!("{e:#}"));
@@ -960,7 +966,12 @@ impl App {
     }
 
     pub(crate) fn draw_limit_switch(&self, f: &mut Frame, l: &LimitSwitch) {
-        let h = 10 + l.to.len() as u16 + u16::from(l.error.is_some());
+        // The error wraps inside the 72-wide box (70 columns in its border).
+        let err_rows = l.error.as_ref().map_or(0, |e| {
+            use unicode_width::UnicodeWidthStr;
+            (e.width() + 2).div_ceil(70)
+        });
+        let h = 10 + l.to.len() as u16 + u16::try_from(err_rows).unwrap_or(u16::MAX);
         let area = newform::centered(f.area(), 72, h);
         f.render_widget(Clear, area);
         let mut lines = vec![

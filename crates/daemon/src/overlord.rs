@@ -528,7 +528,7 @@ pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
 /// kv key: the reset time (ms) of the limit whose switch offer the user
 /// turned down. One limit, one offer: a later limit (another reset time)
 /// is offered again.
-pub const LIMIT_OFFER_DECLINED: &str = "overlord_limit_offer_declined";
+pub const LIMIT_OFFER_ANSWERED: &str = "overlord_limit_offer_answered";
 
 /// What the list offers when the active overlord is out of usage (`limit`:
 /// its row's `limits::annotate` value): the agents to switch it to, from

@@ -2646,7 +2646,8 @@ impl App {
         let total: usize = ctx.iter().map(|(k, l, _)| cap_w(k, l)).sum();
         if total > room {
             let help = self.keys.label(Action::Help);
-            let mut used = cap_w(&help, "more");
+            let more = cap_w(&help, "more");
+            let mut used = more;
             let keep = ctx
                 .iter()
                 .take_while(|(k, l, _)| {
@@ -2655,7 +2656,10 @@ impl App {
                 })
                 .count();
             ctx.truncate(keep);
-            ctx.push((help, "more", press(Action::Help)));
+            // (Not even "more" fits: nothing.)
+            if more <= room {
+                ctx.push((help, "more", press(Action::Help)));
+            }
         }
         let ctx_line = context_line(
             ctx.into_iter()

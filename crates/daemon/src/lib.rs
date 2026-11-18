@@ -752,7 +752,7 @@ impl Daemon {
                     if !v["limit"].is_null() {
                         let declined = self
                             .db()
-                            .kv_get(overlord::LIMIT_OFFER_DECLINED)
+                            .kv_get(overlord::LIMIT_OFFER_ANSWERED)
                             .ok()
                             .flatten()
                             .and_then(|s| s.parse().ok());
@@ -770,7 +770,7 @@ impl Daemon {
             }
             // "Not now" to switching away from an overlord out of usage:
             // not asked again for this limit (`resets_at`, ms).
-            "overlord.decline_limit_switch" => {
+            "overlord.answer_limit_offer" => {
                 let Some(at) = params["resets_at"].as_i64() else {
                     return Some(Err(anyhow::anyhow!(
                         "resets_at (ms, an integer) is required"
@@ -778,7 +778,7 @@ impl Daemon {
                 };
                 let r = self
                     .db()
-                    .kv_set(overlord::LIMIT_OFFER_DECLINED, &at.to_string())
+                    .kv_set(overlord::LIMIT_OFFER_ANSWERED, &at.to_string())
                     .map(|_| json!({"declined": true}));
                 if r.is_ok() {
                     self.changed();

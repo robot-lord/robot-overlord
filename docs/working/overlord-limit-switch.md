@@ -19,7 +19,7 @@ overlord, so this is an offer they confirm, never automatic.
 - **UX:** the list opens a dialog ("Overlord out of usage") on refresh.
   `y` switches (`overlord.switch`, creating the target overlord the first
   time); tab cycles targets; esc declines; either answer records for this limit (kv
-  `overlord_limit_offer_declined` = its `resets_at`). A later limit asks
+  `overlord_limit_offer_answered` = its `resets_at`). A later limit asks
   again.
 - `overlord.md`: one line saying the list offers the switch.
 
