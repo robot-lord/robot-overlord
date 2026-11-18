@@ -1185,8 +1185,8 @@ including when the active one hits a usage limit.
   `limits::annotate`), `overlord.get` adds `limit.switch_to` (installed
   agents other than the active one whose overlord, if any, isn't limited
   too) and `limit.offer` (`overlord::limit_offer`: plain data over the
-  roster, no tmux of its own). The list opens a dialog on a refresh that
-  sees `offer` (enter switches through `overlord.switch`; esc calls
+  roster, no tmux of its own; a limit without a reset time is not offered). The list opens a dialog on a refresh that
+  sees `offer` (keys in its first 800ms are dropped; `y` switches through `overlord.switch` and, like esc, records the limit as answered; esc calls
   `overlord.decline_limit_switch`, which stores that limit's `resets_at`
   in kv `overlord_limit_offer_declined`, so the same limit isn't asked
   again but the next one is). Not offered once the limit has reset, or

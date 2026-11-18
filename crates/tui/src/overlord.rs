@@ -65,6 +65,10 @@ pub(crate) struct RemoteOffer {
     error: Option<String>,
 }
 
+/// Keys pressed this soon after the limit offer opens are dropped: typed
+/// before the user saw it.
+const LIMIT_GRACE: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// The active overlord ran out of usage: switch it to another agent's?
 /// Asked once per limit (`overlord.get`'s `limit.offer`); only the user
 /// switches.
@@ -79,6 +83,8 @@ pub(crate) struct LimitSwitch {
     to: Vec<(String, String, bool)>,
     /// Which of `to` enter picks.
     pick: usize,
+    /// When it opened (`LIMIT_GRACE`).
+    opened: std::time::Instant,
     error: Option<String>,
 }
 
@@ -111,6 +117,7 @@ impl LimitSwitch {
             resets_at: l["resets_at"].as_i64().unwrap_or(0),
             to,
             pick: 0,
+            opened: std::time::Instant::now(),
             error: None,
         })
     }
@@ -876,18 +883,30 @@ impl App {
     }
 
     pub(crate) fn handle_limit_switch(&mut self, k: KeyEvent, mut l: Box<LimitSwitch>) {
+        // It opens on a background refresh, maybe mid-typing: keys pressed
+        // before the user could have seen it are dropped, and only the
+        // deliberate `y` switches (not enter).
+        if l.opened.elapsed() < LIMIT_GRACE {
+            self.mode = Mode::LimitSwitch(l);
+            return;
+        }
         match k.code {
-            KeyCode::Esc | KeyCode::Char('n') => {
-                let _ = client_call(
-                    &paths::socket_path(),
-                    "overlord.decline_limit_switch",
-                    json!({"resets_at": l.resets_at}),
-                );
-                self.status_line = format!(
-                    "overlord stays on {} until {}; switch any time with :overlord <agent>",
-                    l.from, l.until
-                );
-            }
+            KeyCode::Esc => match client_call(
+                &paths::socket_path(),
+                "overlord.decline_limit_switch",
+                json!({"resets_at": l.resets_at}),
+            ) {
+                Ok(_) => {
+                    self.status_line = format!(
+                        "overlord stays on {} until {}; switch any time with :overlord <agent>",
+                        l.from, l.until
+                    );
+                }
+                Err(e) => {
+                    l.error = Some(format!("{e:#}"));
+                    self.mode = Mode::LimitSwitch(l);
+                }
+            },
             KeyCode::Tab | KeyCode::Right | KeyCode::Down | KeyCode::Char('j') => {
                 l.pick = (l.pick + 1) % l.to.len();
                 self.mode = Mode::LimitSwitch(l);
@@ -896,29 +915,22 @@ impl App {
                 l.pick = (l.pick + l.to.len() - 1) % l.to.len();
                 self.mode = Mode::LimitSwitch(l);
             }
-            KeyCode::Enter | KeyCode::Char('y') => {
-                let (agent, label, _) = l.to[l.pick].clone();
-                match client_call(
+            KeyCode::Char('y') => {
+                // Answered: this limit isn't offered again either way.
+                let _ = client_call(
                     &paths::socket_path(),
-                    "overlord.switch",
-                    json!({"agent": agent}),
-                ) {
-                    Ok(_) => {
-                        self.status_line = format!("overlord: now on {label}");
-                        self.dirty = true;
-                    }
-                    Err(e) => {
-                        l.error = Some(format!("{e:#}"));
-                        self.mode = Mode::LimitSwitch(l);
-                    }
-                }
+                    "overlord.decline_limit_switch",
+                    json!({"resets_at": l.resets_at}),
+                );
+                let agent = l.to[l.pick].0.clone();
+                self.switch_overlord(&agent);
             }
             _ => self.mode = Mode::LimitSwitch(l),
         }
     }
 
     pub(crate) fn draw_limit_switch(&self, f: &mut Frame, l: &LimitSwitch) {
-        let h = 9 + l.to.len() as u16 + u16::from(l.error.is_some());
+        let h = 10 + l.to.len() as u16 + u16::from(l.error.is_some());
         let area = newform::centered(f.area(), 72, h);
         f.render_widget(Clear, area);
         let mut lines = vec![
@@ -958,7 +970,7 @@ impl App {
             ]));
         }
         lines.push(Line::from(""));
-        let mut keys = vec![("enter", "switch", Cap::Context)];
+        let mut keys = vec![("y", "switch", Cap::Context)];
         if l.to.len() > 1 {
             keys.push(("tab", "next agent", Cap::Context));
         }

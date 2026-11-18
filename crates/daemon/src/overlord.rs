@@ -556,7 +556,7 @@ pub fn limit_offer(
     let offer = !limit.is_null()
         && limit["reset"] != true
         && !switch_to.is_empty()
-        && (resets_at.is_none() || resets_at != declined);
+        && resets_at.is_some_and(|t| Some(t) != declined);
     json!({"switch_to": switch_to, "offer": offer})
 }
 

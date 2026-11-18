@@ -17,8 +17,8 @@ overlord, so this is an offer they confirm, never automatic.
   (`overlord::limit_offer`, pure over the roster and `limits::limited`).
   Targets: installed, not active, overlord not itself limited.
 - **UX:** the list opens a dialog ("Overlord out of usage") on refresh.
-  enter/y switches (`overlord.switch`, creating the target overlord the first
-  time); tab cycles targets; esc/n declines for this limit (kv
+  `y` switches (`overlord.switch`, creating the target overlord the first
+  time); tab cycles targets; esc declines; either answer records for this limit (kv
   `overlord_limit_offer_declined` = its `resets_at`). A later limit asks
   again.
 - `overlord.md`: one line saying the list offers the switch.
