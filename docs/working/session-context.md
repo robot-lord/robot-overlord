@@ -493,7 +493,7 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 - [x] `rlord mcp --session --token-file <p> [--socket]` (server
   `rlord_session`, conflicts with `--overlord`, never autostarts) and
   `rlord context [--token-file] [--socket] <tool|help> key=value…`.
-- [x] Wiring per agent at every start; pane env `RLORD_SESSION_TOKEN_FILE`
+- [x] Wiring per agent at every start; pane env `RLORD_SESSION_LOOKUP_FILE`
   (not for Codex daemon mode).
 - [x] Background "Looking up more" section.
 - [x] `overlord.md` (link rather than copy), `docs/architecture.md` (MCP
@@ -538,7 +538,7 @@ A. Ack tracking redone as columns: `session_context.sent_ack` /
 
 1. `read_history` passes a hit's `transcript` through (test: a hit
    before a `/clear`; a foreign path refused).
-2. `RLORD_SESSION_TOKEN_FILE` is scrubbed wherever `RLORD_SESSION_ID`
+2. `RLORD_SESSION_LOOKUP_FILE` is scrubbed wherever `RLORD_SESSION_ID`
    is (`agents::PANE_ENV` / `scrub_pane_env`): the Codex-daemon pane's
    unset list, autostart, `process::run`, OpenCode's shared-server
    environment and `run_bounded`, Codex's server commands, install's
@@ -565,7 +565,7 @@ minor releases now).
 1. A failed worktree add removes only a registration at `dir` and a
    branch that weren't there before the call (test: the user's
    "missing but already registered" worktree survives).
-2. No `RLORD_SESSION_TOKEN_FILE` in OpenCode or Codex daemon-mode panes
+2. No `RLORD_SESSION_LOOKUP_FILE` in OpenCode or Codex daemon-mode panes
    (shared servers run their commands); architecture.md fixed.
 3. The background's CLI line always passes `--token-file` and
    `--socket`.
@@ -643,6 +643,183 @@ Still owed:
   `context::check`).
 - The demo OpenCode stand-in embeds Python (shell-is-glue rule).
 
+## PR 3 progress (1.4.0)
+
+- [x] `daemon/src/first_prompt.rs`: `Way { Argv, Stdin, Server, Pointer }`
+  per agent; `place` writes the first prompt (user's words, with the
+  background pointer line when there is one) to 0600
+  `<data>/sessions/<id>/prompt.md`. Used by `session_new`, `fork::finish`
+  and a re-fork's restart. Fixed text with no words
+  (`context::pointer_only`) stays on argv. A file that can't be written
+  leaves the prompt on argv (logged).
+- [x] Codex: argv carries `first_prompt::pointer_line` (user's decision);
+  that line is `bind_prompt`. `session_brief`'s first prompt now reads
+  the launch spec's words before `bind_prompt`.
+- [x] OpenCode: `Service::prompt` (`POST /api/session/<id>/prompt`,
+  `{text}`; route and body read from the installed 2.2.7 binary's API
+  table, not run live). kv `first_prompt:<id>`;
+  `opencode::apply_first_prompt` posts once the session exists and no
+  model `Deferred` is pending (or it ran out). Failed POST, or no session
+  within 30s: queued with `send::queue` (typed at the first idle turn).
+  Event `first_prompt` either way; the file is removed after.
+- [x] Claude: stdin (`exec … < prompt.md`, `first_prompt::with_stdin`)
+  wired but off (`CLAUDE_STDIN = false`): V1 was not run in this PR (the
+  live check was refused by the agent's permission gate). Claude's
+  prompt stays on argv until V1 passes.
+- [x] #70 owed: the pane env var is `RLORD_SESSION_LOOKUP_FILE` (Codex's
+  default env policy drops `*TOKEN*`, `*KEY*`, `*SECRET*`; test); the
+  OpenCode module doc no longer says the prompt rides on argv.
+- Not done from the plan: a `FirstPrompt::Typed` mode for Claude (the
+  queue fallback covers OpenCode only), `discover` changes (none needed:
+  Codex is still launched with a prompt).
+
+Owed from PR 3:
+- Run V1 (Claude interactive with the prompt file on stdin, also with
+  `--resume … --fork-session`), then set `CLAUDE_STDIN = true`.
+- Live-check the OpenCode POST (V4) on a scratch server: that the TUI
+  opened with `-s` shows the posted turn, and that the 30s fallback is
+  long enough.
+- Live-check that Codex reads `prompt.md` from the pointer line in its
+  default sandbox (the plan's Codex pointer-read check).
+- (Fixed in round 2) The typed fallback's prompt was marked rlord's, not
+  the user's.
+- `launch_spec.prompt` still holds the words in the DB (not argv).
+- (Review round 1) A Pointer-mode session's background rows are marked
+  seen at launch, before an OpenCode POST has gone (`methods.rs` start).
+- (Review round 1) The POST runs on the OpenCode follower thread; a slow
+  server delays that tick's event reading (10s limit).
+- (Review round 1) `apply_first_prompt` and `apply_deferred` share their
+  shape (held kv, late clock, service lookup): fold into one; `Placed`
+  could be an enum (exactly one of argv / stdin / server).
+
+### Review round 1 (PR #73)
+
+1. `Service::prompt` returns `Posted { Sent, Refused, Unknown }`: only
+   no connection or an error status falls back to typing; a request sent
+   with no answer back is logged as unknown, never typed again.
+2. A restart keeps a held first prompt (fresh clock, set once the pane
+   is up) instead of deleting it.
+3. The typed fallback has its own slot (`send::FIRST_KEY`,
+   `queue_first`): delivered before the overlord's queued messages, never
+   replaced or dropped by them; a direct send waits while it is there.
+4. `first_prompt::task` / `launch_words`: triage, archive summaries and
+   `session_brief` show the launch's words where a Codex transcript's
+   first prompt is the pointer line. (`recall` reads overlords' own
+   transcripts, which never get one.)
+5. A failed `session.new` removes `prompt.md` and kv `first_prompt`.
+6. Held first prompts of sessions no longer live are settled each
+   OpenCode tick: logged as not sent, file removed.
+7. The pointer line starts `[rlord session <id>]`.
+
+### Review round 2 (PR #73, merged main at 1.5.0; now 1.6.0)
+
+1. The overlord's sends (direct and queued) wait while kv
+   `first_prompt:<id>` is held too, not only the typed slot.
+2. `Service::prompt`: a failure to connect or to write the whole request
+   is `Refused`; only a missing answer after that is `Unknown`.
+3. A typed first prompt that fails is tried again at later ticks (up to
+   `FIRST_TRIES` = 5), then dropped and logged.
+4. Archive summaries read the launch words before reading the transcript
+   (the DB lock is let go first).
+5. `first_prompt::task` replaces only session `id`'s own pointer line.
+6. A typed first prompt is the user's prompt (`type_message` source
+   None), not marked rlord's.
+
+Owed (round 2): the POST (10s limit) on the follower thread; each pass
+reads the file, asks `has_session` and scans kv `first_prompt:*`; the
+private-write helper is repeated in `context` and `first_prompt`; the
+restart's "has words" check repeats `fork::restart_prompt`'s.
+
+### Review round 3 (PR #73)
+
+1. The stopped-session sweep reads each held id's own row under the same
+   DB lock as the kv: a session that just started is never touched.
+2. A stopped session keeps its held first prompt (file and kv, marked
+   `stopped`, logged once) for its restart (`restamp` clears the mark);
+   only an archived or gone one is settled.
+3. `first_prompt::task` also drops another session's full pointer line
+   (a Codex fork's history starts with its parent's): the fork's own
+   words, or nothing; never a path.
+
+Owed (round 3): the POST on the follower thread; per-pass file read,
+`has_session` and kv scan; fold `apply_first_prompt` / `apply_deferred`;
+a held typed first prompt logs `message_held` (not a first-prompt kind);
+`tick` checks kv `first_prompt:<id>` inline rather than via
+`first_waiting`.
+
+### Review round 4 (PR #73)
+
+1. A first prompt queued for typing waits through a stop for the
+   restart; only an archived or gone session drops it.
+2. After the POST, kv and file are settled only if the hold still names
+   the same file with the same words (under the DB lock).
+3. A POSTed first prompt holds the overlord's messages for 15s
+   (`first_prompt::mark_sent` / `waiting`, kv `first_prompt_sent:<id>`),
+   used by `send` and `tick` alike.
+4. `launch_words` falls back to a fork's parent's (up to 4 levels).
+5. A restart with a held first prompt (it carries the pointer) puts no
+   new pointer on argv.
+6. Docs say `RLORD_SESSION_LOOKUP_FILE` throughout.
+
+Owed (round 4): `apply_first_prompt` / `apply_deferred` dedupe; the dead
+`Way::Argv` arm in `place`; triage reads `launch_words` under the DB
+lock (one query per row).
+
+### Review round 5 (PR #73)
+
+1. "First prompt goes first" lives in `send::type_message` (rlord's own
+   texts wait; the first prompt itself is exempt). `tick` no longer
+   skips messages: one for a stopped or failed session is dropped as
+   before; one that must wait is held (logged once).
+2. A POST that went out while the hold changed still marks the prompt
+   sent (`mark_sent`), so it isn't POSTed again.
+3. A session whose pane is gone (stopped or in error) has its held first
+   prompt marked `stopped`, and `waiting` ignores such a hold.
+
+Owed (round 5): the POST's 10s timeout (the route admits asynchronously
+per the binary's description, so it should answer quickly; unverified
+live); `message_held` as the kind for a held first prompt; triage cost;
+`apply_*` dedupe; the restart's words check repeating
+`fork::restart_prompt`; the dead `Way::Argv` arm.
+
+### Review round 6 (PR #73, merged main at 1.7.0; now 1.8.0)
+
+1. Only a 4xx answer to the POST is `Refused`; 5xx and anything else
+   is `Unknown` (never typed again).
+2. `Unknown` sets the sent marker too (15s settle).
+3. A typed first prompt sets the sent marker, so nothing rlord types
+   lands right after it.
+4. Archive removes `prompt.md`, the held POST, the sent marker and a
+   typed-fallback entry (`first_prompt::forget`); the sent marker is
+   deleted once its window is over. Declined: removing Codex's file on
+   binding, since Codex binds (SessionStart, the thread index) before
+   it has read the file. Owed: remove it after its first turn ends.
+5. `session_brief`'s transcript fallback goes through
+   `first_prompt::task`.
+
+Owed (round 6): recovery when a `stopped` mark is left on a session that
+runs again without a restart through rlord; the restart's words check
+and the never-taken server arm on restart; `Placed` as an enum; the POST
+on the follower thread.
+
+### Review round 7 (PR #73)
+
+1. The POST is made under the session's lock, after re-checking that
+   the hold is unchanged and the session is neither stopped nor archived.
+2. The sweep counts a session as gone only when its row is missing
+   (`Db::session_by_id`); a failed read keeps the hold.
+3. A prompt file that can't be read (other than missing) keeps the hold
+   for the next pass.
+4. Only `Stopped` marks a hold stopped (a session in error may still
+   have its pane).
+5. `docs/architecture.md` matches the code.
+
+Owed (round 7): a restart with a prompt queued for typing
+(`FIRST_KEY`) but no held POST may put a pointer on argv as well
+(`carried_held` checks only the POST hold); when the hold changed
+under a POST (`!same`), the event is logged but nothing ties it to the
+newer hold; the dedupe items above.
+
 ## Owed / deferred
 
 - `session_tools::visible()` is computed once per call for every tool;
@@ -668,9 +845,8 @@ Still owed:
     to `prompt.md` as `codex fork`'s `[PROMPT]`, OpenCode's POST to the
     fork's id. `bind_prompt` doesn't apply to forks (`bind_fork`).
 - Follow-up, not in this effort: the guard rail above.
-- The first prompt (with the pointer line for Codex untrusted / OpenCode)
-  is still on argv, `launched_args`, the `launched` event and
-  `bind_prompt`: PR 3.
+- The first prompt left argv in PR 3 for Codex and OpenCode; Claude's
+  waits on V1 (see "PR 3 progress").
 - `get_session` (a read-only tool) shows any session's background to any
   session that added plain `rlord mcp`, like its notes. PR 2's scoped
   tools are the real surface for workers.

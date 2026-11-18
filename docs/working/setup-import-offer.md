@@ -10,16 +10,16 @@ until now only the overlord offered when asked.
 1. After the first-run code-folder form closes (saved, Ctrl-D, or sent to
    the overlord; not Esc), or at startup when setup is already answered,
    the TUI calls `setup.import_offer` (cheap: one kv row, the overlord row,
-   the session list).
+   the session list). Any setup-form close counts (first-run or `:setup`).
 2. The daemon offers only while kv `setup_import_offer` is unset, an
    overlord exists, and there are no sessions besides overlords (archived
    ones count). No scan in rlord: the overlord's flow does that.
 3. Once nothing else is open, the TUI shows a dialog explaining import:
-   `y` import my sessions, `n` not now (won't ask again), Esc ask next start.
+   `y` import my sessions, `d` don't ask again, Esc later. Keys in its first 800ms are dropped; quitting and staying brings it back.
 4. `y`: the overlay opens and, in the background, `setup.import_answer
    {answer:"yes"}` sends the overlord the fixed `[rlord import request]`
    text, then records `yes:` in kv. A failed send records nothing (offered
-   again next start). `n` records `no:`.
+   again next start; the offer reopens with the error). `d` records `no:`.
 5. `overlord.md` routes `[rlord import request]` to "Importing existing
    work": `rlord-import` proposes (scan covers every importable agent; it
    says which agents had any and which installed agents can't be imported

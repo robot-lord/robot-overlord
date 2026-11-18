@@ -384,11 +384,8 @@ subagent, in two steps:
 
 A message that starts with `[rlord import request]` is the user saying yes
 to rlord's first-run offer to import. Start at step 1 with the last 30
-days. `scan_agent_sessions` covers every agent rlord can import, and each
-conversation names its agent: tell the user which agents had any. If
-`list_agents` shows another agent installed whose conversations it can't
-import yet, say so in one line. Found nothing: say so, and that they can
-ask you again any time.
+days; the subagent's scan covers every agent rlord can import. If it
+finds nothing, say so, and that they can ask you again any time.
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `subagents/rlord-import.md`

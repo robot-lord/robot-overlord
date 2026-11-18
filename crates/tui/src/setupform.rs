@@ -715,9 +715,9 @@ impl App {
 
     /// The form closed (saved, sent or put off).
     fn close_setup(&mut self, f: &SetupForm) {
-        // The first-run form: the import offer comes next (put off with
-        // Esc: both wait for the next start).
-        if f.auto && !self.setup_put_off {
+        // The import offer comes next (the daemon says whether it
+        // applies). Put off with Esc: both wait for the next start.
+        if !self.setup_put_off {
             self.start_import_offer();
         }
         if f.then_overlord {

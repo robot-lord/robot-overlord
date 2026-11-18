@@ -727,7 +727,10 @@ pub(crate) fn finish(
     };
     args.extend(context::launch_args(carried, &bg_file));
     let first = context::launch_prompt(want.prompt.as_deref(), carried, &bg_file);
-    let launch = launch(want, made, &project, first.as_deref(), &args)?;
+    // The user's words leave the command line (`first_prompt`).
+    let placed =
+        crate::first_prompt::place(base, id, agent, first.as_deref(), want.prompt.is_some());
+    let launch = launch(want, made, &project, placed.argv.as_deref(), &args)?;
     let tmux_name = methods::tmux_name_for(db, &name, None);
     let launch_spec = spec.to_string();
     methods::start(
@@ -739,7 +742,7 @@ pub(crate) fn finish(
             agent,
             launch_spec: &launch_spec,
             launch,
-            first: first.as_deref(),
+            first: placed,
             project_path: &project,
             repo: repo.as_deref(),
             workspace_path: workspace.as_deref(),

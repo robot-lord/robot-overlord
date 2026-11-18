@@ -60,8 +60,10 @@ pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 pub const PANE_ENV: &[&str] = &["RLORD_SESSION_ID", TOKEN_ENV];
 
 /// The pane env var naming a session's look-up token file (a path, never
-/// the token).
-pub const TOKEN_ENV: &str = "RLORD_SESSION_TOKEN_FILE";
+/// the token). Its name has no `KEY`, `SECRET` or `TOKEN` in it: Codex's
+/// default `shell_environment_policy` drops such variables from the
+/// commands it runs, which would hide it from `rlord context`.
+pub const TOKEN_ENV: &str = "RLORD_SESSION_LOOKUP_FILE";
 
 /// `cmd` without `PANE_ENV`.
 pub fn scrub_pane_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
@@ -799,6 +801,15 @@ mod tests {
         let mut argv = codex::launch_argv(None, None, &[]);
         Agent::Codex.add_first_prompt(&mut argv, "read it");
         assert_eq!(argv, codex::launch_argv(Some("read it"), None, &[]));
+    }
+
+    #[test]
+    fn pane_env_survives_codexs_default_filter() {
+        for k in PANE_ENV {
+            for word in ["KEY", "SECRET", "TOKEN"] {
+                assert!(!k.to_uppercase().contains(word), "{k}");
+            }
+        }
     }
 
     #[test]

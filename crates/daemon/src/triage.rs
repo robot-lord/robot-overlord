@@ -83,8 +83,9 @@ pub fn triage(d: &crate::Daemon, params: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// Rows plus each row's transcript path (when it has one).
-type Collected = (Value, Vec<Option<String>>);
+/// Rows plus each row's transcript path (when it has one) and launch
+/// words (`first_prompt::launch_words`).
+type Collected = (Value, Vec<(Option<String>, Option<String>)>);
 
 fn collect(db: &Db, params: &Value) -> Result<Collected> {
     let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
@@ -110,7 +111,10 @@ fn collect(db: &Db, params: &Value) -> Result<Collected> {
         .into_iter()
         .take(limit)
         .map(|(s, reviewed, changed)| {
-            sources.push(db.transcript_source(&s.id).ok().flatten());
+            sources.push((
+                db.transcript_source(&s.id).ok().flatten(),
+                crate::first_prompt::launch_words(db, &s.id),
+            ));
             json!({
                 "id": s.id, "name": s.name, "status": s.status,
                 "dir": s.project_path, "branch": s.branch,
@@ -132,13 +136,15 @@ fn collect(db: &Db, params: &Value) -> Result<Collected> {
     Ok((out, sources))
 }
 
-fn fill_excerpts(out: &mut Value, sources: &[Option<String>]) {
+fn fill_excerpts(out: &mut Value, sources: &[(Option<String>, Option<String>)]) {
     let Some(rows) = out["sessions"].as_array_mut() else {
         return;
     };
-    for (row, src) in rows.iter_mut().zip(sources) {
+    for (row, (src, words)) in rows.iter_mut().zip(sources) {
         if let Some(src) = src {
-            let e = transcript::transcript_excerpts(std::path::Path::new(src));
+            let mut e = transcript::transcript_excerpts(std::path::Path::new(src));
+            let id = row["id"].as_str().unwrap_or("");
+            e.first_prompt = crate::first_prompt::task(id, e.first_prompt, words.clone());
             row["excerpts"] = serde_json::to_value(e).unwrap_or(Value::Null);
         }
     }

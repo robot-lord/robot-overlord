@@ -73,6 +73,33 @@ mod tests {
         assert!(d.db().kv_get(KV).unwrap().unwrap().starts_with("no:"));
     }
 
+    fn row(db: &Db, id: &str, role: &str) {
+        db.insert_session(&rlord_core::db::NewSession {
+            id,
+            name: id,
+            agent: "claude",
+            agent_session: None,
+            project_path: "/p",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn offered_with_only_an_overlord() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        row(&d.db(), "o1", overlord::ROLE);
+        assert_eq!(offer(&d).unwrap()["offer"], true);
+        row(&d.db(), "s1", "");
+        assert_eq!(offer(&d).unwrap()["offer"], false);
+    }
+
     #[test]
     fn the_request_names_the_overlords_flow() {
         assert!(REQUEST.starts_with("[rlord import request]"));

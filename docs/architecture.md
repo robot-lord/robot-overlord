@@ -248,9 +248,39 @@ facts live in its module) is what the rest of rlord asks:
   only with the first message and has no model flag: the pane command
   first creates the session through OpenCode's server (`opencode api POST
   /api/session`, with the id, folder and model), then execs the TUI on it
-  (`opencode -s <ses_…> [--prompt …]`). `Launch::deferred` names the model
+  (`opencode -s <ses_…>`). `Launch::deferred` names the model
   for `daemon::opencode` to confirm afterwards (set it if the create step
   didn't take; log it if it can't be).
+- **First prompt off argv** (`daemon::first_prompt`): a start that carries
+  the user's words writes them (with any background pointer line) to
+  `<data>/sessions/<id>/prompt.md` (0600), so they never show in `ps`,
+  the pane command, `launched_args` or the `launched` event, and aren't
+  bound by the argument limit. Codex gets a fixed line naming the file as
+  its prompt (`first_prompt::pointer_line`, starting `[rlord session
+  <id>]` so a clipped first message still tells sessions apart; that line
+  is what its conversation is bound by). Anything that shows a
+  conversation's task (triage, summaries, `session_brief`) reads the
+  launch spec's words in its place (`first_prompt::task`). OpenCode's is
+  POSTed to its server (`POST /api/session/<id>/prompt`, `{text}`) once
+  the session exists and its model is settled (kv `first_prompt:<id>`,
+  carried over a restart, `opencode::apply_first_prompt`). The POST is
+  made under the session's lock, after checking the hold is unchanged and
+  the session is neither stopped nor archived. Refused (no connection,
+  the request not fully written, a 4xx answer) or not there after 30s:
+  it is typed in at the first idle turn from its own slot
+  (`send::queue_first`, before and apart from the overlord's queued
+  messages). Sent with no answer back, or any other non-2xx answer:
+  logged as unknown, never typed again (it may have run). A session that
+  stops first keeps it (file and kv, marked `stopped`) for its restart
+  to send; one archived or with no row has it settled (a failed read
+  or an unreadable file keeps it for the next pass). The file is removed
+  once it is sent, typed or settled, and on archive; the log has a
+  `first_prompt` event. Whatever rlord types into the session waits
+  until the first prompt has gone, and 15s after it is sent or typed.
+  A pointer-only first prompt (no words of the user's) stays on argv. Claude reads the file on stdin
+  (`exec … < prompt.md`) once live check V1 passes
+  (`first_prompt::CLAUDE_STDIN`); until then its prompt stays on argv.
+  Fixed text with no user words (`context::pointer_only`) stays on argv.
 - **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
   agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same
   shape, others' hooks kept, one backup), `map_hook_event` turns an event
@@ -809,8 +839,9 @@ reachable through it.
   wiring produced flags, kv `session_lookup:<id>`; else `cli`, or `none`
   without a token), so the
   overlord copies the needed facts into `context` for the last two. A
-  Claude or in-pane Codex pane's env gets `RLORD_SESSION_TOKEN_FILE` (a
-  path); OpenCode and Codex daemon-mode panes don't, since their shell
+  Claude or in-pane Codex pane's env gets `RLORD_SESSION_LOOKUP_FILE` (a
+  path; no `TOKEN`, `KEY` or `SECRET` in its name, which Codex's default
+  env policy drops); OpenCode and Codex daemon-mode panes don't, since their shell
   commands run in a shared server. The variable is scrubbed with
   `RLORD_SESSION_ID` from everything shared between sessions
   (`agents::PANE_ENV`: the daemon drops it from its own environment at
@@ -1611,7 +1642,8 @@ moved.
 ### Session background
 
 `session.new` takes three inputs, kept apart: `prompt`, the user's words
-verbatim (the agent's first prompt; still on its argv); `context`, the
+verbatim (the agent's first prompt, kept off its argv: "First prompt off
+argv" above); `context`, the
 overlord's notes (facts and pointers, at most 8,000 chars); `related`,
 refs to sessions the work builds on (at most 8 per call, 16 per session,
 never an overlord). The notes and links are rows in `session_context`;

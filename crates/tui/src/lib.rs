@@ -195,7 +195,8 @@ enum Mode {
     /// The active overlord is out of usage: switch to another agent's?
     LimitSwitch(Box<overlord::LimitSwitch>),
     /// Initial setup: import existing sessions? (`importoffer`).
-    ImportOffer,
+    /// (When it opened: keys right after are dropped.)
+    ImportOffer(std::time::Instant),
     /// "Quit rlord?" — quitting is deliberate (y/enter), anything else stays.
     ConfirmQuit,
     /// The cheat sheet (`?`).
@@ -292,6 +293,10 @@ struct App {
     import_offer_checked: bool,
     /// The offer applies, waiting for nothing else to be open.
     import_offer_ready: bool,
+    /// A `y` on its way to the overlord (`poll_import_offer`).
+    import_send: Option<mpsc::Receiver<Result<(), String>>>,
+    /// Why the last `y` wasn't sent, shown when the offer reopens.
+    import_offer_error: Option<String>,
     /// The startup sequence (overlord dialog, model upgrade, Remote
     /// Control offer, then the code folder) is still running: a dialog
     /// closing leads to setup once nothing is open (`continue_startup`).
@@ -397,6 +402,8 @@ impl App {
             setup_put_off: false,
             import_offer_checked: false,
             import_offer_ready: false,
+            import_send: None,
+            import_offer_error: None,
             startup_chain: false,
             overlay_after_startup: false,
             last_suggestion: None,
@@ -963,7 +970,7 @@ impl App {
             Mode::OverlordUpgrade(u) => self.handle_upgrade(k, u),
             Mode::RemoteOffer(o) => self.handle_remote_offer(k, o),
             Mode::LimitSwitch(l) => self.handle_limit_switch(k, l),
-            Mode::ImportOffer => self.handle_import_offer(k),
+            Mode::ImportOffer(t) => self.handle_import_offer(k, t),
             Mode::Help => {}
             Mode::Command(l) => self.handle_launcher(k, l, terminal)?,
             Mode::Keys(ks) => self.handle_keys(k, ks),
@@ -1563,7 +1570,7 @@ impl App {
             Mode::OverlordUpgrade(u) => self.draw_upgrade(f, u),
             Mode::RemoteOffer(o) => self.draw_remote_offer(f, o),
             Mode::LimitSwitch(l) => self.draw_limit_switch(f, l),
-            Mode::ImportOffer => self.draw_import_offer(f),
+            Mode::ImportOffer(_) => self.draw_import_offer(f),
             Mode::ConfirmQuit => self.draw_confirm_quit(f),
             Mode::Help => self.draw_help(f),
             Mode::Command(l) => self.draw_launcher(f, l),
@@ -2496,7 +2503,7 @@ impl App {
             | Mode::OverlordUpgrade(_)
             | Mode::RemoteOffer(_)
             | Mode::LimitSwitch(_)
-            | Mode::ImportOffer => {
+            | Mode::ImportOffer(_) => {
                 Some("overlord — see dialog".to_string())
             }
             Mode::Setup(_) => Some("code folder — see form".to_string()),
