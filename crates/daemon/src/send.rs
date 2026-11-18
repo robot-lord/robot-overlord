@@ -79,7 +79,9 @@ pub const CLAIMS_MAX: u64 = 3;
 
 /// Whether Codex's Stop hook claims held messages. On since its block
 /// (`decision: block`) was checked live (Codex 0.169.0, in the pane): the
-/// reason reaches the agent, which goes on in the same turn.
+/// reason reaches the agent, which goes on in the same turn. In-pane
+/// sessions only: on Codex's daemon (hooks run there) it isn't checked
+/// live yet, and those take them at the idle prompt.
 pub const CODEX_STOP_CLAIM: bool = true;
 
 /// How long the idle paste leaves alone messages a Stop hook's answer
@@ -664,10 +666,12 @@ pub(crate) fn stop_claim(
     // in error, or on a usage limit. (A turn that ended on an API error,
     // a usage limit included, ends with Claude's `StopFailure`, never
     // `Stop`: so this Stop isn't a limit reply.) Codex while
-    // `CODEX_STOP_CLAIM` is on.
+    // `CODEX_STOP_CLAIM` is on, in the pane only, and not when its turn
+    // ended on an error or limit (it has no `StopFailure`: its
+    // transcript's last `task_complete` says).
     let claims = match agent {
         Agent::Claude => true,
-        Agent::Codex => CODEX_STOP_CLAIM,
+        Agent::Codex => CODEX_STOP_CLAIM && codex_claims(db, s),
         Agent::OpenCode => false,
     };
     if !claims
@@ -704,6 +708,23 @@ pub(crate) fn stop_claim(
         output: json!({"decision": "block", "reason": text}),
         ack,
     }))
+}
+
+/// Codex's own conditions for a Stop claim: an in-pane session whose last
+/// turn didn't end on an error (see `stop_claim`).
+fn codex_claims(db: &Db, s: &Session) -> bool {
+    let spec: Value = db
+        .launch_spec(&s.id)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if rlord_core::agents::codex::on_daemon(&spec) {
+        return false;
+    }
+    !db.transcript_source(&s.id)
+        .ok()
+        .flatten()
+        .is_some_and(|p| rlord_core::agents::codex::last_turn_failed(std::path::Path::new(&p)))
 }
 
 /// What a Stop-hook claim's ack id starts with (`hook.ack` tells them
@@ -1352,12 +1373,16 @@ mod tests {
         // Nothing waits: no answer.
         assert!(stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_none());
         queue(&db, &id, &msg("also the footer")).unwrap();
-        // OpenCode has no Stop hook; Codex waits for its live check.
+        // OpenCode has no Stop hook. Codex (in the pane) claims as Claude
+        // does; its claim is dropped again (no ack) for the Claude run.
         assert!(stop_claim(&db, &s, Agent::OpenCode, 1).unwrap().is_none());
-        assert_eq!(
-            stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_some(),
-            CODEX_STOP_CLAIM
-        );
+        if CODEX_STOP_CLAIM {
+            let c = stop_claim(&db, &s, Agent::Codex, 1).unwrap().unwrap();
+            assert_eq!(c.output["decision"], "block");
+            assert_eq!(c.output["reason"], framed(&[msg("also the footer")]));
+            assert!(c.ack.starts_with(CLAIM_PREFIX), "{}", c.ack);
+            db.kv_delete(&claims_key(&id)).unwrap();
+        }
         let r = stop_claim(&db, &s, Agent::Claude, 2).unwrap().unwrap();
         assert_eq!(r.output["decision"], "block");
         assert_eq!(r.output["reason"], framed(&[msg("also the footer")]));

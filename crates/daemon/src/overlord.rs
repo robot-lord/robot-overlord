@@ -227,18 +227,44 @@ fn model_effort_in(cfg: &Config, agent: Agent, codex_home: &Path) -> (String, St
 }
 
 /// Codex's strongest current model, mirroring Claude's `opus` alias: the
-/// best-priority listed catalog model in the "astra" family (Codex's most
-/// capable line; its priority-1 entry is the fast everyday one). If the
-/// family is renamed and none matches, the priority-1 entry; "" (Codex's
-/// own default) without a catalog.
+/// best-priority listed catalog model of the "astra" family (Codex's most
+/// capable line; its priority-1 entry is the fast everyday one). A slug
+/// ending in `-astra` first; a variant (`-astra-mini`) only when there is
+/// no plain one. If the family is renamed and nothing matches, "" (Codex's
+/// own default), never a pinned slug that may be the fast model.
 fn codex_top_model(home: &Path) -> String {
     let listed = codex::models(home);
+    let segment = |m: &&String| m.split('-').any(|p| p == "astra");
     listed
         .iter()
-        .find(|m| m.contains("astra"))
-        .or(listed.first())
+        .find(|m| m.ends_with("-astra"))
+        .or_else(|| listed.iter().find(segment))
         .cloned()
         .unwrap_or_default()
+}
+
+/// The setup form's model choices for `agent`: Codex's catalog with ""
+/// (Codex's own default) kept as a choice.
+fn models_in(cfg: &Config, agent: Agent) -> Vec<String> {
+    let mut m = cfg.session.models_for(agent);
+    if agent == Agent::Codex && !m.iter().any(String::is_empty) {
+        m.push(String::new());
+    }
+    m
+}
+
+/// Each Codex catalog model's efforts, for the form to switch the effort
+/// row when the model changes (`efforts_in`). Empty for other agents.
+fn efforts_by_model(cfg: &Config, agent: Agent, codex_home: &Path) -> Value {
+    if agent != Agent::Codex {
+        return json!({});
+    }
+    let mut out = serde_json::Map::new();
+    for m in cfg.session.models_for(agent) {
+        out.insert(m.clone(), json!(efforts_in(agent, &m, codex_home)));
+    }
+    out.insert(String::new(), json!(efforts_in(agent, "", codex_home)));
+    Value::Object(out)
 }
 
 /// The efforts the setup form offers for `agent` on `model`: Codex's from
@@ -937,8 +963,9 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
                 json!({
                     "name": a.name(), "label": a.label(),
                     "model": model, "effort": effort,
-                    "models": cfg.session.models_for(a),
+                    "models": models_in(cfg, a),
                     "efforts": efforts_in(a, &model, &codex::home()),
+                    "efforts_by_model": efforts_by_model(cfg, a, &codex::home()),
                     "remote_control": a.has_remote_control(),
                     "catalog": catalog(a.name()),
                 })
@@ -1150,7 +1177,7 @@ mod tests {
     use super::*;
 
     /// A Codex overlord set up with no model gets the catalog's astra model,
-    /// else its priority-1 entry
+    /// else Codex's own default
     /// (a fixture, never `~/.codex`) and that model's efforts; without a
     /// catalog, Codex's own default and the fixed efforts. Claude and a
     /// configured Codex model are left alone.
@@ -1170,9 +1197,10 @@ mod tests {
         .unwrap();
         let cfg = Config::default();
         let (m, e) = model_effort_in(&cfg, Agent::Codex, tmp.path());
-        assert_eq!((m.as_str(), e.as_str()), ("gpt-new", "medium"));
+        // No astra here: Codex's own default, not the priority-1 slug.
+        assert_eq!((m.as_str(), e.as_str()), ("", "medium"));
         assert_eq!(
-            efforts_in(Agent::Codex, &m, tmp.path()),
+            efforts_in(Agent::Codex, "gpt-new", tmp.path()),
             ["low", "medium", "high", "xhigh"]
         );
         let (m, _) = model_effort_in(&cfg, Agent::Claude, tmp.path());
@@ -1189,13 +1217,28 @@ mod tests {
             astra.path().join("models_cache.json"),
             r#"{"models": [
               {"slug": "gpt-6.2-sol", "priority": 1, "visibility": "list"},
+              {"slug": "gpt-6.3-astra-mini", "priority": 2, "visibility": "list"},
+              {"slug": "gpt-6.2-astrality", "priority": 2, "visibility": "list"},
               {"slug": "gpt-6.1-astra", "priority": 4, "visibility": "list"},
-              {"slug": "gpt-6.2-astra", "priority": 2, "visibility": "list"}]}"#,
+              {"slug": "gpt-6.2-astra", "priority": 3, "visibility": "list"}]}"#,
         )
         .unwrap();
         assert_eq!(
             model_effort_in(&cfg, Agent::Codex, astra.path()).0,
             "gpt-6.2-astra"
+        );
+        // Only a variant: that, over the fast model.
+        let mini = tempfile::tempdir().unwrap();
+        std::fs::write(
+            mini.path().join("models_cache.json"),
+            r#"{"models": [
+              {"slug": "gpt-6.2-sol", "priority": 1, "visibility": "list"},
+              {"slug": "gpt-6.3-astra-mini", "priority": 2, "visibility": "list"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_effort_in(&cfg, Agent::Codex, mini.path()).0,
+            "gpt-6.3-astra-mini"
         );
         assert_eq!(
             efforts_in(Agent::Codex, "gpt-new", empty.path()),

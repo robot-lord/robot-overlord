@@ -44,6 +44,11 @@ struct AgentChoice {
     /// Effort choices ("" = the agent's default); empty: it has none.
     efforts: Vec<String>,
     effort: usize,
+    /// Each model's own efforts (Codex's catalog), shown when the Model
+    /// row moves to it; a model not listed keeps `efforts`.
+    efforts_by: std::collections::HashMap<String, Vec<String>>,
+    /// The default effort, kept across model changes when offered.
+    effort_default: String,
     /// It has Remote Control.
     remote: bool,
     /// family → latest id, for the "→ resolves to" hint.
@@ -182,7 +187,28 @@ impl AgentChoice {
             e if e.is_empty() => (e, 0),
             e => with(e, a["effort"].as_str().unwrap_or("")),
         };
+        let efforts_by = a["efforts_by_model"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let e = v
+                            .as_array()
+                            .map(|l| {
+                                l.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (k.clone(), e)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         AgentChoice {
+            efforts_by,
+            effort_default: a["effort"].as_str().unwrap_or("").to_string(),
             name: a["name"].as_str().unwrap_or("claude").to_string(),
             label: a["label"].as_str().unwrap_or("Claude Code").to_string(),
             models,
@@ -265,6 +291,25 @@ impl Setup {
         self.choice().efforts.get(self.effort).map_or("", |e| e)
     }
 
+    /// The Model row moved: offer that model's own efforts (Codex's
+    /// catalog), keeping the chosen effort if it is offered, else the
+    /// default, else the first.
+    fn refit_efforts(&mut self) {
+        let model = self.model().to_string();
+        let keep = self.effort().to_string();
+        let c = &mut self.agents[self.agent];
+        let Some(e) = c.efforts_by.get(&model).filter(|e| !e.is_empty()).cloned() else {
+            return;
+        };
+        let at = e
+            .iter()
+            .position(|x| *x == keep)
+            .or_else(|| e.iter().position(|x| *x == c.effort_default))
+            .unwrap_or(0);
+        c.efforts = e;
+        self.effort = at;
+    }
+
     /// ← / →: the focused row's next or previous choice. Another agent
     /// starts on its own default model and effort.
     fn step(&mut self, forward: bool) {
@@ -286,7 +331,10 @@ impl Setup {
                     self.effort = self.choice().effort;
                 }
             }
-            Some(SetupRow::Model) => self.model = next(self.model, self.choice().models.len()),
+            Some(SetupRow::Model) => {
+                self.model = next(self.model, self.choice().models.len());
+                self.refit_efforts();
+            }
             Some(SetupRow::Effort) => self.effort = next(self.effort, self.choice().efforts.len()),
             Some(SetupRow::Remote) => self.remote = self.remote.map(|on| !on),
             None => {}
@@ -1147,6 +1195,27 @@ mod tests {
             s.rows(),
             [SetupRow::Agent, SetupRow::Model, SetupRow::Effort]
         );
+    }
+
+    /// Codex: the effort row follows the model (its catalog's levels),
+    /// keeping the chosen effort where offered.
+    #[test]
+    fn setup_efforts_follow_the_codex_model() {
+        let codex = json!({"name": "codex", "label": "Codex", "model": "gpt-a",
+            "effort": "medium", "models": ["gpt-a", "gpt-b", ""],
+            "efforts": ["low", "medium", "xhigh"],
+            "efforts_by_model": {"gpt-a": ["low", "medium", "xhigh"],
+                                 "gpt-b": ["low", "high"], "": ["low", "medium", "high"]}});
+        let mut s = Setup::from_status(&status(json!([codex]), false));
+        assert_eq!((s.model(), s.effort()), ("gpt-a", "medium"));
+        s.row = 1; // Model
+        s.step(true);
+        assert_eq!(s.model(), "gpt-b");
+        assert_eq!(s.choice().efforts, ["low", "high"]);
+        assert_eq!(s.effort(), "low");
+        s.step(true);
+        // "low" is offered here too: kept.
+        assert_eq!((s.model(), s.effort()), ("", "low"));
     }
 
     #[test]

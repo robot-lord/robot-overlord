@@ -851,6 +851,24 @@ pub(crate) fn limit_ended(v: &Value) -> bool {
         .is_some_and(|p| p["error"]["codex_error_info"] == "usage_limit_exceeded")
 }
 
+/// Whether the conversation's last finished turn, with none started since,
+/// ended on an error (a usage limit included): Codex has no `StopFailure`,
+/// so a Stop hook can't tell. Reads the file's tail only.
+pub fn last_turn_failed(path: &Path) -> bool {
+    let (_, tail) = super::transcript::read_head_tail(path);
+    tail.iter()
+        .rev()
+        .find_map(|v| {
+            if event(v, "task_started").is_some() || event(v, "turn_started").is_some() {
+                return Some(false);
+            }
+            event(v, "task_complete")
+                .or_else(|| event(v, "turn_complete"))
+                .map(|p| !p["error"].is_null())
+        })
+        .unwrap_or(false)
+}
+
 /// When the limit that ended the turn at `before.len()` resets (ms), and
 /// which window it was (`five_hour`, `seven_day`, …), from the
 /// `token_count` lines before it (oldest first; `at`: when it hit, ms).
@@ -1590,6 +1608,22 @@ mod tests {
         assert!(threads_started_in(dir.path(), "/src/none", 0, false).is_empty());
         // No index at all (Codex never ran): nothing, quietly.
         assert!(threads_started_in(&dir.path().join("absent"), "/src/app", 0, false).is_empty());
+    }
+
+    #[test]
+    fn a_failed_last_turn_is_told_from_its_task_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("r.jsonl");
+        let ok = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        let bad = r#"{"type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":"usage_limit_exceeded"}}}"#;
+        let start = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        std::fs::write(&f, format!("{start}\n{bad}\n")).unwrap();
+        assert!(last_turn_failed(&f));
+        std::fs::write(&f, format!("{bad}\n{start}\n")).unwrap();
+        assert!(!last_turn_failed(&f));
+        std::fs::write(&f, format!("{start}\n{ok}\n")).unwrap();
+        assert!(!last_turn_failed(&f));
+        assert!(!last_turn_failed(&tmp.path().join("none.jsonl")));
     }
 
     #[test]
