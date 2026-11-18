@@ -328,3 +328,32 @@ async fn per_account_counters_add_up_across_a_host_and_its_devices() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn unused_and_removed_hosts_are_forgotten() {
+    let r = relay(|c| {
+        c.timeouts.sweep = Duration::from_millis(100);
+        c.host_expiry = Some(Duration::ZERO);
+    })
+    .await;
+    // Removed by the CLI while connected: closed within a sweep (4403),
+    // devices too.
+    let mut h = host(&r).await;
+    let mut d = device_of(&r, &mut h).await;
+    let cli = Admin::open(&r.cfg.data_dir).unwrap();
+    assert!(cli.host_remove(&h.fp()).unwrap());
+    assert_eq!(h.closed().await, Some(close::NOT_ALLOWED));
+    assert_eq!(d.closed().await, Some(close::NOT_ALLOWED));
+
+    // Not seen for longer than `host_expiry`: forgotten while away, kept
+    // while connected.
+    let away = host(&r).await;
+    let here = host(&r).await;
+    away.close().await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    eventually("the unused host to be forgotten", || {
+        let hosts = cli.hosts().unwrap();
+        hosts.len() == 1 && hosts[0].fingerprint == here.fp()
+    })
+    .await;
+}

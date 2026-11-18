@@ -6,6 +6,7 @@ How rlord works now. These outrank anything in `working/`.
 |---|---|
 | [guide.md](guide.md) | Using rlord: the list, the overlord, keys, config |
 | [architecture.md](architecture.md) | How it's built: daemon, TUI, tmux, agents, the overlord |
+| [relay.md](relay.md) | Running a relay (`rlord-relay`) for remote access: what it sees, setup, TLS, limits, backup |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Building, testing, releasing |
 
 - `working/`: one working doc per effort in flight (plan, decisions,
