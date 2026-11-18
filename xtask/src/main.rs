@@ -17,6 +17,7 @@ mod e2e;
 mod fresh_install;
 mod preflight;
 mod publish;
+mod relay_image;
 mod release;
 mod screenshots;
 mod smoke;
@@ -40,6 +41,8 @@ usage: cargo xtask <task>
       the Linux build's packaging tools, pinned, into target/release-tools
   smoke-linux DIST [IMAGE…]
       install DIST with get.sh in Linux containers and run a few commands
+  relay-image [--dist DIR] [--push]
+      the relay's container image (amd64, arm64) from a release's relay tarballs
   check-deps
       fail if the rlord binary depends on network code (the web plugin's)
   web install|check|build|watch
@@ -98,6 +101,7 @@ fn main() -> ExitCode {
         "build-release" => build::main(rest, &invoked_from),
         "install-tools" => tools::main(rest),
         "smoke-linux" => smoke::main(rest, &invoked_from),
+        "relay-image" => relay_image::main(rest, &invoked_from),
         "dev-daemon" => dev_daemon::main(rest),
         "check-version-bump" => bump::main(rest),
         "check-deps" => check_deps::main(rest),
