@@ -261,13 +261,19 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
 
 Only `overlord.ask` and `overlord.new_session` travel by the mailbox, one
 frame each, when the device finds its host offline or has no live
-session. The host, for each lane-2 frame: drops (and acknowledges) a frame
-whose id is not its current mailbox's; decrypts (a failure discards the
-mailbox); drops a request id it has seen among the device's last 64; saves
-the state and the id; acknowledges the relay; acts; answers by the mailbox
-with the usual answer (saving the advanced state before sending). A crash
-loses at most that message; the device resends by id, and a repeat is
-answered `{"error":{"code":"repeat"}}` rather than acted on twice.
+session. The host, for each lane-2 frame: acknowledges and ignores a
+frame whose relay `boot` and `seq` it has handled already (delivered
+again after a crash); drops (and acknowledges) a frame whose id is not
+its current mailbox's; decrypts (a failure discards the mailbox); records
+the request id and the frame's `(boot, seq)` and saves them with the
+advanced state in one atomic write (`remote/mailbox-<device id>.json`);
+acknowledges the relay; refuses a repeated id (`repeat`) or another op
+(`not_allowed`), else acts; and answers by the mailbox with the usual
+answer, saving the advanced state before sending. A crash before the
+save means the frame is handled again as new; a crash after it never
+repeats the op, and the device's resend is answered `repeat`. (The plan
+said the receiver saves after acting; saving the id first is what makes
+"never twice" hold.)
 
 ## 4. Host and daemon
 
