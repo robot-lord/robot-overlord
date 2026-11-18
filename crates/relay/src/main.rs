@@ -134,10 +134,7 @@ fn main() -> Result<()> {
         Cmd::Serve { listen } => {
             tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                )
+                .with_env_filter(log_filter())
                 .init();
             let mut cfg = Config::load(&cli.config)?;
             if let Some(l) = listen {
@@ -229,6 +226,24 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// `RUST_LOG` (default `info`), with the websocket and TLS libraries held
+/// to `info` whatever it says: at debug and trace they print frames, and
+/// the relay never logs payloads.
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    let mut f = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for quiet in [
+        "tungstenite=info",
+        "tokio_tungstenite=info",
+        "axum=info",
+        "hyper=info",
+        "rustls=info",
+    ] {
+        f = f.add_directive(quiet.parse().expect("a valid directive"));
+    }
+    f
 }
 
 async fn serve(cfg: Config) -> Result<()> {

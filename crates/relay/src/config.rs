@@ -42,6 +42,9 @@ pub struct Timeouts {
     pub enroll_poll: Duration,
     /// What `bye` and a 503 tell a client to wait, in seconds.
     pub retry_after: u64,
+    /// Housekeeping: expired queues and rendezvous dropped, and hosts
+    /// suspended by the CLI while connected closed.
+    pub sweep: Duration,
 }
 
 impl Default for Timeouts {
@@ -54,6 +57,7 @@ impl Default for Timeouts {
             tls_reload: Duration::from_secs(12 * 3600),
             enroll_poll: Duration::from_secs(1),
             retry_after: 5,
+            sweep: Duration::from_secs(30),
         }
     }
 }

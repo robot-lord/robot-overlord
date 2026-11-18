@@ -2,7 +2,7 @@
 //! connect sequence (checking the relay against its pin), numbered
 //! requests and binary frames. Every relay here is the real one on
 //! 127.0.0.1.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::result_large_err)]
 
 use std::collections::VecDeque;
 use std::time::Duration;

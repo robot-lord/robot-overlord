@@ -244,7 +244,7 @@ pub async fn start(cfg: Config) -> Result<Running> {
     // Housekeeping.
     let h = hub.clone();
     tasks.push(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(sweep_every(&h.cfg));
+        let mut tick = tokio::time::interval(h.cfg.timeouts.sweep);
         loop {
             tick.tick().await;
             h.sweep();
@@ -284,12 +284,6 @@ pub async fn start(cfg: Config) -> Result<Running> {
         tasks,
         server: Some(server),
     })
-}
-
-/// Housekeeping runs often enough for the shortest timer it serves.
-fn sweep_every(cfg: &Config) -> Duration {
-    let t = cfg.limits.mailbox_ttl.min(Duration::from_secs(30));
-    t.max(Duration::from_millis(100))
 }
 
 /// What `rlord-relay address` prints for a config.
