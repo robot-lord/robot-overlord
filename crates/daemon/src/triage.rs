@@ -143,7 +143,8 @@ fn fill_excerpts(out: &mut Value, sources: &[(Option<String>, Option<String>)]) 
     for (row, (src, words)) in rows.iter_mut().zip(sources) {
         if let Some(src) = src {
             let mut e = transcript::transcript_excerpts(std::path::Path::new(src));
-            e.first_prompt = crate::first_prompt::task(e.first_prompt, words.clone());
+            let id = row["id"].as_str().unwrap_or("");
+            e.first_prompt = crate::first_prompt::task(id, e.first_prompt, words.clone());
             row["excerpts"] = serde_json::to_value(e).unwrap_or(Value::Null);
         }
     }

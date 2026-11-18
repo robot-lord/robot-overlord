@@ -110,19 +110,22 @@ impl Service {
         accept: &str,
         read_timeout: Duration,
     ) -> Result<(u16, Body<BufReader<TcpStream>>)> {
-        let stream = self.connect(read_timeout)?;
-        self.send_over(stream, method, path, body, accept)
+        let mut stream = self.connect(read_timeout)?;
+        self.write_request(&mut stream, method, path, body, accept)?;
+        let mut r = BufReader::new(stream);
+        let (status, mode) = read_head(&mut r)?;
+        Ok((status, Body::new(r, mode)))
     }
 
-    /// `send` on a connection already made.
-    fn send_over(
+    /// Write one request on a connection already made.
+    fn write_request(
         &self,
-        mut stream: TcpStream,
+        stream: &mut TcpStream,
         method: &str,
         path: &str,
         body: Option<&Value>,
         accept: &str,
-    ) -> Result<(u16, Body<BufReader<TcpStream>>)> {
+    ) -> Result<()> {
         let auth = base64(format!("opencode:{}", self.password).as_bytes());
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {auth}\r\n\
@@ -141,9 +144,7 @@ impl Service {
         if let Some(p) = &payload {
             stream.write_all(p.as_bytes())?;
         }
-        let mut r = BufReader::new(stream);
-        let (status, mode) = read_head(&mut r)?;
-        Ok((status, Body::new(r, mode)))
+        Ok(())
     }
 
     /// One request and its whole answer: (status, body). `limit`: how long
@@ -336,13 +337,21 @@ impl Service {
             return Posted::Refused("not an OpenCode session id".into());
         }
         let limit = Duration::from_secs(10);
-        let stream = match self.connect(limit) {
+        let mut stream = match self.connect(limit) {
             Ok(s) => s,
             Err(e) => return Posted::Refused(format!("{e:#}")),
         };
         let body = serde_json::json!({ "text": text });
         let path = format!("/api/session/{id}/prompt");
-        match self.send_over(stream, "POST", &path, Some(&body), "application/json") {
+        // (Not all written: the server can't have taken an incomplete
+        // request.)
+        if let Err(e) =
+            self.write_request(&mut stream, "POST", &path, Some(&body), "application/json")
+        {
+            return Posted::Refused(format!("{e:#}"));
+        }
+        let mut r = BufReader::new(stream);
+        match read_head(&mut r) {
             Ok((status, _)) if (200..300).contains(&status) => Posted::Sent,
             Ok((status, _)) => Posted::Refused(format!("POST {path}: {status}")),
             Err(e) => Posted::Unknown(format!("{e:#}")),

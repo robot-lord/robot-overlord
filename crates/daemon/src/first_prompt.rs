@@ -89,9 +89,11 @@ pub fn launch_words(db: &Db, id: &str) -> Option<String> {
 /// A conversation's task as a transcript shows it: its first prompt, or,
 /// where there is none or it is only the pointer line (Codex), the
 /// launch's own words.
-pub fn task(transcript_first: Option<String>, words: Option<String>) -> Option<String> {
+/// Only session `id`'s own pointer line counts.
+pub fn task(id: &str, transcript_first: Option<String>, words: Option<String>) -> Option<String> {
+    let own = format!("{POINTER_HEAD}{id}]");
     match transcript_first {
-        Some(t) if t.trim_start().starts_with(POINTER_HEAD) => words,
+        Some(t) if t.trim_start().starts_with(&own) => words,
         None => words,
         t => t,
     }
@@ -272,14 +274,16 @@ mod tests {
         let line = p.argv.unwrap();
         assert!(line.starts_with("[rlord session 01abc] "), "{line}");
         assert_eq!(
-            task(Some(line), Some("do x".into())).as_deref(),
+            task("01abc", Some(line.clone()), Some("do x".into())).as_deref(),
             Some("do x")
         );
         assert_eq!(
-            task(Some("own".into()), Some("x".into())).as_deref(),
+            task("01abc", Some("own".into()), Some("x".into())).as_deref(),
             Some("own")
         );
-        assert_eq!(task(None, Some("x".into())).as_deref(), Some("x"));
+        assert_eq!(task("01abc", None, Some("x".into())).as_deref(), Some("x"));
+        // (Another session's pointer is just text here.)
+        assert_eq!(task("01xyz", Some(line.clone()), None), Some(line));
     }
 
     #[test]

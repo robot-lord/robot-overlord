@@ -263,8 +263,14 @@ fn agent_pane(s: &Session) -> Result<String> {
 }
 
 /// Type a message into session `s` (read under its lock, just now), after
-/// the last checks (`type_into`). `source`: who sends it.
-pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str, source: Source) -> Result<Typed> {
+/// the last checks (`type_into`). `source`: who sends it (None: the
+/// user's own words, a first prompt).
+pub(crate) fn type_message(
+    d: &Daemon,
+    s: &Session,
+    text: &str,
+    source: Option<Source>,
+) -> Result<Typed> {
     let pane = agent_pane(s)?;
     // On Codex's daemon another client may have started a turn rlord's
     // status doesn't show: the daemon says.
@@ -283,7 +289,7 @@ pub(crate) fn type_message(d: &Daemon, s: &Session, text: &str, source: Source) 
         attached: s.tmux_session.as_deref(),
         overlay: overlay.as_deref(),
         draft: true,
-        source: Some(source),
+        source,
     };
     type_into(d, &s.id, &pane, text, &checks)
 }
@@ -334,12 +340,12 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         return not_now(d, &s, text, when_idle, &why);
     }
     // Its first prompt goes first.
-    if d.db().kv_map(FIRST_KEY)?.contains_key(&s.id) {
+    if first_waiting(&d.db(), &s.id)? {
         let why = format!("{}'s first prompt hasn't been typed in yet", s.name);
         return not_now(d, &s, text, when_idle, &why);
     }
     // (tmux without the DB lock.)
-    if let Typed::NotNow(why) = type_message(d, &s, text, Source::Send)? {
+    if let Typed::NotNow(why) = type_message(d, &s, text, Some(Source::Send))? {
         return not_now(d, &s, text, when_idle, &format!("{}: {why}", s.name));
     }
     let db = d.db();
@@ -393,6 +399,17 @@ fn queue(db: &Db, id: &str, text: &str) -> Result<bool> {
     )?;
     Ok(replaced)
 }
+
+/// Whether session `id`'s first prompt hasn't reached it yet: held for its
+/// server (`first_prompt::pending_key`) or for typing (`FIRST_KEY`). The
+/// overlord's messages wait for it.
+fn first_waiting(db: &Db, id: &str) -> Result<bool> {
+    Ok(db.kv_map(FIRST_KEY)?.contains_key(id)
+        || db.kv_get(&crate::first_prompt::pending_key(id))?.is_some())
+}
+
+/// How many times typing a first prompt may fail before it is dropped.
+const FIRST_TRIES: u64 = 5;
 
 /// Hold first prompt `text` of session `id` for its first idle turn (its
 /// own slot, `FIRST_KEY`).
@@ -475,7 +492,10 @@ fn tick(d: &Daemon) -> Result<()> {
             let mut dropped = false;
             for id in m.keys().cloned().collect::<Vec<_>>() {
                 // (A session's first prompt goes before its messages.)
-                if key == PENDING_KEY && firsts.contains_key(&id) {
+                if key == PENDING_KEY
+                    && (firsts.contains_key(&id)
+                        || db.kv_get(&crate::first_prompt::pending_key(&id))?.is_some())
+                {
                     continue;
                 }
                 let s = db.resolve_ref(&id).ok();
@@ -540,13 +560,28 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
         return Ok(());
     }
     // Without the DB lock: tmux.
-    let r = type_message(d, &s, &text, Source::Send);
+    // (A first prompt is the user's own words: its prompt is theirs.)
+    let source = (key != FIRST_KEY).then_some(Source::Send);
+    let r = type_message(d, &s, &text, source);
     if let Ok(Typed::NotNow(why)) = &r {
         // A later tick; said once, so a stuck queue is visible.
         return held(d, id, &text, why, key);
     }
     let db = d.db();
     let mut m = db.kv_map(key)?;
+    // A first prompt that failed to type: tried again at a later tick, up
+    // to `FIRST_TRIES` times.
+    if let (Err(e), true) = (&r, key == FIRST_KEY) {
+        if let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) {
+            let tries = entry.get("tries").and_then(Value::as_u64).unwrap_or(0) + 1;
+            if tries < FIRST_TRIES {
+                entry.insert("tries".into(), json!(tries));
+                db.kv_set_map(key, &m)?;
+                tracing::info!(session = %id, error = %format!("{e:#}"), tries, "typing a first prompt");
+                return Ok(());
+            }
+        }
+    }
     // (Queued and sent under this lock: still this text.)
     if m.get(id).and_then(|v| v["text"].as_str()) == Some(text.as_str()) {
         m.remove(id);

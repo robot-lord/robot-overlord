@@ -681,7 +681,7 @@ Owed from PR 3:
   long enough.
 - Live-check that Codex reads `prompt.md` from the pointer line in its
   default sandbox (the plan's Codex pointer-read check).
-- The typed fallback's prompt is marked rlord's (`Source::Send`), not
+- (Fixed in round 2) The typed fallback's prompt was marked rlord's, not
   the user's.
 - `launch_spec.prompt` still holds the words in the DB (not argv).
 - (Review round 1) A Pointer-mode session's background rows are marked
@@ -710,6 +710,25 @@ Owed from PR 3:
 6. Held first prompts of sessions no longer live are settled each
    OpenCode tick: logged as not sent, file removed.
 7. The pointer line starts `[rlord session <id>]`.
+
+### Review round 2 (PR #73, merged main at 1.5.0; now 1.6.0)
+
+1. The overlord's sends (direct and queued) wait while kv
+   `first_prompt:<id>` is held too, not only the typed slot.
+2. `Service::prompt`: a failure to connect or to write the whole request
+   is `Refused`; only a missing answer after that is `Unknown`.
+3. A typed first prompt that fails is tried again at later ticks (up to
+   `FIRST_TRIES` = 5), then dropped and logged.
+4. Archive summaries read the launch words before reading the transcript
+   (the DB lock is let go first).
+5. `first_prompt::task` replaces only session `id`'s own pointer line.
+6. A typed first prompt is the user's prompt (`type_message` source
+   None), not marked rlord's.
+
+Owed (round 2): the POST (10s limit) on the follower thread; each pass
+reads the file, asks `has_session` and scans kv `first_prompt:*`; the
+private-write helper is repeated in `context` and `first_prompt`; the
+restart's "has words" check repeats `fork::restart_prompt`'s.
 
 ## Owed / deferred
 
