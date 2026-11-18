@@ -945,8 +945,10 @@ serve a session over a socket.
 has no HTTP server, websocket, TLS or network-client crate. `cargo xtask
 check-deps` (CI's `check` job, and the start of every release build) fails
 when `cargo tree -p robot-overlord` names one (axum, hyper, h2, http,
-tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate)
-or when the four main crates' source names a TCP or UDP socket type. One
+tungstenite, rustls, native-tls, reqwest, ureq, curl, the plugin crate,
+and the remote-access and crypto crates: the e2e and relay crates, snow,
+libcrux, P-256, ring, webpki-roots, wasm-bindgen; `qrcode` is allowed, it
+only draws a string) or when the four main crates' source names a TCP or UDP socket type. One
 file is exempt, by name and with its reason: `core/src/agents/opencode_service.rs`,
 the OpenCode adapter's HTTP client for OpenCode's own background server
 on a local address. tokio's `net` feature compiles its TCP types (it has
@@ -1118,8 +1120,79 @@ control socket).
   drift shows as a wrong label, never a wrong launch, since the daemon
   checks every launch argument again.
 
-Remote access (an end-to-end encrypted relay, a phone app) is planned in
-`docs/working/web-ui-remote.md` and `docs/working/e2e-crypto.md`.
+### Remote access (through a relay)
+
+A paired device reaches the overlord and the session list of a host
+behind NAT through a relay that sees only ciphertext. The protocol is
+written out in `docs/working/e2e-protocol.md` (unreviewed: nobody but the
+user runs it before a review); the relay itself is `docs/relay.md`.
+
+**Two invariants, both tested.**
+
+- *Everyone dials out.* The host (`rlord-web`) and every device open
+  outbound connections to the relay; the relay is the only listener on the
+  network. The plugin's one listener stays `127.0.0.1` in its `main.rs`
+  (`cargo xtask check-deps` fails on a `TcpListener` anywhere else under
+  `crates/web/src/`, and on a bind to every interface outside
+  `crates/relay`).
+- *One pinned relay per host.* `rlord relay setup <address>` takes
+  `https://relay.example.com#k=<fingerprint>`: the origin and the SHA-256
+  of the relay's P-256 key. On every connection the relay signs a
+  transcript over both nonces; the peer checks origin, key and signature
+  before sending anything else, and a miss is "wrong relay", never
+  retried elsewhere. The proved origin and key go into every Noise
+  prologue, so a handshake through any other relay fails on both ends.
+  The pin is part of the host's keys (`remote/pin.json`): another relay
+  is `setup --reset`, and every device pairs again. No redirects, no
+  fallbacks, no `permessage-deflate`.
+
+**Three parties, three crate families.**
+
+| Party | Crates | Holds |
+| --- | --- | --- |
+| Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request-id list per device; `remote.log` (audit) |
+| Device (the phone app, next; `rlord-device` for tests, `crates/e2e-device`) | `rlord_e2e` (natively or as WASM, `crates/e2e-wasm`), `rlord_relay_proto` | its keys, the host's static key and the pin |
+| Relay (`rlord-relay`, `crates/relay`) | `rlord_relay_proto` only | its key, registrations; queues in memory |
+
+`rlord_e2e` is sans-IO (`check-deps` holds its tree free of tokio,
+sockets and TLS) and builds to `wasm32-unknown-unknown`; its test vectors
+(`crates/e2e/vectors/v1.json`, `cargo xtask e2e vectors`) are checked
+natively and in Node from the WASM build (`cargo xtask e2e test-wasm`).
+The relay's tree names no content crypto and no part of rlord. The
+`rlord` binary names none of these crates: the daemon holds no keys and
+does no crypto.
+
+**The content layer.** Pairing is `Noise_IKpsk2`, reconnect and mailbox
+keying `Noise_KKpsk2`, all `25519_ChaChaPoly_SHA256` with an ML-KEM-768
+step mixed in through the PSK slot (post-quantum forward secrecy). The
+device always initiates; the host treats a handshake as a session only
+once the device's first frame decrypts, and any decrypt failure ends the
+session. A live session carries streams (0 is control; panes later),
+fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
+`overlord.new_session` while the host is away) is its own saveable
+cipher state over the kind-3 handshake's raw keys, rekeyed after every
+message; a request id list makes a crash lose a request rather than
+repeat it.
+
+**Pairing is user-only and confirmed.** `rlord relay pair` (or the TUI's
+Devices screen, or the local page's) shows a QR: the pin, a one-use
+rendezvous id, the host's static key and a pairing secret, valid 300 s
+for one device. Both sides then show a six-digit code from the handshake
+hash; the device is stored, put on the relay's allow-list and able to
+call anything only after the user confirms on the host. Never an MCP
+tool, never reachable from a device.
+
+**How a device's request reaches the daemon.** The plugin passes the
+control stream's `{id, op, args}` on as `web.call {op, args, via:
+"remote", device}`. `web::OPS` has a `remote` column: a device may call
+what a local page may except what writes `config.toml`, the surface
+reports, the key screen and device management. A remote call has no
+`page`, never counts as use of a screen and gets no `ui` commands. To
+make an op remote, set `remote: true` on its `Op` and test it from a
+device in `web_api.rs`. The user's commands (`relay.*`) go the other
+way: the daemon forwards them to the plugin on the `web.subscribe`
+stream and keeps the plugin's `web.remote_state` as a mirror for
+`relay.status` and the Devices screens.
 
 ## rlord's private tmux server (2026-11-10)
 
