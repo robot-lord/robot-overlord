@@ -19,7 +19,7 @@ git history (`docs/working/session-context.md`).
   Not run: OpenCode's server is shared and writes the user's own OpenCode
   database. Route and body read from the 2.2.7 binary's API table
   (`delivery: "steer" | "queue"`).
-- Codex's Stop-hook block (`decision: block`, `reason`) live. The 0.169.0
+- Codex's Stop-hook block (`decision: block`, `reason`) live; then turn `CODEX_STOP_CLAIM` on. The 0.169.0
   binary's hook schema has it (Claude-compatible, `stop_hook_active`);
   only Claude's was run (V3, below).
 - Codex reading `prompt.md` from the pointer line in its default sandbox.
@@ -36,10 +36,15 @@ gets the text.
 
 ## Owed
 
-- Later messages: a Stop-hook claim keeps the status "working"; if the
-  hook client's ack is lost, the next Stop or the idle paste delivers it
-  again (at most one duplicate, as designed). A direct send while a claim
-  is out (status idle, which a claim prevents) could duplicate too.
+- Later messages: the Stop sets the status idle as usual and the claim's
+  ack sets it working again. If the ack is lost, the idle paste (after
+  10s) or the next Stop delivers the message again: at most one
+  duplicate, as designed.
+- Codex Stop-hook claim: off (`send::CODEX_STOP_CLAIM = false`) until its
+  block is checked live; Codex takes held messages at its idle prompt.
+- `limits::limited_in` reads kv `limits` beside the daemon's in-memory
+  copy (`limits::limited`): share one helper. Remove kv
+  `stop_claims:<id>` on archive.
 - Later messages (review of #79): a TTL for the `own::mark` of a
   message OpenCode queued behind a long turn; dedupe `deliver`'s server
   path with `sent`; remove kv `stop_claims:<id>` on archive.

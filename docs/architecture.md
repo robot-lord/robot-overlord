@@ -1378,10 +1378,10 @@ including when the active one hits a usage limit.
     (`own::mark`). Only a surely refused POST (no connection, a 4xx)
     falls back to the pane; an unanswered one is logged `unknown` and
     never sent again.
-  - **Claude, Codex, mid-turn** (`when_idle`): held; the session's own
+  - **Claude, mid-turn** (`when_idle`): held; the session's own
     live Stop hook claims it (`send::stop_claim`) and answers
     `{"decision": "block", "reason": <framed text>}`, so the agent goes on
-    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or dead sessions are not claimed. It leaves the
+    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or errored sessions are not claimed; a Stop is never a usage-limit reply (Claude ends such a turn with `StopFailure`). Codex: off (`send::CODEX_STOP_CLAIM`) until its block is checked live; it gets the idle paste. It leaves the
     queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
     unacknowledged, the next Stop or the idle paste carries it again: at
     most one duplicate). At most `CLAIMS_MAX` (3) Stops in a row (kv

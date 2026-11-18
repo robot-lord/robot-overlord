@@ -136,7 +136,7 @@ runs a command.
   the current turn is over. A Claude or Codex session gets it typed into
   its prompt, as if you had, once its turn is over. One that is working,
   or waiting on you, isn't typed into: the overlord says so, or (when you
-  want it delivered anyway) it waits; a Claude or Codex session that is
+  want it delivered anyway) it waits; a Claude session that is
   working then picks it up as its turn ends and carries on with it (at
   most three in a row, then it is typed in). Messages that wait add up;
   none replaces another. Stopped and archived sessions are refused. Each

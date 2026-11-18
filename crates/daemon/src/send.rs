@@ -10,7 +10,7 @@
 //!   (`Service::queue_prompt`), mid-turn only with `when_idle`: OpenCode's inbox runs
 //!   it once the current turn is over. Only a POST that surely failed
 //!   falls back to typing, below.
-//! - **Claude, Codex, mid-turn** (with `when_idle`): held, and claimed by
+//! - **Claude (Codex once `CODEX_STOP_CLAIM` is on), mid-turn** (with `when_idle`): held, and claimed by
 //!   the session's own Stop hook (`stop_claim`): the hook answers
 //!   `decision: block` with the message as its reason, so the agent
 //!   carries on with it instead of ending its turn. At most `CLAIMS_MAX`
@@ -76,6 +76,11 @@ pub const PENDING_KEY: &str = "send_pending";
 /// How many Stop hooks in a row may carry a held message on: then the
 /// turn ends, and what is left is typed in at the idle prompt.
 pub const CLAIMS_MAX: u64 = 3;
+
+/// Whether Codex's Stop hook claims held messages. Off until its block
+/// (`decision: block`, in the 0.169.0 hook schema) is checked live:
+/// until then Codex takes them at its idle prompt.
+pub const CODEX_STOP_CLAIM: bool = false;
 
 /// How long the idle paste leaves alone messages a Stop hook's answer
 /// carries, waiting for its ack.
@@ -345,9 +350,10 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
     let text = params
         .get("text")
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(clean_words)
         .filter(|t| !t.is_empty())
         .context("nothing to send")?;
+    let text = text.as_str();
     let background = params
         .get("context")
         .and_then(Value::as_str)
@@ -433,6 +439,18 @@ pub fn send(d: &Daemon, params: &Value) -> Result<Value> {
         return not_now(d, &s, &part, when_idle, &format!("{}: {why}", s.name));
     }
     sent(d, &s, &waiting, &whole, Via::Typed)
+}
+
+/// The user's words made safe like the overlord's notes
+/// (`context::clean`: no control, escape, bidi or zero-width characters),
+/// but keeping their tabs; trimmed.
+fn clean_words(text: &str) -> String {
+    text.split('\t')
+        .map(crate::context::clean)
+        .collect::<Vec<_>>()
+        .join("\t")
+        .trim()
+        .to_string()
 }
 
 /// How a message went in.
@@ -625,28 +643,36 @@ pub(crate) fn stop_claim(
     db: &Db,
     s: &Session,
     agent: Agent,
-    dead: bool,
     now: i64,
 ) -> Result<Option<crate::context::Reply>> {
-    // Not for a session that can't take it now: stopped, restarting, in
-    // error or with no live pane (`dead`), or on a usage limit.
-    if !matches!(agent, Agent::Claude | Agent::Codex)
+    let key = claims_key(&s.id);
+    // Most Stops: nothing waits (one read, one delete ending a run).
+    let mut m = db.kv_map(PENDING_KEY)?;
+    if !m.get(&s.id).is_some_and(|e| !parts_of(e).is_empty()) {
+        db.kv_delete(&key)?;
+        return Ok(None);
+    }
+    // Not for a session that can't take it now: stopped, restarting or
+    // in error, or on a usage limit. (A turn that ended on an API error,
+    // a usage limit included, ends with Claude's `StopFailure`, never
+    // `Stop`: so this Stop isn't a limit reply.) Codex only once its
+    // block is checked live (`CODEX_STOP_CLAIM`).
+    let claims = match agent {
+        Agent::Claude => true,
+        Agent::Codex => CODEX_STOP_CLAIM,
+        Agent::OpenCode => false,
+    };
+    if !claims
         || crate::overlord::is_overlord_role(&s.role)
         || s.archived_at.is_some()
-        || dead
         || matches!(s.status, Status::Stopped | Status::Starting | Status::Error)
         || crate::limits::limited_in(db, &s.id, now)
     {
         return Ok(None);
     }
-    let key = claims_key(&s.id);
     let in_row: u64 = db.kv_get(&key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut m = db.kv_map(PENDING_KEY)?;
-    let waits = m.get(&s.id).is_some_and(|e| !parts_of(e).is_empty());
-    if !waits || in_row >= CLAIMS_MAX || first_waiting(db, &s.id)? {
-        if in_row > 0 {
-            db.kv_delete(&key)?;
-        }
+    if in_row >= CLAIMS_MAX || first_waiting(db, &s.id)? {
+        db.kv_delete(&key)?;
         return Ok(None);
     }
     let Some(entry) = m.get_mut(&s.id).and_then(Value::as_object_mut) else {
@@ -680,10 +706,7 @@ pub const CLAIM_PREFIX: &str = "send:";
 /// A prompt went in (the user's or rlord's): the Stop hooks that carried
 /// messages on are no longer "in a row".
 pub(crate) fn claims_reset(db: &Db, id: &str) -> Result<()> {
-    if db.kv_get(&claims_key(id))?.is_some() {
-        db.kv_delete(&claims_key(id))?;
-    }
-    Ok(())
+    db.kv_delete(&claims_key(id))
 }
 
 /// The hook client printed the Stop-hook answer `ack` names: the messages
@@ -1278,6 +1301,14 @@ mod tests {
         assert!(db.kv_get(PENDING_KEY).unwrap().is_none());
     }
 
+    #[test]
+    fn the_users_words_are_cleaned_but_keep_tabs() {
+        assert_eq!(
+            clean_words(" a\tb\u{1b}[31m\u{202E}c\u{200B}\r\nd "),
+            "a\tb[31mc\nd"
+        );
+    }
+
     /// A Stop hook claims what waits: `decision: block` with the framed
     /// text; it leaves the queue only on the ack; at most `CLAIMS_MAX` in
     /// a row, and a prompt starts the count again.
@@ -1288,24 +1319,20 @@ mod tests {
         db.set_status(&id, Status::Working, 1).unwrap();
         let s = db.resolve_ref(&id).unwrap();
         // Nothing waits: no answer.
-        assert!(stop_claim(&db, &s, Agent::Codex, false, 1)
-            .unwrap()
-            .is_none());
+        assert!(stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_none());
         queue(&db, &id, &msg("also the footer")).unwrap();
-        // OpenCode has no Stop hook; overlords are never sent to.
-        assert!(stop_claim(&db, &s, Agent::OpenCode, false, 1)
-            .unwrap()
-            .is_none());
-        let r = stop_claim(&db, &s, Agent::Codex, false, 2)
-            .unwrap()
-            .unwrap();
+        // OpenCode has no Stop hook; Codex waits for its live check.
+        assert!(stop_claim(&db, &s, Agent::OpenCode, 1).unwrap().is_none());
+        assert_eq!(
+            stop_claim(&db, &s, Agent::Codex, 1).unwrap().is_some(),
+            CODEX_STOP_CLAIM
+        );
+        let r = stop_claim(&db, &s, Agent::Claude, 2).unwrap().unwrap();
         assert_eq!(r.output["decision"], "block");
         assert_eq!(r.output["reason"], framed(&[msg("also the footer")]));
         assert!(r.ack.starts_with(CLAIM_PREFIX), "{}", r.ack);
         // Unacknowledged: still waiting; the next Stop carries it again.
-        let r2 = stop_claim(&db, &s, Agent::Codex, false, 3)
-            .unwrap()
-            .unwrap();
+        let r2 = stop_claim(&db, &s, Agent::Claude, 3).unwrap().unwrap();
         // The older answer's ack no longer counts.
         assert!(!claim_ack(&db, &r.ack, 4).unwrap());
         assert_eq!(pending_parts(&db, &id).unwrap().len(), 1);
@@ -1320,39 +1347,28 @@ mod tests {
         let e = log.iter().find(|e| e.kind == "message_delivered").unwrap();
         assert_eq!(e.payload["via"], "stop_hook", "{}", e.payload);
         // Third in a row: still claimed; the fourth lets the turn end.
-        assert!(stop_claim(&db, &s, Agent::Claude, false, 6)
-            .unwrap()
-            .is_some());
-        assert!(stop_claim(&db, &s, Agent::Claude, false, 7)
-            .unwrap()
-            .is_none());
+        assert!(stop_claim(&db, &s, Agent::Claude, 6).unwrap().is_some());
+        assert!(stop_claim(&db, &s, Agent::Claude, 7).unwrap().is_none());
         // (That cleared the count.) A prompt clears it too.
-        assert!(stop_claim(&db, &s, Agent::Claude, false, 8)
-            .unwrap()
-            .is_some());
+        assert!(stop_claim(&db, &s, Agent::Claude, 8).unwrap().is_some());
         claims_reset(&db, &id).unwrap();
         assert!(db.kv_get(&claims_key(&id)).unwrap().is_none());
-        // No live pane, stopped, or on a usage limit: not claimed.
-        assert!(stop_claim(&db, &s, Agent::Claude, true, 9)
-            .unwrap()
-            .is_none());
+        // Stopped, or on a usage limit: not claimed.
         let mut stopped = s.clone();
         stopped.status = Status::Stopped;
-        assert!(stop_claim(&db, &stopped, Agent::Claude, false, 9)
+        assert!(stop_claim(&db, &stopped, Agent::Claude, 9)
             .unwrap()
             .is_none());
         let limits = json!({ &id: {"resets_at": now_ms() + 60_000} });
         db.kv_set(crate::limits::LIMITS_KEY, &limits.to_string())
             .unwrap();
-        assert!(stop_claim(&db, &s, Agent::Claude, false, now_ms())
+        assert!(stop_claim(&db, &s, Agent::Claude, now_ms())
             .unwrap()
             .is_none());
         db.kv_delete(crate::limits::LIMITS_KEY).unwrap();
         // Its first prompt hasn't gone in: not claimed.
         queue_first(&db, &id, "the task").unwrap();
-        assert!(stop_claim(&db, &s, Agent::Claude, false, 9)
-            .unwrap()
-            .is_none());
+        assert!(stop_claim(&db, &s, Agent::Claude, 9).unwrap().is_none());
         // An ack that isn't a claim's: nothing.
         assert!(!claim_ack(&db, "send:nope", 10).unwrap());
         assert!(!claim_ack(&db, "s1.abc", 10).unwrap());

@@ -1968,9 +1968,7 @@ fn hook_emit_in(
         let mut claim = None;
         if live && whose != Whose::Other {
             let r = match event {
-                "Stop" => {
-                    crate::send::stop_claim(db, &s, agent, revives_dead, now).map(|c| claim = c)
-                }
+                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
                 "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
                 _ => Ok(()),
             };
