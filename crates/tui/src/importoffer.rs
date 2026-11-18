@@ -12,7 +12,7 @@ use std::time::Instant;
 const GRACE: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Where you can do it later, said on `d`/Esc and in the dialog.
-pub(crate) const LATER: &str = "or ask the overlord \"import my sessions\" any time";
+pub(crate) const LATER: &str = "ask the overlord \"import my sessions\" any time";
 
 impl App {
     /// Open the offer if the daemon says it applies, once a run, when
@@ -98,21 +98,51 @@ impl App {
                 });
                 self.import_send = Some(rx);
                 self.status_line = "sending to the overlord…".into();
+                self.import_then_overlord = false;
                 self.show_overlord();
             }
             KeyCode::Char('d') => {
-                if self
-                    .call("setup.import_answer", json!({"answer": "no"}))
-                    .is_some()
-                {
-                    self.status_line = format!("won't ask again · {LATER}");
+                match client_call(
+                    &paths::socket_path(),
+                    "setup.import_answer",
+                    json!({"answer": "no"}),
+                ) {
+                    Ok(_) => {
+                        self.import_offer_error = None;
+                        self.status_line = format!("won't ask again · {LATER}");
+                        self.overlay_after_offer();
+                    }
+                    // Not recorded: the offer comes back with why.
+                    Err(e) => {
+                        self.import_offer_error = Some(format!("not saved: {e:#}"));
+                        self.import_offer_ready = true;
+                    }
                 }
             }
             // Later: nothing recorded, so it asks again next start.
             KeyCode::Esc => {
-                self.status_line = format!("asks again next start · {LATER}");
+                self.status_line = format!("asks again next start · or {LATER}");
+                self.overlay_after_offer();
             }
             _ => self.mode = Mode::ImportOffer(opened),
+        }
+    }
+
+    /// The offer closed without `y`: the overlay it held back (first
+    /// run) opens now.
+    fn overlay_after_offer(&mut self) {
+        if std::mem::take(&mut self.import_then_overlord) {
+            self.show_overlord();
+        }
+    }
+
+    /// Show the overlay unless the import offer is about to open: then
+    /// it opens once the offer closes (`overlay_after_offer`), not under it.
+    pub(crate) fn show_overlord_after_offer(&mut self) {
+        if self.import_offer_ready {
+            self.import_then_overlord = true;
+        } else {
+            self.show_overlord();
         }
     }
 
@@ -120,7 +150,7 @@ impl App {
         let area = newform::centered(
             f.area(),
             74,
-            13 + u16::from(self.import_offer_error.is_some()),
+            14 + u16::from(self.import_offer_error.is_some()),
         );
         f.render_widget(Clear, area);
         let mut lines = vec![
@@ -143,6 +173,10 @@ impl App {
             )),
             Line::from(Span::styled(
                 "  import, archive or skip; nothing is imported until you approve.",
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "  Only Claude Code conversations can be imported so far.",
                 theme::muted(),
             )),
             Line::from(Span::styled(format!("  Later: {LATER}."), theme::faint())),

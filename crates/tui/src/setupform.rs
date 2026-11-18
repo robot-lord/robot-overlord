@@ -562,7 +562,7 @@ impl App {
         if std::mem::take(&mut self.overlay_after_startup) {
             match &mut self.mode {
                 Mode::Setup(f) if opened => f.then_overlord = true,
-                _ => self.show_overlord(),
+                _ => self.show_overlord_after_offer(),
             }
         }
     }
@@ -721,7 +721,7 @@ impl App {
             self.start_import_offer();
         }
         if f.then_overlord {
-            self.show_overlord();
+            self.show_overlord_after_offer();
         }
     }
 

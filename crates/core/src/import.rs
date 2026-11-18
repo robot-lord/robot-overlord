@@ -136,6 +136,44 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
     out
 }
 
+/// Whether any Claude Code conversation exists to import (outside rlord's
+/// own and temp folders): for the first-run offer. Cheap and bounded:
+/// names only, at most `MAX_DIRS` project dirs and `MAX_FILES` names in
+/// each, stopping at the first.
+pub fn has_claude_conversations() -> bool {
+    has_claude_conversations_in(&claude::config_dir().join("projects"), &excluded_dirs())
+}
+
+const MAX_DIRS: usize = 500;
+const MAX_FILES: usize = 50;
+
+/// `has_claude_conversations` over an explicit projects dir (tests).
+pub fn has_claude_conversations_in(projects: &Path, excluded: &[PathBuf]) -> bool {
+    let Ok(dirs) = std::fs::read_dir(projects) else {
+        return false;
+    };
+    let excluded: Vec<String> = excluded
+        .iter()
+        .map(|e| claude::project_slug(&e.to_string_lossy()))
+        .collect();
+    dirs.flatten().take(MAX_DIRS).any(|dir| {
+        let slug = dir.file_name().to_string_lossy().into_owned();
+        if excluded.iter().any(|e| slug.starts_with(e.as_str())) {
+            return false;
+        }
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            return false;
+        };
+        files.flatten().take(MAX_FILES).any(|f| {
+            let p = f.path();
+            p.extension().is_some_and(|e| e == "jsonl")
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        })
+    })
+}
+
 /// `scan_claude` over an explicit projects dir, process list and excluded
 /// folders (tests).
 pub fn scan_claude_in(
@@ -484,6 +522,20 @@ mod tests {
                    "timestamp": "2026-11-09T00:00:00.000Z"}),
             json!({"type": "pr-link", "prUrl": "https://example.test/pr/7"}),
         ]
+    }
+
+    #[test]
+    fn has_conversations_skips_excluded_and_non_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let excl = [PathBuf::from("/rlord/data")];
+        assert!(!has_claude_conversations_in(&projects, &excl));
+        let line = [json!({"type": "user"})];
+        write(&projects, "/src/app", "notes", &line);
+        write(&projects, "/rlord/data/overlord", ID_A, &line);
+        assert!(!has_claude_conversations_in(&projects, &excl));
+        write(&projects, "/src/app", ID_B, &line);
+        assert!(has_claude_conversations_in(&projects, &excl));
     }
 
     #[test]

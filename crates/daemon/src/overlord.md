@@ -385,7 +385,8 @@ subagent, in two steps:
 A message that starts with `[rlord import request]` is the user saying yes
 to rlord's first-run offer to import. Start at step 1 with the last 30
 days; the subagent's scan covers every agent rlord can import. If it
-finds nothing, say so, and that they can ask you again any time.
+finds nothing, say so: only Claude Code conversations can be imported so
+far, and they can ask you again any time.
 
 Never import without the user approving the list. If you can't start
 subagents, do both steps yourself following `subagents/rlord-import.md`

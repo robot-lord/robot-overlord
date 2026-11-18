@@ -297,6 +297,8 @@ struct App {
     import_send: Option<mpsc::Receiver<Result<(), String>>>,
     /// Why the last `y` wasn't sent, shown when the offer reopens.
     import_offer_error: Option<String>,
+    /// The first-run overlay waits for the offer to close.
+    import_then_overlord: bool,
     /// The startup sequence (overlord dialog, model upgrade, Remote
     /// Control offer, then the code folder) is still running: a dialog
     /// closing leads to setup once nothing is open (`continue_startup`).
@@ -404,6 +406,7 @@ impl App {
             import_offer_ready: false,
             import_send: None,
             import_offer_error: None,
+            import_then_overlord: false,
             startup_chain: false,
             overlay_after_startup: false,
             last_suggestion: None,
