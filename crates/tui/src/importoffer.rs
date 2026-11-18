@@ -8,6 +8,9 @@ use super::*;
 use ratatui::widgets::Clear;
 use std::time::Instant;
 
+/// The dialog's width, borders included.
+const WIDTH: u16 = 74;
+
 /// Keys pressed this soon after it opens are dropped.
 const GRACE: std::time::Duration = std::time::Duration::from_millis(800);
 
@@ -37,6 +40,14 @@ impl App {
     /// overlord can take a while). True when the screen changed.
     pub(crate) fn poll_import_offer(&mut self) -> bool {
         let mut changed = false;
+        // The offer left the screen some way other than its own keys (a
+        // pushed form, say): the overlay it held back opens now.
+        if self.import_then_overlord
+            && !self.import_offer_ready
+            && !matches!(self.mode, Mode::ImportOffer(_) | Mode::ConfirmQuit)
+        {
+            self.overlay_after_offer();
+        }
         if let Some(rx) = &self.import_send {
             let r = match rx.try_recv() {
                 Ok(r) => Some(r),
@@ -147,12 +158,6 @@ impl App {
     }
 
     pub(crate) fn draw_import_offer(&self, f: &mut Frame) {
-        let area = newform::centered(
-            f.area(),
-            74,
-            14 + u16::from(self.import_offer_error.is_some()),
-        );
-        f.render_widget(Clear, area);
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -193,6 +198,13 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
+        // Tall enough for every line as wrapped, so the keys never clip.
+        let rows: usize = lines
+            .iter()
+            .map(|l| l.width().div_ceil(usize::from(WIDTH - 2)).max(1))
+            .sum();
+        let area = newform::centered(f.area(), WIDTH, u16::try_from(rows + 2).unwrap_or(u16::MAX));
+        f.render_widget(Clear, area);
         self.modal_hits(f.area(), area, &lines);
         f.render_widget(
             Paragraph::new(lines)

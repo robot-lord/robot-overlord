@@ -136,42 +136,71 @@ pub fn claude_project_folders_in(projects: &Path, limit: usize) -> Vec<String> {
     out
 }
 
-/// Whether any Claude Code conversation exists to import (outside rlord's
-/// own and temp folders): for the first-run offer. Cheap and bounded:
-/// names only, at most `MAX_DIRS` project dirs and `MAX_FILES` names in
-/// each, stopping at the first.
-pub fn has_claude_conversations() -> bool {
-    has_claude_conversations_in(&claude::config_dir().join("projects"), &excluded_dirs())
+/// Whether any Claude Code conversation exists that `scan_claude` would
+/// list with the same `since_ms` and `tracked`: for the first-run offer.
+/// The same checks (`is_conversation_file`, mtime, `candidate`), but
+/// bounded: at most `MAX_DIRS` project dirs and `MAX_READS` transcripts
+/// read, stopping at the first.
+pub fn has_claude_conversations(since_ms: i64, tracked: &dyn Fn(&str) -> bool) -> bool {
+    let projects = claude::config_dir().join("projects");
+    has_claude_conversations_in(&projects, since_ms, tracked, &excluded_dirs())
 }
 
 const MAX_DIRS: usize = 500;
-const MAX_FILES: usize = 50;
+const MAX_READS: usize = 20;
 
 /// `has_claude_conversations` over an explicit projects dir (tests).
-pub fn has_claude_conversations_in(projects: &Path, excluded: &[PathBuf]) -> bool {
+pub fn has_claude_conversations_in(
+    projects: &Path,
+    since_ms: i64,
+    tracked: &dyn Fn(&str) -> bool,
+    excluded: &[PathBuf],
+) -> bool {
     let Ok(dirs) = std::fs::read_dir(projects) else {
         return false;
     };
-    let excluded: Vec<String> = excluded
-        .iter()
-        .map(|e| claude::project_slug(&e.to_string_lossy()))
-        .collect();
-    dirs.flatten().take(MAX_DIRS).any(|dir| {
-        let slug = dir.file_name().to_string_lossy().into_owned();
-        if excluded.iter().any(|e| slug.starts_with(e.as_str())) {
-            return false;
-        }
+    let mut reads = 0;
+    for dir in dirs.flatten().take(MAX_DIRS) {
         let Ok(files) = std::fs::read_dir(dir.path()) else {
-            return false;
+            continue;
         };
-        files.flatten().take(MAX_FILES).any(|f| {
-            let p = f.path();
-            p.extension().is_some_and(|e| e == "jsonl")
-                && p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        })
-    })
+        let slug = dir.file_name().to_string_lossy().into_owned();
+        for f in files.flatten() {
+            let path = f.path();
+            let Some(id) = is_conversation_file(&path) else {
+                continue;
+            };
+            if tracked(id) {
+                continue;
+            }
+            let mtime = f.metadata().and_then(|m| m.modified()).ok().map(ms_epoch);
+            if mtime.is_some_and(|m| m < since_ms) {
+                continue;
+            }
+            if reads >= MAX_READS {
+                return false;
+            }
+            reads += 1;
+            // (No process list: whether it's open elsewhere doesn't matter.)
+            if candidate(&path, id, &slug, mtime, "", excluded)
+                .is_ok_and(|c| c.last_active_at >= since_ms)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The conversation id when `path` is a Claude transcript: `<uuid>.jsonl`.
+/// Conversations are named by uuid; anything else is not one.
+fn is_conversation_file(path: &Path) -> Option<&str> {
+    if path.extension().is_none_or(|e| e != "jsonl") {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 /// `scan_claude` over an explicit projects dir, process list and excluded
@@ -194,14 +223,10 @@ pub fn scan_claude_in(
         let slug = dir.file_name().to_string_lossy().into_owned();
         for f in files.flatten() {
             let path = f.path();
-            if path.extension().is_none_or(|e| e != "jsonl") {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(id) = is_conversation_file(&path) else {
                 continue;
             };
-            // Conversations are named by uuid; anything else is not one.
-            if uuid::Uuid::parse_str(id).is_err() || tracked(id) {
+            if tracked(id) {
                 continue;
             }
             if !opts.only.is_empty() && !opts.only.iter().any(|o| id.starts_with(o.as_str())) {
@@ -529,13 +554,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("projects");
         let excl = [PathBuf::from("/rlord/data")];
-        assert!(!has_claude_conversations_in(&projects, &excl));
-        let line = [json!({"type": "user"})];
-        write(&projects, "/src/app", "notes", &line);
-        write(&projects, "/rlord/data/overlord", ID_A, &line);
-        assert!(!has_claude_conversations_in(&projects, &excl));
-        write(&projects, "/src/app", ID_B, &line);
-        assert!(has_claude_conversations_in(&projects, &excl));
+        let none = |_: &str| false;
+        let has = |since, tracked: &dyn Fn(&str) -> bool| {
+            has_claude_conversations_in(&projects, since, tracked, &excl)
+        };
+        assert!(!has(0, &none));
+        let last = "2026-11-05T12:00:00.000Z";
+        write(
+            &projects,
+            "/src/app",
+            "notes",
+            &convo("/src/app", "hi", last),
+        );
+        // Excluded by its cwd, as the scan does.
+        let own = "/rlord/data/x";
+        write(&projects, own, ID_A, &convo(own, "hi", last));
+        assert!(!has(0, &none));
+        write(&projects, "/src/app", ID_B, &convo("/src/app", "hi", last));
+        assert!(has(0, &none));
+        assert!(!has(0, &|id| id == ID_B));
+        // Older than the window (by last exchange): not counted.
+        let after = ms_epoch(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        assert!(!has(after, &none));
     }
 
     #[test]

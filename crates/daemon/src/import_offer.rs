@@ -27,8 +27,17 @@ pub(crate) const REQUEST: &str = "[rlord import request] I'm new to rlord. \
 /// there are Claude Code conversations to import (the only agent rlord can
 /// import so far).
 pub(crate) fn offer(d: &Daemon) -> Result<Value> {
-    offer_with(d, &has_claude_conversations)
+    let tracked = d.db().agent_session_ids()?;
+    // The window the overlord's flow scans first (`scan_agent_sessions`'s
+    // default).
+    let since = now_ms() - SINCE_DAYS * 24 * 3_600_000;
+    offer_with(d, &|| {
+        has_claude_conversations(since, &|id| tracked.contains(id))
+    })
 }
+
+/// Matches the 30 days `overlord.md` starts the import with.
+const SINCE_DAYS: i64 = 30;
 
 fn offer_with(d: &Daemon, has_conversations: &dyn Fn() -> bool) -> Result<Value> {
     let initial = {
