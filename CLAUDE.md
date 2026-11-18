@@ -272,6 +272,16 @@ get handled without the user looking. For each one:
 - The `rlord` binary has no network code: HTTP servers, websockets, TLS
   and network-client crates belong in the opt-in web plugin
   (`crates/web`), and `cargo xtask check-deps` fails otherwise. A new
-  browser action is an op on `web::OPS` (with its arguments) and in
+  browser action is an op on `web::OPS` (with its arguments and its
+  `remote` flag: may a paired device call it?) and in
   `crates/web/ui/src/proto.ts`, with a test. Read "Web UI" in
   docs/architecture.md before changing either side.
+- Remote access keeps three crate rules, each a `check-deps` check: the
+  `rlord` binary links none of the e2e, relay or crypto crates (the
+  daemon holds no keys); `rlord-relay` (`crates/relay`) links no content
+  crypto and no part of rlord; `rlord_e2e` (`crates/e2e`) stays sans-IO.
+  The plugin's only listener is the loopback one in `crates/web/src/main.rs`;
+  only `crates/relay` binds every interface. Pairing, confirming and
+  revoking devices are user-only: never an MCP tool, never a remote op.
+  A change to the protocol updates `docs/working/e2e-protocol.md` and the
+  vectors (`cargo xtask e2e vectors`).
