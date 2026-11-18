@@ -1023,7 +1023,68 @@ Decided 2026-11-17 (user):
     `ulid` (through `web-time`) depends on it for wasm32 targets only,
     which `cargo tree --target all` shows; rlord is never built for
     wasm32. `robot-overlord-e2e-wasm` stays denied by name.
+- Slice 3 reliability pass (Opus implementer, 2026-11-17, `feat/web-ui-3`;
+  the relay and e2e-core parts by two forks of it). The rule, now stated
+  in `e2e-protocol.md` §4 and `docs/architecture.md`: one websocket link
+  is one Noise session per device link with implicit nonces; delivery in
+  a connection is lossless and in order; any reconnect is a fresh
+  `KKpsk2`; recovery is resync by snapshot `rev` plus resend by request
+  id. No explicit nonces. What changed:
+  - Host never drops a frame quietly (`remote/outq.rs`): bounded queues
+    per kind and per link, a writer that sends control first and takes
+    turns between links; a link that overflows is dropped (only that
+    device's session ends), a control message that can't be queued closes
+    the connection, a binary frame the host can't parse closes it (it used
+    to be skipped). A link's `drop` waits behind its frames (a pairing's
+    `done` arrives before the close).
+  - One request store per device for both paths (`remote/requests.rs`,
+    `mailbox.rs`): an op that changes something needs an id and runs at
+    most once per id; a resend gets the stored answer or `in_progress`
+    and then the answer (by the live link it came on and the mailbox if a
+    resend came that way); a request running when the plugin stopped is
+    `interrupted` (was `repeat`). `web::Op.idempotent` marks the look-ups;
+    `web.hello`'s answer lists the remote ones. `proto.ts` gains
+    `RemoteErrorCode` and `RemoteReply`.
+  - Mailbox gaps: the receiver skips up to `MAX_SKIP` = 64 lost messages
+    (vectors: `mailbox_gap_over_max`, `mailbox_reordered`, `mb_gaps`
+    replace `mailbox_gap`). The relay answers each lane-2 frame `queued`
+    or `refused` (was `err n:0` on refusal only); the host sends one
+    mailbox answer per device at a time and resends one refused `full`
+    (same bytes) when the device links and every 30 s. `rlord-device`
+    drops mailbox frames by `(boot, seq)` as the host does.
+  - Relay: flow control per link; device to host waits only that device
+    and a stall closes the device (4205), never the host; host to device
+    never blocks the host (128-frame device buffer; overflow closes the
+    device with 4205 and tells the host `undeliverable`); `drop` closes
+    with 4205 (was 1000); a host's read bucket scales with 1 + its links.
+    New close code 4205 "reset: reconnect now" in `relay-proto`.
+  - Detection: the host pings every 15 s and gives up after 45 s of
+    silence (was 70 s, relay pings only). Rust's `Instant` on macOS is
+    `CLOCK_UPTIME_RAW`, checked on this machine: it stood 13.6 h behind
+    `CLOCK_MONOTONIC` (time asleep), so it doesn't advance in sleep, and
+    Linux's `CLOCK_MONOTONIC` doesn't count suspend either. The host
+    compares wall and monotonic clocks each second and reconnects at once
+    when either jumped 10 s (covers both kinds of clock).
+  - Tests: `outq` unit tests (order, overflow, close), the request store
+    and outbox bounds, sleep detection, `only_look_ups_are_idempotent`;
+    in `web/tests/remote.rs` a resend by mailbox after the live link died
+    runs once, a relay restart losing the queue then a resend works, a
+    flooding device never breaks another's session, an answer refused by
+    a full queue is sent again; relay tests for per-link stalls, a
+    non-reading device closed alone, `drop` 4205, `queued`/`refused`.
 - Owed after slice 3:
+  - **The phone slice must** (the device side of the rule above;
+    `e2e-protocol.md` §4): reconnect in a loop with backoff, at once on
+    4205 (backing off if it repeats), on a network change and on coming
+    to the foreground; run `KKpsk2` each time its host comes online
+    (`host online`, `ready.host`); compare the snapshot's `rev` and fetch
+    when it differs; give every request an id unique for the device and
+    resend unanswered ones by id after any reconnect; when the relay's
+    `boot` changes, resend every mailbox request it has no answer to (the
+    queue is gone); answer `queued`/`refused` (resend a refused frame
+    later, before newer ones); drop mailbox frames by `(boot, seq)` and
+    answers by request id it already has; treat `in_progress` as "wait",
+    `interrupted` as "check, then ask anew".
   - **The protocol review** (`docs/working/e2e-protocol.md`), before
     anyone but the user runs a relay. Then promote that doc.
   - By hand: `rlord-relay` in Docker compose on a real host with a real

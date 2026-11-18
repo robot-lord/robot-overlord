@@ -225,7 +225,7 @@ Notes on `snow` 0.10.0 that matter here:
 | Session | fresh `KK` per connection; keys in memory only | `KK` whose messages travel through the queue; state persisted on both sides |
 | Forward secrecy | per connection, plus a rekey every 2^20 frames | rekey after every message (Noise's one-way `REKEY`): a key is deleted as soon as its message is sent or read |
 | Recovery after a compromise | next connection | next handshake; the device starts one each time it comes to the foreground |
-| Ordering and replay | implicit counter; the websocket is ordered; anything replayed, dropped or reordered fails to decrypt | the same, because the queue is ordered. A gap breaks the session; the device re-handshakes and unanswered requests are resent by id |
+| Ordering and replay | implicit counter; the websocket is ordered; anything replayed, dropped or reordered fails to decrypt | the same, because the queue is ordered, except that the receiver skips up to 64 lost messages (trial decryption over at most 64 forward `REKEY` steps; the queue can lose messages to a relay restart, expiry or a crash). Replayed or reordered still fails; a larger gap breaks the session; the device re-handshakes and unanswered requests are resent by id (2026-11-17, `e2e-protocol.md` §4) |
 | Storage at the relay | none | minutes, bounded count and bytes |
 
 **The mailbox is a slow, ordered pipe, not an archive.** The host already

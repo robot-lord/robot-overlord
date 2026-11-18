@@ -1150,7 +1150,7 @@ user runs it before a review); the relay itself is `docs/relay.md`.
 
 | Party | Crates | Holds |
 | --- | --- | --- |
-| Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request-id list per device; `remote.log` (audit) |
+| Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request store per device; `remote.log` (audit) |
 | Device (the phone app, next; `rlord-device` for tests, `crates/e2e-device`) | `rlord_e2e` (natively or as WASM, `crates/e2e-wasm`), `rlord_relay_proto` | its keys, the host's static key and the pin |
 | Relay (`rlord-relay`, `crates/relay`) | `rlord_relay_proto` only | its key, registrations; queues in memory |
 
@@ -1171,8 +1171,29 @@ session. A live session carries streams (0 is control; panes later),
 fragmented up to 1 MiB. The mailbox (for `overlord.ask` and
 `overlord.new_session` while the host is away) is its own saveable
 cipher state over the kind-3 handshake's raw keys, rekeyed after every
-message; a request id list makes a crash lose a request rather than
-repeat it.
+message; its receiver skips up to 64 lost messages (counters only move
+forward), since the relay's queue can lose some.
+
+**Delivery and recovery: one rule.** One websocket link carries one Noise
+session per device link, with implicit nonces (no counter on the wire),
+so delivery within a connection must be lossless and in order: nothing
+is ever dropped quietly. Overflow fails safe instead: the host's
+outgoing queues are bounded per link (`remote/outq.rs`), a link that
+overflows is dropped (only that device's session dies), and a control
+message that can't be queued, a frame the host can't parse, a silent
+relay (the host pings every 15 s) or a sleep of the host machine closes
+the connection. The relay keeps flow control per link and never stops
+reading a host for one device (`docs/relay.md`). Any reconnect is a fresh
+`KKpsk2` handshake; nothing resumes a broken session. Recovery is the
+device's: it resyncs by the snapshot's `rev` and resends what is
+unanswered by request id. The host's per-device request store (shared by
+the live and mailbox paths, saved with the mailbox state) runs an op
+that changes something at most once per id: a resend gets the stored
+answer, or `in_progress` and then the answer. `web::Op.idempotent`
+marks the look-ups that may simply run again; `web.hello`'s answer lists
+the remote ones for the plugin. Don't switch to explicit nonces to make
+sessions survive a lost frame: the reconnect is cheap and the rule keeps
+both ends simple.
 
 **Pairing is user-only and confirmed.** `rlord relay pair` (or the TUI's
 Devices screen, or the local page's) shows a QR: the pin, a one-use
@@ -1190,6 +1211,8 @@ reports, the key screen and device management. A remote call has no
 `page`, never counts as use of a screen and gets no `ui` commands. To
 make an op remote, set `remote: true` on its `Op` and test it from a
 device in `web_api.rs`; an op is local-only unless a device needs it.
+Mark it `.idempotent()` only if running it twice is the same as once (a
+look-up); anything else is deduplicated by request id.
 `overlord.messages` (both) gives the active overlord's recent
 conversation as text, read from its transcript (at most 50 messages of 4
 KiB), for a chat view.

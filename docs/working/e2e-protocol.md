@@ -25,6 +25,13 @@ Both invariants of `web-ui-remote.md` hold: everyone dials out to the relay
 one listener stays `127.0.0.1`), and a host and its devices only ever talk
 to one pinned relay.
 
+A third holds for delivery (§4): **one websocket link is one Noise session
+(per device link) with implicit nonces; delivery within a connection is
+lossless and in order; any reconnect is a fresh `KKpsk2` handshake; and
+recovery is resync by the snapshot's `rev` plus resend by request id.**
+Nothing switches to explicit nonces to let a session outlive a lost frame:
+whatever would lose one closes the link or the connection instead.
+
 ## 1. The relay link (`crates/relay-proto`)
 
 One websocket per peer, `wss://<host>/v1` (or `ws://127.0.0.1:<port>/v1`
@@ -77,10 +84,15 @@ length and bytes. ECDSA P-256 over SHA-256, RFC 6979, 64 bytes `r || s`.
 
 The origin and key a peer proved are what go into its Noise prologues.
 
-Close codes: 4401 bad signature or bad hello, 4402 suspended, 4403 not
-registered / not on the host's allow-list / no such rendezvous, 4408 too
-slow or idle, 4409 replaced by a newer connection of the same identity,
-4426 unsupported `v`, 4429 over a limit, 4503 overloaded. 4401, 4402, 4403
+Close codes: 4205 reset (this connection's link ended under it: the host
+dropped it, or it stalled in either direction; the end-to-end session on
+it is gone, so reconnect at once with a fresh handshake, backing off only
+if it keeps happening), 4401 bad signature or bad hello, 4402 suspended,
+4403 not registered / not on the host's allow-list / no such rendezvous,
+4408 too slow or idle, 4409 replaced by a newer connection of the same
+identity, 4426 unsupported `v`, 4429 over a limit, 4503 overloaded. A
+peer that isn't reading may see the socket cut (1006) instead of 4205:
+the close frame can't reach it. 4401, 4402, 4403
 and 4426 are final (`close::is_final`): a client doesn't retry without a
 change. Before closing for load, rate or idleness the relay sends
 `{"t":"bye","code","retry_after"?}`; a client waits at least `retry_after`
@@ -90,21 +102,28 @@ seconds (plus jitter) before reconnecting.
 
 Requests carry a number `n` (from 1), answered `{"t":"ok","n"}` or
 `{"t":"err","n","code"}` (codes in `msg::code`: `full`, `no_queue`,
-`limit`, `bad`, `unknown`, `rate`). A refused binary frame (a mailbox
-message that is `full`, say) is answered `err` with `n: 0`: a binary
-frame carries no number, so a sender matches refusals by order.
+`limit`, `bad`, `unknown`, `rate`). A lane-2 frame carries no number;
+the relay answers each one, in the order they were sent,
+`{"t":"queued","seq","device"?}` when it is queued or
+`{"t":"refused","code","device"?}` when it is not (`full`, `no_queue`,
+`unknown`, `bad`); `device` (the queue's device fingerprint) only to a
+host. A refused frame is not kept: resend it later, before any newer one,
+or give up. Only an undecodable binary frame is answered `err` with `n: 0`
+(`bad`). Both ends ping (the relay every 25 s, the host every 15 s); any
+message, a pong included, says the other end is there.
 
 | From | Message | Meaning |
 | --- | --- | --- |
 | host | `devices {n, allow: [fingerprint]}` | The whole allow-list, on every connect and change. A device not on it is refused (4403), its connection closed and its queues dropped. At most `devices_per_host`. |
 | host | `rendezvous {n, id, ttl}` / `rendezvous_close {n, id}` | Open (at most 300 s, 4 at once per host) or close a pairing rendezvous. |
 | host | `signal {n, device}` | Sets the device's flag. No content. A connected device gets `{"t":"signal"}`. |
-| host | `drop {n, link}` | Close that device's connection. |
+| host | `drop {n, link}` | Close that device's connection (4205: reconnect now). Queued after that link's frames, so an answer sent just before it arrives first. |
 | host | `ack {n, seq, device}` | Delete that device's queued messages to the host up to `seq`. |
 | device | `ack_signal {n}` | Clears its flag. |
 | device | `ack {n, seq}` | Delete its queued messages up to `seq`. |
 | relay → host | `link {id, device, kind: "device"|"pair", rendezvous?}` / `unlink {id}` | A device (or a pairing device) is connected while the host is; frames for it carry `id`. |
 | relay → device | `host {state: "online"|"offline"}` | Its host came or went. |
+| relay → either | `queued {seq, device?}` / `refused {code, device?}` | The answer to each lane-2 frame, in order (`device` to a host only). |
 | relay → either | `undeliverable {link?}` | A live frame had no other end. |
 
 ### Binary frames (at most 20 KiB; the lane first)
@@ -141,15 +160,25 @@ frame parses without knowing its lane in advance.)
   connection) and tells the host `link`; when either goes, `unlink`. Lane-1
   frames are forwarded at once to the other end of the link, or answered
   `undeliverable`.
-- **Backpressure, never dropping.** A live frame can't be dropped (a
-  missing frame ends the Noise session). Each connection's outgoing buffer
-  holds 64 frames; when the receiver's buffer is full the relay stops
-  reading from the sender; a link whose receiver has not taken a frame for
-  10 s is closed (`bye` with code `idle`, then the connection).
+- **Backpressure per link, never dropping silently.** A live frame can't
+  be dropped (a missing frame ends the Noise session), and one device must
+  not hold up its host's others. Device to host: each link has its own
+  share of the host's outgoing buffer (64 frames); while a device's share
+  is full the relay stops reading that device, and a link whose host takes
+  none of its frames for 10 s (`stall`) closes the device (4205), never the
+  host. Host to device: the relay never stops reading a host for one link;
+  each device's buffer holds 128 frames (a whole 1 MiB control message
+  fits), and a device that lets it fill is closed (4205) and the host told
+  `undeliverable {link}`. A host's read rate and burst are its
+  per-connection limit times (1 + its linked devices); sharing them fairly
+  between links is the host's job (its writer takes turns between
+  per-link queues).
 - **Mailbox queues** (in memory only; never on disk): per device and
   direction, at most 32 messages, 128 KiB and 600 s each
-  (`mailbox_ttl = 0` turns queues off: `err` `no_queue`). A full queue
-  refuses the new message (`err` `full`); it never drops an older one.
+  (`mailbox_ttl = 0` turns queues off: `refused` `no_queue`). A full queue
+  refuses the new message (`refused` `full`); it never drops an older one.
+  A restart forgets every queue, and an expired message is gone: the
+  receiver's cipher skips such gaps (§3, Frames).
   Messages get increasing `seq` numbers per queue; a message is delivered
   when its recipient is connected (at once, or on connect after `ready`),
   and kept until acknowledged or expired.
@@ -166,7 +195,8 @@ frame parses without knowing its lane in advance.)
   log names fingerprints by their first 8 hex characters.
 - **Limits** (`relay.toml` `[limits]`, per account through the
   `Authorizer`): hosts 1000, devices per host 16, unauthenticated
-  connections per address 8, 256 KiB/s per connection (burst 1 MiB),
+  connections per address 8, 256 KiB/s per connection (burst 1 MiB; a
+  host's times 1 + its links),
   queues as above, rendezvous 300 s and 4 per host, ping every 25 s and
   closed after 60 s of silence, unused hosts expire after 90 days,
   `max_connections` (at the cap an upgrade gets HTTP 503 with
@@ -207,8 +237,14 @@ message) over the kind-3 handshake's raw split keys, exported as 89 bytes
 u64`). A lane-2 payload is `mailbox id (8) | frame`, the id
 `SHA-256("rlord-e2e/1 mailbox id" | handshake hash)[..8]` in clear, so a
 frame for a replaced mailbox is dropped by id rather than poisoning the
-current one. One message per frame. A decrypt failure or a gap discards
-the mailbox on both ends; the next live link keys a new one.
+current one. One message per frame. The receiver accepts a frame up to
+`MAX_SKIP` (64, at least the relay's 32-message queue) messages past its
+counter: it steps the counter and `REKEY` once per missing message and
+discards the skipped keys. Counters only move forward: a replayed or
+older frame, a gap over 64, or any other decrypt failure discards the
+mailbox on both ends, and the next live link keys a new one. What a lost
+message carried comes back by the device's resend under the same
+request id (§4).
 
 ### Pairing (a `pair` link)
 
@@ -249,7 +285,9 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    answered `{"id","ok"}` or `{"id","error":{"code","message"}}`. The host
    passes each to the daemon as `web.call {op, args, via: "remote",
    device}`. A device may send 20 ops per second (burst 40); over that the
-   answer is `rate_limited`.
+   answer is `rate_limited`. An id is unique for its device; an op that
+   changes something needs one (else `bad_request`) and runs at most once
+   per id (§4).
 4. Mailbox keying, on the live session: `{"event":"mailbox_key","msg":
    "<kind-3 message 1>"}`, answered `{"event":"mailbox_key","msg":"<message
    2>"}`; the device makes its mailbox, saves it, and sends
@@ -266,18 +304,81 @@ frame each, when the device finds its host offline or has no live
 session. The host, for each lane-2 frame: acknowledges and ignores a
 frame whose relay `boot` and `seq` it has handled already (delivered
 again after a crash); drops (and acknowledges) a frame whose id is not
-its current mailbox's; decrypts (a failure discards the mailbox); records
-the request id and the frame's `(boot, seq)` and saves them with the
-advanced state in one atomic write (`remote/mailbox-<device id>.json`);
-acknowledges the relay; refuses a repeated id (`repeat`) or another op
-(`not_allowed`), else acts; and answers by the mailbox with the usual
-answer, saving the advanced state before sending. A crash before the
-save means the frame is handled again as new; a crash after it never
-repeats the op, and the device's resend is answered `repeat`. (The plan
-said the receiver saves after acting; saving the id first is what makes
-"never twice" hold.)
+its current mailbox's; decrypts (a failure discards the mailbox); looks
+the request id up in the device's request store (§4) and, if new, records
+it as running; saves that, the frame's `(boot, seq)` and the advanced
+state in one atomic write (`remote/mailbox-<device id>.json`);
+acknowledges the relay; refuses another op (`not_allowed`), else acts (or
+answers from the store); and answers by the mailbox with the usual
+answer. A crash before the save means the frame is handled again as new;
+a crash after it never repeats the op, and the device's resend is
+answered `interrupted` (the host can't know whether it happened). (The
+plan said the receiver saves after acting; saving the id first is what
+makes "never twice" hold.)
 
-## 4. Host and daemon
+The device does the same with what the host sends: it ignores a frame
+whose `(boot, seq)` it has opened already (the relay delivers it again
+until acknowledged), and acknowledges what it has opened.
+
+Answers leave one at a time per device: the next is encrypted (state
+saved first) and sent only once the relay said `queued` for the one
+before, so they reach the device in counter order. One refused `full` is
+sent again, the same bytes, when the device next links and every 30 s
+(at most 20 times; after that the device's resend gets it from the
+store). One whose fate a lost connection hides is encrypted afresh: the
+device skips the gap, or drops a second answer to the same id.
+
+## 4. Delivery and recovery
+
+The rule: **one websocket link is one Noise session per device link,
+with implicit nonces; delivery within a connection is lossless and in
+order; any reconnect is a fresh `KKpsk2` handshake; recovery is resync by
+snapshot `rev` plus resend by request id.** No explicit nonces: a session
+never outlives a lost frame, so nothing may be lost quietly.
+
+- **Host, sending** (`crates/web/src/remote/outq.rs`). Bounded queues per
+  connection: control messages (256), mailbox frames (64), and one per
+  link (4 MiB). A writer task sends control first, then mailbox frames,
+  then one frame per link in turn. A link whose queue overflows is
+  dropped (`drop`; only that device's session dies; what was queued for
+  it goes). A control message that can't be queued closes the connection
+  (it is dialled again; every device does a fresh handshake). A link's
+  `drop` waits behind that link's frames.
+- **Host, receiving.** A binary frame it can't parse closes the
+  connection (skipping it could skip one of a session's frames). An
+  unknown text message is skipped (a newer relay's). A relay silent for
+  45 s (pings both ways) is gone.
+- **Host asleep.** `Instant` doesn't advance while macOS sleeps (Rust's is
+  `CLOCK_UPTIME_RAW`; on Linux `CLOCK_MONOTONIC`, which doesn't count
+  suspend either), so silence alone would notice a dead connection late
+  after a wake. Every second the host compares the wall clock with the
+  monotonic one: a tick where the wall clock ran 10 s ahead (or went
+  back), or where the monotonic clock itself jumped 10 s (a platform that
+  counts sleep, or a stall), closes the connection and dials again at
+  once.
+- **Relay.** Flow control per link, never blocking a host for one device;
+  4205 for a link that ended under a device (§2).
+- **Requests at most once** (`crates/web/src/remote/requests.rs`). Each
+  device has one bounded request store (64 ids, answers up to 8 KiB, a
+  larger one kept as a `too_large` note; the oldest answered id makes
+  room), saved in `remote/mailbox-<device id>.json` with the mailbox
+  state, and used by both the live and the mailbox path. An op the daemon
+  marks idempotent (`web::Op.idempotent`: the look-ups) just runs. Any
+  other needs an id; a new id is recorded as running and saved before the
+  op runs; a known one gets its stored answer, or `in_progress` while it
+  runs, and the answer follows by every way it was asked (the live link
+  it came on if still the same, and the mailbox if a resend came that
+  way). A request still running when the plugin stopped is answered
+  `interrupted`.
+- **Device** (the phone slice; `rlord-device` does the protocol parts):
+  reconnect on 4205, on a network change and on coming to the
+  foreground; run `KKpsk2` each time its host comes online; compare the
+  snapshot's `rev` and fetch on a difference; resend unanswered requests
+  by id; when the relay's `boot` changes, resend every mailbox request it
+  has no answer to (the queue is gone); drop mailbox frames by `(boot,
+  seq)` and answers by request id it already has.
+
+## 5. Host and daemon
 
 The daemon holds no keys and does no crypto.
 
@@ -286,7 +387,10 @@ The daemon holds no keys and does no crypto.
   its id); anything else is refused. `web::Op` has `remote: bool`; an op
   with `remote: false` is refused (`NotAllowed`) from a device. A remote
   call carries no `page`, never counts as use of a screen and gets no `ui`
-  commands. `plugin::WEB_PROTOCOL` is 3.
+  commands. `plugin::WEB_PROTOCOL` is 3. `web::Op.idempotent` marks the
+  look-ups; `web.hello`'s answer lists the remote ones (`"idempotent":
+  [op]`), and the plugin runs any op not listed at most once per request
+  id (§4).
 - **User commands** (`relay.*`, `crates/daemon/src/relay.rs`; never on
   `OPS`, never in `mcp.rs`): `relay.status`, `relay.setup {address,
   token?, reset?}`, `relay.pair`, `relay.pair_cancel`, `relay.confirm`,
