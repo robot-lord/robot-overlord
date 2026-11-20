@@ -59,15 +59,15 @@ const TICK: Duration = Duration::from_secs(1);
 /// With nothing settling or unseen, a look every this many ticks (and on
 /// every change).
 const IDLE_TICKS: u32 = 15;
-/// Kinds of look error warned before they're only logged at debug.
-const WARNED_CAP: usize = 16;
-
 /// A stable name for a kind of error (not its text, which carries
 /// ids and paths): the database's or the system's error kind, else its
 /// type.
 fn error_kind(e: &anyhow::Error) -> String {
     if let Some(r) = e.downcast_ref::<rusqlite::Error>() {
-        return format!("sqlite {:?}", std::mem::discriminant(r));
+        return match r {
+            rusqlite::Error::SqliteFailure(f, _) => format!("sqlite {}", f.extended_code),
+            other => format!("sqlite {:?}", std::mem::discriminant(other)),
+        };
     }
     if let Some(io) = e.downcast_ref::<std::io::Error>() {
         return format!("io {:?}", io.kind());
@@ -353,19 +353,21 @@ fn rows(d: &Daemon) -> Result<Vec<Value>> {
 
 /// When each listed session's overlay (background work, a usage limit)
 /// last ended, as recorded where it ends (kv `overlay_end:<id>`:
-/// `background.rs`, `limits.rs`). Only the sessions in `rows` are read.
+/// `background.rs`, `limits.rs`): one query, kept for the sessions in
+/// `rows`.
 fn overlay_ends(d: &Daemon, rows: &[Value]) -> Result<HashMap<String, i64>> {
-    let db = d.db();
-    let mut ends = HashMap::new();
-    for id in rows.iter().filter_map(|r| r["id"].as_str()) {
-        if let Some(t) = db
-            .kv_get(&rlord_core::db::overlay_end_key(id))?
-            .and_then(|v| v.parse().ok())
-        {
-            ends.insert(id.to_string(), t);
-        }
-    }
-    Ok(ends)
+    let listed: HashSet<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+    Ok(d.db()
+        .kv_prefix("overlay_end:")?
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let id = k.strip_prefix("overlay_end:")?;
+            if !listed.contains(id) {
+                return None;
+            }
+            Some((id.to_string(), v.parse().ok()?))
+        })
+        .collect())
 }
 
 /// Inputs from `rows`, with the watcher's memory.
@@ -471,8 +473,8 @@ pub fn start(d: &Arc<Daemon>) {
         let mut changes = d.notify.subscribe();
         let mut settling = true;
         let mut quiet = 0u32;
-        // Kinds of error already warned (a few at most).
-        let mut warned: HashSet<String> = HashSet::new();
+        // The kind of the last look's error (None: it went through).
+        let mut last_error: Option<String> = None;
         loop {
             std::thread::sleep(TICK);
             let poked = d.attention.moved.swap(false, Ordering::Relaxed);
@@ -499,14 +501,18 @@ pub fn start(d: &Arc<Daemon>) {
                 look(&d, now_ms(), &tmux::list_clients, due, poked)
             }));
             settling = match r {
-                Ok(Ok(p)) => p,
+                Ok(Ok(p)) => {
+                    last_error = None;
+                    p
+                }
                 // (After a failure, back to the idle cadence: a change or
                 // the slow fallback looks again, not every tick.)
-                // (Warned once per kind of error, then quietly: a look that
-                // keeps failing the same way doesn't flood the log.)
+                // (Warned when the kind of error changes, then quietly: a
+                // look that keeps failing the same way doesn't flood the
+                // log.)
                 Ok(Err(e)) => {
                     let kind = error_kind(&e);
-                    if warned.len() < WARNED_CAP && warned.insert(kind) {
+                    if last_error.replace(kind.clone()).as_ref() != Some(&kind) {
                         tracing::warn!(error = %format!("{e:#}"), "attention queue");
                     } else {
                         tracing::debug!(error = %e, "attention queue");
@@ -626,7 +632,13 @@ pub(crate) fn look(
     // while rlord wasn't watching (`by: restart`). What is still there
     // goes on (`carried`).
     if first {
-        for (id, kind, since) in db.open_attention_entries()? {
+        for rlord_core::db::OpenEntry {
+            session: id,
+            kind,
+            since,
+            seq,
+        } in db.open_attention_entries()?
+        {
             // (A row the log can't say: closed, and said so, once: the
             // marker matches its kind, unreadable or none, so it isn't
             // open at the next start.)
@@ -634,7 +646,7 @@ pub(crate) fn look(
                 (kind.clone().filter(|k| Kind::parse(k).is_some()), since)
             else {
                 tracing::warn!(session = %id, "an attention entry in the log can't be read: closed");
-                let p = json!({"kind": kind, "by": "unreadable"});
+                let p = json!({"kind": kind, "by": "unreadable", "closes_seq": seq});
                 db.insert_event(&id, now, "attention_cleared", &p.to_string())?;
                 continue;
             };
@@ -803,8 +815,11 @@ pub fn ended_how(events: &[EventRow]) -> (&'static str, Option<i64>) {
 }
 
 /// The event kinds `cleared_by` and `ended_how` read.
-/// Each one changes a status where it is logged (a limit or background
-/// work changes none: `cleared_by` reads those from the row as `overlay`).
+/// Each one is logged with a status change at some `set_status` call
+/// (checked call site by call site: the hooks, OpenCode, `discover`,
+/// `send.rs`, restarts and fresh conversations, stops, the reconcile). A
+/// limit or background work changes none: `cleared_by` reads those from
+/// the row as `overlay`.
 const CLEARING_KINDS: &[&str] = &[
     "prompt_submitted",
     "rlord_prompt",
@@ -819,6 +834,8 @@ const CLEARING_KINDS: &[&str] = &[
     "session_start",
     "restarted",
     "resumed",
+    "reforked",
+    "fresh_conversation",
     "message_delivered",
     "awaiting_first_prompt",
     "permission_request",
@@ -865,7 +882,7 @@ pub fn cleared_by(
             "turn_started" => "self",
             "agent_stopped" => "stop",
             "session_end" | "reconciled_dead" | "stopped" | "archived" | "session_start"
-            | "restarted" | "resumed" => "ended",
+            | "restarted" | "resumed" | "reforked" | "fresh_conversation" => "ended",
             // (Claude fires a question's `PreToolUse` and its
             // `PermissionRequest` together, and a permission notification
             // with a request: the other half of the entry's own trigger.)
@@ -1072,8 +1089,12 @@ mod tests {
         assert_eq!(by(YourTurn, &evs), "prompt");
         assert_eq!(by(YourTurn, &[ev("turn_started", json!({}))]), "self");
         // Not a status change: not what cleared it.
-        for k in ["limit_hit", "pane_gone_turn_running", "fresh_conversation"] {
+        for k in ["limit_hit", "pane_gone_turn_running"] {
             assert_eq!(by(YourTurn, &[ev(k, json!({}))]), "unknown", "{k}");
+        }
+        // A restart in a new conversation, or forked again: it (re)started.
+        for k in ["fresh_conversation", "reforked"] {
+            assert_eq!(by(YourTurn, &[ev(k, json!({}))]), "ended", "{k}");
         }
         assert_eq!(by(NeedsYou, &[ev("restarted", json!({}))]), "ended");
         // How it ended, and when.
@@ -1572,8 +1593,11 @@ mod tests {
                 r#"{"kind": "bogus", "since": 1}"#,
             )
             .unwrap();
+            // A kind that isn't a string at all.
+            db.insert_event("a", NOW, "attention_entered", r#"{"kind": 5, "since": 1}"#)
+                .unwrap();
         }
-        assert_eq!(d.db().open_attention_entries().unwrap().len(), 2);
+        assert_eq!(d.db().open_attention_entries().unwrap().len(), 3);
         look(&d, NOW + 1_000, &Vec::new, true, false).unwrap();
         assert!(d.db().open_attention_entries().unwrap().is_empty());
     }

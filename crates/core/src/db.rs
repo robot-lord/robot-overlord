@@ -43,9 +43,17 @@ pub fn overlay_end_key(id: &str) -> String {
     format!("overlay_end:{id}")
 }
 
-/// An attention entry the log leaves open (`Db::open_attention_entries`):
-/// session, kind, since; kind and since None where its payload can't say.
-pub type OpenEntry = (String, Option<String>, Option<i64>);
+/// An attention entry the log leaves open (`Db::open_attention_entries`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenEntry {
+    pub session: String,
+    /// None where its payload can't say (not JSON, no kind, not a string).
+    pub kind: Option<String>,
+    pub since: Option<i64>,
+    /// The `attention_entered` row: an unreadable entry is closed by a
+    /// marker naming it (`closes_seq`).
+    pub seq: i64,
+}
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -1287,12 +1295,14 @@ impl Db {
     /// `attention_cleared` after it. (session, kind, since.)
     pub fn open_attention_entries(&self) -> Result<Vec<OpenEntry>> {
         // (A payload that isn't JSON, or has no kind: its row comes back
-        // with None, for the caller to skip; never an error for the rest.)
+        // with None, for the caller to close; never an error for the rest.
+        // A marker naming a row's seq, `closes_seq`, closes that row.)
         let mut st = self.conn.prepare(
             "SELECT e.session_id, \
                     CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END, \
                     CASE WHEN json_valid(e.payload) \
-                         THEN COALESCE(json_extract(e.payload, '$.since'), e.ts) END \
+                         THEN COALESCE(json_extract(e.payload, '$.since'), e.ts) END, \
+                    e.seq \
              FROM events e WHERE e.kind = 'attention_entered' \
                AND e.seq = (SELECT MAX(x.seq) FROM events x WHERE x.session_id = e.session_id \
                             AND x.kind = 'attention_entered' \
@@ -1300,15 +1310,18 @@ impl Db {
                                 IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END)) \
                AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
                             AND c.kind = 'attention_cleared' AND c.seq > e.seq \
-                            AND (CASE WHEN json_valid(c.payload) THEN json_extract(c.payload, '$.kind') END) \
-                                IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END))",
+                            AND json_valid(c.payload) \
+                            AND (json_extract(c.payload, '$.closes_seq') = e.seq \
+                                 OR (json_valid(e.payload) \
+                                     AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))))",
         )?;
         let rows = st.query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get::<_, Option<String>>(1).ok().flatten(),
-                r.get::<_, Option<i64>>(2).ok().flatten(),
-            ))
+            Ok(OpenEntry {
+                session: r.get(0)?,
+                kind: r.get::<_, Option<String>>(1).ok().flatten(),
+                since: r.get::<_, Option<i64>>(2).ok().flatten(),
+                seq: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }

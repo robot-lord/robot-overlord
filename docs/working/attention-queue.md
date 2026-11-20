@@ -586,26 +586,31 @@ trustworthy before the go/no-go read:
 
 - `cleared_by`: `self` only on a positive match of the agent's own kinds;
   rlord's own moves (`message_delivered`, `awaiting_first_prompt`,
-  `pane_gone_turn_running`, `rlord_prompt`) are `rlord`; nothing that
-  says is `unknown`, never `self`.
-- An overlay's end is recorded where it ends, in kv `overlay_end:<id>`:
-  background work in `background.rs` (before what is shown changes), a
-  limit in `limits.rs` when a scan drops it (its reset plus margin, or
-  now if it went sooner). It survives a daemon restart, and an overlay
-  that came and went between two looks; a stop or a start drops it.
+  `rlord_prompt`) are `rlord`; nothing that says is `unknown`, never
+  `self` (`pane_gone_turn_running` changes no status: `unknown`).
+- An overlay's end is recorded where it ends, in kv `overlay_end:<id>`,
+  never moved backwards: background work in `background.rs` (before what
+  is shown changes; not work a restart dropped with the old process, nor
+  a session past its stop grace), a limit in `limits.rs` when a scan
+  drops it (its reset plus margin, or now if it went sooner). It survives
+  a daemon restart, and an overlay that came and went between two looks;
+  a stop or a start drops it. Read with one query.
 - `attention_reason` is kept by one rule (`daemon/src/reason.rs`) on
   every path that changes a status: hooks, OpenCode, `discover` (a start
   settling with no turn is no `finished`), `send.rs`'s held messages. A
   stop or a (re)start clears it in `Db::set_status` itself.
-- What cleared an entry is read only among kinds that change a status
-  (no `limit_hit`, `pane_gone_turn_running` or `fresh_conversation`).
+- What cleared an entry is read only among kinds logged with a status
+  change, checked call site by call site (`fresh_conversation` and
+  `reforked` set `starting`: `ended`; `limit_hit` and
+  `pane_gone_turn_running` change none: `unknown`).
 - `attention.list` uses the last real presence sample (a minute at
   most), not an emptied set.
 - OpenCode counts as unlinked only for passes where a connect was tried.
-- An unreadable open entry in the log (no kind, not JSON) is closed
-  `by: unreadable` once, with a warning; a look's error is warned once
-  per kind of error (sqlite or io error kind, not its text; 16 kinds at
-  most).
+- An unreadable open entry in the log (no kind, a kind that isn't a
+  string, not JSON) is closed once with a warning, by a marker naming its
+  row (`by: unreadable`, `closes_seq`); a look's error is warned when its
+  kind (sqlite extended code, io error kind; not its text) differs from
+  the last look's error.
 - A Claude tool hook's cheap checks (`methods::wake_candidate`, shared
   by `Daemon::call` and `wakes_idle`) come before the session is looked
   up.

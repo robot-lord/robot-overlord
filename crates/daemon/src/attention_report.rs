@@ -439,7 +439,12 @@ mod tests {
             .unwrap();
         db.insert_event("e", 20, "attention_entered", r#"{"since": 20}"#)
             .unwrap();
-        let mut open = db.open_attention_entries().unwrap();
+        let mut open: Vec<(String, Option<String>, Option<i64>)> = db
+            .open_attention_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.session, e.kind, e.since))
+            .collect();
         open.sort();
         assert_eq!(
             open,

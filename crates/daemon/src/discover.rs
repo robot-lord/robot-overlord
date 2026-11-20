@@ -230,14 +230,7 @@ fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
         return Ok(false);
     }
     db.set_status(&s.id, Status::Idle, now)?;
-    crate::reason::record(
-        &db,
-        &cur,
-        "awaiting_first_prompt",
-        Status::Idle,
-        false,
-        false,
-    )?;
+    // (No reason to keep: a start, which `set_status` cleared it for.)
     db.insert_event(
         &s.id,
         now,

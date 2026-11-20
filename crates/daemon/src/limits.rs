@@ -258,7 +258,8 @@ fn scan(d: &Daemon) -> Result<()> {
 
 /// Limits shown before a scan (`before`) and not after it: when each
 /// ended, for the attention queue (kv `overlay_end:<id>`): its reset plus
-/// margin, or now if it went sooner (the user carried on).
+/// margin, or now if it went sooner (the user carried on); never moving a
+/// recorded end backwards.
 fn record_ended(
     db: &Db,
     before: &Map<String, Value>,
@@ -269,7 +270,7 @@ fn record_ended(
         let end = l["resets_at"]
             .as_i64()
             .map_or(now, |t| (t + MARGIN_MS).min(now));
-        db.kv_set(&rlord_core::db::overlay_end_key(id), &end.to_string())?;
+        crate::background::record_end(db, id, end)?;
     }
     Ok(())
 }
