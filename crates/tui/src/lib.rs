@@ -347,8 +347,10 @@ struct App {
     /// wheel, a click, focus loss) and by a list refresh, which can move
     /// rows under a pointer that stays put.
     hover_row: Option<(String, u16, u16)>,
-    /// The Status column's width when the list was last drawn.
+    /// The Status column's width when the list was last drawn, and
+    /// whether it was narrow (glyphs alone).
     list_status_w: u16,
+    list_narrow: bool,
     /// The list was refreshed since the pointer last moved: drop the
     /// popup if its session is no longer the row under the pointer.
     hover_stale: bool,
@@ -427,6 +429,7 @@ impl App {
             idle_motion: false,
             hover_row: None,
             list_status_w: list_cols::STATUS_W,
+            list_narrow: false,
             hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
@@ -1602,10 +1605,13 @@ impl App {
         };
         let lines = statustext::describe(
             s,
-            self.list_status_w == list_cols::STATUS_W_NARROW,
+            self.list_narrow,
             usize::from(self.list_status_w),
             rlord_core::types::now_ms(),
         );
+        if lines.is_empty() {
+            return;
+        }
         let plains: Vec<String> = lines.iter().map(statustext::Item::plain).collect();
         let area = f.area();
         // (Border and padding: 2 columns a side; wide characters count
@@ -1649,6 +1655,7 @@ impl App {
             project: show_project,
         } = ListCols::for_width(area.width);
         self.list_status_w = status_w;
+        self.list_narrow = narrow;
         let show_tags = tags_w > 0;
         let sel_w = list_cols::sel_w();
 
@@ -2229,33 +2236,16 @@ impl App {
                 ),
             ]));
         }
-        if let Some(st) = s["remote"]["state"].as_str() {
-            let (text, style) = match st {
-                "on" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["url"].as_str().unwrap_or("in the Claude app")
-                    ),
-                    Style::default().fg(theme::green()),
-                ),
-                "connecting" => ("connecting…".into(), theme::muted()),
-                "pending" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["reason"].as_str().unwrap_or("needs a restart")
-                    ),
-                    theme::muted(),
-                ),
-                "disconnecting" => ("off · disconnects at its restart".into(), theme::muted()),
-                "stopped" => ("on · connects when it starts".into(), theme::muted()),
-                other => (
-                    format!(
-                        "{other}: {}",
-                        s["remote"]["reason"].as_str().unwrap_or("unknown")
-                    ),
-                    Style::default().fg(theme::red()),
-                ),
-            };
+        // Remote Control as the list's ⇄ says it, in its colour (and
+        // where to reach it); nothing for a state the list doesn't draw.
+        if let Some(mut text) = statustext::remote_sentence(s) {
+            if let Some(url) = s["remote"]["url"]
+                .as_str()
+                .filter(|_| s["remote"]["state"] == "on")
+            {
+                text = format!("{text} {url}");
+            }
+            let style = remote_chip(&s["remote"]).style;
             lines.push(Line::from(vec![key("remote"), Span::styled(text, style)]));
         }
         if s["loading"] == true {
@@ -3813,6 +3803,7 @@ mod tests {
         assert_eq!(text(&["release", "tooling", "wip"]), "#3");
         assert_eq!(text(&["a-very-long-group-name"]), "#1");
         // The count is dim, not a tag's colour.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cell = tags_cell(&["release", "tooling"], 15);
         assert_eq!(cell.spans[0].style, theme::muted());
         // Squeezed: the count fits 3 cells (4 for 10 or more), then "…".

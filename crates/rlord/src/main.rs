@@ -1322,11 +1322,12 @@ fn main() -> Result<()> {
             println!("{} ({})", g("name"), g("id"));
             println!("  agent      {} · model {}", g("agent"), g("model"));
             // The status as the list shows it, every symbol in words.
-            for (i, l) in
-                rlord_tui::statustext::describe(&s, false, usize::MAX, rlord_core::types::now_ms())
-                    .iter()
-                    .enumerate()
-            {
+            let lines =
+                rlord_tui::statustext::describe(&s, false, usize::MAX, rlord_core::types::now_ms());
+            if lines.is_empty() {
+                println!("  status     status unknown");
+            }
+            for (i, l) in lines.iter().enumerate() {
                 println!("  {:<10} {}", if i == 0 { "status" } else { "" }, l.plain());
             }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));

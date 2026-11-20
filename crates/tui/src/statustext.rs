@@ -1,6 +1,8 @@
-//! A session's status in words: what each symbol on its row means. Used
-//! by the hover popup over a list row and the details panel. Pure, so it
-//! is tested without a terminal.
+//! The list's Status column and what each of its marks means. The list
+//! draws its marks from `status_marks`; the hover popup and `rlord show`
+//! explain them line by line (`describe`); the details card takes the
+//! sentences (`describe_status`, `remote_sentence`); the help screen
+//! lists them all (`legend`). Pure, so it is tested without a terminal.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -107,7 +109,7 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
     }
     match MEANINGS.iter().find(|(k, _)| *k == shown) {
         Some((_, what)) => format!("{what}."),
-        None => format!("status {shown}."),
+        None => format!("status {shown} (not known to this rlord version)."),
     }
 }
 
@@ -167,6 +169,8 @@ pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
 pub struct Item {
     pub mark: Span<'static>,
     pub text: String,
+    /// The column has room for it (`status_marks`'s width).
+    pub shown: bool,
 }
 
 impl Item {
@@ -211,26 +215,36 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
     let mark = if narrow {
         let mut c = chip.content.chars();
         let glyph: String = c.next().map(String::from).unwrap_or_default();
-        if known {
+        // The label the glyph stands for, unless the sentence already
+        // names it (a status this version doesn't know).
+        let known_label = MEANINGS.iter().any(|(k, _)| *k == crate::shown(s))
+            || matches!(crate::shown(s), "limited" | "background");
+        if known && known_label {
             text = format!("{}: {text}", c.as_str().trim());
         }
         Span::styled(glyph, chip.style)
     } else {
         chip
     };
-    let mut v = vec![Item { mark, text }];
+    let mut v = vec![Item {
+        mark,
+        text,
+        shown: true,
+    }];
     // Its sub-agents are still loading (warm-up): the status is known,
     // the agent counts aren't yet.
     if s["loading"] == true {
         v.push(Item {
             mark: Span::styled("⋯", theme::faint()),
             text: "still loading its sub-agent counts.".into(),
+            shown: true,
         });
     }
     if let Some(text) = remote_sentence(s) {
         v.push(Item {
             mark: trimmed(crate::remote_chip(&s["remote"])),
             text,
+            shown: true,
         });
     }
     let n = s["agents_running"].as_i64().unwrap_or(0);
@@ -238,26 +252,23 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         v.push(Item {
             mark: Span::styled(format!("⚙{n}"), Style::default().fg(theme::overlord())),
             text: format!("{n} sub-agent{} running.", if n == 1 { "" } else { "s" }),
+            shown: true,
         });
     }
     // The status always shows (clipped if it must); the rest only whole.
     let mut used = v[0].mark.width();
-    let mut keep = 1;
-    for m in &v[1..] {
+    for m in &mut v[1..] {
         used += 1 + m.mark.width();
-        if used > width {
-            break;
-        }
-        keep += 1;
+        m.shown = used <= width;
     }
-    v.truncate(keep);
     v
 }
 
 /// The Status column's spans, space-separated, in `width` columns.
 pub fn column_spans(s: &Value, narrow: bool, width: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
-    for (i, m) in status_marks(s, narrow, width, 0).into_iter().enumerate() {
+    let marks = status_marks(s, narrow, width, 0);
+    for (i, m) in marks.into_iter().filter(|m| m.shown).enumerate() {
         if i > 0 {
             out.push(Span::raw(" "));
         }
@@ -266,14 +277,20 @@ pub fn column_spans(s: &Value, narrow: bool, width: usize) -> Vec<Span<'static>>
     out
 }
 
-/// Every mark in the row's Status column that the list shows, in its
-/// order, each with what it means; then background shells, which have
-/// no mark.
+/// Every mark in the row's Status column, each with what it means: the
+/// ones the list shows in its order, then those it has no room for
+/// (said so), then background shells, which have no mark. Empty when
+/// nothing is known.
 pub fn describe(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
-    let mut v: Vec<Item> = status_marks(s, narrow, width, now)
+    let (shown, mut cut): (Vec<Item>, Vec<Item>) = status_marks(s, narrow, width, now)
         .into_iter()
         .filter(|m| !m.text.is_empty())
-        .collect();
+        .partition(|m| m.shown);
+    for m in &mut cut {
+        m.text.push_str(" (not shown in this width)");
+    }
+    let mut v = shown;
+    v.extend(cut);
     v.extend(shells_line(s, now));
     v
 }
@@ -294,6 +311,7 @@ fn shells_line(s: &Value, now: i64) -> Option<Item> {
     shells_sentence(s, now).map(|text| Item {
         mark: Span::raw(""),
         text,
+        shown: true,
     })
 }
 
@@ -390,15 +408,24 @@ mod tests {
         );
         // Marks the column has no room for get no line.
         let d = describe(&s, false, 13, 0);
-        assert_eq!(d.len(), 2, "◷ 3:00pm ↻ ⋯ fits 13; ⇄ doesn't");
+        assert_eq!(
+            d.iter().map(Item::plain).collect::<Vec<_>>()[2..],
+            [
+                "⇄ — Remote Control connected: reachable from the Claude app. \
+                 (not shown in this width)",
+                "⚙1 — 1 sub-agent running. (not shown in this width)",
+            ],
+            "◷ 3:00pm ↻ ⋯ fits 13; ⇄ and ⚙1 don't"
+        );
         assert_eq!(
             column_spans(&s, false, 13).len(),
             3,
             "the column drops the same marks"
         );
         let d = describe(&s, true, 1, 0);
-        assert_eq!(d.len(), 1);
+        assert_eq!(d.len(), 4);
         assert!(d[0].plain().starts_with("◷ — 3:00pm ↻: stopped"));
+        assert!(d[1].plain().ends_with("(not shown in this width)"));
         // No status known: no status line.
         assert!(describe(&json!({}), false, 13, 0).is_empty());
         let s = json!({"status": "idle", "shown_status": "limited",
@@ -423,6 +450,19 @@ mod tests {
 
     fn texts_narrow(s: &Value) -> Vec<String> {
         describe(s, true, 1, 0).iter().map(Item::plain).collect()
+    }
+
+    #[test]
+    fn unknown_status_names_itself() {
+        let s = json!({"status": "paused"});
+        assert_eq!(
+            texts(&s, 0),
+            ["· paused — status paused (not known to this rlord version)."]
+        );
+        assert_eq!(
+            texts_narrow(&s),
+            ["· — status paused (not known to this rlord version)."]
+        );
     }
 
     #[test]
