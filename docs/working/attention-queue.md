@@ -628,8 +628,9 @@ a look's error kind is re-warned when it changes or after ten minutes;
 
 Owed:
 
-- Known limits, shown with the report's go/no-go numbers: an overlay
-  that ended while the daemon was down has no recorded end;
+- Known limits, shown with the report's go/no-go numbers: background
+  work that ended while the daemon was down has no recorded end (a
+  limit's end is its reset, recorded at the next scan);
   `attention.list` shows overlay ends and presence as of the watcher's
   last look; the background end is written by the background scan
   (every 5 s, from complete reads), not where a task closes.

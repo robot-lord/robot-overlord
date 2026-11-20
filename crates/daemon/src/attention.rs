@@ -901,9 +901,9 @@ pub fn cleared_by(
         };
         return by;
     }
-    // No event says; an overlay that ended after it began does (its turn
-    // went to background work or a limit and back).
-    if row.overlay_ended_at.is_some_and(|t| t > since) {
+    // No event says; for a turn of the user's, an overlay that ended after
+    // it began does (it went to background work or a limit and back).
+    if kind == Kind::YourTurn && row.overlay_ended_at.is_some_and(|t| t > since) {
         return "overlay";
     }
     // (Nothing logged that says: never guessed to be the agent's own.)
@@ -1130,6 +1130,8 @@ mod tests {
         let mut back = row("s", "idle");
         back.overlay_ended_at = Some(NOW + 5);
         assert_eq!(cleared_by(YourTurn, Some(&back), &[], NOW), "overlay");
+        // (Needs you: an overlay doesn't end one.)
+        assert_eq!(cleared_by(NeedsYou, Some(&back), &[], NOW), "unknown");
         back.overlay_ended_at = Some(NOW - 5);
         assert_eq!(cleared_by(YourTurn, Some(&back), &[], NOW), "unknown");
         let mut gone = row("s", "stopped");

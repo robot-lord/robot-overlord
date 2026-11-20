@@ -333,14 +333,10 @@ fn keep_unread(
     after: &mut HashMap<String, Shown>,
     unread: &HashSet<String>,
 ) {
+    // (Nothing shown before: what the partial read found is shown.)
     for id in unread {
-        match before.get(id) {
-            Some(sh) => {
-                after.insert(id.clone(), sh.clone());
-            }
-            None => {
-                after.remove(id);
-            }
+        if let Some(sh) = before.get(id) {
+            after.insert(id.clone(), sh.clone());
         }
     }
 }
@@ -425,14 +421,17 @@ mod tests {
         assert_eq!(work_ended(&before, &after, &running, &restarted), ["a"]);
         // Not read up to date: what was shown stays (its end is read on
         // the next complete scan), whatever the partial read said.
-        let mut partial: HashMap<String, Shown> = [("b".into(), shown(0))].into();
+        let mut partial: HashMap<String, Shown> =
+            [("b".into(), shown(0)), ("new".into(), shown(3))].into();
         keep_unread(
             &before,
             &mut partial,
-            &["a".to_string(), "b".to_string()].into(),
+            &["a", "b", "new"].map(String::from).into(),
         );
         assert_eq!(partial.get("a"), Some(&shown(1)));
         assert_eq!(partial.get("b"), Some(&shown(2)));
+        // Nothing shown before: what the partial read found stays.
+        assert_eq!(partial.get("new"), Some(&shown(3)));
         let ended = work_ended(&before, &partial, &running, &HashSet::new());
         assert!(!ended.contains(&"a".to_string()) && !ended.contains(&"b".to_string()));
         // A recorded end only moves forward.

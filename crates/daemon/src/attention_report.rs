@@ -272,7 +272,7 @@ pub fn render(r: &Report) -> String {
 
 /// What the shadow numbers can't see yet: the reader discounts them.
 const KNOWN_LIMITS: &str = "\nknown limits (discount these):\n\
-  - an overlay (background work, a limit) that ended while the daemon was down has no recorded end\n\
+  - background work that ended while the daemon was down has no recorded end (a limit's end is its reset)\n\
   - attention list (and the tool) shows overlay ends and presence as of the watcher's last look\n\
   - a background end is recorded by the background scan (every 5 s), from complete reads only\n";
 

@@ -1981,10 +1981,12 @@ fn hook_emit_in(
         // session only comes back if its tmux session really exists.
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
-        if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
+        let blocked = status.is_some_and(|st| st != Status::Stopped && revives_dead);
+        if let Some(st) = status.filter(|_| !blocked) {
             db.set_status(&s.id, st, now)?;
         }
-        // Why it waits, for the attention queue.
+        // Why it waits, for the attention queue (not when the write was
+        // refused: the status didn't change).
         let after = status.unwrap_or(s.status);
         let (rkind, question) = reason_of_hook(whose == Whose::Other, kind, &payload, after);
         // (Woke from idle by its own tool call: a turn began.)
@@ -1993,7 +1995,9 @@ fn hook_emit_in(
         } else {
             rkind
         };
-        crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
+        if !blocked {
+            crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
+        }
         if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
         } else {
