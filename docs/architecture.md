@@ -433,7 +433,8 @@ trusted hooks; `discover` and `opencode.rs` watch their own):
   `@rlord_id` mark (set when rlord starts or restarts it, or at the
   first look; never moved once set). A session is found by its mark
   wherever it is, so a rename outside rlord isn't an end (several tmux
-  sessions with one mark: a live one, else no verdict). Its tmux session
+  sessions with one mark: a live one, else the one under its stored name,
+else the newest pane). Its tmux session
   counts as gone only once it is known marked: rlord marked it at a start
   or restart (kv `tmux_marked:<id>`), or a look saw the mark.
 - Its agent pane's program exited, or its tmux session gone, on two

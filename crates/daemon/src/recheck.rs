@@ -40,17 +40,14 @@ pub(crate) trait Tmux {
     fn mark(&self, name: &str, id: &str);
 }
 
-struct Real;
+struct Real<'a>(&'a Daemon);
 
-impl Tmux for Real {
+impl Tmux for Real<'_> {
     fn panes(&self) -> Result<HashMap<String, AgentPane>> {
         tmux::agent_panes()
     }
     fn mark(&self, name: &str, id: &str) {
-        // (The re-check sees the mark on its next look: no kv needed.)
-        if let Err(e) = tmux::mark_session(name, id) {
-            tracing::debug!(session = id, error = %e, "marking the tmux session");
-        }
+        crate::methods::mark_tmux(&self.0.db(), name, id);
     }
 }
 
@@ -62,7 +59,7 @@ pub fn start(d: &Arc<Daemon>) {
         let mut memo = Memo::default();
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pass(&d, &mut memo, &Real)
+                pass(&d, &mut memo, &Real(&d))
             }));
             match r {
                 Ok(Err(e)) => tracing::debug!(error = %e, "re-checking panes"),
@@ -108,14 +105,13 @@ pub(crate) struct Memo {
 enum Found<'a> {
     Pane(&'a AgentPane),
     Missing,
-    /// More than one tmux session claims it, none of them live.
-    Unclear,
 }
 
 /// Session `s`'s agent pane in a snapshot: the tmux sessions marked with
 /// its id, and the one under its stored name if that isn't marked as
 /// another's. One: that. More (a copy of a marked session): a live one,
-/// the first by tmux name (never `HashMap` order); none live: unclear.
+/// the first by tmux name (never `HashMap` order); none live: the one
+/// under its stored name, else the newest pane (the highest `%id`).
 fn find<'a>(s: &Session, panes: &'a HashMap<String, AgentPane>) -> Found<'a> {
     let mut found: Vec<(&String, &AgentPane)> = panes
         .iter()
@@ -128,11 +124,24 @@ fn find<'a>(s: &Session, panes: &'a HashMap<String, AgentPane>) -> Found<'a> {
     match found.as_slice() {
         [] => Found::Missing,
         [(_, p)] => Found::Pane(p),
-        many => many
-            .iter()
-            .find(|(_, p)| !p.dead)
-            .map_or(Found::Unclear, |(_, p)| Found::Pane(p)),
+        many => {
+            let pane = many
+                .iter()
+                .find(|(_, p)| !p.dead)
+                .or_else(|| {
+                    many.iter()
+                        .find(|(n, _)| s.tmux_session.as_deref() == Some(n.as_str()))
+                })
+                .or_else(|| many.iter().max_by_key(|(_, p)| pane_number(&p.pane)))
+                .map(|(_, p)| *p);
+            pane.map_or(Found::Missing, Found::Pane)
+        }
     }
+}
+
+/// A pane id's number (`%12`: 12): tmux numbers panes as it makes them.
+fn pane_number(pane: &str) -> u64 {
+    pane.trim_start_matches('%').parse().unwrap_or(0)
 }
 
 /// What one look says of session `s`: `Some(pane)` dead (`pane` None: its
@@ -146,7 +155,6 @@ fn dead_look(
     match find(s, panes) {
         Found::Pane(p) => p.dead.then(|| Some(p.pane.clone())),
         Found::Missing => marked.then_some(None),
-        Found::Unclear => None,
     }
 }
 
@@ -208,14 +216,20 @@ pub(crate) fn pass(d: &Daemon, memo: &mut Memo, tmux: &dyn Tmux) -> Result<usize
                     tmux.mark(t, &s.id);
                 }
             }
-            Found::Missing | Found::Unclear => {}
+            Found::Missing => {}
         }
         // (Marked by rlord at its start or restart counts too: killed
         // before the first look, it can still be told gone.)
         let marked = memo.marked.contains(&s.id) || {
             let db = d.db();
-            db.kv_get(&crate::methods::tmux_marked_key(&s.id))?
-                .is_some()
+            // (Can't read it: not known marked, and the pass goes on.)
+            match db.kv_get(&crate::methods::tmux_marked_key(&s.id)) {
+                Ok(v) => v.is_some(),
+                Err(e) => {
+                    tracing::debug!(session = %s.id, error = %e, "reading its mark");
+                    false
+                }
+            }
         };
         if marked {
             memo.marked.insert(s.id.clone());
@@ -487,11 +501,17 @@ mod tests {
             assert_eq!(find(&s, &panes), Found::Pane(&panes["s-copy"]));
             assert_eq!(dead_look(&s, &panes, true), None);
         }
+        // None live: the copy under its stored name.
         let mut both_dead = HashMap::new();
         both_dead.insert("s".to_string(), pane("%1", true));
         both_dead.insert("s-copy".to_string(), pane("%2", true));
-        assert_eq!(find(&s, &both_dead), Found::Unclear);
-        assert_eq!(dead_look(&s, &both_dead, true), None);
+        assert_eq!(find(&s, &both_dead), Found::Pane(&both_dead["s"]));
+        assert_eq!(dead_look(&s, &both_dead, true), Some(Some("%1".into())));
+        // ... and with none under its name: the newest pane.
+        let mut renamed = HashMap::new();
+        renamed.insert("a".to_string(), pane("%12", true));
+        renamed.insert("b".to_string(), pane("%9", true));
+        assert_eq!(find(&s, &renamed), Found::Pane(&renamed["a"]));
     }
 
     /// Marked by rlord at its start: killed before the first look, it is

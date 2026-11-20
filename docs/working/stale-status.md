@@ -75,4 +75,3 @@ statuses end stale, and how:
   the deferred `user_text`) read user text their own ways.
 - `check`/`verdict` duplication and one place to derive status age (for
   the deferred rules).
-- The pin is written by `pin_agent_pane` and `respawn_pane`: one helper.

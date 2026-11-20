@@ -278,23 +278,20 @@ const SESSION_MARK: &str = "@rlord_id";
 /// Mark tmux session `name` as rlord session `id` (`SESSION_MARK`),
 /// unless it is marked already.
 pub fn mark_session(name: &str, id: &str) -> Result<()> {
-    run(&[
-        "set-option",
-        "-o",
-        "-t",
-        &format!("{}:", exact(name)),
-        SESSION_MARK,
-        id,
-    ])
-    .map(|_| ())
-    .or_else(|e| {
-        // (`-o`: already set is an error tmux reports; not one here.)
-        if e.to_string().contains("already set") {
-            Ok(())
-        } else {
-            Err(e)
+    let target = format!("{}:", exact(name));
+    match run(&["set-option", "-o", "-t", &target, SESSION_MARK, id]) {
+        Ok(_) => Ok(()),
+        // (`-o`: set already. Fine only if it is this session's.)
+        Err(e) if e.to_string().contains("already set") => {
+            let has = run(&["show-options", "-v", "-t", &target, SESSION_MARK])?;
+            if has == id {
+                Ok(())
+            } else {
+                bail!("{name} is marked as another session's ({has})")
+            }
         }
-    })
+        Err(e) => Err(e),
+    }
 }
 
 /// One tmux session's agent pane, as `agent_panes` saw it.
@@ -1739,9 +1736,11 @@ mod tests {
             run(&["show-options", "-p", "-v", "-t", &pin, "remain-on-exit"]).unwrap(),
             "on"
         );
-        // Marked once with its rlord id; a second mark doesn't move it.
+        // Marked once with its rlord id; again with it: fine; another id
+        // doesn't move it, and says so.
         mark_session(name, "01first").unwrap();
-        mark_session(name, "01second").unwrap();
+        mark_session(name, "01first").unwrap();
+        assert!(mark_session(name, "01second").is_err());
         let panes = agent_panes().unwrap();
         let p = &panes[name];
         assert!(!p.dead);

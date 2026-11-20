@@ -2312,7 +2312,17 @@ pub(crate) fn save_cursors(db: &Db) {
 /// `tmux_marked:<id>` says so, so a session killed before the re-check's
 /// first look can still be told gone. Best effort.
 pub(crate) fn mark_tmux(db: &Db, name: &str, id: &str) {
-    let r = tmux::mark_session(name, id).and_then(|_| db.kv_set(&tmux_marked_key(id), "1"));
+    record_mark(db, id, tmux::mark_session(name, id));
+}
+
+/// Keep kv `tmux_marked:<id>` as `marked` says: set when the tmux session
+/// carries the mark, gone when marking failed (a tmux session made again
+/// may not carry it).
+fn record_mark(db: &Db, id: &str, marked: Result<()>) {
+    let r = match marked {
+        Ok(()) => db.kv_set(&tmux_marked_key(id), "1"),
+        Err(e) => db.kv_delete(&tmux_marked_key(id)).and(Err(e)),
+    };
     if let Err(e) = r {
         tracing::debug!(session = id, error = %e, "marking the tmux session");
     }
@@ -2403,6 +2413,20 @@ mod tests {
     }
 
     use super::*;
+
+    /// A mark that failed (a tmux session made again) is no longer known.
+    #[test]
+    fn a_failed_mark_is_forgotten() {
+        let db = Db::open_in_memory().unwrap();
+        record_mark(&db, "s", Ok(()));
+        assert!(db.kv_get(&tmux_marked_key("s")).unwrap().is_some());
+        record_mark(
+            &db,
+            "s",
+            Err(anyhow::anyhow!("marked as another session's")),
+        );
+        assert_eq!(db.kv_get(&tmux_marked_key("s")).unwrap(), None);
+    }
 
     #[test]
     fn only_plain_codex_sessions_go_on_the_daemon() {
