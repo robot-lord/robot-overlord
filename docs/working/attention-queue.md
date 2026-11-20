@@ -579,6 +579,11 @@ at, seen before, and repeats.
 
 Owed:
 
+- A failed write of `attention_entered` isn't tried again (the entry is
+  tracked anyway; its later events still are written).
+- `look` builds `inputs`/`entries` twice (before and after asking tmux).
+- `transcript::turn_open_after` parses the whole tail window: a lazy
+  reverse parse would stop at the first turn line.
 - The overlay's since is lost on a daemon restart (in memory only).
 - Set the presence hooks once per tmux server.
 - One shared reason helper for hooks and OpenCode.

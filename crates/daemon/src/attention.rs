@@ -516,7 +516,19 @@ pub(crate) fn look(
             .retain(|id, _| rows.iter().any(|r| r["id"] == id.as_str()));
         st.overlaid = overlaid;
         let all = entries(&inputs(d, &rows, &st), now);
-        poked || all.iter().any(|e| !e.settled || (unseen_too && !e.seen))
+        // (An entry that settles on this look needs who is looking now:
+        // its announcement depends on it.)
+        let settles_now = |e: &Entry| {
+            e.settled
+                && !st
+                    .tracked
+                    .get(&(e.session.clone(), e.kind, e.since))
+                    .is_some_and(|t| t.settled)
+        };
+        poked
+            || all
+                .iter()
+                .any(|e| !e.settled || settles_now(e) || (unseen_too && !e.seen))
     };
     // Who is looking (tmux, with no lock held).
     let by_tmux: HashMap<String, String> = rows
@@ -1357,6 +1369,34 @@ mod tests {
         assert_eq!(
             (&last["kind"], &last["by"]),
             (&json!("your_turn"), &json!("prompt"))
+        );
+    }
+
+    /// The look on which an entry settles asks tmux who is looking, even
+    /// with nothing else to look for: one session, first seen already
+    /// past its settle time, looked at.
+    #[test]
+    fn the_settling_look_asks_who_is_looking() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let t0 = NOW;
+        add(&d.db(), "a", Status::Working, t0);
+        let there = || vec![client("t-a", true)];
+        look(&d, t0 + 100, &there, false, false).unwrap();
+        {
+            let db = d.db();
+            db.set_status("a", Status::Idle, t0 + 1_000).unwrap();
+            db.touch_last_agent_msg("a", t0 + 1_000).unwrap();
+        }
+        // First seen past its 10 s: it settles on this look.
+        look(&d, t0 + 12_000, &there, false, false).unwrap();
+        let settled = shadow(&d, "a")
+            .into_iter()
+            .find(|(k, _)| k == "attention_settled")
+            .unwrap()
+            .1;
+        assert_eq!(
+            (&settled["viewed"], &settled["announced"]),
+            (&json!(true), &json!(false))
         );
     }
 

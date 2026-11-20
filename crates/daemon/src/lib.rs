@@ -624,14 +624,20 @@ impl Daemon {
             (found, roots, cfg)
         });
         // A hook that may wake an idle session: its transcript is read
-        // here, not under the DB lock (`methods::turn_open_for`).
-        if method == "hook.emit" {
+        // here, not under the DB lock (`methods::turn_open_for`). Only a
+        // Claude tool hook can; the session is looked up only for one.
+        let mut turn_open = None;
+        if method == "hook.emit"
+            && params["agent"] == rlord_core::agents::Agent::Claude.name()
+            && matches!(
+                params["event"].as_str(),
+                Some("PostToolUse" | "PostToolUseFailure")
+            )
+        {
             let s = params["instance"]
                 .as_str()
                 .and_then(|i| self.db().resolve_ref(i).ok());
-            if let Some(open) = s.and_then(|s| methods::turn_open_for(&s, &params)) {
-                params["turn_open"] = json!(open);
-            }
+            turn_open = s.and_then(|s| methods::turn_open_for(&s, &params));
         }
         let db = self.db();
         let r = match method {
@@ -670,7 +676,7 @@ impl Daemon {
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => {
-                let r = methods::hook_emit(&db, &params);
+                let r = methods::hook_emit_turn(&db, &params, turn_open);
                 methods::save_cursors(&db);
                 r
             }
@@ -2592,12 +2598,20 @@ mod tests {
             // (As `Daemon::call` does before the DB lock: the transcript
             // read, only past the cheap checks.)
             let s = db.resolve_ref("01cl").unwrap();
-            if let Some(open) = methods::turn_open_for(&s, &p) {
-                p["turn_open"] = json!(open);
-            }
-            methods::hook_emit(&db, &p).unwrap()
+            let open = methods::turn_open_for(&s, &p);
+            methods::hook_emit_turn(&db, &p, open).unwrap()
         };
         let stopped_at = db.resolve_ref("01cl").unwrap().last_agent_msg_at.unwrap();
+        // A client can't claim a turn open: only the typed argument counts.
+        let claimed = json!({"instance": "01cl", "agent": "claude", "event": "PostToolUse",
+                             "at": stopped_at + 1, "turn_open": true,
+                             "payload": {"session_id": "u-1", "hook_event_name": "PostToolUse",
+                                         "transcript_path": tp.to_string_lossy()}});
+        assert_eq!(
+            methods::hook_emit(&db, &claimed).unwrap()["unchanged"],
+            true
+        );
+        assert_eq!(status(), Status::Idle);
         assert_eq!(tool(None)["unchanged"], true);
         assert_eq!(tool(Some(stopped_at - 5))["unchanged"], true);
         assert_eq!(status(), Status::Idle);

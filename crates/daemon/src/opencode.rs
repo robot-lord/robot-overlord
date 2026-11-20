@@ -141,6 +141,7 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     f.gone.retain(|id, _| live.iter().any(|s| &s.id == id));
     f.blocked.retain(|id, _| live.iter().any(|s| &s.id == id));
     if live.is_empty() {
+        f.unlinked = 0;
         d.opencode_blind
             .store(false, std::sync::atomic::Ordering::Relaxed);
         f.link = None;
@@ -651,7 +652,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         let question = pending
             .as_ref()
             .is_some_and(|p| p.iter().any(|w| w.starts_with("form:")));
-        set_reason(&db, s, kind, question, want)?;
+        // (A turn's end only when OpenCode recorded one.)
+        let lost = kind == "agent_stopped" && idle_at.is_none() && from != "opencode session";
+        set_reason(&db, s, if lost { TURN_LOST } else { kind }, question, want)?;
         let mut detail = crate::own::with_source(json!({ "from": from }), source);
         if let Some(t) = idle_at {
             detail["idle_at"] = json!(t);
@@ -661,6 +664,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
     }
     Ok(changed)
 }
+
+/// `set_reason`'s kind for an `agent_stopped` that wasn't a turn's real end.
+const TURN_LOST: &str = "turn_lost";
 
 /// Why the session waits, for the attention queue, after a step logged as
 /// `kind` (`methods::attention_reason` for the hooks): `question` (a form,
@@ -677,6 +683,9 @@ fn set_reason(db: &Db, s: &Session, kind: &str, question: bool, after: Status) -
         "permission_request" if question || kept => Some(Some("question")),
         "permission_request" => Some(Some("permission")),
         "agent_stopped" => Some(Some("finished")),
+        // A turn that never ended (its server gone, or no such turn on
+        // the server now): no reason known.
+        TURN_LOST => Some(None),
         "turn_started" | "prompt_submitted" | "rlord_prompt" | "session_start"
             if after != Status::WaitingInput =>
         {
@@ -1274,6 +1283,10 @@ mod tests {
         );
         set_reason(&db, &s(), "agent_stopped", false, Idle).unwrap();
         assert_eq!(reason().as_deref(), Some("finished"));
+        // A turn lost with its server, not ended: no reason.
+        set_reason(&db, &s(), TURN_LOST, false, Idle).unwrap();
+        assert_eq!(reason(), None);
+        set_reason(&db, &s(), "agent_stopped", false, Idle).unwrap();
         // A prompt while still waiting (on another form): the reason stays.
         db.set_status("01oc", WaitingInput, 6).unwrap();
         set_reason(&db, &s(), "question", false, WaitingInput).unwrap();

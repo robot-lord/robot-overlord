@@ -1689,7 +1689,14 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
 
 /// Ingest one live agent hook event (from `rlord hook emit`).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
-    hook_emit_with(db, params, &|agent, id| agent.indexed(id))
+    hook_emit_turn(db, params, None)
+}
+
+/// `hook_emit`, with whether the session's transcript shows a turn open
+/// since its last turn end (`turn_open_for`, read before the DB lock;
+/// None: not asked). Never taken from the request.
+pub(crate) fn hook_emit_turn(db: &Db, params: &Value, turn_open: Option<bool>) -> Result<Value> {
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), true, turn_open)
 }
 
 /// `hook.ack`: the hook client printed the answer `ack` names.
@@ -1708,17 +1715,18 @@ pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
 /// but its client is long gone, so it gets no answer (nothing is handed
 /// over, nothing marked).
 pub fn hook_replay(db: &Db, params: &Value) -> Result<Value> {
-    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false)
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false, None)
 }
 
 /// `hook_emit`, with how to ask an agent's own index whether a
 /// conversation is one the user drives (tests answer it themselves).
+#[cfg(test)]
 pub(crate) fn hook_emit_with(
     db: &Db,
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
 ) -> Result<Value> {
-    hook_emit_in(db, params, indexed, true)
+    hook_emit_in(db, params, indexed, true, None)
 }
 
 /// `live`: its client waits for the answer (false: replayed).
@@ -1727,6 +1735,7 @@ fn hook_emit_in(
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
     live: bool,
+    turn_open: Option<bool>,
 ) -> Result<Value> {
     // `instance`: the hook's RLORD_SESSION_ID. A hook Codex's background
     // server ran has none (`by: "thread"`): see `codex_daemon::route`.
@@ -1770,7 +1779,7 @@ fn hook_emit_in(
             ran_at,
             s.last_agent_msg_at,
             // (Read before the DB lock was taken: `turn_open_for`.)
-            &|_, _| params["turn_open"] == true,
+            &|_, _| turn_open == Some(true),
         )
     });
     if let Some(a) = own_agent {
@@ -2056,7 +2065,7 @@ fn hook_emit_in(
 /// the DB lock): whether session `s`'s transcript shows a turn open that
 /// began after its last turn end, asked only when `wakes_idle`'s cheap
 /// conditions hold (the transcript read is the costly part). The answer
-/// goes in as `params["turn_open"]`. None: not asked.
+/// goes to `hook_emit_turn`. None: not asked.
 pub(crate) fn turn_open_for(s: &rlord_core::types::Session, params: &Value) -> Option<bool> {
     let agent = Agent::parse(params["agent"].as_str()?)?;
     let event = params["event"].as_str()?;
