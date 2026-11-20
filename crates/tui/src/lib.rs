@@ -347,6 +347,8 @@ struct App {
     /// wheel, a click, focus loss) and by a list refresh, which can move
     /// rows under a pointer that stays put.
     hover_row: Option<(String, u16, u16)>,
+    /// The list was last drawn narrow (status glyphs alone).
+    list_narrow: bool,
     /// The list was refreshed since the pointer last moved: drop the
     /// popup if its session is no longer the row under the pointer.
     hover_stale: bool,
@@ -424,6 +426,7 @@ impl App {
             last_click: None,
             idle_motion: false,
             hover_row: None,
+            list_narrow: false,
             hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
@@ -1597,21 +1600,22 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
-        let lines = statustext::describe(s, rlord_core::types::now_ms());
+        let lines = statustext::describe(s, self.list_narrow, rlord_core::types::now_ms());
+        let plains: Vec<String> = lines.iter().map(statustext::Item::plain).collect();
         let area = f.area();
         // (Border and padding: 2 columns a side; wide characters count
         // two.)
-        let w = lines
+        let w = plains
             .iter()
-            .map(|l| Span::raw(l.plain()).width() as u16 + 4)
+            .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
             .max()
             .unwrap_or(10)
             .min(64)
             .min(area.width);
         let inner = usize::from(w.saturating_sub(4));
-        let rows: u16 = lines
+        let rows: u16 = plains
             .iter()
-            .map(|l| theme::wrapped_rows(&l.plain(), inner) as u16)
+            .map(|l| theme::wrapped_rows(l, inner) as u16)
             .sum();
         let text: Vec<Line> = lines
             .iter()
@@ -1639,6 +1643,7 @@ impl App {
             tags_w,
             project: show_project,
         } = ListCols::for_width(area.width);
+        self.list_narrow = narrow;
         let show_tags = tags_w > 0;
         let sel_w = list_cols::sel_w();
 
@@ -1755,31 +1760,8 @@ impl App {
                         spans.push(Span::styled(others_up(s), theme::faint()));
                         spans
                     })),
-                    Cell::from(Line::from(vec![
-                        // Not loaded yet (the daemon's warm-up): say so
-                        // rather than show half-known data.
-                        if narrow {
-                            // The glyph alone (`○`, `●`, `◷`).
-                            let chip = state_chip(s, false);
-                            let glyph: String = chip.content.chars().take(1).collect();
-                            Span::styled(glyph, chip.style)
-                        } else {
-                            state_chip(s, false)
-                        },
-                        // Its sub-agents are still loading (warm-up): the
-                        // status is known, the agent counts aren't yet.
-                        Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
-                        // Remote Control: connected, connecting, or wanted
-                        // but not to be had.
-                        remote_chip(&s["remote"]),
-                        Span::styled(
-                            match s["agents_running"].as_i64().unwrap_or(0) {
-                                0 => String::new(),
-                                n => format!(" ⚙{n}"),
-                            },
-                            Style::default().fg(theme::overlord()),
-                        ),
-                    ])),
+                    // Every mark, as the status popup explains them.
+                    Cell::from(Line::from(statustext::column_spans(s, narrow))),
                     // The time the list is sorted by (activity otherwise).
                     Cell::from(Span::styled(
                         rel_age(match sort {
@@ -2130,7 +2112,7 @@ impl App {
             },
         ];
         // Every symbol on its row, in words.
-        for (n, l) in statustext::describe(s, rlord_core::types::now_ms())
+        for (n, l) in statustext::describe_status(s, rlord_core::types::now_ms())
             .into_iter()
             .enumerate()
         {
@@ -2269,7 +2251,7 @@ impl App {
         if s["loading"] == true {
             lines.push(Line::from(vec![
                 key("agents"),
-                Span::styled("◌ loading sub-agents…", theme::faint()),
+                Span::styled("… loading sub-agents", theme::faint()),
             ]));
         } else if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self

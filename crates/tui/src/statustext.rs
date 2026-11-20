@@ -53,7 +53,7 @@ pub fn legend() -> Vec<(String, &'static str)> {
         "Remote Control: green on, dim connecting, red failing",
     ));
     v.push(("⚙N".into(), "N sub-agents running"));
-    v.push(("◌".into(), "still loading its sub-agent counts"));
+    v.push(("…".into(), "still loading its sub-agent counts"));
     v
 }
 
@@ -62,23 +62,15 @@ use rlord_core::timefmt::rel_age_at;
 /// The status itself, after its mark: what it means.
 pub fn status_sentence(s: &Value, now: i64) -> String {
     let l = &s["limit"];
-    let shown = s["shown_status"]
-        .as_str()
-        .or(s["status"].as_str())
-        .unwrap_or("");
+    let shown = crate::shown(s);
     if shown == "limited" {
         let until = l["until"].as_str().unwrap_or("?");
         let resume = if l["resume"] == true {
-            " It resumes by itself then."
+            " It resumes by itself."
         } else {
             ""
         };
         return if l["reset"] == true {
-            let resume = if l["resume"] == true {
-                " It resumes by itself."
-            } else {
-                ""
-            };
             format!("its usage limit just reset.{resume}")
         } else {
             format!("stopped on a usage limit until {until}.{resume}")
@@ -203,16 +195,26 @@ fn trimmed(sp: Span<'static>) -> Span<'static> {
     Span::styled(sp.content.trim().to_string(), sp.style)
 }
 
-/// Every mark in the row's Status column, in its order, each with what
-/// it means; then background shells, which have no mark.
-pub fn describe(s: &Value, now: i64) -> Vec<Item> {
-    let mut v = vec![Item {
-        mark: trimmed(crate::state_chip(s, false)),
-        text: status_sentence(s, now),
-    }];
+/// The row's Status column: each mark as the list draws it (`narrow`:
+/// the status as its glyph alone) and what it means. The list and the
+/// status popup both use this, so they can't drift apart.
+pub fn status_marks(s: &Value, narrow: bool, now: i64) -> Vec<Item> {
+    let chip = trimmed(crate::state_chip(s, false));
+    let mut text = status_sentence(s, now);
+    let mark = if narrow {
+        let mut c = chip.content.chars();
+        let glyph: String = c.next().map(String::from).unwrap_or_default();
+        text = format!("{}: {text}", c.as_str().trim());
+        Span::styled(glyph, chip.style)
+    } else {
+        chip
+    };
+    let mut v = vec![Item { mark, text }];
+    // Its sub-agents are still loading (warm-up): the status is known,
+    // the agent counts aren't yet.
     if s["loading"] == true {
         v.push(Item {
-            mark: Span::styled("◌", theme::faint()),
+            mark: Span::styled("…", theme::faint()),
             text: "still loading its sub-agent counts.".into(),
         });
     }
@@ -229,13 +231,43 @@ pub fn describe(s: &Value, now: i64) -> Vec<Item> {
             text: format!("{n} sub-agent{} running.", if n == 1 { "" } else { "s" }),
         });
     }
-    if let Some(text) = shells_sentence(s, now) {
-        v.push(Item {
-            mark: Span::raw(""),
-            text,
-        });
-    }
     v
+}
+
+/// The Status column's spans, space-separated.
+pub fn column_spans(s: &Value, narrow: bool) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for (i, m) in status_marks(s, narrow, 0).into_iter().enumerate() {
+        if i > 0 {
+            out.push(Span::raw(" "));
+        }
+        out.push(m.mark);
+    }
+    out
+}
+
+/// Every mark in the row's Status column, in its order, each with what
+/// it means; then background shells, which have no mark.
+pub fn describe(s: &Value, narrow: bool, now: i64) -> Vec<Item> {
+    let mut v = status_marks(s, narrow, now);
+    v.extend(shells_line(s, now));
+    v
+}
+
+/// The details card: the status and shells only (its own `remote` and
+/// `agents` rows say more about those).
+pub fn describe_status(s: &Value, now: i64) -> Vec<Item> {
+    let mut v = status_marks(s, false, now);
+    v.truncate(1);
+    v.extend(shells_line(s, now));
+    v
+}
+
+fn shells_line(s: &Value, now: i64) -> Option<Item> {
+    shells_sentence(s, now).map(|text| Item {
+        mark: Span::raw(""),
+        text,
+    })
 }
 
 #[cfg(test)]
@@ -257,7 +289,7 @@ mod tests {
     }
 
     fn texts(s: &Value, now: i64) -> Vec<String> {
-        describe(s, now).iter().map(Item::plain).collect()
+        describe(s, false, now).iter().map(Item::plain).collect()
     }
 
     #[test]
@@ -297,21 +329,51 @@ mod tests {
         let s = json!({"status": "idle", "shown_status": "limited", "async_tasks": 1,
             "limit": {"until": "3:00pm", "resume": true}, "loading": true,
             "remote": {"state": "on"}, "agents_running": 1});
-        let d = describe(&s, 0);
+        let d = describe(&s, false, 0);
         assert_eq!(
             d.iter().map(Item::plain).collect::<Vec<_>>(),
             [
-                "◷ 3:00pm ↻ — stopped on a usage limit until 3:00pm. It resumes by itself then.",
-                "◌ — still loading its sub-agent counts.",
+                "◷ 3:00pm ↻ — stopped on a usage limit until 3:00pm. It resumes by itself.",
+                "… — still loading its sub-agent counts.",
                 "⇄ — Remote Control connected: reachable from the Claude app.",
                 "⚙1 — 1 sub-agent running.",
             ]
         );
-        assert_eq!(d[0].mark.style, crate::state_chip(&s, false).style);
-        assert_eq!(d[2].mark.style, crate::remote_chip(&s["remote"]).style);
+        // The list's colours: a limit yellow, connected green.
+        assert_eq!(d[0].mark.style.fg, Some(theme::yellow()));
+        assert_eq!(d[1].mark.style, theme::faint());
+        assert_eq!(d[2].mark.style.fg, Some(theme::green()));
+        assert_eq!(d[3].mark.style.fg, Some(theme::overlord()));
+        // The column draws exactly these marks, in this order.
+        let col: Vec<String> = column_spans(&s, false)
+            .iter()
+            .map(|sp| sp.content.to_string())
+            .collect();
+        assert_eq!(col, ["◷ 3:00pm ↻", " ", "…", " ", "⇄", " ", "⚙1"]);
+        // The details card keeps only the status (and shells).
+        assert_eq!(describe_status(&s, 0).len(), 1);
         let s = json!({"status": "idle", "shown_status": "limited",
             "limit": {"until": "3pm", "reset": true}});
         assert_eq!(texts(&s, 0), ["◷ reset — its usage limit just reset."]);
+    }
+
+    #[test]
+    fn narrow_shows_the_glyph_and_spells_the_label() {
+        let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 1});
+        let d = describe(&s, true, 0);
+        assert_eq!(d[0].mark.content, "◔");
+        assert!(d[0]
+            .plain()
+            .starts_with("◔ — bg 1: waiting on 1 background task."));
+        assert_eq!(column_spans(&s, true)[0].content, "◔");
+        assert_eq!(
+            texts_narrow(&json!({"status": "idle"})),
+            ["○ — your turn: it finished; the next prompt is yours."]
+        );
+    }
+
+    fn texts_narrow(s: &Value) -> Vec<String> {
+        describe(s, true, 0).iter().map(Item::plain).collect()
     }
 
     #[test]

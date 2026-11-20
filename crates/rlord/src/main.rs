@@ -1322,7 +1322,7 @@ fn main() -> Result<()> {
             println!("{} ({})", g("name"), g("id"));
             println!("  agent      {} · model {}", g("agent"), g("model"));
             // The status as the list shows it, every symbol in words.
-            for (i, l) in rlord_tui::statustext::describe(&s, rlord_core::types::now_ms())
+            for (i, l) in rlord_tui::statustext::describe(&s, false, rlord_core::types::now_ms())
                 .iter()
                 .enumerate()
             {
