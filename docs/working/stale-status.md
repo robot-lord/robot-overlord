@@ -47,6 +47,19 @@ statuses end stale, and how:
 
 ## Owed
 
+- A dead tmux server while the daemon runs: "no server running" gives no
+  verdict, so its sessions stay live until the next daemon start's
+  reconcile. Stopping them needs proof the server is down for good: a
+  deleted socket file doesn't prove it (a server can outlive its socket
+  file), the daemon doesn't own the server's lifetime, and a pid can be
+  reused.
+- A pin whose pane is gone falls back to the first pane (as
+  `window_pane_ids` does): an unrelated split there reads as the agent.
+- `discover`'s own pane check on `agent_panes` (marks, pane ids).
+- The "still as read" guard could move into `discover::stop_from_pane`.
+- Dead branches left by the cut.
+- A shared "every N seconds" loop helper for the watchers.
+
 - `discover`'s own pane check using `agent_panes` and the pin.
 - A tail `(len, mtime)` cache and a lazy reverse parse (for the
   deferred rules).

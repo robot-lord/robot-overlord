@@ -1044,6 +1044,7 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
     tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
+    mark_tmux(s.tmux_name, id);
     // The pane is up: from here nothing fails the start (a caller undoes a
     // start that failed, and must never undo a running one).
     let (kind, mut detail) = s.event;
@@ -1394,6 +1395,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    mark_tmux(&tmux_name, &s.id);
     // The pane is up: from here nothing fails the restart (as at `start`).
     // Each step is logged if it fails, and the status, the seen marks and
     // the event are always written.
@@ -1559,6 +1561,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
+    mark_tmux(&tmux_name, &s.id);
     hold_deferred(db, &s.id, &launch)?;
     match (&launch.session_id, &launch.transcript) {
         (Some(sid), transcript) => {
@@ -2301,6 +2304,14 @@ pub(crate) fn save_cursors(db: &Db) {
     let dirty = transcript::take_dirty_cursors();
     if let Err(e) = db.save_transcript_cursors(&dirty) {
         tracing::warn!(error = %e, "saving transcript read positions");
+    }
+}
+
+/// Mark tmux session `name` with rlord session `id` (`tmux::mark_session`):
+/// how `recheck` finds it after a rename outside rlord. Best effort.
+pub(crate) fn mark_tmux(name: &str, id: &str) {
+    if let Err(e) = tmux::mark_session(name, id) {
+        tracing::debug!(session = id, error = %e, "marking the tmux session");
     }
 }
 

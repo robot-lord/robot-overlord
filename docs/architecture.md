@@ -429,16 +429,24 @@ trusted hooks; `discover` and `opencode.rs` watch their own):
 
 - One `list-panes -a` a pass reads each session's agent pane, as
   `window_pane_ids` picks it (the pinned `@rlord_pane` when it is in the
-  session, else the first). `respawn_pane` pins the pane it used.
-- Its program exited, or its tmux session isn't listed, on two answered
-  looks of the same pane in a row (a status change in between, a restart
-  say, starts the count again): `stopped`, through `discover`'s stop
-  (`session_end` from the pane; the needs-you parties are dropped).
+  session, else the first), with the pane's id and the tmux session's
+  `@rlord_id` mark (set when rlord starts or restarts it, or at the
+  first look; never moved once set). A session is found by its mark
+  wherever it is, so a rename outside rlord isn't an end; its tmux
+  session counts as gone only once it was seen marked.
+- Its agent pane's program exited, or its tmux session gone, on two
+  answered looks of the same pane in a row (a different pane, or a
+  status change in between, starts the count again): `stopped`, through
+  `discover`'s stop (`session_end` from the pane; the needs-you parties
+  are dropped).
+- The stop asks tmux again under the session's lock (the same pane still
+  dead), then stops only if the session is still as it was read: its
+  status, when that changed, and its message times, under the DB lock.
 - Any tmux failure, "no server running" included, gives no verdict that
   pass and starts the counts again. A server that really died is for
   the startup reconcile.
-- A session is stopped only if it is still as it was read: its status,
-  when that changed, and its message times, under one DB lock.
+- `respawn_pane` pins the pane it used and keeps it on screen when it
+  exits (best effort).
 
 Nothing else is concluded. A "needs you" or "working" the transcript
 shows to be over is left as it is for now (the working doc
