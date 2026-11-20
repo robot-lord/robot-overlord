@@ -55,12 +55,18 @@ statuses end stale, and how:
   reused.
 - A pin whose pane is gone falls back to the first pane (as
   `window_pane_ids` does): an unrelated split there reads as the agent.
-- `discover`'s own pane check on `agent_panes` (marks, pane ids).
+- `discover`'s own pane check on `agent_panes` (marks, pane ids, the
+  pin).
 - The "still as read" guard could move into `discover::stop_from_pane`.
 - Dead branches left by the cut.
 - A shared "every N seconds" loop helper for the watchers.
-
-- `discover`'s own pane check using `agent_panes` and the pin.
+- The startup reconcile and `discover` still go by tmux names, not marks
+  (as before #82): a rename outside rlord fools them.
+- A session whose tmux session sits unmarked under its stored name (made
+  before marks, or the mark failed) is found by name only.
+- One helper writes the pin (`pin_agent_pane`, `respawn_pane`).
+- `find` runs twice a session a pass: once is enough.
+- `Memo.gone`'s tuple wants a struct.
 - A tail `(len, mtime)` cache and a lazy reverse parse (for the
   deferred rules).
 - `pid_alive` is written three times (`remote.rs`, `autostart.rs`, and

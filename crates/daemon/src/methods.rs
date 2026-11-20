@@ -1044,7 +1044,7 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
     tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
-    mark_tmux(s.tmux_name, id);
+    mark_tmux(db, s.tmux_name, id);
     // The pane is up: from here nothing fails the start (a caller undoes a
     // start that failed, and must never undo a running one).
     let (kind, mut detail) = s.event;
@@ -1395,7 +1395,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    mark_tmux(&tmux_name, &s.id);
+    mark_tmux(db, &tmux_name, &s.id);
     // The pane is up: from here nothing fails the restart (as at `start`).
     // Each step is logged if it fails, and the status, the seen marks and
     // the event are always written.
@@ -1561,7 +1561,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    mark_tmux(&tmux_name, &s.id);
+    mark_tmux(db, &tmux_name, &s.id);
     hold_deferred(db, &s.id, &launch)?;
     match (&launch.session_id, &launch.transcript) {
         (Some(sid), transcript) => {
@@ -2308,11 +2308,19 @@ pub(crate) fn save_cursors(db: &Db) {
 }
 
 /// Mark tmux session `name` with rlord session `id` (`tmux::mark_session`):
-/// how `recheck` finds it after a rename outside rlord. Best effort.
-pub(crate) fn mark_tmux(name: &str, id: &str) {
-    if let Err(e) = tmux::mark_session(name, id) {
+/// how `recheck` finds it after a rename outside rlord. Once marked, kv
+/// `tmux_marked:<id>` says so, so a session killed before the re-check's
+/// first look can still be told gone. Best effort.
+pub(crate) fn mark_tmux(db: &Db, name: &str, id: &str) {
+    let r = tmux::mark_session(name, id).and_then(|_| db.kv_set(&tmux_marked_key(id), "1"));
+    if let Err(e) = r {
         tracing::debug!(session = id, error = %e, "marking the tmux session");
     }
+}
+
+/// kv key: session `id`'s tmux session carries its mark (`mark_tmux`).
+pub(crate) fn tmux_marked_key(id: &str) -> String {
+    format!("tmux_marked:{id}")
 }
 
 /// Startup reconcile: sessions marked running whose tmux is gone are stopped

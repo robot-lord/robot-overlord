@@ -432,11 +432,15 @@ trusted hooks; `discover` and `opencode.rs` watch their own):
   session, else the first), with the pane's id and the tmux session's
   `@rlord_id` mark (set when rlord starts or restarts it, or at the
   first look; never moved once set). A session is found by its mark
-  wherever it is, so a rename outside rlord isn't an end; its tmux
-  session counts as gone only once it was seen marked.
+  wherever it is, so a rename outside rlord isn't an end (several tmux
+  sessions with one mark: a live one, else no verdict). Its tmux session
+  counts as gone only once it is known marked: rlord marked it at a start
+  or restart (kv `tmux_marked:<id>`), or a look saw the mark.
 - Its agent pane's program exited, or its tmux session gone, on two
-  answered looks of the same pane in a row (a different pane, or a
-  status change in between, starts the count again): `stopped`, through
+  answered looks of the same pane id in a row (a different pane, or a
+  status change in between, starts the count again; a respawn keeps the
+  pane id, and is caught by the pane being live again, the status time,
+  and the session lock the stop holds): `stopped`, through
   `discover`'s stop (`session_end` from the pane; the needs-you parties
   are dropped).
 - The stop asks tmux again under the session's lock (the same pane still
