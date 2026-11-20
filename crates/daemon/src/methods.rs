@@ -1987,6 +1987,12 @@ fn hook_emit_in(
         // Why it waits, for the attention queue.
         let after = status.unwrap_or(s.status);
         let (rkind, question) = reason_of_hook(whose == Whose::Other, kind, &payload, after);
+        // (Woke from idle by its own tool call: a turn began.)
+        let rkind = if wakes && status == Some(Status::Working) {
+            "turn_started"
+        } else {
+            rkind
+        };
         crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
         if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;

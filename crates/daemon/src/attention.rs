@@ -817,11 +817,14 @@ pub fn ended_how(events: &[EventRow]) -> (&'static str, Option<i64>) {
 }
 
 /// The event kinds `cleared_by` and `ended_how` read.
-/// Each one is logged with a status change at some `set_status` call
-/// (checked call site by call site: the hooks, OpenCode, `discover`,
-/// `send.rs`, restarts and fresh conversations, stops, the reconcile). A
-/// limit or background work changes none: `cleared_by` reads those from
-/// the row as `overlay`.
+/// Each one is logged with a status change where it is logged (checked
+/// call site by call site: the hooks, OpenCode, `discover`, restarts,
+/// stops, the reconcile), but two: `message_delivered` changes the status
+/// only from idle (a Stop's held messages), and `fresh_conversation`,
+/// logged by a hook for a `/clear`, comes with no change of its own (a
+/// fresh conversation started by rlord sets `starting`). A limit or
+/// background work changes none: `cleared_by` reads those from the row as
+/// `overlay`.
 const CLEARING_KINDS: &[&str] = &[
     "prompt_submitted",
     "rlord_prompt",

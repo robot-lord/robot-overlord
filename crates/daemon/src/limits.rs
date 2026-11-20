@@ -225,7 +225,10 @@ fn scan(d: &Daemon) -> Result<()> {
             // OpenCode's conversations are rows, not files: read every
             // tick (two indexed look-ups).
             None if Format::of(path) == Format::OpenCode => false,
-            None => continue, // (gone)
+            // (Gone, or not readable now: nothing new can be read, so as
+            // unchanged: the limit stays while it holds, then ends by the
+            // clock. A usage limit doesn't lift because a file went.)
+            None => true,
         };
         judged.insert(id.clone());
         let state = if unchanged {

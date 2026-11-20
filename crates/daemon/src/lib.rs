@@ -2627,8 +2627,14 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
+        assert_eq!(
+            db.resolve_ref("01cl").unwrap().attention_reason.as_deref(),
+            Some("finished")
+        );
         tool(Some(stopped_at + 2));
         assert_eq!(status(), Status::Working);
+        // A turn began: the last turn's end is no longer why it waits.
+        assert_eq!(db.resolve_ref("01cl").unwrap().attention_reason, None);
         let woke = db.list_events("01cl", 1).unwrap();
         assert_eq!(
             (woke[0].kind.as_str(), &woke[0].payload["woke"]),

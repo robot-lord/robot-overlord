@@ -630,8 +630,8 @@ Owed:
 
 - Known limits, shown with the report's go/no-go numbers: an overlay
   that ended while the daemon was down has no recorded end;
-  `attention.list` reads overlay ends as of its call, the watcher as of
-  its last look; the background end is written by the background scan
+  `attention.list` shows overlay ends and presence as of the watcher's
+  last look; the background end is written by the background scan
   (every 5 s, from complete reads), not where a task closes.
 - The background tests build the same transcript fixture in several
   places: one helper.

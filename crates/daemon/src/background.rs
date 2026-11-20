@@ -70,6 +70,9 @@ struct Refreshed {
     dropped: bool,
     /// The transcript was read up to date.
     complete: bool,
+    /// When the session last wrote anything its work's staleness goes by
+    /// (its transcript, or its open subagents' output; ms).
+    last_write: i64,
 }
 
 /// What a session shows, as of the last scan.
@@ -150,6 +153,7 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
             shown: shown(&s.tracker, agents, 0, now),
             dropped,
             complete: false,
+            last_write: agents,
         };
     };
     let main = meta_mtime_ms(&meta).unwrap_or(0);
@@ -184,6 +188,7 @@ fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u6
         dropped,
         // (Read to this stat's end: the stamp was saved for it.)
         complete: s.stamp == stamp,
+        last_write: agents,
     }
 }
 
@@ -268,7 +273,7 @@ fn scan(d: &Daemon) -> Result<()> {
         let r = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
         if r.dropped {
             unsure.insert(l.id.clone());
-        } else if !r.complete {
+        } else if keeps_previous(&r, now) {
             unread.insert(l.id.clone());
         }
         let sh = r.shown;
@@ -309,6 +314,15 @@ fn task_list(v: &[Task]) -> Value {
     v.iter()
         .map(|t| json!({"label": t.label, "started_at": t.started_at}))
         .collect()
+}
+
+/// Whether a session's last shown entry stands instead of this read: the
+/// read wasn't up to date (a budget-cut chunk, a transcript it can't see)
+/// and the session wrote within `STALE_MS`. Past that, the usual stale
+/// hiding applies (and the work's end is recorded then): a transcript gone
+/// for good never keeps "background" showing.
+fn keeps_previous(r: &Refreshed, now: i64) -> bool {
+    !r.complete && !r.dropped && now - r.last_write < STALE_MS
 }
 
 /// For sessions not read up to date this scan (`unread`), keep what was
@@ -450,6 +464,32 @@ mod tests {
         assert!(refresh(&mut s, &main, 0, now_ms(), &mut 0).complete);
         // A file it can't see: not.
         assert!(!refresh(&mut s, &dir.path().join("gone"), 0, now_ms(), &mut all()).complete);
+    }
+
+    /// A read that isn't up to date keeps what was shown only while the
+    /// session wrote lately; past `STALE_MS` it goes stale as usual.
+    #[test]
+    fn an_unread_session_keeps_its_entry_only_while_fresh() {
+        let r = |complete: bool, dropped: bool, last_write: i64| Refreshed {
+            shown: Shown::default(),
+            dropped,
+            complete,
+            last_write,
+        };
+        let now = 10 * STALE_MS;
+        assert!(keeps_previous(&r(false, false, now - 1_000), now));
+        assert!(
+            !keeps_previous(&r(false, false, now - STALE_MS), now),
+            "stale: hidden"
+        );
+        assert!(
+            !keeps_previous(&r(true, false, now - 1_000), now),
+            "read up to date"
+        );
+        assert!(
+            !keeps_previous(&r(false, true, now - 1_000), now),
+            "a restart"
+        );
     }
 
     /// A budget with no limit, for one call.
