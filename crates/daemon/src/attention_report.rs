@@ -433,13 +433,21 @@ mod tests {
         let deaths = db.pane_deaths(0).unwrap();
         assert_eq!(deaths.get("b"), Some(&vec![15, 17]));
         assert!(!deaths.contains_key("a") && !deaths.contains_key("c"));
+        // A payload that isn't JSON, or has no kind: its row says None,
+        // and the rest still comes back.
+        db.insert_event("d", 19, "attention_entered", "not json")
+            .unwrap();
+        db.insert_event("e", 20, "attention_entered", r#"{"since": 20}"#)
+            .unwrap();
         let mut open = db.open_attention_entries().unwrap();
         open.sort();
         assert_eq!(
             open,
             [
-                ("a".to_string(), "your_turn".to_string(), 13),
-                ("b".to_string(), "needs_you".to_string(), 14)
+                ("a".to_string(), Some("your_turn".to_string()), Some(13)),
+                ("b".to_string(), Some("needs_you".to_string()), Some(14)),
+                ("d".to_string(), None, None),
+                ("e".to_string(), None, Some(20)),
             ]
         );
     }

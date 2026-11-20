@@ -767,11 +767,9 @@ pub(crate) fn claim_ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     db.kv_set(&key, &(in_row + 1).to_string())?;
     // The Stop set it idle; it carries on with them. (Only from idle: a
     // stop or restart meanwhile wins.)
-    if db
-        .session_by_id(id)?
-        .is_some_and(|s| s.status == Status::Idle)
-    {
+    if let Some(s) = db.session_by_id(id)?.filter(|s| s.status == Status::Idle) {
         db.set_status(id, Status::Working, now)?;
+        crate::reason::record(db, &s, "message_delivered", Status::Working, false, false)?;
     }
     db.insert_event(
         id,

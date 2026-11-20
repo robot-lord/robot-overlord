@@ -2,7 +2,9 @@
 
 # Attention queue: which session needs you next
 
-PR A (shadow queue) is in review; PR B and C are not started. See
+PR A (shadow queue) shipped in 1.14.0 (#83); a follow-up for the
+shadow data's accuracy is in review (branch `attention-accuracy`). PR B
+and C are not started. See
 "Decisions" and "Progress" below. The user's request: while working in one
 session, see that another session's status changed, most of all when it is
 asking for the user; a clear indicator of what needs you next instead of
@@ -464,8 +466,9 @@ server killed after each. tmux 3.8, Claude Code 2.1.327.
 **PR A** (branch `attention-queue`, 1.14.0):
 
 - `daemon/src/attention.rs`: `entries`/`queue`/`unknown` (pure, table
-  tests), the watcher (one look a second while something settles or is
-  unseen, else every 15 s and on every change), presence from focused
+  tests), the watcher (one look a second while something settles, else
+  on every change, a tmux client hook's poke, and every 15 s), presence
+  from focused
   tmux clients, `last_viewed_at`, shadow events `attention_entered`,
   `attention_settled` (`viewed`, `seen`, `announced`),
   `attention_cleared` (`by`, `waited_ms`, `announced`, `seen`,
@@ -551,8 +554,9 @@ Review round 4 changed:
 
 Review round 5 changed: a needs-you's paired trigger events (within a
 second) don't count as what cleared it; a turn woken by a queued prompt
-is cleared `by: queued`; OpenCode's resync logs a turn's end at its own
-time (so it matches the entry's since); a poke always resamples who is
+is cleared `by: queued`; OpenCode's resync dates a turn's end by its own
+time (since #83's rebase: logged at `now`, OpenCode's time in `idle_at`,
+which the clearing search reads); a poke always resamples who is
 looking, and not sampling means nobody; presence hooks are set one by
 one; `events (kind, ts)` is indexed (migration 0014) and the report
 reads pane deaths only from its oldest entry on.
@@ -577,59 +581,56 @@ blind only after a whole pass unlinked; after an error the watcher goes
 back to the idle cadence; the report splits "not announced" into looked
 at, seen before, and repeats.
 
+Follow-up (`attention-accuracy`, 1.15.3): so the shadow data is
+trustworthy before the go/no-go read:
+
+- `cleared_by`: `self` only on a positive match of the agent's own kinds;
+  rlord's own moves (`message_delivered`, `awaiting_first_prompt`,
+  `pane_gone_turn_running`, `rlord_prompt`) are `rlord`; nothing that
+  says is `unknown`, never `self`.
+- An overlay's end is recorded where it is computed: background work in
+  `background.rs` (kv `overlay_end:<id>`), a limit at its reset plus
+  margin (`limits::ended`). It survives a daemon restart, and an overlay
+  that came and went between two looks.
+- `attention_reason` is kept by one rule (`daemon/src/reason.rs`) on
+  every path that changes a status: hooks, OpenCode, `discover`,
+  `send.rs`'s held messages, restarts, stops, the reconcile.
+- `attention.list` uses the last real presence sample (a minute at
+  most), not an emptied set.
+- OpenCode counts as unlinked only for passes where a connect was tried.
+- An unreadable open entry in the log (no kind, not JSON) is skipped
+  with a warning; a look's error is warned once per kind of error.
+- A Claude tool hook's cheap payload checks (`agent_id`, `at`,
+  `transcript_path`) come before the session is looked up.
+
 Owed:
 
 - A failed write of `attention_entered` isn't tried again (the entry is
   tracked anyway; its later events still are written).
-- `look` builds `inputs`/`entries` twice (before and after asking tmux).
+- `look` builds `inputs`/`entries` twice (before and after asking tmux),
+  and lists every session each time: a live-only query, `HashSet`
+  retains.
 - `transcript::turn_open_after` parses the whole tail window: a lazy
   reverse parse would stop at the first turn line.
-- The overlay's since is lost on a daemon restart (in memory only).
-- Set the presence hooks once per tmux server.
-- One shared reason helper for hooks and OpenCode.
-- `discover::is_unhooked`: its home.
-- `client-focus-in`/`-out` hooks were checked on tmux 3.8 only; on an
-  older tmux that lacks them, the 15 s look covers it.
-- Record an overlay's end where it happens (`background.rs`,
-  `limits.rs`) instead of sampling it in `look`.
-- `look`'s cost: a live-only query, `inputs` once, `HashSet` retains.
 - Set the presence hooks once per tmux server, not on every nav-key
-  bind.
+  bind; `client-focus-in`/`-out` were checked on tmux 3.8 only (on an
+  older tmux that lacks them, the 15 s look covers it).
 - `ended_how` and `Db::pane_deaths` say the same rule twice.
-- One shared reason helper (`opencode::set_reason` and
-  `methods::attention_reason`).
 - `discover::is_unhooked` and `Blind::codex_untrusted` say similar
-  things differently.
-- `overlay_ended` lives in memory only: lost on a daemon restart.
+  things differently; `is_unhooked`'s home.
 - Carried entries (taken over at a start) lose `announced`/`seen`.
 - `open_attention_entries` matches the latest entered per kind, not by
   `since`.
 - The hook's unchanged early return (a tool or notification that moves
-  no status) skips `attention_reason` too.
+  no status) skips the reason too.
 - The `ui.*` poke covers rlord's own `goto`/overlord moves only; other
   moves come from the tmux hooks.
-- `look` computes `inputs`/`entries` twice.
-- `discover::is_unhooked` is `pub(crate)` for the queue; decide its home.
-- `attention_reason` is set by each status writer (hooks, OpenCode)
-  next to `set_status`, not by `set_status` itself.
-- The cost of `rows()` (the whole session list) on each look, and
-  `inputs`/`entries` computed twice in a look.
-- `pane_deaths` (report) and `ended_how` (watcher) say the same thing
-  twice.
-- The reason rules exist twice (`methods::attention_reason` for hooks,
-  `opencode::set_reason`): one shared function.
 - Dead match arms in `cleared_by` (kinds never logged for some agents).
-- The cost of a full `look` (the session list, every row) on each change.
-- `input_of` deserializes nothing now but still copies strings per row
-  per look: measure if the list grows large.
-
-- Overlay-end timing: when background work or a limit stops being shown,
-  your turn dates from the look that noticed (up to a tick, or 15 s with
-  nothing settling, late), not from when the overlay really ended.
-
+- `input_of` copies strings per row per look: measure if the list grows
+  large.
 - The unchecked hook paths above.
-- A week of shadow data, then `rlord attention report` with the
-  user before PR B's gate.
+- A week of shadow data, then `rlord attention report` with the user
+  before PR B's gate.
 - The details card and popup can now say which reason
   (`bg-status.md`'s owed item).
 - `own::prompt` still counts a background task's wake as the user's

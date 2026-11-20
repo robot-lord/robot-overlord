@@ -122,6 +122,20 @@ pub fn limited(d: &Daemon) -> HashMap<String, i64> {
 
 /// Whether session `id` is held by a usage limit now, read from the DB
 /// (for callers holding only it, like a hook). An unreadable record: no.
+/// When each session's usage limit stopped being shown (ms): its reset
+/// plus `MARGIN_MS`, for limits that ended by `now`. (Known from the limit
+/// itself: survives a daemon restart, and a limit that came and went
+/// between two looks.)
+pub(crate) fn ended(d: &Daemon, now: i64) -> HashMap<String, i64> {
+    limits(d)
+        .into_iter()
+        .filter_map(|(id, l)| {
+            let t = l["resets_at"].as_i64()?;
+            (!held(t, now)).then_some((id, t + MARGIN_MS))
+        })
+        .collect()
+}
+
 pub fn limited_in(db: &Db, id: &str, now: i64) -> bool {
     db.kv_map(LIMITS_KEY)
         .ok()

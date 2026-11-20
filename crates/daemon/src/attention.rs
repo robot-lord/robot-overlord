@@ -59,6 +59,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// With nothing settling or unseen, a look every this many ticks (and on
 /// every change).
 const IDLE_TICKS: u32 = 15;
+/// How long a presence sample stands for `attention.list`.
+const SAMPLE_FRESH_MS: i64 = 60_000;
 /// Entries `attention.list` returns by default.
 const LIMIT: usize = 20;
 
@@ -70,6 +72,14 @@ pub enum Kind {
 }
 
 impl Kind {
+    fn parse(s: &str) -> Option<Kind> {
+        match s {
+            "needs_you" => Some(Kind::NeedsYou),
+            "your_turn" => Some(Kind::YourTurn),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::NeedsYou => "needs_you",
@@ -292,10 +302,12 @@ struct State {
     tracked: HashMap<Key, Track>,
     /// Sessions a person's terminal showed at the last sample.
     viewing: HashSet<String>,
-    /// Sessions shown with an overlay (background work, a limit) at the
-    /// last look, and when each one's overlay was last seen to end.
-    overlaid: HashSet<String>,
+    /// When each session's overlay (background work, a limit) last ended,
+    /// as recorded at the source (`overlay_ends`).
     overlay_ended: HashMap<String, i64>,
+    /// The last real presence sample: when, and who was looking (for
+    /// `attention.list`, which asks no tmux).
+    sample: Option<(i64, HashSet<String>)>,
     /// Each session's turn (its end, `last_agent_msg_at`) a your-turn
     /// announcement was last made for: never twice for one turn.
     announced_turn: HashMap<String, i64>,
@@ -323,8 +335,30 @@ fn rows(d: &Daemon) -> Result<Vec<Value>> {
     Ok(rows)
 }
 
+/// When each session's overlay last ended: background work as
+/// `background.rs` recorded it (kv `overlay_end:<id>`), a limit at its
+/// reset plus margin; the later of the two.
+fn overlay_ends(d: &Daemon, now: i64) -> Result<HashMap<String, i64>> {
+    let mut ends: HashMap<String, i64> = d
+        .db()
+        .kv_prefix("overlay_end:")?
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("overlay_end:")?.to_string(), v.parse().ok()?)))
+        .collect();
+    for (id, t) in crate::limits::ended(d, now) {
+        let e = ends.entry(id).or_insert(t);
+        *e = (*e).max(t);
+    }
+    Ok(ends)
+}
+
 /// Inputs from `rows`, with the watcher's memory.
 fn inputs(d: &Daemon, rows: &[Value], st: &State) -> Vec<Input> {
+    inputs_seen(d, rows, st, &st.viewing)
+}
+
+/// `inputs`, with who is looking given.
+fn inputs_seen(d: &Daemon, rows: &[Value], st: &State, viewing: &HashSet<String>) -> Vec<Input> {
     let codex = rows.iter().any(|r| r["agent"] == "codex");
     let blind = Blind {
         codex_untrusted: codex && !codex_hooks_trusted(d),
@@ -333,7 +367,7 @@ fn inputs(d: &Daemon, rows: &[Value], st: &State) -> Vec<Input> {
     rows.iter()
         .map(|r| {
             let id = r["id"].as_str().unwrap_or("");
-            input_of(r, &st.viewing, st.overlay_ended.get(id).copied(), blind)
+            input_of(r, viewing, st.overlay_ended.get(id).copied(), blind)
         })
         .collect()
 }
@@ -375,7 +409,15 @@ pub fn list(d: &Daemon, params: &Value) -> Result<Value> {
     let now = now_ms();
     let inputs = {
         let st = d.attention.state();
-        inputs(d, &rows, &st)
+        // Who was looking at the last real sample (a minute at most: it
+        // asks no tmux itself).
+        let viewing = st
+            .sample
+            .as_ref()
+            .filter(|(at, _)| now - at <= SAMPLE_FRESH_MS)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        inputs_seen(d, &rows, &st, &viewing)
     };
     Ok(shape(&inputs, now, limit))
 }
@@ -413,6 +455,7 @@ pub fn start(d: &Arc<Daemon>) {
         let mut changes = d.notify.subscribe();
         let mut settling = true;
         let mut quiet = 0u32;
+        let mut warned: HashSet<String> = HashSet::new();
         loop {
             std::thread::sleep(TICK);
             let poked = d.attention.moved.swap(false, Ordering::Relaxed);
@@ -442,8 +485,14 @@ pub fn start(d: &Arc<Daemon>) {
                 Ok(Ok(p)) => p,
                 // (After a failure, back to the idle cadence: a change or
                 // the slow fallback looks again, not every tick.)
+                // (Warned once per kind of error, then quietly: a look that
+                // keeps failing the same way doesn't flood the log.)
                 Ok(Err(e)) => {
-                    tracing::debug!(error = %e, "attention queue");
+                    if warned.insert(e.to_string()) {
+                        tracing::warn!(error = %format!("{e:#}"), "attention queue");
+                    } else {
+                        tracing::debug!(error = %e, "attention queue");
+                    }
                     false
                 }
                 Err(_) => {
@@ -494,27 +543,14 @@ pub(crate) fn look(
 ) -> Result<bool> {
     let rows = rows(d)?;
     let ask = {
+        let ends = overlay_ends(d, now)?;
         let mut st = d.attention.state();
-        // Overlays that ended since the last look: a turn is yours from
-        // then (as of this look: up to a tick late).
-        let mut overlaid = HashSet::new();
-        for r in &rows {
-            let id = r["id"].as_str().unwrap_or("").to_string();
-            match r["shown_status"].as_str() {
-                Some("limited" | "background") => {
-                    overlaid.insert(id);
-                }
-                Some("idle") if st.overlaid.contains(&id) => {
-                    st.overlay_ended.insert(id, now);
-                }
-                _ => {}
-            }
-        }
-        st.overlay_ended
-            .retain(|id, _| rows.iter().any(|r| r["id"] == id.as_str()));
+        // When each overlay ended, as recorded where it ends (background
+        // work: `background.rs`; a limit: its reset): a turn is yours from
+        // then.
+        st.overlay_ended = ends;
         st.announced_turn
             .retain(|id, _| rows.iter().any(|r| r["id"] == id.as_str()));
-        st.overlaid = overlaid;
         let all = entries(&inputs(d, &rows, &st), now);
         // (An entry that settles on this look needs who is looking now:
         // its announcement depends on it.)
@@ -541,6 +577,9 @@ pub(crate) fn look(
     // (Fields borrowed apart below.)
     let st = &mut *guard;
     // (No focused client, or not asked: nobody.)
+    if let Some(v) = &viewing {
+        st.sample = Some((now, v.clone()));
+    }
     st.viewing = viewing.unwrap_or_default();
     let ins = inputs(d, &rows, st);
     let all = entries(&ins, now);
@@ -570,6 +609,12 @@ pub(crate) fn look(
     // goes on (`carried`).
     if first {
         for (id, kind, since) in db.open_attention_entries()? {
+            // (A row the log can't say: skipped, and said so.)
+            let (Some(kind), Some(since)) = (kind.filter(|k| Kind::parse(k).is_some()), since)
+            else {
+                tracing::warn!(session = %id, "an attention entry in the log can't be read: skipped");
+                continue;
+            };
             let still = all
                 .iter()
                 .any(|e| e.session == id && e.kind.as_str() == kind && e.since == since);
@@ -751,6 +796,9 @@ const CLEARING_KINDS: &[&str] = &[
     "resumed",
     "fresh_conversation",
     "limit_hit",
+    "message_delivered",
+    "awaiting_first_prompt",
+    "pane_gone_turn_running",
     "permission_request",
     "question_asked",
     "question",
@@ -763,7 +811,8 @@ const CLEARING_KINDS: &[&str] = &[
 /// archived, gone), `overlay` (background work or a limit now shown over
 /// it), `prompt` (the user's), `rlord` (a prompt rlord typed), `answer`
 /// (a tool ran: the prompt was answered), `queued` (a turn the user
-/// queued started), `stop` (another turn ended),
+/// queued started), `stop` (another turn ended), `unknown` (no event
+/// says),
 /// or `self` (the agent moved
 /// on with no user action: it asked, or worked, by itself).
 pub fn cleared_by(
@@ -782,7 +831,12 @@ pub fn cleared_by(
         let by = match e.kind.as_str() {
             "prompt_submitted" if e.payload["wake"] == true => "self",
             "prompt_submitted" => "prompt",
-            "rlord_prompt" => "rlord",
+            // rlord moved it: a prompt or held message it typed, a start
+            // it settled, a pane it saw gone with the turn going on.
+            "rlord_prompt"
+            | "message_delivered"
+            | "awaiting_first_prompt"
+            | "pane_gone_turn_running" => "rlord",
             "tool" | "answered" if kind == Kind::NeedsYou => "answer",
             // A turn the user queued while the agent worked (no prompt
             // hook for it: `methods::wakes_idle`).
@@ -807,7 +861,8 @@ pub fn cleared_by(
         };
         return by;
     }
-    "self"
+    // (Nothing logged that says: never guessed to be the agent's own.)
+    "unknown"
 }
 
 #[cfg(test)]
@@ -1009,7 +1064,17 @@ mod tests {
         );
         assert_eq!(ended_how(&[ev("archived", json!({}))]).0, "archive");
         assert_eq!(ended_how(&[]), ("unknown", None));
-        assert_eq!(by(YourTurn, &[]), "self");
+        assert_eq!(by(YourTurn, &[]), "unknown", "nothing says: never self");
+        // rlord moved it: its own `by`.
+        for k in [
+            "message_delivered",
+            "awaiting_first_prompt",
+            "pane_gone_turn_running",
+        ] {
+            assert_eq!(by(YourTurn, &[ev(k, json!({}))]), "rlord", "{k}");
+        }
+        // A kind nobody maps: skipped, then unknown.
+        assert_eq!(by(YourTurn, &[ev("renamed", json!({}))]), "unknown");
         let mut bg = row("s", "idle");
         bg.shown = "background".into();
         assert_eq!(cleared_by(YourTurn, Some(&bg), &[], NOW), "overlay");
@@ -1398,6 +1463,70 @@ mod tests {
             (&settled["viewed"], &settled["announced"]),
             (&json!(true), &json!(false))
         );
+    }
+
+    /// When background work ended is read from where it was recorded
+    /// (kv `overlay_end:`), not from the watcher's memory: it holds over a
+    /// daemon restart (a new watcher), and for work that came and went
+    /// between two looks.
+    #[test]
+    fn an_overlays_end_survives_a_restart() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let t0 = NOW;
+        add(&d.db(), "a", Status::Working, t0);
+        let none = Vec::new;
+        // (A fresh watcher: nothing in memory.)
+        look(&d, t0 + 100, &none, true, false).unwrap();
+        {
+            let db = d.db();
+            db.set_status("a", Status::Idle, t0 + 1_000).unwrap();
+            db.touch_last_agent_msg("a", t0 + 1_000).unwrap();
+            db.kv_set(
+                &crate::background::overlay_end_key("a"),
+                &(t0 + 30_000).to_string(),
+            )
+            .unwrap();
+        }
+        look(&d, t0 + 31_000, &none, true, false).unwrap();
+        let entered = shadow(&d, "a")
+            .into_iter()
+            .find(|(k, _)| k == "attention_entered")
+            .unwrap()
+            .1;
+        assert_eq!(
+            entered["since"],
+            t0 + 30_000,
+            "from the work's end, not the turn's"
+        );
+    }
+
+    /// `attention.list` goes by the last real presence sample (a minute at
+    /// most), not an emptied set: a turn that ended since the last look,
+    /// in the session being looked at, is seen.
+    #[test]
+    fn the_list_uses_the_last_presence_sample() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let now = now_ms();
+        add(&d.db(), "a", Status::Working, now - 5_000);
+        let there = || vec![client("t-a", true)];
+        look(&d, now - 1_000, &there, false, true).unwrap();
+        // A look that asks nobody: `viewing` emptied, the sample kept.
+        look(&d, now - 900, &Vec::new, false, false).unwrap();
+        assert!(d.attention.state().viewing.is_empty());
+        // Its turn ends after that, with no look since.
+        {
+            let db = d.db();
+            db.set_status("a", Status::Idle, now - 500).unwrap();
+            db.touch_last_agent_msg("a", now - 500).unwrap();
+        }
+        assert_eq!(
+            list(&d, &json!({})).unwrap()["your_turn"],
+            0,
+            "looked at: seen"
+        );
+        // An old sample doesn't count.
+        d.attention.state().sample = Some((now - 120_000, ["a".to_string()].into()));
+        assert_eq!(list(&d, &json!({})).unwrap()["your_turn"], 1);
     }
 
     #[test]

@@ -243,12 +243,21 @@ fn scan(d: &Daemon) -> Result<()> {
     }
     drop(seen);
     // Compared with what was shown: going stale is a change too.
-    let changed = {
+    let (changed, ended) = {
         let mut shown = d.background.shown.lock().expect("background mutex");
         let changed = *shown != after;
+        // Sessions whose background work stopped being shown: when, for
+        // the attention queue (`overlay_end_key`).
+        let ended = work_ended(&shown, &after);
         *shown = after;
-        changed
+        (changed, ended)
     };
+    if !ended.is_empty() {
+        let db = d.db();
+        for id in &ended {
+            db.kv_set(&overlay_end_key(id), &now.to_string())?;
+        }
+    }
     if changed {
         d.changed();
     }
@@ -259,6 +268,22 @@ fn task_list(v: &[Task]) -> Value {
     v.iter()
         .map(|t| json!({"label": t.label, "started_at": t.started_at}))
         .collect()
+}
+
+/// Sessions whose background work was shown (`before`) and isn't now.
+fn work_ended(before: &HashMap<String, Shown>, after: &HashMap<String, Shown>) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(id, sh)| sh.agent_count > 0 && after.get(*id).is_none_or(|a| a.agent_count == 0))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// kv key: when session `id`'s background work last stopped being shown
+/// (ms): its turn is the user's from then (`attention`). Kept across
+/// daemon restarts.
+pub(crate) fn overlay_end_key(id: &str) -> String {
+    format!("overlay_end:{id}")
 }
 
 /// Annotate rows with background work:
@@ -285,6 +310,24 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Background work that stops being shown is noticed where it is
+    /// computed (its end recorded for the attention queue).
+    #[test]
+    fn the_end_of_background_work_is_noticed() {
+        let shown = |n: usize| Shown {
+            agent_count: n,
+            ..Default::default()
+        };
+        let before: HashMap<String, Shown> = [
+            ("a".into(), shown(1)),
+            ("b".into(), shown(2)),
+            ("c".into(), shown(0)),
+        ]
+        .into();
+        let after: HashMap<String, Shown> = [("b".into(), shown(1))].into();
+        assert_eq!(work_ended(&before, &after), ["a"]);
+    }
 
     /// A budget with no limit, for one call.
     fn all() -> u64 {

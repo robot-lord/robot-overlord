@@ -434,7 +434,9 @@ transcript shows that wake) is logged with `wake: true`.
 Why a session waits is kept beside its status (`attention_reason`):
 `permission` or `question` while it needs you (a question wins over the
 permission request Claude fires with it), `finished` or `failed` once the
-turn is over (`StopFailure`); a prompt clears it.
+turn is over (`StopFailure`); a prompt, a start or a stop clears it. One
+rule (`daemon/src/reason.rs`) for every path that changes a status: the
+hooks, OpenCode, `discover`, rlord's own moves, the reconcile.
 
 ### Stale statuses re-checked (`daemon/src/recheck.rs`)
 

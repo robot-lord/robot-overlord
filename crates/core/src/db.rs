@@ -35,6 +35,10 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
      last_viewed_at, attention_reason";
 
+/// An attention entry the log leaves open (`Db::open_attention_entries`):
+/// session, kind, since; kind and since None where its payload can't say.
+pub type OpenEntry = (String, Option<String>, Option<i64>);
+
 pub struct NewSession<'a> {
     pub id: &'a str,
     pub name: &'a str,
@@ -1266,19 +1270,31 @@ impl Db {
     /// Attention entries the log leaves open: the latest
     /// `attention_entered` of each session and kind with no
     /// `attention_cleared` after it. (session, kind, since.)
-    pub fn open_attention_entries(&self) -> Result<Vec<(String, String, i64)>> {
+    pub fn open_attention_entries(&self) -> Result<Vec<OpenEntry>> {
+        // (A payload that isn't JSON, or has no kind: its row comes back
+        // with None, for the caller to skip; never an error for the rest.)
         let mut st = self.conn.prepare(
-            "SELECT e.session_id, json_extract(e.payload, '$.kind'), \
-                    COALESCE(json_extract(e.payload, '$.since'), e.ts) \
+            "SELECT e.session_id, \
+                    CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END, \
+                    CASE WHEN json_valid(e.payload) \
+                         THEN COALESCE(json_extract(e.payload, '$.since'), e.ts) END \
              FROM events e WHERE e.kind = 'attention_entered' \
                AND e.seq = (SELECT MAX(x.seq) FROM events x WHERE x.session_id = e.session_id \
                             AND x.kind = 'attention_entered' \
-                            AND json_extract(x.payload, '$.kind') = json_extract(e.payload, '$.kind')) \
+                            AND (CASE WHEN json_valid(x.payload) THEN json_extract(x.payload, '$.kind') END) \
+                                IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END)) \
                AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
                             AND c.kind = 'attention_cleared' AND c.seq > e.seq \
+                            AND json_valid(c.payload) AND json_valid(e.payload) \
                             AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, Option<String>>(1).ok().flatten(),
+                r.get::<_, Option<i64>>(2).ok().flatten(),
+            ))
+        })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 

@@ -1457,6 +1457,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         "setting its status",
         db.set_status(&s.id, Status::Starting, now).map(|_| ()),
     );
+    logged("clearing why it waited", crate::reason::clear(db, &s.id));
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
     crate::codex_daemon::sync_gate(db);
@@ -1580,6 +1581,7 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     // Nor is there a fork to make again at its next restart.
     db.kv_delete(&crate::fork::pending_key(&s.id))?;
     db.set_status(&s.id, Status::Starting, now)?;
+    crate::reason::clear(db, &s.id)?;
     db.insert_event(
         &s.id,
         now,
@@ -1624,6 +1626,7 @@ pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
     let now = now_ms();
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
+    crate::reason::clear(db, &s.id)?;
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "stopped", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);
@@ -1665,6 +1668,7 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     let now = now_ms();
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
+    crate::reason::clear(db, &s.id)?;
     db.set_archived(&s.id, Some(now))?;
     // Its look-ups stop answering (a start after unarchiving makes a new
     // token).
@@ -1991,11 +1995,8 @@ fn hook_emit_in(
         }
         // Why it waits, for the attention queue.
         let after = status.unwrap_or(s.status);
-        if let Some(r) = attention_reason(whose == Whose::Other, kind, event, &payload, after, &s) {
-            if r != s.attention_reason.as_deref() {
-                db.set_attention_reason(&s.id, r)?;
-            }
-        }
+        let (rkind, question) = reason_of_hook(whose == Whose::Other, kind, &payload, after);
+        crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
         if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
         } else {
@@ -2120,54 +2121,27 @@ pub(crate) fn wakes_idle(
             .is_some_and(|p| turn_open(p, last_stop.unwrap_or(0)))
 }
 
-/// The `attention_reason` to store after a hook event, if it changes:
-/// `Some(None)` clears it. While the session needs you: `question` (a
-/// question dialog, Claude's `AskUserQuestion` or an elicitation) or
-/// `permission`; a question isn't turned back into a permission prompt
-/// (both fire for one question). A turn's end: `finished`, or `failed`
-/// (`StopFailure`). A prompt or a new start clears it.
-fn attention_reason<'a>(
+/// A hook event as `reason::record` reads it: its kind (another
+/// conversation's wait reads as a permission request; its other events
+/// don't concern the session's reason) and whether what it asks is a
+/// question (`AskUserQuestion`, an elicitation).
+fn reason_of_hook<'a>(
     other: bool,
-    kind: &str,
-    event: &str,
+    kind: &'a str,
     payload: &Value,
     after: Status,
-    s: &rlord_core::types::Session,
-) -> Option<Option<&'a str>> {
-    let asks = matches!(
-        kind,
-        "permission_request" | "question_asked" | "notification"
-    ) || (other && after == Status::WaitingInput);
-    if after == Status::WaitingInput && asks {
-        let question = kind == "question_asked"
-            || payload["tool_name"] == "AskUserQuestion"
-            || payload["notification_type"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("elicitation"));
-        let kept =
-            s.status == Status::WaitingInput && s.attention_reason.as_deref() == Some("question");
-        return Some(Some(if question || kept {
-            "question"
-        } else {
-            "permission"
-        }));
-    }
-    if other {
-        return None;
-    }
-    match kind {
-        "agent_stopped" if after == Status::Idle => Some(Some(if event == "StopFailure" {
-            "failed"
-        } else {
-            "finished"
-        })),
-        // (A prompt while still waiting on someone, a sub-agent say,
-        // leaves why it waits.)
-        "prompt_submitted" | "rlord_prompt" | "session_start" if after != Status::WaitingInput => {
-            Some(None)
-        }
-        _ => None,
-    }
+) -> (&'a str, bool) {
+    let question = kind == "question_asked"
+        || payload["tool_name"] == "AskUserQuestion"
+        || payload["notification_type"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("elicitation"));
+    let kind = match (other, after) {
+        (true, Status::WaitingInput) => "permission_request",
+        (true, _) => "",
+        _ => kind,
+    };
+    (kind, question)
 }
 
 /// Whether a hook says the user cleared the conversation: Claude's
@@ -2473,6 +2447,7 @@ pub fn reconcile(db: &Db) -> Result<()> {
         if !alive {
             let now = now_ms();
             db.set_status(&s.id, Status::Stopped, now)?;
+            crate::reason::clear(db, &s.id)?;
             db.insert_event(&s.id, now, "reconciled_dead", "{}")?;
             tracing::info!(session = %s.id, "tmux gone; marked stopped (resumable)");
         }
@@ -2559,8 +2534,10 @@ mod tests {
         db.set_attention_reason("r1", Some("question")).unwrap();
         let s = db.resolve_ref("r1").unwrap();
         let p = json!({});
-        let r =
-            |after| attention_reason(false, "prompt_submitted", "UserPromptSubmit", &p, after, &s);
+        let r = |after| {
+            let (kind, q) = reason_of_hook(false, "prompt_submitted", &p, after);
+            crate::reason::after(&s, kind, after, q, false)
+        };
         assert_eq!(r(Status::WaitingInput), None);
         assert_eq!(r(Status::Working), Some(None));
     }
