@@ -560,8 +560,8 @@ over as many lines as they need) — plus two fields you write:
 a one-line **description** (`D`, or `rlord describe <ref> <text>`) and
 free-form **notes** (`E` opens `$EDITOR`; `rlord notes <ref> [--set|--file]`).
 Its **status** line spells out the status in words, with background
-tasks (what they are and how long ago they started) or a usage limit,
-then any background shells; its `remote` and `agents` rows cover
+tasks (what they are and how long ago they started) or a usage limit;
+its `shells`, `remote` and `agents` rows cover background shells,
 Remote Control and sub-agents. Hovering the pointer over a row in the
 list shows a small popup that explains every mark in the row's Status
 column, one line each, in the column's order and colour: the mark as the
@@ -570,10 +570,11 @@ tasks: …`, `⇄ — Remote Control connected: reachable from the Claude
 app.`, `⚙1 — 1 sub-agent running.`, `⋯ — still loading its sub-agent
 counts.`). In a narrow list, where the status is its glyph alone, the
 line spells out the label (`○ — your turn: …`). Marks the column has
-no room for come after the rest, marked "(not shown in this width)". `?` lists every status symbol.
-`rlord show <ref>` prints the same card, with the popup's lines (every
-mark but `⋯`, which only the list knows) under their own labels. The list always wins on space: it
-keeps its width and the preview drops out first when the terminal is narrow.
+no room for come after the rest, marked "(not shown in this width)".
+`?` lists every status symbol. `rlord show <ref>` prints the same card,
+with the popup's lines (every mark but `⋯`, which only the list knows)
+under their own labels. The list always wins on space: it keeps its
+width and the preview drops out first when the terminal is narrow.
 Where its `list_width_pct` share is too narrow for a readable name, Status,
 the time column and Usage, the list borrows that much from the preview,
 leaving the preview at least 40 columns or 30% of the width. It never takes

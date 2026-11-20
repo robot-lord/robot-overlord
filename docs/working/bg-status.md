@@ -111,4 +111,4 @@ file). PR #68.
 
 ### Owed from the status-popup PR (#86, 1.15.0)
 - `column_spans` builds the sentences only to drop them; split marks from meanings.
-- Move `state_chip`, `remote_chip` and `shown` from lib.rs into statustext.
+- Move `state_chip` and `shown` from lib.rs into statustext.

@@ -2120,7 +2120,8 @@ impl App {
                 ))
             },
         ];
-        // Every symbol on its row, in words.
+        // The status in words, and any background shells (the chip is
+        // in the headline; remote and agents have their own rows).
         for (label, l) in statustext::describe_status(s, rlord_core::types::now_ms()) {
             lines.push(Line::from(vec![
                 key(label),
@@ -2228,14 +2229,13 @@ impl App {
         }
         // Remote Control as the list's ⇄ says it, in its colour (and
         // where to reach it); nothing for a state the list doesn't draw.
-        if let Some(mut text) = statustext::remote_sentence(s) {
+        if let Some((style, mut text)) = statustext::remote_parts(&s["remote"]) {
             if let Some(url) = s["remote"]["url"]
                 .as_str()
                 .filter(|_| s["remote"]["state"] == "on")
             {
                 text = format!("{text} {url}");
             }
-            let style = remote_chip(&s["remote"]).style;
             lines.push(Line::from(vec![key("remote"), Span::styled(text, style)]));
         }
         if s["loading"] == true {
@@ -2894,15 +2894,6 @@ fn others_up(s: &Value) -> String {
         String::new()
     } else {
         format!(" +{}", marks.join(" "))
-    }
-}
-
-/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
-/// wanted but failing or unavailable (red); nothing when off.
-pub(crate) fn remote_chip(r: &Value) -> Span<'static> {
-    match statustext::remote_parts(r) {
-        Some((style, _)) => Span::styled("⇄", style),
-        None => Span::raw(""),
     }
 }
 

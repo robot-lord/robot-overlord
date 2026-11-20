@@ -238,7 +238,9 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         // names it (a status this version doesn't know).
         let known_label =
             MEANINGS.iter().any(|(k, _)| *k == shown) || matches!(shown, "limited" | "background");
-        if known && known_label {
+        if shown == "limited" {
+            text = narrow_limit(&s["limit"]);
+        } else if known && known_label {
             text = format!("{}: {text}", c.as_str().trim());
         }
         Span::styled(glyph, chip.style)
@@ -285,6 +287,22 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         m.shown = used <= width;
     }
     v
+}
+
+/// A limited row in a narrow list (its `◷` alone): the limit in words,
+/// time once, and what `↻` means.
+fn narrow_limit(l: &Value) -> String {
+    let resume = if l["resume"] == true {
+        ", resumes by itself (↻)"
+    } else {
+        ""
+    };
+    if l["reset"] == true {
+        format!("usage limit just reset{resume}.")
+    } else {
+        let until = l["until"].as_str().unwrap_or("?");
+        format!("usage limit until {until}{resume}.")
+    }
 }
 
 /// The Status column's spans, space-separated, in `width` columns.
@@ -451,7 +469,10 @@ mod tests {
         );
         let d = describe(&s, true, 1, 0);
         assert_eq!(d.len(), 4);
-        assert!(d[0].plain().starts_with("◷ — 3:00pm ↻: stopped"));
+        assert_eq!(
+            d[0].plain(),
+            "◷ — usage limit until 3:00pm, resumes by itself (↻)."
+        );
         assert!(d[1].plain().ends_with("(not shown in this width)"));
         // No status known: no status line.
         assert!(describe(&json!({}), false, 13, 0).is_empty());
