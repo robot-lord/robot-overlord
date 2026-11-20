@@ -17,6 +17,7 @@ pub mod overlord;
 pub mod own;
 pub mod profile;
 pub mod recall;
+pub mod recheck;
 pub mod remote;
 pub mod repo_latest;
 mod repo_scan;

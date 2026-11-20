@@ -61,13 +61,16 @@ fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
     Ok(d.db()
         .running_sessions()?
         .into_iter()
-        .filter(|s| Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()))
-        .filter(|s| {
-            s.agent_session.is_none()
-                || s.agent_session_trust != "hook"
-                || s.status == Status::Starting
-        })
+        .filter(is_unhooked)
         .collect())
+}
+
+/// Whether a live session is one `unhooked` follows here.
+pub(crate) fn is_unhooked(s: &Session) -> bool {
+    Agent::parse(&s.agent).is_some_and(|a| !a.mints_id())
+        && (s.agent_session.is_none()
+            || s.agent_session_trust != "hook"
+            || s.status == Status::Starting)
 }
 
 /// Live sessions on Codex's daemon that the hooks follow (not `unhooked`):
@@ -180,6 +183,8 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
     db.kv_delete(&format!("pane_gone_turn:{}", s.id))?;
+    // Nobody waits in a stopped session.
+    db.kv_delete(&methods::needs_you_key(&s.id))?;
     // (Its thread leaves the gate: a stopped session's hooks are dropped.)
     crate::codex_daemon::sync_gate(db);
     Ok(true)

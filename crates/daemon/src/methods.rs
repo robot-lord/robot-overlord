@@ -2028,7 +2028,7 @@ fn cleared(event: &str, payload: &Value) -> bool {
 /// kv key: who the session's "needs you" is for, as a JSON list ("" its
 /// own agent, else a sub-agent's id or thread). Present only while it
 /// waits on someone.
-fn needs_you_key(id: &str) -> String {
+pub(crate) fn needs_you_key(id: &str) -> String {
     format!("needs_you_by:{id}")
 }
 

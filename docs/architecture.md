@@ -419,6 +419,37 @@ Same three-tier degradation the research validated, implemented once:
 Every status transition is an `events` row and a push to subscribers; that is
 what makes the TUI live and `last_state_change_at` trustworthy.
 
+### Stale statuses re-checked (`daemon/src/recheck.rs`)
+
+A stored status moves only when an event moves it. An agent that crashed
+without its `SessionEnd` leaves a live status behind on a dead pane.
+Once at daemon start and then every minute, plain code looks at the
+sessions that follow hooks (Claude, and Codex with trusted hooks;
+`discover` and `opencode.rs` watch their own):
+
+- One `list-panes -a` a pass reads each tmux session's agent pane where
+  it is certain: the pinned `@rlord_pane` when it is in the session;
+  with no pin, the session's only pane. A pin whose pane isn't in the
+  session (moved by `join-pane`, or gone), or no pin and several panes:
+  no verdict. Skipped with no live session to look at.
+- A session is stopped only when its tmux session is there under its
+  stored name and that pane's program exited, on two answered looks of
+  the same pane id in a row, with its status time unchanged. The stop
+  goes through `discover`'s stop (`session_end` from the pane; the
+  needs-you parties are dropped).
+- The stop takes the session's lock (a restart through rlord holds it),
+  asks tmux again (the same pane still dead), then, under the DB lock
+  with no tmux call, stops only if the session is still as it was read:
+  its status, when that changed, and its message times.
+- `respawn-pane -k` keeps the pane id: a restart is caught by the pane
+  being live again, by the status time when it moves, and by the lock.
+  `respawn_pane` pins the pane it used and keeps it on screen when it
+  exits (best effort).
+- No verdict: a tmux session missing under the stored name (killed, or
+  renamed outside rlord: the startup reconcile handles a missing one),
+  and any tmux failure, "no server running" included (the counts start
+  again).
+
 ### Usage limits (`daemon/src/limits.rs`)
 
 "Limited" is not a stored status: it is read from the transcript and laid
