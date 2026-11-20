@@ -184,6 +184,36 @@ impl<'a> Line<'a> {
     }
 }
 
+/// Whether the transcript shows a turn open that began after `after_ms`:
+/// its last line about the turn opens or continues one (a prompt, a tool
+/// call, a tool result) and was written after that time. Reads the file's
+/// last `EXCERPT_WINDOW` bytes only; the incremental read positions are
+/// left alone. False when it can't be read, or for OpenCode.
+pub fn turn_open_after(path: &Path, after_ms: i64) -> bool {
+    if opencode::locate(path).is_some() {
+        return false;
+    }
+    let format = Format::of(path);
+    let Some(text) = read_window(path, true) else {
+        return false;
+    };
+    let lines: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    turn_open_after_in(format, &lines, after_ms)
+}
+
+/// `turn_open_after` over lines already parsed (oldest first).
+pub fn turn_open_after_in(format: Format, lines: &[Value], after_ms: i64) -> bool {
+    lines
+        .iter()
+        .rev()
+        .map(|v| format.line(v))
+        .find_map(|l| l.turn_ended().map(|e| (e, l.at().and_then(parse_iso_ms))))
+        .is_some_and(|(ended, at)| !ended && at.is_some_and(|t| t > after_ms))
+}
+
 /// Parse ISO-8601 `2026-10-27T17:03:44.498Z` to ms epoch (lenient).
 pub fn parse_iso_ms(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T')?;
@@ -879,6 +909,31 @@ mod tests {
         );
         // Nothing to save a read position for.
         assert!(take_dirty_cursors().iter().all(|(c, _)| c != &p));
+    }
+
+    /// A turn open, begun after a time: a new prompt and its tool call
+    /// after the last turn's end; not the final reply, nor an open line
+    /// from before.
+    #[test]
+    fn a_turn_open_after_a_time() {
+        let at = |s: &str| parse_iso_ms(s).unwrap();
+        let user = |ts: &str| json!({"type": "user", "timestamp": ts, "message": {"role": "user", "content": "next"}});
+        let reply = |ts: &str, stop: &str| json!({"type": "assistant", "timestamp": ts, "message": {"stop_reason": stop, "content": []}});
+        let stop = at("2026-11-12T10:00:05Z");
+        let ended = [
+            user("2026-11-12T10:00:00Z"),
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+        ];
+        assert!(!turn_open_after_in(Format::Claude, &ended, stop));
+        let queued = [
+            reply("2026-11-12T10:00:05Z", "end_turn"),
+            user("2026-11-12T10:00:06Z"),
+            reply("2026-11-12T10:00:07Z", "tool_use"),
+        ];
+        assert!(turn_open_after_in(Format::Claude, &queued, stop));
+        let old_open = [reply("2026-11-12T10:00:04Z", "tool_use")];
+        assert!(!turn_open_after_in(Format::Claude, &old_open, stop));
+        assert!(!turn_open_after(Path::new("/nonexistent/x.jsonl"), 0));
     }
 
     /// A Codex conversation killed mid-turn and resumed: the old open turn

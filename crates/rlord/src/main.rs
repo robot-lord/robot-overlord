@@ -299,6 +299,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What waits on you, in order: sessions that need you (a permission
+    /// prompt or a question), then finished turns you haven't looked at.
+    /// The same list the overlord's `attention` tool gives.
+    Attention {
+        #[command(subcommand)]
+        cmd: Option<AttentionCmd>,
+        /// At most this many
+        #[arg(long, short = 'n', default_value = "20")]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a session's event log
     Log {
         r#ref: String,
@@ -518,6 +530,21 @@ enum NavCmd {
     /// session (the mastermind): the overlord is one session now
     #[command(hide = true)]
     Mastermind,
+}
+
+#[derive(Subcommand)]
+enum AttentionCmd {
+    /// Tell the daemon a terminal moved or changed focus (run by tmux's
+    /// client hooks; never starts a daemon)
+    #[command(hide = true)]
+    Poke,
+    /// The shadow run so far against the go/no-go numbers for turning
+    /// announcements on (read from rlord's log; changes nothing)
+    Report {
+        /// Over the last N days
+        #[arg(long, default_value = "7")]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1322,6 +1349,35 @@ fn main() -> Result<()> {
             if agents.as_array().is_some_and(|a| !a.is_empty()) {
                 println!("  agents");
                 print_agents(&agents);
+            }
+            Ok(())
+        }
+        Command::Attention {
+            cmd: Some(AttentionCmd::Poke),
+            ..
+        } => {
+            // (Best effort: no daemon, nobody to tell.)
+            let _ = call_running("attention.poke", json!({}));
+            Ok(())
+        }
+        Command::Attention {
+            cmd: Some(AttentionCmd::Report { days }),
+            ..
+        } => {
+            let r = call("attention.report", json!({"days": days}))?;
+            print!("{}", r["text"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Command::Attention {
+            cmd: None,
+            limit,
+            json,
+        } => {
+            let r = call("attention.list", json!({"limit": limit}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", attention_text(&r));
             }
             Ok(())
         }
@@ -2214,6 +2270,8 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::opencode::start(&daemon);
         // Sessions whose agent pane died without a SessionEnd: stopped.
         rlord_daemon::recheck::start(&daemon);
+        // Who waits on the user: the queue, in shadow (attention.rs).
+        rlord_daemon::attention::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
         // before the first launch needs it.
         std::thread::spawn(rlord_core::agents::install::warm);
@@ -2235,6 +2293,47 @@ fn run_daemon() -> Result<()> {
     // would otherwise hold a restart hostage).
     rt.shutdown_timeout(std::time::Duration::from_millis(300));
     r
+}
+
+/// `rlord attention`'s text: one line per entry, then the sessions whose
+/// state can't be told.
+fn attention_text(r: &Value) -> String {
+    let mut out = String::new();
+    let entries = r["queue"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if entries.is_empty() {
+        out.push_str("nothing waiting\n");
+    }
+    for e in entries {
+        let kind = match e["kind"].as_str() {
+            Some("needs_you") => "needs you",
+            _ => "your turn",
+        };
+        let by = match e["prompted_by"].as_str() {
+            Some(who) => format!(" (prompted by {who})"),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{kind:<10} {:<24} {:<10} {:>4}{by}\n",
+            e["name"].as_str().unwrap_or("?"),
+            e["reason"].as_str().unwrap_or(""),
+            e["waited"].as_str().unwrap_or(""),
+        ));
+    }
+    if let Some(n) = r["more"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!("… and {n} more\n"));
+    }
+    for c in r["cant_tell"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        out.push_str(&format!(
+            "can't tell {}: {}\n",
+            c["name"].as_str().unwrap_or("?"),
+            c["why"].as_str().unwrap_or("")
+        ));
+    }
+    out
 }
 
 /// Fast path for agent hooks: read payload from stdin, forward to the daemon,
@@ -2285,8 +2384,11 @@ fn hook_emit(agent: &str) -> Result<()> {
             let socket = std::env::var("TMUX")
                 .ok()
                 .and_then(|t| t.split(',').next().map(str::to_string));
+            // When the hook ran: the daemon may get it late (a slow
+            // answer, a replay), and order matters (`wakes_idle`).
             json!({"instance": instance, "agent": agent, "event": event,
-                   "payload": payload, "pane": pane, "tmux": socket})
+                   "payload": payload, "pane": pane, "tmux": socket,
+                   "at": rlord_core::types::now_ms()})
         }
     };
     // Bounded: a stalled daemon never holds up the agent's tool call.
@@ -2918,6 +3020,27 @@ fn lineage_lines(s: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attention_prints_one_line_an_entry() {
+        use serde_json::json;
+        let r = json!({"queue": [
+            {"kind": "needs_you", "name": "api-fix", "reason": "question", "waited": "12m"},
+            {"kind": "your_turn", "name": "docs", "reason": "finished", "waited": "3m", "prompted_by": "rlord"},
+        ], "more": 1, "cant_tell": [{"name": "cx", "why": "Codex hooks not trusted yet"}]});
+        let t = super::attention_text(&r);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("needs you  api-fix") && lines[0].ends_with("12m"));
+        assert!(
+            lines[1].starts_with("your turn  docs") && lines[1].ends_with("(prompted by rlord)")
+        );
+        assert_eq!(lines[2], "… and 1 more");
+        assert_eq!(lines[3], "can't tell cx: Codex hooks not trusted yet");
+        assert_eq!(
+            super::attention_text(&json!({"queue": []})),
+            "nothing waiting\n"
+        );
+    }
+
     #[test]
     fn latest_prune_is_the_current_repo_unless_all() {
         use serde_json::json;

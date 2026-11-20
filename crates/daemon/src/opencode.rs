@@ -88,6 +88,8 @@ struct Follower {
     /// `service.json`, or nothing accepting connections at its address),
     /// in a row. An error answer means it is there: that resets it.
     failed: u8,
+    /// Passes in a row with no event stream after trying to connect.
+    unlinked: u8,
 }
 
 /// Start the follower.
@@ -102,6 +104,7 @@ pub fn start(d: &Arc<Daemon>) {
             gone: HashMap::new(),
             parents: HashMap::new(),
             failed: 0,
+            unlinked: 0,
         };
         loop {
             let began = Instant::now();
@@ -138,6 +141,8 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     f.gone.retain(|id, _| live.iter().any(|s| &s.id == id));
     f.blocked.retain(|id, _| live.iter().any(|s| &s.id == id));
     if live.is_empty() {
+        d.opencode_blind
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         f.link = None;
         f.parents.clear();
         f.failed = 0;
@@ -166,6 +171,16 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
             }
         }
     }
+    // (Needs-you is seen only through a live event stream: `attention`.
+    // Blind only once it stayed unlinked for a whole pass after a try: a
+    // reconnect blip suspends nothing.)
+    f.unlinked = if f.link.is_none() {
+        f.unlinked.saturating_add(1)
+    } else {
+        0
+    };
+    d.opencode_blind
+        .store(f.unlinked >= 2, std::sync::atomic::Ordering::Relaxed);
     match f.link.take() {
         Some((svc, mut events)) => {
             changed |= apply_deferred(d, Some(&svc), &up)?;
@@ -342,6 +357,7 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str, text: Option<&PromptMark
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
+    set_reason(db, s, kind, false, step.status.unwrap_or(s.status))?;
     // A prompt: the user's, or one rlord typed (`own.rs`: by its text
     // when the event carried it, else by time).
     let (kind, source) = if step.user_msg {
@@ -601,6 +617,9 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         let ended = turn.is_some_and(|t| !t.working());
         // (The times OpenCode recorded, not when rlord noticed.)
         let mut source = None;
+        // A turn's end: OpenCode's own time for it, the one its last
+        // message is dated from (the event is logged now, in order).
+        let mut idle_at = None;
         let (kind, from) = match want {
             // What it waited on was answered while rlord wasn't listening:
             // not a message (as from the event stream).
@@ -619,6 +638,7 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if ended => {
                 let idle = turn.and_then(|t| t.idle).unwrap_or(now);
                 db.touch_last_agent_msg(&s.id, idle)?;
+                idle_at = Some(idle);
                 ("agent_stopped", "opencode session")
             }
             // Its turn never ended: the server it ran in is gone, or the
@@ -627,11 +647,47 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             _ if seen == Seen::NotRunning => ("agent_stopped", "opencode turn not running"),
             _ => ("agent_stopped", "opencode server gone"),
         };
-        let detail = crate::own::with_source(json!({ "from": from }), source);
+        // (A form among what it waits on: a question.)
+        let question = pending
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|w| w.starts_with("form:")));
+        set_reason(&db, s, kind, question, want)?;
+        let mut detail = crate::own::with_source(json!({ "from": from }), source);
+        if let Some(t) = idle_at {
+            detail["idle_at"] = json!(t);
+        }
         db.insert_event(&s.id, now, kind, &detail.to_string())?;
         changed = true;
     }
     Ok(changed)
+}
+
+/// Why the session waits, for the attention queue, after a step logged as
+/// `kind` (`methods::attention_reason` for the hooks): `question` (a form,
+/// or `question` when a form is among what it waits on) wins over a
+/// permission while it still waits; a turn's end is `finished`; a new
+/// turn or start clears it.
+/// `after`: the status once the step is written (a prompt while it still
+/// waits on someone leaves the reason).
+fn set_reason(db: &Db, s: &Session, kind: &str, question: bool, after: Status) -> Result<()> {
+    let kept =
+        s.status == Status::WaitingInput && s.attention_reason.as_deref() == Some("question");
+    let reason = match kind {
+        "question" => Some(Some("question")),
+        "permission_request" if question || kept => Some(Some("question")),
+        "permission_request" => Some(Some("permission")),
+        "agent_stopped" => Some(Some("finished")),
+        "turn_started" | "prompt_submitted" | "rlord_prompt" | "session_start"
+            if after != Status::WaitingInput =>
+        {
+            Some(None)
+        }
+        _ => None,
+    };
+    if let Some(r) = reason.filter(|r| *r != s.attention_reason.as_deref()) {
+        db.set_attention_reason(&s.id, r)?;
+    }
+    Ok(())
 }
 
 /// Confirm each launch's model (see `Deferred`), once:
@@ -1200,6 +1256,33 @@ mod tests {
         db
     }
 
+    /// The resync path keeps why it waits too (a form among what it waits
+    /// on is a question).
+    #[test]
+    fn the_reason_follows_every_write_path() {
+        let db = db_with("01oc", "opencode", "ses_1a");
+        let s = || db.resolve_ref("01oc").unwrap();
+        let reason = || s().attention_reason;
+        set_reason(&db, &s(), "permission_request", true, WaitingInput).unwrap();
+        assert_eq!(reason().as_deref(), Some("question"));
+        db.set_status("01oc", WaitingInput, 5).unwrap();
+        set_reason(&db, &s(), "permission_request", false, WaitingInput).unwrap();
+        assert_eq!(
+            reason().as_deref(),
+            Some("question"),
+            "still the question it waits on"
+        );
+        set_reason(&db, &s(), "agent_stopped", false, Idle).unwrap();
+        assert_eq!(reason().as_deref(), Some("finished"));
+        // A prompt while still waiting (on another form): the reason stays.
+        db.set_status("01oc", WaitingInput, 6).unwrap();
+        set_reason(&db, &s(), "question", false, WaitingInput).unwrap();
+        set_reason(&db, &s(), "prompt_submitted", false, WaitingInput).unwrap();
+        assert_eq!(reason().as_deref(), Some("question"));
+        set_reason(&db, &s(), "prompt_submitted", false, Working).unwrap();
+        assert_eq!(reason(), None);
+    }
+
     #[test]
     fn signals_write_status_events_and_message_times() {
         let db = db_with("01oc", "opencode", "ses_1a");
@@ -1221,11 +1304,13 @@ mod tests {
         assert_eq!(events(), n);
         assert!(on(Signal::Asked("perm:1".into())));
         assert_eq!(get().status, WaitingInput);
+        assert_eq!(get().attention_reason.as_deref(), Some("permission"));
         assert_eq!(get().last_agent_msg_at, None);
         assert!(on(Signal::Answered("perm:1".into())));
         assert_eq!(get().status, Working);
         assert!(on(Signal::Ended));
         assert_eq!(get().status, Idle);
+        assert_eq!(get().attention_reason.as_deref(), Some("finished"));
         assert!(get().last_agent_msg_at.is_some());
         assert!(!on(Signal::Ended));
         // A stopped session (its TUI closed) isn't revived by the server

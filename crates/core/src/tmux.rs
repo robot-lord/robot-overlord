@@ -522,6 +522,11 @@ pub struct Client {
     pub session: String,
     /// Last input/output activity, epoch seconds.
     pub activity: i64,
+    /// Its terminal window has focus. rlord's server has `focus-events on`
+    /// (tmux 3.2+, rlord's minimum, reports it); a terminal that never
+    /// reports focus reads as focused (tmux starts a client focused), so
+    /// this is false only after it said it lost it.
+    pub focused: bool,
 }
 
 pub fn list_clients() -> Vec<Client> {
@@ -530,20 +535,33 @@ pub fn list_clients() -> Vec<Client> {
         "-F",
         // Space-separated: none of the leading fields contain spaces; the
         // session name (which may) comes last.
-        "#{client_activity} #{client_control_mode} #{client_name} #{session_name}",
+        "#{client_activity} #{client_control_mode} #{client_name} #{client_flags} #{session_name}",
     ]) else {
         return vec![]; // no server
     };
+    parse_clients(&out)
+}
+
+/// `list_clients`' lines: activity, control mode, name, flags (`attached,
+/// focused,UTF-8`), session.
+fn parse_clients(out: &str) -> Vec<Client> {
     out.lines()
         .filter_map(|l| {
-            let mut f = l.splitn(4, ' ');
+            let mut f = l.splitn(5, ' ');
             let activity = f.next()?.parse().ok()?;
             if f.next()? == "1" {
                 return None; // control-mode client (a program, not a person)
             }
+            let name = f.next()?.to_string();
+            let flags = f.next()?;
             Some(Client {
                 activity,
-                name: f.next()?.to_string(),
+                name,
+                // tmux 3.2+ (rlord's minimum) lists `focused` among the
+                // flags ("Include focused in client flags", 3.2's
+                // CHANGES): a list without it says unfocused. No flags at
+                // all: no focus info, counted as focused.
+                focused: flags.is_empty() || flags.split(',').any(|x| x == "focused"),
                 session: f.next()?.to_string(),
             })
         })
@@ -564,6 +582,40 @@ pub fn user_client<'a>(clients: &'a [Client], home: Option<&str>) -> Option<&'a 
         .filter(ours)
         .max_by_key(|c| c.activity)
         .or_else(|| clients.iter().max_by_key(|c| c.activity))
+}
+
+/// The client events that change who is looking at what: each runs
+/// `rlord attention poke` (in the background), so the attention queue
+/// looks at presence again. Checked on a scratch tmux 3.8 socket: all five
+/// fire (focus in and out with `focus-events on`).
+const PRESENCE_HOOKS: [&str; 5] = [
+    "client-focus-in",
+    "client-focus-out",
+    "client-session-changed",
+    "client-attached",
+    "client-detached",
+];
+
+/// Set the presence hooks on rlord's server, at their own index (90) so
+/// the user's own hooks of the same name stay.
+pub fn set_presence_hooks(rlord_bin: &str) -> Result<()> {
+    let cmd = format!(
+        "run-shell -b {}",
+        tmux_dq(&format!("{} attention poke", shell_quote(rlord_bin)))
+    );
+    // Each on its own: one this tmux lacks doesn't stop the others.
+    let failed: Vec<String> = PRESENCE_HOOKS
+        .iter()
+        .filter_map(|h| {
+            run(&["set-hook", "-g", &format!("{h}[90]"), &cmd])
+                .err()
+                .map(|e| format!("{h}: {e}"))
+        })
+        .collect();
+    if !failed.is_empty() {
+        bail!("presence hooks not set: {}", failed.join("; "));
+    }
+    Ok(())
 }
 
 /// Point a specific client at a session.
@@ -1629,12 +1681,34 @@ mod tests {
         assert!(!p.contains_key("g"));
     }
 
+    /// Flags as tmux 3.8 printed them on a scratch socket with
+    /// `focus-events on` (live check, 2026-11-18): `focused` goes when the
+    /// terminal reports focus out and comes back on focus in.
+    #[test]
+    fn clients_say_whether_their_window_has_focus() {
+        let out = "1795035108 0 /dev/ttys044 attached,focused,UTF-8 a b\n\
+                   1795035109 0 /dev/ttys045 attached,UTF-8 c\n\
+                   1795035110 1 client-1 attached,focused,control-mode d";
+        let c = parse_clients(out);
+        assert_eq!(c.len(), 2, "a control-mode client is a program");
+        assert!(c[0].focused && c[0].session == "a b");
+        assert!(!c[1].focused && c[1].session == "c");
+        // A flag list without `focused`: explicitly unfocused (tmux 3.2+
+        // reports focus); an empty flag field: no focus info, focused.
+        let c = parse_clients("1 0 /dev/ttys046  e");
+        assert!(c[0].focused && c[0].session == "e");
+        // None focused: nobody is looking.
+        let c = parse_clients("1 0 /dev/ttys044 attached,UTF-8 a\n2 0 /dev/ttys045 attached c");
+        assert!(c.iter().all(|c| !c.focused));
+    }
+
     #[test]
     fn user_client_is_most_recent() {
         let c = |n: &str, a| Client {
             name: n.into(),
             session: "s".into(),
             activity: a,
+            focused: true,
         };
         let clients = vec![c("/dev/ttys1", 10), c("/dev/ttys2", 20)];
         assert_eq!(user_client(&clients, None).unwrap().name, "/dev/ttys2");

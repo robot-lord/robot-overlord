@@ -45,6 +45,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "search_history",
     "read_history",
     "recall",
+    "attention",
     "list_groups",
     "find_repos",
     "keys_list",
@@ -275,6 +276,10 @@ pub fn tools() -> Value {
             "Set the user's favourite groups, in order: they head the groups list (★); the rest follow, biggest first. Replaces the whole list, so pass every favourite you want to keep (get_ui_state / list_groups shows the current order).",
             json!({"order": {"type": "array", "items": {"type": "string"}, "description": "Tags, most important first; [] clears"}}),
             &["order"]),
+        tool("attention",
+            "What waits on the user, in order (plain code, no screen or transcript reads): needs_you (blocked on a permission prompt or a question; reason permission|question) oldest first, then your_turn (a finished turn they haven't looked at since; reason finished|failed; prompted_by rlord when rlord sent the prompt) oldest first. Each entry: session, name, kind, reason, since, waited, seen, settled. Also the counts, and cant_tell: live sessions whose needs-you can't be seen (Codex before its hooks are trusted, OpenCode with its server out of reach). The overlord's own sessions are never listed.",
+            json!({"limit": {"type": "integer", "description": "Max entries (default 20)"}}),
+            &[]),
         tool("triage",
             "Cheap first pass for upkeep (no AI, no screen reads): live sessions changed since you last reviewed them, newest first, with what their meta-context is missing (flags: default_name, no_description, untagged, waiting_on_user) and excerpts from their transcripts (first_prompt, last_prompt, last_reply, title). Editing a session with update_session/organize marks it reviewed.",
             json!({
@@ -975,6 +980,10 @@ pub fn call(d: &Daemon, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(json!({"results": done}))
         }
+        "attention" => d.rpc(
+            "attention.list",
+            json!({"limit": args.get("limit").and_then(Value::as_u64)}),
+        ),
         "triage" => {
             let mut p = Map::new();
             if let Some(v) = args.get("all").and_then(Value::as_bool) {

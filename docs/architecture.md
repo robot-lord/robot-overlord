@@ -419,6 +419,23 @@ Same three-tier degradation the research validated, implemented once:
 Every status transition is an `events` row and a push to subscribers; that is
 what makes the TUI live and `last_state_change_at` trustworthy.
 
+Claude starts some turns with no `UserPromptSubmit`: a prompt queued while
+it worked, and after the user's `!` shell command. Their `Stop` arrives
+while the session is already idle. So a tool call finishing
+(`PostToolUse`) from the session's own agent (no `agent_id`) while `idle`
+sets `working` (`methods::wakes_idle`), but only when the transcript's
+tail shows a turn open that began after the last turn's end (read before
+the DB lock is taken, and only past the cheap checks): a tool hook alone
+would leave the session working with nothing to set it back. Live
+hooks only, never a replayed one. A background task finishing does run `UserPromptSubmit` (Claude Code
+2.1.327); a hook prompt that starts with `<task-notification>` (how the
+transcript shows that wake) is logged with `wake: true`.
+
+Why a session waits is kept beside its status (`attention_reason`):
+`permission` or `question` while it needs you (a question wins over the
+permission request Claude fires with it), `finished` or `failed` once the
+turn is over (`StopFailure`); a prompt clears it.
+
 ### Stale statuses re-checked (`daemon/src/recheck.rs`)
 
 A stored status moves only when an event moves it. An agent that crashed
