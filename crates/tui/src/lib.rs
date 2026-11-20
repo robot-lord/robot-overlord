@@ -347,10 +347,6 @@ struct App {
     /// wheel, a click, focus loss) and by a list refresh, which can move
     /// rows under a pointer that stays put.
     hover_row: Option<(String, u16, u16)>,
-    /// The Status column's width when the list was last drawn, and
-    /// whether it was narrow (glyphs alone).
-    list_status_w: u16,
-    list_narrow: bool,
     /// The list was refreshed since the pointer last moved: drop the
     /// popup if its session is no longer the row under the pointer.
     hover_stale: bool,
@@ -428,8 +424,6 @@ impl App {
             last_click: None,
             idle_motion: false,
             hover_row: None,
-            list_status_w: list_cols::STATUS_W,
-            list_narrow: false,
             hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
@@ -1571,7 +1565,7 @@ impl App {
         }
         self.draw_footer(f, footer_area);
         if matches!(self.mode, Mode::Normal) {
-            self.draw_hover(f);
+            self.draw_hover(f, list_area.width);
         }
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
@@ -1595,7 +1589,7 @@ impl App {
 
     /// The popup over the list row under the pointer: its status, and every
     /// symbol on the row, in words.
-    fn draw_hover(&self, f: &mut Frame) {
+    fn draw_hover(&self, f: &mut Frame, list_w: u16) {
         let Some((id, x, y)) = &self.hover_row else {
             return;
         };
@@ -1603,10 +1597,11 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
+        let cols = ListCols::for_width(list_w);
         let lines = statustext::describe(
             s,
-            self.list_narrow,
-            usize::from(self.list_status_w),
+            cols.narrow,
+            usize::from(cols.status_w),
             rlord_core::types::now_ms(),
         );
         if lines.is_empty() {
@@ -1654,8 +1649,6 @@ impl App {
             tags_w,
             project: show_project,
         } = ListCols::for_width(area.width);
-        self.list_status_w = status_w;
-        self.list_narrow = narrow;
         let show_tags = tags_w > 0;
         let sel_w = list_cols::sel_w();
 
@@ -2128,12 +2121,9 @@ impl App {
             },
         ];
         // Every symbol on its row, in words.
-        for (n, l) in statustext::describe_status(s, rlord_core::types::now_ms())
-            .into_iter()
-            .enumerate()
-        {
+        for (label, l) in statustext::describe_status(s, rlord_core::types::now_ms()) {
             lines.push(Line::from(vec![
-                key(if n == 0 { "status" } else { "" }),
+                key(label),
                 Span::styled(l, theme::muted()),
             ]));
         }
@@ -2910,15 +2900,9 @@ fn others_up(s: &Value) -> String {
 /// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
 /// wanted but failing or unavailable (red); nothing when off.
 pub(crate) fn remote_chip(r: &Value) -> Span<'static> {
-    match r["state"].as_str() {
-        Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
-        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
-            Span::styled(" ⇄", theme::faint())
-        }
-        Some("failed") | Some("unavailable") => {
-            Span::styled(" ⇄", Style::default().fg(theme::red()))
-        }
-        _ => Span::raw(""),
+    match statustext::remote_parts(r) {
+        Some((style, _)) => Span::styled("⇄", style),
+        None => Span::raw(""),
     }
 }
 

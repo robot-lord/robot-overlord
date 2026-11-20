@@ -572,7 +572,7 @@ counts.`). In a narrow list, where the status is its glyph alone, the
 line spells out the label (`○ — your turn: …`). Marks the column has
 no room for come after the rest, marked "(not shown in this width)". `?` lists every status symbol.
 `rlord show <ref>` prints the same card, with the popup's lines (every
-mark) as its status. The list always wins on space: it
+mark but `⋯`, which only the list knows) under their own labels. The list always wins on space: it
 keeps its width and the preview drops out first when the terminal is narrow.
 Where its `list_width_pct` share is too narrow for a readable name, Status,
 the time column and Usage, the list borrows that much from the preview,

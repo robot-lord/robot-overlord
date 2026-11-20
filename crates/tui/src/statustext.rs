@@ -115,20 +115,39 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
 
 /// The Remote Control mark (⇄) in words, if the list shows one.
 pub fn remote_sentence(s: &Value) -> Option<String> {
-    let r = &s["remote"];
+    remote_parts(&s["remote"]).map(|(_, t)| t)
+}
+
+/// Each Remote Control state the list draws a ⇄ for: its colour and
+/// what it means. None: no mark (off, or a state the list doesn't draw).
+pub fn remote_parts(r: &Value) -> Option<(Style, String)> {
     let why = r["reason"].as_str();
+    let dim = theme::faint();
     Some(match r["state"].as_str()? {
-        "on" => "Remote Control connected: reachable from the Claude app.".into(),
-        "connecting" => "Remote Control connecting.".into(),
-        "pending" => format!(
-            "Remote Control on, not connected yet: {}.",
-            why.unwrap_or("needs a restart")
+        "on" => (
+            Style::default().fg(theme::green()),
+            "Remote Control connected: reachable from the Claude app.".into(),
         ),
-        "stopped" => "Remote Control on: connects when the session starts.".into(),
-        "disconnecting" => "Remote Control off: disconnects when the session restarts.".into(),
-        st @ ("failed" | "unavailable") => {
-            format!("Remote Control {st}: {}.", why.unwrap_or("unknown reason"))
-        }
+        "connecting" => (dim, "Remote Control connecting.".into()),
+        "pending" => (
+            dim,
+            format!(
+                "Remote Control on, not connected yet: {}.",
+                why.unwrap_or("needs a restart")
+            ),
+        ),
+        "stopped" => (
+            dim,
+            "Remote Control on: connects when the session starts.".into(),
+        ),
+        "disconnecting" => (
+            dim,
+            "Remote Control off: disconnects when the session restarts.".into(),
+        ),
+        st @ ("failed" | "unavailable") => (
+            Style::default().fg(theme::red()),
+            format!("Remote Control {st}: {}.", why.unwrap_or("unknown reason")),
+        ),
         _ => return None,
     })
 }
@@ -167,6 +186,9 @@ pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
 /// One mark from the row's Status column and what it means. `mark` is
 /// the column's own text and colour (empty for a line with no mark).
 pub struct Item {
+    /// The details row it belongs under (`status`, `agents`, `remote`,
+    /// `shells`).
+    pub label: &'static str,
     pub mark: Span<'static>,
     pub text: String,
     /// The column has room for it (`status_marks`'s width).
@@ -195,18 +217,15 @@ impl Item {
     }
 }
 
-fn trimmed(sp: Span<'static>) -> Span<'static> {
-    Span::styled(sp.content.trim().to_string(), sp.style)
-}
-
 /// The row's Status column: each mark as the list draws it and what it
 /// means. `narrow`: the status as its glyph alone. Only the marks that
 /// fit in `width` columns are kept, so the popup explains just what the
 /// list shows. The list and the popup both use this, so they can't
 /// drift apart. A row with no status keeps its mark with empty text.
 pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
-    let chip = trimmed(crate::state_chip(s, false));
-    let known = !matches!(crate::shown(s), "-" | "");
+    let chip = crate::state_chip(s, false);
+    let shown = crate::shown(s);
+    let known = !matches!(shown, "-" | "");
     let mut text = if known {
         status_sentence(s, now)
     } else {
@@ -217,8 +236,8 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         let glyph: String = c.next().map(String::from).unwrap_or_default();
         // The label the glyph stands for, unless the sentence already
         // names it (a status this version doesn't know).
-        let known_label = MEANINGS.iter().any(|(k, _)| *k == crate::shown(s))
-            || matches!(crate::shown(s), "limited" | "background");
+        let known_label =
+            MEANINGS.iter().any(|(k, _)| *k == shown) || matches!(shown, "limited" | "background");
         if known && known_label {
             text = format!("{}: {text}", c.as_str().trim());
         }
@@ -227,6 +246,7 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
         chip
     };
     let mut v = vec![Item {
+        label: "status",
         mark,
         text,
         shown: true,
@@ -235,14 +255,16 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
     // the agent counts aren't yet.
     if s["loading"] == true {
         v.push(Item {
+            label: "agents",
             mark: Span::styled("⋯", theme::faint()),
             text: "still loading its sub-agent counts.".into(),
             shown: true,
         });
     }
-    if let Some(text) = remote_sentence(s) {
+    if let Some((style, text)) = remote_parts(&s["remote"]) {
         v.push(Item {
-            mark: trimmed(crate::remote_chip(&s["remote"])),
+            label: "remote",
+            mark: Span::styled("⇄", style),
             text,
             shown: true,
         });
@@ -250,6 +272,7 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
     let n = s["agents_running"].as_i64().unwrap_or(0);
     if n != 0 {
         v.push(Item {
+            label: "agents",
             mark: Span::styled(format!("⚙{n}"), Style::default().fg(theme::overlord())),
             text: format!("{n} sub-agent{} running.", if n == 1 { "" } else { "s" }),
             shown: true,
@@ -298,17 +321,18 @@ pub fn describe(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
 /// The details card's status row: the status in words and any shells,
 /// without marks (the headline shows the status chip; its own `remote`
 /// and `agents` rows cover the rest).
-pub fn describe_status(s: &Value, now: i64) -> Vec<String> {
+pub fn describe_status(s: &Value, now: i64) -> Vec<(&'static str, String)> {
     let mut v = Vec::new();
     if !matches!(crate::shown(s), "-" | "") {
-        v.push(status_sentence(s, now));
+        v.push(("status", status_sentence(s, now)));
     }
-    v.extend(shells_sentence(s, now));
+    v.extend(shells_sentence(s, now).map(|t| ("shells", t)));
     v
 }
 
 fn shells_line(s: &Value, now: i64) -> Option<Item> {
     shells_sentence(s, now).map(|text| Item {
+        label: "shells",
         mark: Span::raw(""),
         text,
         shown: true,
@@ -404,9 +428,12 @@ mod tests {
         // The details card keeps only the status (and shells).
         assert_eq!(
             describe_status(&s, 0),
-            ["stopped on a usage limit until 3:00pm. It resumes by itself."]
+            [(
+                "status",
+                "stopped on a usage limit until 3:00pm. It resumes by itself.".to_string()
+            )]
         );
-        // Marks the column has no room for get no line.
+        // Marks the column has no room for come last, said so.
         let d = describe(&s, false, 13, 0);
         assert_eq!(
             d.iter().map(Item::plain).collect::<Vec<_>>()[2..],

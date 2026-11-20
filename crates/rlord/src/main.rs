@@ -1324,11 +1324,11 @@ fn main() -> Result<()> {
             // The status as the list shows it, every symbol in words.
             let lines =
                 rlord_tui::statustext::describe(&s, false, usize::MAX, rlord_core::types::now_ms());
-            if lines.is_empty() {
-                println!("  status     status unknown");
+            if lines.first().is_none_or(|l| l.label != "status") {
+                println!("  status     unknown");
             }
-            for (i, l) in lines.iter().enumerate() {
-                println!("  {:<10} {}", if i == 0 { "status" } else { "" }, l.plain());
+            for l in &lines {
+                println!("  {:<10} {}", l.label, l.plain());
             }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
             println!("  dir        {}", g("project_path"));
