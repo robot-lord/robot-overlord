@@ -3,20 +3,20 @@
 //! `docs/architecture.md`.)
 //!
 //! A stored status moves only when an event moves it. An agent that
-//! crashed without its `SessionEnd`, or a tmux session that went away,
-//! leaves a live status behind. Once at daemon start and then once a
-//! minute, every session that follows hooks (Claude; Codex once its hooks
-//! are trusted) is looked at: its agent pane's program exited, or its tmux
-//! session gone (found by its rlord mark, not its name: a rename outside
-//! rlord isn't an end), on two answered looks of the same pane in a row:
-//! stopped. Nothing else is concluded: when tmux can't answer (no server
-//! running included), there is no verdict that pass.
+//! crashed without its `SessionEnd` leaves a live status behind on a dead
+//! pane. Once at daemon start and then once a minute, every session that
+//! follows hooks (Claude; Codex once its hooks are trusted) is looked at:
+//! its tmux session there under its stored name, and its agent pane's
+//! program exited, on two answered looks of the same pane in a row:
+//! stopped. Nothing else is concluded: a tmux session missing (killed, or
+//! renamed outside rlord) is the startup reconcile's, and when tmux can't
+//! answer (no server running included) there is no verdict that pass.
 //!
 //! Bounded: one `tmux list-panes -a` a pass, and one more for each stop.
-//! Nothing is read under the DB lock; a session is stopped only if it is
-//! still as it was read, under its session lock.
+//! No tmux call is made under the DB lock; a session is stopped only if
+//! it is still as it was read, under its session lock.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,34 +32,19 @@ use crate::Daemon;
 /// Time between passes.
 const PASS: Duration = Duration::from_secs(60);
 
-/// What the checker asks tmux (tests answer it themselves).
-pub(crate) trait Tmux {
-    /// Every tmux session's agent pane, by name (`tmux::agent_panes`).
-    fn panes(&self) -> Result<HashMap<String, AgentPane>>;
-    /// Mark tmux session `name` with rlord session `id`.
-    fn mark(&self, name: &str, id: &str);
-}
-
-struct Real<'a>(&'a Daemon);
-
-impl Tmux for Real<'_> {
-    fn panes(&self) -> Result<HashMap<String, AgentPane>> {
-        tmux::agent_panes()
-    }
-    fn mark(&self, name: &str, id: &str) {
-        crate::methods::mark_tmux(&self.0.db(), name, id);
-    }
-}
+/// Every tmux session's agent pane, by name (`tmux::agent_panes`; tests
+/// pass their own).
+pub(crate) type Panes<'a> = dyn Fn() -> Result<HashMap<String, AgentPane>> + 'a;
 
 /// Start the checker: a pass now (after `Daemon::startup`'s reconcile),
 /// then one every `PASS`.
 pub fn start(d: &Arc<Daemon>) {
     let d = Arc::clone(d);
     std::thread::spawn(move || {
-        let mut memo = Memo::default();
+        let mut gone = Gone::new();
         loop {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pass(&d, &mut memo, &Real(&d))
+                pass(&d, &mut gone, &tmux::agent_panes)
             }));
             match r {
                 Ok(Err(e)) => tracing::debug!(error = %e, "re-checking panes"),
@@ -84,163 +69,89 @@ fn checked(s: &Session) -> bool {
         }
 }
 
-/// What passes remember.
-#[derive(Default)]
-pub(crate) struct Memo {
-    /// Per session: dead looks in a row, of which pane (None: its tmux
-    /// session missing), and its `last_state_change_at` at the first. (A
-    /// restart through rlord respawns in the same pane, `respawn-pane -k`
-    /// keeps its id: it is caught by the pane being live again, by
-    /// `last_state_change_at` when the status moves, and by the session
-    /// lock `stop` holds; a new pane id is a new tmux session.)
-    gone: HashMap<String, (u8, Option<String>, Option<i64>)>,
-    /// Sessions seen marked with their rlord id: only these can be told
-    /// gone when no tmux session carries the mark (else a rename outside
-    /// rlord looks like an end).
-    marked: HashSet<String>,
+/// Dead looks in a row at one session's agent pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Looks {
+    count: u8,
+    /// The pane seen dead.
+    pane: String,
+    /// The session's `last_state_change_at` at the first dead look.
+    since: Option<i64>,
 }
 
-/// Where session `s` is in a snapshot.
-#[derive(Debug, PartialEq)]
-enum Found<'a> {
-    Pane(&'a AgentPane),
-    Missing,
+/// Per session id.
+pub(crate) type Gone = HashMap<String, Looks>;
+
+/// Session `s`'s dead agent pane in a snapshot: its pane id when its tmux
+/// session is there under the stored name and the pane's program exited.
+/// None otherwise: alive, or missing (not this checker's to judge).
+fn dead_pane(s: &Session, panes: &HashMap<String, AgentPane>) -> Option<String> {
+    let p = panes.get(s.tmux_session.as_deref()?)?;
+    p.dead.then(|| p.pane.clone())
 }
 
-/// Session `s`'s agent pane in a snapshot: the tmux sessions marked with
-/// its id, and the one under its stored name if that isn't marked as
-/// another's. One: that. More (a copy of a marked session): a live one,
-/// the first by tmux name (never `HashMap` order); none live: the one
-/// under its stored name, else the newest pane (the highest `%id`).
-fn find<'a>(s: &Session, panes: &'a HashMap<String, AgentPane>) -> Found<'a> {
-    let mut found: Vec<(&String, &AgentPane)> = panes
-        .iter()
-        .filter(|(name, p)| {
-            p.mark.as_deref() == Some(s.id.as_str())
-                || (s.tmux_session.as_deref() == Some(name.as_str()) && p.mark.is_none())
-        })
-        .collect();
-    found.sort_by(|a, b| a.0.cmp(b.0));
-    match found.as_slice() {
-        [] => Found::Missing,
-        [(_, p)] => Found::Pane(p),
-        many => {
-            let pane = many
-                .iter()
-                .find(|(_, p)| !p.dead)
-                .or_else(|| {
-                    many.iter()
-                        .find(|(n, _)| s.tmux_session.as_deref() == Some(n.as_str()))
-                })
-                .or_else(|| many.iter().max_by_key(|(_, p)| pane_number(&p.pane)))
-                .map(|(_, p)| *p);
-            pane.map_or(Found::Missing, Found::Pane)
-        }
-    }
-}
-
-/// A pane id's number (`%12`: 12): tmux numbers panes as it makes them.
-fn pane_number(pane: &str) -> u64 {
-    pane.trim_start_matches('%').parse().unwrap_or(0)
-}
-
-/// What one look says of session `s`: `Some(pane)` dead (`pane` None: its
-/// tmux session is gone, which only a marked session can be told), or
-/// None (alive, or nothing can be concluded).
-fn dead_look(
-    s: &Session,
-    panes: &HashMap<String, AgentPane>,
-    marked: bool,
-) -> Option<Option<String>> {
-    match find(s, panes) {
-        Found::Pane(p) => p.dead.then(|| Some(p.pane.clone())),
-        Found::Missing => marked.then_some(None),
-    }
-}
-
-/// Count one look at session `s`. Two dead looks in a row count only if
-/// they are of the same pane id (or both found its tmux session gone) and
-/// the status didn't change between them. Returns the dead looks in a
-/// row.
-fn count_look(s: &Session, memo: &mut Memo, look: Option<Option<String>>) -> u8 {
-    let Some(pane) = look else {
-        memo.gone.remove(&s.id);
+/// Count one look at session `s` (`dead`: the dead pane seen, if any).
+/// Two dead looks in a row count only for the same pane id with the
+/// status time unchanged. (`respawn-pane -k` keeps the pane id: a restart
+/// is caught by the pane being live again, by `last_state_change_at` when
+/// the status moves, and by the session lock `stop` holds.) Returns the
+/// dead looks in a row.
+fn count_look(s: &Session, gone: &mut Gone, dead: Option<String>) -> u8 {
+    let Some(pane) = dead else {
+        gone.remove(&s.id);
         return 0;
     };
-    let at = s.last_state_change_at;
-    let e = memo
-        .gone
-        .entry(s.id.clone())
-        .or_insert((0, pane.clone(), at));
-    if e.0 > 0 && e.1 == pane && e.2 == at {
-        e.0 = e.0.saturating_add(1);
-    } else {
-        *e = (1, pane, at);
+    let since = s.last_state_change_at;
+    match gone.get_mut(&s.id) {
+        Some(l) if l.pane == pane && l.since == since => {
+            l.count = l.count.saturating_add(1);
+            l.count
+        }
+        _ => {
+            gone.insert(
+                s.id.clone(),
+                Looks {
+                    count: 1,
+                    pane,
+                    since,
+                },
+            );
+            1
+        }
     }
-    e.0
 }
 
 /// One pass. When tmux can't say, no verdict this pass, and the counts
 /// start again (two looks in a row means two answered ones). One
 /// session's failure is logged and the pass goes on. Returns how many
 /// sessions were stopped.
-pub(crate) fn pass(d: &Daemon, memo: &mut Memo, tmux: &dyn Tmux) -> Result<usize> {
+pub(crate) fn pass(d: &Daemon, gone: &mut Gone, panes: &Panes<'_>) -> Result<usize> {
     let sessions: Vec<Session> = d
         .db()
         .running_sessions()?
         .into_iter()
         .filter(checked)
         .collect();
-    memo.gone
-        .retain(|id, _| sessions.iter().any(|s| &s.id == id));
-    memo.marked
-        .retain(|id| sessions.iter().any(|s| &s.id == id));
-    let panes = match tmux.panes() {
+    gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    let snapshot = match panes() {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(error = %e, "tmux couldn't say: no verdict this pass");
-            memo.gone.clear();
+            gone.clear();
             return Ok(0);
         }
     };
     let mut stopped = 0;
     for s in &sessions {
-        // Seen marked: from now on it is found by its mark. Not marked
-        // yet (made before marks): marked now.
-        match find(s, &panes) {
-            Found::Pane(p) if p.mark.as_deref() == Some(s.id.as_str()) => {
-                memo.marked.insert(s.id.clone());
-            }
-            Found::Pane(_) => {
-                if let Some(t) = s.tmux_session.as_deref() {
-                    tmux.mark(t, &s.id);
-                }
-            }
-            Found::Missing => {}
-        }
-        // (Marked by rlord at its start or restart counts too: killed
-        // before the first look, it can still be told gone.)
-        let marked = memo.marked.contains(&s.id) || {
-            let db = d.db();
-            // (Can't read it: not known marked, and the pass goes on.)
-            match db.kv_get(&crate::methods::tmux_marked_key(&s.id)) {
-                Ok(v) => v.is_some(),
-                Err(e) => {
-                    tracing::debug!(session = %s.id, error = %e, "reading its mark");
-                    false
-                }
-            }
-        };
-        if marked {
-            memo.marked.insert(s.id.clone());
-        }
-        let look = dead_look(s, &panes, marked);
-        let pane = look.clone();
-        if count_look(s, memo, look) < 2 {
+        let dead = dead_pane(s, &snapshot);
+        let seen = dead.clone();
+        if count_look(s, gone, dead) < 2 {
             continue;
         }
-        let seen = pane.expect("counted dead");
-        match stop(d, s, &seen, memo.marked.contains(&s.id), tmux) {
+        let Some(seen) = seen else {
+            continue;
+        };
+        match stop(d, s, &seen, panes) {
             Ok(true) => stopped += 1,
             Ok(false) => {}
             Err(e) => {
@@ -254,23 +165,15 @@ pub(crate) fn pass(d: &Daemon, memo: &mut Memo, tmux: &dyn Tmux) -> Result<usize
     Ok(stopped)
 }
 
-/// Stop session `s` (its pane `seen` found dead twice; None: its tmux
-/// session gone), through `discover`'s stop. Under the session's lock (a
-/// restart through rlord holds it), tmux is asked again: the same pane
-/// still dead (or the session still gone), else nothing. Then under the
-/// DB lock, only if the session is still as it was read: its status, when
-/// that last changed, and its message times. Returns whether it was
-/// stopped.
-fn stop(
-    d: &Daemon,
-    s: &Session,
-    seen: &Option<String>,
-    marked: bool,
-    tmux: &dyn Tmux,
-) -> Result<bool> {
+/// Stop session `s` (its agent pane `seen` found dead twice), through
+/// `discover`'s stop. Under the session's lock (a restart through rlord
+/// holds it), tmux is asked again: the same pane still dead, else
+/// nothing. Then, under the DB lock with no tmux call, only if the
+/// session is still as it was read: its status, when that last changed,
+/// and its message times. Returns whether it was stopped.
+fn stop(d: &Daemon, s: &Session, seen: &str, panes: &Panes<'_>) -> Result<bool> {
     let _session = d.sessions.lock(&s.id);
-    let now = tmux.panes()?;
-    if dead_look(s, &now, marked).as_ref() != Some(seen) {
+    if dead_pane(s, &panes()?).as_deref() != Some(seen) {
         return Ok(false);
     }
     let db = d.db();
@@ -321,8 +224,7 @@ mod tests {
         db.set_status(id, status, at).unwrap();
     }
 
-    /// A tmux that answers from a table: tmux session name to (pane,
-    /// dead, mark). Marks set through `mark` land in it.
+    /// tmux as a table: session name to its agent pane; `down`: no server.
     #[derive(Default)]
     struct Fake {
         panes: RefCell<HashMap<String, AgentPane>>,
@@ -331,35 +233,19 @@ mod tests {
 
     impl Fake {
         fn set(&self, name: &str, pane: &str, dead: bool) {
-            let mut p = self.panes.borrow_mut();
-            let mark = p.get(name).and_then(|x| x.mark.clone());
-            p.insert(
+            self.panes.borrow_mut().insert(
                 name.into(),
                 AgentPane {
                     pane: pane.into(),
                     dead,
-                    mark,
                 },
             );
         }
-        fn rename(&self, from: &str, to: &str) {
-            let mut p = self.panes.borrow_mut();
-            let x = p.remove(from).unwrap();
-            p.insert(to.into(), x);
-        }
-    }
-
-    impl Tmux for Fake {
-        fn panes(&self) -> Result<HashMap<String, AgentPane>> {
+        fn look(&self) -> Result<HashMap<String, AgentPane>> {
             if *self.down.borrow() {
                 anyhow::bail!("no server running");
             }
             Ok(self.panes.borrow().clone())
-        }
-        fn mark(&self, name: &str, id: &str) {
-            if let Some(p) = self.panes.borrow_mut().get_mut(name) {
-                p.mark.get_or_insert_with(|| id.to_string());
-            }
         }
     }
 
@@ -372,6 +258,8 @@ mod tests {
             add(&db, "dead", "claude", Status::WaitingInput, 5);
             db.kv_set(&crate::methods::needs_you_key("dead"), r#"[""]"#)
                 .unwrap();
+            // Its tmux session missing: never here (the reconcile's).
+            add(&db, "missing", "claude", Status::Working, 5);
             // Other watchers' sessions: never here.
             add(&db, "oc", "opencode", Status::Idle, 5);
             add(&db, "cx", "codex", Status::Idle, 5);
@@ -381,18 +269,27 @@ mod tests {
         t.set("dead", "%2", true);
         t.set("oc", "%3", true);
         t.set("cx", "%4", true);
+        let panes = || t.look();
         let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
-        let mut memo = Memo::default();
-        assert_eq!(pass(&d, &mut memo, &t).unwrap(), 0, "one look isn't proof");
+        let mut gone = Gone::new();
+        assert_eq!(
+            pass(&d, &mut gone, &panes).unwrap(),
+            0,
+            "one look isn't proof"
+        );
         // A failed look in between: no verdict, and the count starts again.
         *t.down.borrow_mut() = true;
-        assert_eq!(pass(&d, &mut memo, &t).unwrap(), 0);
-        assert!(memo.gone.is_empty());
+        assert_eq!(pass(&d, &mut gone, &panes).unwrap(), 0);
+        assert!(gone.is_empty());
         *t.down.borrow_mut() = false;
-        assert_eq!(pass(&d, &mut memo, &t).unwrap(), 0);
-        assert_eq!(pass(&d, &mut memo, &t).unwrap(), 1);
+        assert_eq!(pass(&d, &mut gone, &panes).unwrap(), 0);
+        assert_eq!(pass(&d, &mut gone, &panes).unwrap(), 1);
+        for _ in 0..3 {
+            pass(&d, &mut gone, &panes).unwrap();
+        }
         assert_eq!(status("dead"), Status::Stopped);
         assert_eq!(status("alive"), Status::Working);
+        assert_eq!(status("missing"), Status::Working, "missing: no verdict");
         assert_eq!(status("oc"), Status::Idle);
         assert_eq!(status("cx"), Status::Idle);
         // Stopped through `discover`'s stop: logged as the pane's end, and
@@ -409,125 +306,64 @@ mod tests {
         );
     }
 
-    /// Renamed outside rlord: found by its mark, alive. A missing session
-    /// is gone only once it was seen marked; never marked: no verdict.
+    /// Renamed outside rlord: its stored name isn't there, so nothing is
+    /// concluded, however many looks.
     #[test]
-    fn a_rename_is_not_an_end() {
+    fn a_rename_is_never_an_end() {
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         add(&d.db(), "s", "claude", Status::Working, 5);
-        add(&d.db(), "u", "claude", Status::Working, 5);
         let t = Fake::default();
-        t.set("s", "%1", false);
-        let mut memo = Memo::default();
-        let status = |id: &str| d.db().resolve_ref(id).unwrap().status;
-        // First look marks it ("u" isn't there at all: never seen marked).
-        pass(&d, &mut memo, &t).unwrap();
-        assert_eq!(t.panes.borrow()["s"].mark.as_deref(), Some("s"));
-        pass(&d, &mut memo, &t).unwrap();
-        // Renamed by the user: found by its mark, nothing stops.
-        t.rename("s", "my-work");
-        for _ in 0..3 {
-            assert_eq!(pass(&d, &mut memo, &t).unwrap(), 0);
+        t.set("my-work", "%1", true);
+        let panes = || t.look();
+        let mut gone = Gone::new();
+        for _ in 0..4 {
+            assert_eq!(pass(&d, &mut gone, &panes).unwrap(), 0);
         }
-        assert_eq!(status("s"), Status::Working);
-        assert_eq!(status("u"), Status::Working, "never marked: no verdict");
-        // Gone for real (killed): stopped on two looks.
-        t.panes.borrow_mut().remove("my-work");
-        pass(&d, &mut memo, &t).unwrap();
-        assert_eq!(status("s"), Status::Working);
-        pass(&d, &mut memo, &t).unwrap();
-        assert_eq!(status("s"), Status::Stopped);
-        assert_eq!(status("u"), Status::Working);
+        assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Working);
     }
 
-    /// A different pane id between the looks (its tmux session killed and
-    /// made again; `respawn-pane -k` keeps the id) starts the count again;
-    /// and the stop asks tmux again under the session's lock: a pane that
-    /// changed, or came back live, stops nothing.
+    /// A different pane id between the looks starts the count again; the
+    /// stop asks tmux again under the session's lock: a pane that changed,
+    /// or is live again (a respawn keeps the id), stops nothing.
     #[test]
-    fn a_new_pane_starts_the_count_again() {
+    fn the_same_pane_must_be_dead_twice() {
         let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
         add(&d.db(), "s", "claude", Status::Starting, 5);
         let t = Fake::default();
         t.set("s", "%1", true);
-        let mut memo = Memo::default();
-        pass(&d, &mut memo, &t).unwrap();
-        // Made again (a new tmux session, a new pane), which also died.
+        let panes = || t.look();
+        let mut gone = Gone::new();
+        pass(&d, &mut gone, &panes).unwrap();
         t.set("s", "%7", true);
         assert_eq!(
-            pass(&d, &mut memo, &t).unwrap(),
+            pass(&d, &mut gone, &panes).unwrap(),
             0,
             "not the pane seen dead"
         );
-        assert_eq!(memo.gone["s"].0, 1);
-        // The stop itself: the pane changed since the looks, or is live
-        // again (a respawn in the same pane): nothing.
+        assert_eq!(gone["s"].count, 1);
         let s = d.db().resolve_ref("s").unwrap();
         t.set("s", "%7", false);
-        assert!(!stop(&d, &s, &Some("%7".into()), false, &t).unwrap());
+        assert!(!stop(&d, &s, "%7", &panes).unwrap());
         t.set("s", "%9", true);
-        assert!(!stop(&d, &s, &Some("%7".into()), false, &t).unwrap());
-        assert!(stop(&d, &s, &Some("%9".into()), false, &t).unwrap());
+        assert!(!stop(&d, &s, "%7", &panes).unwrap());
+        assert!(stop(&d, &s, "%9", &panes).unwrap());
     }
 
-    /// Two tmux sessions marked as one rlord session: a live one wins;
-    /// none live: no verdict. The same answer whatever the map's order.
+    /// The count starts again when the status changed since the first dead
+    /// look.
     #[test]
-    fn copies_of_a_marked_session_are_judged_by_the_live_one() {
-        let s: Session = serde_json::from_value(json!({
-            "id": "s", "name": "s", "name_locked": false, "agent": "claude",
-            "agent_session": null, "agent_session_trust": "minted", "project_path": "/tmp",
-            "tmux_session": "s", "status": "working", "group_path": "", "pinned": false,
-            "created_at": 1, "archived_at": null, "last_user_msg_at": null,
-            "last_agent_msg_at": null, "last_state_change_at": 5, "repo_path": null,
-            "workspace_path": null, "branch": null, "model": null}))
-        .unwrap();
-        let pane = |id: &str, dead: bool| AgentPane {
-            pane: id.into(),
-            dead,
-            mark: Some("s".into()),
-        };
-        for order in [["s", "s-copy"], ["s-copy", "s"]] {
-            let mut panes = HashMap::new();
-            panes.insert(
-                order[0].to_string(),
-                pane(if order[0] == "s" { "%1" } else { "%2" }, order[0] == "s"),
-            );
-            panes.insert(
-                order[1].to_string(),
-                pane(if order[1] == "s" { "%1" } else { "%2" }, order[1] == "s"),
-            );
-            // "s" dead, its copy live: the live one.
-            assert_eq!(find(&s, &panes), Found::Pane(&panes["s-copy"]));
-            assert_eq!(dead_look(&s, &panes, true), None);
-        }
-        // None live: the copy under its stored name.
-        let mut both_dead = HashMap::new();
-        both_dead.insert("s".to_string(), pane("%1", true));
-        both_dead.insert("s-copy".to_string(), pane("%2", true));
-        assert_eq!(find(&s, &both_dead), Found::Pane(&both_dead["s"]));
-        assert_eq!(dead_look(&s, &both_dead, true), Some(Some("%1".into())));
-        // ... and with none under its name: the newest pane.
-        let mut renamed = HashMap::new();
-        renamed.insert("a".to_string(), pane("%12", true));
-        renamed.insert("b".to_string(), pane("%9", true));
-        assert_eq!(find(&s, &renamed), Found::Pane(&renamed["a"]));
-    }
-
-    /// Marked by rlord at its start: killed before the first look, it is
-    /// still told gone (on two looks).
-    #[test]
-    fn rlords_own_mark_counts_before_the_first_look() {
-        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
-        add(&d.db(), "s", "claude", Status::Working, 5);
-        d.db()
-            .kv_set(&crate::methods::tmux_marked_key("s"), "1")
-            .unwrap();
-        let t = Fake::default();
-        let mut memo = Memo::default();
-        pass(&d, &mut memo, &t).unwrap();
-        pass(&d, &mut memo, &t).unwrap();
-        assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Stopped);
+    fn a_status_change_between_looks_starts_the_count_again() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "s", "claude", Status::Idle, 5);
+        let mut gone = Gone::new();
+        let s1 = db.resolve_ref("s").unwrap();
+        assert_eq!(count_look(&s1, &mut gone, Some("%1".into())), 1);
+        db.set_status("s", Status::Starting, 9).unwrap();
+        db.set_status("s", Status::Idle, 10).unwrap();
+        let s2 = db.resolve_ref("s").unwrap();
+        assert_eq!(count_look(&s2, &mut gone, Some("%1".into())), 1);
+        assert_eq!(count_look(&s2, &mut gone, Some("%1".into())), 2);
+        assert_eq!(count_look(&s2, &mut gone, None), 0);
     }
 
     /// A message moved since the session was read (the status kept):
@@ -538,12 +374,13 @@ mod tests {
         add(&d.db(), "s", "claude", Status::Working, 5);
         let t = Fake::default();
         t.set("s", "%1", true);
+        let panes = || t.look();
         let seen = d.db().resolve_ref("s").unwrap();
         d.db().touch_last_user_msg("s", 7).unwrap();
-        assert!(!stop(&d, &seen, &Some("%1".into()), false, &t).unwrap());
+        assert!(!stop(&d, &seen, "%1", &panes).unwrap());
         assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Working);
         let fresh = d.db().resolve_ref("s").unwrap();
-        assert!(stop(&d, &fresh, &Some("%1".into()), false, &t).unwrap());
+        assert!(stop(&d, &fresh, "%1", &panes).unwrap());
         assert_eq!(d.db().resolve_ref("s").unwrap().status, Status::Stopped);
     }
 }

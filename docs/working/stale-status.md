@@ -11,9 +11,19 @@ Escape), and crashed agents leaving a live status on a dead pane.
 ## Shipped (#82, 1.13.2)
 
 Dead-pane detection only (`daemon/src/recheck.rs`; rules in
-`docs/architecture.md`, "Stale statuses re-checked"). The user decided
-to cut #82 down to that after seven review rounds kept finding ways the
-transcript rules could clear a real "needs you".
+`docs/architecture.md`, "Stale statuses re-checked"): a session whose
+tmux session is there under its stored name and whose agent pane is dead
+on two looks of the same pane. The user decided to cut #82 to that after
+review rounds kept finding false stops in the transcript rules, then in
+a marker layer that found renamed sessions (`@rlord_id`), also removed.
+
+## Deferred: a killed tmux session while the daemon runs
+
+A tmux session missing under its stored name gives no verdict here: it
+may be renamed outside rlord, and finding it otherwise (a session mark)
+kept producing false stops. It is left to the startup reconcile, as
+before #82. Likewise a dead tmux server ("no server running"): no
+verdict, left to the reconcile.
 
 ## Deferred: transcript-based clearing waits for attention shadow data
 
@@ -47,26 +57,12 @@ statuses end stale, and how:
 
 ## Owed
 
-- A dead tmux server while the daemon runs: "no server running" gives no
-  verdict, so its sessions stay live until the next daemon start's
-  reconcile. Stopping them needs proof the server is down for good: a
-  deleted socket file doesn't prove it (a server can outlive its socket
-  file), the daemon doesn't own the server's lifetime, and a pid can be
-  reused.
 - A pin whose pane is gone falls back to the first pane (as
   `window_pane_ids` does): an unrelated split there reads as the agent.
-- `discover`'s own pane check on `agent_panes` (marks, pane ids, the
-  pin).
+- `discover`'s own pane check on `agent_panes` (pane ids, the pin).
 - The "still as read" guard could move into `discover::stop_from_pane`.
-- Dead branches left by the cut.
 - A shared "every N seconds" loop helper for the watchers.
-- The startup reconcile and `discover` still go by tmux names, not marks
-  (as before #82): a rename outside rlord fools them.
-- A session whose tmux session sits unmarked under its stored name (made
-  before marks, or the mark failed) is found by name only.
 - One helper writes the pin (`pin_agent_pane`, `respawn_pane`).
-- `find` runs twice a session a pass: once is enough.
-- `Memo.gone`'s tuple wants a struct.
 - A tail `(len, mtime)` cache and a lazy reverse parse (for the
   deferred rules).
 - `pid_alive` is written three times (`remote.rs`, `autostart.rs`, and

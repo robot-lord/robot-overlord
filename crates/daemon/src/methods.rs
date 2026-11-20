@@ -1044,7 +1044,6 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
     tmux::new_session(s.tmux_name, s.project_path, &cmd)?;
-    mark_tmux(db, s.tmux_name, id);
     // The pane is up: from here nothing fails the start (a caller undoes a
     // start that failed, and must never undo a running one).
     let (kind, mut detail) = s.event;
@@ -1395,7 +1394,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    mark_tmux(db, &tmux_name, &s.id);
     // The pane is up: from here nothing fails the restart (as at `start`).
     // Each step is logged if it fails, and the status, the seen marks and
     // the event are always written.
@@ -1561,7 +1559,6 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     } else {
         tmux::new_session(&tmux_name, &s.project_path, &cmd)?;
     }
-    mark_tmux(db, &tmux_name, &s.id);
     hold_deferred(db, &s.id, &launch)?;
     match (&launch.session_id, &launch.transcript) {
         (Some(sid), transcript) => {
@@ -2307,32 +2304,6 @@ pub(crate) fn save_cursors(db: &Db) {
     }
 }
 
-/// Mark tmux session `name` with rlord session `id` (`tmux::mark_session`):
-/// how `recheck` finds it after a rename outside rlord. Once marked, kv
-/// `tmux_marked:<id>` says so, so a session killed before the re-check's
-/// first look can still be told gone. Best effort.
-pub(crate) fn mark_tmux(db: &Db, name: &str, id: &str) {
-    record_mark(db, id, tmux::mark_session(name, id));
-}
-
-/// Keep kv `tmux_marked:<id>` as `marked` says: set when the tmux session
-/// carries the mark, gone when marking failed (a tmux session made again
-/// may not carry it).
-fn record_mark(db: &Db, id: &str, marked: Result<()>) {
-    let r = match marked {
-        Ok(()) => db.kv_set(&tmux_marked_key(id), "1"),
-        Err(e) => db.kv_delete(&tmux_marked_key(id)).and(Err(e)),
-    };
-    if let Err(e) = r {
-        tracing::debug!(session = id, error = %e, "marking the tmux session");
-    }
-}
-
-/// kv key: session `id`'s tmux session carries its mark (`mark_tmux`).
-pub(crate) fn tmux_marked_key(id: &str) -> String {
-    format!("tmux_marked:{id}")
-}
-
 /// Startup reconcile: sessions marked running whose tmux is gone are stopped
 /// (resumable). Never auto-revives — crash vs. intentional kill is ambiguous.
 pub fn reconcile(db: &Db) -> Result<()> {
@@ -2413,20 +2384,6 @@ mod tests {
     }
 
     use super::*;
-
-    /// A mark that failed (a tmux session made again) is no longer known.
-    #[test]
-    fn a_failed_mark_is_forgotten() {
-        let db = Db::open_in_memory().unwrap();
-        record_mark(&db, "s", Ok(()));
-        assert!(db.kv_get(&tmux_marked_key("s")).unwrap().is_some());
-        record_mark(
-            &db,
-            "s",
-            Err(anyhow::anyhow!("marked as another session's")),
-        );
-        assert_eq!(db.kv_get(&tmux_marked_key("s")).unwrap(), None);
-    }
 
     #[test]
     fn only_plain_codex_sessions_go_on_the_daemon() {

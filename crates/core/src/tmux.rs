@@ -271,74 +271,45 @@ pub fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Session option holding the rlord session id a tmux session runs: how
-/// it is found after a rename outside rlord.
-const SESSION_MARK: &str = "@rlord_id";
-
-/// Mark tmux session `name` as rlord session `id` (`SESSION_MARK`),
-/// unless it is marked already.
-pub fn mark_session(name: &str, id: &str) -> Result<()> {
-    let target = format!("{}:", exact(name));
-    match run(&["set-option", "-o", "-t", &target, SESSION_MARK, id]) {
-        Ok(_) => Ok(()),
-        // (`-o`: set already. Fine only if it is this session's.)
-        Err(e) if e.to_string().contains("already set") => {
-            let has = run(&["show-options", "-v", "-t", &target, SESSION_MARK])?;
-            if has == id {
-                Ok(())
-            } else {
-                bail!("{name} is marked as another session's ({has})")
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// One tmux session's agent pane, as `agent_panes` saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
-    /// The pane's id (`%3`): a restart or respawn that changed panes is
-    /// told apart by it.
+    /// The pane's id (`%3`; `respawn-pane -k` keeps it).
     pub pane: String,
     /// Its program exited (rlord keeps a dead agent pane on screen).
     pub dead: bool,
-    /// The rlord session id it is marked with (`mark_session`), if any.
-    pub mark: Option<String>,
 }
 
-/// Each rlord tmux session's agent pane, as `window_pane_ids` picks it
-/// (the pinned one, `@rlord_pane`, when it is in the session; else the
-/// first), by tmux session name. One `list-panes -a` for every session.
-/// Any failure, "no server running" included, is an error: nothing is
+/// Each tmux session's agent pane, as `window_pane_ids` picks it (the
+/// pinned one, `@rlord_pane`, when it is in the session; else the first),
+/// by tmux session name. One `list-panes -a` for every session. Any
+/// failure, "no server running" included, is an error: nothing is
 /// concluded from it.
 pub fn agent_panes() -> Result<std::collections::HashMap<String, AgentPane>> {
     let out = run(&[
         "list-panes",
         "-a",
         "-F",
-        &format!(
-            "#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{{SESSION_MARK}}}\t#{{session_name}}"
-        ),
+        &format!("#{{pane_id}}\t#{{pane_dead}}\t#{{{AGENT_PANE}}}\t#{{session_name}}"),
     ])?;
     Ok(parse_agent_panes(&out))
 }
 
 /// `agent_panes`' lines: pane id, dead (`1`), the session's pinned pane,
-/// its mark, session name.
+/// session name.
 fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, AgentPane> {
     let mut first: std::collections::HashMap<String, AgentPane> = Default::default();
     let mut pinned: std::collections::HashMap<String, AgentPane> = Default::default();
     for l in out.lines() {
-        let mut f = l.splitn(5, '\t');
-        let (Some(pane), Some(dead), Some(pin), Some(mark), Some(session)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
+        let mut f = l.splitn(4, '\t');
+        let (Some(pane), Some(dead), Some(pin), Some(session)) =
+            (f.next(), f.next(), f.next(), f.next())
         else {
             continue;
         };
         let p = AgentPane {
             pane: pane.to_string(),
             dead: dead == "1",
-            mark: (!mark.is_empty()).then(|| mark.to_string()),
         };
         if pane == pin {
             pinned.insert(session.to_string(), p.clone());
@@ -1622,22 +1593,18 @@ mod tests {
 
     /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
     /// pane when it is in the session, else the first (as
-    /// `window_pane_ids`); a session name may hold spaces; the mark comes
-    /// along.
+    /// `window_pane_ids`); a session name may hold spaces.
     #[test]
     fn agent_panes_are_the_pinned_ones() {
         let p = parse_agent_panes(
-            "%0\t0\t%0\t01a\ta b\n%1\t1\t%0\t01a\ta b\n%2\t1\t\t\tc\n%3\t0\t%4\t\td\n%4\t1\t%4\t\td\n%5\t0\t%9\t\te",
+            "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td\n%5\t0\t%9\te",
         );
-        let a = &p["a b"];
         assert_eq!(
-            (a.pane.as_str(), a.dead, a.mark.as_deref()),
-            ("%0", false, Some("01a"))
+            (p["a b"].pane.as_str(), p["a b"].dead),
+            ("%0", false),
+            "the pinned pane, not the split"
         );
-        assert!(
-            p["c"].dead && p["c"].mark.is_none(),
-            "none pinned: the first"
-        );
+        assert!(p["c"].dead, "none pinned: the first");
         assert_eq!((p["d"].pane.as_str(), p["d"].dead), ("%4", true));
         assert_eq!(
             (p["e"].pane.as_str(), p["e"].dead),
@@ -1736,15 +1703,8 @@ mod tests {
             run(&["show-options", "-p", "-v", "-t", &pin, "remain-on-exit"]).unwrap(),
             "on"
         );
-        // Marked once with its rlord id; again with it: fine; another id
-        // doesn't move it, and says so.
-        mark_session(name, "01first").unwrap();
-        mark_session(name, "01first").unwrap();
-        assert!(mark_session(name, "01second").is_err());
         let panes = agent_panes().unwrap();
-        let p = &panes[name];
-        assert!(!p.dead);
-        assert_eq!(p.mark.as_deref(), Some("01first"));
+        assert!(!panes[name].dead);
 
         // Key hints: a slim bar of rlord's own without a profile...
         let opt = |o: &str| run(&["show-options", "-v", "-t", &format!("={name}:"), o]).unwrap();

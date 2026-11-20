@@ -422,40 +422,31 @@ what makes the TUI live and `last_state_change_at` trustworthy.
 ### Stale statuses re-checked (`daemon/src/recheck.rs`)
 
 A stored status moves only when an event moves it. An agent that crashed
-without its `SessionEnd`, or a tmux session that went away, leaves a
-live status behind. Once at daemon start and then every minute, plain
-code looks at the sessions that follow hooks (Claude, and Codex with
-trusted hooks; `discover` and `opencode.rs` watch their own):
+without its `SessionEnd` leaves a live status behind on a dead pane.
+Once at daemon start and then every minute, plain code looks at the
+sessions that follow hooks (Claude, and Codex with trusted hooks;
+`discover` and `opencode.rs` watch their own):
 
-- One `list-panes -a` a pass reads each session's agent pane, as
+- One `list-panes -a` a pass reads each tmux session's agent pane, as
   `window_pane_ids` picks it (the pinned `@rlord_pane` when it is in the
-  session, else the first), with the pane's id and the tmux session's
-  `@rlord_id` mark (set when rlord starts or restarts it, or at the
-  first look; never moved once set). A session is found by its mark
-  wherever it is, so a rename outside rlord isn't an end (several tmux
-  sessions with one mark: a live one, else the one under its stored name,
-else the newest pane). Its tmux session
-  counts as gone only once it is known marked: rlord marked it at a start
-  or restart (kv `tmux_marked:<id>`), or a look saw the mark.
-- Its agent pane's program exited, or its tmux session gone, on two
-  answered looks of the same pane id in a row (a different pane, or a
-  status change in between, starts the count again; a respawn keeps the
-  pane id, and is caught by the pane being live again, the status time,
-  and the session lock the stop holds): `stopped`, through
-  `discover`'s stop (`session_end` from the pane; the needs-you parties
-  are dropped).
-- The stop asks tmux again under the session's lock (the same pane still
-  dead), then stops only if the session is still as it was read: its
-  status, when that changed, and its message times, under the DB lock.
-- Any tmux failure, "no server running" included, gives no verdict that
-  pass and starts the counts again. A server that really died is for
-  the startup reconcile.
-- `respawn_pane` pins the pane it used and keeps it on screen when it
+  session, else the first), with its pane id.
+- A session is stopped only when its tmux session is there under its
+  stored name and that pane's program exited, on two answered looks of
+  the same pane id in a row, with its status time unchanged. The stop
+  goes through `discover`'s stop (`session_end` from the pane; the
+  needs-you parties are dropped).
+- The stop takes the session's lock (a restart through rlord holds it),
+  asks tmux again (the same pane still dead), then, under the DB lock
+  with no tmux call, stops only if the session is still as it was read:
+  its status, when that changed, and its message times.
+- `respawn-pane -k` keeps the pane id: a restart is caught by the pane
+  being live again, by the status time when it moves, and by the lock.
+  `respawn_pane` pins the pane it used and keeps it on screen when it
   exits (best effort).
-
-Nothing else is concluded. A "needs you" or "working" the transcript
-shows to be over is left as it is for now (the working doc
-`docs/working/stale-status.md` says why and what is deferred).
+- No verdict: a tmux session missing under the stored name (killed, or
+  renamed outside rlord: the startup reconcile handles a missing one),
+  and any tmux failure, "no server running" included (the counts start
+  again).
 
 ### Usage limits (`daemon/src/limits.rs`)
 
