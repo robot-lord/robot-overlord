@@ -1,7 +1,7 @@
 //! The list's Status column and what each of its marks means. The list
 //! draws its marks from `status_marks`; the hover popup and `rlord show`
 //! explain them line by line (`describe`); the details card takes the
-//! sentences (`describe_status`, `remote_sentence`); the help screen
+//! sentences (`describe_status`, `remote_parts`); the help screen
 //! lists them all (`legend`). Pure, so it is tested without a terminal.
 
 use ratatui::style::Style;
@@ -109,13 +109,9 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
     }
     match MEANINGS.iter().find(|(k, _)| *k == shown) {
         Some((_, what)) => format!("{what}."),
-        None => format!("status {shown} (not known to this rlord version)."),
+        None if matches!(shown, "-" | "") => "rlord doesn't know this session's state yet.".into(),
+        None => format!("{shown} (not known to this rlord version)."),
     }
-}
-
-/// The Remote Control mark (⇄) in words, if the list shows one.
-pub fn remote_sentence(s: &Value) -> Option<String> {
-    remote_parts(&s["remote"]).map(|(_, t)| t)
 }
 
 /// Each Remote Control state the list draws a ⇄ for: its colour and
@@ -225,22 +221,16 @@ impl Item {
 pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
     let chip = crate::state_chip(s, false);
     let shown = crate::shown(s);
-    let known = !matches!(shown, "-" | "");
-    let mut text = if known {
-        status_sentence(s, now)
-    } else {
-        String::new()
-    };
+    let mut text = status_sentence(s, now);
     let mark = if narrow {
         let mut c = chip.content.chars();
         let glyph: String = c.next().map(String::from).unwrap_or_default();
         // The label the glyph stands for, unless the sentence already
         // names it (a status this version doesn't know).
-        let known_label =
-            MEANINGS.iter().any(|(k, _)| *k == shown) || matches!(shown, "limited" | "background");
+        let known_label = status_parts(shown).1 != "unknown" || shown == "background";
         if shown == "limited" {
             text = narrow_limit(&s["limit"]);
-        } else if known && known_label {
+        } else if known_label {
             text = format!("{}: {text}", c.as_str().trim());
         }
         Span::styled(glyph, chip.style)
@@ -274,7 +264,7 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
     let n = s["agents_running"].as_i64().unwrap_or(0);
     if n != 0 {
         v.push(Item {
-            label: "agents",
+            label: "running",
             mark: Span::styled(format!("⚙{n}"), Style::default().fg(theme::overlord())),
             text: format!("{n} sub-agent{} running.", if n == 1 { "" } else { "s" }),
             shown: true,
@@ -325,10 +315,10 @@ pub fn column_spans(s: &Value, narrow: bool, width: usize) -> Vec<Span<'static>>
 pub fn describe(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
     let (shown, mut cut): (Vec<Item>, Vec<Item>) = status_marks(s, narrow, width, now)
         .into_iter()
-        .filter(|m| !m.text.is_empty())
         .partition(|m| m.shown);
     for m in &mut cut {
-        m.text.push_str(" (not shown in this width)");
+        let t = m.text.strip_suffix('.').unwrap_or(&m.text).to_string();
+        m.text = format!("{t} (not shown in this width).");
     }
     let mut v = shown;
     v.extend(cut);
@@ -341,9 +331,7 @@ pub fn describe(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item> {
 /// and `agents` rows cover the rest).
 pub fn describe_status(s: &Value, now: i64) -> Vec<(&'static str, String)> {
     let mut v = Vec::new();
-    if !matches!(crate::shown(s), "-" | "") {
-        v.push(("status", status_sentence(s, now)));
-    }
+    v.push(("status", status_sentence(s, now)));
     v.extend(shells_sentence(s, now).map(|t| ("shells", t)));
     v
 }
@@ -456,9 +444,9 @@ mod tests {
         assert_eq!(
             d.iter().map(Item::plain).collect::<Vec<_>>()[2..],
             [
-                "⇄ — Remote Control connected: reachable from the Claude app. \
-                 (not shown in this width)",
-                "⚙1 — 1 sub-agent running. (not shown in this width)",
+                "⇄ — Remote Control connected: reachable from the Claude app \
+                 (not shown in this width).",
+                "⚙1 — 1 sub-agent running (not shown in this width).",
             ],
             "◷ 3:00pm ↻ ⋯ fits 13; ⇄ and ⚙1 don't"
         );
@@ -473,9 +461,15 @@ mod tests {
             d[0].plain(),
             "◷ — usage limit until 3:00pm, resumes by itself (↻)."
         );
-        assert!(d[1].plain().ends_with("(not shown in this width)"));
-        // No status known: no status line.
-        assert!(describe(&json!({}), false, 13, 0).is_empty());
+        assert!(d[1].plain().ends_with("(not shown in this width)."));
+        // No status known: the column's mark is still explained.
+        assert_eq!(
+            describe(&json!({}), false, 13, 0)
+                .iter()
+                .map(Item::plain)
+                .collect::<Vec<_>>(),
+            ["· unknown — rlord doesn't know this session's state yet."]
+        );
         let s = json!({"status": "idle", "shown_status": "limited",
             "limit": {"until": "3pm", "reset": true}});
         assert_eq!(texts(&s, 0), ["◷ reset — its usage limit just reset."]);
@@ -505,24 +499,28 @@ mod tests {
         let s = json!({"status": "paused"});
         assert_eq!(
             texts(&s, 0),
-            ["· paused — status paused (not known to this rlord version)."]
+            ["· paused — paused (not known to this rlord version)."]
         );
         assert_eq!(
             texts_narrow(&s),
-            ["· — status paused (not known to this rlord version)."]
+            ["· — paused (not known to this rlord version)."]
         );
     }
 
     #[test]
     fn remote_states() {
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = json!({"remote": {"state": "failed", "reason": "not logged in"}});
         assert_eq!(
-            remote_sentence(&s).unwrap(),
-            "Remote Control failed: not logged in."
+            remote_parts(&s["remote"]).unwrap(),
+            (
+                Style::default().fg(theme::red()),
+                "Remote Control failed: not logged in.".to_string()
+            )
         );
-        assert_eq!(remote_sentence(&json!({})), None);
+        assert_eq!(remote_parts(&json!(null)), None);
         // A state the list draws no mark for gets no line.
-        assert_eq!(remote_sentence(&json!({"remote": {"state": "off"}})), None);
+        assert_eq!(remote_parts(&json!({"state": "off"})), None);
     }
 
     #[test]

@@ -1324,9 +1324,6 @@ fn main() -> Result<()> {
             // The status as the list shows it, every symbol in words.
             let lines =
                 rlord_tui::statustext::describe(&s, false, usize::MAX, rlord_core::types::now_ms());
-            if lines.first().is_none_or(|l| l.label != "status") {
-                println!("  status     unknown");
-            }
             for l in &lines {
                 println!("  {:<10} {}", l.label, l.plain());
             }
