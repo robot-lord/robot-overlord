@@ -280,10 +280,12 @@ pub struct AgentPane {
     pub dead: bool,
 }
 
-/// Each tmux session's agent pane, as `window_pane_ids` picks it (the
-/// pinned one, `@rlord_pane`, when it is in the session; else the first),
-/// by tmux session name. One `list-panes -a` for every session. Any
-/// failure, "no server running" included, is an error: nothing is
+/// Each tmux session's agent pane, by tmux session name, only where it is
+/// certain: the pinned pane (`@rlord_pane`) when it is in the session; with
+/// no pin at all, the session's only pane. A pin whose pane isn't in the
+/// session (moved by `join-pane`, or gone), or no pin and several panes:
+/// left out (no verdict on it). One `list-panes -a` for every session.
+/// Any failure, "no server running" included, is an error: nothing is
 /// concluded from it.
 pub fn agent_panes() -> Result<std::collections::HashMap<String, AgentPane>> {
     let out = run(&[
@@ -298,8 +300,8 @@ pub fn agent_panes() -> Result<std::collections::HashMap<String, AgentPane>> {
 /// `agent_panes`' lines: pane id, dead (`1`), the session's pinned pane,
 /// session name.
 fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, AgentPane> {
-    let mut first: std::collections::HashMap<String, AgentPane> = Default::default();
-    let mut pinned: std::collections::HashMap<String, AgentPane> = Default::default();
+    // Per session: its pin, and its panes in order.
+    let mut seen: std::collections::HashMap<String, (String, Vec<AgentPane>)> = Default::default();
     for l in out.lines() {
         let mut f = l.splitn(4, '\t');
         let (Some(pane), Some(dead), Some(pin), Some(session)) =
@@ -307,17 +309,28 @@ fn parse_agent_panes(out: &str) -> std::collections::HashMap<String, AgentPane> 
         else {
             continue;
         };
-        let p = AgentPane {
+        let e = seen
+            .entry(session.to_string())
+            .or_insert_with(|| (pin.to_string(), Vec::new()));
+        e.1.push(AgentPane {
             pane: pane.to_string(),
             dead: dead == "1",
-        };
-        if pane == pin {
-            pinned.insert(session.to_string(), p.clone());
-        }
-        first.entry(session.to_string()).or_insert(p);
+        });
     }
-    first.extend(pinned);
-    first
+    seen.into_iter()
+        .filter_map(|(session, (pin, panes))| {
+            let agent = if pin.is_empty() {
+                // No pin: only a lone pane is surely the agent's.
+                match panes.as_slice() {
+                    [only] => only.clone(),
+                    _ => return None,
+                }
+            } else {
+                panes.into_iter().find(|p| p.pane == pin)?
+            };
+            Some((session, agent))
+        })
+        .collect()
 }
 
 /// Session option naming the agent's pane. With the user's tmux profile a
@@ -1592,25 +1605,28 @@ mod tests {
     use super::*;
 
     /// As tmux 3.8 answered on a scratch socket (2026-11-18): the pinned
-    /// pane when it is in the session, else the first (as
-    /// `window_pane_ids`); a session name may hold spaces.
+    /// pane when it is in the session; no pin, the only pane; else left
+    /// out. A session name may hold spaces.
     #[test]
     fn agent_panes_are_the_pinned_ones() {
         let p = parse_agent_panes(
-            "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td\n%5\t0\t%9\te",
+            "%0\t0\t%0\ta b\n%1\t1\t%0\ta b\n%2\t1\t\tc\n%3\t0\t%4\td\n%4\t1\t%4\td\n\
+             %5\t1\t%8\te\n%6\t0\t%8\te\n%7\t0\t%9\tf\n%10\t0\t\tg\n%11\t1\t\tg",
         );
         assert_eq!(
             (p["a b"].pane.as_str(), p["a b"].dead),
             ("%0", false),
             "the pinned pane, not the split"
         );
-        assert!(p["c"].dead, "none pinned: the first");
+        assert!(p["c"].dead, "no pin, one pane: that one");
         assert_eq!((p["d"].pane.as_str(), p["d"].dead), ("%4", true));
-        assert_eq!(
-            (p["e"].pane.as_str(), p["e"].dead),
-            ("%5", false),
-            "its pin isn't there: the first"
-        );
+        // The agent moved out by join-pane, a dead split left first: no
+        // verdict (not that split).
+        assert!(!p.contains_key("e"));
+        // Its pin gone, a live split left: no verdict either.
+        assert!(!p.contains_key("f"));
+        // No pin and two panes: no telling which.
+        assert!(!p.contains_key("g"));
     }
 
     #[test]

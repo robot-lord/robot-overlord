@@ -57,9 +57,17 @@ statuses end stale, and how:
 
 ## Owed
 
-- A pin whose pane is gone falls back to the first pane (as
-  `window_pane_ids` does): an unrelated split there reads as the agent.
-- `discover`'s own pane check on `agent_panes` (pane ids, the pin).
+- `window_pane_ids` (restart, keys, the hint bar) still falls back to
+  the first pane when the pin is gone; the re-check gives no verdict
+  then. One pane picker for both.
+- `methods::hook_emit`'s `revives_dead` checks the tmux session only:
+  it could check the agent pane too.
+- `discover` and `codex_daemon` on `agent_panes`.
+- `respawn_pane` runs an extra `list-panes` (`keep_agent_pane_on_exit`
+  looks the pane up again).
+- `stop` lists every pane again: a targeted `list-panes -t` would do.
+- The `let Some(seen) = seen else { continue }` branch in `pass` can't
+  be taken after two dead looks.
 - The "still as read" guard could move into `discover::stop_from_pane`.
 - A shared "every N seconds" loop helper for the watchers.
 - One helper writes the pin (`pin_agent_pane`, `respawn_pane`).

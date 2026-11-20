@@ -427,9 +427,11 @@ Once at daemon start and then every minute, plain code looks at the
 sessions that follow hooks (Claude, and Codex with trusted hooks;
 `discover` and `opencode.rs` watch their own):
 
-- One `list-panes -a` a pass reads each tmux session's agent pane, as
-  `window_pane_ids` picks it (the pinned `@rlord_pane` when it is in the
-  session, else the first), with its pane id.
+- One `list-panes -a` a pass reads each tmux session's agent pane where
+  it is certain: the pinned `@rlord_pane` when it is in the session;
+  with no pin, the session's only pane. A pin whose pane isn't in the
+  session (moved by `join-pane`, or gone), or no pin and several panes:
+  no verdict. Skipped with no live session to look at.
 - A session is stopped only when its tmux session is there under its
   stored name and that pane's program exited, on two answered looks of
   the same pane id in a row, with its status time unchanged. The stop

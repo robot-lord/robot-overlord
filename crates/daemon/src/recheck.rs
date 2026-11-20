@@ -133,6 +133,10 @@ pub(crate) fn pass(d: &Daemon, gone: &mut Gone, panes: &Panes<'_>) -> Result<usi
         .filter(checked)
         .collect();
     gone.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    // (Nothing to look at: no tmux call.)
+    if sessions.is_empty() {
+        return Ok(0);
+    }
     let snapshot = match panes() {
         Ok(p) => p,
         Err(e) => {
@@ -304,6 +308,19 @@ mod tests {
             db.kv_get(&crate::methods::needs_you_key("dead")).unwrap(),
             None
         );
+    }
+
+    /// No session to look at: tmux isn't asked.
+    #[test]
+    fn no_sessions_no_tmux_call() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        let asked = RefCell::new(false);
+        let panes = || -> Result<HashMap<String, AgentPane>> {
+            *asked.borrow_mut() = true;
+            Ok(HashMap::new())
+        };
+        assert_eq!(pass(&d, &mut Gone::new(), &panes).unwrap(), 0);
+        assert!(!*asked.borrow());
     }
 
     /// Renamed outside rlord: its stored name isn't there, so nothing is
