@@ -106,6 +106,14 @@ pub struct Session {
     pub forked_from: Option<String>,
     #[serde(default)]
     pub forked_from_name: Option<String>,
+    /// When a person's terminal last showed it (`rlord_daemon::attention`).
+    #[serde(default)]
+    pub last_viewed_at: Option<i64>,
+    /// Why it waits: `permission` or `question` while it needs you;
+    /// `finished` or `failed` (the turn ended on an API error) while it is
+    /// your turn. None when not known.
+    #[serde(default)]
+    pub attention_reason: Option<String>,
     /// How many sessions were forked from it (live or archived), and how
     /// many of them aren't archived: on every listed row (`Db::sessions`).
     #[serde(default)]

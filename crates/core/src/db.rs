@@ -20,6 +20,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0010_session_context.sql"),
     include_str!("../migrations/0011_forked_from.sql"),
     include_str!("../migrations/0012_events_kind.sql"),
+    include_str!("../migrations/0013_attention.sql"),
+    include_str!("../migrations/0014_events_kind_ts.sql"),
 ];
 
 /// kv: the id of the active overlord (see `Db::overlord`).
@@ -30,7 +32,8 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      last_user_msg_at, last_agent_msg_at, last_state_change_at, \
      repo_path, workspace_path, branch, description, notes, launch_spec, role, summary, summary_at, \
      last_rlord_msg_at, forked_from, \
-     (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from)";
+     (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
+     last_viewed_at, attention_reason";
 
 pub struct NewSession<'a> {
     pub id: &'a str,
@@ -1174,6 +1177,132 @@ impl Db {
         Ok(())
     }
 
+    /// The attention queue's shadow events since `from` (ms), oldest
+    /// first: (session, ts, kind, payload).
+    pub fn attention_events(
+        &self,
+        from: i64,
+    ) -> Result<Vec<(String, i64, String, serde_json::Value)>> {
+        let mut st = self.conn.prepare(
+            "SELECT session_id, ts, kind, payload FROM events \
+             WHERE kind IN ('attention_entered', 'attention_settled', 'attention_cleared') \
+               AND ts >= ?1 ORDER BY seq",
+        )?;
+        let rows = st.query_map([from], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or(serde_json::Value::Null),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// When each session's pane was found dead since `from` (ms): a crash
+    /// or a kill, as rlord logs it (`reconciled_dead`, a `session_end`
+    /// from the pane). Not the agent
+    /// ending itself, nor the user stopping or archiving it.
+    pub fn pane_deaths(&self, from: i64) -> Result<std::collections::HashMap<String, Vec<i64>>> {
+        let mut st = self.conn.prepare(
+            "SELECT session_id, ts FROM events WHERE ts >= ?1 AND (kind = 'reconciled_dead' \
+               OR (kind = 'session_end' AND json_extract(payload, '$.from') = 'pane')) \
+             ORDER BY seq",
+        )?;
+        let mut out: std::collections::HashMap<String, Vec<i64>> = Default::default();
+        for row in st.query_map([from], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (id, ts) = row?;
+            out.entry(id).or_default().push(ts);
+        }
+        Ok(out)
+    }
+
+    /// When the attention queue's first shadow event was logged (ms).
+    pub fn first_attention_event(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(ts) FROM events WHERE kind IN \
+             ('attention_entered', 'attention_settled', 'attention_cleared')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Session `session_id`'s events of these `kinds` logged after `ts`
+    /// (ms), oldest first, all of them (no cap: other kinds never crowd
+    /// them out). On `idx_events_session_kind`.
+    pub fn events_of_kinds_after(
+        &self,
+        session_id: &str,
+        ts: i64,
+        kinds: &[&str],
+    ) -> Result<Vec<EventRow>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; kinds.len()].join(", ");
+        let sql = format!(
+            "SELECT seq, ts, kind, payload FROM events WHERE session_id = ? AND ts > ? \
+             AND kind IN ({marks}) ORDER BY seq"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &ts];
+        for k in kinds {
+            args.push(k);
+        }
+        let rows = stmt.query_map(args.as_slice(), |r| {
+            Ok(EventRow {
+                seq: r.get(0)?,
+                ts: r.get(1)?,
+                kind: r.get(2)?,
+                payload: serde_json::from_str(&r.get::<_, String>(3)?)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Attention entries the log leaves open: the latest
+    /// `attention_entered` of each session and kind with no
+    /// `attention_cleared` after it. (session, kind, since.)
+    pub fn open_attention_entries(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut st = self.conn.prepare(
+            "SELECT e.session_id, json_extract(e.payload, '$.kind'), \
+                    COALESCE(json_extract(e.payload, '$.since'), e.ts) \
+             FROM events e WHERE e.kind = 'attention_entered' \
+               AND e.seq = (SELECT MAX(x.seq) FROM events x WHERE x.session_id = e.session_id \
+                            AND x.kind = 'attention_entered' \
+                            AND json_extract(x.payload, '$.kind') = json_extract(e.payload, '$.kind')) \
+               AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
+                            AND c.kind = 'attention_cleared' AND c.seq > e.seq \
+                            AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Why the session waits (`attention_reason`; see migration 0013).
+    pub fn set_attention_reason(&self, id: &str, reason: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET attention_reason = ?2 WHERE id = ?1",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
+    /// A person's terminal showed these sessions at `ts`.
+    pub fn set_last_viewed(&self, ids: &[&str], ts: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE sessions SET last_viewed_at = ?2 \
+             WHERE id = ?1 AND (last_viewed_at IS NULL OR last_viewed_at < ?2)",
+        )?;
+        for id in ids {
+            stmt.execute(params![id, ts])?;
+        }
+        Ok(())
+    }
+
     /// Sessions the reconciler must check on daemon startup.
     pub fn running_sessions(&self) -> Result<Vec<Session>> {
         let sql = format!(
@@ -1758,6 +1887,8 @@ fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
         last_rlord_msg_at: r.get(25)?,
         forked_from: r.get(26)?,
         forked_from_name: r.get(27)?,
+        last_viewed_at: r.get(28)?,
+        attention_reason: r.get(29)?,
         forks: Vec::new(),
         fork_count: 0,
         live_fork_count: 0,
@@ -2018,7 +2149,7 @@ mod tests {
     #[test]
     fn migrations_apply_and_tables_exist() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 14);
         for table in [
             "sessions",
             "tags",
@@ -2259,7 +2390,7 @@ mod tests {
         let path = dir.path().join("state.db");
         drop(Db::open(&path).unwrap());
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 12);
+        assert_eq!(db.schema_version().unwrap(), 14);
     }
 
     #[test]

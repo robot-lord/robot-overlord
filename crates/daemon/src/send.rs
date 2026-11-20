@@ -1194,6 +1194,7 @@ mod tests {
             name: "/dev/ttys001".into(),
             session: session.into(),
             activity,
+            focused: true,
         };
         let now = 1_000_000;
         assert!(user_active(
