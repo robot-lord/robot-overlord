@@ -60,9 +60,6 @@ struct Seen {
     /// The file's (len, inode, mtime ms) once all of it was read:
     /// unchanged, it isn't opened.
     stamp: (u64, u64, i64),
-    /// The last scan read the transcript up to date (not a chunk cut by
-    /// the budget, not a file it couldn't see).
-    complete: bool,
 }
 
 /// What one look at a session's transcript found (`refresh`).
@@ -256,21 +253,23 @@ fn scan(d: &Daemon) -> Result<()> {
         .turn
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = sources.len().max(1);
-    // Sessions whose work going can't be read as work ending this tick: an
-    // old process's dropped (a restart), or a transcript not read up to
-    // date on this scan and the last (a budget-cut chunk, a file it
-    // couldn't see).
+    // Sessions whose work going isn't work ending: an old process's
+    // dropped (a restart).
     let mut unsure: HashSet<String> = HashSet::new();
+    // Not read up to date this scan (a budget-cut chunk, a file it couldn't
+    // see): what they showed stays shown (`keep_unread`), so what is shown
+    // always comes from a complete read, and an end is read from two.
+    let mut unread: HashSet<String> = HashSet::new();
     for l in sources.iter().cycle().skip(start % n).take(sources.len()) {
         let s = seen.entry(l.id.clone()).or_default();
         s.tracker.switch_hint = l.switched_at;
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
-        let was_complete = s.complete;
         let r = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
-        s.complete = r.complete;
-        if r.dropped || !(was_complete && r.complete) {
+        if r.dropped {
             unsure.insert(l.id.clone());
+        } else if !r.complete {
+            unread.insert(l.id.clone());
         }
         let sh = r.shown;
         if sh != Shown::default() {
@@ -284,6 +283,7 @@ fn scan(d: &Daemon) -> Result<()> {
     // changes (a look in between never sees the work gone with no end).
     let ended = {
         let shown = d.background.shown.lock().expect("background mutex");
+        keep_unread(&shown, &mut after, &unread);
         work_ended(&shown, &after, &running, &unsure)
     };
     if !ended.is_empty() {
@@ -311,10 +311,30 @@ fn task_list(v: &[Task]) -> Value {
         .collect()
 }
 
+/// For sessions not read up to date this scan (`unread`), keep what was
+/// shown before instead of what the partial read says: their work's end,
+/// if it ended, is then seen (and recorded) on the next complete scan.
+fn keep_unread(
+    before: &HashMap<String, Shown>,
+    after: &mut HashMap<String, Shown>,
+    unread: &HashSet<String>,
+) {
+    for id in unread {
+        match before.get(id) {
+            Some(sh) => {
+                after.insert(id.clone(), sh.clone());
+            }
+            None => {
+                after.remove(id);
+            }
+        }
+    }
+}
+
 /// Sessions whose background work was shown (`before`) and isn't now,
 /// because it ended: still `running`, and not `unsure` (work dropped with
-/// an old process, or a transcript not read up to date on both scans; a
-/// session past its stop grace isn't running).
+/// an old process; a session past its stop grace isn't running). (A
+/// partial read keeps what was shown: `keep_unread`.)
 fn work_ended(
     before: &HashMap<String, Shown>,
     after: &HashMap<String, Shown>,
@@ -389,6 +409,18 @@ mod tests {
         // stop grace: neither is work ending.
         let restarted: HashSet<String> = ["r".to_string()].into();
         assert_eq!(work_ended(&before, &after, &running, &restarted), ["a"]);
+        // Not read up to date: what was shown stays (its end is read on
+        // the next complete scan), whatever the partial read said.
+        let mut partial: HashMap<String, Shown> = [("b".into(), shown(0))].into();
+        keep_unread(
+            &before,
+            &mut partial,
+            &["a".to_string(), "b".to_string()].into(),
+        );
+        assert_eq!(partial.get("a"), Some(&shown(1)));
+        assert_eq!(partial.get("b"), Some(&shown(2)));
+        let ended = work_ended(&before, &partial, &running, &HashSet::new());
+        assert!(!ended.contains(&"a".to_string()) && !ended.contains(&"b".to_string()));
         // A recorded end only moves forward.
         let db = rlord_core::db::Db::open_in_memory().unwrap();
         record_end(&db, "a", 10).unwrap();

@@ -202,6 +202,9 @@ fn scan(d: &Daemon) -> Result<()> {
     };
     let now = now_ms();
     let mut after = Map::new();
+    // Sessions whose limit was judged this scan (live, unarchived, with a
+    // transcript to read): only these can be said to have stopped holding.
+    let mut judged: std::collections::HashSet<String> = Default::default();
     // New stamps, kept once what was read is saved: a scan that fails
     // part way looks at those files again next time.
     let mut stamps = Vec::new();
@@ -224,6 +227,7 @@ fn scan(d: &Daemon) -> Result<()> {
             None if Format::of(path) == Format::OpenCode => false,
             None => continue, // (gone)
         };
+        judged.insert(id.clone());
         let state = if unchanged {
             // Nothing new was written: only the clock can end it.
             before
@@ -246,7 +250,7 @@ fn scan(d: &Daemon) -> Result<()> {
                     db.insert_event(id, now, "limit_hit", &l.to_string())?;
                 }
             }
-            record_ended(&db, &before, &after, now)?;
+            record_ended(&db, &before, &after, &judged, now)?;
             db.kv_set_map(LIMITS_KEY, &after)?;
         }
         *d.limits.now.lock().expect("limits mutex") = Some(after);
@@ -256,17 +260,24 @@ fn scan(d: &Daemon) -> Result<()> {
     Ok(())
 }
 
-/// Limits shown before a scan (`before`) and not after it: when each
-/// ended, for the attention queue (kv `overlay_end:<id>`): its reset plus
+/// Limits shown before a scan (`before`) and not after it, for sessions
+/// whose limit the scan judged (`judged`: live, unarchived, transcript
+/// read; one that left the scan's sessions or lost its transcript didn't
+/// stop holding): when each ended, for the attention queue (kv
+/// `overlay_end:<id>`): its reset plus
 /// margin, or now if it went sooner (the user carried on); never moving a
 /// recorded end backwards.
 fn record_ended(
     db: &Db,
     before: &Map<String, Value>,
     after: &Map<String, Value>,
+    judged: &std::collections::HashSet<String>,
     now: i64,
 ) -> Result<()> {
-    for (id, l) in before.iter().filter(|(id, _)| !after.contains_key(*id)) {
+    for (id, l) in before
+        .iter()
+        .filter(|(id, _)| !after.contains_key(*id) && judged.contains(*id))
+    {
         let end = l["resets_at"]
             .as_i64()
             .map_or(now, |t| (t + MARGIN_MS).min(now));
@@ -643,7 +654,10 @@ mod tests {
         before.insert("kept".into(), json!({"resets_at": 900_000}));
         let mut after = Map::new();
         after.insert("kept".into(), json!({"resets_at": 900_000}));
-        record_ended(&db, &before, &after, 500_000).unwrap();
+        before.insert("left".into(), json!({"resets_at": 1_000}));
+        let judged: std::collections::HashSet<String> =
+            ["old", "early", "kept"].map(String::from).into();
+        record_ended(&db, &before, &after, &judged, 500_000).unwrap();
         let end = |id: &str| db.kv_get(&rlord_core::db::overlay_end_key(id)).unwrap();
         assert_eq!(
             end("old").as_deref(),
@@ -655,6 +669,8 @@ mod tests {
             "gone before its reset: now"
         );
         assert_eq!(end("kept"), None);
+        // Left the scan (archived, stopped, its transcript gone): no end.
+        assert_eq!(end("left"), None);
     }
     use rlord_core::db::Db;
 

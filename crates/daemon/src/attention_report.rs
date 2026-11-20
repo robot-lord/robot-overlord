@@ -274,7 +274,7 @@ pub fn render(r: &Report) -> String {
 const KNOWN_LIMITS: &str = "\nknown limits (discount these):\n\
   - an overlay (background work, a limit) that ended while the daemon was down has no recorded end\n\
   - attention list reads overlay ends as of its call, the watcher as of its last look\n\
-  - a background end is recorded by the background scan (every 5 s), only after two up-to-date reads\n";
+  - a background end is recorded by the background scan (every 5 s), from complete reads only\n";
 
 #[cfg(test)]
 mod tests {
