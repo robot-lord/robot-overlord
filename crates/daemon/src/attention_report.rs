@@ -266,8 +266,15 @@ pub fn render(r: &Report) -> String {
         r.stale_dead
     ));
     out.push_str("  look  announcements per day, by kind: above, with the user\n");
+    out.push_str(KNOWN_LIMITS);
     out
 }
+
+/// What the shadow numbers can't see yet: the reader discounts them.
+const KNOWN_LIMITS: &str = "\nknown limits (discount these):\n\
+  - an overlay (background work, a limit) that ended while the daemon was down has no recorded end\n\
+  - attention list reads overlay ends as of its call, the watcher as of its last look\n\
+  - a background end is recorded by the background scan (every 5 s), only after two up-to-date reads\n";
 
 #[cfg(test)]
 mod tests {
@@ -390,6 +397,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("answered after: median 80s"), "{text}");
+        assert!(text.contains("known limits (discount these)"), "{text}");
     }
 
     /// The log, as the daemon reads it for the report and at a restart.

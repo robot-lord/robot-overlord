@@ -60,6 +60,19 @@ struct Seen {
     /// The file's (len, inode, mtime ms) once all of it was read:
     /// unchanged, it isn't opened.
     stamp: (u64, u64, i64),
+    /// The last scan read the transcript up to date (not a chunk cut by
+    /// the budget, not a file it couldn't see).
+    complete: bool,
+}
+
+/// What one look at a session's transcript found (`refresh`).
+struct Refreshed {
+    shown: Shown,
+    /// A new agent process dropped work launched before it (a restart:
+    /// that work didn't end, it went with the old process).
+    dropped: bool,
+    /// The transcript was read up to date.
+    complete: bool,
 }
 
 /// What a session shows, as of the last scan.
@@ -126,15 +139,7 @@ fn last_write(main: i64, t: &Tracker) -> i64 {
 /// Bring a tracker up to date: read what was appended and drop the work
 /// launched before the agent was last started again (`started_at`: its
 /// tasks died with the old process). Returns what it shows at `now`.
-/// Also whether a new agent process dropped work launched before it (a
-/// restart: that work didn't end, it went with the old process).
-fn refresh(
-    s: &mut Seen,
-    path: &Path,
-    started_at: i64,
-    now: i64,
-    budget: &mut u64,
-) -> (Shown, bool) {
+fn refresh(s: &mut Seen, path: &Path, started_at: i64, now: i64, budget: &mut u64) -> Refreshed {
     use std::os::unix::fs::MetadataExt;
     // One stat: unchanged since the last read, nothing is opened.
     let Ok(meta) = std::fs::metadata(path) else {
@@ -144,7 +149,11 @@ fn refresh(
         // (The transcript can't be seen: its subagents' own files still
         // tell whether they run.)
         let agents = last_write(0, &s.tracker);
-        return (shown(&s.tracker, agents, 0, now), dropped);
+        return Refreshed {
+            shown: shown(&s.tracker, agents, 0, now),
+            dropped,
+            complete: false,
+        };
     };
     let main = meta_mtime_ms(&meta).unwrap_or(0);
     let stamp = (meta.len(), meta.ino(), main);
@@ -173,7 +182,12 @@ fn refresh(
     } else {
         main
     };
-    (shown(t, agents, main, now), dropped)
+    Refreshed {
+        shown: shown(t, agents, main, now),
+        dropped,
+        // (Read to this stat's end: the stamp was saved for it.)
+        complete: s.stamp == stamp,
+    }
 }
 
 /// Drop the work launched before the agent process last started
@@ -242,17 +256,23 @@ fn scan(d: &Daemon) -> Result<()> {
         .turn
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let n = sources.len().max(1);
-    // Sessions whose old process's work was dropped this tick (a restart).
-    let mut restarted: HashSet<String> = HashSet::new();
+    // Sessions whose work going can't be read as work ending this tick: an
+    // old process's dropped (a restart), or a transcript not read up to
+    // date on this scan and the last (a budget-cut chunk, a file it
+    // couldn't see).
+    let mut unsure: HashSet<String> = HashSet::new();
     for l in sources.iter().cycle().skip(start % n).take(sources.len()) {
         let s = seen.entry(l.id.clone()).or_default();
         s.tracker.switch_hint = l.switched_at;
         // (A new path, after a `/clear`: the tracker notices the new file
         // by its inode and carries the open work over.)
-        let (sh, dropped) = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
-        if dropped {
-            restarted.insert(l.id.clone());
+        let was_complete = s.complete;
+        let r = refresh(s, Path::new(&l.path), l.started_at, now, &mut budget);
+        s.complete = r.complete;
+        if r.dropped || !(was_complete && r.complete) {
+            unsure.insert(l.id.clone());
         }
+        let sh = r.shown;
         if sh != Shown::default() {
             after.insert(l.id.clone(), sh);
         }
@@ -264,7 +284,7 @@ fn scan(d: &Daemon) -> Result<()> {
     // changes (a look in between never sees the work gone with no end).
     let ended = {
         let shown = d.background.shown.lock().expect("background mutex");
-        work_ended(&shown, &after, &running, &restarted)
+        work_ended(&shown, &after, &running, &unsure)
     };
     if !ended.is_empty() {
         let db = d.db();
@@ -292,18 +312,19 @@ fn task_list(v: &[Task]) -> Value {
 }
 
 /// Sessions whose background work was shown (`before`) and isn't now,
-/// because it ended: still `running`, and not `restarted` (work dropped
-/// with an old process, or a session past its stop grace, didn't end).
+/// because it ended: still `running`, and not `unsure` (work dropped with
+/// an old process, or a transcript not read up to date on both scans; a
+/// session past its stop grace isn't running).
 fn work_ended(
     before: &HashMap<String, Shown>,
     after: &HashMap<String, Shown>,
     running: &HashSet<String>,
-    restarted: &HashSet<String>,
+    unsure: &HashSet<String>,
 ) -> Vec<String> {
     before
         .iter()
         .filter(|(id, sh)| sh.agent_count > 0 && after.get(*id).is_none_or(|a| a.agent_count == 0))
-        .filter(|(id, _)| running.contains(*id) && !restarted.contains(*id))
+        .filter(|(id, _)| running.contains(*id) && !unsure.contains(*id))
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -378,6 +399,27 @@ mod tests {
         );
     }
 
+    /// A read cut by the budget isn't up to date: no overlay end can be
+    /// read from that scan.
+    #[test]
+    fn a_budget_cut_read_is_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("m.jsonl");
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "message": {"content": "x".repeat(200)}})
+        );
+        std::fs::write(&main, line.repeat(50)).unwrap();
+        let mut s = Seen::default();
+        let mut small = 300u64;
+        assert!(!refresh(&mut s, &main, 0, now_ms(), &mut small).complete);
+        assert!(refresh(&mut s, &main, 0, now_ms(), &mut all()).complete);
+        // Nothing new: still up to date.
+        assert!(refresh(&mut s, &main, 0, now_ms(), &mut 0).complete);
+        // A file it can't see: not.
+        assert!(!refresh(&mut s, &dir.path().join("gone"), 0, now_ms(), &mut all()).complete);
+    }
+
     /// A budget with no limit, for one call.
     fn all() -> u64 {
         u64::MAX
@@ -407,14 +449,20 @@ mod tests {
         std::fs::write(&main, format!("{}\n{}\n", agent("a1"), shell("b1"))).unwrap();
         let mut t = Seen::default();
         let now = now_ms();
-        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).0.agent_count, 1);
+        assert_eq!(
+            refresh(&mut t, &main, 0, now, &mut all()).shown.agent_count,
+            1
+        );
         // Nothing written for the stale time: the agent and the shell are
         // hidden, back to "your turn".
-        let later = refresh(&mut t, &main, 0, now + STALE_MS, &mut all()).0;
+        let later = refresh(&mut t, &main, 0, now + STALE_MS, &mut all()).shown;
         assert_eq!(later, Shown::default());
         // Not forgotten: shown again once it writes (here: `now` again).
         assert_eq!(t.tracker.open.len(), 2);
-        assert_eq!(refresh(&mut t, &main, 0, now, &mut all()).0.agent_count, 1);
+        assert_eq!(
+            refresh(&mut t, &main, 0, now, &mut all()).shown.agent_count,
+            1
+        );
         // A late notification still closes it.
         let done = json!({"type": "attachment", "attachment": {"type": "queued_command",
             "commandMode": "task-notification",
@@ -438,7 +486,7 @@ mod tests {
             rlord_core::agents::transcript::parse_iso_ms("2026-01-01T00:05:00.000Z").unwrap();
         let mut t = Seen::default();
         // (`now` right after: fresh enough by the file's mtime.)
-        let sh = refresh(&mut t, &main, started, now_ms(), &mut all()).0;
+        let sh = refresh(&mut t, &main, started, now_ms(), &mut all()).shown;
         assert_eq!(sh.agent_count, 1);
         assert_eq!(t.tracker.open.keys().collect::<Vec<_>>(), ["a2"]);
     }
@@ -517,11 +565,12 @@ mod tests {
         let forked =
             rlord_core::agents::transcript::parse_iso_ms("2026-01-02T00:00:00.000Z").unwrap();
         let mut s = Seen::default();
-        let (sh, dropped) = refresh(&mut s, &main, forked, now_ms(), &mut all());
-        assert_eq!(sh, Shown::default());
+        let r = refresh(&mut s, &main, forked, now_ms(), &mut all());
+        assert_eq!(r.shown, Shown::default());
         // Dropped with the old process: a restart, not work ending (no
         // overlay end is recorded for it: `work_ended`).
-        assert!(dropped);
+        assert!(r.dropped);
+        assert!(r.complete, "read up to date");
     }
 
     #[test]
@@ -550,12 +599,12 @@ mod tests {
         let mut s = Seen::default();
         assert_eq!(
             refresh(&mut s, &main, 0, now_ms(), &mut all())
-                .0
+                .shown
                 .agent_count,
             1
         );
         assert_eq!(
-            refresh(&mut s, &main, 1, now_ms(), &mut all()).0,
+            refresh(&mut s, &main, 1, now_ms(), &mut all()).shown,
             Shown::default()
         );
     }
@@ -588,7 +637,9 @@ mod tests {
         refresh(&mut t, &old, 0, now_ms(), &mut all());
         // Same process (no new start): the open work goes on.
         assert_eq!(
-            refresh(&mut t, &new, 0, now_ms(), &mut all()).0.agent_count,
+            refresh(&mut t, &new, 0, now_ms(), &mut all())
+                .shown
+                .agent_count,
             1
         );
     }

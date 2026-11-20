@@ -2435,6 +2435,7 @@ pub fn reconcile(db: &Db) -> Result<()> {
         if !alive {
             let now = now_ms();
             db.set_status(&s.id, Status::Stopped, now)?;
+            db.kv_delete(&rlord_core::db::overlay_end_key(&s.id))?;
             db.insert_event(&s.id, now, "reconciled_dead", "{}")?;
             tracing::info!(session = %s.id, "tmux gone; marked stopped (resumable)");
         }

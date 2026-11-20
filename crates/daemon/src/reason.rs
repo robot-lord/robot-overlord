@@ -27,24 +27,16 @@ const ASKS: &[&str] = &[
     "notification",
 ];
 
-/// The event kinds that leave no reason: a turn starting (the user's,
-/// rlord's, or one the agent began without a prompt hook), a start or
-/// restart, a stop, a turn that ended without a real end.
+/// The event kinds that leave no reason, among those `record` is called
+/// with: a turn starting (the user's, rlord's, or one the agent began
+/// without a prompt hook), a start, a turn that ended without a real end.
+/// (A stop or a restart: `Db::set_status` clears it.)
 const CLEARS: &[&str] = &[
     "prompt_submitted",
     "rlord_prompt",
     "turn_started",
     "message_delivered",
-    "awaiting_first_prompt",
     "session_start",
-    "restarted",
-    "resumed",
-    "launched",
-    "fresh_conversation",
-    "stopped",
-    "archived",
-    "session_end",
-    "reconciled_dead",
     TURN_LOST,
 ];
 
@@ -146,7 +138,7 @@ mod tests {
         for k in [
             "prompt_submitted",
             "message_delivered",
-            "awaiting_first_prompt",
+            "session_start",
             TURN_LOST,
         ] {
             assert_eq!(after(&working, k, Working, false, false), Some(None), "{k}");

@@ -36,7 +36,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -473,8 +473,8 @@ pub fn start(d: &Arc<Daemon>) {
         let mut changes = d.notify.subscribe();
         let mut settling = true;
         let mut quiet = 0u32;
-        // The kind of the last look's error (None: it went through).
-        let mut last_error: Option<String> = None;
+        // The kind of error last warned, and when.
+        let mut warned: Option<(String, Instant)> = None;
         loop {
             std::thread::sleep(TICK);
             let poked = d.attention.moved.swap(false, Ordering::Relaxed);
@@ -501,18 +501,20 @@ pub fn start(d: &Arc<Daemon>) {
                 look(&d, now_ms(), &tmux::list_clients, due, poked)
             }));
             settling = match r {
-                Ok(Ok(p)) => {
-                    last_error = None;
-                    p
-                }
+                Ok(Ok(p)) => p,
                 // (After a failure, back to the idle cadence: a change or
                 // the slow fallback looks again, not every tick.)
-                // (Warned when the kind of error changes, then quietly: a
-                // look that keeps failing the same way doesn't flood the
+                // (Warned when the kind of error differs from the last one
+                // warned, or ten minutes on: a look that keeps failing the
+                // same way, between good looks or not, doesn't flood the
                 // log.)
                 Ok(Err(e)) => {
                     let kind = error_kind(&e);
-                    if last_error.replace(kind.clone()).as_ref() != Some(&kind) {
+                    let again = warned.as_ref().is_none_or(|(k, at)| {
+                        *k != kind || at.elapsed() >= Duration::from_secs(600)
+                    });
+                    if again {
+                        warned = Some((kind, Instant::now()));
                         tracing::warn!(error = %format!("{e:#}"), "attention queue");
                     } else {
                         tracing::debug!(error = %e, "attention queue");
@@ -896,6 +898,11 @@ pub fn cleared_by(
         };
         return by;
     }
+    // No event says; an overlay that ended after it began does (its turn
+    // went to background work or a limit and back).
+    if row.overlay_ended_at.is_some_and(|t| t > since) {
+        return "overlay";
+    }
     // (Nothing logged that says: never guessed to be the agent's own.)
     "unknown"
 }
@@ -1116,6 +1123,12 @@ mod tests {
         let mut bg = row("s", "idle");
         bg.shown = "background".into();
         assert_eq!(cleared_by(YourTurn, Some(&bg), &[], NOW), "overlay");
+        // No event says, but an overlay ended after it began: overlay.
+        let mut back = row("s", "idle");
+        back.overlay_ended_at = Some(NOW + 5);
+        assert_eq!(cleared_by(YourTurn, Some(&back), &[], NOW), "overlay");
+        back.overlay_ended_at = Some(NOW - 5);
+        assert_eq!(cleared_by(YourTurn, Some(&back), &[], NOW), "unknown");
         let mut gone = row("s", "stopped");
         gone.live = false;
         assert_eq!(cleared_by(NeedsYou, Some(&gone), &[], NOW), "ended");

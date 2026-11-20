@@ -361,15 +361,8 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str, text: Option<&PromptMark
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
-    let question = kind == "question";
-    crate::reason::record(
-        db,
-        s,
-        kind,
-        step.status.unwrap_or(s.status),
-        question,
-        false,
-    )?;
+    // (A form, `question`, reads as a question by its kind.)
+    crate::reason::record(db, s, kind, step.status.unwrap_or(s.status), false, false)?;
     // A prompt: the user's, or one rlord typed (`own.rs`: by its text
     // when the event carried it, else by time).
     let (kind, source) = if step.user_msg {

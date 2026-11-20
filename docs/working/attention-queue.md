@@ -615,8 +615,26 @@ trustworthy before the go/no-go read:
   by `Daemon::call` and `wakes_idle`) come before the session is looked
   up.
 
+Review rounds 3 and 4 changed: `fresh_conversation` and `reforked` set
+`starting` (back in the clearing kinds, `ended`); a background end is
+recorded only when the transcript was read up to date on that scan and
+the last (not a budget-cut chunk); a stop (a `/clear` is a brief one)
+keeps the overlay's end, a start, an archive, a delete or a reconcile
+drops it; a turn that opened and closed since a start, as `discover`
+reads it, is a real end (`finished`, last message dated); a clear no
+event explains but an overlay ended after the entry began is `overlay`;
+a look's error kind is re-warned when it changes or after ten minutes;
+`kv_prefix` is a key range (the index).
+
 Owed:
 
+- Known limits, shown with the report's go/no-go numbers: an overlay
+  that ended while the daemon was down has no recorded end;
+  `attention.list` reads overlay ends as of its call, the watcher as of
+  its last look; the background end is written by the background scan
+  (every 5 s, after two up-to-date reads), not where a task closes.
+- The background tests build the same transcript fixture in several
+  places: one helper.
 - The kind-specific reason rules still depend on each status writer
   calling `reason::record` (stops and starts don't: `Db::set_status`
   clears those).

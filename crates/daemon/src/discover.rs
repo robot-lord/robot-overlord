@@ -701,23 +701,33 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
         // only that a turn is open was read, so by time).
         Status::Working => crate::own::prompt(&db, &s.id, None, now, crate::own::Via::Transcript)?,
         _ => {
-            if s.status == Status::Working {
+            // A turn ended: from working, or one that opened and closed
+            // since a start (`working_since` saw it).
+            if s.status == Status::Working || working.is_some() {
                 db.touch_last_agent_msg(&s.id, now)?;
             }
             ("agent_stopped", None)
         }
     };
-    crate::reason::record(&db, &cur, reason_kind(s.status, kind), next, false, false)?;
+    crate::reason::record(
+        &db,
+        &cur,
+        reason_kind(s.status, working, kind),
+        next,
+        false,
+        false,
+    )?;
     let detail = crate::own::with_source(json!({"from": "transcript"}), source);
     db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
 }
 
 /// The kind `reason::record` reads for a status the transcript set: a
-/// start settling to idle with no turn ended is no turn's end (`finished`
-/// would be wrong): read as the start it is.
-fn reason_kind(from: Status, kind: &str) -> &str {
-    if from == Status::Starting && kind == "agent_stopped" {
+/// start settling to idle with no turn in the transcript (`working` None)
+/// is no turn's end (`finished` would be wrong): read as the start it is.
+/// A turn that opened and closed since the start is a real end.
+fn reason_kind(from: Status, working: Option<bool>, kind: &str) -> &str {
+    if from == Status::Starting && working.is_none() && kind == "agent_stopped" {
         "session_start"
     } else {
         kind
@@ -770,10 +780,21 @@ mod tests {
     #[test]
     fn a_start_that_settles_is_no_turns_end() {
         use Status::*;
-        assert_eq!(reason_kind(Starting, "agent_stopped"), "session_start");
-        assert_eq!(reason_kind(Working, "agent_stopped"), "agent_stopped");
         assert_eq!(
-            reason_kind(Starting, "prompt_submitted"),
+            reason_kind(Starting, None, "agent_stopped"),
+            "session_start"
+        );
+        // A turn opened and closed since the start: a real end.
+        assert_eq!(
+            reason_kind(Starting, Some(false), "agent_stopped"),
+            "agent_stopped"
+        );
+        assert_eq!(
+            reason_kind(Working, Some(false), "agent_stopped"),
+            "agent_stopped"
+        );
+        assert_eq!(
+            reason_kind(Starting, Some(true), "prompt_submitted"),
             "prompt_submitted"
         );
         let s: Session = serde_json::from_value(json!({
@@ -787,7 +808,7 @@ mod tests {
         assert_eq!(
             crate::reason::after(
                 &s,
-                reason_kind(Starting, "agent_stopped"),
+                reason_kind(Starting, None, "agent_stopped"),
                 Idle,
                 false,
                 false

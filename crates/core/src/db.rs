@@ -35,10 +35,22 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
      last_viewed_at, attention_reason";
 
+/// The first string after every one that starts with `prefix` (its last
+/// character bumped). None: no such string (empty, or ends in the last
+/// character there is).
+fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let bumped = char::from_u32(last as u32 + 1)?;
+    chars.push(bumped);
+    Some(chars.into_iter().collect())
+}
+
 /// kv key: when session `id`'s last overlay (background work, a usage
 /// limit) stopped being shown (ms), recorded where it ends
 /// (`rlord_daemon::background`, `rlord_daemon::limits`): its turn is the
-/// user's from then. Dropped when it stops or starts again.
+/// user's from then. Dropped when it starts again (a restart, a fresh
+/// conversation), is archived, deleted, or found dead at a reconcile.
 pub fn overlay_end_key(id: &str) -> String {
     format!("overlay_end:{id}")
 }
@@ -496,10 +508,22 @@ impl Db {
 
     /// Every kv entry whose key starts with `prefix`, by key.
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare(
-            "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
-        )?;
-        let rows = st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // A range on the key (its primary key index), not a function of
+        // it: `prefix <= key < next`, `next` the prefix with its last
+        // character bumped.
+        let next = prefix_end(prefix);
+        let (sql, upper) = match &next {
+            Some(n) => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                n.as_str(),
+            ),
+            None => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND ?2 = ?2 ORDER BY key",
+                "",
+            ),
+        };
+        let mut st = self.conn.prepare(sql)?;
+        let rows = st.query_map(params![prefix, upper], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -1078,8 +1102,8 @@ impl Db {
     }
 
     /// Update status; stamps last_state_change_at and returns true iff changed.
-    /// Stopped or starting (a stop, a restart): why it waited and when its
-    /// last overlay ended go with it (the attention queue's).
+    /// Stopped or starting (a stop, a restart): why it waited goes with it;
+    /// starting, also when its last overlay ended (the attention queue's).
     pub fn set_status(&self, id: &str, status: Status, ts: i64) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE sessions SET status = ?2, last_state_change_at = ?3, \
@@ -1088,7 +1112,9 @@ impl Db {
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
-        if n > 0 && matches!(status, Status::Stopped | Status::Starting) {
+        // (A start, from a restart or a fresh conversation: a new
+        // process. Not a stop: a `/clear` stops it a moment.)
+        if n > 0 && status == Status::Starting {
             self.kv_delete(&overlay_end_key(id))?;
         }
         if n > 0 && status == Status::Stopped {
@@ -1153,6 +1179,9 @@ impl Db {
             "UPDATE sessions SET archived_at = ?2 WHERE id = ?1",
             params![id, ts],
         )?;
+        if ts.is_some() {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         Ok(())
     }
 
@@ -2190,8 +2219,8 @@ mod tests {
         assert_eq!(tokens(&db), (90, 20));
     }
 
-    /// A stop or a (re)start drops why it waited and its last overlay's
-    /// end; other changes keep them.
+    /// A stop or a (re)start drops why it waited; a (re)start or an
+    /// archive also its last overlay's end; other changes keep them.
     #[test]
     fn a_stop_or_start_clears_the_attention_state() {
         let db = Db::open_in_memory().unwrap();
@@ -2224,11 +2253,26 @@ mod tests {
         set(Status::Idle, 2);
         db.set_status("s", Status::Working, 3).unwrap();
         assert_eq!(state(), (Some("finished".into()), Some("5".into())));
+        // A stop (a `/clear` is a brief one) keeps the overlay's end.
         db.set_status("s", Status::Stopped, 4).unwrap();
-        assert_eq!(state(), (None, None));
+        assert_eq!(state(), (None, Some("5".into())));
         set(Status::Idle, 5);
         db.set_status("s", Status::Starting, 6).unwrap();
         assert_eq!(state(), (None, None));
+        db.kv_set(&overlay_end_key("s"), "7").unwrap();
+        db.set_archived("s", Some(8)).unwrap();
+        assert_eq!(db.kv_get(&overlay_end_key("s")).unwrap(), None);
+        // The key range finds exactly the prefix's keys.
+        db.kv_set("overlay_end:a", "1").unwrap();
+        db.kv_set("overlay_end;", "x").unwrap();
+        db.kv_set("overlay_enc", "x").unwrap();
+        let found: Vec<String> = db
+            .kv_prefix("overlay_end:")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(found, ["overlay_end:a"]);
     }
 
     #[test]
