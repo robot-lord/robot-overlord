@@ -1202,6 +1202,7 @@ mod tests {
         app.handle_key(a, &mut term).unwrap();
         assert!(app.show_archived, "a opens the archived view");
 
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (w, h) = (150, 34);
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         t.draw(|f| app.draw(f)).unwrap();

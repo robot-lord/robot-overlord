@@ -1565,7 +1565,7 @@ impl App {
         }
         self.draw_footer(f, footer_area);
         if matches!(self.mode, Mode::Normal) {
-            self.draw_hover(f);
+            self.draw_hover(f, list_area.width);
         }
         match &self.mode {
             Mode::NewSession(form) => self.draw_form(f, form),
@@ -1589,7 +1589,7 @@ impl App {
 
     /// The popup over the list row under the pointer: its status, and every
     /// symbol on the row, in words.
-    fn draw_hover(&self, f: &mut Frame) {
+    fn draw_hover(&self, f: &mut Frame, list_w: u16) {
         let Some((id, x, y)) = &self.hover_row else {
             return;
         };
@@ -1597,11 +1597,21 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
-        let lines = statustext::describe(s, rlord_core::types::now_ms());
+        let cols = ListCols::for_width(list_w);
+        let lines = statustext::describe(
+            s,
+            cols.narrow,
+            usize::from(cols.status_w),
+            rlord_core::types::now_ms(),
+        );
+        if lines.is_empty() {
+            return;
+        }
+        let plains: Vec<String> = lines.iter().map(statustext::Item::plain).collect();
         let area = f.area();
         // (Border and padding: 2 columns a side; wide characters count
         // two.)
-        let w = lines
+        let w = plains
             .iter()
             .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
             .max()
@@ -1609,13 +1619,13 @@ impl App {
             .min(64)
             .min(area.width);
         let inner = usize::from(w.saturating_sub(4));
-        let rows: u16 = lines
+        let rows: u16 = plains
             .iter()
             .map(|l| theme::wrapped_rows(l, inner) as u16)
             .sum();
         let text: Vec<Line> = lines
-            .into_iter()
-            .map(|l| Line::styled(l, Style::default().fg(theme::text())))
+            .iter()
+            .map(|l| l.line(Style::default().fg(theme::text())))
             .collect();
         let p = Paragraph::new(text)
             .wrap(Wrap { trim: true })
@@ -1755,31 +1765,12 @@ impl App {
                         spans.push(Span::styled(others_up(s), theme::faint()));
                         spans
                     })),
-                    Cell::from(Line::from(vec![
-                        // Not loaded yet (the daemon's warm-up): say so
-                        // rather than show half-known data.
-                        if narrow {
-                            // The glyph alone (`○`, `●`, `◷`).
-                            let chip = state_chip(s, false);
-                            let glyph: String = chip.content.chars().take(1).collect();
-                            Span::styled(glyph, chip.style)
-                        } else {
-                            state_chip(s, false)
-                        },
-                        // Its sub-agents are still loading (warm-up): the
-                        // status is known, the agent counts aren't yet.
-                        Span::styled(if s["loading"] == true { " ◌" } else { "" }, theme::faint()),
-                        // Remote Control: connected, connecting, or wanted
-                        // but not to be had.
-                        remote_chip(&s["remote"]),
-                        Span::styled(
-                            match s["agents_running"].as_i64().unwrap_or(0) {
-                                0 => String::new(),
-                                n => format!(" ⚙{n}"),
-                            },
-                            Style::default().fg(theme::overlord()),
-                        ),
-                    ])),
+                    // Every mark, as the status popup explains them.
+                    Cell::from(Line::from(statustext::column_spans(
+                        s,
+                        narrow,
+                        usize::from(status_w),
+                    ))),
                     // The time the list is sorted by (activity otherwise).
                     Cell::from(Span::styled(
                         rel_age(match sort {
@@ -2129,13 +2120,11 @@ impl App {
                 ))
             },
         ];
-        // Every symbol on its row, in words.
-        for (n, l) in statustext::describe(s, rlord_core::types::now_ms())
-            .into_iter()
-            .enumerate()
-        {
+        // The status in words, and any background shells (the chip is
+        // in the headline; remote and agents have their own rows).
+        for (label, l) in statustext::describe_status(s, rlord_core::types::now_ms()) {
             lines.push(Line::from(vec![
-                key(if n == 0 { "status" } else { "" }),
+                key(label),
                 Span::styled(l, theme::muted()),
             ]));
         }
@@ -2238,39 +2227,21 @@ impl App {
                 ),
             ]));
         }
-        if let Some(st) = s["remote"]["state"].as_str() {
-            let (text, style) = match st {
-                "on" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["url"].as_str().unwrap_or("in the Claude app")
-                    ),
-                    Style::default().fg(theme::green()),
-                ),
-                "connecting" => ("connecting…".into(), theme::muted()),
-                "pending" => (
-                    format!(
-                        "on · {}",
-                        s["remote"]["reason"].as_str().unwrap_or("needs a restart")
-                    ),
-                    theme::muted(),
-                ),
-                "disconnecting" => ("off · disconnects at its restart".into(), theme::muted()),
-                "stopped" => ("on · connects when it starts".into(), theme::muted()),
-                other => (
-                    format!(
-                        "{other}: {}",
-                        s["remote"]["reason"].as_str().unwrap_or("unknown")
-                    ),
-                    Style::default().fg(theme::red()),
-                ),
-            };
+        // Remote Control as the list's ⇄ says it, in its colour (and
+        // where to reach it); nothing for a state the list doesn't draw.
+        if let Some((style, mut text)) = statustext::remote_parts(&s["remote"]) {
+            if let Some(url) = s["remote"]["url"]
+                .as_str()
+                .filter(|_| s["remote"]["state"] == "on")
+            {
+                text = format!("{text} {url}");
+            }
             lines.push(Line::from(vec![key("remote"), Span::styled(text, style)]));
         }
         if s["loading"] == true {
             lines.push(Line::from(vec![
                 key("agents"),
-                Span::styled("◌ loading sub-agents…", theme::faint()),
+                Span::styled("⋯ loading sub-agents", theme::faint()),
             ]));
         } else if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
@@ -2871,7 +2842,7 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// `↻`: a resume is scheduled for when it resets. Its turn over while
 /// subagents it started still run (`async_tasks`, from the daemon's
 /// `background`): that, in place of "your turn".
-fn state_chip(s: &Value, full: bool) -> Span<'static> {
+pub(crate) fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let until = match shown(s) {
         "limited" => l["until"].as_str().unwrap_or("?"),
@@ -2923,21 +2894,6 @@ fn others_up(s: &Value) -> String {
         String::new()
     } else {
         format!(" +{}", marks.join(" "))
-    }
-}
-
-/// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
-/// wanted but failing or unavailable (red); nothing when off.
-fn remote_chip(r: &Value) -> Span<'static> {
-    match r["state"].as_str() {
-        Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
-        Some("connecting" | "stopped" | "pending" | "disconnecting") => {
-            Span::styled(" ⇄", theme::faint())
-        }
-        Some("failed") | Some("unavailable") => {
-            Span::styled(" ⇄", Style::default().fg(theme::red()))
-        }
-        _ => Span::raw(""),
     }
 }
 
@@ -3792,6 +3748,7 @@ mod tests {
         assert!(out.join("\n").contains("Groups"));
 
         // Every theme renders; themes with a background paint all of it.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for p in rlord_core::themes::THEMES {
             theme::set(p);
             term.draw(|f| app.draw(f)).unwrap();
@@ -3821,6 +3778,7 @@ mod tests {
         assert_eq!(text(&["release", "tooling", "wip"]), "#3");
         assert_eq!(text(&["a-very-long-group-name"]), "#1");
         // The count is dim, not a tag's colour.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cell = tags_cell(&["release", "tooling"], 15);
         assert_eq!(cell.spans[0].style, theme::muted());
         // Squeezed: the count fits 3 cells (4 for 10 or more), then "…".

@@ -12,6 +12,11 @@ use rlord_core::themes::{self, Palette, Rgb};
 
 static ACTIVE: RwLock<Option<&'static Palette>> = RwLock::new(None);
 
+/// Held by tests that switch the palette or check colours, so they
+/// don't race.
+#[cfg(test)]
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Switch the palette everything draws with.
 pub fn set(p: &'static Palette) {
     *ACTIVE.write().expect("theme lock") = Some(p);
@@ -171,6 +176,11 @@ pub fn agent_marker(agent: &str) -> Vec<Span<'static>> {
 /// `● working`, colored.
 pub fn status_chip(status: &str) -> Span<'static> {
     let (glyph, label, color) = status_parts(status);
+    // A status this version doesn't know: its own name.
+    let label = match (label, status) {
+        ("unknown", st) if !matches!(st, "" | "-") => st,
+        (l, _) => l,
+    };
     Span::styled(format!("{glyph} {label}"), Style::default().fg(color))
 }
 
