@@ -1326,7 +1326,7 @@ fn main() -> Result<()> {
                 .iter()
                 .enumerate()
             {
-                println!("  {:<10} {l}", if i == 0 { "status" } else { "" });
+                println!("  {:<10} {}", if i == 0 { "status" } else { "" }, l.plain());
             }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
             println!("  dir        {}", g("project_path"));

@@ -2,7 +2,11 @@
 //! by the hover popup over a list row and the details panel. Pure, so it
 //! is tested without a terminal.
 
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use serde_json::Value;
+
+use crate::theme;
 
 use crate::theme::status_parts;
 
@@ -14,7 +18,7 @@ const MEANINGS: [(&str, &str); 6] = [
         "waiting_input",
         "blocked on a permission prompt or a question",
     ),
-    ("idle", "it finished, the next prompt is yours"),
+    ("idle", "it finished; the next prompt is yours"),
     ("starting", "the agent is starting"),
     ("stopped", "not running (can be resumed)"),
     ("error", "the agent failed"),
@@ -48,12 +52,14 @@ pub fn legend() -> Vec<(String, &'static str)> {
         "⇄".into(),
         "Remote Control: green on, dim connecting, red failing",
     ));
+    v.push(("⚙N".into(), "N sub-agents running"));
+    v.push(("◌".into(), "still loading its sub-agent counts"));
     v
 }
 
 use rlord_core::timefmt::rel_age_at;
 
-/// The status itself, as a sentence.
+/// The status itself, after its mark: what it means.
 pub fn status_sentence(s: &Value, now: i64) -> String {
     let l = &s["limit"];
     let shown = s["shown_status"]
@@ -68,9 +74,14 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             ""
         };
         return if l["reset"] == true {
-            format!("Usage limit just reset.{resume}")
+            let resume = if l["resume"] == true {
+                " It resumes by itself."
+            } else {
+                ""
+            };
+            format!("its usage limit just reset.{resume}")
         } else {
-            format!("Stopped on a usage limit until {until}.{resume}")
+            format!("stopped on a usage limit until {until}.{resume}")
         };
     }
     if shown == "background" {
@@ -86,7 +97,7 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
             .filter(|t| *t > 0)
             .min();
         let mut out = format!(
-            "Waiting on {n} background task{}",
+            "waiting on {n} background task{}",
             if n == 1 { "" } else { "s" }
         );
         if !labels.is_empty() {
@@ -102,43 +113,34 @@ pub fn status_sentence(s: &Value, now: i64) -> String {
         out.push_str(". Its turn is over; it goes on when they finish.");
         return out;
     }
-    let st = shown;
-    let (_, label, _) = status_parts(st);
-    match MEANINGS.iter().find(|(k, _)| *k == st) {
-        Some((_, what)) => {
-            let mut c = label.chars();
-            let first: String = c
-                .next()
-                .map(|f| f.to_uppercase().collect())
-                .unwrap_or_default();
-            format!("{first}{}: {what}.", c.as_str())
-        }
-        None => format!("Status: {st}."),
+    match MEANINGS.iter().find(|(k, _)| *k == shown) {
+        Some((_, what)) => format!("{what}."),
+        None => format!("status {shown}."),
     }
 }
 
-/// The Remote Control mark (⇄) in words, if it shows one.
+/// The Remote Control mark (⇄) in words, if the list shows one.
 pub fn remote_sentence(s: &Value) -> Option<String> {
     let r = &s["remote"];
     let why = r["reason"].as_str();
     Some(match r["state"].as_str()? {
-        "on" => "Remote Control connected (⇄): reachable from the Claude app.".into(),
-        "connecting" => "Remote Control connecting (⇄, dim).".into(),
+        "on" => "Remote Control connected: reachable from the Claude app.".into(),
+        "connecting" => "Remote Control connecting.".into(),
         "pending" => format!(
-            "Remote Control on (⇄, dim): {}.",
+            "Remote Control on, not connected yet: {}.",
             why.unwrap_or("needs a restart")
         ),
-        "stopped" => "Remote Control on (⇄, dim): connects when it starts.".into(),
-        "disconnecting" => "Remote Control off (⇄, dim): disconnects at its restart.".into(),
-        other => format!(
-            "Remote Control {other} (⇄, red): {}.",
-            why.unwrap_or("unknown reason")
-        ),
+        "stopped" => "Remote Control on: connects when the session starts.".into(),
+        "disconnecting" => "Remote Control off: disconnects when the session restarts.".into(),
+        st @ ("failed" | "unavailable") => {
+            format!("Remote Control {st}: {}.", why.unwrap_or("unknown reason"))
+        }
+        _ => return None,
     })
 }
 
 /// Background shells (dev servers, watchers) still running, if any:
-/// information, never a status.
+/// information, never a status, and no mark in the list.
 pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
     let sh = &s["async_shells"];
     let n = sh["count"].as_u64().filter(|n| *n > 0)?;
@@ -168,11 +170,71 @@ pub fn shells_sentence(s: &Value, now: i64) -> Option<String> {
     Some(out)
 }
 
-/// Everything the row's symbols say, one sentence per line.
-pub fn describe(s: &Value, now: i64) -> Vec<String> {
-    let mut v = vec![status_sentence(s, now)];
-    v.extend(shells_sentence(s, now));
-    v.extend(remote_sentence(s));
+/// One mark from the row's Status column and what it means. `mark` is
+/// the column's own text and colour (empty for a line with no mark).
+pub struct Item {
+    pub mark: Span<'static>,
+    pub text: String,
+}
+
+impl Item {
+    /// `mark — text`, or the text alone.
+    pub fn plain(&self) -> String {
+        if self.mark.content.is_empty() {
+            self.text.clone()
+        } else {
+            format!("{} — {}", self.mark.content, self.text)
+        }
+    }
+
+    /// The line, the mark in its column colour.
+    pub fn line(&self, text: Style) -> Line<'static> {
+        let mut v = Vec::new();
+        if !self.mark.content.is_empty() {
+            v.push(self.mark.clone());
+            v.push(Span::styled(" — ", text));
+        }
+        v.push(Span::styled(self.text.clone(), text));
+        Line::from(v)
+    }
+}
+
+fn trimmed(sp: Span<'static>) -> Span<'static> {
+    Span::styled(sp.content.trim().to_string(), sp.style)
+}
+
+/// Every mark in the row's Status column, in its order, each with what
+/// it means; then background shells, which have no mark.
+pub fn describe(s: &Value, now: i64) -> Vec<Item> {
+    let mut v = vec![Item {
+        mark: trimmed(crate::state_chip(s, false)),
+        text: status_sentence(s, now),
+    }];
+    if s["loading"] == true {
+        v.push(Item {
+            mark: Span::styled("◌", theme::faint()),
+            text: "still loading its sub-agent counts.".into(),
+        });
+    }
+    if let Some(text) = remote_sentence(s) {
+        v.push(Item {
+            mark: trimmed(crate::remote_chip(&s["remote"])),
+            text,
+        });
+    }
+    let n = s["agents_running"].as_i64().unwrap_or(0);
+    if n != 0 {
+        v.push(Item {
+            mark: Span::styled(format!("⚙{n}"), Style::default().fg(theme::overlord())),
+            text: format!("{n} sub-agent{} running.", if n == 1 { "" } else { "s" }),
+        });
+    }
+    if let Some(text) = shells_sentence(s, now) {
+        v.push(Item {
+            mark: Span::raw(""),
+            text,
+        });
+    }
     v
 }
 
@@ -194,20 +256,21 @@ mod tests {
         assert!(!hover_still_there(None, &rows, "b"));
     }
 
+    fn texts(s: &Value, now: i64) -> Vec<String> {
+        describe(s, now).iter().map(Item::plain).collect()
+    }
+
     #[test]
     fn plain_statuses() {
-        let s = json!({"status": "idle"});
         assert_eq!(
-            describe(&s, 0),
-            ["Your turn: it finished, the next prompt is yours."]
+            texts(&json!({"status": "idle"}), 0),
+            ["○ your turn — it finished; the next prompt is yours."]
         );
-        let s = json!({"status": "waiting_input"});
-        assert!(status_sentence(&s, 0).starts_with("Needs you"));
+        assert!(texts(&json!({"status": "waiting_input"}), 0)[0].starts_with("◐ needs you — "));
         assert_eq!(
-            status_sentence(&json!({"status": "stopped"}), 0),
-            "Stopped: not running (can be resumed)."
+            texts(&json!({"status": "stopped"}), 0),
+            ["■ stopped — not running (can be resumed)."]
         );
-        // The legend uses the list's own glyphs and labels.
         let l = legend();
         assert_eq!(l[0].0, "● working");
         assert!(l.iter().any(|(k, _)| k == "○ your turn"));
@@ -219,32 +282,48 @@ mod tests {
             {"label": "Run tests", "started_at": 60_000},
             {"label": "Review PR", "started_at": 120_000}]});
         assert_eq!(
-            status_sentence(&s, 300_000),
-            "Waiting on 2 background tasks: Run tests, Review PR, started 4m ago. \
+            texts(&s, 300_000),
+            [
+                "◔ bg 2 — waiting on 2 background tasks: Run tests, Review PR, started 4m ago. \
              Its turn is over; it goes on when they finish."
+            ]
         );
         let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 1});
-        assert!(status_sentence(&s, 0).starts_with("Waiting on 1 background task."));
+        assert!(status_sentence(&s, 0).starts_with("waiting on 1 background task."));
     }
 
     #[test]
-    fn limit_wins_and_remote_is_spelled_out() {
+    fn every_mark_in_column_order_with_its_colour() {
         let s = json!({"status": "idle", "shown_status": "limited", "async_tasks": 1,
-            "limit": {"until": "3:00pm", "resume": true},
-            "remote": {"state": "on"}});
+            "limit": {"until": "3:00pm", "resume": true}, "loading": true,
+            "remote": {"state": "on"}, "agents_running": 1});
+        let d = describe(&s, 0);
         assert_eq!(
-            describe(&s, 0),
+            d.iter().map(Item::plain).collect::<Vec<_>>(),
             [
-                "Stopped on a usage limit until 3:00pm. It resumes by itself then.",
-                "Remote Control connected (⇄): reachable from the Claude app.",
+                "◷ 3:00pm ↻ — stopped on a usage limit until 3:00pm. It resumes by itself then.",
+                "◌ — still loading its sub-agent counts.",
+                "⇄ — Remote Control connected: reachable from the Claude app.",
+                "⚙1 — 1 sub-agent running.",
             ]
         );
+        assert_eq!(d[0].mark.style, crate::state_chip(&s, false).style);
+        assert_eq!(d[2].mark.style, crate::remote_chip(&s["remote"]).style);
+        let s = json!({"status": "idle", "shown_status": "limited",
+            "limit": {"until": "3pm", "reset": true}});
+        assert_eq!(texts(&s, 0), ["◷ reset — its usage limit just reset."]);
+    }
+
+    #[test]
+    fn remote_states() {
         let s = json!({"remote": {"state": "failed", "reason": "not logged in"}});
         assert_eq!(
             remote_sentence(&s).unwrap(),
-            "Remote Control failed (⇄, red): not logged in."
+            "Remote Control failed: not logged in."
         );
         assert_eq!(remote_sentence(&json!({})), None);
+        // A state the list draws no mark for gets no line.
+        assert_eq!(remote_sentence(&json!({"remote": {"state": "off"}})), None);
     }
 
     #[test]
@@ -254,7 +333,7 @@ mod tests {
             .collect();
         let s = json!({"status": "idle", "shown_status": "background", "async_tasks": 7,
             "async_work": tasks.clone(), "async_shells": {"count": 6, "tasks": tasks}});
-        let d = describe(&s, 0);
+        let d = texts(&s, 0);
         assert!(d[0].contains("t4, +2 more."), "{}", d[0]);
         assert!(d[1].ends_with("t4, +1 more."), "{}", d[1]);
     }
@@ -265,9 +344,9 @@ mod tests {
             {"label": "Dev server", "started_at": 0},
             {"label": "Watch tests", "started_at": 60_000}]}});
         assert_eq!(
-            describe(&s, 120_000),
+            texts(&s, 120_000),
             [
-                "Your turn: it finished, the next prompt is yours.",
+                "○ your turn — it finished; the next prompt is yours.",
                 "2 background shells: Dev server, Watch tests (1m ago).",
             ]
         );

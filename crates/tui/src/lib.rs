@@ -1603,7 +1603,7 @@ impl App {
         // two.)
         let w = lines
             .iter()
-            .map(|l| Span::raw(l.as_str()).width() as u16 + 4)
+            .map(|l| Span::raw(l.plain()).width() as u16 + 4)
             .max()
             .unwrap_or(10)
             .min(64)
@@ -1611,11 +1611,11 @@ impl App {
         let inner = usize::from(w.saturating_sub(4));
         let rows: u16 = lines
             .iter()
-            .map(|l| theme::wrapped_rows(l, inner) as u16)
+            .map(|l| theme::wrapped_rows(&l.plain(), inner) as u16)
             .sum();
         let text: Vec<Line> = lines
-            .into_iter()
-            .map(|l| Line::styled(l, Style::default().fg(theme::text())))
+            .iter()
+            .map(|l| l.line(Style::default().fg(theme::text())))
             .collect();
         let p = Paragraph::new(text)
             .wrap(Wrap { trim: true })
@@ -2134,10 +2134,9 @@ impl App {
             .into_iter()
             .enumerate()
         {
-            lines.push(Line::from(vec![
-                key(if n == 0 { "status" } else { "" }),
-                Span::styled(l, theme::muted()),
-            ]));
+            let mut v = vec![key(if n == 0 { "status" } else { "" })];
+            v.extend(l.line(theme::muted()).spans);
+            lines.push(Line::from(v));
         }
         lines.extend([
             Line::raw(""),
@@ -2871,7 +2870,7 @@ fn hover_rect(area: Rect, x: u16, y: u16, w: u16, h: u16) -> Rect {
 /// `↻`: a resume is scheduled for when it resets. Its turn over while
 /// subagents it started still run (`async_tasks`, from the daemon's
 /// `background`): that, in place of "your turn".
-fn state_chip(s: &Value, full: bool) -> Span<'static> {
+pub(crate) fn state_chip(s: &Value, full: bool) -> Span<'static> {
     let l = &s["limit"];
     let until = match shown(s) {
         "limited" => l["until"].as_str().unwrap_or("?"),
@@ -2928,7 +2927,7 @@ fn others_up(s: &Value) -> String {
 
 /// The list's Remote Control mark: ⇄ connected (green), connecting (dim),
 /// wanted but failing or unavailable (red); nothing when off.
-fn remote_chip(r: &Value) -> Span<'static> {
+pub(crate) fn remote_chip(r: &Value) -> Span<'static> {
     match r["state"].as_str() {
         Some("on") => Span::styled(" ⇄", Style::default().fg(theme::green())),
         Some("connecting" | "stopped" | "pending" | "disconnecting") => {
