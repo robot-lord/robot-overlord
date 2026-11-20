@@ -12,6 +12,11 @@ use rlord_core::themes::{self, Palette, Rgb};
 
 static ACTIVE: RwLock<Option<&'static Palette>> = RwLock::new(None);
 
+/// Held by tests that switch the palette or check colours, so they
+/// don't race.
+#[cfg(test)]
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Switch the palette everything draws with.
 pub fn set(p: &'static Palette) {
     *ACTIVE.write().expect("theme lock") = Some(p);

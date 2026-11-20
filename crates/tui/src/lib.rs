@@ -347,8 +347,8 @@ struct App {
     /// wheel, a click, focus loss) and by a list refresh, which can move
     /// rows under a pointer that stays put.
     hover_row: Option<(String, u16, u16)>,
-    /// The list was last drawn narrow (status glyphs alone).
-    list_narrow: bool,
+    /// The Status column's width when the list was last drawn.
+    list_status_w: u16,
     /// The list was refreshed since the pointer last moved: drop the
     /// popup if its session is no longer the row under the pointer.
     hover_stale: bool,
@@ -426,7 +426,7 @@ impl App {
             last_click: None,
             idle_motion: false,
             hover_row: None,
-            list_narrow: false,
+            list_status_w: list_cols::STATUS_W,
             hover_stale: false,
             preview_scroll: 0,
             preview_scroll_max: Default::default(),
@@ -1600,7 +1600,12 @@ impl App {
         let Some(s) = self.sessions.iter().find(|s| s["id"] == id.as_str()) else {
             return;
         };
-        let lines = statustext::describe(s, self.list_narrow, rlord_core::types::now_ms());
+        let lines = statustext::describe(
+            s,
+            self.list_status_w == list_cols::STATUS_W_NARROW,
+            usize::from(self.list_status_w),
+            rlord_core::types::now_ms(),
+        );
         let plains: Vec<String> = lines.iter().map(statustext::Item::plain).collect();
         let area = f.area();
         // (Border and padding: 2 columns a side; wide characters count
@@ -1643,7 +1648,7 @@ impl App {
             tags_w,
             project: show_project,
         } = ListCols::for_width(area.width);
-        self.list_narrow = narrow;
+        self.list_status_w = status_w;
         let show_tags = tags_w > 0;
         let sel_w = list_cols::sel_w();
 
@@ -1761,7 +1766,11 @@ impl App {
                         spans
                     })),
                     // Every mark, as the status popup explains them.
-                    Cell::from(Line::from(statustext::column_spans(s, narrow))),
+                    Cell::from(Line::from(statustext::column_spans(
+                        s,
+                        narrow,
+                        usize::from(status_w),
+                    ))),
                     // The time the list is sorted by (activity otherwise).
                     Cell::from(Span::styled(
                         rel_age(match sort {
@@ -2116,9 +2125,10 @@ impl App {
             .into_iter()
             .enumerate()
         {
-            let mut v = vec![key(if n == 0 { "status" } else { "" })];
-            v.extend(l.line(theme::muted()).spans);
-            lines.push(Line::from(v));
+            lines.push(Line::from(vec![
+                key(if n == 0 { "status" } else { "" }),
+                Span::styled(l, theme::muted()),
+            ]));
         }
         lines.extend([
             Line::raw(""),
@@ -2251,7 +2261,7 @@ impl App {
         if s["loading"] == true {
             lines.push(Line::from(vec![
                 key("agents"),
-                Span::styled("… loading sub-agents", theme::faint()),
+                Span::styled("⋯ loading sub-agents", theme::faint()),
             ]));
         } else if !self.agents.is_empty() && self.preview_for == self.selected_id() {
             let running = self
@@ -3773,6 +3783,7 @@ mod tests {
         assert!(out.join("\n").contains("Groups"));
 
         // Every theme renders; themes with a background paint all of it.
+        let _pin = theme::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for p in rlord_core::themes::THEMES {
             theme::set(p);
             term.draw(|f| app.draw(f)).unwrap();
