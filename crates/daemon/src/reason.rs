@@ -1,8 +1,9 @@
 //! Why a session waits (`sessions.attention_reason`), kept beside its
 //! status by every path that changes the status: the hooks
 //! (`methods::hook_emit`), OpenCode (`opencode.rs`), the transcript
-//! follower (`discover.rs`), rlord's own moves (`send.rs`, restarts,
-//! stops, the reconcile). One rule for all of them, here.
+//! follower (`discover.rs`), rlord's held messages (`send.rs`). One rule
+//! for all of them, here. A stop or a (re)start clears it in
+//! `Db::set_status` itself, whoever writes it.
 //!
 //! - While it needs you: `question` (a question dialog, Claude's
 //!   `AskUserQuestion`, an elicitation, an OpenCode form) or `permission`.
@@ -97,14 +98,6 @@ pub(crate) fn record(
         }
     }
     Ok(())
-}
-
-/// Clear session `id`'s reason (a restart or a stop), when it has one.
-pub(crate) fn clear(db: &Db, id: &str) -> Result<()> {
-    match db.resolve_ref(id) {
-        Ok(s) if s.attention_reason.is_some() => db.set_attention_reason(id, None),
-        _ => Ok(()),
-    }
 }
 
 #[cfg(test)]

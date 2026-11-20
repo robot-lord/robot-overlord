@@ -59,6 +59,22 @@ const TICK: Duration = Duration::from_secs(1);
 /// With nothing settling or unseen, a look every this many ticks (and on
 /// every change).
 const IDLE_TICKS: u32 = 15;
+/// Kinds of look error warned before they're only logged at debug.
+const WARNED_CAP: usize = 16;
+
+/// A stable name for a kind of error (not its text, which carries
+/// ids and paths): the database's or the system's error kind, else its
+/// type.
+fn error_kind(e: &anyhow::Error) -> String {
+    if let Some(r) = e.downcast_ref::<rusqlite::Error>() {
+        return format!("sqlite {:?}", std::mem::discriminant(r));
+    }
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return format!("io {:?}", io.kind());
+    }
+    "other".into()
+}
+
 /// How long a presence sample stands for `attention.list`.
 const SAMPLE_FRESH_MS: i64 = 60_000;
 /// Entries `attention.list` returns by default.
@@ -335,19 +351,19 @@ fn rows(d: &Daemon) -> Result<Vec<Value>> {
     Ok(rows)
 }
 
-/// When each session's overlay last ended: background work as
-/// `background.rs` recorded it (kv `overlay_end:<id>`), a limit at its
-/// reset plus margin; the later of the two.
-fn overlay_ends(d: &Daemon, now: i64) -> Result<HashMap<String, i64>> {
-    let mut ends: HashMap<String, i64> = d
-        .db()
-        .kv_prefix("overlay_end:")?
-        .into_iter()
-        .filter_map(|(k, v)| Some((k.strip_prefix("overlay_end:")?.to_string(), v.parse().ok()?)))
-        .collect();
-    for (id, t) in crate::limits::ended(d, now) {
-        let e = ends.entry(id).or_insert(t);
-        *e = (*e).max(t);
+/// When each listed session's overlay (background work, a usage limit)
+/// last ended, as recorded where it ends (kv `overlay_end:<id>`:
+/// `background.rs`, `limits.rs`). Only the sessions in `rows` are read.
+fn overlay_ends(d: &Daemon, rows: &[Value]) -> Result<HashMap<String, i64>> {
+    let db = d.db();
+    let mut ends = HashMap::new();
+    for id in rows.iter().filter_map(|r| r["id"].as_str()) {
+        if let Some(t) = db
+            .kv_get(&rlord_core::db::overlay_end_key(id))?
+            .and_then(|v| v.parse().ok())
+        {
+            ends.insert(id.to_string(), t);
+        }
     }
     Ok(ends)
 }
@@ -455,6 +471,7 @@ pub fn start(d: &Arc<Daemon>) {
         let mut changes = d.notify.subscribe();
         let mut settling = true;
         let mut quiet = 0u32;
+        // Kinds of error already warned (a few at most).
         let mut warned: HashSet<String> = HashSet::new();
         loop {
             std::thread::sleep(TICK);
@@ -488,7 +505,8 @@ pub fn start(d: &Arc<Daemon>) {
                 // (Warned once per kind of error, then quietly: a look that
                 // keeps failing the same way doesn't flood the log.)
                 Ok(Err(e)) => {
-                    if warned.insert(e.to_string()) {
+                    let kind = error_kind(&e);
+                    if warned.len() < WARNED_CAP && warned.insert(kind) {
                         tracing::warn!(error = %format!("{e:#}"), "attention queue");
                     } else {
                         tracing::debug!(error = %e, "attention queue");
@@ -543,7 +561,7 @@ pub(crate) fn look(
 ) -> Result<bool> {
     let rows = rows(d)?;
     let ask = {
-        let ends = overlay_ends(d, now)?;
+        let ends = overlay_ends(d, &rows)?;
         let mut st = d.attention.state();
         // When each overlay ended, as recorded where it ends (background
         // work: `background.rs`; a limit: its reset): a turn is yours from
@@ -609,10 +627,15 @@ pub(crate) fn look(
     // goes on (`carried`).
     if first {
         for (id, kind, since) in db.open_attention_entries()? {
-            // (A row the log can't say: skipped, and said so.)
-            let (Some(kind), Some(since)) = (kind.filter(|k| Kind::parse(k).is_some()), since)
+            // (A row the log can't say: closed, and said so, once: the
+            // marker matches its kind, unreadable or none, so it isn't
+            // open at the next start.)
+            let (Some(kind), Some(since)) =
+                (kind.clone().filter(|k| Kind::parse(k).is_some()), since)
             else {
-                tracing::warn!(session = %id, "an attention entry in the log can't be read: skipped");
+                tracing::warn!(session = %id, "an attention entry in the log can't be read: closed");
+                let p = json!({"kind": kind, "by": "unreadable"});
+                db.insert_event(&id, now, "attention_cleared", &p.to_string())?;
                 continue;
             };
             let still = all
@@ -780,6 +803,8 @@ pub fn ended_how(events: &[EventRow]) -> (&'static str, Option<i64>) {
 }
 
 /// The event kinds `cleared_by` and `ended_how` read.
+/// Each one changes a status where it is logged (a limit or background
+/// work changes none: `cleared_by` reads those from the row as `overlay`).
 const CLEARING_KINDS: &[&str] = &[
     "prompt_submitted",
     "rlord_prompt",
@@ -794,11 +819,8 @@ const CLEARING_KINDS: &[&str] = &[
     "session_start",
     "restarted",
     "resumed",
-    "fresh_conversation",
-    "limit_hit",
     "message_delivered",
     "awaiting_first_prompt",
-    "pane_gone_turn_running",
     "permission_request",
     "question_asked",
     "question",
@@ -832,11 +854,8 @@ pub fn cleared_by(
             "prompt_submitted" if e.payload["wake"] == true => "self",
             "prompt_submitted" => "prompt",
             // rlord moved it: a prompt or held message it typed, a start
-            // it settled, a pane it saw gone with the turn going on.
-            "rlord_prompt"
-            | "message_delivered"
-            | "awaiting_first_prompt"
-            | "pane_gone_turn_running" => "rlord",
+            // it settled.
+            "rlord_prompt" | "message_delivered" | "awaiting_first_prompt" => "rlord",
             "tool" | "answered" if kind == Kind::NeedsYou => "answer",
             // A turn the user queued while the agent worked (no prompt
             // hook for it: `methods::wakes_idle`).
@@ -846,8 +865,7 @@ pub fn cleared_by(
             "turn_started" => "self",
             "agent_stopped" => "stop",
             "session_end" | "reconciled_dead" | "stopped" | "archived" | "session_start"
-            | "restarted" | "resumed" | "fresh_conversation" => "ended",
-            "limit_hit" => "overlay",
+            | "restarted" | "resumed" => "ended",
             // (Claude fires a question's `PreToolUse` and its
             // `PermissionRequest` together, and a permission notification
             // with a request: the other half of the entry's own trigger.)
@@ -1053,7 +1071,10 @@ mod tests {
         ];
         assert_eq!(by(YourTurn, &evs), "prompt");
         assert_eq!(by(YourTurn, &[ev("turn_started", json!({}))]), "self");
-        assert_eq!(by(YourTurn, &[ev("limit_hit", json!({}))]), "overlay");
+        // Not a status change: not what cleared it.
+        for k in ["limit_hit", "pane_gone_turn_running", "fresh_conversation"] {
+            assert_eq!(by(YourTurn, &[ev(k, json!({}))]), "unknown", "{k}");
+        }
         assert_eq!(by(NeedsYou, &[ev("restarted", json!({}))]), "ended");
         // How it ended, and when.
         let mut pane = ev("session_end", json!({"from": "pane"}));
@@ -1066,11 +1087,7 @@ mod tests {
         assert_eq!(ended_how(&[]), ("unknown", None));
         assert_eq!(by(YourTurn, &[]), "unknown", "nothing says: never self");
         // rlord moved it: its own `by`.
-        for k in [
-            "message_delivered",
-            "awaiting_first_prompt",
-            "pane_gone_turn_running",
-        ] {
+        for k in ["message_delivered", "awaiting_first_prompt"] {
             assert_eq!(by(YourTurn, &[ev(k, json!({}))]), "rlord", "{k}");
         }
         // A kind nobody maps: skipped, then unknown.
@@ -1527,6 +1544,38 @@ mod tests {
         // An old sample doesn't count.
         d.attention.state().sample = Some((now - 120_000, ["a".to_string()].into()));
         assert_eq!(list(&d, &json!({})).unwrap()["your_turn"], 1);
+    }
+
+    /// Errors are told apart by kind, not text: two of a kind, one warning.
+    #[test]
+    fn errors_are_kinds_not_texts() {
+        let a = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "/a"));
+        let b = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "/b"));
+        assert_eq!(error_kind(&a), error_kind(&b));
+        assert_eq!(error_kind(&anyhow::anyhow!("x {}", 1)), "other");
+    }
+
+    /// An entry the log can't read is closed at the first start that sees
+    /// it, so the next start doesn't warn about it again.
+    #[test]
+    fn an_unreadable_entry_is_closed_once() {
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        {
+            let db = d.db();
+            add(&db, "a", Status::Working, NOW);
+            db.insert_event("a", NOW, "attention_entered", "not json")
+                .unwrap();
+            db.insert_event(
+                "a",
+                NOW,
+                "attention_entered",
+                r#"{"kind": "bogus", "since": 1}"#,
+            )
+            .unwrap();
+        }
+        assert_eq!(d.db().open_attention_entries().unwrap().len(), 2);
+        look(&d, NOW + 1_000, &Vec::new, true, false).unwrap();
+        assert!(d.db().open_attention_entries().unwrap().is_empty());
     }
 
     #[test]

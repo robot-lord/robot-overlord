@@ -588,23 +588,33 @@ trustworthy before the go/no-go read:
   rlord's own moves (`message_delivered`, `awaiting_first_prompt`,
   `pane_gone_turn_running`, `rlord_prompt`) are `rlord`; nothing that
   says is `unknown`, never `self`.
-- An overlay's end is recorded where it is computed: background work in
-  `background.rs` (kv `overlay_end:<id>`), a limit at its reset plus
-  margin (`limits::ended`). It survives a daemon restart, and an overlay
-  that came and went between two looks.
+- An overlay's end is recorded where it ends, in kv `overlay_end:<id>`:
+  background work in `background.rs` (before what is shown changes), a
+  limit in `limits.rs` when a scan drops it (its reset plus margin, or
+  now if it went sooner). It survives a daemon restart, and an overlay
+  that came and went between two looks; a stop or a start drops it.
 - `attention_reason` is kept by one rule (`daemon/src/reason.rs`) on
-  every path that changes a status: hooks, OpenCode, `discover`,
-  `send.rs`'s held messages, restarts, stops, the reconcile.
+  every path that changes a status: hooks, OpenCode, `discover` (a start
+  settling with no turn is no `finished`), `send.rs`'s held messages. A
+  stop or a (re)start clears it in `Db::set_status` itself.
+- What cleared an entry is read only among kinds that change a status
+  (no `limit_hit`, `pane_gone_turn_running` or `fresh_conversation`).
 - `attention.list` uses the last real presence sample (a minute at
   most), not an emptied set.
 - OpenCode counts as unlinked only for passes where a connect was tried.
-- An unreadable open entry in the log (no kind, not JSON) is skipped
-  with a warning; a look's error is warned once per kind of error.
-- A Claude tool hook's cheap payload checks (`agent_id`, `at`,
-  `transcript_path`) come before the session is looked up.
+- An unreadable open entry in the log (no kind, not JSON) is closed
+  `by: unreadable` once, with a warning; a look's error is warned once
+  per kind of error (sqlite or io error kind, not its text; 16 kinds at
+  most).
+- A Claude tool hook's cheap checks (`methods::wake_candidate`, shared
+  by `Daemon::call` and `wakes_idle`) come before the session is looked
+  up.
 
 Owed:
 
+- The kind-specific reason rules still depend on each status writer
+  calling `reason::record` (stops and starts don't: `Db::set_status`
+  clears those).
 - A failed write of `attention_entered` isn't tried again (the entry is
   tracked anyway; its later events still are written).
 - `look` builds `inputs`/`entries` twice (before and after asking tmux),

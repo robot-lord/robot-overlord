@@ -111,7 +111,8 @@ fn limits(d: &Daemon) -> Map<String, Value> {
 }
 
 /// When each session stopped on a usage limit now gets out of it (ms):
-/// `{id: resets_at}`, held `MARGIN_MS` past the reset. Takes the DB lock the first time: not under it.
+/// `{id: resets_at}`, held `MARGIN_MS` past the reset. Takes the DB lock
+/// the first time: not under it.
 pub fn limited(d: &Daemon) -> HashMap<String, i64> {
     let now = now_ms();
     limits(d)
@@ -122,20 +123,6 @@ pub fn limited(d: &Daemon) -> HashMap<String, i64> {
 
 /// Whether session `id` is held by a usage limit now, read from the DB
 /// (for callers holding only it, like a hook). An unreadable record: no.
-/// When each session's usage limit stopped being shown (ms): its reset
-/// plus `MARGIN_MS`, for limits that ended by `now`. (Known from the limit
-/// itself: survives a daemon restart, and a limit that came and went
-/// between two looks.)
-pub(crate) fn ended(d: &Daemon, now: i64) -> HashMap<String, i64> {
-    limits(d)
-        .into_iter()
-        .filter_map(|(id, l)| {
-            let t = l["resets_at"].as_i64()?;
-            (!held(t, now)).then_some((id, t + MARGIN_MS))
-        })
-        .collect()
-}
-
 pub fn limited_in(db: &Db, id: &str, now: i64) -> bool {
     db.kv_map(LIMITS_KEY)
         .ok()
@@ -259,12 +246,31 @@ fn scan(d: &Daemon) -> Result<()> {
                     db.insert_event(id, now, "limit_hit", &l.to_string())?;
                 }
             }
+            record_ended(&db, &before, &after, now)?;
             db.kv_set_map(LIMITS_KEY, &after)?;
         }
         *d.limits.now.lock().expect("limits mutex") = Some(after);
         d.changed();
     }
     d.limits.seen.lock().expect("limits mutex").extend(stamps);
+    Ok(())
+}
+
+/// Limits shown before a scan (`before`) and not after it: when each
+/// ended, for the attention queue (kv `overlay_end:<id>`): its reset plus
+/// margin, or now if it went sooner (the user carried on).
+fn record_ended(
+    db: &Db,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+    now: i64,
+) -> Result<()> {
+    for (id, l) in before.iter().filter(|(id, _)| !after.contains_key(*id)) {
+        let end = l["resets_at"]
+            .as_i64()
+            .map_or(now, |t| (t + MARGIN_MS).min(now));
+        db.kv_set(&rlord_core::db::overlay_end_key(id), &end.to_string())?;
+    }
     Ok(())
 }
 
@@ -624,6 +630,31 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A limit dropped by a scan leaves when it ended (kept in the DB: a
+    /// daemon restart reads it back).
+    #[test]
+    fn a_limits_end_is_recorded_when_it_is_dropped() {
+        let db = Db::open_in_memory().unwrap();
+        let mut before = Map::new();
+        before.insert("old".into(), json!({"resets_at": 1_000}));
+        before.insert("early".into(), json!({"resets_at": 900_000}));
+        before.insert("kept".into(), json!({"resets_at": 900_000}));
+        let mut after = Map::new();
+        after.insert("kept".into(), json!({"resets_at": 900_000}));
+        record_ended(&db, &before, &after, 500_000).unwrap();
+        let end = |id: &str| db.kv_get(&rlord_core::db::overlay_end_key(id)).unwrap();
+        assert_eq!(
+            end("old").as_deref(),
+            Some((1_000 + MARGIN_MS).to_string().as_str())
+        );
+        assert_eq!(
+            end("early").as_deref(),
+            Some("500000"),
+            "gone before its reset: now"
+        );
+        assert_eq!(end("kept"), None);
+    }
     use rlord_core::db::Db;
 
     fn session(status: Status) -> Session {

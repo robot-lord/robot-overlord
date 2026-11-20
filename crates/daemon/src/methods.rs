@@ -1457,7 +1457,6 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         "setting its status",
         db.set_status(&s.id, Status::Starting, now).map(|_| ()),
     );
-    logged("clearing why it waited", crate::reason::clear(db, &s.id));
     // Listed in the gate again (no longer stopped). (A resumed Codex runs
     // no hook before its next prompt.)
     crate::codex_daemon::sync_gate(db);
@@ -1581,7 +1580,6 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     // Nor is there a fork to make again at its next restart.
     db.kv_delete(&crate::fork::pending_key(&s.id))?;
     db.set_status(&s.id, Status::Starting, now)?;
-    crate::reason::clear(db, &s.id)?;
     db.insert_event(
         &s.id,
         now,
@@ -1626,7 +1624,6 @@ pub fn session_stop(db: &Db, params: &Value) -> Result<Value> {
     let now = now_ms();
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
-    crate::reason::clear(db, &s.id)?;
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "stopped", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);
@@ -1668,7 +1665,6 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     let now = now_ms();
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
-    crate::reason::clear(db, &s.id)?;
     db.set_archived(&s.id, Some(now))?;
     // Its look-ups stop answering (a start after unarchiving makes a new
     // token).
@@ -1772,20 +1768,15 @@ fn hook_emit_in(
     let own_agent = Agent::parse(agent).filter(|a| a.name() == s.agent);
     // (A tool call of the session's own agent while its turn is over: the
     // agent is working again without a prompt hook; see `wakes_idle`.)
-    let ran_at = params["at"].as_i64();
-    let wakes = own_agent.is_some_and(|a| {
-        wakes_idle(
-            a,
-            event,
-            &payload,
+    let wakes = own_agent.is_some()
+        && wakes_idle(
+            params,
             s.status,
             live,
-            ran_at,
             s.last_agent_msg_at,
             // (Read before the DB lock was taken: `turn_open_for`.)
             &|_, _| turn_open == Some(true),
-        )
-    });
+        );
     if let Some(a) = own_agent {
         let (kind, effect) = a.map_hook_event(event, &payload);
         if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() && !wakes {
@@ -2062,61 +2053,58 @@ fn hook_emit_in(
     Ok(json!({"ok": true}))
 }
 
+/// A hook that might wake an idle session, by its own fields alone (no
+/// session, no file): Claude's main agent (no `agent_id`) finishing a tool
+/// call (`PostToolUse`), stamped with when it ran (`at`), whole (not cut
+/// off), with a transcript to look at. Asked first, before anything costs:
+/// by `Daemon::call` before it looks the session up, and by `wakes_idle`.
+pub(crate) fn wake_candidate(params: &Value) -> bool {
+    let payload = &params["payload"];
+    params["agent"] == Agent::Claude.name()
+        && matches!(
+            params["event"].as_str(),
+            Some("PostToolUse" | "PostToolUseFailure")
+        )
+        && params["at"].is_i64()
+        && payload["truncated"] != true
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
+        && payload["transcript_path"].is_string()
+}
+
 /// For a live hook about to be handled (`Daemon::call`, before it takes
 /// the DB lock): whether session `s`'s transcript shows a turn open that
 /// began after its last turn end, asked only when `wakes_idle`'s cheap
 /// conditions hold (the transcript read is the costly part). The answer
 /// goes to `hook_emit_turn`. None: not asked.
 pub(crate) fn turn_open_for(s: &rlord_core::types::Session, params: &Value) -> Option<bool> {
-    let agent = Agent::parse(params["agent"].as_str()?)?;
-    let event = params["event"].as_str()?;
-    let payload = &params["payload"];
-    let path = payload["transcript_path"].as_str()?;
-    let at = params["at"].as_i64();
-    let cheap = wakes_idle(
-        agent,
-        event,
-        payload,
-        s.status,
-        true,
-        at,
-        s.last_agent_msg_at,
-        &|_, _| true,
-    );
-    cheap.then(|| {
+    let path = params["payload"]["transcript_path"].as_str()?;
+    wakes_idle(params, s.status, true, s.last_agent_msg_at, &|_, _| true).then(|| {
         transcript::turn_open_after(std::path::Path::new(path), s.last_agent_msg_at.unwrap_or(0))
     })
 }
 
 /// Whether a hook shows the session's own agent at work while its stored
-/// status says the turn is over: a tool call finishing (`PostToolUse`) of
-/// Claude's main agent (no `agent_id`: a sub-agent's, background ones
-/// included, carries one) while `idle`. Claude starts a turn without a
-/// `UserPromptSubmit` for a prompt the user queued while it worked; its
-/// `Stop` comes while already idle. A tool hook alone isn't proof (a stray
-/// one would leave the session working with nothing to set it back): the
-/// transcript must show a turn open that began after the session's last
-/// turn end (`turn_open`, asked last: it reads the file's tail). Live
-/// hooks only: a replayed one is old news; and only one that ran
-/// (`ran_at`, stamped by the hook client) after that turn end.
-#[allow(clippy::too_many_arguments)]
+/// status says the turn is over: a `wake_candidate` while `idle`. Claude
+/// starts a turn without a `UserPromptSubmit` for a prompt the user queued
+/// while it worked; its `Stop` comes while already idle. A tool hook alone
+/// isn't proof (a stray one would leave the session working with nothing
+/// to set it back): the transcript must show a turn open that began after
+/// the session's last turn end (`turn_open`, asked last: it reads the
+/// file). Live hooks only: a replayed one is old news; and only one that
+/// ran (`at`) after that turn end.
 pub(crate) fn wakes_idle(
-    agent: Agent,
-    event: &str,
-    payload: &Value,
+    params: &Value,
     status: Status,
     live: bool,
-    ran_at: Option<i64>,
     last_stop: Option<i64>,
     turn_open: &dyn Fn(&str, i64) -> bool,
 ) -> bool {
-    live && agent == Agent::Claude
-        && status == Status::Idle
-        && ran_at.is_some_and(|at| last_stop.is_none_or(|stop| at > stop))
-        && matches!(event, "PostToolUse" | "PostToolUseFailure")
-        && payload["truncated"] != true
-        && payload["agent_id"].as_str().is_none_or(str::is_empty)
-        && payload["transcript_path"]
+    live && status == Status::Idle
+        && wake_candidate(params)
+        && params["at"]
+            .as_i64()
+            .is_some_and(|at| last_stop.is_none_or(|stop| at > stop))
+        && params["payload"]["transcript_path"]
             .as_str()
             .is_some_and(|p| turn_open(p, last_stop.unwrap_or(0)))
 }
@@ -2447,7 +2435,6 @@ pub fn reconcile(db: &Db) -> Result<()> {
         if !alive {
             let now = now_ms();
             db.set_status(&s.id, Status::Stopped, now)?;
-            crate::reason::clear(db, &s.id)?;
             db.insert_event(&s.id, now, "reconciled_dead", "{}")?;
             tracing::info!(session = %s.id, "tmux gone; marked stopped (resumable)");
         }

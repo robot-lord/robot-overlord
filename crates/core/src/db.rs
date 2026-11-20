@@ -35,6 +35,14 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
      last_viewed_at, attention_reason";
 
+/// kv key: when session `id`'s last overlay (background work, a usage
+/// limit) stopped being shown (ms), recorded where it ends
+/// (`rlord_daemon::background`, `rlord_daemon::limits`): its turn is the
+/// user's from then. Dropped when it stops or starts again.
+pub fn overlay_end_key(id: &str) -> String {
+    format!("overlay_end:{id}")
+}
+
 /// An attention entry the log leaves open (`Db::open_attention_entries`):
 /// session, kind, since; kind and since None where its payload can't say.
 pub type OpenEntry = (String, Option<String>, Option<i64>);
@@ -1062,12 +1070,19 @@ impl Db {
     }
 
     /// Update status; stamps last_state_change_at and returns true iff changed.
+    /// Stopped or starting (a stop, a restart): why it waited and when its
+    /// last overlay ended go with it (the attention queue's).
     pub fn set_status(&self, id: &str, status: Status, ts: i64) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE sessions SET status = ?2, last_state_change_at = ?3 \
+            "UPDATE sessions SET status = ?2, last_state_change_at = ?3, \
+               attention_reason = CASE WHEN ?2 IN ('stopped', 'starting') THEN NULL \
+                                       ELSE attention_reason END \
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
+        if n > 0 && matches!(status, Status::Stopped | Status::Starting) {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         if n > 0 && status == Status::Stopped {
             // A sub-agent can't outlive its session's agent process.
             self.close_open_subagents(Some(id), ts)?;
@@ -1285,8 +1300,8 @@ impl Db {
                                 IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END)) \
                AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
                             AND c.kind = 'attention_cleared' AND c.seq > e.seq \
-                            AND json_valid(c.payload) AND json_valid(e.payload) \
-                            AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))",
+                            AND (CASE WHEN json_valid(c.payload) THEN json_extract(c.payload, '$.kind') END) \
+                                IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END))",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -2160,6 +2175,47 @@ mod tests {
         })
         .unwrap();
         assert_eq!(tokens(&db), (90, 20));
+    }
+
+    /// A stop or a (re)start drops why it waited and its last overlay's
+    /// end; other changes keep them.
+    #[test]
+    fn a_stop_or_start_clears_the_attention_state() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&NewSession {
+            id: "s",
+            name: "s",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let set = |st: Status, t: i64| {
+            db.set_status("s", st, t).unwrap();
+            db.set_attention_reason("s", Some("finished")).unwrap();
+            db.kv_set(&overlay_end_key("s"), "5").unwrap();
+        };
+        let state = || {
+            (
+                db.resolve_ref("s").unwrap().attention_reason,
+                db.kv_get(&overlay_end_key("s")).unwrap(),
+            )
+        };
+        set(Status::Idle, 2);
+        db.set_status("s", Status::Working, 3).unwrap();
+        assert_eq!(state(), (Some("finished".into()), Some("5".into())));
+        db.set_status("s", Status::Stopped, 4).unwrap();
+        assert_eq!(state(), (None, None));
+        set(Status::Idle, 5);
+        db.set_status("s", Status::Starting, 6).unwrap();
+        assert_eq!(state(), (None, None));
     }
 
     #[test]

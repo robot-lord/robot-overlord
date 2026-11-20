@@ -242,15 +242,12 @@ fn scan(d: &Daemon) -> Result<()> {
         }
     }
     drop(seen);
-    // Compared with what was shown: going stale is a change too.
-    let (changed, ended) = {
-        let mut shown = d.background.shown.lock().expect("background mutex");
-        let changed = *shown != after;
-        // Sessions whose background work stopped being shown: when, for
-        // the attention queue (`overlay_end_key`).
-        let ended = work_ended(&shown, &after);
-        *shown = after;
-        (changed, ended)
+    // Sessions whose background work stops being shown: when, for the
+    // attention queue (`overlay_end_key`), written before what is shown
+    // changes (a look in between never sees the work gone with no end).
+    let ended = {
+        let shown = d.background.shown.lock().expect("background mutex");
+        work_ended(&shown, &after)
     };
     if !ended.is_empty() {
         let db = d.db();
@@ -258,6 +255,13 @@ fn scan(d: &Daemon) -> Result<()> {
             db.kv_set(&overlay_end_key(id), &now.to_string())?;
         }
     }
+    // Compared with what was shown: going stale is a change too.
+    let changed = {
+        let mut shown = d.background.shown.lock().expect("background mutex");
+        let changed = *shown != after;
+        *shown = after;
+        changed
+    };
     if changed {
         d.changed();
     }
@@ -279,12 +283,7 @@ fn work_ended(before: &HashMap<String, Shown>, after: &HashMap<String, Shown>) -
         .collect()
 }
 
-/// kv key: when session `id`'s background work last stopped being shown
-/// (ms): its turn is the user's from then (`attention`). Kept across
-/// daemon restarts.
-pub(crate) fn overlay_end_key(id: &str) -> String {
-    format!("overlay_end:{id}")
-}
+pub(crate) use rlord_core::db::overlay_end_key;
 
 /// Annotate rows with background work:
 /// - `async_tasks`: how many subagents still run for a session whose

@@ -181,7 +181,6 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     }
     let now = now_ms();
     db.set_status(&s.id, Status::Stopped, now)?;
-    crate::reason::clear(db, &s.id)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
     db.kv_delete(&format!("pane_gone_turn:{}", s.id))?;
     // Nobody waits in a stopped session.
@@ -715,10 +714,21 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
             ("agent_stopped", None)
         }
     };
-    crate::reason::record(&db, &cur, kind, next, false, false)?;
+    crate::reason::record(&db, &cur, reason_kind(s.status, kind), next, false, false)?;
     let detail = crate::own::with_source(json!({"from": "transcript"}), source);
     db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
+}
+
+/// The kind `reason::record` reads for a status the transcript set: a
+/// start settling to idle with no turn ended is no turn's end (`finished`
+/// would be wrong): read as the start it is.
+fn reason_kind(from: Status, kind: &str) -> &str {
+    if from == Status::Starting && kind == "agent_stopped" {
+        "session_start"
+    } else {
+        kind
+    }
 }
 
 /// The status a transcript implies, if it differs: `working` is whether
@@ -762,6 +772,36 @@ mod tests {
         assert_eq!(settles(unknown, Some(SETTLE_ANYWAY_MS)), Some(false));
         // A dialog never settles it.
         assert_eq!(settles(dialog, Some(10 * SETTLE_ANYWAY_MS)), None);
+    }
+
+    #[test]
+    fn a_start_that_settles_is_no_turns_end() {
+        use Status::*;
+        assert_eq!(reason_kind(Starting, "agent_stopped"), "session_start");
+        assert_eq!(reason_kind(Working, "agent_stopped"), "agent_stopped");
+        assert_eq!(
+            reason_kind(Starting, "prompt_submitted"),
+            "prompt_submitted"
+        );
+        let s: Session = serde_json::from_value(json!({
+            "id": "s", "name": "s", "name_locked": false, "agent": "codex",
+            "agent_session": "t", "agent_session_trust": "minted", "project_path": "/tmp",
+            "tmux_session": null, "status": "starting", "group_path": "", "pinned": false,
+            "created_at": 1, "archived_at": null, "last_user_msg_at": null,
+            "last_agent_msg_at": null, "last_state_change_at": null, "repo_path": null,
+            "workspace_path": null, "branch": null, "model": null}))
+        .unwrap();
+        assert_eq!(
+            crate::reason::after(
+                &s,
+                reason_kind(Starting, "agent_stopped"),
+                Idle,
+                false,
+                false
+            ),
+            Some(None),
+            "no reason, not finished"
+        );
     }
 
     #[test]

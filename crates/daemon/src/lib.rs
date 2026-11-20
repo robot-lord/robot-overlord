@@ -628,17 +628,7 @@ impl Daemon {
         // here, not under the DB lock (`methods::turn_open_for`). Only a
         // Claude tool hook can; the session is looked up only for one.
         let mut turn_open = None;
-        let payload = &params["payload"];
-        if method == "hook.emit"
-            && params["agent"] == rlord_core::agents::Agent::Claude.name()
-            && matches!(
-                params["event"].as_str(),
-                Some("PostToolUse" | "PostToolUseFailure")
-            )
-            && params["at"].is_i64()
-            && payload["agent_id"].as_str().is_none_or(str::is_empty)
-            && payload["transcript_path"].is_string()
-        {
+        if method == "hook.emit" && methods::wake_candidate(&params) {
             let s = params["instance"]
                 .as_str()
                 .and_then(|i| self.db().resolve_ref(i).ok());
