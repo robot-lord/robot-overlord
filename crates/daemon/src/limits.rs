@@ -111,7 +111,8 @@ fn limits(d: &Daemon) -> Map<String, Value> {
 }
 
 /// When each session stopped on a usage limit now gets out of it (ms):
-/// `{id: resets_at}`, held `MARGIN_MS` past the reset. Takes the DB lock the first time: not under it.
+/// `{id: resets_at}`, held `MARGIN_MS` past the reset. Takes the DB lock
+/// the first time: not under it.
 pub fn limited(d: &Daemon) -> HashMap<String, i64> {
     let now = now_ms();
     limits(d)
@@ -201,6 +202,9 @@ fn scan(d: &Daemon) -> Result<()> {
     };
     let now = now_ms();
     let mut after = Map::new();
+    // Sessions whose limit was judged this scan (live, unarchived, with a
+    // transcript to read): only these can be said to have stopped holding.
+    let mut judged: std::collections::HashSet<String> = Default::default();
     // New stamps, kept once what was read is saved: a scan that fails
     // part way looks at those files again next time.
     let mut stamps = Vec::new();
@@ -221,8 +225,12 @@ fn scan(d: &Daemon) -> Result<()> {
             // OpenCode's conversations are rows, not files: read every
             // tick (two indexed look-ups).
             None if Format::of(path) == Format::OpenCode => false,
-            None => continue, // (gone)
+            // (Gone, or not readable now: nothing new can be read, so as
+            // unchanged: the limit stays while it holds, then ends by the
+            // clock. A usage limit doesn't lift because a file went.)
+            None => true,
         };
+        judged.insert(id.clone());
         let state = if unchanged {
             // Nothing new was written: only the clock can end it.
             before
@@ -245,12 +253,39 @@ fn scan(d: &Daemon) -> Result<()> {
                     db.insert_event(id, now, "limit_hit", &l.to_string())?;
                 }
             }
+            record_ended(&db, &before, &after, &judged, now)?;
             db.kv_set_map(LIMITS_KEY, &after)?;
         }
         *d.limits.now.lock().expect("limits mutex") = Some(after);
         d.changed();
     }
     d.limits.seen.lock().expect("limits mutex").extend(stamps);
+    Ok(())
+}
+
+/// Limits shown before a scan (`before`) and not after it, for sessions
+/// whose limit the scan judged (`judged`: live, unarchived, transcript
+/// read; one that left the scan's sessions or lost its transcript didn't
+/// stop holding): when each ended, for the attention queue (kv
+/// `overlay_end:<id>`): its reset plus
+/// margin, or now if it went sooner (the user carried on); never moving a
+/// recorded end backwards.
+fn record_ended(
+    db: &Db,
+    before: &Map<String, Value>,
+    after: &Map<String, Value>,
+    judged: &std::collections::HashSet<String>,
+    now: i64,
+) -> Result<()> {
+    for (id, l) in before
+        .iter()
+        .filter(|(id, _)| !after.contains_key(*id) && judged.contains(*id))
+    {
+        let end = l["resets_at"]
+            .as_i64()
+            .map_or(now, |t| (t + MARGIN_MS).min(now));
+        crate::background::record_end(db, id, end)?;
+    }
     Ok(())
 }
 
@@ -610,6 +645,36 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A limit dropped by a scan leaves when it ended (kept in the DB: a
+    /// daemon restart reads it back).
+    #[test]
+    fn a_limits_end_is_recorded_when_it_is_dropped() {
+        let db = Db::open_in_memory().unwrap();
+        let mut before = Map::new();
+        before.insert("old".into(), json!({"resets_at": 1_000}));
+        before.insert("early".into(), json!({"resets_at": 900_000}));
+        before.insert("kept".into(), json!({"resets_at": 900_000}));
+        let mut after = Map::new();
+        after.insert("kept".into(), json!({"resets_at": 900_000}));
+        before.insert("left".into(), json!({"resets_at": 1_000}));
+        let judged: std::collections::HashSet<String> =
+            ["old", "early", "kept"].map(String::from).into();
+        record_ended(&db, &before, &after, &judged, 500_000).unwrap();
+        let end = |id: &str| db.kv_get(&rlord_core::db::overlay_end_key(id)).unwrap();
+        assert_eq!(
+            end("old").as_deref(),
+            Some((1_000 + MARGIN_MS).to_string().as_str())
+        );
+        assert_eq!(
+            end("early").as_deref(),
+            Some("500000"),
+            "gone before its reset: now"
+        );
+        assert_eq!(end("kept"), None);
+        // Left the scan (archived, stopped, its transcript gone): no end.
+        assert_eq!(end("left"), None);
+    }
     use rlord_core::db::Db;
 
     fn session(status: Status) -> Session {

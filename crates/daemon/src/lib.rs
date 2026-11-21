@@ -18,6 +18,7 @@ pub mod opencode;
 pub mod overlord;
 pub mod own;
 pub mod profile;
+pub mod reason;
 pub mod recall;
 pub mod recheck;
 pub mod remote;
@@ -627,13 +628,7 @@ impl Daemon {
         // here, not under the DB lock (`methods::turn_open_for`). Only a
         // Claude tool hook can; the session is looked up only for one.
         let mut turn_open = None;
-        if method == "hook.emit"
-            && params["agent"] == rlord_core::agents::Agent::Claude.name()
-            && matches!(
-                params["event"].as_str(),
-                Some("PostToolUse" | "PostToolUseFailure")
-            )
-        {
+        if method == "hook.emit" && methods::wake_candidate(&params) {
             let s = params["instance"]
                 .as_str()
                 .and_then(|i| self.db().resolve_ref(i).ok());
@@ -2632,8 +2627,14 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
+        assert_eq!(
+            db.resolve_ref("01cl").unwrap().attention_reason.as_deref(),
+            Some("finished")
+        );
         tool(Some(stopped_at + 2));
         assert_eq!(status(), Status::Working);
+        // A turn began: the last turn's end is no longer why it waits.
+        assert_eq!(db.resolve_ref("01cl").unwrap().attention_reason, None);
         let woke = db.list_events("01cl", 1).unwrap();
         assert_eq!(
             (woke[0].kind.as_str(), &woke[0].payload["woke"]),

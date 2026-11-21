@@ -35,6 +35,38 @@ const SESSION_COLS: &str = "id, name, name_locked, agent, agent_session, agent_s
      (SELECT p.name FROM sessions p WHERE p.id = sessions.forked_from), \
      last_viewed_at, attention_reason";
 
+/// The first string after every one that starts with `prefix` (its last
+/// character bumped). None: no such string (empty, or ends in the last
+/// character there is).
+fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    let last = chars.pop()?;
+    let bumped = char::from_u32(last as u32 + 1)?;
+    chars.push(bumped);
+    Some(chars.into_iter().collect())
+}
+
+/// kv key: when session `id`'s last overlay (background work, a usage
+/// limit) stopped being shown (ms), recorded where it ends
+/// (`rlord_daemon::background`, `rlord_daemon::limits`): its turn is the
+/// user's from then. Dropped when it starts again (a restart, a fresh
+/// conversation), is archived, deleted, or found dead at a reconcile.
+pub fn overlay_end_key(id: &str) -> String {
+    format!("overlay_end:{id}")
+}
+
+/// An attention entry the log leaves open (`Db::open_attention_entries`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenEntry {
+    pub session: String,
+    /// None where its payload can't say (not JSON, no kind, not a string).
+    pub kind: Option<String>,
+    pub since: Option<i64>,
+    /// The `attention_entered` row: an unreadable entry is closed by a
+    /// marker naming it (`closes_seq`).
+    pub seq: i64,
+}
+
 pub struct NewSession<'a> {
     pub id: &'a str,
     pub name: &'a str,
@@ -476,10 +508,22 @@ impl Db {
 
     /// Every kv entry whose key starts with `prefix`, by key.
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare(
-            "SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
-        )?;
-        let rows = st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // A range on the key (its primary key index), not a function of
+        // it: `prefix <= key < next`, `next` the prefix with its last
+        // character bumped.
+        let next = prefix_end(prefix);
+        let (sql, upper) = match &next {
+            Some(n) => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                n.as_str(),
+            ),
+            None => (
+                "SELECT key, value FROM kv WHERE key >= ?1 AND ?2 = ?2 ORDER BY key",
+                "",
+            ),
+        };
+        let mut st = self.conn.prepare(sql)?;
+        let rows = st.query_map(params![prefix, upper], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -1058,12 +1102,21 @@ impl Db {
     }
 
     /// Update status; stamps last_state_change_at and returns true iff changed.
+    /// Stopped or starting (a stop, a restart): why it waited goes with it;
+    /// starting, also when its last overlay ended (the attention queue's).
     pub fn set_status(&self, id: &str, status: Status, ts: i64) -> Result<bool> {
         let n = self.conn.execute(
-            "UPDATE sessions SET status = ?2, last_state_change_at = ?3 \
+            "UPDATE sessions SET status = ?2, last_state_change_at = ?3, \
+               attention_reason = CASE WHEN ?2 IN ('stopped', 'starting') THEN NULL \
+                                       ELSE attention_reason END \
              WHERE id = ?1 AND status != ?2",
             params![id, status.as_str(), ts],
         )?;
+        // (A start, from a restart or a fresh conversation: a new
+        // process. Not a stop: a `/clear` stops it a moment.)
+        if n > 0 && status == Status::Starting {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         if n > 0 && status == Status::Stopped {
             // A sub-agent can't outlive its session's agent process.
             self.close_open_subagents(Some(id), ts)?;
@@ -1126,6 +1179,9 @@ impl Db {
             "UPDATE sessions SET archived_at = ?2 WHERE id = ?1",
             params![id, ts],
         )?;
+        if ts.is_some() {
+            self.kv_delete(&overlay_end_key(id))?;
+        }
         Ok(())
     }
 
@@ -1266,19 +1322,36 @@ impl Db {
     /// Attention entries the log leaves open: the latest
     /// `attention_entered` of each session and kind with no
     /// `attention_cleared` after it. (session, kind, since.)
-    pub fn open_attention_entries(&self) -> Result<Vec<(String, String, i64)>> {
+    pub fn open_attention_entries(&self) -> Result<Vec<OpenEntry>> {
+        // (A payload that isn't JSON, or has no kind: its row comes back
+        // with None, for the caller to close; never an error for the rest.
+        // A marker naming a row's seq, `closes_seq`, closes that row.)
         let mut st = self.conn.prepare(
-            "SELECT e.session_id, json_extract(e.payload, '$.kind'), \
-                    COALESCE(json_extract(e.payload, '$.since'), e.ts) \
+            "SELECT e.session_id, \
+                    CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END, \
+                    CASE WHEN json_valid(e.payload) \
+                         THEN COALESCE(json_extract(e.payload, '$.since'), e.ts) END, \
+                    e.seq \
              FROM events e WHERE e.kind = 'attention_entered' \
                AND e.seq = (SELECT MAX(x.seq) FROM events x WHERE x.session_id = e.session_id \
                             AND x.kind = 'attention_entered' \
-                            AND json_extract(x.payload, '$.kind') = json_extract(e.payload, '$.kind')) \
+                            AND (CASE WHEN json_valid(x.payload) THEN json_extract(x.payload, '$.kind') END) \
+                                IS (CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.kind') END)) \
                AND NOT EXISTS (SELECT 1 FROM events c WHERE c.session_id = e.session_id \
                             AND c.kind = 'attention_cleared' AND c.seq > e.seq \
-                            AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))",
+                            AND json_valid(c.payload) \
+                            AND (json_extract(c.payload, '$.closes_seq') = e.seq \
+                                 OR (json_valid(e.payload) \
+                                     AND json_extract(c.payload, '$.kind') = json_extract(e.payload, '$.kind'))))",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok(OpenEntry {
+                session: r.get(0)?,
+                kind: r.get::<_, Option<String>>(1).ok().flatten(),
+                since: r.get::<_, Option<i64>>(2).ok().flatten(),
+                seq: r.get(3)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -2144,6 +2217,62 @@ mod tests {
         })
         .unwrap();
         assert_eq!(tokens(&db), (90, 20));
+    }
+
+    /// A stop or a (re)start drops why it waited; a (re)start or an
+    /// archive also its last overlay's end; other changes keep them.
+    #[test]
+    fn a_stop_or_start_clears_the_attention_state() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&NewSession {
+            id: "s",
+            name: "s",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let set = |st: Status, t: i64| {
+            db.set_status("s", st, t).unwrap();
+            db.set_attention_reason("s", Some("finished")).unwrap();
+            db.kv_set(&overlay_end_key("s"), "5").unwrap();
+        };
+        let state = || {
+            (
+                db.resolve_ref("s").unwrap().attention_reason,
+                db.kv_get(&overlay_end_key("s")).unwrap(),
+            )
+        };
+        set(Status::Idle, 2);
+        db.set_status("s", Status::Working, 3).unwrap();
+        assert_eq!(state(), (Some("finished".into()), Some("5".into())));
+        // A stop (a `/clear` is a brief one) keeps the overlay's end.
+        db.set_status("s", Status::Stopped, 4).unwrap();
+        assert_eq!(state(), (None, Some("5".into())));
+        set(Status::Idle, 5);
+        db.set_status("s", Status::Starting, 6).unwrap();
+        assert_eq!(state(), (None, None));
+        db.kv_set(&overlay_end_key("s"), "7").unwrap();
+        db.set_archived("s", Some(8)).unwrap();
+        assert_eq!(db.kv_get(&overlay_end_key("s")).unwrap(), None);
+        // The key range finds exactly the prefix's keys.
+        db.kv_set("overlay_end:a", "1").unwrap();
+        db.kv_set("overlay_end;", "x").unwrap();
+        db.kv_set("overlay_enc", "x").unwrap();
+        let found: Vec<String> = db
+            .kv_prefix("overlay_end:")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(found, ["overlay_end:a"]);
     }
 
     #[test]

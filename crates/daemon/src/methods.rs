@@ -1768,20 +1768,15 @@ fn hook_emit_in(
     let own_agent = Agent::parse(agent).filter(|a| a.name() == s.agent);
     // (A tool call of the session's own agent while its turn is over: the
     // agent is working again without a prompt hook; see `wakes_idle`.)
-    let ran_at = params["at"].as_i64();
-    let wakes = own_agent.is_some_and(|a| {
-        wakes_idle(
-            a,
-            event,
-            &payload,
+    let wakes = own_agent.is_some()
+        && wakes_idle(
+            params,
             s.status,
             live,
-            ran_at,
             s.last_agent_msg_at,
             // (Read before the DB lock was taken: `turn_open_for`.)
             &|_, _| turn_open == Some(true),
-        )
-    });
+        );
     if let Some(a) = own_agent {
         let (kind, effect) = a.map_hook_event(event, &payload);
         if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() && !wakes {
@@ -1986,15 +1981,22 @@ fn hook_emit_in(
         // session only comes back if its tmux session really exists.
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
-        if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
+        let blocked = status.is_some_and(|st| st != Status::Stopped && revives_dead);
+        if let Some(st) = status.filter(|_| !blocked) {
             db.set_status(&s.id, st, now)?;
         }
-        // Why it waits, for the attention queue.
+        // Why it waits, for the attention queue (not when the write was
+        // refused: the status didn't change).
         let after = status.unwrap_or(s.status);
-        if let Some(r) = attention_reason(whose == Whose::Other, kind, event, &payload, after, &s) {
-            if r != s.attention_reason.as_deref() {
-                db.set_attention_reason(&s.id, r)?;
-            }
+        let (rkind, question) = reason_of_hook(whose == Whose::Other, kind, &payload, after);
+        // (Woke from idle by its own tool call: a turn began.)
+        let rkind = if wakes && status == Some(Status::Working) {
+            "turn_started"
+        } else {
+            rkind
+        };
+        if !blocked {
+            crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
         }
         if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
@@ -2061,113 +2063,83 @@ fn hook_emit_in(
     Ok(json!({"ok": true}))
 }
 
+/// A hook that might wake an idle session, by its own fields alone (no
+/// session, no file): Claude's main agent (no `agent_id`) finishing a tool
+/// call (`PostToolUse`), stamped with when it ran (`at`), whole (not cut
+/// off), with a transcript to look at. Asked first, before anything costs:
+/// by `Daemon::call` before it looks the session up, and by `wakes_idle`.
+pub(crate) fn wake_candidate(params: &Value) -> bool {
+    let payload = &params["payload"];
+    params["agent"] == Agent::Claude.name()
+        && matches!(
+            params["event"].as_str(),
+            Some("PostToolUse" | "PostToolUseFailure")
+        )
+        && params["at"].is_i64()
+        && payload["truncated"] != true
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
+        && payload["transcript_path"].is_string()
+}
+
 /// For a live hook about to be handled (`Daemon::call`, before it takes
 /// the DB lock): whether session `s`'s transcript shows a turn open that
 /// began after its last turn end, asked only when `wakes_idle`'s cheap
 /// conditions hold (the transcript read is the costly part). The answer
 /// goes to `hook_emit_turn`. None: not asked.
 pub(crate) fn turn_open_for(s: &rlord_core::types::Session, params: &Value) -> Option<bool> {
-    let agent = Agent::parse(params["agent"].as_str()?)?;
-    let event = params["event"].as_str()?;
-    let payload = &params["payload"];
-    let path = payload["transcript_path"].as_str()?;
-    let at = params["at"].as_i64();
-    let cheap = wakes_idle(
-        agent,
-        event,
-        payload,
-        s.status,
-        true,
-        at,
-        s.last_agent_msg_at,
-        &|_, _| true,
-    );
-    cheap.then(|| {
+    let path = params["payload"]["transcript_path"].as_str()?;
+    wakes_idle(params, s.status, true, s.last_agent_msg_at, &|_, _| true).then(|| {
         transcript::turn_open_after(std::path::Path::new(path), s.last_agent_msg_at.unwrap_or(0))
     })
 }
 
 /// Whether a hook shows the session's own agent at work while its stored
-/// status says the turn is over: a tool call finishing (`PostToolUse`) of
-/// Claude's main agent (no `agent_id`: a sub-agent's, background ones
-/// included, carries one) while `idle`. Claude starts a turn without a
-/// `UserPromptSubmit` for a prompt the user queued while it worked; its
-/// `Stop` comes while already idle. A tool hook alone isn't proof (a stray
-/// one would leave the session working with nothing to set it back): the
-/// transcript must show a turn open that began after the session's last
-/// turn end (`turn_open`, asked last: it reads the file's tail). Live
-/// hooks only: a replayed one is old news; and only one that ran
-/// (`ran_at`, stamped by the hook client) after that turn end.
-#[allow(clippy::too_many_arguments)]
+/// status says the turn is over: a `wake_candidate` while `idle`. Claude
+/// starts a turn without a `UserPromptSubmit` for a prompt the user queued
+/// while it worked; its `Stop` comes while already idle. A tool hook alone
+/// isn't proof (a stray one would leave the session working with nothing
+/// to set it back): the transcript must show a turn open that began after
+/// the session's last turn end (`turn_open`, asked last: it reads the
+/// file). Live hooks only: a replayed one is old news; and only one that
+/// ran (`at`) after that turn end.
 pub(crate) fn wakes_idle(
-    agent: Agent,
-    event: &str,
-    payload: &Value,
+    params: &Value,
     status: Status,
     live: bool,
-    ran_at: Option<i64>,
     last_stop: Option<i64>,
     turn_open: &dyn Fn(&str, i64) -> bool,
 ) -> bool {
-    live && agent == Agent::Claude
-        && status == Status::Idle
-        && ran_at.is_some_and(|at| last_stop.is_none_or(|stop| at > stop))
-        && matches!(event, "PostToolUse" | "PostToolUseFailure")
-        && payload["truncated"] != true
-        && payload["agent_id"].as_str().is_none_or(str::is_empty)
-        && payload["transcript_path"]
+    live && status == Status::Idle
+        && wake_candidate(params)
+        && params["at"]
+            .as_i64()
+            .is_some_and(|at| last_stop.is_none_or(|stop| at > stop))
+        && params["payload"]["transcript_path"]
             .as_str()
             .is_some_and(|p| turn_open(p, last_stop.unwrap_or(0)))
 }
 
-/// The `attention_reason` to store after a hook event, if it changes:
-/// `Some(None)` clears it. While the session needs you: `question` (a
-/// question dialog, Claude's `AskUserQuestion` or an elicitation) or
-/// `permission`; a question isn't turned back into a permission prompt
-/// (both fire for one question). A turn's end: `finished`, or `failed`
-/// (`StopFailure`). A prompt or a new start clears it.
-fn attention_reason<'a>(
+/// A hook event as `reason::record` reads it: its kind (another
+/// conversation's wait reads as a permission request; its other events
+/// don't concern the session's reason) and whether what it asks is a
+/// question (`AskUserQuestion`, an elicitation).
+fn reason_of_hook<'a>(
     other: bool,
-    kind: &str,
-    event: &str,
+    kind: &'a str,
     payload: &Value,
     after: Status,
-    s: &rlord_core::types::Session,
-) -> Option<Option<&'a str>> {
-    let asks = matches!(
-        kind,
-        "permission_request" | "question_asked" | "notification"
-    ) || (other && after == Status::WaitingInput);
-    if after == Status::WaitingInput && asks {
-        let question = kind == "question_asked"
-            || payload["tool_name"] == "AskUserQuestion"
-            || payload["notification_type"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("elicitation"));
-        let kept =
-            s.status == Status::WaitingInput && s.attention_reason.as_deref() == Some("question");
-        return Some(Some(if question || kept {
-            "question"
-        } else {
-            "permission"
-        }));
-    }
-    if other {
-        return None;
-    }
-    match kind {
-        "agent_stopped" if after == Status::Idle => Some(Some(if event == "StopFailure" {
-            "failed"
-        } else {
-            "finished"
-        })),
-        // (A prompt while still waiting on someone, a sub-agent say,
-        // leaves why it waits.)
-        "prompt_submitted" | "rlord_prompt" | "session_start" if after != Status::WaitingInput => {
-            Some(None)
-        }
-        _ => None,
-    }
+) -> (&'a str, bool) {
+    let question = kind == "question_asked"
+        || payload["tool_name"] == "AskUserQuestion"
+        || payload["notification_type"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("elicitation"));
+    let kind = match (other, after) {
+        (true, Status::WaitingInput) => "permission_request",
+        (true, _) => "",
+        _ => kind,
+    };
+    (kind, question)
 }
 
 /// Whether a hook says the user cleared the conversation: Claude's
@@ -2473,6 +2445,7 @@ pub fn reconcile(db: &Db) -> Result<()> {
         if !alive {
             let now = now_ms();
             db.set_status(&s.id, Status::Stopped, now)?;
+            db.kv_delete(&rlord_core::db::overlay_end_key(&s.id))?;
             db.insert_event(&s.id, now, "reconciled_dead", "{}")?;
             tracing::info!(session = %s.id, "tmux gone; marked stopped (resumable)");
         }
@@ -2559,8 +2532,10 @@ mod tests {
         db.set_attention_reason("r1", Some("question")).unwrap();
         let s = db.resolve_ref("r1").unwrap();
         let p = json!({});
-        let r =
-            |after| attention_reason(false, "prompt_submitted", "UserPromptSubmit", &p, after, &s);
+        let r = |after| {
+            let (kind, q) = reason_of_hook(false, "prompt_submitted", &p, after);
+            crate::reason::after(&s, kind, after, q, false)
+        };
         assert_eq!(r(Status::WaitingInput), None);
         assert_eq!(r(Status::Working), Some(None));
     }

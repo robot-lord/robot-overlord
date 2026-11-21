@@ -155,7 +155,10 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
         .iter()
         .filter(|s| f.gone.get(&s.id).is_none_or(|n| *n == 0))
         .collect();
-    if f.link.is_none() && Instant::now() >= f.retry_at {
+    // (Whether a connect was tried this pass: only such a pass counts as
+    // one unlinked.)
+    let tried = f.link.is_none() && Instant::now() >= f.retry_at;
+    if tried {
         match connect() {
             Ok((svc, events)) => {
                 tracing::debug!(server = ?svc, "following OpenCode's events");
@@ -175,10 +178,10 @@ fn pass(d: &Daemon, f: &mut Follower) -> Result<()> {
     // (Needs-you is seen only through a live event stream: `attention`.
     // Blind only once it stayed unlinked for a whole pass after a try: a
     // reconnect blip suspends nothing.)
-    f.unlinked = if f.link.is_none() {
-        f.unlinked.saturating_add(1)
-    } else {
-        0
+    f.unlinked = match (&f.link, tried) {
+        (Some(_), _) => 0,
+        (None, true) => f.unlinked.saturating_add(1),
+        (None, false) => f.unlinked,
     };
     d.opencode_blind
         .store(f.unlinked >= 2, std::sync::atomic::Ordering::Relaxed);
@@ -358,7 +361,8 @@ fn write(db: &Db, s: &Session, step: &Step, from: &str, text: Option<&PromptMark
     if let Some(status) = step.status {
         db.set_status(&s.id, status, now)?;
     }
-    set_reason(db, s, kind, false, step.status.unwrap_or(s.status))?;
+    // (A form, `question`, reads as a question by its kind.)
+    crate::reason::record(db, s, kind, step.status.unwrap_or(s.status), false, false)?;
     // A prompt: the user's, or one rlord typed (`own.rs`: by its text
     // when the event carried it, else by time).
     let (kind, source) = if step.user_msg {
@@ -654,7 +658,8 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
             .is_some_and(|p| p.iter().any(|w| w.starts_with("form:")));
         // (A turn's end only when OpenCode recorded one.)
         let lost = kind == "agent_stopped" && idle_at.is_none() && from != "opencode session";
-        set_reason(&db, s, if lost { TURN_LOST } else { kind }, question, want)?;
+        let kind_for = if lost { crate::reason::TURN_LOST } else { kind };
+        crate::reason::record(&db, s, kind_for, want, question, false)?;
         let mut detail = crate::own::with_source(json!({ "from": from }), source);
         if let Some(t) = idle_at {
             detail["idle_at"] = json!(t);
@@ -663,40 +668,6 @@ fn settle_all(d: &Daemon, with: With, up: &[&Session], blocked: &mut Blocked) ->
         changed = true;
     }
     Ok(changed)
-}
-
-/// `set_reason`'s kind for an `agent_stopped` that wasn't a turn's real end.
-const TURN_LOST: &str = "turn_lost";
-
-/// Why the session waits, for the attention queue, after a step logged as
-/// `kind` (`methods::attention_reason` for the hooks): `question` (a form,
-/// or `question` when a form is among what it waits on) wins over a
-/// permission while it still waits; a turn's end is `finished`; a new
-/// turn or start clears it.
-/// `after`: the status once the step is written (a prompt while it still
-/// waits on someone leaves the reason).
-fn set_reason(db: &Db, s: &Session, kind: &str, question: bool, after: Status) -> Result<()> {
-    let kept =
-        s.status == Status::WaitingInput && s.attention_reason.as_deref() == Some("question");
-    let reason = match kind {
-        "question" => Some(Some("question")),
-        "permission_request" if question || kept => Some(Some("question")),
-        "permission_request" => Some(Some("permission")),
-        "agent_stopped" => Some(Some("finished")),
-        // A turn that never ended (its server gone, or no such turn on
-        // the server now): no reason known.
-        TURN_LOST => Some(None),
-        "turn_started" | "prompt_submitted" | "rlord_prompt" | "session_start"
-            if after != Status::WaitingInput =>
-        {
-            Some(None)
-        }
-        _ => None,
-    };
-    if let Some(r) = reason.filter(|r| *r != s.attention_reason.as_deref()) {
-        db.set_attention_reason(&s.id, r)?;
-    }
-    Ok(())
 }
 
 /// Confirm each launch's model (see `Deferred`), once:
@@ -1272,27 +1243,27 @@ mod tests {
         let db = db_with("01oc", "opencode", "ses_1a");
         let s = || db.resolve_ref("01oc").unwrap();
         let reason = || s().attention_reason;
-        set_reason(&db, &s(), "permission_request", true, WaitingInput).unwrap();
+        crate::reason::record(&db, &s(), "permission_request", WaitingInput, true, false).unwrap();
         assert_eq!(reason().as_deref(), Some("question"));
         db.set_status("01oc", WaitingInput, 5).unwrap();
-        set_reason(&db, &s(), "permission_request", false, WaitingInput).unwrap();
+        crate::reason::record(&db, &s(), "permission_request", WaitingInput, false, false).unwrap();
         assert_eq!(
             reason().as_deref(),
             Some("question"),
             "still the question it waits on"
         );
-        set_reason(&db, &s(), "agent_stopped", false, Idle).unwrap();
+        crate::reason::record(&db, &s(), "agent_stopped", Idle, false, false).unwrap();
         assert_eq!(reason().as_deref(), Some("finished"));
         // A turn lost with its server, not ended: no reason.
-        set_reason(&db, &s(), TURN_LOST, false, Idle).unwrap();
+        crate::reason::record(&db, &s(), crate::reason::TURN_LOST, Idle, false, false).unwrap();
         assert_eq!(reason(), None);
-        set_reason(&db, &s(), "agent_stopped", false, Idle).unwrap();
+        crate::reason::record(&db, &s(), "agent_stopped", Idle, false, false).unwrap();
         // A prompt while still waiting (on another form): the reason stays.
         db.set_status("01oc", WaitingInput, 6).unwrap();
-        set_reason(&db, &s(), "question", false, WaitingInput).unwrap();
-        set_reason(&db, &s(), "prompt_submitted", false, WaitingInput).unwrap();
+        crate::reason::record(&db, &s(), "question", WaitingInput, false, false).unwrap();
+        crate::reason::record(&db, &s(), "prompt_submitted", WaitingInput, false, false).unwrap();
         assert_eq!(reason().as_deref(), Some("question"));
-        set_reason(&db, &s(), "prompt_submitted", false, Working).unwrap();
+        crate::reason::record(&db, &s(), "prompt_submitted", Working, false, false).unwrap();
         assert_eq!(reason(), None);
     }
 

@@ -767,20 +767,21 @@ pub(crate) fn claim_ack(db: &Db, ack: &str, now: i64) -> Result<bool> {
     db.kv_set(&key, &(in_row + 1).to_string())?;
     // The Stop set it idle; it carries on with them. (Only from idle: a
     // stop or restart meanwhile wins.)
-    if db
-        .session_by_id(id)?
-        .is_some_and(|s| s.status == Status::Idle)
-    {
-        db.set_status(id, Status::Working, now)?;
+    // (Logged only when it moved the status: the event is read as what
+    // ended a wait.)
+    if let Some(s) = db.session_by_id(id)?.filter(|s| s.status == Status::Idle) {
+        if db.set_status(id, Status::Working, now)? {
+            crate::reason::record(db, &s, "message_delivered", Status::Working, false, false)?;
+            db.insert_event(
+                id,
+                now,
+                "message_delivered",
+                &json!({"from": "overlord", "via": "stop_hook", "messages": n,
+                        "chars": framed(taken).chars().count()})
+                .to_string(),
+            )?;
+        }
     }
-    db.insert_event(
-        id,
-        now,
-        "message_delivered",
-        &json!({"from": "overlord", "via": "stop_hook", "messages": n,
-                "chars": framed(taken).chars().count()})
-        .to_string(),
-    )?;
     Ok(true)
 }
 
@@ -1401,6 +1402,8 @@ mod tests {
         assert_eq!(pending_parts(&db, &id).unwrap().len(), 1);
         // One more came while the answer was out: it stays.
         queue(&db, &id, &msg("and the header")).unwrap();
+        // (The Stop set it idle: the ack carries it on, and logs that.)
+        db.set_status(&id, Status::Idle, 4).unwrap();
         assert!(claim_ack(&db, &r2.ack, 5).unwrap());
         assert_eq!(
             pending_parts(&db, &id).unwrap(),
