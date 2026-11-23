@@ -74,6 +74,8 @@ pub(crate) fn status(d: &Daemon) -> Result<Value> {
         "done": a.done,
         "repo_roots": cfg.session.repo_roots,
         "roots_default": default_roots(&cfg, a.done),
+        // Not chosen yet (null): the form asks.
+        "auto_resume": cfg.limits.auto_resume,
     }))
 }
 
@@ -433,7 +435,13 @@ fn apply_with(
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
         created = true;
     }
-    let file = Config::set_code_dir_at(path, &contract_tilde(&dir), roots)?;
+    // With the form's auto-resume answer, if picked: one write.
+    let file = Config::set_setup_at(
+        path,
+        &contract_tilde(&dir),
+        roots,
+        params["auto_resume"].as_bool(),
+    )?;
     d.db().kv_set(KV, &format!("done:{}", now_ms()))?;
     let cfg = Config::load_at(&file)?;
     let effective: Vec<String> = cfg
@@ -447,6 +455,7 @@ fn apply_with(
         "repo_roots": effective,
         "checked": checked,
         "created": created,
+        "auto_resume": cfg.limits.auto_resume,
         "config": file.to_string_lossy(),
     }))
 }
@@ -476,6 +485,28 @@ mod tests {
             with_resolved(vec![PathBuf::from("/no/such")]),
             [PathBuf::from("/no/such")]
         );
+    }
+
+    #[test]
+    fn the_auto_resume_answer_is_saved_with_the_folder() {
+        let d = daemon();
+        assert_eq!(status(&d).unwrap()["auto_resume"], Value::Null);
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        std::fs::create_dir(&code).unwrap();
+        let cfg = dir.path().join("config.toml");
+        let p = json!({"code_dir": code, "roots": "follow", "auto_resume": true});
+        let r = apply_with(&d, &p, &cfg, &Guard::new(), &[]).unwrap();
+        assert_eq!(r["auto_resume"], true);
+        assert_eq!(
+            Config::load_at(&cfg).unwrap().limits.auto_resume,
+            Some(true)
+        );
+        // Not answered: left unset.
+        let cfg2 = dir.path().join("config2.toml");
+        let p = json!({"code_dir": code, "roots": "follow"});
+        apply_with(&d, &p, &cfg2, &Guard::new(), &[]).unwrap();
+        assert_eq!(Config::load_at(&cfg2).unwrap().limits.auto_resume, None);
     }
 
     #[test]

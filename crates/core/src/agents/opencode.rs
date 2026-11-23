@@ -468,6 +468,29 @@ fn parse_jsonc(text: &str) -> Option<Value> {
     serde_json::from_str(&clean).ok()
 }
 
+/// OpenCode is counting down its own retry of a failed request ("retrying
+/// in 2m 30s") while its turn is still going: text typed now would stack
+/// on that turn. Only OpenCode's own chrome under its prompt box is read
+/// (the status lines from the box's closing `╹` line down, as `draft`
+/// finds the box), never the transcript above it or the input inside it,
+/// so a reply or a draft with these words doesn't count. No prompt box on
+/// screen: no.
+/// `screen` without attributes (as `at_prompt` gets it).
+pub fn retrying(screen: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(close) = prompt_box_close(&lines) else {
+        return false;
+    };
+    lines[close..].iter().any(|l| {
+        let l = l.to_lowercase();
+        l.match_indices("retrying in ").any(|(i, m)| {
+            l[i + m.len()..]
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
 /// A dialog is on OpenCode's screen, where its prompt box was: a
 /// permission request ("△ Permission required", then `Allow once  Always
 /// allow  Reject`, where Enter allows) or a question (numbered options,
@@ -513,6 +536,14 @@ fn dialog_line(line: &str) -> bool {
         || has("⇆ select", "enter confirm")
 }
 
+/// The line closing OpenCode's prompt box (the lowest `╹` line), with or
+/// without attributes.
+fn prompt_box_close(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|l| super::strip_ansi(l).trim().starts_with('╹'))
+}
+
 /// What is typed in OpenCode's prompt box (`screen` captured with
 /// attributes, `capture-pane -e`), if anything. The box is the lowest run
 /// of `┃` lines closed by a `╹` line; its last line is the agent and model
@@ -524,7 +555,7 @@ fn dialog_line(line: &str) -> bool {
 pub fn draft(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let plain = |l: &str| super::strip_ansi(l).trim().to_string();
-    let close = lines.iter().rposition(|l| plain(l).starts_with('╹'))?;
+    let close = prompt_box_close(&lines)?;
     let top = lines[..close]
         .iter()
         .rposition(|l| !plain(l).starts_with('┃'))
@@ -1710,6 +1741,30 @@ pub fn iso_ms(ms: i64) -> String {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// OpenCode's own retry countdown, at the bottom of its screen, holds
+    /// a resume; the words quoted in a reply higher up don't.
+    #[test]
+    fn its_retry_countdown_is_seen() {
+        let box_ = "  ┃\n  ┃  Build · Big Pickle OpenCode\n  ╹▀▀▀▀▀▀▀▀▀▀\n";
+        let counting = format!(
+            "  reply\n\n{box_}  ⠋ Rate limited [retrying in 2m 30s attempt #3]  esc interrupt\n"
+        );
+        assert!(retrying(&counting));
+        let idle = format!("  reply\n\n{box_}  /tmp/proj  5.5K (3%)  ctrl+p commands\n");
+        assert!(!retrying(&idle));
+        // The agent's own reply, right above the box, quoting the words.
+        let quoted = format!(
+            "  The server said retrying in 30s, so I backed off.\n{box_}  /tmp/proj  ctrl+p commands\n"
+        );
+        assert!(!retrying(&quoted));
+        // A draft in the prompt box with them.
+        let draft =
+            "  ┃  retrying in 30s?\n  ┃  Build · Big Pickle OpenCode\n  ╹▀▀▀▀\n  ctrl+p commands\n";
+        assert!(!retrying(draft));
+        // No prompt box: not read.
+        assert!(!retrying("  Retrying in 45s"));
+    }
 
     #[test]
     fn the_users_global_agents_are_named() {

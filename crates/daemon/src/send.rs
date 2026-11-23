@@ -193,10 +193,14 @@ pub fn type_into(
     }
     // With attributes: a dim placeholder isn't a draft.
     let ansi = tmux::capture_pane_id_ansi(pane)?;
-    if !checks.agent.at_prompt(&strip_ansi(&ansi)) {
+    let plain = strip_ansi(&ansi);
+    if !checks.agent.at_prompt(&plain) {
         return Ok(Typed::NotNow(
             "its screen isn't at its input prompt (a dialog or question is up)".into(),
         ));
+    }
+    if let Some(why) = resume_held(checks, &plain) {
+        return Ok(Typed::NotNow(why.into()));
     }
     if checks.draft && draft(checks.agent, &ansi).is_some() {
         return Ok(Typed::NotNow(
@@ -233,6 +237,17 @@ pub fn type_into(
     }
     last.insert(session.to_string(), Instant::now());
     Ok(Typed::Done)
+}
+
+/// Why a resume after a usage limit (`Source::Resume`) can't be typed
+/// into this screen now, if it can't: OpenCode counting down its own
+/// retry (`opencode::retrying`). The message would stack on that turn;
+/// the job tries again next tick.
+fn resume_held(checks: &Checks, screen: &str) -> Option<&'static str> {
+    (checks.source == Some(Source::Resume)
+        && checks.agent == Agent::OpenCode
+        && rlord_core::agents::opencode::retrying(screen))
+    .then_some("OpenCode is retrying the request itself (\"retrying in …\")")
 }
 
 /// A terminal showing tmux session `t` was used in the last
@@ -1032,6 +1047,27 @@ fn held(d: &Daemon, id: &str, text: &str, why: &str, key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resume isn't typed into OpenCode while it counts down its own
+    /// retry; other messages and agents aren't held by it.
+    #[test]
+    fn a_resume_waits_for_opencodes_retry() {
+        let checks = |agent, source| Checks {
+            agent,
+            settle: true,
+            attached: None,
+            overlay: None,
+            draft: true,
+            source,
+        };
+        let retrying = "  ┃\n  ╹▀▀▀▀\n  ⠋ Rate limited [retrying in 30s attempt #2]";
+        let idle = "  ┃\n  ╹▀▀▀▀\n  ctrl+p commands";
+        let resume = checks(Agent::OpenCode, Some(Source::Resume));
+        assert!(resume_held(&resume, retrying).is_some());
+        assert!(resume_held(&resume, idle).is_none());
+        assert!(resume_held(&checks(Agent::OpenCode, Some(Source::Send)), retrying).is_none());
+        assert!(resume_held(&checks(Agent::Claude, Some(Source::Resume)), retrying).is_none());
+    }
 
     /// Claude Code's idle screen as it really draws it (layout taken from
     /// a live 2.x pane): the input box between two rules, then status

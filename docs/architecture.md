@@ -532,9 +532,27 @@ hooks and `discover` keep the stored status to themselves.
   limit until …"); with `when_idle`, and for a message already queued,
   it waits for the reset plus a minute, as a resume does
   (`send::refusal`/`next`, from `limits::limited`). Its hook state reads `idle` all the same.
-- **Resuming is only ever asked for** (`limits.resume`: the
+- **Resuming is asked for** (`limits.resume`: the
   `resume_after_limit` tool, `rlord resume-after-limit`, the list's
-  menu). Each session gets a job in kv `limit_resume`, so a daemon
+  menu), **or automatic** with `[limits] auto_resume = true`
+  (`limits::auto_schedule`, on the same tick): each limit of a session
+  other than an overlord gets the same job, once per limit (kv
+  `limit_auto`: `{id: limit at}`, written whenever a job is made or
+  rescheduled, whatever the setting, so turning it on later doesn't
+  revive a cancelled resume), so a cancelled or given-up job isn't
+  remade, and an automatic job (`auto: true`) is never made over a job
+  or for a limit marked meanwhile (both checked under the session's
+  lock). With the setting off (however: the dialog, a reload, a
+  restart), the next tick drops the `auto` jobs, logged as
+  `limit_resume_cancelled`; asked-for ones stay. The resume message
+  fallback is `LimitsConfig::message`. Unset is off; the first-run setup
+  form offers it as an optional hint ("ask me later" by default;
+  `setup.apply {auto_resume}`, one config write with the folder), and a
+  dialog asks when a listed session is limited and `limits.auto_resume {on}` writes the
+  answer to rlord's `config.toml` and takes it without a restart.
+  `limits::native_auto_resume` is the per-agent stand-down slot: true
+  for an agent that resumes by itself, and then rlord neither schedules
+  nor sends. It is false for all three today. Each session gets a job in kv `limit_resume`, so a daemon
   restart keeps it. `limits::step` decides each tick: wait until reset +
   60s; drop the job if the conversation went on since the limit; else
   type `[limits] resume_message` in through `send::type_message` (under
@@ -542,7 +560,10 @@ hooks and `discover` keep the stored status to themselves.
   on `idle`, and on `working` too: the untouched limit record is where
   the turn ended, so a session whose `StopFailure` hook is missing
   (older install) still resumes. Not on `waiting_input`, which is
-  blocked on a prompt. Scheduling takes the session's lock, and a job
+  blocked on a prompt. For OpenCode, `type_into` holds a resume while the
+  status lines under its prompt box show "retrying in <n>"
+  (`opencode::retrying`, `send::resume_held`), so the message doesn't
+  stack on OpenCode's own retry. Scheduling takes the session's lock, and a job
   only writes back over itself (same `limit_at` and `asked_at`), so
   asking again while a job runs replaces it cleanly. After
   sending, a newer untouched limit record within 15 minutes reschedules

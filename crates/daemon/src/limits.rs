@@ -12,8 +12,13 @@
 //! 3:00pm"); it is not a stored status, so hooks and `discover` keep
 //! theirs.
 //!
-//! **Resuming** happens only when asked (`limits.resume`: the overlord's
-//! `resume_after_limit`, `rlord resume-after-limit`, the list's menu).
+//! **Resuming** happens when asked (`limits.resume`: the overlord's
+//! `resume_after_limit`, `rlord resume-after-limit`, the list's menu),
+//! or by itself with `[limits] auto_resume = true` (`auto_schedule`: each
+//! new limit of a session other than an overlord gets the same job, once
+//! per limit, so a cancelled one stays cancelled). Unset, it is off and
+//! the list asks the user once (`limits.auto_resume`). None of the agents
+//! rlord runs picks itself up at the reset (`native_auto_resume`).
 //! Each session asked for gets a job in kv `limit_resume`, which a daemon
 //! restart doesn't forget. The same tick runs them. A job waits for its
 //! limit's reset time plus `MARGIN_MS`, then:
@@ -23,8 +28,11 @@
 //! - otherwise the message (`[limits] resume_message`, "continue") is
 //!   typed into the session the way `send_to_session` types (`send::
 //!   type_message`: under the session's lock, only at its input prompt,
-//!   not over a draft or while someone types there). Not possible right
-//!   now: tried again each tick, up to `GIVE_UP_MS` past the reset.
+//!   not over a draft or while someone types there). Not while OpenCode
+//!   counts down its own retry (`opencode::retrying`, checked by
+//!   `send::type_into` for a resume): a message typed then would stack on
+//!   it. Not possible right now: tried
+//!   again each tick, up to `GIVE_UP_MS` past the reset.
 //! - sent, and the limit hits again within `WATCH_MS`: the job waits for
 //!   the new reset (at most `MAX_ATTEMPTS` sends in all).
 //!
@@ -39,6 +47,8 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use rlord_core::agents::transcript::{self, Format, LimitHit};
+use rlord_core::agents::Agent;
+use rlord_core::config::Config;
 use rlord_core::db::{ArchivedMode, Db, SessionQuery};
 use rlord_core::timefmt::clock;
 use rlord_core::types::{now_ms, Session, Status};
@@ -53,6 +63,11 @@ pub const LIMITS_KEY: &str = "limits";
 /// sent_at?, attempts, sent_hit?}}`. `sent_hit`: the key of the limit
 /// record it was sent on (still the old limit, however it reads later).
 pub const JOBS_KEY: &str = "limit_resume";
+/// kv: the limit last handled per session, `{id: limit at}`: every limit
+/// a resume job was made or rescheduled for (asked for or automatic,
+/// whatever the setting), so `auto_schedule` makes at most one job per
+/// limit, whatever became of it (cancelled, given up).
+pub const AUTO_KEY: &str = "limit_auto";
 
 const TICK: Duration = Duration::from_secs(15);
 /// How long after the reset time a job sends (clocks differ a little).
@@ -93,6 +108,9 @@ pub fn start(d: &Arc<Daemon>) {
     std::thread::spawn(move || loop {
         if let Err(e) = scan(&d) {
             tracing::debug!(error = %e, "looking for usage limits");
+        }
+        if let Err(e) = auto_schedule(&d) {
+            tracing::debug!(error = %e, "scheduling resumes by itself");
         }
         if let Err(e) = run_jobs(&d) {
             tracing::debug!(error = %e, "resuming sessions after their limit");
@@ -333,12 +351,7 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| d.config().limits.resume_message.trim().to_string());
-    let message = if message.is_empty() {
-        "continue".to_string()
-    } else {
-        message
-    };
+        .unwrap_or_else(|| default_message(d));
     let db = d.db();
     let named: Vec<&str> = params["sessions"]
         .as_array()
@@ -372,6 +385,8 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
             Some("archived".to_string())
         } else if !limits.contains_key(&s.id) {
             Some("not stopped on a usage limit".to_string())
+        } else if native_auto_resume(&s) {
+            Some("its agent picks itself up when the limit resets".to_string())
         } else {
             None
         };
@@ -380,18 +395,7 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
             continue;
         }
         let l = &limits[&s.id];
-        let job = json!({
-            "message": message, "limit_at": l["at"], "resets_at": l["resets_at"],
-            "asked_at": now, "attempts": 0,
-        });
-        // Its lock: a job running now finishes before this one replaces it.
-        let _session = d.sessions.lock(&s.id);
-        let db = d.db();
-        let mut jobs = db.kv_map(JOBS_KEY)?;
-        jobs.insert(s.id.clone(), job.clone());
-        db.kv_set_map(JOBS_KEY, &jobs)?;
-        db.insert_event(&s.id, now, "limit_resume_scheduled", &job.to_string())?;
-        drop(db);
+        schedule(d, &s.id, l, &message, now, false)?;
         scheduled.push(json!({
             "session": s.name,
             "at": clock(l["resets_at"].as_i64().unwrap_or(0) + MARGIN_MS),
@@ -404,6 +408,230 @@ pub fn resume(d: &Daemon, params: &Value) -> Result<Value> {
         "each is sent the message once its limit resets, unless someone touches it first"
     };
     Ok(json!({"scheduled": scheduled, "skipped": skipped, "message": message, "note": note}))
+}
+
+/// The message a resume sends unless told otherwise (`[limits]
+/// resume_message`, "continue" when blank).
+fn default_message(d: &Daemon) -> String {
+    d.config().limits.message()
+}
+
+/// Give session `id` a resume job for limit `l` (`{at, resets_at}`).
+/// Asked for: over any job it has. `auto` (`auto_schedule`): marked so,
+/// and not made over a job or for a limit handled meanwhile. Whether one was
+/// made. Takes its lock, then the DB: called holding neither.
+fn schedule(d: &Daemon, id: &str, l: &Value, message: &str, now: i64, auto: bool) -> Result<bool> {
+    let mut job = json!({
+        "message": message, "limit_at": l["at"], "resets_at": l["resets_at"],
+        "asked_at": now, "attempts": 0,
+    });
+    if auto {
+        // (Dropped if auto-resume is turned off: `drop_auto_jobs`.)
+        job["auto"] = json!(true);
+    }
+    // Its lock: a job running now finishes before this one replaces it.
+    let _session = d.sessions.lock(id);
+    let db = d.db();
+    let mut jobs = db.kv_map(JOBS_KEY)?;
+    // Automatic: never over a job, nor for a limit already handled (a
+    // resume made and cancelled meanwhile), checked under the lock.
+    if auto && (jobs.contains_key(id) || db.kv_map(AUTO_KEY)?.get(id) == Some(&l["at"])) {
+        return Ok(false);
+    }
+    jobs.insert(id.to_string(), job.clone());
+    db.kv_set_map(JOBS_KEY, &jobs)?;
+    mark_handled(&db, id, &l["at"])?;
+    db.insert_event(id, now, "limit_resume_scheduled", &job.to_string())?;
+    Ok(true)
+}
+
+/// Whether session `s`'s agent picks it up by itself once its usage
+/// limit resets, so rlord should stand down rather than type over it.
+/// None does today:
+///
+/// - Claude Code: "auto-continue when limits reset" is in its Desktop app
+///   only, with no CLI setting or flag.
+/// - Codex: retries a transient 429, but a usage limit ends the turn.
+/// - OpenCode: retries on the same provider (at times with a long
+///   "retrying in" wait), but doesn't resume at the reset.
+///
+/// Should one gain it, return true for it: rlord then neither schedules
+/// nor sends a resume. An unknown agent: no.
+pub(crate) fn native_auto_resume(s: &Session) -> bool {
+    match Agent::named(&s.agent) {
+        Ok(Agent::Claude | Agent::Codex | Agent::OpenCode) | Err(_) => false,
+    }
+}
+
+/// Record that session `id`'s limit `at` had a resume job (kv
+/// `limit_auto`), whatever `auto_resume` says: turned on later, it
+/// doesn't bring back a resume the user cancelled.
+fn mark_handled(db: &Db, id: &str, at: &Value) -> Result<()> {
+    let mut done = db.kv_map(AUTO_KEY)?;
+    if done.get(id) != Some(at) {
+        done.insert(id.to_string(), at.clone());
+        db.kv_set_map(AUTO_KEY, &done)?;
+    }
+    Ok(())
+}
+
+/// Which of the limits now (`limits`) `auto_schedule` gives a job: not
+/// handled before for this limit (`done`, kv `limit_auto`) and no job
+/// (`jobs`). A job waiting on this very limit (its `limit_at`) marks it
+/// handled in `done`; one on an older limit doesn't.
+fn auto_due(
+    limits: &Map<String, Value>,
+    jobs: &Map<String, Value>,
+    done: &mut Map<String, Value>,
+) -> Vec<String> {
+    let mut due = Vec::new();
+    for (id, l) in limits {
+        if done.get(id) == Some(&l["at"]) {
+            continue;
+        }
+        match jobs.get(id) {
+            Some(j) if j["limit_at"] == l["at"] => {
+                done.insert(id.clone(), l["at"].clone());
+            }
+            Some(_) => {}
+            None => due.push(id.clone()),
+        }
+    }
+    due
+}
+
+/// `[limits] auto_resume = true`: give each session stopped on a new limit
+/// a resume job, as `limits.resume` would. Once per limit (kv
+/// `limit_auto`): a job the user cancelled, or one that ended, isn't made
+/// again for the same limit. Not the overlords (the user switches agents
+/// instead), not a session that already has a job, not one whose agent
+/// resumes by itself. Off or unset: nothing.
+fn auto_schedule(d: &Daemon) -> Result<()> {
+    let cfg = d.config();
+    if !cfg.limits.auto_resume_on() {
+        // (Turned off however: the dialog, config reloaded, a restart.)
+        return drop_auto_jobs(d);
+    }
+    let limits = limits(d);
+    let (todo, mut done) = {
+        let db = d.db();
+        let jobs = db.kv_map(JOBS_KEY)?;
+        let saved = db.kv_map(AUTO_KEY)?;
+        let mut done = saved.clone();
+        let due = auto_due(&limits, &jobs, &mut done);
+        // (Limits that are over are forgotten: the map stays small.)
+        done.retain(|id, _| limits.contains_key(id));
+        if due.is_empty() {
+            if done != saved {
+                db.kv_set_map(AUTO_KEY, &done)?;
+            }
+            return Ok(());
+        }
+        let todo: Vec<(String, Option<Session>)> = due
+            .into_iter()
+            .map(|id| {
+                let s = db.resolve_ref(&id).ok();
+                (id, s)
+            })
+            .collect();
+        (todo, done)
+    };
+    let now = now_ms();
+    let message = default_message(d);
+    for (id, s) in todo {
+        let l = &limits[&id];
+        done.insert(id.clone(), l["at"].clone());
+        let Some(s) = s else { continue };
+        if overlord::is_overlord_role(&s.role) || s.archived_at.is_some() || native_auto_resume(&s)
+        {
+            continue;
+        }
+        if !schedule(d, &s.id, l, &message, now, true)? {
+            continue;
+        }
+        tracing::info!(session = %s.name, "resume scheduled by itself (auto_resume)");
+    }
+    {
+        // (Over what `schedule` recorded meanwhile.)
+        let db = d.db();
+        let mut now_done = db.kv_map(AUTO_KEY)?;
+        merge_newer(&mut now_done, done);
+        now_done.retain(|id, _| limits.contains_key(id));
+        db.kv_set_map(AUTO_KEY, &now_done)?;
+    }
+    d.changed();
+    Ok(())
+}
+
+/// Markers in `from` over `into` (kv `limit_auto`), keeping the later
+/// limit per session: one recorded meanwhile isn't put back to an older.
+fn merge_newer(into: &mut Map<String, Value>, from: Map<String, Value>) {
+    for (id, at) in from {
+        let newer = into
+            .get(&id)
+            .is_none_or(|old| old.as_i64().unwrap_or(i64::MIN) < at.as_i64().unwrap_or(i64::MIN));
+        if newer {
+            into.insert(id, at);
+        }
+    }
+}
+
+/// Auto-resume is off: drop the jobs it made (`auto`), keep the ones
+/// asked for, each logged.
+fn drop_auto_jobs(d: &Daemon) -> Result<()> {
+    let ids: Vec<String> = d
+        .db()
+        .kv_map(JOBS_KEY)?
+        .into_iter()
+        .filter(|(_, j)| j["auto"] == true)
+        .map(|(id, _)| id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let now = now_ms();
+    for id in ids {
+        let _session = d.sessions.lock(&id);
+        let db = d.db();
+        let mut jobs = db.kv_map(JOBS_KEY)?;
+        if jobs.get(&id).is_some_and(|j| j["auto"] == true) {
+            jobs.remove(&id);
+            db.kv_set_map(JOBS_KEY, &jobs)?;
+            db.insert_event(
+                &id,
+                now,
+                "limit_resume_cancelled",
+                &json!({"why": "auto-resume was turned off"}).to_string(),
+            )?;
+        }
+    }
+    d.changed();
+    Ok(())
+}
+
+/// `limits.auto_resume {on?: bool}`: with `on`, save the user's answer to
+/// rlord's one-time question (`[limits] auto_resume` in rlord's own
+/// config) and take it at once; without, say what is set (null: not
+/// chosen yet).
+pub(crate) fn set_auto_resume(d: &Daemon, params: &Value) -> Result<Value> {
+    set_auto_resume_at(d, params, &rlord_core::paths::config_path())
+}
+
+/// `set_auto_resume` writing the config file at `path`.
+fn set_auto_resume_at(d: &Daemon, params: &Value, path: &Path) -> Result<Value> {
+    match &params["on"] {
+        Value::Null => {}
+        Value::Bool(on) => {
+            Config::set_auto_resume_at(path, *on)?;
+            d.update_config(|c| c.limits.auto_resume = Some(*on));
+            if !on {
+                drop_auto_jobs(d)?;
+            }
+            d.changed();
+        }
+        other => anyhow::bail!("on: true or false, not {other}"),
+    }
+    Ok(json!({"auto_resume": d.config().limits.auto_resume}))
 }
 
 /// `limits.resume {cancel: true, sessions?: [ref]}`: drop the scheduled
@@ -458,6 +686,10 @@ fn cancel(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"cancelled": cancelled, "skipped": skipped}))
 }
 
+/// Why a job gives up on a limit that keeps hitting (the only drop that
+/// marks the newer limit handled).
+const KEPT_HITTING: &str = "the limit kept hitting";
+
 /// What to do with a job now.
 #[derive(Debug, PartialEq)]
 enum Step {
@@ -493,7 +725,7 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
         }
         return match newer {
             Some(_) if job["attempts"].as_u64().unwrap_or(0) >= MAX_ATTEMPTS => {
-                Step::Drop("the limit kept hitting", false)
+                Step::Drop(KEPT_HITTING, false)
             }
             Some(h) => Step::Reschedule(h.at, h.resets_at.max(h.at)),
             None if now - sent > WATCH_MS => Step::Drop("resumed", true),
@@ -530,6 +762,8 @@ fn step(job: &Value, s: Option<&Session>, hit: Option<&LimitHit>, now: i64) -> S
     // said (an older install has no `StopFailure` hook). Not "needs you":
     // that is blocked on a prompt. Its screen is checked right before
     // typing either way.
+    // (OpenCode counting down its own retry is held at the screen:
+    // `send::type_into`.)
     match s.status {
         Status::Idle | Status::Working => Step::Send,
         _ => Step::Wait,
@@ -584,12 +818,26 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
         }
         Ok(())
     };
-    match step(&job, s.as_ref(), hit.as_ref(), now) {
+    // Its agent picks it up by itself: rlord stands down.
+    let native = s.as_ref().is_some_and(native_auto_resume);
+    let next = if native {
+        Step::Drop("its agent picks itself up when the limit resets", false)
+    } else {
+        step(&job, s.as_ref(), hit.as_ref(), now)
+    };
+    match next {
         Step::Wait => return Ok(()),
         Step::Drop(why, done) => {
             update(&|j| {
                 j.remove(id);
             })?;
+            // A newer limit it gives up on (it kept hitting) is handled
+            // too: `auto_schedule` doesn't start over on it.
+            if let Some(h) = hit.as_ref().filter(|h| {
+                why == KEPT_HITTING && !h.touched && h.at > job["limit_at"].as_i64().unwrap_or(0)
+            }) {
+                mark_handled(&d.db(), id, &json!(h.at))?;
+            }
             if !done {
                 log("limit_resume_skipped", json!({"why": why}))?;
             }
@@ -602,6 +850,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
                     job.remove("sent_at");
                 }
             })?;
+            mark_handled(&d.db(), id, &json!(limit_at))?;
             log(
                 "limit_resume_rescheduled",
                 json!({"resets_at": resets_at, "why": "the limit hit again"}),
@@ -997,6 +1246,239 @@ mod tests {
             }
             assert!(limits(&d).contains_key("s1"));
             assert!(d.db().kv_map(LIMITS_KEY).unwrap().contains_key("s1"));
+        }
+    }
+
+    /// A daemon with `s1` limited (its transcript in `dir`), and
+    /// `auto_resume` as given.
+    fn limited_daemon(dir: &Path, auto: Option<bool>) -> Arc<Daemon> {
+        let path = dir.join("t.jsonl");
+        std::fs::write(&path, format!("{}\n", limit_line(99999999999))).unwrap();
+        let d = daemon_with(&path);
+        d.update_config(|c| c.limits.auto_resume = auto);
+        scan(&d).unwrap();
+        assert!(limited(&d).contains_key("s1"));
+        d
+    }
+
+    /// `auto_resume = true` gives a limited session the same job
+    /// `limits.resume` would; unset or false, nothing is scheduled.
+    #[test]
+    fn auto_resume_schedules_only_when_on() {
+        for auto in [None, Some(false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = limited_daemon(dir.path(), auto);
+            auto_schedule(&d).unwrap();
+            assert!(
+                d.db().kv_map(JOBS_KEY).unwrap().is_empty(),
+                "{auto:?}: nothing scheduled"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        let jobs = d.db().kv_map(JOBS_KEY).unwrap();
+        let job = &jobs["s1"];
+        assert_eq!(job["message"], "continue");
+        assert_eq!(job["resets_at"], json!(99999999999i64 * 1000));
+        let mut rows = [json!({"id": "s1"})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["limit"]["resume"], true);
+    }
+
+    /// A resume the user cancelled isn't made again for the same limit.
+    #[test]
+    fn auto_resume_respects_a_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        resume(&d, &json!({"cancel": true})).unwrap();
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        // (A new limit is: `auto_due` keys on the limit's time.)
+        let limits = Map::from_iter([("s1".to_string(), json!({"at": 5}))]);
+        let mut done = Map::from_iter([("s1".to_string(), json!(4))]);
+        assert_eq!(auto_due(&limits, &Map::new(), &mut done), ["s1"]);
+    }
+
+    /// The user's answer is saved in rlord's config and taken at once.
+    #[test]
+    fn the_auto_resume_answer_is_saved_and_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), None);
+        let cfg = dir.path().join("config.toml");
+        let r = set_auto_resume_at(&d, &json!({}), &cfg).unwrap();
+        assert_eq!(r["auto_resume"], Value::Null);
+        assert!(!cfg.exists());
+        let r = set_auto_resume_at(&d, &json!({"on": true}), &cfg).unwrap();
+        assert_eq!(r["auto_resume"], true);
+        assert_eq!(
+            Config::load_at(&cfg).unwrap().limits.auto_resume,
+            Some(true)
+        );
+        // Taken without a restart: the limited session gets its job.
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+        assert!(set_auto_resume_at(&d, &json!({"on": "yes"}), &cfg).is_err());
+    }
+
+    /// An OpenCode session still reading "working" (a missed idle event)
+    /// is resumed like any other: the untouched limit ended its turn.
+    #[test]
+    fn opencode_reading_working_still_resumes() {
+        let job = json!({"message": "continue", "limit_at": 1_000, "resets_at": 100_000,
+                         "attempts": 0});
+        let h = hit(1_000, 100_000, false);
+        let mut working = session(Status::Working);
+        working.agent = "opencode".into();
+        assert_eq!(
+            step(&job, Some(&working), Some(&h), 100_000 + MARGIN_MS),
+            Step::Send
+        );
+    }
+
+    /// A limit with a job (asked for) is marked handled: a job that
+    /// ended (cancelled, gave up) isn't remade for it.
+    #[test]
+    fn a_limit_with_a_job_is_not_auto_scheduled_again() {
+        let limits = Map::from_iter([("s1".to_string(), json!({"at": 5}))]);
+        let on = |at: i64| Map::from_iter([("s1".to_string(), json!({"limit_at": at}))]);
+        let mut done = Map::new();
+        assert!(auto_due(&limits, &on(5), &mut done).is_empty());
+        assert_eq!(done["s1"], 5);
+        assert!(auto_due(&limits, &Map::new(), &mut done).is_empty());
+        // The job rescheduled onto the newer limit and then gave up: that
+        // limit was marked while the job sat on it, so no fresh job.
+        let later = Map::from_iter([("s1".to_string(), json!({"at": 9}))]);
+        assert!(auto_due(&later, &on(9), &mut done).is_empty());
+        assert!(auto_due(&later, &Map::new(), &mut done).is_empty());
+    }
+
+    /// A job still waiting on an older limit doesn't mark the newer one:
+    /// once it ends, the newer limit gets its own.
+    #[test]
+    fn a_job_on_an_older_limit_doesnt_mark_the_new_one() {
+        let limits = Map::from_iter([("s1".to_string(), json!({"at": 9}))]);
+        let old = Map::from_iter([("s1".to_string(), json!({"limit_at": 5}))]);
+        let mut done = Map::new();
+        assert!(auto_due(&limits, &old, &mut done).is_empty());
+        assert!(!done.contains_key("s1"));
+        assert_eq!(auto_due(&limits, &Map::new(), &mut done), ["s1"]);
+    }
+
+    /// Cancelled while auto-resume was off, then turned on: the
+    /// cancelled resume isn't brought back.
+    #[test]
+    fn turning_auto_resume_on_later_keeps_a_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), None);
+        resume(&d, &json!({"sessions": ["s1"]})).unwrap();
+        resume(&d, &json!({"cancel": true})).unwrap();
+        d.update_config(|c| c.limits.auto_resume = Some(true));
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+    }
+
+    /// A resume made and cancelled after `auto_schedule` read the jobs:
+    /// the automatic one isn't made for that limit (checked under the lock).
+    #[test]
+    fn an_auto_job_isnt_made_for_a_limit_handled_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        let l = limits(&d)["s1"].clone();
+        mark_handled(&d.db(), "s1", &l["at"]).unwrap();
+        assert!(!schedule(&d, "s1", &l, "continue", 3, true).unwrap());
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+    }
+
+    /// A marker recorded meanwhile isn't put back to an older limit.
+    #[test]
+    fn markers_merge_keeping_the_later_limit() {
+        let mut into = Map::from_iter([("s1".to_string(), json!(9)), ("s2".to_string(), json!(1))]);
+        let from = Map::from_iter([
+            ("s1".to_string(), json!(5)),
+            ("s2".to_string(), json!(4)),
+            ("s3".to_string(), json!(2)),
+        ]);
+        merge_newer(&mut into, from);
+        assert_eq!(
+            (into["s1"].clone(), into["s2"].clone(), into["s3"].clone()),
+            (json!(9), json!(4), json!(2))
+        );
+    }
+
+    /// Turning auto-resume off drops the jobs it made, logged; one asked
+    /// for stays.
+    #[test]
+    fn turning_auto_resume_off_drops_its_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        auto_schedule(&d).unwrap();
+        assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["auto"], true);
+        let cfg = dir.path().join("config.toml");
+        set_auto_resume_at(&d, &json!({"on": false}), &cfg).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+        // Asked for: kept when it is turned off (any way, next tick).
+        d.update_config(|c| c.limits.auto_resume = Some(true));
+        resume(&d, &json!({"sessions": ["s1"]})).unwrap();
+        d.update_config(|c| c.limits.auto_resume = Some(false));
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+    }
+
+    /// A job that gives up because the limit kept hitting: auto-resume
+    /// doesn't start a fresh one on that newer limit.
+    #[test]
+    fn giving_up_on_a_limit_that_kept_hitting_is_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        let at = limits(&d)["s1"]["at"].as_i64().unwrap();
+        let job = json!({"message": "continue", "limit_at": at - 10, "resets_at": at - 5,
+                         "asked_at": 0, "attempts": MAX_ATTEMPTS, "sent_at": at - 1});
+        let jobs = Map::from_iter([("s1".to_string(), job)]);
+        d.db().kv_set_map(JOBS_KEY, &jobs).unwrap();
+        run_job(&d, "s1").unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty(), "given up");
+        auto_schedule(&d).unwrap();
+        assert!(
+            d.db().kv_map(JOBS_KEY).unwrap().is_empty(),
+            "no fresh job on the limit it gave up on"
+        );
+    }
+
+    /// Asked for, then cancelled, with auto-resume on: stays cancelled.
+    #[test]
+    fn a_cancelled_manual_resume_stays_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        resume(&d, &json!({"sessions": ["s1"], "message": "go on"})).unwrap();
+        auto_schedule(&d).unwrap();
+        assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["message"], "go on");
+        resume(&d, &json!({"cancel": true})).unwrap();
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
+    }
+
+    /// An automatic job never replaces one made meanwhile.
+    #[test]
+    fn an_auto_job_keeps_a_job_made_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        resume(&d, &json!({"sessions": ["s1"], "message": "go on"})).unwrap();
+        let l = json!({"at": 1, "resets_at": 2});
+        assert!(!schedule(&d, "s1", &l, "continue", 3, true).unwrap());
+        assert_eq!(d.db().kv_map(JOBS_KEY).unwrap()["s1"]["message"], "go on");
+        assert!(schedule(&d, "s1", &l, "continue", 3, false).unwrap());
+    }
+
+    /// No agent picks itself up at the reset today; one that did would
+    /// make rlord stand down.
+    #[test]
+    fn rlord_stands_down_for_an_agent_that_resumes_itself() {
+        for a in ["claude", "codex", "opencode", "nope"] {
+            let mut s = session(Status::Idle);
+            s.agent = a.into();
+            assert!(!native_auto_resume(&s), "{a}");
         }
     }
 

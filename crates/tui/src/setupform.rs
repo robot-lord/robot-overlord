@@ -10,6 +10,12 @@
 //!
 //! Opened on first run (after the overlord's own dialog), by `:setup`, and
 //! by the overlord.
+//!
+//! While `[limits] auto_resume` is unset it also offers that as an
+//! optional hint (the Auto-resume row, default "ask me later": left unset,
+//! and the list asks at the first limit). On or off picked there is saved
+//! with the folder (`setup.apply`'s `auto_resume`), or (`limits.auto_resume`)
+//! once the form is on its way to the overlord.
 
 use super::*;
 use ratatui::widgets::Clear;
@@ -41,6 +47,7 @@ enum Row {
     Describe,
     Folder,
     Roots,
+    AutoResume,
     Save,
 }
 
@@ -103,6 +110,10 @@ pub(crate) struct SetupForm {
     /// The line under the folder (`folder_hint`), worked out once per
     /// edit, not per frame (it may look at the disk).
     hint: String,
+    /// `[limits] auto_resume` isn't chosen yet: the Auto-resume row asks.
+    auto_resume_row: bool,
+    /// The user's pick on that row (None: the default, "ask me later").
+    pub(crate) auto_resume: Option<bool>,
 }
 
 /// A setup request on its way to the overlord: its result, and the form
@@ -199,6 +210,8 @@ impl SetupForm {
             proposed_roots: None,
             guard: rlord_core::privacy::Guard::new(),
             hint: String::new(),
+            auto_resume_row: false,
+            auto_resume: None,
         };
         f.roots_row = f.roots_differ();
         // With a folder filled in, Enter saves it; with none, type one.
@@ -228,6 +241,8 @@ impl SetupForm {
             "roots_default": status["roots_default"],
         });
         let mut f = SetupForm::from_suggest(&known, overlord, auto);
+        // (A key present and null: not chosen yet.)
+        f.auto_resume_row = status.get("auto_resume").is_some_and(Value::is_null);
         f.loading = true;
         f.refresh_hint();
         f
@@ -335,6 +350,9 @@ impl SetupForm {
         if self.roots_row {
             v.push(Row::Roots);
         }
+        if self.auto_resume_row {
+            v.push(Row::AutoResume);
+        }
         v.push(Row::Save);
         v
     }
@@ -408,6 +426,22 @@ impl SetupForm {
         self.choices.iter().find(|c| c.path == self.code_dir)
     }
 
+    /// ←/→/space on the Auto-resume row: ask me later (the default), on,
+    /// off, and round again.
+    fn toggle_auto_resume(&mut self) {
+        self.auto_resume = match self.auto_resume {
+            None => Some(true),
+            Some(true) => Some(false),
+            Some(false) => None,
+        };
+    }
+
+    /// What the Auto-resume row picked, if it is shown and not left at
+    /// "ask me later".
+    pub(crate) fn auto_resume_pick(&self) -> Option<bool> {
+        self.auto_resume.filter(|_| self.auto_resume_row)
+    }
+
     /// What Save does, or why it can't. `exists`: whether a folder is
     /// there (None: can't tell without risking a macOS prompt).
     pub(crate) fn save_call(
@@ -468,12 +502,16 @@ impl SetupForm {
             Roots::Keep(_) => json!("leave"),
             Roots::Set(r) => json!(r),
         };
-        Ok(SaveCall::Apply(json!({
+        let mut p = json!({
             "code_dir": path,
             "roots": roots,
             "create": create,
             "allow_home": home,
-        })))
+        });
+        if let Some(on) = self.auto_resume_pick() {
+            p["auto_resume"] = json!(on);
+        }
+        Ok(SaveCall::Apply(p))
     }
 
     /// `path` is `$HOME` (as given or resolved).
@@ -773,6 +811,18 @@ impl App {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if row == Row::Roots => {
                 f.toggle_roots();
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if row == Row::AutoResume => {
+                f.toggle_auto_resume();
+                f.error = None;
+            }
+            KeyCode::Char('y') if row == Row::AutoResume => {
+                f.auto_resume = Some(true);
+                f.error = None;
+            }
+            KeyCode::Char('n') if row == Row::AutoResume => {
+                f.auto_resume = Some(false);
+                f.error = None;
+            }
             KeyCode::Backspace => match row {
                 Row::Describe => {
                     if let Some(d) = &mut f.describe {
@@ -901,6 +951,14 @@ impl App {
                         Some("no overlord yet: clear the description to save as shown".into());
                     self.mode = Mode::Setup(f);
                     return;
+                }
+                // The overlord's reopened form doesn't carry the
+                // auto-resume pick: saved now it is going.
+                if let Some(on) = f.auto_resume_pick() {
+                    if self.call("limits.auto_resume", json!({"on": on})).is_some() {
+                        self.config.limits.auto_resume = Some(on);
+                        f.auto_resume_row = false;
+                    }
                 }
                 // In the background: a stopped overlord can take a while.
                 // The form is kept until it's delivered (`poll_setup_send`).
@@ -1077,6 +1135,35 @@ impl App {
                     }
                     lines.push(Line::from(spans));
                 }
+                Row::AutoResume => {
+                    let mut spans = label(focused, "Auto-resume");
+                    let value = match s.auto_resume {
+                        None => "ask me later (when a session first hits a limit)",
+                        Some(true) => "on: limited sessions carry on when the limit resets",
+                        Some(false) => "off: resume one from its menu",
+                    };
+                    let style = if s.auto_resume.is_none() {
+                        theme::faint()
+                    } else {
+                        Style::default().fg(theme::text())
+                    };
+                    spans.push(Span::styled(
+                        if focused {
+                            format!("◀ {value} ▶")
+                        } else {
+                            value.to_string()
+                        },
+                        style,
+                    ));
+                    lines.push(Line::from(spans));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{:21}(optional) after a usage limit, not the overlord's · [limits] auto_resume",
+                            ""
+                        ),
+                        muted,
+                    )));
+                }
                 Row::Save => {
                     lines.push(Line::from(""));
                     starts.pop();
@@ -1221,6 +1308,49 @@ mod tests {
         assert_eq!(f.rows(), [Row::Folder, Row::Save]);
         assert!(f.hint.starts_with("rlord found no projects yet"));
         assert!(f.save_call(&|_| Some(true)).is_err());
+    }
+
+    /// `[limits] auto_resume` unset: an optional hint, "ask me later" by
+    /// default, which never blocks saving or sending; on or off picked is
+    /// sent. Set: the row isn't there.
+    #[test]
+    fn auto_resume_is_an_optional_hint_while_unset() {
+        let status = json!({"code_dir": "/elsewhere/ko", "repo_roots": [],
+                            "roots_default": "leave", "auto_resume": null});
+        let mut f = SetupForm::loading(false, true, &status);
+        assert_eq!(f.rows(), [Row::Folder, Row::AutoResume, Row::Save]);
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("expected a save");
+        };
+        assert!(p.get("auto_resume").is_none(), "left unset: {p}");
+        f.describe = Some("work in ~/ko".into());
+        assert!(matches!(
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::Request(_)
+        ));
+        f.describe = None;
+        f.toggle_auto_resume();
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("expected a save");
+        };
+        assert_eq!(p["auto_resume"], true);
+        f.toggle_auto_resume();
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("expected a save");
+        };
+        assert_eq!(p["auto_resume"], false);
+        f.toggle_auto_resume();
+        assert_eq!(f.auto_resume_pick(), None, "back to ask me later");
+        for set in [json!(true), json!(false)] {
+            let mut st = status.clone();
+            st["auto_resume"] = set;
+            let f = SetupForm::loading(false, true, &st);
+            assert_eq!(f.rows(), [Row::Folder, Row::Save]);
+            let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+                panic!("expected a save");
+            };
+            assert!(p.get("auto_resume").is_none());
+        }
     }
 
     #[test]
