@@ -277,11 +277,14 @@ async fn a_mailbox_frame_skipped() {
     assert_eq!(count(&format!("{id} mailbox discarded")), 0);
 }
 
+type Recorded = (Option<(B64, [u8; 32])>, Vec<Vec<u8>>);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recorded_pairing_replayed_after_the_rendezvous_closed() {
     let _g = LOCK.lock().await;
     let w = world(1).await;
-    let rec: Arc<Mutex<(Option<(B64, [u8; 32])>, Vec<Vec<u8>>)>> = Arc::default();
+    // The pairing's hello (rendezvous, device) and its lane-1 frames.
+    let rec: Arc<Mutex<Recorded>> = Arc::default();
     let r2 = rec.clone();
     w.tamper.set_filter(Box::new(move |p, dir, m| {
         if p.role == Role::Pair && dir == Dir::Up {

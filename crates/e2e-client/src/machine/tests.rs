@@ -74,6 +74,10 @@ struct World {
     closes: Vec<(u64, u16)>,
     /// Every lane-2 frame the device sent, as sent.
     mb_raw: Vec<Vec<u8>>,
+    /// Pings the driver was asked for.
+    pings: usize,
+    /// Saves and frames in the order carried out.
+    order: Vec<&'static str>,
     /// The current link id (from the last Dial).
     link: u64,
     boot: String,
@@ -156,6 +160,8 @@ impl World {
             dials: vec![],
             closes: vec![],
             mb_raw: vec![],
+            pings: 0,
+            order: vec![],
             link: 0,
             boot: "boot1".into(),
         }
@@ -197,7 +203,11 @@ impl World {
         let mut replies = Vec::new();
         for a in actions {
             match a {
-                Action::Save { plain, .. } => self.disk = Some(plain),
+                Action::Save { plain, .. } => {
+                    let mb = Record::decode(&plain).is_some_and(|r| r.mailbox.is_some());
+                    self.order.push(if mb { "save+mb" } else { "save" });
+                    self.disk = Some(plain);
+                }
                 Action::Delete { .. } => self.disk = None,
                 Action::Dial { link, .. } => {
                     self.dials.push(link);
@@ -207,9 +217,9 @@ impl World {
                 Action::ToPage(s) => self.page.push(serde_json::from_str(&s).unwrap()),
                 Action::Notify { count, .. } => self.notified.push(count),
                 Action::BackgroundDone(o) => self.bg_done.push(o),
-                Action::Ping { .. } => {}
+                Action::Ping { .. } => self.pings += 1,
                 Action::Text { json, .. } => self.relay_got.push(ToRelay::parse(&json).unwrap()),
-                Action::Binary { link, bytes } => match FromDevice::decode(&bytes).unwrap() {
+                Action::Binary { link, bytes } => match self.frame(&bytes) {
                     FromDevice::Live(p) => replies.extend(self.host_live(link, &p)),
                     FromDevice::Mailbox(p) => {
                         // The same bytes again are the same frame (a
@@ -299,6 +309,11 @@ impl World {
                 None
             }
         }
+    }
+
+    fn frame(&mut self, bytes: &[u8]) -> FromDevice {
+        self.order.push("frame");
+        FromDevice::decode(bytes).unwrap()
     }
 
     fn host_mailbox(&mut self, p: &[u8]) -> Value {
@@ -1002,11 +1017,12 @@ fn enroll_is_shown_and_waited_on() {
 fn silence_pings_then_gives_up() {
     let mut w = World::live();
     w.advance(PING_MS);
-    let pings = |w: &World| w.m.out.len();
-    let _ = pings;
-    // (Pings are actions the driver turns into websocket pings.)
+    // (A ping is an action the driver turns into a websocket ping.)
+    assert_eq!(w.pings, 1);
+    w.advance(PING_MS);
+    assert_eq!(w.pings, 2);
     let n = w.dials.len();
-    w.advance(SILENCE_MS - PING_MS - 1_000);
+    w.advance(SILENCE_MS - 2 * PING_MS - 1_000);
     assert_eq!(w.dials.len(), n, "not yet");
     w.advance(1_000);
     assert!(!w.m.live(), "given up after 45 s of silence");
@@ -1337,9 +1353,13 @@ fn mailbox_keying_saves_before_the_first_frame() {
         w.pending = batch;
         w.apply();
     }
+    // The save that holds the new mailbox comes before the last frame
+    // sent (`mailbox_ready`, the frame that advanced it).
     let _ = all;
-    let r = w.saved();
-    assert!(r.mailbox.is_some());
+    let saved_at = w.order.iter().position(|o| *o == "save+mb").unwrap();
+    let last_frame = w.order.iter().rposition(|o| *o == "frame").unwrap();
+    assert!(saved_at < last_frame, "{:?}", w.order);
+    assert!(w.saved().mailbox.is_some());
 }
 
 // ---- the background check ----
