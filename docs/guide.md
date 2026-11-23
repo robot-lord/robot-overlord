@@ -537,6 +537,19 @@ alone. If the limit hits again, it waits for the next reset. A scheduled
 resume shows as `↻` next to the time and survives restarting rlord.
 Nothing is resumed unless you ask.
 
+Or have rlord do this for every limited session by itself:
+`[limits] auto_resume = true` in `config.toml`. Each session stopped on a
+limit then gets a scheduled resume as above, except the overlords (switch
+agents instead); cancel one and it stays cancelled for that limit.
+`false` never resumes on its own. Until you choose, it is off, and rlord
+asks you once: in the first-run setup form, or in a dialog the first time
+a session hits a limit (`y` on, `n` off, Esc asks again next start). The
+answer goes in your `config.toml`; change it there any time. None of the
+agents picks itself up when a limit resets (Claude Code's
+"auto-continue" is in its Desktop app only), so rlord does it. An
+OpenCode session is resumed only once its turn is over, never while
+OpenCode is counting down its own retry ("retrying in …").
+
 To call a scheduled resume off: right-click the session, "Cancel
 scheduled resume" (or `:cancel resume`), `rlord resume-after-limit
 --cancel [sessions]` (no sessions: every scheduled one), or ask the

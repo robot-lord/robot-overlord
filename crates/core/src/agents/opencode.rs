@@ -468,6 +468,22 @@ fn parse_jsonc(text: &str) -> Option<Value> {
     serde_json::from_str(&clean).ok()
 }
 
+/// OpenCode is counting down its own retry of a failed request ("retrying
+/// in 2m 30s", next to the prompt while its turn is still going): text
+/// typed now would stack on that turn. Only the bottom lines are read,
+/// where it draws the countdown, so a reply quoting the words higher up
+/// doesn't count.
+pub fn retrying(screen: &str) -> bool {
+    crate::agents::bottom_lines(screen, 12).any(|l| {
+        let l = l.to_lowercase();
+        l.match_indices("retrying in ").any(|(i, m)| {
+            l[i + m.len()..]
+                .trim_start()
+                .starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
 /// A dialog is on OpenCode's screen, where its prompt box was: a
 /// permission request ("△ Permission required", then `Allow once  Always
 /// allow  Reject`, where Enter allows) or a question (numbered options,
@@ -1710,6 +1726,21 @@ pub fn iso_ms(ms: i64) -> String {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// OpenCode's own retry countdown, at the bottom of its screen, holds
+    /// a resume; the words quoted in a reply higher up don't.
+    #[test]
+    fn its_retry_countdown_is_seen() {
+        let counting = "┃ fix the build\n\n  Rate limited [retrying in 2m 30s attempt #3]\n┃ >\n  esc interrupt";
+        assert!(retrying(counting));
+        assert!(retrying("  Retrying in 45s"));
+        assert!(!retrying("┃ >\n  ctrl+p commands"));
+        assert!(!retrying("we stop retrying in production\n┃ >"));
+        let mut quoted = String::from("it said retrying in 5s\n");
+        quoted.push_str(&"reply line\n".repeat(20));
+        quoted.push_str("┃ >");
+        assert!(!retrying(&quoted));
+    }
 
     #[test]
     fn the_users_global_agents_are_named() {

@@ -687,12 +687,26 @@ pub struct LimitsConfig {
     /// What a session is sent when it is resumed after its limit resets
     /// (`resume_after_limit`, only when asked for).
     pub resume_message: String,
+    /// Resume every session stopped on a usage limit by itself, as if
+    /// `resume_after_limit` had been asked for it. None: not chosen yet
+    /// (off; rlord asks the user once, at the first limit or in setup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<bool>,
+}
+
+impl LimitsConfig {
+    /// Whether rlord resumes limited sessions by itself: only when the
+    /// user said so.
+    pub fn auto_resume_on(&self) -> bool {
+        self.auto_resume == Some(true)
+    }
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
             resume_message: "continue".into(),
+            auto_resume: None,
         }
     }
 }
@@ -833,6 +847,24 @@ impl Config {
         Ok(path.to_path_buf())
     }
 
+    /// Save `[limits] auto_resume` (the user's answer to rlord's one-time
+    /// question) in the config file at `path`, keeping the rest of it as
+    /// written. The result must load with exactly that, or nothing is
+    /// written.
+    pub fn set_auto_resume_at(path: &std::path::Path, on: bool) -> Result<()> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let out = set_item_in(&text, "limits", "auto_resume", toml_edit::Value::from(on))?;
+        let c = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+        if c.limits.auto_resume != Some(on) {
+            anyhow::bail!("auto_resume didn't take in config.toml");
+        }
+        write_config(path, &out)
+    }
+
     /// Commented template written by `rlord config init`; equals the defaults.
     pub fn default_toml() -> String {
         DEFAULT_TOML.to_string()
@@ -919,6 +951,11 @@ fn set_code_dir_in(text: &str, code_dir: &str, roots: &RootsEdit) -> Result<Stri
 
 /// `text` with `[section] field = value` set (see `Config::set_value`).
 fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String> {
+    set_item_in(text, section, field, toml_edit::Value::from(value))
+}
+
+/// `text` with `[section] field = value` set, any TOML value.
+fn set_item_in(text: &str, section: &str, field: &str, value: toml_edit::Value) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", paths::config_path().display()))?;
@@ -932,7 +969,7 @@ fn set_in(text: &str, section: &str, field: &str, value: &str) -> Result<String>
     let table = doc[section]
         .as_table_mut()
         .with_context(|| format!("[{section}] isn't a table"))?;
-    set_value_in(table, field, toml_edit::Value::from(value));
+    set_value_in(table, field, value);
     let out = doc.to_string();
     toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
     Ok(out)
@@ -1096,13 +1133,61 @@ channel = "stable"
 # A session stopped by a usage limit shows "limited until <time>". Ask the
 # overlord (or `rlord resume-after-limit`) to pick it up when the limit
 # resets: it is sent this message then, if nobody touched it meanwhile.
+# auto_resume = true picks up every limited session that way by itself;
+# false never does. Unset, rlord asks you once (at the first limit).
 [limits]
 resume_message = "continue"
+# auto_resume = false
 "##;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_resume_is_unset_true_or_false() {
+        let load = |t: &str| toml::from_str::<Config>(t).unwrap().limits;
+        let unset = load("[limits]\nresume_message = \"go\"\n");
+        assert_eq!(unset.auto_resume, None);
+        assert!(!unset.auto_resume_on());
+        assert_eq!(load("").auto_resume, None);
+        let on = load("[limits]\nauto_resume = true\n");
+        assert_eq!(on.auto_resume, Some(true));
+        assert!(on.auto_resume_on());
+        let off = load("[limits]\nauto_resume = false\n");
+        assert_eq!(off.auto_resume, Some(false));
+        assert!(!off.auto_resume_on());
+        assert!(toml::from_str::<Config>("[limits]\nauto_resume = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn auto_resume_is_saved_keeping_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# mine\n[limits]\nresume_message = \"go on\"  # here\n",
+        )
+        .unwrap();
+        Config::set_auto_resume_at(&path, true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# mine") && text.contains("# here"), "{text}");
+        let c = Config::load_at(&path).unwrap();
+        assert_eq!(c.limits.auto_resume, Some(true));
+        assert_eq!(c.limits.resume_message, "go on");
+        Config::set_auto_resume_at(&path, false).unwrap();
+        assert_eq!(
+            Config::load_at(&path).unwrap().limits.auto_resume,
+            Some(false)
+        );
+        // No file yet: one with only that.
+        let fresh = dir.path().join("new.toml");
+        Config::set_auto_resume_at(&fresh, true).unwrap();
+        assert_eq!(
+            Config::load_at(&fresh).unwrap().limits.auto_resume,
+            Some(true)
+        );
+    }
 
     #[test]
     fn set_in_keeps_the_file_as_written() {
