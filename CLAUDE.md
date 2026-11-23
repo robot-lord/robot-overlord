@@ -278,6 +278,15 @@ get handled without the user looking. For each one:
   `remote` flag: may a paired device call it?) and in
   `crates/web/ui/src/proto.ts`, with a test. Read "Web UI" in
   docs/architecture.md before changing either side.
+- The phone app (`apps/ios`, on the dark feature branch) has one network
+  path: the device engine's relay link (`crates/e2e-client`). Its page
+  has `connect-src 'none'`, and `cargo xtask check-deps` fails if `apps/`
+  names a network API. A page feature reaches the phone as a remote op
+  (`remote: true` on its `Op`, tested from a device in `web_api.rs`) and
+  a `caps` check in `transport.ts`; the engine and the shell don't
+  change. The remote API only grows within its `api` level
+  (`remote_api.json` pins it); a removal or a changed shape bumps
+  `web::API`. Read "The phone app" in docs/architecture.md first.
 - Remote access keeps three crate rules, each a `check-deps` check: the
   `rlord` binary links none of the e2e, relay or crypto crates (the
   daemon holds no keys); `rlord-relay` (`crates/relay`) links no content
