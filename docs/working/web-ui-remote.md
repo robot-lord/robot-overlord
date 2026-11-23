@@ -1191,6 +1191,143 @@ Decided 2026-11-17 (user):
       is a SwiftUI `App`.
     - (e) A binary in the iOS simulator reaches a listener on the Mac's
       `127.0.0.1`.
+  - The lead fixed one contract for the engine, the page and the shell
+    before splitting the work (it refines "The bridge and
+    RemoteTransport"): page messages `{"app":"ready"}` (the engine replays
+    `conn`, `pairing`, `outbox` and the last `hello`, so a reload
+    restores everything) and `{"app":"pair_continue","name"}` (after the
+    engine's `pairing` `scanned` event, which carries the relay origin and
+    the default name), beside the planned `status`, `pair_cancel`,
+    `unpair`, `cancel`; the shell serves `scan` and `settings` itself and
+    answers `{"event":"settings","app_lock","notifications","platform"}`;
+    the engine answers `status` with `{"event":"status","host","relay",
+    "state","device_id","device_name","keys","version","api":{min,max}}`;
+    engine error codes `disconnected`, `host_offline`, `outbox_full`,
+    `cancelled`, `expired`, `interrupted`. Steps 2 and 3, 4, and 5 and 6
+    were built in parallel by three Opus agents on their own branches,
+    merged here.
+  - Step 4 done (daemon and plugin; agent branch `slice4-daemon`):
+    `ui::Target::Device(id)`; `pick` takes devices as it takes pages
+    (latest use, then newest; `ui_target = "web"` covers devices);
+    `confirm_setup` and `open_keys` use `target_local` (never a phone;
+    with only a phone they fail naming the phone, the terminal and `rlord
+    web`); one `WebUi` record per device (at most 16, dropped when the
+    plugin no longer lists the device as paired); one parked command per
+    device for 10 minutes; `page.report` (idempotent) and `page.pending`
+    remote, the device id stamped by the plugin; `device.leave`
+    (`{"left":id}`; `bad_request` locally, new RPC code
+    `RPC_ERR_BAD_REQUEST` -32012); `session.messages {ref, before,
+    limit}` (`{"session":{id,name,agent,conversation},"messages",
+    "more"}`, 50 messages of 4 KiB); `web::API` = 1 in `web.hello` and
+    the device's hello (`{"event":"hello","version","api":1,"rev",
+    "page":id,"device":id}`, no `build`); `WEB_PROTOCOL` 4;
+    `get_ui_state` `target: "phone"` and a `phone` object (`open`,
+    `devices`, `name`, `showing`, `visible`, `form`); answers say
+    `"on":"phone"`; `overlord.md` and `mcp.rs` updated; the TUI ignores
+    `to:"device"` lines. Fixture `crates/daemon/tests/fixtures/
+    remote_api.json` pins the remote ops and snapshot keys within a
+    level. Deviations: a plugin-only method `web.ui_delivered {device,
+    n}` clears a parked command once the plugin sent it live (clearing on
+    an empty `page.report` would race: the device id is stable across
+    sessions, so its post-hello report would wipe a command it never
+    got); a leaving device is removed when its link closes or after a 3 s
+    grace (closing at once lost the answer at the relay); notices are
+    never sent to a phone (when the phone is the target they go to the
+    TUI, else the newest page); slice 3's `remote.rs` refused-op list
+    swaps `page.report` for `device.revoke`. Official docs corrected in
+    the same change (`docs/architecture.md`, `e2e-protocol.md` §3 and
+    §5). Tests: `web_api.rs` `session_messages_are_bounded`,
+    `a_paired_phone_is_a_surface`,
+    `screens_on_this_computer_never_go_to_a_phone`,
+    `device_leave_is_the_callers_own`,
+    `the_remote_api_only_grows_within_a_level`; `web/tests/
+    remote_surface.rs` (leave, a `ui` command live, parked then pulled
+    with the relay's signal, the phone the target after it sent a form);
+    unit tests in `ui`, `lib`, the TUI and the plugin.
+  - Steps 5 and 6 done (the page; agent branch `slice4-page`):
+    `transport.ts` (`Transport`, `Caps`, `LOCAL_CAPS`, `REMOTE_CAPS`,
+    `ApiError`), `Control` became `LocalTransport`; `remote.ts`
+    `RemoteTransport` and the bridge (`window.__rlord_recv(text)`,
+    defined once, not writable; iOS `messageHandlers.rlord` first, then
+    Android's `rlord` listener object; request ids count up from
+    `Date.now()` so a reloaded page never reuses one); `phone.ts`,
+    `chat.ts`, `commands.ts` (`runUi` shared by both entries; on a phone
+    `setup` and `keys` become a notice), `phoneApp.ts`; the second entry
+    `app.html` + `src/app.tsx` + `phone.css`; `views/Chat.tsx`
+    (overlord chat with pending and failed bubbles, a session's notes and
+    `session.messages`, "The live terminal isn't available remotely
+    yet."), `views/Phone.tsx` (pairing screens, `#/status`, the
+    connection line). Views take their body and local-only forms from
+    their entry, so the bundles stay apart. `cargo xtask web build --app`
+    writes `dist-app/` (`index.html`, `assets/`, the licenses) and
+    `manifest.json` (`{"index","csp","files":[{path,type,bytes}]}`,
+    paths with a leading `/`), then checks the bundle (`xtask/src/
+    web_app.rs`, also `web check-app`): every file local, no network
+    scheme or API, the CSP exact, no inline script, no xterm, no
+    `LocalTransport` (found by a `static marker` string, since class
+    names are minified). `web build` checks the local bundle has no bridge
+    code. Lint: oxlint's `react/no-danger`. CI's `web` job builds the app
+    entry too. Tests: `transport`, `remote` (a fake bridge, a reload
+    restoring bubbles from `outbox`), `chat` (fixture
+    `overlord_messages.json`, written by the daemon test), `phone`,
+    `phoneApp`. No DOM tests (no jsdom dependency added).
+  - Step 8 (`crates/e2e-ffi`, `app bindings`, `check-deps`) and most of
+    step 9 (the iOS shell) built by the lead while the engine was built:
+    - `crates/e2e-ffi`: proc-macro UniFFI, foreign traits `Signers`,
+      `Vault`, `Listener`, object `Engine`, error `FfiError`, record
+      `BackgroundResult`. Found: UniFFI 0.32.2 escapes Swift's `open`
+      keyword with backticks into the C header, which then fails to
+      compile, so the FFI's vault method is `unseal` (the engine's
+      `open`).
+    - `cargo xtask app bindings | core-ios | ios [--sim [NAME] |
+      --device ID] | test-ios [--unit]` (`xtask/src/app.rs`, unit-tested
+      logic: developer dir, versions, simulator choice, xcframework
+      arguments). Bindgen in process (`uniffi_bindgen` =0.32.2 in xtask).
+      Swift into `apps/ios/Generated/Swift`, the header and
+      `module.modulemap` into `Generated/Headers`, the xcframework
+      `apps/ios/Frameworks/RlordCore.xcframework`, the page into
+      `Generated/page` (all git-ignored). Apple wants a numbers-only
+      `CFBundleShortVersionString`: `1.3.0-dev.5` builds as marketing
+      version `1.3.0`, build number `5`. Kotlin is generated only once
+      `apps/android` exists.
+    - `check-deps`: `rlord` denies `robot-overlord-e2e-ffi` and
+      `uniffi`; a source check fails if `apps/` names a network API
+      (`URLSession`, `NWConnection`, `CFNetwork`, `socket(`, `java.net`,
+      `okhttp`, `HttpURLConnection`, …; generated and build folders
+      skipped; `NWPathMonitor` allowed), with planted-name tests.
+    - `apps/ios`: a committed Xcode project (objectVersion 77, folders
+      synchronised, so new Swift files need no project edit), a shared
+      scheme with the unit and UI test targets, `Config/Base.xcconfig`
+      (team `PL2X8AJK8A`, `com.robot-lord.rlord`, iOS 26, arm64 only,
+      `#include? "../Local.xcconfig"`), `Local.xcconfig.example`,
+      `Config/Info.plist` (background refresh id, `fetch` mode). Sources:
+      `RlordApp.swift` (SwiftUI `App`, `.backgroundTask(.appRefresh)`),
+      `Shell.swift` (engine, bridge routing, settings, lifecycle with
+      the OS's finishing time, `NWPathMonitor` keyed by interfaces so a
+      path change redials, app lock after 5 minutes away with
+      `LocalAuthentication` and a cover in the app switcher, local
+      notifications, the debug-only `-rlordQR` launch argument),
+      `WebView.swift` (scheme handler from the manifest, CSP and
+      `nosniff` on every response, content rule list, navigation limited
+      to the first load and same-document changes, no windows, link
+      previews, data detectors, media or fraud-warning lookups,
+      non-persistent data store, inspectable in debug only),
+      `Keys.swift` (Secure Enclave signer and ECIES vault,
+      `AfterFirstUnlockThisDeviceOnly`; software keys only without an
+      enclave, in debug builds), `Scanner.swift` (AVFoundation, `RLORD1:`
+      only; a paste field in debug builds). No App Transport Security
+      exception: the app makes no URL loads, and ATS doesn't govern the
+      engine's own sockets.
+    - Found: the Apple Silicon simulator passes the Mac's Secure
+      Enclave through (`SecureEnclave.isAvailable` is true; enclave
+      signing and ECIES work there), so the simulator runs the hardware
+      key path, not the software fallback the plan expected.
+    - `crates/web/examples/remote_stack.rs`: a loopback host for the
+      app's runs (an in-memory daemon with fixture sessions, the real
+      `rlord-web`, the real relay in process; commands `pair`,
+      `restart-relay`, `stop-plugin`, `start-plugin`, `status`, by stdin
+      or `<dir>/control/*.cmd` files so the simulator's test runner can
+      drive it; `--auto-confirm`). `xtask` drives it (`app::Stack`).
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
