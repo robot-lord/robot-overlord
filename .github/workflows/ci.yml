@@ -65,6 +65,9 @@ jobs:
       # its vectors run in Node: byte for byte the native core's.
       - run: cargo xtask e2e test-wasm
       - run: cargo xtask web build
+      # The phone app's page, and its checks: every file local, no
+      # network, its CSP, no xterm.js and no LocalTransport.
+      - run: cargo xtask web build --app
       - run: cargo test -p robot-overlord-web
         env:
           RLORD_WEB_REQUIRE_ASSETS: "1"

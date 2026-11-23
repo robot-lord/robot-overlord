@@ -15,36 +15,48 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::cmd;
+use crate::{cmd, web_app};
 
 const UI: &str = "crates/web/ui";
 
-const USAGE: &str = "usage: cargo xtask web install|check|build|watch
+const USAGE: &str = "usage: cargo xtask web install|check|build [--app]|check-app|watch
 
-  install   npm ci --ignore-scripts in crates/web/ui (checks Node against .node-version)
-  check     types (tsc), lint (oxlint, type-aware), format (biome, check only), tests (vitest)
-  build     the page into crates/web/ui/dist/, which rlord-web embeds when built next
-  watch     rebuild dist/ on every change; run a debug rlord-web with
-            RLORD_WEB_ASSETS=crates/web/ui/dist to serve it from disk";
+  install       npm ci --ignore-scripts in crates/web/ui (checks Node against .node-version)
+  check         types (tsc), lint (oxlint, type-aware), format (biome, check only), tests
+                (vitest); both entries, the local page's and the phone app's
+  build         the page into crates/web/ui/dist/, which rlord-web embeds when built next
+  build --app   the phone app's page into crates/web/ui/dist-app/, with its asset table
+                (manifest.json) for the apps' shells; then check-app
+  check-app     the built phone page: every file local, no network, its CSP, no xterm.js
+                and no LocalTransport
+  watch         rebuild dist/ on every change; run a debug rlord-web with
+                RLORD_WEB_ASSETS=crates/web/ui/dist to serve it from disk";
 
 pub fn main(args: &[String]) -> Result<()> {
-    let [task] = args else {
-        return cmd::usage(USAGE);
-    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let ui = PathBuf::from(UI);
-    match task.as_str() {
-        "install" => install(&ui),
-        "check" => {
+    match args.as_slice() {
+        ["install"] => install(&ui),
+        ["check"] => {
             ensure_installed(&ui)?;
             check(&ui)
         }
-        "build" => {
+        ["build"] => {
             ensure_installed(&ui)?;
             run(&ui, "vite", &["build"])?;
+            web_app::check_local(&ui.join("dist"))?;
             println!("built {UI}/dist: rebuild rlord-web to embed it");
             Ok(())
         }
-        "watch" => {
+        ["build", "--app"] => {
+            ensure_installed(&ui)?;
+            run(&ui, "vite", &["build", "--mode", "app"])?;
+            web_app::finish(&ui.join("dist-app"))?;
+            println!("built {UI}/dist-app for the phone app");
+            Ok(())
+        }
+        ["check-app"] => web_app::check(&ui.join("dist-app")),
+        ["watch"] => {
             ensure_installed(&ui)?;
             println!(
                 "rebuilding {UI}/dist on change; serve it with a debug rlord-web and \
