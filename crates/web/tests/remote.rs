@@ -164,7 +164,7 @@ async fn pair_confirm_then_use_it() {
         "keys.list",
         "device.list",
         "device.confirm",
-        "page.report",
+        "device.revoke",
     ] {
         let a = live.request(&mut c, op, json!({})).await.unwrap();
         assert_eq!(a["error"]["code"], "not_allowed", "{op}: {a}");

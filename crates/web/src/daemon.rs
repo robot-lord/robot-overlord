@@ -100,6 +100,13 @@ impl Daemon {
             .await
     }
 
+    /// `web.ui_delivered`: device `device`'s UI command `n` went out on its
+    /// live session (the daemon stops keeping it for `page.pending`).
+    pub async fn ui_delivered(&self, device: &str, n: u64) -> Result<Value, CallError> {
+        self.call("web.ui_delivered", json!({"device": device, "n": n}))
+            .await
+    }
+
     /// `web.remote_state`: this plugin's relay state, the whole of it, on
     /// every change (`{relay, connected, error, devices, pairing,
     /// pending}`; crates/daemon/src/relay.rs `normalize`).
@@ -135,6 +142,14 @@ pub enum Event {
     Changed { rev: String, relay: bool },
     /// A UI command for one page (`crates/daemon/src/ui.rs`).
     Ui { page: String, cmd: Value },
+    /// A UI command for one paired device. `n`: the daemon keeps it for
+    /// the device's next `page.pending` until told it went out live
+    /// (`Daemon::ui_delivered`); None for a notice, which isn't kept.
+    DeviceUi {
+        device: String,
+        n: Option<u64>,
+        cmd: Value,
+    },
     /// The user's relay command (`crates/daemon/src/relay.rs`): answer it
     /// with `Daemon::remote_reply(id, …)` within 10 s. `req` is
     /// `{"cmd": "setup" | "pair" | "pair_cancel" | "confirm" | "reject" |
@@ -170,10 +185,17 @@ fn event(line: &str) -> Option<Event> {
             rev: v["rev"].as_str().unwrap_or("").to_string(),
             relay: v["relay"] == true,
         }),
-        "ui" => Some(Event::Ui {
-            page: v["page"].as_str()?.to_string(),
-            cmd: v.get("cmd")?.clone(),
-        }),
+        "ui" => match v["device"].as_str() {
+            Some(device) => Some(Event::DeviceUi {
+                device: device.to_string(),
+                n: v["n"].as_u64(),
+                cmd: v.get("cmd")?.clone(),
+            }),
+            None => Some(Event::Ui {
+                page: v["page"].as_str()?.to_string(),
+                cmd: v.get("cmd")?.clone(),
+            }),
+        },
         "remote" => Some(Event::Remote {
             id: v["id"].as_str()?.to_string(),
             req: v.get("req").filter(|r| r.is_object())?.clone(),
@@ -234,6 +256,22 @@ mod tests {
             })
         );
         assert_eq!(event(r#"{"notify":"ui","cmd":{"cmd":"show_list"}}"#), None);
+        assert_eq!(
+            event(r#"{"notify":"ui","device":"ab12","n":3,"cmd":{"cmd":"show_list"}}"#),
+            Some(Event::DeviceUi {
+                device: "ab12".into(),
+                n: Some(3),
+                cmd: json!({"cmd": "show_list"})
+            })
+        );
+        assert_eq!(
+            event(r#"{"notify":"ui","device":"ab12","cmd":{"cmd":"notice","text":"t"}}"#),
+            Some(Event::DeviceUi {
+                device: "ab12".into(),
+                n: None,
+                cmd: json!({"cmd": "notice", "text": "t"})
+            })
+        );
         assert_eq!(
             event(r#"{"id":"r1","notify":"remote","req":{"cmd":"pair"}}"#),
             Some(Event::Remote {
