@@ -4262,3 +4262,16 @@ and 8. Steps 12 and 13 can move to a later PR.
     happens before the final merge to `main`, and the hosted relay is
     planned with the production-relay and push work. Recommended: as
     planned.
+
+### Slice 4 answers (user, 2026-11-23)
+
+1. Crypto and the relay link: the native Rust engine (UniFFI) in the
+   shell. This replaces the earlier "WASM in the page" answer for the phone.
+2. iOS first.
+3. The paid Apple developer team (`PL2X8AJK8A`, the one that signs the
+   macOS Developer ID builds). No Apple Development certificate is on this
+   Mac yet; Xcode automatic signing creates one on the first device build.
+4. App identifier `com.robot-lord.rlord`.
+5–16. The recommended defaults.
+
+`xcode-select` now points at Xcode (the user ran `sudo xcode-select -s`).
