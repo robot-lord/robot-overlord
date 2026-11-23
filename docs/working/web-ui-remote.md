@@ -1242,7 +1242,8 @@ Decided 2026-11-17 (user):
     `device_leave_is_the_callers_own`,
     `the_remote_api_only_grows_within_a_level`; `web/tests/
     remote_surface.rs` (leave, a `ui` command live, parked then pulled
-    with the relay's signal, the phone the target after it sent a form);
+    with the relay's signal, the phone the target after it sent a form;
+    later moved onto the engine as `engine_surface.rs`, below);
     unit tests in `ui`, `lib`, the TUI and the plugin.
   - Steps 5 and 6 done (the page; agent branch `slice4-page`):
     `transport.ts` (`Transport`, `Caps`, `LOCAL_CAPS`, `REMOTE_CAPS`,

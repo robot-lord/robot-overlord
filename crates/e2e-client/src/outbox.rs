@@ -32,7 +32,13 @@ pub fn may_wait(op: &str) -> bool {
 
 /// Look-ups: they run again harmlessly, so they get no entry; one in
 /// flight when the link dies fails with `disconnected`. An op this list
-/// doesn't know is treated as one that changes something.
+/// doesn't know is treated as one that changes something. Exactly the
+/// daemon's remote ops marked idempotent (`web::OPS`), which the host runs
+/// as often as asked without storing an answer for a resend
+/// (`crates/web/tests/engine_surface.rs` holds the two lists together).
+/// `page.report` is one (reporting what the page shows twice is the same
+/// as once); `page.pending` is not (it takes the parked command, so a
+/// resend must get the stored answer).
 pub fn is_lookup(op: &str) -> bool {
     matches!(
         op,
@@ -44,6 +50,7 @@ pub fn is_lookup(op: &str) -> bool {
             | "view.default"
             | "form.defaults"
             | "form.repos"
+            | "page.report"
     )
 }
 
