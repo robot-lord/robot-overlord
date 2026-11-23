@@ -513,3 +513,109 @@ export interface OverlordMessages {
  * this slice (in `OPS` once its list has them; the union stays valid).
  */
 export type PageOp = Op | "session.messages";
+
+/** A session's recent conversation (op `session.messages {ref, before, limit}`). */
+export interface SessionMessages {
+  messages: OverlordMessage[];
+  /** Earlier ones are left. */
+  more: boolean;
+}
+
+/** The phone's connection, as its engine reports it. */
+export type ConnKind =
+  | "unpaired"
+  /** No network. */
+  | "offline"
+  | "connecting"
+  /** Linked to the relay, no session with the host yet. */
+  | "relay"
+  | "host_offline"
+  | "live"
+  | "wrong_relay"
+  | "revoked"
+  | "update_app"
+  | "update_host"
+  | "suspended";
+
+export type PairingKind = "scanned" | "connecting" | "waiting" | "done" | "rejected" | "failed";
+
+export type OutboxState = "waiting" | "sent" | "running" | "failed" | "interrupted";
+
+/** A request the engine keeps until it is answered (asks only, as the page sees them). */
+export interface OutboxItem {
+  /** The engine's id for it (pass to `cancel`). */
+  id: string;
+  op: string;
+  /** An ask's text. */
+  text?: string;
+  /** When it was asked (Unix ms). */
+  at: number;
+  state: OutboxState;
+  error?: { code: string; message: string };
+}
+
+export interface ConnEvent {
+  event: "conn";
+  state: ConnKind;
+  host?: string;
+  /** The relay's origin. */
+  relay?: string;
+  /** One line more. */
+  detail?: string;
+}
+
+export interface PairingEvent {
+  event: "pairing";
+  state: PairingKind;
+  relay?: string;
+  /** The default device name (`scanned`). */
+  name?: string;
+  /** Six digits (`waiting`). */
+  code?: string;
+  reason?: string;
+}
+
+export interface OutboxEvent {
+  event: "outbox";
+  items: OutboxItem[];
+}
+
+export interface StatusEvent {
+  event: "status";
+  host?: string;
+  relay?: string;
+  state: ConnKind;
+  device_id?: string;
+  device_name?: string;
+  keys: "hardware" | "software";
+  /** The engine's version. */
+  version: string;
+  api: { min: number; max: number };
+}
+
+/** The shell's own settings (answers every `settings` message). */
+export interface SettingsEvent {
+  event: "settings";
+  app_lock: boolean;
+  notifications: boolean;
+  platform: "ios" | "android";
+}
+
+/** What the native side sends the page beyond the control socket's messages. */
+export type AppEvent = ConnEvent | PairingEvent | OutboxEvent | StatusEvent | SettingsEvent;
+
+/** What the page sends the native side beyond requests. */
+export type AppMessage =
+  | { app: "ready" }
+  | { app: "status" }
+  | { app: "pair_continue"; name: string }
+  | { app: "pair_cancel" }
+  | { app: "unpair" }
+  | { app: "cancel"; request: string }
+  /** The shell's: opens the native scanner. */
+  | { app: "scan" }
+  /** The shell's: sets what is given, answers `settings` either way. */
+  | { app: "settings"; app_lock?: boolean; notifications?: boolean };
+
+/** Everything the native side sends the page. */
+export type BridgeMessage = ControlMessage | RemoteReply | AppEvent;

@@ -1,16 +1,44 @@
-// The overlord (`#/overlord`): the active overlord's pane, its status and
-// its agents. The pane follows a switch to another agent's overlord.
+// The overlord (`#/overlord`): its status, its agents and its buttons,
+// then what the entry puts below them: the local page's pane
+// (views/panes.tsx), the phone's chat (views/Chat.tsx).
 
+import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { OverlordActions, useRunner } from "../components/Actions";
-import { Pane } from "../components/Pane";
 import { Status, Work } from "../components/Status";
+import type { Overlord as OverlordRow } from "../proto";
 import type { Store } from "../store";
 import { Back } from "./Session";
 
-export function Overlord({ store, token }: { store: Store; token: string }) {
-  const o = store.snapshot.value?.overlord ?? null;
+/** Start the overlord (`overlord.ensure`), saying how it went. */
+export function StartOverlord({ store }: { store: Store }) {
   const [starting, setStarting] = useState<string | null>(null);
+  const start = () => {
+    setStarting("starting…");
+    store
+      .request("overlord.ensure")
+      .then(() => setStarting(null))
+      .catch((e: unknown) => setStarting(e instanceof Error ? e.message : String(e)));
+  };
+  return (
+    <>
+      <button type="button" onClick={start} disabled={starting === "starting…"}>
+        Start it
+      </button>
+      {starting && <p class="dim">{starting}</p>}
+    </>
+  );
+}
+
+export function Overlord({
+  store,
+  body,
+}: {
+  store: Store;
+  /** Below the buttons: the pane or the chat. */
+  body: (o: OverlordRow) => ComponentChildren;
+}) {
+  const o = store.snapshot.value?.overlord ?? null;
   const r = useRunner(store);
   if (!store.snapshot.value) return <p class="hint">loading…</p>;
   if (!o) {
@@ -25,13 +53,6 @@ export function Overlord({ store, token }: { store: Store; token: string }) {
     );
   }
   const active = o.overlords.find((a) => a.active);
-  const start = () => {
-    setStarting("starting…");
-    store
-      .request("overlord.ensure")
-      .then(() => setStarting(null))
-      .catch((e: unknown) => setStarting(e instanceof Error ? e.message : String(e)));
-  };
   return (
     <section class="view">
       <header class="view-head">
@@ -43,21 +64,7 @@ export function Overlord({ store, token }: { store: Store; token: string }) {
         <Work s={o} />
       </header>
       <OverlordActions o={o} r={r} />
-      <Pane
-        target="overlord"
-        token={token}
-        watch={`${o.id}:${o.status}`}
-        expectId={o.id}
-        notRunning={
-          <>
-            <p>The overlord isn't running.</p>
-            <button type="button" onClick={start} disabled={starting === "starting…"}>
-              Start it
-            </button>
-            {starting && <p class="dim">{starting}</p>}
-          </>
-        }
-      />
+      {body(o)}
     </section>
   );
 }

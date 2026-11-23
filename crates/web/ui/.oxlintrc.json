@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "unicorn", "oxc", "import", "promise", "vitest"],
+  "plugins": ["typescript", "unicorn", "oxc", "import", "promise", "vitest", "react"],
   "categories": {
     "correctness": "error",
     "suspicious": "warn"
@@ -26,8 +26,16 @@
         "allow": ["**/*.css"]
       }
     ],
+    "react/no-danger": "error",
+    "react/no-unstable-nested-components": ["warn", { "allowAsProps": true }],
+    "react/no-danger-with-children": "error",
+    "react/react-in-jsx-scope": "off",
+    "react/jsx-key": "off",
+    "react/immutability": "off",
+    "react/purity": "off",
+    "react-hooks/exhaustive-deps": "off",
     "typescript/no-unsafe-type-assertion": "off",
     "typescript/consistent-return": "off"
   },
-  "ignorePatterns": ["dist/**", "node_modules/**"]
+  "ignorePatterns": ["dist/**", "dist-app/**", "node_modules/**"]
 }

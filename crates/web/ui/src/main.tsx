@@ -4,16 +4,19 @@
 import { effect } from "@preact/signals";
 import { render } from "preact";
 import { LocalTransport, takeToken, wsUrl } from "./api";
+import { runUi } from "./commands";
 import { FormHost } from "./components/FormHost";
+import { LocalForms } from "./components/LocalForms";
 import { Toast } from "./components/Toast";
 import { tick } from "./components/time";
 import type { UiCmd } from "./proto";
-import { followHash, href, parse, route } from "./route";
+import { followHash, parse, route } from "./route";
 import { listView, Store } from "./store";
 import { LOCAL_CAPS, menu } from "./transport";
-import { decide, Reporter } from "./ui";
+import { Reporter } from "./ui";
 import { List, open as openForm } from "./views/List";
 import { Overlord } from "./views/Overlord";
+import { OverlordPane, SessionPane } from "./views/panes";
 import { openFork, Session } from "./views/Session";
 import "./app.css";
 
@@ -38,27 +41,9 @@ tick();
 
 /** Carry out an overlord's UI command (`ui.ts` decides). */
 function onUi(cmd: UiCmd): void {
-  for (const e of decide(cmd, store.form.value)) {
-    switch (e.do) {
-      case "route":
-        if (e.closeForm) store.form.value = null;
-        location.hash = href(e.to);
-        break;
-      case "view":
-        store.applyView(e.view, e.select);
-        break;
-      case "open":
-        store.parked.value = null;
-        store.form.value = e.form;
-        break;
-      case "park":
-        store.parked.value = e.cmd;
-        break;
-      case "toast":
-        store.toast.value = e.text;
-        break;
-    }
-  }
+  runUi(cmd, store, LOCAL_CAPS, (h) => {
+    location.hash = h;
+  });
 }
 
 const reporter = new Reporter((args) => {
@@ -168,7 +153,7 @@ function App() {
           </span>
         )}
       </header>
-      <FormHost store={store} />
+      <FormHost store={store} local={(f) => <LocalForms store={store} form={f} />} />
       <Toast store={store} />
       <div class="body">
         <aside class="side">
@@ -178,9 +163,17 @@ function App() {
           {r.kind === "list" || !token ? (
             <p class="hint">Pick the overlord or a session.</p>
           ) : r.kind === "overlord" ? (
-            <Overlord store={store} token={token} />
+            <Overlord
+              store={store}
+              body={(o) => <OverlordPane store={store} o={o} token={token} />}
+            />
           ) : (
-            <Session key={r.id} store={store} id={r.id} token={token} />
+            <Session
+              key={r.id}
+              store={store}
+              id={r.id}
+              body={(s, act) => <SessionPane s={s} act={act} token={token} />}
+            />
           )}
         </main>
       </div>

@@ -1,0 +1,40 @@
+{
+  "messages": [
+    {
+      "at": "2026-11-17T10:00:00.000Z",
+      "line": 66,
+      "text": "answer 32",
+      "who": "agent"
+    },
+    {
+      "at": "2026-11-17T10:00:00.000Z",
+      "line": 67,
+      "text": "ask 33",
+      "who": "you"
+    },
+    {
+      "at": "2026-11-17T10:00:00.000Z",
+      "line": 68,
+      "text": "answer 33",
+      "who": "agent"
+    },
+    {
+      "at": "2026-11-17T10:00:00.000Z",
+      "line": 69,
+      "text": "ask 34",
+      "who": "you"
+    },
+    {
+      "at": "2026-11-17T10:00:00.000Z",
+      "line": 70,
+      "text": "answer 34",
+      "who": "agent"
+    }
+  ],
+  "more": true,
+  "overlord": {
+    "agent": "claude",
+    "conversation": "overlord-1",
+    "id": "overlord-1"
+  }
+}
