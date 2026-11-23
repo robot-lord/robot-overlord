@@ -318,7 +318,19 @@ async fn forward(
     upstream: &str,
 ) -> anyhow::Result<()> {
     let (mut up, _) = tokio_tungstenite::connect_async(upstream).await?;
-    up.send(Message::Text(hello.into())).await?;
+    // The hello passes the filter too (a test may record or rewrite it).
+    let hello = Message::Text(hello.into());
+    trace(peer, Dir::Up, &hello);
+    let first = {
+        let mut g = st.lock().unwrap();
+        match g.filter.as_mut() {
+            Some(f) => f(peer, Dir::Up, hello),
+            None => vec![hello],
+        }
+    };
+    for m in first {
+        up.send(m).await?;
+    }
     *st.lock().unwrap().up_count.entry(peer.conn).or_default() += 1;
     let mut frozen = false;
     loop {

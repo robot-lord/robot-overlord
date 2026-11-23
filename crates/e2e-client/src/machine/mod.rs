@@ -281,7 +281,9 @@ struct Up {
     mb_inflight: Option<(String, Vec<u8>, u64)>,
     /// A mailbox being keyed on this session.
     mb_keying: Option<Initiator>,
-    /// The one resend pass of this link is done.
+    /// The one resend pass of this link is done (a link being the host's
+    /// link to this device: a new one when the host comes back online;
+    /// handshakes retried on it make no second pass).
     resent: bool,
     /// The refused frame was offered again on this link.
     refused_tried: bool,
@@ -1018,6 +1020,9 @@ impl Machine {
                 if online {
                     up.hs_attempt = 0;
                     up.hs_retry_at = mono;
+                    // The host's own link to us is a new one: what it may
+                    // have lost meanwhile goes again on the next session.
+                    up.resent = false;
                 } else if !matches!(up.sess, Sess::PairHs(_) | Sess::Pair { .. }) {
                     up.sess = Sess::None;
                     up.mb_keying = None;

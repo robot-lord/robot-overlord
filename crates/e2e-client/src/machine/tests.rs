@@ -1214,7 +1214,16 @@ fn one_resend_pass_per_link() {
         state: HostState::Online,
     });
     assert_eq!(w.requests().len(), 2);
-    // The host flaps on the same link: no second pass.
+    // The session dies on the same link (undeliverable) and a retried
+    // handshake makes a new one: no second pass.
+    w.relay_says(FromRelay::Undeliverable { link: None });
+    assert!(!w.m.live());
+    w.host.session = None;
+    w.advance_heard(HANDSHAKE_RETRY_MIN_MS);
+    assert!(w.m.live());
+    assert_eq!(w.requests().len(), 2);
+    // The host went away and came back: its link to us is new, and what
+    // it may have lost goes again (by id).
     w.relay_says(FromRelay::Host {
         state: HostState::Offline,
     });
@@ -1222,7 +1231,9 @@ fn one_resend_pass_per_link() {
     w.relay_says(FromRelay::Host {
         state: HostState::Online,
     });
-    assert_eq!(w.requests().len(), 2);
+    let reqs = w.requests();
+    assert_eq!(reqs.len(), 4);
+    assert_eq!(reqs[2]["id"], reqs[0]["id"]);
 }
 
 // ---- crashes between steps ----

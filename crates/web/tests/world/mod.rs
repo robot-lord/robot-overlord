@@ -93,7 +93,8 @@ pub async fn world(n: usize) -> World {
 }
 
 pub async fn world_with(n: usize, f: impl FnOnce(&mut rlord_relay::Config)) -> World {
-    env_once("engine", "rlord-test-engine");
+    let name = env!("CARGO_CRATE_NAME");
+    env_once(name, &format!("rlord-test-{name}"));
     let rig = tokio::task::spawn_blocking(move || {
         Rig::start(move |db| {
             for i in 0..n {
