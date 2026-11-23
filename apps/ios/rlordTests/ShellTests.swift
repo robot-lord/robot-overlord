@@ -69,9 +69,9 @@ final class PageAssetsTests: XCTestCase {
 
     func testListedFilesOnly() throws {
         let a = try XCTUnwrap(manifest(
-            #"{"entry":"app.html","files":[{"path":"app.html","type":"text/html"},{"path":"assets/a.js","type":"text/javascript"}]}"#))
+            #"{"index":"/index.html","files":[{"path":"/index.html","type":"text/html"},{"path":"/assets/a.js","type":"text/javascript"}]}"#))
         XCTAssertEqual(a.lookup("/")?.1, "text/html")
-        XCTAssertEqual(a.lookup("/")?.0.path, "/page/app.html")
+        XCTAssertEqual(a.lookup("/")?.0.path, "/page/index.html")
         XCTAssertEqual(a.lookup("/assets/a.js")?.1, "text/javascript")
         XCTAssertNil(a.lookup("/assets/b.js"))
         XCTAssertNil(a.lookup("/manifest.json"))
@@ -79,17 +79,30 @@ final class PageAssetsTests: XCTestCase {
     }
 
     func testBadManifestsAreRefused() {
-        XCTAssertNil(manifest(#"{"files":[{"path":"../x","type":"text/html"}],"entry":"../x"}"#))
-        XCTAssertNil(manifest(#"{"files":[{"path":"/abs","type":"text/html"}]}"#))
-        XCTAssertNil(manifest(#"{"files":[{"path":"a.html","type":"text/html"}],"entry":"b.html"}"#))
+        XCTAssertNil(manifest(#"{"files":[{"path":"/../x","type":"text/html"}],"index":"/../x"}"#))
+        XCTAssertNil(manifest(#"{"files":[{"path":"relative.html","type":"text/html"}]}"#))
+        XCTAssertNil(manifest(#"{"files":[{"path":"//host/x","type":"text/html"}]}"#))
+        XCTAssertNil(manifest(#"{"files":[{"path":"/a.html","type":"text/html"}],"index":"/b.html"}"#))
         XCTAssertNil(manifest("not json"))
     }
 
     func testTheBundledPageIsThere() throws {
         let a = try XCTUnwrap(PageAssets.load(), "the app bundle carries page/manifest.json")
         let (file, type) = try XCTUnwrap(a.lookup("/"))
-        XCTAssertEqual(type, "text/html")
+        XCTAssertTrue(type.hasPrefix("text/html"), type)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    /// The shell's header policy is the page's own (app.html, carried in
+    /// the manifest), directive for directive.
+    func testThePolicyMatchesThePages() throws {
+        let url = try XCTUnwrap(Bundle.main.resourceURL?.appendingPathComponent("page/manifest.json"))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let page = try XCTUnwrap(obj["csp"] as? String)
+        func directives(_ p: String) -> Set<String> {
+            Set(p.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        }
+        XCTAssertEqual(directives(page), directives(pagePolicy))
     }
 
     func testEveryResponseCarriesThePolicy() {

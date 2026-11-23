@@ -33,21 +33,33 @@ struct PageAssets {
         return parse(root: root, manifest: data)
     }
 
-    /// `{"entry": "app.html", "files": [{"path": "app.html", "type": "text/html"}, …]}`.
+    /// The manifest `cargo xtask web build --app` writes:
+    /// `{"index": "/index.html", "csp": "…", "files": [{"path": "/assets/a.js",
+    /// "type": "text/javascript; charset=utf-8", "bytes": 76407}, …]}`.
     static func parse(root: URL, manifest: Data) -> PageAssets? {
         guard let obj = try? JSONSerialization.jsonObject(with: manifest) as? [String: Any],
               let files = obj["files"] as? [[String: Any]]
         else { return nil }
         var types: [String: String] = [:]
         for f in files {
-            guard let path = f["path"] as? String, let type = f["type"] as? String,
-                  !path.contains(".."), !path.hasPrefix("/")
+            guard let path = (f["path"] as? String).flatMap(relative), let type = f["type"] as? String
             else { return nil }
             types[path] = type
         }
-        let entry = obj["entry"] as? String ?? "app.html"
-        guard types[entry] != nil else { return nil }
+        guard let entry = (obj["index"] as? String ?? "/index.html").flatMap(relative),
+              types[entry] != nil
+        else { return nil }
         return PageAssets(root: root, types: types, entry: entry)
+    }
+
+    /// `/assets/a.js` as `assets/a.js`; nil for anything that could leave
+    /// the page's folder.
+    static func relative(_ path: String) -> String? {
+        guard path.hasPrefix("/"), !path.hasPrefix("//") else { return nil }
+        let rel = String(path.dropFirst())
+        guard !rel.isEmpty, !rel.split(separator: "/").contains(where: { $0 == ".." || $0 == "." })
+        else { return nil }
+        return rel
     }
 
     /// The file and its type for a request path, or nil (404).

@@ -337,8 +337,15 @@ fn ios(root: &Path, args: &[String]) -> Result<()> {
             )?)?;
             let app = ios_dir(root).join("build/Build/Products/Debug-iphonesimulator/rlord.app");
             run(xcode("xcrun").args(["simctl", "install", &udid]).arg(&app))?;
-            run(xcode("xcrun").args(["simctl", "launch", &udid, BUNDLE_ID]))?;
-            run(xcode("open").args(["-a", "Simulator"]))?;
+            // A simulator has no passcode, so the app lock would only
+            // cover the page: off for this launch (UserDefaults' argument
+            // domain).
+            run(xcode("xcrun").args(["simctl", "launch", &udid, BUNDLE_ID, "-appLock", "NO"]))?;
+            // Show it (Simulator.app lives inside Xcode); not fatal.
+            let dev = developer_dir().unwrap_or_else(|| XCODE_DEVELOPER.to_string());
+            let _ = cmd::status_quiet(
+                Command::new("open").arg(format!("{dev}/Applications/Simulator.app")),
+            );
         }
         Dest::Device(id) => {
             run(&mut xcodebuild(
