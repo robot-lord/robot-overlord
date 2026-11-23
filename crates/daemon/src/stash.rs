@@ -1,40 +1,43 @@
 //! Delivering to a Claude session past a draft, with Claude Code's own
 //! prompt stash (`chat:stash`, Ctrl+S): with text in the input, Ctrl+S
 //! stashes it and clears the box ("draft stashed" shows on its status
-//! line); pressed again on an empty box, it puts the draft back as it was.
+//! line). Claude Code puts the stashed draft back by itself once the
+//! next turn is over (seen live, 2.1.331: "draft restored" about 2s
+//! after the turn).
 //!
 //! The user's decision: rather than hold a message for as long as a
-//! Claude session's input holds unsent text, rlord stashes the draft,
-//! types the message, and restores the draft once the turn is over.
-//! Codex and OpenCode have no such stash: a draft still holds them.
+//! Claude session's input holds unsent text, rlord stashes the draft and
+//! types the message; Claude Code restores the draft. Codex and OpenCode
+//! have no such stash: a draft still holds them.
 //!
-//! What was checked live (Claude Code 2.1.327 and 2.1.331): the stash is
-//! ONE slot (stashing again overwrites, and the first draft is lost);
-//! Claude Code restores the stashed draft by itself about 2s after the
-//! delivered turn ("draft restored"), so a Ctrl+S after that stashes it
-//! again (that is what "draft restored · draft stashed" with an empty
-//! box was). The guiding rule: never lose a draft; a held message is
-//! fine. So:
+//! The rule: never lose a draft; a held message is fine. The stash is
+//! one slot (stashing again overwrites: checked live), and rlord never
+//! presses Ctrl+S to restore (a press after the auto-restore would stash
+//! the draft again). So:
 //!
-//! - **Stash** (`plan`, from `send::type_into`) only when nothing is
-//!   stashed (no "draft stashed" on the status lines, no record of
-//!   rlord's, failed ones included), no back-off after a Ctrl+S that
-//!   didn't take, the whole box has sat unchanged for `DRAFT_IDLE` with
-//!   no one typing at it, and Ctrl+S alone is the stash key
-//!   (`keybindings.json`, read only, last: `stash_bound`). After the
-//!   press the screen is polled (`poll_stash`): the box going empty
-//!   proves the stash; it is recorded, then the message typed.
-//! - **Restore** (`tick`, from `send`'s slow tick): mostly Claude's own
-//!   auto-restore is seen. Ctrl+S only with the box empty and the latest
-//!   status "draft stashed", the turn over a while, and a fresh look
-//!   right before (`restore_step`). Never with text in the box. Nothing
-//!   stashed and our draft not in the box: dealt with, dropped quietly
-//!   (`draft_restore_unknown`). Still stashed after presses: it gives up
-//!   (`draft_restore_failed`, row mark `⎘`), and that record blocks new
-//!   stashes until the draft shows back or `rlord stash-dismiss`.
+//! - **Stash** (`plan`, from `send::type_into`) only when the input box
+//!   is recognised (`claude::input_box`, shared with `dialog_shown`), the
+//!   screen is at its prompt, no "draft stashed" shows, no record of
+//!   rlord's is live for the session, the whole box has sat unchanged for
+//!   `DRAFT_IDLE` with no one typing at it, rlord isn't backing off there,
+//!   and Ctrl+S alone is the stash key (`keybindings.json`, read only,
+//!   last). After the press the screen is polled (`poll_stash`): a
+//!   recognised, empty box at the prompt is the stash; it is recorded,
+//!   then the message typed. A dialog or unrecognised screen: recorded
+//!   (it may have happened), nothing typed. The text still there: back
+//!   off.
+//! - **While a record is live** every message to that session holds
+//!   (`Kind::Stash`), empty box or not, so no paste races the restore.
+//! - **The record clears** (`tick`) when the draft's first line shows back
+//!   in the box, when the user sends a prompt of their own after rlord's
+//!   message (they dealt with the box), or on `rlord stash-dismiss`. A
+//!   minute after the turn ended without any of those, the row shows `⎘`
+//!   ("draft may still be stashed"); nothing is pressed.
+//! - A session stopped, errored, archived or gone with a record:
+//!   `draft_lost_with_session` (with the first line), and it is forgotten.
 //!
-//! Events: `draft_stashed`, `draft_restored`, `draft_restore_failed`,
-//! `draft_restore_unknown`, `draft_restore_dismissed`.
+//! Events: `draft_stashed`, `draft_restored` (`by`: seen, user_prompt),
+//! `draft_restore_dismissed`, `draft_lost_with_session`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -46,27 +49,23 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use rlord_core::agents::claude::input_box;
 use rlord_core::agents::{strip_ansi, Agent};
 use rlord_core::tmux;
-use rlord_core::types::{now_ms, Status};
+use rlord_core::types::{now_ms, Session, Status};
 
 use crate::Daemon;
 
-/// kv key: drafts rlord stashed and hasn't restored yet, `{session id:
-/// {"first_line", "at", "tries", "next_at", "failed"?, "failed_at"?}}`.
+/// kv key: drafts rlord stashed, until it sees them dealt with,
+/// `{session id: {"first_line", "at", "sent_at"?, "stale"?}}`.
 pub const STASH_KEY: &str = "draft_stash";
 
 /// How long a draft must sit unchanged before rlord stashes it.
 pub const DRAFT_IDLE: Duration = Duration::from_secs(30);
 
-/// How long the session's turn must have been over before a restore.
-const RESTORE_IDLE_MS: i64 = 3_000;
-
-/// Presses of Ctrl+S that didn't bring the draft back before giving up.
-const RESTORE_TRIES: u64 = 6;
-
-/// How long after the stash a restore is tried at all.
-const RESTORE_FOR_MS: i64 = 30 * 60_000;
+/// After the turn rlord's message started has ended, how long before the
+/// row shows the draft may still be stashed.
+const STALE_AFTER_MS: i64 = 60_000;
 
 /// Time for Claude to redraw after a key.
 pub const REDRAW: Duration = Duration::from_millis(400);
@@ -114,6 +113,28 @@ pub(crate) fn prune_drafts(idle: impl Fn(&str) -> bool) {
     }
 }
 
+/// After a Ctrl+S that didn't take, how long before rlord tries the
+/// stash in that session again.
+pub const UNTOUCHED_BACKOFF: Duration = Duration::from_secs(600);
+
+/// Sessions where the stash's Ctrl+S didn't take, and when.
+static UNTOUCHED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+/// The stash's Ctrl+S didn't take in session `id`: not again for a while.
+pub(crate) fn back_off(id: &str) {
+    let mut g = UNTOUCHED.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new)
+        .insert(id.to_string(), Instant::now());
+}
+
+/// Whether session `id` is in its back-off after a Ctrl+S that didn't take.
+pub(crate) fn backing_off(id: &str) -> bool {
+    let g = UNTOUCHED.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(id))
+        .is_some_and(|t| t.elapsed() < UNTOUCHED_BACKOFF)
+}
+
 /// Claude Code's keybindings file (read only).
 fn keybindings_path() -> PathBuf {
     if cfg!(test) {
@@ -138,9 +159,9 @@ fn stash_key_ok_at(path: &Path) -> bool {
 
 /// Whether Ctrl+S stashes, and only it, given the keybindings file's
 /// text (None: no file, the defaults). No when the JSON doesn't parse,
-/// when `ctrl+s` is bound in `Chat` or `Global` to anything but
-/// `chat:stash` (null unbinds it), or when `chat:stash` is bound to any
-/// other key (the user moved it: leave it alone).
+/// when `ctrl+s` (or a chord starting with it) is bound in `Chat` or
+/// `Global` to anything but `chat:stash` (null unbinds it), or when
+/// `chat:stash` is bound to any other key (the user moved it).
 pub(crate) fn stash_bound(file: Option<&str>) -> bool {
     let Some(text) = file else {
         return true;
@@ -179,46 +200,28 @@ fn starts_with_ctrl_s(key: &str) -> bool {
     key.split_whitespace().next().is_some_and(is_ctrl_s)
 }
 
-/// A `─` rule line (the input box's top and bottom).
-fn is_rule(line: &str) -> bool {
-    line.trim_start().starts_with("───")
-}
-
-/// Claude's input box on a plain screen: (top rule, bottom rule) line
-/// indexes around the last `❯` line. None: not recognised.
-fn input_box(lines: &[&str]) -> Option<(usize, usize)> {
-    let input = lines
-        .iter()
-        .rposition(|l| l.trim_start().starts_with('❯'))?;
-    let top = lines[..input].iter().rposition(|l| is_rule(l))?;
-    let bottom = input + lines[input..].iter().position(|l| is_rule(l))?;
-    Some((top, bottom))
-}
-
 /// Every line inside Claude's input box (plain), for a draft's age.
 pub(crate) fn input_region(screen: &str) -> Option<String> {
+    let b = input_box(screen)?;
     let lines: Vec<&str> = screen.lines().collect();
-    let (top, bottom) = input_box(&lines)?;
-    Some(lines[top + 1..bottom].join("\n"))
+    Some(b.lines(&lines).join("\n"))
 }
 
 /// Whether Claude's screen (plain) shows a stashed draft, read only on
 /// its status lines: below the input box's bottom rule, and the line
 /// right above its top rule when that line starts with the notice (seen
 /// live: "draft stashed · ✔ Update installed"). Of "draft stashed" and
-/// "draft restored", the last one wins ("draft restored · draft
-/// stashed", seen live after a restore that didn't take, is still
-/// stashed). None: the box isn't recognised.
+/// "draft restored", the last one wins. None: the box isn't recognised.
 pub(crate) fn stash_shown(screen: &str) -> Option<bool> {
+    let b = input_box(screen)?;
     let lines: Vec<&str> = screen.lines().collect();
-    let (top, bottom) = input_box(&lines)?;
     let mut status: Vec<String> = Vec::new();
-    if let Some(above) = top.checked_sub(1).map(|i| lines[i].trim().to_lowercase()) {
+    if let Some(above) = b.top.checked_sub(1).map(|i| lines[i].trim().to_lowercase()) {
         if above.starts_with("draft stashed") || above.starts_with("draft restored") {
             status.push(above);
         }
     }
-    status.extend(lines[bottom + 1..].iter().map(|l| l.to_lowercase()));
+    status.extend(lines[b.bottom + 1..].iter().map(|l| l.to_lowercase()));
     let tail = status.join("\n");
     Some(
         match (tail.rfind("draft stashed"), tail.rfind("draft restored")) {
@@ -237,36 +240,17 @@ pub(crate) enum Plan {
     Hold(String),
 }
 
-/// What rlord knows of its own earlier stash in a session.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum Earlier {
-    None,
-    /// Stashed, restore not done yet.
-    Pending,
-    /// Its restore gave up (`⎘`): the draft may still be in the stash.
-    Failed,
-}
-
 /// Whether to stash a draft (`age`: how long the box has sat unchanged)
-/// on this screen (plain). `earlier`: rlord's own earlier stash there.
-/// `backoff`: a Ctrl+S that didn't take was pressed there lately.
-/// `key_ok`: Ctrl+S is the stash key and only it (read last, only when
-/// everything else says yes).
+/// on this screen (plain). `backoff`: a Ctrl+S that didn't take was
+/// pressed there lately. `key_ok`: Ctrl+S is the stash key and only it
+/// (read last, only when everything else says yes). (A live record of
+/// rlord's holds every message before this is asked: `held_by_record`.)
 pub(crate) fn plan(
     screen: &str,
-    earlier: Earlier,
     backoff: bool,
     age: Duration,
     key_ok: impl FnOnce() -> bool,
 ) -> Plan {
-    if earlier == Earlier::Failed {
-        return Plan::Hold(
-            "its input holds unsent text (a draft), and a draft rlord stashed earlier couldn't \
-             be put back (⎘ on its row): the user restores it with Ctrl+S in the session, or \
-             dismisses it with `rlord stash-dismiss <session>`"
-                .into(),
-        );
-    }
     if backoff {
         return Plan::Hold(format!(
             "its input holds unsent text (a draft), and Claude Code's prompt stash (Ctrl+S) \
@@ -274,34 +258,25 @@ pub(crate) fn plan(
             UNTOUCHED_BACKOFF.as_secs() / 60
         ));
     }
-    match stash_shown(screen) {
-        None => {
-            return Plan::Hold(
-                "its input holds unsent text (a draft), and rlord can't read where Claude Code \
-                 shows its prompt stash, so it doesn't stash"
-                    .into(),
-            )
-        }
-        Some(true) => {
-            return Plan::Hold(
-                "its input holds unsent text (a draft), and Claude Code's prompt stash already \
-                 holds another one (stashing again would lose it)"
-                    .into(),
-            )
-        }
-        Some(false) if earlier == Earlier::Pending => {
-            return Plan::Hold(
-                "its input holds unsent text (a draft), and a draft rlord stashed earlier isn't \
-                 back yet (stashing again could lose it)"
-                    .into(),
-            )
-        }
-        Some(false) => {}
+    if input_box(screen).is_none() || !Agent::Claude.at_prompt(screen) {
+        return Plan::Hold(
+            "its input holds unsent text (a draft), and rlord can't read Claude Code's input box \
+             there, so it doesn't stash"
+                .into(),
+        );
+    }
+    if stash_shown(screen) != Some(false) {
+        return Plan::Hold(
+            "its input holds unsent text (a draft), and Claude Code's prompt stash already holds \
+             another one (stashing again would lose it)"
+                .into(),
+        );
     }
     if age < DRAFT_IDLE {
         return Plan::Hold(format!(
-            "its input holds unsent text (a draft) the user may still be writing; once it has \
-             sat unchanged for {}s rlord stashes it (Ctrl+S), delivers, and restores it",
+            "its input holds unsent text (a draft) the user may still be writing; rlord stashes \
+             a draft only once it has sat unchanged for {}s (with when_idle the message waits \
+             for that)",
             DRAFT_IDLE.as_secs()
         ));
     }
@@ -315,40 +290,32 @@ pub(crate) fn plan(
     Plan::Stash
 }
 
-/// After an Ctrl+S that didn't take, how long before rlord tries the
-/// stash in that session again.
-pub const UNTOUCHED_BACKOFF: Duration = Duration::from_secs(600);
-
-/// Sessions where the stash's Ctrl+S didn't take, and when.
-static UNTOUCHED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
-
-/// The stash's Ctrl+S didn't take in session `id`: not again for a while.
-pub(crate) fn back_off(id: &str) {
-    let mut g = UNTOUCHED.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashMap::new)
-        .insert(id.to_string(), Instant::now());
-}
-
-/// Whether session `id` is in its back-off after a Ctrl+S that didn't take.
-pub(crate) fn backing_off(id: &str) -> bool {
-    let g = UNTOUCHED.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref()
-        .and_then(|m| m.get(id))
-        .is_some_and(|t| t.elapsed() < UNTOUCHED_BACKOFF)
-}
-
 /// What the screen after the stash's Ctrl+S proved.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum AfterStash {
-    /// The box went from text to empty: stashed, whatever the indicator
-    /// shows. Record it, then type the message.
+    /// A recognised, empty box at the prompt: stashed. Record it, then
+    /// type the message.
     Stashed,
     /// The text is still in the box: nothing was stashed. Back off.
     Untouched,
-    /// No capture could be read: record it (the restore only presses on
-    /// an empty box, and clears the record when it sees the draft), and
-    /// don't type.
+    /// A dialog, an unrecognised or unreadable screen: it may have been
+    /// stashed. Record it; type nothing.
     Unclear,
+}
+
+/// One look after the press: Some(definite) or None (keep looking).
+fn look_after_stash(screen: Option<&str>) -> (Option<AfterStash>, AfterStash) {
+    let Some(ansi) = screen else {
+        return (None, AfterStash::Unclear);
+    };
+    let plain = strip_ansi(ansi);
+    if input_box(&plain).is_none() || !Agent::Claude.at_prompt(&plain) {
+        return (None, AfterStash::Unclear);
+    }
+    match crate::remote::input_text(ansi) {
+        None => (Some(AfterStash::Stashed), AfterStash::Stashed),
+        Some(_) => (None, AfterStash::Untouched),
+    }
 }
 
 /// Captures after the press, `REDRAW` apart.
@@ -356,134 +323,131 @@ pub(crate) const POLLS: usize = 5;
 
 /// Read the screen after the stash's Ctrl+S, up to `POLLS` captures
 /// (`capture`: the next screen with attributes, None when unreadable),
-/// until it is definite: an empty box at any capture is stashed; text in
-/// the last readable capture is untouched.
+/// until it is definite. Otherwise the last look decides.
 pub(crate) fn poll_stash(mut capture: impl FnMut() -> Option<String>) -> AfterStash {
     let mut last = AfterStash::Unclear;
     for _ in 0..POLLS {
-        match capture() {
-            Some(s) if crate::remote::input_text(&s).is_none() => return AfterStash::Stashed,
-            Some(_) => last = AfterStash::Untouched,
-            None => {}
+        let (done, now) = look_after_stash(capture().as_deref());
+        if let Some(d) = done {
+            return d;
         }
+        last = now;
     }
     last
 }
 
-/// Whether the input (its first line, as `remote::input_text` reads it)
-/// is the stashed draft back: the whole first line, trimmed.
-fn same_draft(input: &str, first_line: &str) -> bool {
-    let a = input.trim();
-    !a.is_empty() && a == first_line.trim()
+/// Whitespace collapsed, trimmed.
+fn norm(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The next step of a restore.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Restore {
-    /// Press Ctrl+S now.
-    Press,
-    /// Not now (text in the box, a dialog up, the turn not over, the
-    /// screen not recognised).
-    Wait,
-    /// The draft is back (someone restored it).
-    Back,
-    /// Nothing shows stashed and our draft isn't in the box: Claude Code
-    /// restored it by itself (seen live) and the user moved on, or the
-    /// user dealt with it. Drop the record quietly; never press.
-    Gone,
-}
-
-/// What to do for a stashed draft whose first line is `first_line`, on
-/// a screen whose input holds `input` (`remote::input_text`), shows the
-/// stash or not (None: unrecognised), is at its prompt or not, with the
-/// turn over a while (`settled`) or not. Pressed only with the box empty
-/// and the latest status "draft stashed": Claude Code may restore the
-/// draft by itself after the turn (seen live), and a press then would
-/// stash it again.
-pub(crate) fn restore_step(
-    input: Option<&str>,
-    shown: Option<bool>,
-    at_prompt: bool,
-    settled: bool,
-    first_line: &str,
-) -> Restore {
-    match (input, shown) {
-        (Some(t), Some(false)) if same_draft(t, first_line) => Restore::Back,
-        _ if !(at_prompt && settled) => Restore::Wait,
-        (_, Some(false)) => Restore::Gone,
-        (None, Some(true)) => Restore::Press,
-        // Text in the box (a press would stash over it), or the screen
-        // not recognised.
-        _ => Restore::Wait,
+/// Whether the stashed draft (its first visual row, `first_line`) shows
+/// back in the box: the first row equal, or the whole box's text (its
+/// rows joined, as the line may now wrap differently) starting with it.
+pub(crate) fn draft_back(screen_ansi: &str, first_line: &str) -> bool {
+    let want = norm(first_line);
+    if want.is_empty() {
+        return false;
     }
-}
-
-/// What a restore's press did.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Pressed {
-    /// The draft is back.
-    Back,
-    /// Still stashed: try again later.
-    Retry,
-    /// Nothing stashed any more and not our draft back: the stash was
-    /// gone already (or held something else). Drop the record quietly.
-    Unknown,
-}
-
-/// After a restore's press: the input then (`remote::input_text`) and
-/// whether the stash still shows.
-pub(crate) fn after_press(input: Option<&str>, shown: Option<bool>, first_line: &str) -> Pressed {
-    match input {
-        Some(t) if same_draft(t, first_line) => Pressed::Back,
-        Some(_) => Pressed::Unknown,
-        None if shown != Some(false) => Pressed::Retry,
-        None => Pressed::Unknown,
+    if crate::remote::input_text(screen_ansi).is_some_and(|r| norm(&r) == want) {
+        return true;
     }
+    let plain = strip_ansi(screen_ansi);
+    let Some(region) = input_region(&plain) else {
+        return false;
+    };
+    let text = norm(region.trim_start().trim_start_matches('❯'));
+    // Only a whole row's worth: it must end at a word boundary.
+    text == want || text.starts_with(&format!("{want} "))
 }
 
-/// Backoff before the next press after `tries` that didn't take.
-fn backoff_ms(tries: u64) -> i64 {
-    (2_000i64 << tries.min(5)).min(60_000)
+/// What a live record's session says now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    Keep,
+    /// The user dealt with the box: cleared.
+    Cleared(&'static str),
+    /// Show `⎘`: a minute after the turn ended and nothing cleared it.
+    Stale,
+    /// The session can't restore it any more: logged, forgotten.
+    Lost,
 }
 
-/// A draft (first line `draft`) was most likely stashed in session `id`:
-/// remember it for the restore, and log it.
-pub(crate) fn stashed(d: &Daemon, id: &str, draft: &str) -> Result<()> {
+/// A record (`entry`) against its session (`s`, None: gone) and whether
+/// the draft is seen back (`back`), at `now`.
+pub(crate) fn check(entry: &Value, s: Option<&Session>, back: bool, now: i64) -> Check {
+    let Some(s) = s.filter(|s| {
+        s.archived_at.is_none() && !matches!(s.status, Status::Stopped | Status::Error)
+    }) else {
+        return Check::Lost;
+    };
+    if back {
+        return Check::Cleared("seen");
+    }
+    let sent = entry["sent_at"]
+        .as_i64()
+        .or(entry["at"].as_i64())
+        .unwrap_or(0);
+    if s.last_user_msg_at.is_some_and(|t| t > sent) {
+        return Check::Cleared("user_prompt");
+    }
+    let ended = s.status == Status::Idle
+        && s.last_state_change_at
+            .is_some_and(|t| t > sent && now - t >= STALE_AFTER_MS);
+    if ended && entry["stale"] != true {
+        return Check::Stale;
+    }
+    Check::Keep
+}
+
+/// The stash's Ctrl+S emptied (or may have emptied) session `id`'s box:
+/// record its first row before anything is typed.
+pub(crate) fn stashed(d: &Daemon, id: &str, first_line: &str) -> Result<()> {
     let db = d.db();
     let now = now_ms();
     let mut m = db.kv_map(STASH_KEY)?;
-    m.insert(
-        id.to_string(),
-        json!({"first_line": draft, "at": now, "tries": 0, "next_at": now}),
-    );
+    m.insert(id.to_string(), json!({"first_line": first_line, "at": now}));
     db.kv_set_map(STASH_KEY, &m)?;
     db.insert_event(
         id,
         now,
         "draft_stashed",
-        &json!({"chars": draft.chars().count()}).to_string(),
+        &json!({"chars": first_line.chars().count()}).to_string(),
     )?;
     forget_draft(id);
     Ok(())
 }
 
-/// rlord's own earlier stash in session `id`. A failed one still blocks:
-/// rlord can't see what the stash holds, only its record. (A DB error
-/// reads as pending: it blocks too.)
-pub(crate) fn earlier(d: &Daemon, id: &str) -> Earlier {
-    match d.db().kv_map(STASH_KEY) {
-        Ok(m) => match m.get(id) {
-            None => Earlier::None,
-            Some(e) if e["failed"] == true => Earlier::Failed,
-            Some(_) => Earlier::Pending,
-        },
-        Err(_) => Earlier::Pending,
+/// rlord's message went in after the stash: the time the user's own
+/// next prompt is compared with.
+pub(crate) fn sent(d: &Daemon, id: &str) -> Result<()> {
+    let db = d.db();
+    let mut m = db.kv_map(STASH_KEY)?;
+    if let Some(e) = m.get_mut(id).and_then(Value::as_object_mut) {
+        e.insert("sent_at".into(), json!(now_ms()));
+        db.kv_set_map(STASH_KEY, &m)?;
     }
+    Ok(())
 }
 
-/// `session.stash_dismiss {ref}`: the user says the draft rlord couldn't
-/// put back is dealt with (`⎘`): its record goes, and stashing in that
-/// session may resume.
+/// Why a message to session `id` holds: a record of rlord's stash is
+/// live there (whatever the box shows: a paste must not race Claude's
+/// own restore). (A DB error holds too.)
+pub(crate) fn held_by_record(d: &Daemon, id: &str) -> Option<String> {
+    let live = d
+        .db()
+        .kv_map(STASH_KEY)
+        .map_or(true, |m| m.contains_key(id));
+    live.then(|| {
+        "a draft of the user's that rlord stashed there isn't seen back yet (Claude Code \
+         restores it after the turn; once it shows in the box, the user sends a prompt, or \
+         `rlord stash-dismiss <session>`, messages go again)"
+            .to_string()
+    })
+}
+
+/// `session.stash_dismiss {ref}`: the user says the stashed draft is
+/// dealt with: its record goes, and messages to the session go again.
 pub fn dismiss(d: &Daemon, params: &Value) -> Result<Value> {
     let r = params
         .get("ref")
@@ -504,120 +468,69 @@ pub fn dismiss(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"session": s.name, "dismissed": had}))
 }
 
-/// Annotate list rows with `draft_stash`: "pending" (rlord restores it
-/// after the turn) or "failed" (the user restores it: Ctrl+S), else null.
+/// Annotate list rows with `draft_stash`: "pending" (a record is live:
+/// messages hold) or "stale" (`⎘`: it may still be stashed), else null.
 pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     let m = d.db().kv_map(STASH_KEY).unwrap_or_default();
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
         row["draft_stash"] = match m.get(id) {
-            Some(e) if e["failed"] == true => json!("failed"),
+            Some(e) if e["stale"] == true => json!("stale"),
             Some(_) => json!("pending"),
             None => Value::Null,
         };
     }
 }
 
-/// Restore the drafts rlord stashed, where it can now.
+/// Look at each live record: clear, mark or forget it.
 pub(crate) fn tick(d: &Daemon) -> Result<()> {
-    let ids: Vec<String> = d.db().kv_map(STASH_KEY)?.keys().cloned().collect();
-    for id in ids {
-        if let Err(e) = restore(d, &id) {
-            tracing::debug!(session = %id, error = %e, "restoring a stashed draft");
+    let m = d.db().kv_map(STASH_KEY)?;
+    for (id, entry) in m {
+        if let Err(e) = look(d, &id, &entry) {
+            tracing::debug!(session = %id, error = %e, "checking a stashed draft");
         }
     }
     Ok(())
 }
 
-/// One look at session `id`'s stashed draft, under its lock.
-fn restore(d: &Daemon, id: &str) -> Result<()> {
-    let _session = d.sessions.lock(id);
+fn look(d: &Daemon, id: &str, entry: &Value) -> Result<()> {
+    let s = d.db().resolve_ref(id).ok();
+    let first_line = entry["first_line"].as_str().unwrap_or_default();
+    let back = s
+        .as_ref()
+        .and_then(|s| crate::send::agent_pane(s).ok())
+        .and_then(|p| tmux::capture_pane_id_ansi(&p).ok())
+        .is_some_and(|screen| draft_back(&screen, first_line));
     let now = now_ms();
-    let (s, entry) = {
-        let db = d.db();
-        let Some(entry) = db.kv_map(STASH_KEY)?.get(id).cloned() else {
-            return Ok(());
-        };
-        (db.resolve_ref(id).ok(), entry)
-    };
-    let gone = s.as_ref().is_none_or(|s| {
-        s.archived_at.is_some() || matches!(s.status, Status::Stopped | Status::Error)
-    });
-    if gone {
-        return forget(d, id);
-    }
-    let failed = entry["failed"] == true;
-    let first_line = entry["first_line"].as_str().unwrap_or_default().to_string();
-    let s = s.expect("checked above");
-    let pane = crate::send::agent_pane(&s)?;
-    let look = || -> Result<(Option<String>, Option<bool>, bool)> {
-        let ansi = tmux::capture_pane_id_ansi(&pane)?;
-        let plain = strip_ansi(&ansi);
-        Ok((
-            crate::remote::input_text(&ansi),
-            stash_shown(&plain),
-            Agent::Claude.at_prompt(&plain),
-        ))
-    };
-    let (input, shown, at_prompt) = look()?;
-    if failed {
-        // It blocks new stashes until the draft shows back (or the user
-        // dismisses it, `dismiss`).
-        if input.as_deref().is_some_and(|i| same_draft(i, &first_line)) {
-            return restored(d, id, "other");
+    match check(entry, s.as_ref(), back, now) {
+        Check::Keep => Ok(()),
+        Check::Cleared(by) => {
+            d.db()
+                .insert_event(id, now, "draft_restored", &json!({"by": by}).to_string())?;
+            forget(d, id)
         }
-        return Ok(());
-    }
-    let t = s.tmux_session.as_deref().unwrap_or_default();
-    let settled = s.status == Status::Idle
-        && s.last_state_change_at
-            .is_none_or(|t| now - t >= RESTORE_IDLE_MS)
-        && crate::send::settled_since_typed(id)
-        && !crate::send::user_typing(t);
-    let late = now - entry["at"].as_i64().unwrap_or(now) > RESTORE_FOR_MS;
-    match restore_step(input.as_deref(), shown, at_prompt, settled, &first_line) {
-        Restore::Back => restored(d, id, "other"),
-        Restore::Gone => unknown(d, id),
-        Restore::Wait if late => give_up(d, id, "no moment to restore it came in time"),
-        Restore::Wait => Ok(()),
-        Restore::Press => {
-            if now < entry["next_at"].as_i64().unwrap_or(0) {
-                return Ok(());
+        Check::Stale => {
+            let db = d.db();
+            let mut m = db.kv_map(STASH_KEY)?;
+            if let Some(e) = m.get_mut(id).and_then(Value::as_object_mut) {
+                e.insert("stale".into(), json!(true));
+                db.kv_set_map(STASH_KEY, &m)?;
             }
-            let after = {
-                let _typing = crate::send::typing();
-                // A fresh look right before the key: Claude may have
-                // restored it by itself meanwhile.
-                let (input, shown, at_prompt) = look()?;
-                if restore_step(input.as_deref(), shown, at_prompt, settled, &first_line)
-                    != Restore::Press
-                {
-                    return Ok(());
-                }
-                let _ = tmux::cancel_mode(&pane);
-                tmux::send_keys(&pane, &["C-s"])?;
-                std::thread::sleep(REDRAW);
-                tmux::capture_pane_id_ansi(&pane)?
-            };
-            let input = crate::remote::input_text(&after);
-            let shown = stash_shown(&strip_ansi(&after));
-            match after_press(input.as_deref(), shown, &first_line) {
-                Pressed::Back => restored(d, id, "rlord"),
-                Pressed::Unknown => unknown(d, id),
-                Pressed::Retry => {
-                    let tries = entry["tries"].as_u64().unwrap_or(0) + 1;
-                    if tries >= RESTORE_TRIES || late {
-                        return give_up(d, id, "Ctrl+S didn't bring it back");
-                    }
-                    let db = d.db();
-                    let mut m = db.kv_map(STASH_KEY)?;
-                    if let Some(e) = m.get_mut(id).and_then(Value::as_object_mut) {
-                        e.insert("tries".into(), json!(tries));
-                        e.insert("next_at".into(), json!(now + backoff_ms(tries)));
-                    }
-                    db.kv_set_map(STASH_KEY, &m)
-                }
+            drop(db);
+            d.changed();
+            Ok(())
+        }
+        Check::Lost => {
+            if s.is_some() {
+                d.db().insert_event(
+                    id,
+                    now,
+                    "draft_lost_with_session",
+                    &json!({"first_line": first_line}).to_string(),
+                )?;
             }
+            tracing::warn!(session = %id, "a stashed draft's session went away");
+            forget(d, id)
         }
     }
 }
@@ -630,49 +543,6 @@ fn forget(d: &Daemon, id: &str) -> Result<()> {
         drop(db);
         d.changed();
     }
-    Ok(())
-}
-
-fn restored(d: &Daemon, id: &str, by: &str) -> Result<()> {
-    d.db().insert_event(
-        id,
-        now_ms(),
-        "draft_restored",
-        &json!({"by": by}).to_string(),
-    )?;
-    forget(d, id)
-}
-
-/// The press brought nothing back and nothing shows stashed: dropped
-/// quietly (no mark).
-fn unknown(d: &Daemon, id: &str) -> Result<()> {
-    d.db().insert_event(
-        id,
-        now_ms(),
-        "draft_restore_unknown",
-        &json!({"reason": "Ctrl+S brought nothing back and nothing shows stashed"}).to_string(),
-    )?;
-    forget(d, id)
-}
-
-fn give_up(d: &Daemon, id: &str, why: &str) -> Result<()> {
-    let db = d.db();
-    let now = now_ms();
-    let mut m = db.kv_map(STASH_KEY)?;
-    if let Some(e) = m.get_mut(id).and_then(Value::as_object_mut) {
-        e.insert("failed".into(), json!(true));
-        e.insert("failed_at".into(), json!(now));
-    }
-    db.kv_set_map(STASH_KEY, &m)?;
-    db.insert_event(
-        id,
-        now,
-        "draft_restore_failed",
-        &json!({"reason": why}).to_string(),
-    )?;
-    drop(db);
-    tracing::info!(session = %id, why, "a stashed draft wasn't restored");
-    d.changed();
     Ok(())
 }
 
@@ -710,6 +580,9 @@ mod tests {
         screen_with("● Done.", input, status)
     }
 
+    /// A permission dialog in place of the box.
+    const DIALOG: &str = "● Bash(ls)\n Do you want to proceed?\n ❯ 1. Yes\n   2. No";
+
     #[test]
     fn the_stash_indicator_is_read_on_the_status_lines_only() {
         assert_eq!(
@@ -717,7 +590,6 @@ mod tests {
             Some(false)
         );
         assert_eq!(stash_shown(&screen("", "draft stashed")), Some(true));
-        // Seen live after a restore that didn't take.
         assert_eq!(
             stash_shown(&screen("", "draft restored · draft stashed")),
             Some(true)
@@ -726,7 +598,6 @@ mod tests {
             stash_shown(&screen("half", "draft stashed · draft restored")),
             Some(false)
         );
-        // Seen live: the notice right above the top rule.
         assert_eq!(
             stash_shown(&screen_with(
                 "draft stashed · ✔ Update installed",
@@ -735,7 +606,6 @@ mod tests {
             )),
             Some(true)
         );
-        // A reply ending with the words, right above the box, isn't it.
         assert_eq!(
             stash_shown(&screen_with(
                 "● The status line then reads draft stashed",
@@ -744,19 +614,28 @@ mod tests {
             )),
             Some(false)
         );
-        // No box recognised: unknown, not "nothing stashed".
         assert_eq!(stash_shown("no prompt at all\ndraft stashed"), None);
         assert_eq!(stash_shown("❯ text without rules\ndraft stashed"), None);
     }
 
+    /// The shared reader agrees with `dialog_shown`: a dialog has no box.
     #[test]
-    fn the_whole_box_is_the_draft() {
+    fn one_input_box_reader() {
+        assert!(input_box(&screen("half", "Opus")).is_some());
+        assert!(input_box(DIALOG).is_none());
+        // A dialog between rules is still no box (no rule right above its `❯`).
+        let ruled = format!(
+            "{0}\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n{0}",
+            "─".repeat(40)
+        );
+        assert!(rlord_core::agents::claude::dialog_shown(&ruled));
+        assert!(input_box(&ruled).is_none());
+        assert_eq!(input_region(DIALOG), None);
         let two = screen("first line\nsecond line", "Opus");
         assert_eq!(
             input_region(&two).as_deref(),
             Some("❯ first line\n  second line")
         );
-        assert_eq!(input_region("no box"), None);
     }
 
     #[test]
@@ -773,84 +652,71 @@ mod tests {
         assert!(stash_bound(Some(&chat("ctrl+s", "\"chat:stash\""))));
         assert!(!stash_bound(Some(&chat("ctrl+s", "null"))));
         assert!(!stash_bound(Some(&chat("Ctrl+S", "\"chat:submit\""))));
-        // The stash on another key: the user moved it, left alone.
         assert!(!stash_bound(Some(&chat("ctrl+k", "\"chat:stash\""))));
+        assert!(!stash_bound(Some(&chat(
+            "ctrl+s ctrl+x",
+            "\"chat:submit\""
+        ))));
+        assert!(stash_bound(Some(&chat("ctrl+s ctrl+x", "null"))));
+        assert!(stash_bound(Some(&chat(
+            "ctrl+x ctrl+s",
+            "\"chat:sendNow\""
+        ))));
         let global =
             r#"{"bindings": [{"context": "Global", "bindings": {"ctrl+s": "app:redraw"}}]}"#;
         assert!(!stash_bound(Some(global)));
         let other = r#"{"bindings": [{"context": "Agents", "bindings": {"ctrl+s": null}}]}"#;
         assert!(stash_bound(Some(other)));
         assert!(!stash_bound(Some("{not json")));
-        assert!(
-            !stash_key_ok_at(Path::new("/")),
-            "a directory can't be read"
-        );
+        assert!(!stash_key_ok_at(Path::new("/")));
         assert!(stash_key_ok_at(Path::new(
             "/nonexistent/rlord/keybindings.json"
         )));
     }
 
-    #[test]
-    fn chords_on_ctrl_s_mean_no_stash() {
-        let chat = |k: &str, v: &str| {
-            format!(r#"{{"bindings": [{{"context": "Chat", "bindings": {{"{k}": {v}}}}}]}}"#)
-        };
-        assert!(!stash_bound(Some(&chat(
-            "ctrl+s ctrl+x",
-            "\"chat:submit\""
-        ))));
-        // Unbinding such a chord is fine.
-        assert!(stash_bound(Some(&chat("ctrl+s ctrl+x", "null"))));
-        assert!(stash_bound(Some(&chat(
-            "ctrl+x ctrl+s",
-            "\"chat:sendNow\""
-        ))));
-    }
-
+    /// Rule A.
     #[test]
     fn a_draft_is_stashed_only_when_safe() {
         let idle = screen("half a thought", "Opus 5.5");
         let old = DRAFT_IDLE + Duration::from_secs(1);
         let yes = || true;
-        let e = Earlier::None;
-        assert_eq!(plan(&idle, e, false, old, yes), Plan::Stash);
+        assert_eq!(plan(&idle, false, old, yes), Plan::Stash);
+        assert!(matches!(plan(&idle, false, old, || false), Plan::Hold(_)));
+        assert!(matches!(plan(&idle, true, old, yes), Plan::Hold(_)));
         assert!(matches!(
-            plan(&idle, e, false, old, || false),
+            plan(&screen("half", "draft stashed"), false, old, yes),
             Plan::Hold(_)
         ));
         assert!(matches!(
-            plan(&idle, Earlier::Pending, false, old, yes),
+            plan("❯ half, no box", false, old, yes),
             Plan::Hold(_)
         ));
-        // A failed restore blocks: rlord can't see what the stash holds.
-        let Plan::Hold(why) = plan(&idle, Earlier::Failed, false, old, yes) else {
-            panic!("a failed restore must block");
+        let Plan::Hold(why) = plan(DIALOG, false, old, yes) else {
+            panic!("a dialog must hold");
         };
-        assert!(why.contains("stash-dismiss"), "{why}");
-        // After a Ctrl+S that didn't take: backs off.
-        assert!(matches!(plan(&idle, e, true, old, yes), Plan::Hold(_)));
-        assert!(matches!(
-            plan(&screen("half", "draft stashed"), e, false, old, yes),
-            Plan::Hold(_)
-        ));
-        assert!(matches!(
-            plan("❯ half, no box", e, false, old, yes),
-            Plan::Hold(_)
-        ));
-        let Plan::Hold(why) = plan(&idle, e, false, Duration::from_secs(3), yes) else {
-            panic!("a fresh draft must hold");
-        };
-        assert!(why.contains("still be writing"));
+        assert!(why.contains("can't read"), "{why}");
         // The keybindings file is read only once everything else says yes.
         let read = std::cell::Cell::new(false);
-        let key = || {
+        let _ = plan(&idle, false, Duration::from_secs(3), || {
             read.set(true);
             true
-        };
-        let _ = plan(&idle, e, false, Duration::from_secs(3), key);
+        });
         assert!(!read.get(), "read before the age check");
     }
 
+    /// Rule G: a young draft's refusal points at when_idle, claims no
+    /// delivery.
+    #[test]
+    fn a_young_draft_says_when_idle() {
+        let idle = screen("half a thought", "Opus 5.5");
+        let Plan::Hold(why) = plan(&idle, false, Duration::from_secs(3), || true) else {
+            panic!("a fresh draft must hold");
+        };
+        assert!(why.contains("when_idle"), "{why}");
+        assert!(!why.contains("delivers"), "{why}");
+    }
+
+    /// Rule B.
     #[test]
     fn after_the_stash_press_the_screen_decides() {
         let polls = |v: Vec<Option<String>>| {
@@ -858,19 +724,22 @@ mod tests {
             poll_stash(|| it.next().flatten())
         };
         let draft = || Some(screen("half a thought", "Opus"));
-        // Empty at any look, indicator or not: stashed.
         assert_eq!(
             polls(vec![draft(), Some(screen("", "Opus"))]),
             AfterStash::Stashed
         );
-        assert_eq!(
-            polls(vec![Some(screen("", "draft stashed"))]),
-            AfterStash::Stashed
-        );
-        // Still there after every look: untouched.
         assert_eq!(polls(vec![draft(); POLLS]), AfterStash::Untouched);
-        // Still there, then unreadable: untouched (last readable).
-        assert_eq!(polls(vec![draft(), None]), AfterStash::Untouched);
+        // A dialog came up: may have happened, not typed.
+        assert_eq!(
+            polls(vec![Some(DIALOG.to_string()); POLLS]),
+            AfterStash::Unclear
+        );
+        // Unrecognised (no box) though "empty": not counted as stashed.
+        assert_eq!(
+            polls(vec![Some("❯ \nno rules".to_string()); POLLS]),
+            AfterStash::Unclear
+        );
+        assert_eq!(polls(vec![draft(), None]), AfterStash::Unclear);
         assert_eq!(polls(vec![]), AfterStash::Unclear);
     }
 
@@ -882,22 +751,10 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_first_line_must_match() {
-        assert!(same_draft("fix the login bug", " fix the login bug "));
-        assert!(!same_draft("fix the login", "fix the login bug"));
-        assert!(!same_draft(
-            "fix the login bug, and more",
-            "fix the login bug"
-        ));
-        assert!(!same_draft("", ""));
-    }
-
-    #[test]
     fn a_draft_ages_only_while_unchanged() {
         assert_eq!(draft_age("t-age", "one"), Duration::ZERO);
         std::thread::sleep(Duration::from_millis(5));
         assert!(draft_age("t-age", "one") > Duration::ZERO);
-        // A change on a later line of the box counts too.
         assert_eq!(draft_age("t-age", "one\ntwo"), Duration::ZERO);
         forget_draft("t-age");
         assert_eq!(draft_age("t-age", "one\ntwo"), Duration::ZERO);
@@ -908,56 +765,80 @@ mod tests {
         assert_eq!(draft_age("t-age", "one\ntwo"), Duration::ZERO);
     }
 
+    /// Rule E, first clause: the first row back, or the text rewrapped.
     #[test]
-    fn restore_presses_only_on_a_stash_it_sees() {
-        let line = "fix the login bug";
-        let (yes, no) = (Some(true), Some(false));
-        assert_eq!(restore_step(None, yes, true, true, line), Restore::Press);
-        // No indicator, empty box: Claude restored it by itself (seen
-        // live) and the user moved on. Never pressed: dropped.
-        assert_eq!(restore_step(None, no, true, true, line), Restore::Gone);
-        assert_eq!(restore_step(None, None, true, true, line), Restore::Wait);
-        assert_eq!(restore_step(None, yes, true, false, line), Restore::Wait);
-        assert_eq!(restore_step(None, no, true, false, line), Restore::Wait);
-        assert_eq!(restore_step(None, yes, false, true, line), Restore::Wait);
-        // Text in the box with the stash shown: never pressed.
-        assert_eq!(
-            restore_step(Some("new text"), yes, true, true, line),
-            Restore::Wait
-        );
-        // Restored and edited (no stash shows): gone.
-        assert_eq!(
-            restore_step(Some("new text"), no, true, true, line),
-            Restore::Gone
-        );
-        assert_eq!(
-            restore_step(Some(line), no, true, false, line),
-            Restore::Back
-        );
-        // Back but the stash shows still: not sure, so wait.
-        assert_eq!(
-            restore_step(Some(line), yes, true, true, line),
-            Restore::Wait
-        );
+    fn the_draft_is_seen_back() {
+        let line = "fix the  login bug";
+        assert!(draft_back(
+            &screen("fix the login bug", "draft restored"),
+            line
+        ));
+        // Rewrapped: the first row is now shorter, the text the same.
+        assert!(draft_back(
+            &screen("fix the\nlogin bug and more", "x"),
+            line
+        ));
+        assert!(!draft_back(&screen("fix the login", "x"), line));
+        assert!(!draft_back(&screen("fix the login bugs", "x"), line));
+        assert!(!draft_back(&screen("", "draft stashed"), line));
+        assert!(!draft_back(DIALOG, line));
     }
 
-    #[test]
-    fn a_press_that_brings_nothing_back_drops_quietly() {
-        let line = "fix the login bug";
-        assert_eq!(after_press(Some(line), Some(false), line), Pressed::Back);
-        assert_eq!(after_press(None, Some(true), line), Pressed::Retry);
-        assert_eq!(after_press(None, None, line), Pressed::Retry);
-        assert_eq!(after_press(None, Some(false), line), Pressed::Unknown);
-        assert_eq!(
-            after_press(Some("other"), Some(false), line),
-            Pressed::Unknown
-        );
+    fn session(status: Status, changed: i64, user: Option<i64>) -> Session {
+        let db = rlord_core::db::Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "s1",
+            name: "x",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let mut s = db.resolve_ref("s1").unwrap();
+        s.status = status;
+        s.last_state_change_at = Some(changed);
+        s.last_user_msg_at = user;
+        s
     }
 
+    /// Rules E and F.
     #[test]
-    fn backoff_grows_and_caps() {
-        assert_eq!(backoff_ms(0), 2_000);
-        assert_eq!(backoff_ms(1), 4_000);
-        assert_eq!(backoff_ms(9), 60_000);
+    fn a_record_clears_only_on_what_proves_it() {
+        let e = json!({"first_line": "x", "at": 1_000, "sent_at": 2_000});
+        let idle = session(Status::Idle, 3_000, None);
+        assert_eq!(check(&e, Some(&idle), true, 4_000), Check::Cleared("seen"));
+        let typed = session(Status::Working, 3_000, Some(2_500));
+        assert_eq!(
+            check(&e, Some(&typed), false, 4_000),
+            Check::Cleared("user_prompt")
+        );
+        // A prompt before rlord's message doesn't count.
+        let before = session(Status::Idle, 3_000, Some(1_500));
+        assert_eq!(check(&e, Some(&before), false, 4_000), Check::Keep);
+        // A minute after the turn ended: the mark, nothing else.
+        assert_eq!(
+            check(&e, Some(&idle), false, 3_000 + STALE_AFTER_MS),
+            Check::Stale
+        );
+        let stale = json!({"first_line": "x", "at": 1_000, "sent_at": 2_000, "stale": true});
+        assert_eq!(
+            check(&stale, Some(&idle), false, 3_000 + STALE_AFTER_MS),
+            Check::Keep
+        );
+        let working = session(Status::Working, 3_000, None);
+        assert_eq!(check(&e, Some(&working), false, 999_999), Check::Keep);
+        // Rule F.
+        assert_eq!(check(&e, None, false, 4_000), Check::Lost);
+        let stopped = session(Status::Stopped, 3_000, None);
+        assert_eq!(check(&e, Some(&stopped), false, 4_000), Check::Lost);
+        let errored = session(Status::Error, 3_000, None);
+        assert_eq!(check(&e, Some(&errored), true, 4_000), Check::Lost);
     }
 }

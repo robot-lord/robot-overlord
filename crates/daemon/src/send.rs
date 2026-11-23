@@ -164,22 +164,51 @@ pub enum Typed {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Why {
     pub text: String,
-    /// Held by a draft in the session's input (the row shows `✉ draft`).
-    pub draft: bool,
+    pub kind: Kind,
+}
+
+/// What holds a message (the row shows `✉ draft` for both draft kinds).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Kind {
+    Other,
+    /// A draft in the session's input.
+    Draft,
+    /// A draft rlord stashed there isn't seen dealt with yet (stash.rs).
+    Stash,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Other => "other",
+            Kind::Draft => "draft",
+            Kind::Stash => "stash",
+        }
+    }
 }
 
 impl Why {
     fn draft(text: impl Into<String>) -> Self {
         Why {
             text: text.into(),
-            draft: true,
+            kind: Kind::Draft,
+        }
+    }
+
+    fn stash(text: impl Into<String>) -> Self {
+        Why {
+            text: text.into(),
+            kind: Kind::Stash,
         }
     }
 }
 
 impl From<String> for Why {
     fn from(text: String) -> Self {
-        Why { text, draft: false }
+        Why {
+            text,
+            kind: Kind::Other,
+        }
     }
 }
 
@@ -240,16 +269,21 @@ pub fn type_into(
     // A draft holds the message, except in Claude, whose own prompt
     // stash sets it aside (stash.rs) when that is safe.
     let mut stash: Option<String> = None;
+    // A draft rlord stashed there isn't seen dealt with: nothing goes in,
+    // empty box or not (a paste must not race Claude's own restore).
+    if checks.draft && checks.agent == Agent::Claude {
+        if let Some(why) = crate::stash::held_by_record(d, session) {
+            return Ok(Typed::NotNow(Why::stash(why)));
+        }
+    }
     if checks.draft {
         match draft(checks.agent, &ansi) {
             Some(first_line) if checks.agent == Agent::Claude => {
                 // Aged by the whole box, not just its first line.
                 let whole = crate::stash::input_region(&plain).unwrap_or_default();
                 let age = crate::stash::draft_age(session, &whole);
-                let earlier = crate::stash::earlier(d, session);
                 let backoff = crate::stash::backing_off(session);
-                match crate::stash::plan(&plain, earlier, backoff, age, crate::stash::stash_key_ok)
-                {
+                match crate::stash::plan(&plain, backoff, age, crate::stash::stash_key_ok) {
                     crate::stash::Plan::Hold(why) => return Ok(Typed::NotNow(Why::draft(why))),
                     crate::stash::Plan::Stash => stash = Some(first_line),
                 }
@@ -284,16 +318,18 @@ pub fn type_into(
     if let Some(first_line) = &stash {
         // Ctrl+S, then looks until the screen is definite. (`TYPING`
         // only around the keys: recording the stash takes the DB.)
-        let step = {
+        let pressed = {
             let _typing = typing();
             let _ = tmux::cancel_mode(pane);
-            match tmux::send_keys(pane, &["C-s"]) {
-                Ok(()) => crate::stash::poll_stash(|| {
-                    std::thread::sleep(crate::stash::REDRAW);
-                    tmux::capture_pane_id_ansi(pane).ok()
-                }),
-                Err(_) => crate::stash::AfterStash::Unclear,
-            }
+            tmux::send_keys(pane, &["C-s"])
+        };
+        // (Looks without `TYPING`: other sessions' pastes go on.)
+        let step = match pressed {
+            Ok(()) => crate::stash::poll_stash(|| {
+                std::thread::sleep(crate::stash::REDRAW);
+                tmux::capture_pane_id_ansi(pane).ok()
+            }),
+            Err(_) => crate::stash::AfterStash::Unclear,
         };
         use crate::stash::AfterStash;
         if step == AfterStash::Untouched {
@@ -320,8 +356,9 @@ pub fn type_into(
                      it; rlord tries again after {} minutes",
                     crate::stash::UNTOUCHED_BACKOFF.as_secs() / 60
                 ),
-                _ => "its input held a draft, and rlord couldn't read the screen after Ctrl+S: \
-                      not typing until the restore has looked"
+                _ => "its input held a draft, and rlord couldn't tell from the screen after \
+                      Ctrl+S that it was stashed: not typing (messages wait until the draft \
+                      shows back, the user sends a prompt, or `rlord stash-dismiss`)"
                     .to_string(),
             })));
         }
@@ -339,10 +376,16 @@ pub fn type_into(
         return Err(e);
     }
     last.insert(session.to_string(), Instant::now());
+    drop(typed);
+    if stash.is_some() {
+        if let Err(e) = crate::stash::sent(d, session) {
+            tracing::warn!(session, error = %e, "noting a message sent past a stash");
+        }
+    }
     Ok(Typed::Done)
 }
 
-/// `TYPING`, for another key press into a pane (stash.rs's restore).
+/// `TYPING`, held around key presses into a pane.
 pub(crate) fn typing() -> std::sync::MutexGuard<'static, Option<HashMap<String, Instant>>> {
     TYPING.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -353,12 +396,6 @@ pub(crate) fn settled_since_typed(id: &str) -> bool {
         .as_ref()
         .and_then(|m| m.get(id))
         .is_none_or(|t| t.elapsed() >= SETTLE)
-}
-
-/// Someone used a terminal showing tmux session `t` just now (the
-/// overlord's overlay aside is not known here: counted).
-pub(crate) fn user_typing(t: &str) -> bool {
-    user_active(&tmux::list_clients(), t, None, now_ms() / 1000)
 }
 
 /// Why a resume after a usage limit (`Source::Resume`) can't be typed
@@ -734,7 +771,7 @@ pub(crate) fn queue(db: &Db, id: &str, part: &Value) -> Result<usize> {
     entry["at"] = json!(now);
     if let Some(e) = entry.as_object_mut() {
         e.remove("held");
-        e.remove("held_draft");
+        e.remove("held_kind");
         e.remove("held_logged");
     }
     db.kv_set_map(PENDING_KEY, &m)?;
@@ -984,18 +1021,26 @@ pub fn start(d: &Arc<Daemon>) {
         }
     });
 }
-
-/// Annotate list rows with `mail`: `{"held": why or null, "draft": bool}`
-/// for a session with messages waiting for it (`draft`: held by a draft
-/// in its input), else null.
+/// Annotate list rows with `mail`: `{"held": why or null, "draft": bool,
+/// "kind", "first": bool}` for a session with messages waiting for it
+/// (`draft`: held by a draft in its input or rlord's stash of one;
+/// `first`: its first prompt waits), else null.
 pub fn annotate(d: &Daemon, rows: &mut [Value]) {
     let m = d.db().kv_map(PENDING_KEY).unwrap_or_default();
+    let first = d.db().kv_map(FIRST_KEY).unwrap_or_default();
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
-        row["mail"] = match m.get(id).filter(|e| !parts_of(e).is_empty()) {
-            Some(e) => {
+        let entry = m
+            .get(id)
+            .filter(|e| !parts_of(e).is_empty())
+            .map(|e| (e, false))
+            .or_else(|| first.get(id).map(|e| (e, true)));
+        row["mail"] = match entry {
+            Some((e, first)) => {
                 let why = e["held"].as_str();
-                json!({"held": why, "draft": why.is_some() && e["held_draft"] == true})
+                let kind = e["held_kind"].as_str();
+                json!({"held": why, "kind": kind, "first": first,
+                       "draft": why.is_some() && matches!(kind, Some("draft" | "stash"))})
             }
             None => Value::Null,
         };
@@ -1010,7 +1055,7 @@ fn lift_hold(entry: &mut Value, s: Option<&Session>) -> bool {
     match entry.as_object_mut() {
         Some(e) if busy && e.contains_key("held") => {
             e.remove("held");
-            e.remove("held_draft");
+            e.remove("held_kind");
             true
         }
         _ => false,
@@ -1210,7 +1255,7 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
 /// keeps the latest reason in `held`, for the row; a newer message
 /// starts unmarked).
 fn held(d: &Daemon, id: &str, text: &str, why: &Why, key: &str) -> Result<()> {
-    let (why, draft) = (why.text.as_str(), why.draft);
+    let (why, kind) = (why.text.as_str(), why.kind.name());
     let db = d.db();
     let mut m = db.kv_map(key)?;
     let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) else {
@@ -1218,7 +1263,7 @@ fn held(d: &Daemon, id: &str, text: &str, why: &Why, key: &str) -> Result<()> {
     };
     if entry.get("text").and_then(Value::as_str) != Some(text)
         || (entry.get("held").and_then(Value::as_str) == Some(why)
-            && entry.get("held_draft").and_then(Value::as_bool) == Some(draft))
+            && entry.get("held_kind").and_then(Value::as_str) == Some(kind))
     {
         return Ok(());
     }
@@ -1226,7 +1271,7 @@ fn held(d: &Daemon, id: &str, text: &str, why: &Why, key: &str) -> Result<()> {
     // per message (`held_logged` outlives a lifted hold).
     let first = entry.get("held_logged") != Some(&json!(true));
     entry.insert("held".into(), json!(why));
-    entry.insert("held_draft".into(), json!(draft));
+    entry.insert("held_kind".into(), json!(kind));
     entry.insert("held_logged".into(), json!(true));
     if !first {
         db.kv_set_map(key, &m)?;
@@ -1512,12 +1557,18 @@ mod tests {
             annotate(&d, &mut rows);
             rows[0]["mail"].clone()
         };
-        assert_eq!(row(), json!({"held": null, "draft": false}));
+        assert_eq!(
+            row(),
+            json!({"held": null, "draft": false, "kind": null, "first": false})
+        );
         // Worded like a draft, but not one.
         held(&d, &id, &first, &"(a draft) lookalike".into(), PENDING_KEY).unwrap();
         assert_eq!(row()["draft"], false);
         held(&d, &id, &first, &Why::draft("unsent text"), PENDING_KEY).unwrap();
         assert_eq!(row()["draft"], true);
+        held(&d, &id, &first, &Why::stash("a stash record"), PENDING_KEY).unwrap();
+        assert_eq!(row()["draft"], true);
+        assert_eq!(row()["kind"], "stash");
         // Still "your turn": the hold stays.
         let mut m = d.db().kv_map(PENDING_KEY).unwrap();
         let s = d.db().resolve_ref(&id).unwrap();
@@ -1527,27 +1578,39 @@ mod tests {
         let mut busy = s;
         busy.status = Status::Working;
         assert!(lift_hold(m.get_mut(&id).unwrap(), Some(&busy)));
-        assert!(m[&id].get("held").is_none() && m[&id].get("held_draft").is_none());
+        assert!(m[&id].get("held").is_none() && m[&id].get("held_kind").is_none());
     }
 
-    /// A stash record blocks new stashes, failed or not, until the user
-    /// dismisses it.
+    /// A first prompt that waits shows on the row too.
     #[test]
-    fn a_stash_record_blocks_until_dismissed() {
-        use crate::stash::{earlier, Earlier};
+    fn a_waiting_first_prompt_is_on_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        queue_first(&db, &id, "the task").unwrap();
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        let mut rows = vec![json!({"id": id})];
+        annotate(&d, &mut rows);
+        assert_eq!(rows[0]["mail"]["first"], true);
+    }
+
+    /// Rule D: while a stash record is live (stale or not) every message
+    /// to the session holds, until it clears (here: dismissed).
+    #[test]
+    fn a_stash_record_holds_messages_until_cleared() {
+        use crate::stash::held_by_record;
         let db = Db::open_in_memory().unwrap();
         let id = insert(&db);
         let d = Daemon::new(db, rlord_core::config::Config::default());
-        assert_eq!(earlier(&d, &id), Earlier::None);
+        assert_eq!(held_by_record(&d, &id), None);
         crate::stash::stashed(&d, &id, "half a thought").unwrap();
-        assert_eq!(earlier(&d, &id), Earlier::Pending);
+        assert!(held_by_record(&d, &id).is_some());
         let mut m = d.db().kv_map(crate::stash::STASH_KEY).unwrap();
-        m.get_mut(&id).unwrap()["failed"] = json!(true);
+        m.get_mut(&id).unwrap()["stale"] = json!(true);
         d.db().kv_set_map(crate::stash::STASH_KEY, &m).unwrap();
-        assert_eq!(earlier(&d, &id), Earlier::Failed);
+        assert!(held_by_record(&d, &id).is_some());
         let r = crate::stash::dismiss(&d, &json!({"ref": &id})).unwrap();
         assert_eq!(r["dismissed"], true);
-        assert_eq!(earlier(&d, &id), Earlier::None);
+        assert_eq!(held_by_record(&d, &id), None);
         let log = d.db().list_events(&id, 20).unwrap();
         assert!(log.iter().any(|e| e.kind == "draft_restore_dismissed"));
     }

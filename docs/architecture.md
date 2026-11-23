@@ -1446,40 +1446,41 @@ including when the active one hits a usage limit.
   reason stays in the pending entry's `held`; the row's `mail`
   annotation, `✉` / `✉ draft` in the list).
 - **Claude drafts: the prompt stash** (`daemon/src/stash.rs`). In a
-  Claude session a draft doesn't hold a message indefinitely. It is
-  stashed when the whole input box (every line between its rules,
-  hashed) has sat unchanged for `DRAFT_IDLE` (tracked in memory; reset
-  when the box is seen empty, when someone used a terminal on it, and
-  when the session leaves "your turn"), Ctrl+S is `chat:stash` and the
-  only key for it, with no chord starting with Ctrl+S
-  (`keybindings.json` under Claude's config dir, read only, and only
-  once everything else says yes), and nothing is stashed: no "draft
-  stashed" on the status lines (below the box's bottom rule, or a line
-  right above its top rule that starts with the notice; transcript text
-  never counts; an unrecognised box means don't stash), no record of
-  rlord's in kv `draft_stash` (a failed one blocks too: rlord can't see
-  what the stash holds; it lifts when rlord sees the draft back or on
-  `rlord stash-dismiss`, RPC `session.stash_dismiss`), and no back-off.
-  After Ctrl+S the screen is polled (`poll_stash`, up to ~2s): the box
-  going empty proves the stash, whatever the indicator shows, and it is
-  recorded before the paste and Enter in the same call. Text still there
-  means it didn't take: no stash in that session for 10 minutes (in
-  memory), the message held. No readable screen: recorded, not typed.
-  The stash is one slot (stashing again loses the first: checked live),
-  so each of those conditions guards it. Claude Code restores the draft
-  by itself about 2s after the delivered turn (seen live, 2.1.331), so
-  the restore on `send`'s tick (session idle a few seconds, `SETTLE`
-  since the paste, no one typing, at its prompt) mostly just sees it
-  back (`draft_restored` by other). It presses Ctrl+S (after
-  `cancel_mode`, with a fresh look right before) only with the box empty
-  and the latest status "draft stashed": a press after the auto-restore
-  would stash the draft again. No indicator and the draft not in the box
-  means it was dealt with: `draft_restore_unknown`, dropped quietly.
-  Still stashed after a press: retried with backoff, and after a few
-  presses or 30 minutes `draft_restore_failed` (row mark `⎘`, row field
-  `draft_stash: "failed"`). A hold's kind (`Why::draft`) is stored with
-  its reason (`held_draft`); a hold lifts when the session leaves "your
-  turn", and `held_logged` keeps it logged once per message.
+  Claude session a draft doesn't hold a message indefinitely; the rule
+  is never to lose a draft (a held message is fine). The input box is
+  read by one function, `claude::input_box` (core, shared with
+  `dialog_shown`). A draft is stashed (Ctrl+S) only when the box is
+  recognised, the screen is at its prompt, no "draft stashed" shows on
+  its status lines (below the bottom rule, or a line right above the top
+  rule that starts with the notice), no record of rlord's is live, the
+  whole box (hashed) has sat unchanged for `DRAFT_IDLE` (reset when the
+  box is seen empty, someone used a terminal on it, or the session left
+  "your turn"), rlord isn't backing off there, and Ctrl+S alone is
+  `chat:stash` with no chord starting with it (`keybindings.json` under
+  Claude's config dir, read only, read last). After the press the screen
+  is polled (`poll_stash`, `TYPING` held only around the key): a
+  recognised, empty box at the prompt is the stash; it is recorded (kv
+  `draft_stash`), then the message pasted. A dialog or unrecognised
+  screen: recorded (it may have happened), nothing typed. The text still
+  there: a 10-minute back-off (in memory). The stash is one slot
+  (stashing again loses the first: checked live). Claude Code restores
+  the draft by itself about 2s after the delivered turn (seen live,
+  2.1.331), so rlord never presses Ctrl+S to restore: a press after the
+  auto-restore would stash the draft again. While a record is live,
+  every message to the session holds (`Kind::Stash`), empty box or not,
+  so no paste races the restore. The record clears (`draft_restored`)
+  when the draft's first row shows back in the box (whitespace
+  normalised; or the box's text starts with it, rewrapped), when the
+  user sends a prompt of their own after rlord's message
+  (`last_user_msg_at` past the record's `sent_at`), or on
+  `rlord stash-dismiss` (RPC `session.stash_dismiss`). A minute after the
+  turn ended without any of those, the row shows `⎘` (`draft_stash:
+  "stale"`); nothing is pressed. A session stopped, errored, archived or
+  gone with a record logs `draft_lost_with_session` (with the first
+  line) and the record goes. A hold's kind (`Why::kind`: draft, stash)
+  is stored with its reason (`held_kind`); a hold lifts when the session
+  leaves "your turn", and `held_logged` keeps it logged once per
+  message.
 - **Per-session lock** (`daemon/src/locks.rs`): taken by sends,
   deliveries and asks around the final re-read and the paste, and by
   restart, stop, archive, fresh restarts and `overlord.continue` (and the

@@ -61,7 +61,7 @@ pub fn legend() -> Vec<(String, &'static str)> {
     ));
     v.push((
         "⎘".into(),
-        "a draft rlord stashed wasn't restored: Ctrl+S in the session, or rlord stash-dismiss",
+        "a draft rlord stashed may still be stashed: Ctrl+S in the session, or rlord stash-dismiss",
     ));
     v.push(("⋯".into(), "still loading its sub-agent counts"));
     v
@@ -290,7 +290,7 @@ pub fn status_marks(s: &Value, narrow: bool, width: usize, now: i64) -> Vec<Item
 
 /// The overlord's messages waiting for the session (`mail`: `✉`, or `✉
 /// draft` when a draft in its input holds them) and a draft rlord
-/// stashed and couldn't put back (`draft_stash`: "failed").
+/// stashed that may still be in the stash (`draft_stash`: "stale").
 fn mail_marks(s: &Value) -> Vec<Item> {
     let mut v = Vec::new();
     let m = &s["mail"];
@@ -298,6 +298,7 @@ fn mail_marks(s: &Value) -> Vec<Item> {
         let (mark, text) = match m["held"].as_str() {
             Some(why) if m["draft"] == true => ("✉ draft", format!("a message is held: {why}.")),
             Some(why) => ("✉", format!("a message is held: {why}.")),
+            None if m["first"] == true => ("✉", "its first prompt waits to go in.".to_string()),
             None => ("✉", "a message waits for its turn to end.".to_string()),
         };
         v.push(Item {
@@ -307,11 +308,11 @@ fn mail_marks(s: &Value) -> Vec<Item> {
             shown: true,
         });
     }
-    if s["draft_stash"] == "failed" {
+    if s["draft_stash"] == "stale" {
         v.push(Item {
             label: "stash",
             mark: Span::styled("⎘", Style::default().fg(theme::red())),
-            text: "draft stashed: Ctrl+S in the session to restore it (rlord couldn't), or `rlord stash-dismiss`. rlord stashes nothing more there until then.".into(),
+            text: "draft may still be stashed: Ctrl+S in the session to restore it, or `rlord stash-dismiss`. Messages to it wait until then.".into(),
             shown: true,
         });
     }
@@ -608,8 +609,10 @@ mod tests {
         let draft = json!({"status": "idle",
             "mail": {"held": "its input holds unsent text (a draft)", "draft": true}});
         assert!(marks(&draft)[0].starts_with("✉ draft — a message is held: its input"));
-        let failed = json!({"status": "idle", "draft_stash": "failed"});
-        assert!(marks(&failed)[0].starts_with("⎘ — draft stashed: Ctrl+S"));
+        let failed = json!({"status": "idle", "draft_stash": "stale"});
+        assert!(marks(&failed)[0].starts_with("⎘ — draft may still be stashed: Ctrl+S"));
+        let first = json!({"status": "idle", "mail": {"held": null, "first": true}});
+        assert_eq!(marks(&first), ["✉ — its first prompt waits to go in."]);
         assert!(marks(&json!({"status": "idle", "draft_stash": "pending"})).is_empty());
     }
 }

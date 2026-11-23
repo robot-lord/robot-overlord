@@ -350,9 +350,10 @@ start a new session for it.
   add up, none is lost. A session that needs the user is better left for
   them (offer `goto_session`).
 - Unsent text in its input (a draft) holds a message; the answer's `why`
-  says so. In Claude sessions rlord sets an older draft aside and puts it
-  back after the turn, so with `when_idle` it goes shortly. Elsewhere
-  tell the user it waits for them to send or clear their draft.
+  says so. In Claude sessions rlord stashes an older draft and Claude
+  Code restores it after the turn, so with `when_idle` it goes; further
+  messages wait until the draft is seen back. Elsewhere tell the user it
+  waits for them to send or clear their draft.
 - Stopped: `session_action` restart first if the user wants it, then send
   once it shows "your turn". Starting: try again in a moment.
 
