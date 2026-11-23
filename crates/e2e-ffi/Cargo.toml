@@ -1,0 +1,22 @@
+# The phone app's device engine (`rlord_e2e_client`) as a native library
+# with UniFFI bindings for Swift and Kotlin (`cargo xtask app bindings`,
+# `app core-ios`, `app core-android`). Proc-macro mode, no UDL file. Never
+# in the `rlord` binary; never released on its own.
+[package]
+name = "robot-overlord-e2e-ffi"
+description = "rlord's phone app engine, for Swift and Kotlin. Not a stable API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rlord_e2e_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+uniffi = { version = "=0.32.2", default-features = false }
+thiserror.workspace = true
+serde_json.workspace = true

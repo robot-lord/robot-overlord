@@ -1,0 +1,96 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4F4B14B6B0195484B4B82A1B /* RlordCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7CA2BF245ACBED94684AE4A6 /* RlordCore.xcframework */; };
+		35EBF14E7FE79637073EF3BF /* page in Resources */ = {isa = PBXBuildFile; fileRef = 3449FD999DA2066F6AAB2E6E /* page */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F30088A51914709EF13373CD /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = 46B2095A8B5ED4A02E59884C /* Project object */; proxyType = 1; remoteGlobalIDString = 288CBD4CC567D21AC63D96DF; remoteInfo = rlord; };
+		54C56E7F78C2D7EAC8DCAD3B /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = 46B2095A8B5ED4A02E59884C /* Project object */; proxyType = 1; remoteGlobalIDString = 288CBD4CC567D21AC63D96DF; remoteInfo = rlord; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		7CA2BF245ACBED94684AE4A6 /* RlordCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = RlordCore.xcframework; sourceTree = "<group>"; };
+		3449FD999DA2066F6AAB2E6E /* page */ = {isa = PBXFileReference; lastKnownFileType = folder; path = page; sourceTree = "<group>"; };
+		C4D5501256FF0FE770D39E08 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		B267DB4068C25FEB5891A88D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BC5FB01DBF1F64DDDC07E014 /* rlord.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = rlord.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E90F92E0BB95B42EB2EAC308 /* rlordTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = rlordTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5E97EAA9B874F187E8D3BB1C /* rlordUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = rlordUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		29A9DC2AFDC673F3E3AE144B /* rlord */ = {isa = PBXFileSystemSynchronizedRootGroup; path = rlord; sourceTree = "<group>"; };
+		B24D5A7292B13564285FA53D /* Swift */ = {isa = PBXFileSystemSynchronizedRootGroup; path = Swift; sourceTree = "<group>"; };
+		B99C0D39E49DAA6669880AA3 /* rlordTests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = rlordTests; sourceTree = "<group>"; };
+		CBDF05BA7AFA8948C8A65735 /* rlordUITests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = rlordUITests; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		5CA782E14CAFA8CB950E6B66 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (4F4B14B6B0195484B4B82A1B /* RlordCore.xcframework in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A2EE9A84889548BD452EDF5E /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		AADD3571946E9AD22A1721DB /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		BDA2399C64C9EE4B698B9ACB = {isa = PBXGroup; children = (29A9DC2AFDC673F3E3AE144B /* rlord */, B99C0D39E49DAA6669880AA3 /* rlordTests */, CBDF05BA7AFA8948C8A65735 /* rlordUITests */, 5B96CD8BA450CF56FAD8D7E5 /* Config */, 950544BDAD347304D0ED1A29 /* Generated */, DFA327DDA60F05524E85E7FA /* Frameworks */, EFA1190013D40ACD392A95D5 /* Products */, ); sourceTree = "<group>"; };
+		5B96CD8BA450CF56FAD8D7E5 /* Config */ = {isa = PBXGroup; children = (C4D5501256FF0FE770D39E08 /* Base.xcconfig */, B267DB4068C25FEB5891A88D /* Info.plist */, ); path = Config; sourceTree = "<group>"; };
+		950544BDAD347304D0ED1A29 /* Generated */ = {isa = PBXGroup; children = (B24D5A7292B13564285FA53D /* Swift */, 3449FD999DA2066F6AAB2E6E /* page */, ); path = Generated; sourceTree = "<group>"; };
+		DFA327DDA60F05524E85E7FA /* Frameworks */ = {isa = PBXGroup; children = (7CA2BF245ACBED94684AE4A6 /* RlordCore.xcframework */, ); path = Frameworks; sourceTree = "<group>"; };
+		EFA1190013D40ACD392A95D5 /* Products */ = {isa = PBXGroup; children = (BC5FB01DBF1F64DDDC07E014 /* rlord.app */, E90F92E0BB95B42EB2EAC308 /* rlordTests.xctest */, 5E97EAA9B874F187E8D3BB1C /* rlordUITests.xctest */, ); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		288CBD4CC567D21AC63D96DF /* rlord */ = {isa = PBXNativeTarget; buildConfigurationList = 4387DF536D0502FF6BCEEBC5; buildPhases = (131372EA5B76563559A96C3A /* Sources */, 5CA782E14CAFA8CB950E6B66 /* Frameworks */, B60D3547D9A8DCD6B677E610 /* Resources */, ); buildRules = (); dependencies = (); fileSystemSynchronizedGroups = (29A9DC2AFDC673F3E3AE144B /* rlord */, B24D5A7292B13564285FA53D /* Swift */, ); name = rlord; packageProductDependencies = (); productName = rlord; productReference = BC5FB01DBF1F64DDDC07E014; productType = "com.apple.product-type.application"; };
+		273905DCC6387A6AC06CEC8D /* rlordTests */ = {isa = PBXNativeTarget; buildConfigurationList = D9762795C3499752921C8C52; buildPhases = (8BE9E545166424FB4A2219E0 /* Sources */, A2EE9A84889548BD452EDF5E /* Frameworks */, 645EF0D11526F7F68A8A94CB /* Resources */, ); buildRules = (); dependencies = (807A55BA4AFCA91420EB8CAD /* PBXTargetDependency */, ); fileSystemSynchronizedGroups = (B99C0D39E49DAA6669880AA3 /* rlordTests */, ); name = rlordTests; packageProductDependencies = (); productName = rlordTests; productReference = E90F92E0BB95B42EB2EAC308; productType = "com.apple.product-type.bundle.unit-test"; };
+		5FD0C36C08BCE2D0F58FFFC9 /* rlordUITests */ = {isa = PBXNativeTarget; buildConfigurationList = 5C0BD06342A68ADFFF66CDA7; buildPhases = (DFB10FB88D3E20EE8CF2CF43 /* Sources */, AADD3571946E9AD22A1721DB /* Frameworks */, FD77F57817C7755B2D2BF1AF /* Resources */, ); buildRules = (); dependencies = (2DBD6B09E762177929595319 /* PBXTargetDependency */, ); fileSystemSynchronizedGroups = (CBDF05BA7AFA8948C8A65735 /* rlordUITests */, ); name = rlordUITests; packageProductDependencies = (); productName = rlordUITests; productReference = 5E97EAA9B874F187E8D3BB1C; productType = "com.apple.product-type.bundle.ui-testing"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		46B2095A8B5ED4A02E59884C /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2720; LastUpgradeCheck = 2720; TargetAttributes = {288CBD4CC567D21AC63D96DF = {CreatedOnToolsVersion = 27.2; }; 273905DCC6387A6AC06CEC8D = {CreatedOnToolsVersion = 27.2; TestTargetID = 288CBD4CC567D21AC63D96DF; }; 5FD0C36C08BCE2D0F58FFFC9 = {CreatedOnToolsVersion = 27.2; TestTargetID = 288CBD4CC567D21AC63D96DF; }; }; }; buildConfigurationList = CC44C22D9EC36E58E989B808; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base, ); mainGroup = BDA2399C64C9EE4B698B9ACB; minimizedProjectReferenceProxies = 1; preferredProjectObjectVersion = 77; productRefGroup = EFA1190013D40ACD392A95D5 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (288CBD4CC567D21AC63D96DF /* rlord */, 273905DCC6387A6AC06CEC8D /* rlordTests */, 5FD0C36C08BCE2D0F58FFFC9 /* rlordUITests */, ); };
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B60D3547D9A8DCD6B677E610 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (35EBF14E7FE79637073EF3BF /* page in Resources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		645EF0D11526F7F68A8A94CB /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		FD77F57817C7755B2D2BF1AF /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		131372EA5B76563559A96C3A /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		8BE9E545166424FB4A2219E0 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		DFB10FB88D3E20EE8CF2CF43 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		807A55BA4AFCA91420EB8CAD /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 288CBD4CC567D21AC63D96DF /* rlord */; targetProxy = F30088A51914709EF13373CD /* PBXContainerItemProxy */; };
+		2DBD6B09E762177929595319 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 288CBD4CC567D21AC63D96DF /* rlord */; targetProxy = 54C56E7F78C2D7EAC8DCAD3B /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		273942791B98190B8B44543E /* Debug */ = {isa = XCBuildConfiguration; baseConfigurationReference = C4D5501256FF0FE770D39E08 /* Base.xcconfig */; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; ENABLE_STRICT_OBJC_MSGSEND = YES; ENABLE_USER_SCRIPT_SANDBOXING = YES; GCC_NO_COMMON_BLOCKS = YES; SDKROOT = iphoneos; SWIFT_EMIT_LOC_STRINGS = NO; LOCALIZATION_PREFERS_STRING_CATALOGS = YES; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_OPTIMIZATION_LEVEL = 0; ONLY_ACTIVE_ARCH = YES; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; GCC_PREPROCESSOR_DEFINITIONS = ("DEBUG=1", "$(inherited)", ); }; name = Debug; };
+		3A42C599D49C21624B059BD2 /* Release */ = {isa = XCBuildConfiguration; baseConfigurationReference = C4D5501256FF0FE770D39E08 /* Base.xcconfig */; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; ENABLE_STRICT_OBJC_MSGSEND = YES; ENABLE_USER_SCRIPT_SANDBOXING = YES; GCC_NO_COMMON_BLOCKS = YES; SDKROOT = iphoneos; SWIFT_EMIT_LOC_STRINGS = NO; LOCALIZATION_PREFERS_STRING_CATALOGS = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; SWIFT_COMPILATION_MODE = wholemodule; VALIDATE_PRODUCT = YES; }; name = Release; };
+		2412F9107EDACC7C3E8E656C /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Config/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = rlord; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; INFOPLIST_KEY_NSCameraUsageDescription = "rlord scans the pairing code your computer shows."; INFOPLIST_KEY_NSFaceIDUsageDescription = "rlord locks itself when you have been away."; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait; INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", ); PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = NO; }; name = Debug; };
+		7B7E4784F8DB37DDB6E1CB86 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; INFOPLIST_FILE = Config/Info.plist; INFOPLIST_KEY_CFBundleDisplayName = rlord; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; INFOPLIST_KEY_NSCameraUsageDescription = "rlord scans the pairing code your computer shows."; INFOPLIST_KEY_NSFaceIDUsageDescription = "rlord locks itself when you have been away."; INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES; INFOPLIST_KEY_UILaunchScreen_Generation = YES; INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait; INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", ); PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = NO; }; name = Release; };
+		0A394153A70242DBD4A6F461 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "com.robot-lord.rlord.tests"; PRODUCT_NAME = "$(TARGET_NAME)"; BUNDLE_LOADER = "$(TEST_HOST)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/rlord.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/rlord"; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; }; name = Debug; };
+		62494182867146DAA0C8705D /* Release */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "com.robot-lord.rlord.tests"; PRODUCT_NAME = "$(TARGET_NAME)"; BUNDLE_LOADER = "$(TEST_HOST)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/rlord.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/rlord"; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; }; name = Release; };
+		DA2B6AC801B0B031A6DA2F8D /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "com.robot-lord.rlord.uitests"; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_TARGET_NAME = rlord; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; }; name = Debug; };
+		FAFCC98838572202422A468A /* Release */ = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = "com.robot-lord.rlord.uitests"; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_TARGET_NAME = rlord; MARKETING_VERSION = 1.0.0; CURRENT_PROJECT_VERSION = 1; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		CC44C22D9EC36E58E989B808 /* Build configuration list for PBXProject "rlord" */ = {isa = XCConfigurationList; buildConfigurations = (273942791B98190B8B44543E /* Debug */, 3A42C599D49C21624B059BD2 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		4387DF536D0502FF6BCEEBC5 /* Build configuration list for PBXNativeTarget "rlord" */ = {isa = XCConfigurationList; buildConfigurations = (2412F9107EDACC7C3E8E656C /* Debug */, 7B7E4784F8DB37DDB6E1CB86 /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		D9762795C3499752921C8C52 /* Build configuration list for PBXNativeTarget "rlordTests" */ = {isa = XCConfigurationList; buildConfigurations = (0A394153A70242DBD4A6F461 /* Debug */, 62494182867146DAA0C8705D /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		5C0BD06342A68ADFFF66CDA7 /* Build configuration list for PBXNativeTarget "rlordUITests" */ = {isa = XCConfigurationList; buildConfigurations = (DA2B6AC801B0B031A6DA2F8D /* Debug */, FAFCC98838572202422A468A /* Release */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = 46B2095A8B5ED4A02E59884C /* Project object */;
+}

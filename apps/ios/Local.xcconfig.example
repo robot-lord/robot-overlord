@@ -1,0 +1,7 @@
+// Personal overrides for building rlord's iOS app on your own machine.
+// Copy to Local.xcconfig (git-ignored) and change what you need. The
+// committed project already signs with the project's team and bundle id;
+// a contributor without access to that team sets their own here.
+//
+// DEVELOPMENT_TEAM = ABCDE12345
+// PRODUCT_BUNDLE_IDENTIFIER = com.example.rlord

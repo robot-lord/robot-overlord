@@ -1,0 +1,15 @@
+// Settings every configuration of the app shares. The team and bundle id
+// are the project's (answers to slice 4's questions 3 and 4); personal
+// overrides go in ../Local.xcconfig (git-ignored, optional).
+DEVELOPMENT_TEAM = PL2X8AJK8A
+PRODUCT_BUNDLE_IDENTIFIER = com.robot-lord.rlord
+CODE_SIGN_STYLE = Automatic
+IPHONEOS_DEPLOYMENT_TARGET = 26.0
+SWIFT_VERSION = 5.0
+TARGETED_DEVICE_FAMILY = 1
+// Apple Silicon only: the engine is built for arm64 devices and the arm64
+// simulator (rust-toolchain.toml).
+ARCHS = arm64
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64
+
+#include? "../Local.xcconfig"

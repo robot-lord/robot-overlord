@@ -25,6 +25,13 @@
 //!    no other file under `crates/web/src/` names `TcpListener`.
 //! 5. `crates/relay` is the only crate that may bind a non-loopback
 //!    address.
+//!
+//! The phone app (docs/working/web-ui-remote.md, "Slice 4 plan") adds:
+//!
+//! 6. `rlord` names neither the app's engine library nor UniFFI.
+//! 7. The app's own sources (`apps/`) name no network API: the engine's
+//!    relay link is the app's only network path. Observing the network
+//!    (`NWPathMonitor`, `ConnectivityManager`) is allowed.
 
 use std::path::Path;
 
@@ -53,6 +60,8 @@ pub const DENIED: &[&str] = &[
     "robot-overlord-relay",
     "robot-overlord-relay-proto",
     "robot-overlord-e2e-device",
+    "robot-overlord-e2e-ffi",
+    "uniffi",
     "snow",
     "libcrux-ml-kem",
     "chacha20poly1305",
@@ -66,6 +75,29 @@ pub const DENIED: &[&str] = &[
     // Not `wasm-bindgen`: `ulid` (through `web-time`) depends on it for
     // wasm32 targets only, which rlord is never built for. The WASM
     // crypto build is denied by name above.
+];
+
+/// The phone apps' sources, and the network APIs they must never name
+/// (the engine's relay link is the app's one network path). Generated and
+/// build folders aren't sources.
+const APPS: &str = "apps";
+const APP_SOURCE_EXTENSIONS: &[&str] = &["swift", "kt", "kts", "java", "m", "mm", "c", "h"];
+const APP_SKIP_DIRS: &[&str] = &["Generated", "Frameworks", "build", ".gradle", "xcuserdata"];
+const APP_DENIED: &[&str] = &[
+    "URLSession",
+    "NSURLConnection",
+    "NWConnection",
+    "NWListener",
+    "NWBrowser",
+    "CFNetwork",
+    "CFSocket",
+    "CFStream",
+    "socket(",
+    "java.net",
+    "javax.net",
+    "okhttp",
+    "HttpURLConnection",
+    "SocketChannel",
 ];
 
 /// The relay's package, and what it must never depend on: content crypto
@@ -183,9 +215,17 @@ pub fn check() -> Result<()> {
             found.join("\n  ")
         );
     }
+    let found = network_in_apps(Path::new(APPS))?;
+    if !found.is_empty() {
+        bail!(
+            "a network API in the phone app (its only network path is the engine's \
+             relay link):\n  {}",
+            found.join("\n  ")
+        );
+    }
     println!(
         "check-deps: rlord has no network dependency; rlord-relay no content crypto; \
-         rlord_e2e no IO"
+         rlord_e2e no IO; the phone app no network API"
     );
     Ok(())
 }
@@ -330,9 +370,91 @@ fn denied_in_source(text: &str) -> Vec<(usize, &'static str)> {
     v
 }
 
+/// `path:line: name` for each network API named in the app sources.
+fn network_in_apps(dir: &Path) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    if !dir.exists() {
+        return Ok(found);
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)? {
+            let p = entry?.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if !APP_SKIP_DIRS.contains(&name) {
+                    stack.push(p);
+                }
+            } else if p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| APP_SOURCE_EXTENSIONS.contains(&e))
+            {
+                let text = std::fs::read_to_string(&p)?;
+                for (i, t) in network_in_app_source(&text) {
+                    found.push(format!("{}:{}: {t}", p.display(), i + 1));
+                }
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// (line index, name) for each network API named in `text`.
+fn network_in_app_source(text: &str) -> Vec<(usize, &'static str)> {
+    let mut v = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        for t in APP_DENIED {
+            if line.contains(t) {
+                v.push((i, *t));
+            }
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_planted_network_api_in_the_app_is_caught() {
+        let clean = "import Network\nlet m = NWPathMonitor()\nlet s = WKURLSchemeHandler.self\n";
+        assert!(network_in_app_source(clean).is_empty());
+        for planted in [
+            "let s = URLSession.shared",
+            "let c = NWConnection(host: h, port: p, using: .tcp)",
+            "import java.net.URL",
+            "val c = OkHttpClient() // okhttp",
+            "val u = url.openConnection() as HttpURLConnection",
+            "let fd = socket(AF_INET, SOCK_STREAM, 0)",
+            "CFStreamCreatePairWithSocketToHost(nil, h, p, &r, &w)",
+        ] {
+            assert!(!network_in_app_source(planted).is_empty(), "{planted}");
+        }
+    }
+
+    #[test]
+    fn app_sources_are_found_and_generated_ones_skipped() {
+        let tmp = std::env::temp_dir().join(format!("rlord-check-apps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("ios/rlord")).unwrap();
+        std::fs::create_dir_all(tmp.join("ios/Generated/Swift")).unwrap();
+        std::fs::write(tmp.join("ios/rlord/A.swift"), "let x = 1\n").unwrap();
+        std::fs::write(tmp.join("ios/Generated/Swift/B.swift"), "URLSession\n").unwrap();
+        std::fs::write(tmp.join("ios/rlord/notes.md"), "URLSession is not used\n").unwrap();
+        assert!(network_in_apps(&tmp).unwrap().is_empty());
+        std::fs::write(
+            tmp.join("ios/rlord/C.swift"),
+            "\nlet s = URLSession.shared\n",
+        )
+        .unwrap();
+        let found = network_in_apps(&tmp).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].ends_with("C.swift:2: URLSession"), "{found:?}");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn a_planted_network_crate_is_caught() {

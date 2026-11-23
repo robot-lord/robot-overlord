@@ -7,6 +7,7 @@
 //! the scripts xtask runs inside bare distro containers (`*.sh` next to
 //! the task that runs them, compiled in).
 
+mod app;
 mod build;
 mod bump;
 mod check_deps;
@@ -49,6 +50,8 @@ usage: cargo xtask <task>
       the web plugin's page (crates/web/ui): install its pinned tools, check, build
   e2e vectors [--check] | wasm | test-wasm
       the end-to-end crypto core's test vectors and WASM build (crates/e2e)
+  app bindings | core-ios | ios [--sim [NAME] | --device ID] | test-ios [--unit]
+      the phone app (apps/ios): bindings, the engine's xcframework, build and run, tests
   check-version-bump [BASE] [REV]
       fail unless REV bumps the version above BASE's (origin/main, HEAD)
   update-tap VERSION SHA256SUMS [TAP_REPO]
@@ -107,6 +110,7 @@ fn main() -> ExitCode {
         "check-deps" => check_deps::main(rest),
         "web" => web::main(rest),
         "e2e" => e2e::main(rest),
+        "app" => app::main(rest),
         "update-tap" => tap::main(rest, &invoked_from),
         "publish-crates" => publish::main(rest),
         "release-preflight" => preflight::main(rest),
