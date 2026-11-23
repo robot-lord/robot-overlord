@@ -17,6 +17,9 @@ name = "rlord_e2e_ffi"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
+rlord-e2e-client = { package = "robot-overlord-e2e-client", path = "../e2e-client" }
 uniffi = { version = "=0.32.2", default-features = false }
 thiserror.workspace = true
-serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

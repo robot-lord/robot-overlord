@@ -13,7 +13,7 @@ struct RlordApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(shell: shell)
-                .onChange(of: phase) { _, now in shell.phase(now) }
+                .onChange(of: phase, initial: true) { _, now in shell.phase(now) }
         }
         .backgroundTask(.appRefresh(refreshTask)) {
             await shell.backgroundRefresh()

@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use rlord_e2e_client as client;
+
 uniffi::setup_scaffolding!();
 
 /// Every error across the boundary, both ways.
@@ -59,24 +61,51 @@ pub trait Listener: Send + Sync {
 /// What one background check did.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct BackgroundResult {
+    /// `not_paired`, `nothing_new`, `host_offline`, `refreshed` or
+    /// `failed`.
+    pub outcome: String,
     /// It reached the relay.
     pub reached: bool,
     /// It ran a session with the host (something was waiting).
     pub handshake: bool,
     /// Sessions newly waiting for input (notified).
     pub waiting: u32,
+    /// Why it failed (`failed` only).
+    pub reason: Option<String>,
+}
+
+impl From<client::BackgroundOutcome> for BackgroundResult {
+    fn from(o: client::BackgroundOutcome) -> Self {
+        use client::BackgroundOutcome as O;
+        let r = |outcome: &str, reached, handshake, waiting, reason| BackgroundResult {
+            outcome: outcome.into(),
+            reached,
+            handshake,
+            waiting,
+            reason,
+        };
+        match o {
+            O::NotPaired => r("not_paired", false, false, 0, None),
+            O::NothingNew => r("nothing_new", true, false, 0, None),
+            O::HostOffline => r("host_offline", true, false, 0, None),
+            O::Refreshed { notified, .. } => r("refreshed", true, true, notified, None),
+            O::Failed { reason } => r("failed", false, false, 0, Some(reason)),
+        }
+    }
 }
 
 /// The device engine.
 #[derive(uniffi::Object)]
 pub struct Engine {
-    inner: stand_in::Engine,
+    inner: client::Engine,
 }
 
 #[uniffi::export]
 impl Engine {
     /// `dir`: the app's own folder, out of every backup. `ca_pem`: an extra
-    /// root certificate, for tests and debug builds only.
+    /// root certificate, for tests and debug builds only. The engine starts
+    /// as if in the background: the shell calls `lifecycle(true)` once the
+    /// app is in front.
     #[uniffi::constructor]
     pub fn new(
         dir: String,
@@ -85,7 +114,16 @@ impl Engine {
         signers: Arc<dyn Signers>,
         listener: Arc<dyn Listener>,
     ) -> Result<Arc<Self>, FfiError> {
-        let inner = stand_in::Engine::new(dir, ca_pem, vault, signers, listener)?;
+        let inner = client::Engine::new(
+            client::Config {
+                dir: dir.into(),
+                ca_pem,
+            },
+            Arc::new(VaultAdapter(vault)),
+            Arc::new(SignersAdapter(signers)),
+            Arc::new(ListenerAdapter(listener)),
+        )
+        .map_err(|e| FfiError::Failed { message: e.message })?;
         Ok(Arc::new(Engine { inner }))
     }
 
@@ -111,7 +149,7 @@ impl Engine {
     /// One bounded check for the OS's background refresh; blocks at most
     /// `budget_ms`.
     pub fn background_check(&self, budget_ms: u64) -> BackgroundResult {
-        self.inner.background_check(budget_ms)
+        self.inner.background_check(budget_ms).into()
     }
 
     /// Forget every host, key and file.
@@ -124,48 +162,139 @@ impl Engine {
     }
 }
 
-/// A stand-in until the engine crate is wired in: answers `ready` with
-/// `unpaired`, echoes requests as `disconnected`.
-mod stand_in {
-    use super::*;
+// The platform's objects, seen by the engine through its own traits.
 
-    pub struct Engine {
-        listener: Arc<dyn Listener>,
+fn platform(e: FfiError) -> client::PlatformError {
+    match e {
+        FfiError::Failed { message } => client::PlatformError::new(message),
+    }
+}
+
+struct SignersAdapter(Arc<dyn Signers>);
+
+impl client::Signers for SignersAdapter {
+    fn create(&self, label: String) -> Result<Vec<u8>, client::PlatformError> {
+        self.0.create(label).map_err(platform)
+    }
+    fn public_key(&self, label: String) -> Result<Vec<u8>, client::PlatformError> {
+        self.0.public_key(label).map_err(platform)
+    }
+    fn sign(&self, label: String, msg: Vec<u8>) -> Result<Vec<u8>, client::PlatformError> {
+        self.0.sign(label, msg).map_err(platform)
+    }
+    fn delete(&self, label: String) {
+        self.0.delete(label)
+    }
+    fn hardware(&self) -> bool {
+        self.0.hardware()
+    }
+}
+
+struct VaultAdapter(Arc<dyn Vault>);
+
+impl client::Vault for VaultAdapter {
+    fn seal(&self, plain: Vec<u8>) -> Result<Vec<u8>, client::PlatformError> {
+        self.0.seal(plain).map_err(platform)
+    }
+    fn open(&self, sealed: Vec<u8>) -> Result<Vec<u8>, client::PlatformError> {
+        self.0.unseal(sealed).map_err(platform)
+    }
+}
+
+struct ListenerAdapter(Arc<dyn Listener>);
+
+impl client::Listener for ListenerAdapter {
+    fn to_page(&self, json: String) {
+        self.0.to_page(json)
+    }
+    fn notify(&self, kind: String, count: u32) {
+        self.0.notify(kind, count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// A vault that keeps bytes as they are, signers from the engine's own
+    /// software keys, and a listener that records what the page would get:
+    /// the adapters carry each call both ways.
+    struct Plain;
+    impl Vault for Plain {
+        fn seal(&self, plain: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            Ok(plain)
+        }
+        fn unseal(&self, sealed: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            Ok(sealed)
+        }
     }
 
-    impl Engine {
-        pub fn new(
-            _dir: String,
-            _ca_pem: Option<String>,
-            _vault: Arc<dyn Vault>,
-            _signers: Arc<dyn Signers>,
-            listener: Arc<dyn Listener>,
-        ) -> Result<Engine, FfiError> {
-            Ok(Engine { listener })
+    struct Soft(client::soft::SoftSigners);
+    impl Signers for Soft {
+        fn create(&self, label: String) -> Result<Vec<u8>, FfiError> {
+            client::Signers::create(&self.0, label).map_err(fail)
         }
-        pub fn page_message(&self, json: String) {
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
-            if v["app"] == "ready" {
-                self.listener
-                    .to_page(r#"{"event":"conn","state":"unpaired"}"#.into());
-            } else if let Some(id) = v["id"].as_u64() {
-                self.listener.to_page(
-                    serde_json::json!({"id": id, "error": {"code": "disconnected", "message": "not paired"}})
-                        .to_string(),
-                );
+        fn public_key(&self, label: String) -> Result<Vec<u8>, FfiError> {
+            client::Signers::public_key(&self.0, label).map_err(fail)
+        }
+        fn sign(&self, label: String, msg: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            client::Signers::sign(&self.0, label, msg).map_err(fail)
+        }
+        fn delete(&self, label: String) {
+            client::Signers::delete(&self.0, label)
+        }
+        fn hardware(&self) -> bool {
+            false
+        }
+    }
+
+    fn fail(e: client::PlatformError) -> FfiError {
+        FfiError::Failed { message: e.message }
+    }
+
+    #[derive(Default)]
+    struct Record(Mutex<Vec<String>>);
+    impl Listener for Record {
+        fn to_page(&self, json: String) {
+            self.0.lock().unwrap().push(json);
+        }
+        fn notify(&self, _kind: String, _count: u32) {}
+    }
+
+    #[test]
+    fn the_engine_answers_through_the_adapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Arc::new(Record::default());
+        let e = Engine::new(
+            dir.path().to_string_lossy().into(),
+            None,
+            Arc::new(Plain),
+            Arc::new(Soft(client::soft::SoftSigners::default())),
+            rec.clone(),
+        )
+        .unwrap();
+        e.page_message(r#"{"app":"ready"}"#.into());
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if rec.0.lock().unwrap().iter().any(|m| m.contains("unpaired")) {
+                break;
             }
+            assert!(Instant::now() < until, "{:?}", rec.0.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
         }
-        pub fn scanned(&self, _qr: String, _name: String) {}
-        pub fn lifecycle(&self, _fg: bool) {}
-        pub fn network(&self, _online: bool) {}
-        pub fn background_check(&self, _budget: u64) -> BackgroundResult {
-            BackgroundResult {
-                reached: false,
-                handshake: false,
-                waiting: 0,
-            }
-        }
-        pub fn wipe(&self) {}
-        pub fn shutdown(&self) {}
+        let r = e.background_check(1_000);
+        assert_eq!(r.outcome, "not_paired");
+        assert!(!r.reached);
+        e.shutdown();
+    }
+
+    #[test]
+    fn a_platform_failure_crosses_as_its_message() {
+        let e = platform(FfiError::Failed {
+            message: "keystore refused".into(),
+        });
+        assert_eq!(e.message, "keystore refused");
     }
 }
