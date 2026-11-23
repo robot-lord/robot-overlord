@@ -700,6 +700,12 @@ impl LimitsConfig {
     pub fn auto_resume_on(&self) -> bool {
         self.auto_resume == Some(true)
     }
+
+    /// What a resume sends: `resume_message`, "continue" when blank.
+    pub fn message(&self) -> String {
+        let m = self.resume_message.trim();
+        if m.is_empty() { "continue" } else { m }.to_string()
+    }
 }
 
 impl Default for LimitsConfig {

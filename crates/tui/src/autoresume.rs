@@ -34,8 +34,7 @@ pub(crate) fn unreachable(e: &anyhow::Error) -> bool {
 /// The message a resume types, as the dialog says it (`[limits]
 /// resume_message`, "continue" when blank, as the daemon sends).
 pub(crate) fn resume_text(cfg: &Config) -> String {
-    let m = cfg.limits.resume_message.trim();
-    if m.is_empty() { "continue" } else { m }.to_string()
+    cfg.limits.message()
 }
 
 impl App {
@@ -78,8 +77,10 @@ impl App {
             self.mode = Mode::AutoResume(opened);
             return;
         }
-        // Quitting is never trapped; it asks again next start.
+        // Quitting is never trapped; staying brings the question back
+        // (on the next refresh).
         if self.keys.action(&k) == Some(Action::Quit) {
+            self.auto_resume_asked = false;
             self.mode = Mode::ConfirmQuit;
             return;
         }
@@ -182,6 +183,22 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Quitting from the question, then staying: it comes back.
+    #[test]
+    fn backing_out_of_quit_brings_the_question_back() {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        let mut app = App::new(rx, Config::default(), keys);
+        app.auto_resume_asked = true;
+        let opened = Instant::now() - std::time::Duration::from_secs(2);
+        app.handle_auto_resume(
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
+            opened,
+        );
+        assert!(matches!(app.mode, Mode::ConfirmQuit));
+        assert!(!app.auto_resume_asked, "asked again once back in the list");
+    }
 
     #[test]
     fn the_dialog_names_the_configured_message() {

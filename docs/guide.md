@@ -535,7 +535,7 @@ message (`[limits] resume_message`, "continue" by default;
 `send_to_session` types. A session you used in the meantime is left
 alone. If the limit hits again, it waits for the next reset. A scheduled
 resume shows as `↻` next to the time and survives restarting rlord.
-Nothing is resumed unless you ask.
+Nothing is resumed unless you ask, or turn on auto-resume (below).
 
 Or have rlord do this for every limited session by itself:
 `[limits] auto_resume = true` in `config.toml`. Each session stopped on a
@@ -545,7 +545,9 @@ agents instead); cancel one and it stays cancelled for that limit.
 setup form offers it as an optional row ("ask me later" by default), and
 the first time a session hits a limit a dialog asks (`y` on, `n` off, Esc
 asks again next start). The
-answer goes in your `config.toml`; change it there any time. None of the
+answer goes in your `config.toml`. Edited there by hand, it takes effect
+on `rlord reset` or the next start. Turning it off drops the resumes it
+scheduled; ones you asked for stay. None of the
 agents picks itself up when a limit resets (Claude Code's
 "auto-continue" is in its Desktop app only), so rlord does it. An
 OpenCode session is never resumed while OpenCode is counting down its

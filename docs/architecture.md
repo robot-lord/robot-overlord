@@ -540,8 +540,12 @@ hooks and `discover` keep the stored status to themselves.
   `limit_auto`: `{id: limit at}`, written whenever a job is made or
   rescheduled, whatever the setting, so turning it on later doesn't
   revive a cancelled resume), so a cancelled or given-up job isn't
-  remade, and an automatic job never replaces one made meanwhile
-  (checked under the session's lock). Unset is off; the first-run setup
+  remade, and an automatic job (`auto: true`) is never made over a job
+  or for a limit marked meanwhile (both checked under the session's
+  lock). With the setting off (however: the dialog, a reload, a
+  restart), the next tick drops the `auto` jobs, logged as
+  `limit_resume_cancelled`; asked-for ones stay. The resume message
+  fallback is `LimitsConfig::message`. Unset is off; the first-run setup
   form offers it as an optional hint ("ask me later" by default;
   `setup.apply {auto_resume}`, one config write with the folder), and a
   dialog asks when a listed session is limited and `limits.auto_resume {on}` writes the
