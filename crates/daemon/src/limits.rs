@@ -827,6 +827,14 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
             update(&|j| {
                 j.remove(id);
             })?;
+            // A newer limit it gives up on (it kept hitting) is handled
+            // too: `auto_schedule` doesn't start over on it.
+            if let Some(h) = hit
+                .as_ref()
+                .filter(|h| !h.touched && h.at > job["limit_at"].as_i64().unwrap_or(0))
+            {
+                mark_handled(&d.db(), id, &json!(h.at))?;
+            }
             if !done {
                 log("limit_resume_skipped", json!({"why": why}))?;
             }
@@ -1413,6 +1421,26 @@ mod tests {
         d.update_config(|c| c.limits.auto_resume = Some(false));
         auto_schedule(&d).unwrap();
         assert!(d.db().kv_map(JOBS_KEY).unwrap().contains_key("s1"));
+    }
+
+    /// A job that gives up because the limit kept hitting: auto-resume
+    /// doesn't start a fresh one on that newer limit.
+    #[test]
+    fn giving_up_on_a_limit_that_kept_hitting_is_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), Some(true));
+        let at = limits(&d)["s1"]["at"].as_i64().unwrap();
+        let job = json!({"message": "continue", "limit_at": at - 10, "resets_at": at - 5,
+                         "asked_at": 0, "attempts": MAX_ATTEMPTS, "sent_at": at - 1});
+        let jobs = Map::from_iter([("s1".to_string(), job)]);
+        d.db().kv_set_map(JOBS_KEY, &jobs).unwrap();
+        run_job(&d, "s1").unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty(), "given up");
+        auto_schedule(&d).unwrap();
+        assert!(
+            d.db().kv_map(JOBS_KEY).unwrap().is_empty(),
+            "no fresh job on the limit it gave up on"
+        );
     }
 
     /// Asked for, then cancelled, with auto-resume on: stays cancelled.
