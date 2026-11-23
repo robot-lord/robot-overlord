@@ -241,7 +241,8 @@ pub struct OverlordConfig {
 
 impl OverlordConfig {
     /// The overlord's default (model, effort) on `agent`: a strong model at
-    /// medium effort. Claude: Opus / medium. Codex: its own default model with
+    /// medium effort. Claude: Opus / medium. Codex: "" here, resolved from its
+    /// catalog when the overlord is set up (`overlord::model_effort_for`), with
     /// `model_reasoning_effort = "medium"`. OpenCode: its default model; it has
     /// no effort to set.
     pub fn defaults_for(agent: &str) -> (&'static str, &'static str) {

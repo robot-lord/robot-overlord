@@ -691,6 +691,7 @@ mod tests {
             name: "/dev/ttys001".into(),
             session: "rlord".into(),
             activity: 0,
+            focused: true,
         });
         let sugg = json!({"suggestion": null, "roots": {"configured": []}});
         let r = queue_confirm(

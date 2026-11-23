@@ -98,6 +98,8 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
         bail!("workspace directory already exists: {}", dir.display());
     }
     let exists = branch_exists(repo, branch);
+    // (What was there before: a failure removes only what this call made.)
+    let was_registered = worktree_registered(repo, dir);
     if exists && start.is_some() {
         bail!("branch {branch} already exists");
     }
@@ -105,9 +107,9 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
         std::fs::create_dir_all(parent)?;
     }
     let dir_s = dir.to_string_lossy();
-    match (exists, start) {
-        (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch])?,
-        (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s])?,
+    let made = match (exists, start) {
+        (true, _) => git(&["-C", repo, "worktree", "add", &dir_s, branch]),
+        (false, None) => git(&["-C", repo, "worktree", "add", "-b", branch, &dir_s]),
         (false, Some(start)) => git(&[
             "-C",
             repo,
@@ -118,14 +120,60 @@ pub fn worktree_add(repo: &str, branch: &str, dir: &Path, start: Option<&str>) -
             branch,
             &dir_s,
             start,
-        ])?,
+        ]),
     };
+    if let Err(e) = made {
+        // git makes a new branch before its folder: a failure after that
+        // leaves the branch behind (and maybe this worktree, registered).
+        // Only what this call made is removed: a registration at `dir`
+        // that wasn't there before, then a branch that wasn't (`branch -D`
+        // refuses one checked out anywhere). No repo-wide prune.
+        if !was_registered && worktree_registered(repo, dir) {
+            let _ = git(&["-C", repo, "worktree", "remove", "--force", &dir_s]);
+        }
+        if !exists && branch_exists(repo, branch) {
+            let _ = git(&["-C", repo, "branch", "-D", branch]);
+        }
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Whether `repo` lists a worktree at `dir`.
+fn worktree_registered(repo: &str, dir: &Path) -> bool {
+    let want = canonical_path(dir);
+    git(&["-C", repo, "worktree", "list", "--porcelain"]).is_ok_and(|out| {
+        out.lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|w| canonical_path(Path::new(w)) == want)
+    })
+}
+
+/// `p` with symlinks resolved, also when it is missing: its nearest
+/// existing ancestor resolved, the rest joined back on.
+fn canonical_path(p: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical_path(parent).join(name)
+        }
+        _ => p.to_path_buf(),
+    }
 }
 
 /// The commit checked out in the folder `dir` (its HEAD).
 pub fn head_commit(dir: &str) -> Result<String> {
     git(&["-C", dir, "rev-parse", "--verify", "HEAD"])
+}
+
+/// The branch checked out in `dir` (None: detached, or not a repo).
+pub fn checked_out_branch(dir: &str) -> Option<String> {
+    git(&["-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
 }
 
 /// Whether the checkout at `dir` has anything not committed: changed
@@ -494,6 +542,39 @@ mod tests {
         let e = worktree_add(r, "x-fork", &repo.join("other"), Some(&first)).unwrap_err();
         assert!(e.to_string().contains("already exists"), "{e}");
         assert!(worktree_add(r, "y-fork", &wt, Some(&first)).is_err());
+        // A failure after git made the branch (its folder can't be made)
+        // leaves no branch behind.
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // (Root writes there anyway: nothing fails, nothing to check.)
+        if std::fs::create_dir(locked.join("probe")).is_err() {
+            let e = worktree_add(r, "z-fork", &locked.join("z"), Some(&first));
+            assert!(e.is_err());
+            assert!(!branch_exists(r, "z-fork"));
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The user's own registration of a folder that is gone ("missing
+        // but already registered"): git refuses the add, and that
+        // registration survives (only this call's new branch goes).
+        let gone = repo.join(".worktrees").join("gone");
+        worktree_add(r, "gone-branch", &gone, Some(&first)).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(worktree_add(r, "new-branch", &gone, Some(&first)).is_err());
+        assert!(worktree_registered(r, &gone));
+        assert!(branch_exists(r, "gone-branch"));
+        assert!(!branch_exists(r, "new-branch"));
+        // A missing folder under a symlinked path still matches.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        assert!(worktree_registered(
+            r,
+            &link.join(".worktrees").join("gone")
+        ));
+        // (Tidied up for what follows.)
+        git(&["-C", r, "worktree", "prune"]).unwrap();
+        git(&["-C", r, "branch", "-D", "gone-branch"]).unwrap();
         assert_eq!(
             has_changes(&dir.path().join("none").to_string_lossy()),
             None

@@ -396,51 +396,61 @@ impl App {
                 Span::styled(what.to_string(), theme::muted()),
             ])
         };
+        let sub =
+            |s: &str| Line::styled(format!("  {s}"), Style::default().fg(theme::text()).bold());
         let mut left = vec![
             head("In the list"),
+            sub("Move"),
             row(format!("{}/{}", k(Action::Down), k(Action::Up)), "move"),
             row(
                 format!("{}/{}", k(Action::Top), k(Action::Bottom)),
                 "top / bottom",
             ),
-            row(k(Action::Attach), "attach (resumes a stopped one)"),
-            row(k(Action::Filter), "search"),
-            row(k(Action::New), "new session (ask the overlord)"),
-            row(k(Action::NewManual), "new session (form)"),
-            row(k(Action::Fork), "fork (a copy of its conversation)"),
+        ];
+        if self.config.jump_digits {
+            left.push(row("1–9".into(), "attach the Nth session"));
+        }
+        left.extend([
             row(k(Action::SwitchTab), "sessions ⇄ groups"),
             row(
                 format!("{}/{}", k(Action::SessionsTab), k(Action::GroupsTab)),
                 "step between tabs",
             ),
+            row(k(Action::Filter), "search"),
+            sub("Sessions"),
+            row(k(Action::Attach), "attach (resumes a stopped one)"),
+            row(k(Action::New), "new session (ask the overlord)"),
+            row(k(Action::NewManual), "new session (form)"),
+            row(k(Action::Fork), "fork (a copy of its conversation)"),
             row(k(Action::Restart), "restart"),
             row(k(Action::Stop), "stop"),
             row(
                 format!("{}/{}", k(Action::Archive), k(Action::Unarchive)),
                 "archive / unarchive",
             ),
+            sub("Edit"),
             row(k(Action::Rename), "rename"),
             row(k(Action::Pin), "pin"),
             row(k(Action::Tags), "tags (= groups)"),
             row(k(Action::Describe), "describe"),
             row(k(Action::Notes), "notes in $EDITOR"),
+            sub("View"),
             row(k(Action::Sort), "next sort"),
             row(k(Action::ReverseSort), "reverse sort"),
+        ]);
+        // (Unbound: its default `U` gave way to a key of the user's.)
+        if self.keys.event(Action::Usage).is_some() {
+            left.push(row(k(Action::Usage), "Usage: turns/tokens/context"));
+        }
+        left.extend([
             row(
                 format!("{}/{}", k(Action::ToggleArchived), k(Action::Cancel)),
                 "archived view / back to the list",
             ),
             row(k(Action::ToggleLog), "pane ⇄ log preview"),
+            Line::from(""),
             row(k(Action::Quit), "quit"),
-        ];
-        // (Unbound: its default `U` gave way to a key of the user's.)
-        if self.keys.event(Action::Usage).is_some() {
-            let at = left.len() - 3;
-            left.insert(at, row(k(Action::Usage), "Usage: turns/tokens/context"));
-        }
-        if self.config.jump_digits {
-            left.insert(4, row("1–9".into(), "attach the Nth session"));
-        }
+        ]);
         let mut right = vec![
             head("Ask the overlord"),
             Line::styled(

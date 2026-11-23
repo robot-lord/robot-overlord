@@ -47,11 +47,22 @@ fn matched_fields(s: &Session, ws: &[String]) -> Vec<&'static str> {
 
 /// The overlord's session, or one that ran in an overlord's folder (the
 /// retired front desk of a two-session overlord).
-fn is_overlords(s: &Session, dirs: &[String]) -> bool {
-    crate::overlord::is_overlord_role(&s.role) || dirs.contains(&s.project_path)
+fn is_overlords(s: &Session) -> bool {
+    crate::overlord::overlords_at(&s.role, &s.project_path)
 }
 
 pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
+    search_in(d, params, None)
+}
+
+/// `search`, over the sessions in `only` (by id) when given: nothing
+/// outside rlord and no other session. For a session's own scoped tools
+/// (`session_tools`); not reachable from an MCP tool's arguments.
+pub(crate) fn search_in(
+    d: &Daemon,
+    params: &Value,
+    only: Option<&std::collections::HashSet<String>>,
+) -> Result<Value> {
     let query = params["query"].as_str().unwrap_or("").trim();
     if query.is_empty() {
         bail!("query is required");
@@ -63,6 +74,9 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     let one = match params["session"].as_str().map(str::trim) {
         Some(r) if !r.is_empty() => {
             let s = d.db().resolve_ref(r)?;
+            if only.is_some_and(|o| !o.contains(&s.id)) {
+                bail!("no such session among those this one can see");
+            }
             if crate::overlord::is_overlord_role(&s.role) {
                 bail!("the overlord's own conversations are searched with recall");
             }
@@ -71,7 +85,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
         _ => None,
     };
     let named = one.is_some();
-    let everywhere = everywhere && !named;
+    let everywhere = everywhere && !named && only.is_none();
     let sessions = match one {
         Some(s) => vec![s],
         None => {
@@ -79,7 +93,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
                 archived: ArchivedMode::All,
                 ..Default::default()
             };
-            d.db().sessions(&q)?
+            let mut all = d.db().sessions(&q)?;
+            if let Some(o) = only {
+                all.retain(|s| o.contains(&s.id));
+            }
+            all
         }
     };
     // Each session's transcripts: the current one, then any from before a
@@ -111,7 +129,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
     // A session that ran in an overlord's folder (the retired front desk)
     // is searched only when named: then its own transcripts are what was
     // asked for.
-    let dropped = |s: &Session| !named && is_overlords(s, &own_dirs);
+    let dropped = |s: &Session| !named && is_overlords(s);
     for (i, s) in sessions.iter().enumerate() {
         if dropped(s) {
             // (Its folder is skipped whole, above: no need to look its
@@ -119,7 +137,7 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
             continue;
         }
         let ps = summary::transcripts_of(d, s);
-        if named && ps.is_empty() && is_overlords(s, &own_dirs) {
+        if named && ps.is_empty() && is_overlords(s) {
             bail!("{} has no transcript left on disk to search", s.name);
         }
         for p in &ps {
@@ -246,6 +264,11 @@ pub fn search(d: &Daemon, params: &Value) -> Result<Value> {
 }
 
 pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
+    read_with(d, params, 12_000)
+}
+
+/// `read`, its messages within `budget` characters.
+pub(crate) fn read_with(d: &Daemon, params: &Value, budget: usize) -> Result<Value> {
     let line = params["line"].as_u64();
     let before = params["before"].as_u64().unwrap_or(6).min(40) as usize;
     let after = params["after"].as_u64().unwrap_or(14).min(60) as usize;
@@ -288,7 +311,7 @@ pub fn read(d: &Daemon, params: &Value) -> Result<Value> {
         }
         _ => bail!("session or transcript is required"),
     };
-    let msgs = history::read(&path, line, before, after, 12_000)?;
+    let msgs = history::read(&path, line, before, after, budget)?;
     let mut v = label;
     v["messages"] = json!(msgs);
     Ok(v)

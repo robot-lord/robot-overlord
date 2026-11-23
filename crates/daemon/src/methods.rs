@@ -202,11 +202,14 @@ pub fn session_tag(db: &Db, params: &Value) -> Result<Value> {
     Ok(serde_json::to_value(db.resolve_ref(&s.id)?)?)
 }
 
-/// Tags are rlord's groups: `{groups: [{tag, count}], untagged}` over live
-/// sessions.
-pub fn tag_list(db: &Db) -> Result<Value> {
+/// Tags are rlord's groups: `{groups: [{tag, count}], untagged, order}`
+/// over live sessions. `{archived: true}` counts archived sessions in
+/// `groups` too (the TUI's tags editor suggests from those); `untagged`
+/// stays live only.
+pub fn tag_list(db: &Db, params: &Value) -> Result<Value> {
+    let archived = params["archived"].as_bool().unwrap_or(false);
     let groups: Vec<Value> = db
-        .tag_counts()?
+        .tag_counts_in(archived)?
         .into_iter()
         .map(|(tag, count)| json!({"tag": tag, "count": count}))
         .collect();
@@ -406,6 +409,27 @@ pub(crate) fn spec_args(agent: Agent, spec: &Value) -> Vec<String> {
     a
 }
 
+/// A start's agent flags: the session's own (`spec_args`) and its
+/// look-ups (`session_tools::wiring`, which makes its token). Every start
+/// path uses it: a new session, a restart, a fork, a fresh conversation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_args(
+    db: &Db,
+    base: &std::path::Path,
+    id: &str,
+    agent: Agent,
+    spec: &Value,
+    role: &str,
+    folder: &str,
+    daemon: bool,
+) -> Vec<String> {
+    let mut a = spec_args(agent, spec);
+    a.extend(crate::session_tools::wiring(
+        db, base, id, agent, role, folder, daemon,
+    ));
+    a
+}
+
 /// `[session] claude_tui`, set once at daemon start (see `set_claude_tui`).
 static CLAUDE_TUI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -551,6 +575,8 @@ fn program_at(agent: Agent, argv: &mut [String], at: Option<std::path::PathBuf>)
 /// its hooks run in the daemon and go by thread, and a daemon the TUI
 /// starts from this pane would hand the variable to every thread's hooks.
 fn pane_env(
+    base: &std::path::Path,
+    agent: Agent,
     session_id: &str,
     program: Option<&std::path::Path>,
     daemon: bool,
@@ -558,6 +584,17 @@ fn pane_env(
     let mut env = Vec::new();
     if !daemon {
         env.push(("RLORD_SESSION_ID".to_string(), session_id.to_string()));
+        // Where its look-up token is (`rlord context`): a path, never the
+        // token itself. Not for OpenCode: its shell commands run in its
+        // shared server, which would hand the first pane's to every
+        // session (its background names the file and socket instead).
+        let token = crate::session_tools::token_path(base, session_id);
+        if agent != Agent::OpenCode && token.is_file() {
+            env.push((
+                crate::session_tools::TOKEN_ENV.to_string(),
+                token.to_string_lossy().into_owned(),
+            ));
+        }
     }
     let path = std::env::var("PATH").unwrap_or_default();
     env.extend(path_with(program, &path).map(|p| ("PATH".to_string(), p)));
@@ -582,17 +619,22 @@ pub fn launched_args_key(id: &str) -> String {
 
 /// The command a session's pane runs (see `pane_env`).
 fn pane_cmd(
+    base: &std::path::Path,
+    agent: Agent,
     session_id: &str,
     program: Option<&std::path::Path>,
     daemon: bool,
     argv: &[String],
 ) -> String {
-    let env = pane_env(session_id, program, daemon);
-    if daemon {
-        tmux::pane_command_unsetting(&["RLORD_SESSION_ID"], &env, argv)
-    } else {
-        tmux::pane_command(&env, argv)
-    }
+    let env = pane_env(base, agent, session_id, program, daemon);
+    // What it isn't given is unset: tmux's server may carry another
+    // pane's (`PANE_ENV`).
+    let unset: Vec<&str> = rlord_core::agents::PANE_ENV
+        .iter()
+        .copied()
+        .filter(|k| !env.iter().any(|(e, _)| e == k))
+        .collect();
+    tmux::pane_command_unsetting(&unset, &env, argv)
 }
 
 fn note_launch(db: &Db, id: &str, argv: &[String]) -> Result<()> {
@@ -822,8 +864,11 @@ pub(crate) fn session_new_with(
     // Its file first (the agent may read it at once). Best effort: a
     // file that can't be written never stops the launch; the launch then
     // carries no flag or pointer naming it.
+    // Its own read-only look-ups, computed at every start and never
+    // stored (the token first: its background names it).
+    let mut args = start_args(db, &base, &id, agent, &spec, &role, &project_path, daemon);
     let file_ok = delivery.is_some() && {
-        let text = context::launch_file_text_rows(db, &name, &[], &rows, now_ms());
+        let text = context::launch_file_text_rows(db, &base, &id, &name, &[], &rows, now_ms());
         match context::write_file(&base, &id, &text) {
             Ok(_) => true,
             Err(e) => {
@@ -833,25 +878,32 @@ pub(crate) fn session_new_with(
         }
     };
     let carried = delivery.filter(|d| file_ok || *d == context::Delivery::Hook);
-    let mut args = spec_args(agent, &spec);
     args.extend(context::launch_args(carried, &bg_file));
     // With no words of the user's, the pointer line alone is the prompt.
     let first = context::launch_prompt(prompt.as_deref(), carried, &bg_file);
-    let launch = agent.launch(&project_path, first.as_deref(), model.as_deref(), &args);
+    // The user's words leave the command line (`first_prompt`).
+    let placed = crate::first_prompt::place(&base, &id, agent, first.as_deref(), prompt.is_some());
+    let launch = agent.launch(
+        &project_path,
+        placed.argv.as_deref(),
+        model.as_deref(),
+        &args,
+    );
     let tmux_name = match p_opt("tmux_name") {
         Some(n) => n,
         None => tmux_name_for(db, &name, None),
     };
     let launch_spec = spec.to_string();
-    start(
+    let started = start(
         db,
         Start {
+            base: &base,
             id: &id,
             name: &name,
             agent,
             launch_spec: &launch_spec,
             launch,
-            first: first.as_deref(),
+            first: placed,
             project_path: &project_path,
             repo: repo.as_deref(),
             workspace_path: workspace_path.as_deref(),
@@ -872,7 +924,13 @@ pub(crate) fn session_new_with(
                 json!({"workspace": workspace_path, "branch": branch, "base": start_base}),
             ),
         },
-    )?;
+    );
+    if let Err(e) = started {
+        // (Its token, MCP config and kv keys were made for it: gone too.)
+        crate::session_tools::forget(db, &base, &id);
+        crate::first_prompt::forget(db, &base, &id);
+        return Err(e);
+    }
     tracing::info!(session = %id, name = %name, agent = agent.name(), workspace = ?workspace_path, "launched session");
 
     let s = db.resolve_ref(&id)?;
@@ -897,6 +955,8 @@ pub(crate) struct Background<'a> {
 
 /// What a new session and a fork have decided before the pane starts.
 pub(crate) struct Start<'a> {
+    /// rlord's data folder (its session files).
+    pub base: &'a std::path::Path,
     pub id: &'a str,
     pub name: &'a str,
     pub agent: Agent,
@@ -904,9 +964,10 @@ pub(crate) struct Start<'a> {
     pub launch_spec: &'a str,
     /// The agent's command, and what is known of its conversation.
     pub launch: rlord_core::agents::Launch,
-    /// The first prompt as typed (an agent that picks its own id is bound
-    /// by it).
-    pub first: Option<&'a str>,
+    /// Where its first prompt went (`first_prompt::place`): what is on
+    /// argv binds an agent that picks its own id; a file for its stdin or
+    /// its server.
+    pub first: crate::first_prompt::Placed,
     pub project_path: &'a str,
     pub repo: Option<&'a str>,
     pub workspace_path: Option<&'a str>,
@@ -961,7 +1022,8 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
         db.upsert_transcript_source(id, &t.to_string_lossy())?;
     }
     hold_deferred(db, id, &launch)?;
-    note_first_prompt(db, id, agent, s.first, now)?;
+    note_first_prompt(db, id, agent, s.first.argv.as_deref(), now)?;
+    crate::first_prompt::hold(db, id, s.first.server.as_deref(), now)?;
     if let Some(bg) = &s.background {
         context::turn_on(db, id)?;
         if let Some((from, except)) = bg.copy_from {
@@ -976,7 +1038,8 @@ pub(crate) fn start(db: &Db, s: Start) -> Result<()> {
         }
     }
 
-    let cmd = pane_cmd(id, program.as_deref(), s.daemon, argv);
+    let cmd = pane_cmd(s.base, agent, id, program.as_deref(), s.daemon, argv);
+    let cmd = crate::first_prompt::with_stdin(cmd, s.first.stdin.as_deref());
     note_launch(db, id, argv)?;
     // (Its folder is in the gate before its first hook can run.)
     crate::codex_daemon::sync_gate(db);
@@ -1228,6 +1291,18 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // without it the start carries no flag or pointer naming it.
     let base = paths::data_dir();
     let bg_file = context::file_path(&base, &s.id);
+    // With its own read-only look-ups, computed at every start (the token
+    // first: its background names it).
+    let own_args = start_args(
+        db,
+        &base,
+        &s.id,
+        agent,
+        &spec,
+        &s.role,
+        &s.project_path,
+        s.codex_daemon,
+    );
     let rewritten = match context::refresh_file_with(db, &base, &s, renewed_note.as_ref()) {
         Ok(f) => f.is_some(),
         Err(e) => {
@@ -1240,13 +1315,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     // them).
     let (mut argv, resumed) = match &refork {
         Some(parent) => (
-            crate::fork::refork_argv(
-                agent,
-                &s,
-                parent,
-                model.as_deref(),
-                &spec_args(agent, &spec),
-            )?,
+            crate::fork::refork_argv(agent, &s, parent, model.as_deref(), &own_args)?,
             false,
         ),
         None => agent.resume(
@@ -1254,7 +1323,7 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
             &s.agent_session_trust,
             &s.project_path,
             model.as_deref(),
-            &spec_args(agent, &spec),
+            &own_args,
         )?,
     };
     let mut mode = context::mode(db, &s.id)?;
@@ -1280,6 +1349,21 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let first = crate::fork::restart_prompt(&spec, refork.is_some(), carried, resumed, &bg_file);
     // (What it hands over: the pointer.)
     let pointer_sent = first.is_some() && carried == Some(context::Delivery::Pointer);
+    // A re-fork's own words leave the command line, as at the fork.
+    let words = refork.is_some()
+        && spec["prompt"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty());
+    let placed = crate::first_prompt::place(&base, &s.id, agent, first.as_deref(), words);
+    // A first prompt still held from an earlier start (it carries the
+    // pointer already) goes instead of a new pointer on argv.
+    let carried_held = placed.server.is_none()
+        && !words
+        && db
+            .kv_get(&crate::first_prompt::pending_key(&s.id))?
+            .is_some();
+    let first = placed.argv.clone().filter(|_| !carried_held);
+    let pointer_sent = pointer_sent && !carried_held;
     if let Some(p) = &first {
         agent.add_first_prompt(&mut argv, p);
     }
@@ -1290,7 +1374,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
     let deferred = agent.deferred(model.as_deref()).filter(|_| !resumed);
     hold(db, &s.id, deferred.as_ref())?;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, &argv);
+    let cmd = pane_cmd(
+        &base,
+        agent,
+        &s.id,
+        program.as_deref(),
+        s.codex_daemon,
+        &argv,
+    );
+    let cmd = crate::first_prompt::with_stdin(cmd, placed.stdin.as_deref());
     note_launch(db, &s.id, &argv)?;
     // A re-fork binds its new thread as at the fork: the key that says so
     // is written before the pane starts, so it can't be lost after.
@@ -1312,6 +1404,15 @@ pub fn session_restart(db: &Db, params: &Value) -> Result<Value> {
         }
     };
     let now = now_ms();
+    // A first prompt for the server: this start's, else one an earlier
+    // start left unsent, carried with a fresh clock.
+    logged(
+        "holding the first prompt",
+        match placed.server.as_deref() {
+            Some(f) => crate::first_prompt::hold(db, &s.id, Some(f), now),
+            None => crate::first_prompt::restamp(db, &s.id, now),
+        },
+    );
     if let Some(fallback) = fell_back {
         logged(
             "recording the mode",
@@ -1429,11 +1530,28 @@ pub fn session_fresh(db: &Db, params: &Value) -> Result<Value> {
     let agent = Agent::named(&s.agent)?;
     let spec: Value = serde_json::from_str(&db.launch_spec(&s.id)?).unwrap_or(json!({}));
     let model = spec.get("model").and_then(Value::as_str);
-    let mut launch = agent.launch(&s.project_path, None, model, &spec_args(agent, &spec));
+    let args = start_args(
+        db,
+        &paths::data_dir(),
+        &s.id,
+        agent,
+        &spec,
+        &s.role,
+        &s.project_path,
+        s.codex_daemon,
+    );
+    let mut launch = agent.launch(&s.project_path, None, model, &args);
     let program = pane_program(agent, &mut launch.argv);
     let argv = &launch.argv;
     let tmux_name = tmux_name_of(db, &s)?;
-    let cmd = pane_cmd(&s.id, program.as_deref(), s.codex_daemon, argv);
+    let cmd = pane_cmd(
+        &paths::data_dir(),
+        agent,
+        &s.id,
+        program.as_deref(),
+        s.codex_daemon,
+        argv,
+    );
     note_launch(db, &s.id, argv)?;
     let now = now_ms();
     if tmux::has_session(&tmux_name) {
@@ -1548,6 +1666,13 @@ pub fn session_archive(db: &Db, params: &Value) -> Result<Value> {
     db.kv_delete(&needs_you_key(&s.id))?;
     db.set_status(&s.id, Status::Stopped, now)?;
     db.set_archived(&s.id, Some(now))?;
+    // Its look-ups stop answering (a start after unarchiving makes a new
+    // token).
+    if let Err(e) = crate::session_tools::revoke(db, &paths::data_dir(), &s.id) {
+        tracing::warn!(session = %s.id, error = %e, "removing the session's token");
+    }
+    // Its first prompt's file and keys are done with.
+    crate::first_prompt::forget(db, &paths::data_dir(), &s.id);
     let turn = &params["interrupt"];
     db.insert_event(&s.id, now, "archived", &stop_detail(turn).to_string())?;
     crate::codex_daemon::sync_gate(db);
@@ -1564,12 +1689,25 @@ pub fn session_log(db: &Db, params: &Value) -> Result<Value> {
 
 /// Ingest one live agent hook event (from `rlord hook emit`).
 pub fn hook_emit(db: &Db, params: &Value) -> Result<Value> {
-    hook_emit_with(db, params, &|agent, id| agent.indexed(id))
+    hook_emit_turn(db, params, None)
+}
+
+/// `hook_emit`, with whether the session's transcript shows a turn open
+/// since its last turn end (`turn_open_for`, read before the DB lock;
+/// None: not asked). Never taken from the request.
+pub(crate) fn hook_emit_turn(db: &Db, params: &Value, turn_open: Option<bool>) -> Result<Value> {
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), true, turn_open)
 }
 
 /// `hook.ack`: the hook client printed the answer `ack` names.
 pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
-    let acked = context::ack(db, p_str(params, "ack")?, now_ms())?;
+    let ack = p_str(params, "ack")?;
+    // A Stop hook's answer that carried held messages on, or background.
+    let acked = if ack.starts_with(crate::send::CLAIM_PREFIX) {
+        crate::send::claim_ack(db, ack, now_ms())?
+    } else {
+        context::ack(db, ack, now_ms())?
+    };
     Ok(json!({"acked": acked}))
 }
 
@@ -1577,17 +1715,18 @@ pub fn hook_ack(db: &Db, params: &Value) -> Result<Value> {
 /// but its client is long gone, so it gets no answer (nothing is handed
 /// over, nothing marked).
 pub fn hook_replay(db: &Db, params: &Value) -> Result<Value> {
-    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false)
+    hook_emit_in(db, params, &|agent, id| agent.indexed(id), false, None)
 }
 
 /// `hook_emit`, with how to ask an agent's own index whether a
 /// conversation is one the user drives (tests answer it themselves).
+#[cfg(test)]
 pub(crate) fn hook_emit_with(
     db: &Db,
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
 ) -> Result<Value> {
-    hook_emit_in(db, params, indexed, true)
+    hook_emit_in(db, params, indexed, true, None)
 }
 
 /// `live`: its client waits for the answer (false: replayed).
@@ -1596,6 +1735,7 @@ fn hook_emit_in(
     params: &Value,
     indexed: &dyn Fn(Agent, &str) -> Indexed,
     live: bool,
+    turn_open: Option<bool>,
 ) -> Result<Value> {
     // `instance`: the hook's RLORD_SESSION_ID. A hook Codex's background
     // server ran has none (`by: "thread"`): see `codex_daemon::route`.
@@ -1626,9 +1766,20 @@ fn hook_emit_in(
     // change nothing for this session: done, with no tmux call, no write
     // and no log line.
     let own_agent = Agent::parse(agent).filter(|a| a.name() == s.agent);
+    // (A tool call of the session's own agent while its turn is over: the
+    // agent is working again without a prompt hook; see `wakes_idle`.)
+    let wakes = own_agent.is_some()
+        && wakes_idle(
+            params,
+            s.status,
+            live,
+            s.last_agent_msg_at,
+            // (Read before the DB lock was taken: `turn_open_for`.)
+            &|_, _| turn_open == Some(true),
+        );
     if let Some(a) = own_agent {
         let (kind, effect) = a.map_hook_event(event, &payload);
-        if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() {
+        if matches!(kind, "tool" | "notification") && effect.apply(s.status).is_none() && !wakes {
             return Ok(json!({"ok": true, "unchanged": true}));
         }
     }
@@ -1786,6 +1937,7 @@ fn hook_emit_in(
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or_default();
         let (blocked, status) = blocked_after(was.clone(), &change, effect, s.status);
+        let status = status.or((wakes && whose != Whose::Other).then_some(Status::Working));
         if (effect == Effect::Resume || whose == Whose::Other) && status.is_none() {
             // Someone moved on or ended, but not (all of) who the session
             // waits for.
@@ -1829,8 +1981,22 @@ fn hook_emit_in(
         // session only comes back if its tmux session really exists.
         let revives_dead = s.status == Status::Stopped
             && !s.tmux_session.as_deref().is_some_and(tmux::has_session);
-        if let Some(st) = status.filter(|st| *st == Status::Stopped || !revives_dead) {
+        let blocked = status.is_some_and(|st| st != Status::Stopped && revives_dead);
+        if let Some(st) = status.filter(|_| !blocked) {
             db.set_status(&s.id, st, now)?;
+        }
+        // Why it waits, for the attention queue (not when the write was
+        // refused: the status didn't change).
+        let after = status.unwrap_or(s.status);
+        let (rkind, question) = reason_of_hook(whose == Whose::Other, kind, &payload, after);
+        // (Woke from idle by its own tool call: a turn began.)
+        let rkind = if wakes && status == Some(Status::Working) {
+            "turn_started"
+        } else {
+            rkind
+        };
+        if !blocked {
+            crate::reason::record(db, &s, rkind, after, question, event == "StopFailure")?;
         }
         if kind.starts_with("subagent_") && agent.tracks_subagents() {
             ingest_subagent_hook(db, &s.id, kind, &payload, now)?;
@@ -1843,6 +2009,15 @@ fn hook_emit_in(
                 _ => kind,
             };
             let mut detail = crate::own::with_source(json!({"hook": event}), source);
+            // A prompt the agent got from a background task finishing
+            // (Claude runs `UserPromptSubmit` for it): not the user's.
+            if payload["prompt_wake"] == true {
+                detail["wake"] = json!(true);
+            }
+            // The agent at work again with no prompt hook.
+            if wakes && status == Some(Status::Working) {
+                detail["woke"] = json!(true);
+            }
             // How the agent started (`startup`, `resume`, `clear`,
             // `compact`). Only `startup` is sure to be a new process,
             // which ended the old one's background work (`background.rs`;
@@ -1856,6 +2031,26 @@ fn hook_emit_in(
             }
             db.insert_event(&s.id, now, kind, &detail.to_string())?;
         }
+        // The session's own Stop while overlord messages wait for it: the
+        // hook's answer carries them on (`send::stop_claim`). Last, after
+        // every fallible step: an event that failed leaves no claim. The
+        // status went idle as usual; the ack (`send::claim_ack`) sets it
+        // working again, so a lost ack never leaves it working. Best
+        // effort, like the background. A prompt ends a run of claims.
+        let mut claim = None;
+        if live && whose != Whose::Other {
+            let r = match event {
+                "Stop" => crate::send::stop_claim(db, &s, agent, now).map(|c| claim = c),
+                "UserPromptSubmit" => crate::send::claims_reset(db, &s.id),
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                tracing::warn!(session = %s.id, event, error = %e, "held messages at a hook");
+            }
+        }
+        if let Some(c) = claim {
+            return Ok(json!({"ok": true, "reply": c.output, "reply_ack": c.ack}));
+        }
         return Ok(answer(json!({"ok": true})));
     } else {
         db.insert_event(
@@ -1868,6 +2063,85 @@ fn hook_emit_in(
     Ok(json!({"ok": true}))
 }
 
+/// A hook that might wake an idle session, by its own fields alone (no
+/// session, no file): Claude's main agent (no `agent_id`) finishing a tool
+/// call (`PostToolUse`), stamped with when it ran (`at`), whole (not cut
+/// off), with a transcript to look at. Asked first, before anything costs:
+/// by `Daemon::call` before it looks the session up, and by `wakes_idle`.
+pub(crate) fn wake_candidate(params: &Value) -> bool {
+    let payload = &params["payload"];
+    params["agent"] == Agent::Claude.name()
+        && matches!(
+            params["event"].as_str(),
+            Some("PostToolUse" | "PostToolUseFailure")
+        )
+        && params["at"].is_i64()
+        && payload["truncated"] != true
+        && payload["agent_id"].as_str().is_none_or(str::is_empty)
+        && payload["transcript_path"].is_string()
+}
+
+/// For a live hook about to be handled (`Daemon::call`, before it takes
+/// the DB lock): whether session `s`'s transcript shows a turn open that
+/// began after its last turn end, asked only when `wakes_idle`'s cheap
+/// conditions hold (the transcript read is the costly part). The answer
+/// goes to `hook_emit_turn`. None: not asked.
+pub(crate) fn turn_open_for(s: &rlord_core::types::Session, params: &Value) -> Option<bool> {
+    let path = params["payload"]["transcript_path"].as_str()?;
+    wakes_idle(params, s.status, true, s.last_agent_msg_at, &|_, _| true).then(|| {
+        transcript::turn_open_after(std::path::Path::new(path), s.last_agent_msg_at.unwrap_or(0))
+    })
+}
+
+/// Whether a hook shows the session's own agent at work while its stored
+/// status says the turn is over: a `wake_candidate` while `idle`. Claude
+/// starts a turn without a `UserPromptSubmit` for a prompt the user queued
+/// while it worked; its `Stop` comes while already idle. A tool hook alone
+/// isn't proof (a stray one would leave the session working with nothing
+/// to set it back): the transcript must show a turn open that began after
+/// the session's last turn end (`turn_open`, asked last: it reads the
+/// file). Live hooks only: a replayed one is old news; and only one that
+/// ran (`at`) after that turn end.
+pub(crate) fn wakes_idle(
+    params: &Value,
+    status: Status,
+    live: bool,
+    last_stop: Option<i64>,
+    turn_open: &dyn Fn(&str, i64) -> bool,
+) -> bool {
+    live && status == Status::Idle
+        && wake_candidate(params)
+        && params["at"]
+            .as_i64()
+            .is_some_and(|at| last_stop.is_none_or(|stop| at > stop))
+        && params["payload"]["transcript_path"]
+            .as_str()
+            .is_some_and(|p| turn_open(p, last_stop.unwrap_or(0)))
+}
+
+/// A hook event as `reason::record` reads it: its kind (another
+/// conversation's wait reads as a permission request; its other events
+/// don't concern the session's reason) and whether what it asks is a
+/// question (`AskUserQuestion`, an elicitation).
+fn reason_of_hook<'a>(
+    other: bool,
+    kind: &'a str,
+    payload: &Value,
+    after: Status,
+) -> (&'a str, bool) {
+    let question = kind == "question_asked"
+        || payload["tool_name"] == "AskUserQuestion"
+        || payload["notification_type"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("elicitation"));
+    let kind = match (other, after) {
+        (true, Status::WaitingInput) => "permission_request",
+        (true, _) => "",
+        _ => kind,
+    };
+    (kind, question)
+}
+
 /// Whether a hook says the user cleared the conversation: Claude's
 /// SessionStart carries `source: "clear"` for the one a `/clear` starts.
 fn cleared(event: &str, payload: &Value) -> bool {
@@ -1877,7 +2151,7 @@ fn cleared(event: &str, payload: &Value) -> bool {
 /// kv key: who the session's "needs you" is for, as a JSON list ("" its
 /// own agent, else a sub-agent's id or thread). Present only while it
 /// waits on someone.
-fn needs_you_key(id: &str) -> String {
+pub(crate) fn needs_you_key(id: &str) -> String {
     format!("needs_you_by:{id}")
 }
 
@@ -2171,6 +2445,7 @@ pub fn reconcile(db: &Db) -> Result<()> {
         if !alive {
             let now = now_ms();
             db.set_status(&s.id, Status::Stopped, now)?;
+            db.kv_delete(&rlord_core::db::overlay_end_key(&s.id))?;
             db.insert_event(&s.id, now, "reconciled_dead", "{}")?;
             tracing::info!(session = %s.id, "tmux gone; marked stopped (resumable)");
         }
@@ -2233,6 +2508,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// A prompt clears why a session waits only if it stops waiting.
+    #[test]
+    fn a_prompt_while_still_waiting_keeps_the_reason() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "r1",
+            name: "r1",
+            agent: "claude",
+            agent_session: None,
+            project_path: "/tmp",
+            tmux_session: None,
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_status("r1", Status::WaitingInput, 2).unwrap();
+        db.set_attention_reason("r1", Some("question")).unwrap();
+        let s = db.resolve_ref("r1").unwrap();
+        let p = json!({});
+        let r = |after| {
+            let (kind, q) = reason_of_hook(false, "prompt_submitted", &p, after);
+            crate::reason::after(&s, kind, after, q, false)
+        };
+        assert_eq!(r(Status::WaitingInput), None);
+        assert_eq!(r(Status::Working), Some(None));
+    }
 
     #[test]
     fn only_plain_codex_sessions_go_on_the_daemon() {
@@ -2386,26 +2692,70 @@ mod tests {
             path_with(Some(program), "").as_deref(),
             Some("/home/a/.nvm/versions/node/v22/bin")
         );
-        let env = pane_env("01s", Some(program), false);
+        let none = std::path::Path::new("/nonexistent-rlord-base");
+        let env = pane_env(none, Agent::Claude, "01s", Some(program), false);
         assert_eq!(env[0], ("RLORD_SESSION_ID".to_string(), "01s".to_string()));
         assert_eq!(env[1].0, "PATH");
         assert!(env[1].1.starts_with("/home/a/.nvm/versions/node/v22/bin"));
-        assert_eq!(pane_env("01s", None, false).len(), 1);
+        assert_eq!(pane_env(none, Agent::Claude, "01s", None, false).len(), 1);
+    }
+
+    /// A pane names its look-up token file (a path) once it has one; a
+    /// Codex daemon pane never (its env would reach every thread).
+    #[test]
+    fn a_pane_names_its_token_file() {
+        let base = std::env::temp_dir().join(format!("rlord-paneenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = Db::open_in_memory().unwrap();
+        let tok = crate::session_tools::mint(&db, &base, "01s").unwrap();
+        let env = pane_env(&base, Agent::Claude, "01s", None, false);
+        assert!(env.contains(&(
+            "RLORD_SESSION_LOOKUP_FILE".to_string(),
+            tok.to_string_lossy().into_owned()
+        )));
+        assert!(pane_env(&base, Agent::Claude, "01s", None, true).is_empty());
+        // OpenCode's commands run in its shared server: no token file.
+        assert!(!pane_env(&base, Agent::OpenCode, "01s", None, false)
+            .iter()
+            .any(|(k, _)| k == "RLORD_SESSION_LOOKUP_FILE"));
+        // ...and its pane unsets one tmux's server might hand it; a pane
+        // given the file sets it and unsets nothing.
+        let argv = ["opencode".to_string()];
+        let cmd = pane_cmd(&base, Agent::OpenCode, "01s", None, false, &argv);
+        assert!(
+            cmd.starts_with("exec env -u RLORD_SESSION_LOOKUP_FILE "),
+            "{cmd}"
+        );
+        let cmd = pane_cmd(&base, Agent::Claude, "01s", None, false, &argv);
+        assert!(!cmd.contains(" -u "), "{cmd}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The daemon drops the pane identity from its own environment at
+    /// start, so nothing it starts inherits it.
+    #[test]
+    fn the_daemon_scrubs_pane_env_from_itself() {
+        std::env::set_var("RLORD_SESSION_LOOKUP_FILE", "/x/token");
+        crate::scrub_own_env();
+        for k in rlord_core::agents::PANE_ENV {
+            assert!(std::env::var_os(k).is_none(), "{k}");
+        }
     }
 
     /// A pane on Codex's daemon names no session: a daemon its TUI starts
     /// would pass the name to every thread's hooks.
     #[test]
     fn a_daemon_pane_names_no_session() {
-        assert!(pane_env("01s", None, true).is_empty());
+        let none = std::path::Path::new("/nonexistent-rlord-base");
+        assert!(pane_env(none, Agent::Claude, "01s", None, true).is_empty());
         let argv = ["codex".to_string()];
         assert_eq!(
-            pane_cmd("01s", None, true, &argv),
-            "exec env -u RLORD_SESSION_ID codex"
+            pane_cmd(none, Agent::Codex, "01s", None, true, &argv),
+            "exec env -u RLORD_SESSION_ID -u RLORD_SESSION_LOOKUP_FILE codex"
         );
         assert_eq!(
-            pane_cmd("01s", None, false, &argv),
-            "exec env RLORD_SESSION_ID=01s codex"
+            pane_cmd(none, Agent::Codex, "01s", None, false, &argv),
+            "exec env -u RLORD_SESSION_LOOKUP_FILE RLORD_SESSION_ID=01s codex"
         );
     }
 
@@ -2712,6 +3062,7 @@ mod tests {
             last_user_at: Some(4_000),
             last_agent_at: Some(5_000),
             open_elsewhere: true,
+            maybe_held_by_codex_server: false,
             recently_written: false,
         }
     }

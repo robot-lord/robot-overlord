@@ -302,6 +302,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What waits on you, in order: sessions that need you (a permission
+    /// prompt or a question), then finished turns you haven't looked at.
+    /// The same list the overlord's `attention` tool gives.
+    Attention {
+        #[command(subcommand)]
+        cmd: Option<AttentionCmd>,
+        /// At most this many
+        #[arg(long, short = 'n', default_value = "20")]
+        limit: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a session's event log
     Log {
         r#ref: String,
@@ -412,8 +424,16 @@ enum Command {
     Mcp {
         /// Serve every tool (sending to sessions, stopping, renaming, UI
         /// control). Only rlord's overlord config passes it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "session")]
         overlord: bool,
+        /// A session's own read-only look-ups (server `rlord_session`),
+        /// bound to the session whose token `--token-file` holds. rlord
+        /// wires it into the sessions it starts.
+        #[arg(long, requires = "token_file")]
+        session: bool,
+        /// The session's token file (with `--session`).
+        #[arg(long, requires = "session")]
+        token_file: Option<std::path::PathBuf>,
         /// The daemon's socket, as the daemon resolved it. The overlord's
         /// MCP config always passes it: an agent may start this server with
         /// another environment (OpenCode's shared server), where the XDG
@@ -432,6 +452,20 @@ enum Command {
     Relay {
         #[command(subcommand)]
         cmd: relay_cmd::RelayCmd,
+    },
+    /// A session's own read-only look-ups, for its agent: `rlord context
+    /// help` lists them; `rlord context <tool> key=value…` calls one.
+    Context {
+        /// The session's token file (default: $RLORD_SESSION_LOOKUP_FILE)
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
+        /// The daemon's socket
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// `help`, or a tool name
+        tool: String,
+        /// The tool's arguments, as key=value
+        args: Vec<String>,
     },
     /// The overlord overlay itself (runs inside the tmux popup)
     #[command(hide = true)]
@@ -545,6 +579,21 @@ enum NavCmd {
     /// session (the mastermind): the overlord is one session now
     #[command(hide = true)]
     Mastermind,
+}
+
+#[derive(Subcommand)]
+enum AttentionCmd {
+    /// Tell the daemon a terminal moved or changed focus (run by tmux's
+    /// client hooks; never starts a daemon)
+    #[command(hide = true)]
+    Poke,
+    /// The shadow run so far against the go/no-go numbers for turning
+    /// announcements on (read from rlord's log; changes nothing)
+    Report {
+        /// Over the last N days
+        #[arg(long, default_value = "7")]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -668,7 +717,25 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Mcp { overlord, socket } => mcp_stdio(overlord, socket),
+        Command::Mcp {
+            overlord,
+            session,
+            token_file,
+            socket,
+        } => {
+            let mode = match (session, token_file) {
+                (true, Some(t)) => McpMode::Session(t),
+                _ if overlord => McpMode::Overlord,
+                _ => McpMode::ReadOnly,
+            };
+            mcp_stdio(mode, socket)
+        }
+        Command::Context {
+            token_file,
+            socket,
+            tool,
+            args,
+        } => context_cli(token_file, socket, &tool, &args),
         Command::Update {
             tag,
             force,
@@ -1306,11 +1373,10 @@ fn main() -> Result<()> {
             println!("{} ({})", g("name"), g("id"));
             println!("  agent      {} · model {}", g("agent"), g("model"));
             // The status as the list shows it, every symbol in words.
-            for (i, l) in rlord_tui::statustext::describe(&s, rlord_core::types::now_ms())
-                .iter()
-                .enumerate()
-            {
-                println!("  {:<10} {l}", if i == 0 { "status" } else { "" });
+            let lines =
+                rlord_tui::statustext::describe(&s, false, usize::MAX, rlord_core::types::now_ms());
+            for l in &lines {
+                println!("  {:<10} {}", l.label, l.plain());
             }
             println!("  repo       {}  branch {}", g("repo_path"), g("branch"));
             println!("  dir        {}", g("project_path"));
@@ -1333,6 +1399,35 @@ fn main() -> Result<()> {
             if agents.as_array().is_some_and(|a| !a.is_empty()) {
                 println!("  agents");
                 print_agents(&agents);
+            }
+            Ok(())
+        }
+        Command::Attention {
+            cmd: Some(AttentionCmd::Poke),
+            ..
+        } => {
+            // (Best effort: no daemon, nobody to tell.)
+            let _ = call_running("attention.poke", json!({}));
+            Ok(())
+        }
+        Command::Attention {
+            cmd: Some(AttentionCmd::Report { days }),
+            ..
+        } => {
+            let r = call("attention.report", json!({"days": days}))?;
+            print!("{}", r["text"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Command::Attention {
+            cmd: None,
+            limit,
+            json,
+        } => {
+            let r = call("attention.list", json!({"limit": limit}))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", attention_text(&r));
             }
             Ok(())
         }
@@ -1554,14 +1649,18 @@ fn import_cmd(
             if c["open_elsewhere"] == true || c["recently_written"] == true {
                 flags.push("maybe open elsewhere");
             }
+            if c["maybe_held_by_codex_server"] == true {
+                flags.push("may be held by Codex's app/server");
+            }
             let flags = if flags.is_empty() {
                 String::new()
             } else {
                 format!("  [{}]", flags.join(", "))
             };
             println!(
-                "{}  {:>9}  {}{}\n          {}",
-                &c["agent_session"].as_str().unwrap_or("")[..8],
+                "{}  {:<6}  {:>9}  {}{}\n    {}",
+                c["agent_session"].as_str().unwrap_or(""),
+                c["agent"].as_str().unwrap_or("?"),
                 rel_age(c["last_active_at"].as_i64()),
                 dir,
                 flags,
@@ -1589,7 +1688,7 @@ fn import_cmd(
             Ok(s) => {
                 println!(
                     "imported {} as {}{}",
-                    &full[..8],
+                    full,
                     s["name"].as_str().unwrap_or("?"),
                     if archive { " (archived)" } else { "" }
                 );
@@ -1599,7 +1698,7 @@ fn import_cmd(
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("{}: {e:#}", &full[..8]);
+                eprintln!("{}: {e:#}", full);
             }
         }
     }
@@ -2296,6 +2395,9 @@ fn ensure_daemon_current() {
 }
 
 fn run_daemon() -> Result<()> {
+    // Nothing it starts (tmux's server, agents' shared servers) may carry
+    // the session identity of a pane it was started from.
+    rlord_daemon::scrub_own_env();
     // Pin both at startup, before any rebuild or reinstall.
     rlord_daemon::build_id();
     rlord_daemon::exe_id();
@@ -2329,6 +2431,10 @@ fn run_daemon() -> Result<()> {
         rlord_daemon::background::start(&daemon);
         // OpenCode sessions: status from its background server's events.
         rlord_daemon::opencode::start(&daemon);
+        // Sessions whose agent pane died without a SessionEnd: stopped.
+        rlord_daemon::recheck::start(&daemon);
+        // Who waits on the user: the queue, in shadow (attention.rs).
+        rlord_daemon::attention::start(&daemon);
         // Where each agent's command is (may ask the login shell): known
         // before the first launch needs it.
         std::thread::spawn(rlord_core::agents::install::warm);
@@ -2355,6 +2461,47 @@ fn run_daemon() -> Result<()> {
     // would otherwise hold a restart hostage).
     rt.shutdown_timeout(std::time::Duration::from_millis(300));
     r
+}
+
+/// `rlord attention`'s text: one line per entry, then the sessions whose
+/// state can't be told.
+fn attention_text(r: &Value) -> String {
+    let mut out = String::new();
+    let entries = r["queue"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if entries.is_empty() {
+        out.push_str("nothing waiting\n");
+    }
+    for e in entries {
+        let kind = match e["kind"].as_str() {
+            Some("needs_you") => "needs you",
+            _ => "your turn",
+        };
+        let by = match e["prompted_by"].as_str() {
+            Some(who) => format!(" (prompted by {who})"),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{kind:<10} {:<24} {:<10} {:>4}{by}\n",
+            e["name"].as_str().unwrap_or("?"),
+            e["reason"].as_str().unwrap_or(""),
+            e["waited"].as_str().unwrap_or(""),
+        ));
+    }
+    if let Some(n) = r["more"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!("… and {n} more\n"));
+    }
+    for c in r["cant_tell"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        out.push_str(&format!(
+            "can't tell {}: {}\n",
+            c["name"].as_str().unwrap_or("?"),
+            c["why"].as_str().unwrap_or("")
+        ));
+    }
+    out
 }
 
 /// Fast path for agent hooks: read payload from stdin, forward to the daemon,
@@ -2405,8 +2552,11 @@ fn hook_emit(agent: &str) -> Result<()> {
             let socket = std::env::var("TMUX")
                 .ok()
                 .and_then(|t| t.split(',').next().map(str::to_string));
+            // When the hook ran: the daemon may get it late (a slow
+            // answer, a replay), and order matters (`wakes_idle`).
             json!({"instance": instance, "agent": agent, "event": event,
-                   "payload": payload, "pane": pane, "tmux": socket})
+                   "payload": payload, "pane": pane, "tmux": socket,
+                   "at": rlord_core::types::now_ms()})
         }
     };
     // Bounded: a stalled daemon never holds up the agent's tool call.
@@ -2528,8 +2678,17 @@ fn restart_daemon() -> Result<()> {
 /// (`mcp.tools` / `mcp.call`), so this stays a thin, stateless bridge.
 /// Without `overlord` it is read-only (the daemon serves and accepts only
 /// `mcp::READ_ONLY_TOOLS`) and never starts a daemon.
-fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
+fn mcp_stdio(mode: McpMode, socket: Option<std::path::PathBuf>) -> Result<()> {
     use std::io::{BufRead, Write};
+    let overlord = matches!(mode, McpMode::Overlord);
+    let scoped = matches!(mode, McpMode::Session(_));
+    // A session's own tools: by its token, read fresh from its file on
+    // each call (never the token on argv).
+    let token = |p: &std::path::Path| {
+        std::fs::read_to_string(p)
+            .map(|t| t.trim().to_string())
+            .with_context(|| format!("reading the session token {}", p.display()))
+    };
     let caller = std::env::var("RLORD_SESSION_ID")
         .ok()
         .filter(|v| !v.is_empty());
@@ -2559,23 +2718,40 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
             "initialize" => Ok(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "rlord", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": if overlord {
+                "serverInfo": {"name": if scoped { rlord_daemon::session_tools::SERVER } else { "rlord" },
+                               "version": env!("CARGO_PKG_VERSION")},
+                "instructions": if scoped {
+                    "This session's own rlord look-ups (read-only): its brief, related sessions, and their history."
+                } else if overlord {
                     "Robot Overlord control surface: inspect agent sessions and drive the rlord UI (navigate, set the list view, propose or create sessions)."
                 } else {
                     "Robot Overlord look-ups (read-only): list rlord's agent sessions, read their screens, search and read their history."
                 },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => call("mcp.tools", json!({"overlord": overlord}))
-                .map(|t| json!({"tools": t}))
-                .map_err(|e| (-32603, format!("{e:#}"))),
+            "tools/list" => match &mode {
+                McpMode::Session(p) => {
+                    token(p).and_then(|t| call("sctx.tools", json!({"token": t})))
+                }
+                _ => call("mcp.tools", json!({"overlord": overlord})),
+            }
+            .map(|t| json!({"tools": t}))
+            .map_err(|e| (-32603, format!("{e:#}"))),
             "tools/call" => {
-                let r = call(
-                    "mcp.call",
-                    json!({"name": params["name"], "arguments": params.get("arguments").cloned().unwrap_or(json!({})),
-                           "caller": caller, "overlord": overlord}),
-                );
+                let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                let r = match &mode {
+                    McpMode::Session(p) => token(p).and_then(|t| {
+                        call(
+                            "sctx.call",
+                            json!({"token": t, "name": params["name"], "arguments": arguments}),
+                        )
+                    }),
+                    _ => call(
+                        "mcp.call",
+                        json!({"name": params["name"], "arguments": arguments,
+                               "caller": caller, "overlord": overlord}),
+                    ),
+                };
                 Ok(match r {
                     Ok(v) => json!({"content": [{"type": "text",
                         "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}),
@@ -2595,6 +2771,123 @@ fn mcp_stdio(overlord: bool, socket: Option<std::path::PathBuf>) -> Result<()> {
         out.flush()?;
     }
     Ok(())
+}
+
+/// Which tools `rlord mcp` serves.
+enum McpMode {
+    /// Every tool (`--overlord`).
+    Overlord,
+    /// `mcp::READ_ONLY_TOOLS`.
+    ReadOnly,
+    /// A session's own look-ups (`--session --token-file`).
+    Session(std::path::PathBuf),
+}
+
+/// `rlord context`: a session's own look-ups from its shell. Never starts
+/// a daemon.
+fn context_cli(
+    token_file: Option<std::path::PathBuf>,
+    socket: Option<std::path::PathBuf>,
+    tool: &str,
+    args: &[String],
+) -> Result<()> {
+    let file = token_file
+        .or_else(|| {
+            std::env::var_os(rlord_core::agents::TOKEN_ENV)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .context(
+            "no session token: pass --token-file (rlord sets RLORD_SESSION_LOOKUP_FILE in its sessions)",
+        )?;
+    let token = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading {}", file.display()))?
+        .trim()
+        .to_string();
+    let socket = socket.unwrap_or_else(paths::socket_path);
+    if matches!(tool, "help" | "--help" | "-h") {
+        let tools = client_call(&socket, "sctx.tools", json!({"token": token}))?;
+        print!("{}", context_help(&tools));
+        return Ok(());
+    }
+    let r = client_call(
+        &socket,
+        "sctx.call",
+        json!({"token": token, "name": tool, "arguments": context_args(args)?}),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `key=value` pairs as a tool's arguments. Only the count arguments
+/// (`line`, `before`, `after`, `limit`) are numbers; everything else (a
+/// session named `2024`, a query) stays a string.
+fn context_args(args: &[String]) -> Result<Value> {
+    let mut m = serde_json::Map::new();
+    for a in args {
+        let (k, v) = a
+            .split_once('=')
+            .with_context(|| format!("'{a}': arguments are key=value"))?;
+        let k = k.trim();
+        let v = if matches!(k, "line" | "before" | "after" | "limit") {
+            json!(v
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{k}: a whole number"))?)
+        } else {
+            json!(v)
+        };
+        m.insert(k.to_string(), v);
+    }
+    Ok(Value::Object(m))
+}
+
+/// The tool list as `rlord context help` prints it.
+fn context_help(tools: &Value) -> String {
+    let mut out = String::from(
+        "rlord context <tool> [key=value ...]  (read-only look-ups for this session)\n\n",
+    );
+    for t in tools.as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "{}: {}\n",
+            t["name"].as_str().unwrap_or(""),
+            t["description"].as_str().unwrap_or("")
+        ));
+        for (k, v) in t["inputSchema"]["properties"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(&format!(
+                "  {k}=...  {}\n",
+                v["description"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod context_cli_tests {
+    use super::*;
+
+    #[test]
+    fn context_arguments_parse() {
+        let v =
+            context_args(&["session=2024".into(), "limit=3".into(), "query=42".into()]).unwrap();
+        assert_eq!(v, json!({"session": "2024", "limit": 3, "query": "42"}));
+        assert!(context_args(&["line=x".into()]).is_err());
+        assert!(context_args(&["oops".into()]).is_err());
+    }
+
+    #[test]
+    fn context_help_lists_tools_and_arguments() {
+        let t = json!([{"name": "read_history", "description": "Read it.",
+                        "inputSchema": {"properties": {"session": {"description": "Which"}}}}]);
+        let h = context_help(&t);
+        assert!(h.contains("read_history: Read it."), "{h}");
+        assert!(h.contains("  session=...  Which"), "{h}");
+    }
 }
 
 /// `nav next|prev`: move to the neighbouring live session in list order.
@@ -2895,6 +3188,27 @@ fn lineage_lines(s: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attention_prints_one_line_an_entry() {
+        use serde_json::json;
+        let r = json!({"queue": [
+            {"kind": "needs_you", "name": "api-fix", "reason": "question", "waited": "12m"},
+            {"kind": "your_turn", "name": "docs", "reason": "finished", "waited": "3m", "prompted_by": "rlord"},
+        ], "more": 1, "cant_tell": [{"name": "cx", "why": "Codex hooks not trusted yet"}]});
+        let t = super::attention_text(&r);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("needs you  api-fix") && lines[0].ends_with("12m"));
+        assert!(
+            lines[1].starts_with("your turn  docs") && lines[1].ends_with("(prompted by rlord)")
+        );
+        assert_eq!(lines[2], "… and 1 more");
+        assert_eq!(lines[3], "can't tell cx: Codex hooks not trusted yet");
+        assert_eq!(
+            super::attention_text(&json!({"queue": []})),
+            "nothing waiting\n"
+        );
+    }
+
     #[test]
     fn latest_prune_is_the_current_repo_unless_all() {
         use serde_json::json;

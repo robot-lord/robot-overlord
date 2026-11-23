@@ -250,9 +250,40 @@ facts live in its module) is what the rest of rlord asks:
   only with the first message and has no model flag: the pane command
   first creates the session through OpenCode's server (`opencode api POST
   /api/session`, with the id, folder and model), then execs the TUI on it
-  (`opencode -s <ses_…> [--prompt …]`). `Launch::deferred` names the model
+  (`opencode -s <ses_…>`). `Launch::deferred` names the model
   for `daemon::opencode` to confirm afterwards (set it if the create step
   didn't take; log it if it can't be).
+- **First prompt off argv** (`daemon::first_prompt`): a start that carries
+  the user's words writes them (with any background pointer line) to
+  `<data>/sessions/<id>/prompt.md` (0600), so they never show in `ps`,
+  the pane command, `launched_args` or the `launched` event, and aren't
+  bound by the argument limit. Codex gets a fixed line naming the file as
+  its prompt (`first_prompt::pointer_line`, starting `[rlord session
+  <id>]` so a clipped first message still tells sessions apart; that line
+  is what its conversation is bound by). Anything that shows a
+  conversation's task (triage, summaries, `session_brief`) reads the
+  launch spec's words in its place (`first_prompt::task`). OpenCode's is
+  POSTed to its server (`POST /api/session/<id>/prompt`, `{text}`) once
+  the session exists and its model is settled (kv `first_prompt:<id>`,
+  carried over a restart, `opencode::apply_first_prompt`). The POST is
+  made under the session's lock, after checking the hold is unchanged and
+  the session is neither stopped nor archived. Refused (no connection,
+  the request not fully written, a 4xx answer) or not there after 30s:
+  it is typed in at the first idle turn from its own slot
+  (`send::queue_first`, before and apart from the overlord's queued
+  messages). Sent with no answer back, or any other non-2xx answer:
+  logged as unknown, never typed again (it may have run). A session that
+  stops first keeps it (file and kv, marked `stopped`) for its restart
+  to send; one archived or with no row has it settled (a failed read
+  or an unreadable file keeps it for the next pass). The file is removed
+  once it is sent, typed or settled, and on archive; the log has a
+  `first_prompt` event. Whatever rlord types into the session waits
+  until the first prompt has gone, and 15s after it is sent or typed.
+  Claude reads the file on stdin
+  (`exec … < prompt.md`; `first_prompt::CLAUDE_STDIN`). It needs an
+  interactive `claude` that takes piped stdin as its first prompt and
+  keeps its terminal (checked on Claude Code 2.1.327).
+  Fixed text with no user words (`context::pointer_only`) stays on argv.
 - **Hooks**: `install_hooks` merges `rlord hook emit <agent>` into the
   agent's hooks file (Claude `settings.json`, Codex `hooks.json`; same
   shape, others' hooks kept, one backup), `map_hook_event` turns an event
@@ -389,6 +420,56 @@ Same three-tier degradation the research validated, implemented once:
 
 Every status transition is an `events` row and a push to subscribers; that is
 what makes the TUI live and `last_state_change_at` trustworthy.
+
+Claude starts some turns with no `UserPromptSubmit`: a prompt queued while
+it worked, and after the user's `!` shell command. Their `Stop` arrives
+while the session is already idle. So a tool call finishing
+(`PostToolUse`) from the session's own agent (no `agent_id`) while `idle`
+sets `working` (`methods::wakes_idle`), but only when the transcript's
+tail shows a turn open that began after the last turn's end (read before
+the DB lock is taken, and only past the cheap checks): a tool hook alone
+would leave the session working with nothing to set it back. Live
+hooks only, never a replayed one. A background task finishing does run `UserPromptSubmit` (Claude Code
+2.1.327); a hook prompt that starts with `<task-notification>` (how the
+transcript shows that wake) is logged with `wake: true`.
+
+Why a session waits is kept beside its status (`attention_reason`):
+`permission` or `question` while it needs you (a question wins over the
+permission request Claude fires with it), `finished` or `failed` once the
+turn is over (`StopFailure`); a prompt, a start or a stop clears it. One
+rule (`daemon/src/reason.rs`) for every path that changes a status: the
+hooks, OpenCode, `discover`, rlord's own moves, the reconcile.
+
+### Stale statuses re-checked (`daemon/src/recheck.rs`)
+
+A stored status moves only when an event moves it. An agent that crashed
+without its `SessionEnd` leaves a live status behind on a dead pane.
+Once at daemon start and then every minute, plain code looks at the
+sessions that follow hooks (Claude, and Codex with trusted hooks;
+`discover` and `opencode.rs` watch their own):
+
+- One `list-panes -a` a pass reads each tmux session's agent pane where
+  it is certain: the pinned `@rlord_pane` when it is in the session;
+  with no pin, the session's only pane. A pin whose pane isn't in the
+  session (moved by `join-pane`, or gone), or no pin and several panes:
+  no verdict. Skipped with no live session to look at.
+- A session is stopped only when its tmux session is there under its
+  stored name and that pane's program exited, on two answered looks of
+  the same pane id in a row, with its status time unchanged. The stop
+  goes through `discover`'s stop (`session_end` from the pane; the
+  needs-you parties are dropped).
+- The stop takes the session's lock (a restart through rlord holds it),
+  asks tmux again (the same pane still dead), then, under the DB lock
+  with no tmux call, stops only if the session is still as it was read:
+  its status, when that changed, and its message times.
+- `respawn-pane -k` keeps the pane id: a restart is caught by the pane
+  being live again, by the status time when it moves, and by the lock.
+  `respawn_pane` pins the pane it used and keeps it on screen when it
+  exits (best effort).
+- No verdict: a tmux session missing under the stored name (killed, or
+  renamed outside rlord: the startup reconcile handles a missing one),
+  and any tmux failure, "no server running" included (the counts start
+  again).
 
 ### Usage limits (`daemon/src/limits.rs`)
 
@@ -715,14 +796,12 @@ transcript store so `rlord search` covers them.
 
 ## Inter-session messaging
 
-**Built today:** only the idle-prompt path below, as the overlord's
-`send_to_session` (see "Passing work to a session" under "The overlord"):
-typed into a session whose turn is over, or held (one message per
-session) until it is. The mailbox, pull tool and Stop-hook injection
-described here are the original design and are not built. (A session's
-background, "Session background", reaches it through its hooks; the
-work in `docs/working/session-context.md` adds Stop-hook delivery and
-OpenCode's queue.)
+**Built today:** the overlord's `send_to_session` (see "Passing work to
+a session" under "The overlord"): OpenCode's server queue, Claude's
+and Codex's Stop-hook block mid-turn (at most 3 delivered in a row;
+`send::CODEX_STOP_CLAIM` for Codex), and the idle paste. The mailbox and pull tool described here are the original design
+and are not built; a session's background ("Session background") reaches
+it through its hooks.
 
 Durable mailbox in the daemon; **delivery is channel-ranked per adapter**,
 keystroke injection last:
@@ -766,7 +845,7 @@ inside the pane, it inherits `RLORD_SESSION_ID` — **caller identity is
 automatic**, so tools can default "me" and enforce policy (e.g. rate limits,
 no self-restart).
 
-Two modes. `rlord mcp` alone is read-only, for any agent session to add:
+Three modes. `rlord mcp` alone is read-only, for any agent session to add:
 the daemon lists and accepts only `mcp::READ_ONLY_TOOLS` (look-ups that
 change no session, tag, view, watermark or UI state and run no agent CLI
 or model), refuses any other call, and the shim never autostarts a
@@ -777,6 +856,59 @@ daemon treats the caller as read-only. A test makes every tool sit in
 exactly one of the read-only and mutating lists. The gate trusts the shim: it
 keeps an agent that added plain `rlord mcp` to look-ups, but it is no
 boundary against local processes, which can reach the socket anyway.
+
+The third, `rlord mcp --session --token-file <p>` (server
+`rlord_session`), is a session's own look-ups (`session_tools.rs`):
+`session_brief`, `related_sessions`, `session_summary`,
+`search_history`, `read_history`, read-only and bound to one session by
+a token. `rlord context <tool> key=value…` is the same through the
+shell. RPC `sctx.tools` / `sctx.call` take the token and nothing else
+naming a session; it is a dispatch of its own, so no overlord tool is
+reachable through it.
+
+- **Token.** 32 random bytes (two v4 uuids), hex, made at a session's
+  first start (`methods::start_args`, the one helper every start path
+  uses: `session.new`, `session.restart`, `session.fork`, a fresh
+  conversation) and kept across restarts: kv `session_token:<id>` and
+  the 0600 file `<data>/sessions/<id>/token`. Removed on archive; a start
+  after unarchiving makes a new one. Overlords get none and are refused.
+- **Visible set.** The session itself; sessions linked to it (its
+  background links either way, its fork parent and forks); sessions in
+  the same repo; sessions sharing a tag. Archived ones count; overlords,
+  and sessions that ran in an overlord's folder, never do. Search runs
+  only over that set (`search::search_in`), never outside rlord. A
+  session ref resolves only within it (id, exact name, unique name
+  prefix). `read_history` takes a hit's `transcript` (an older
+  conversation, before a `/clear`), and only one of that session's own.
+- **Wiring**, computed at every start, never stored: Claude
+  `--mcp-config=<data>/sessions/<id>/mcp.json` and
+  `--allowedTools=mcp__rlord_session` (`=` form: both take several
+  values and the first prompt may follow). Codex in the pane:
+  `-c mcp_servers.rlord_session.{command,args,default_tools_approval_mode}`
+  (`session_tools::CODEX_MCP`; any `-c` runs Codex embedded, which
+  `--no-daemon` already does). Daemon-mode Codex and OpenCode have only
+  the CLI, which isn't relied on inside Codex's sandbox. `get_session` and the launch
+  and fork answers say which (`lookup`: `mcp` only when the last start's
+  wiring produced flags, kv `session_lookup:<id>`; else `cli`, or `none`
+  without a token), so the
+  overlord copies the needed facts into `context` for the last two. A
+  Claude or in-pane Codex pane's env gets `RLORD_SESSION_LOOKUP_FILE` (a
+  path; no `TOKEN`, `KEY` or `SECRET` in its name, which Codex's default
+  env policy drops); OpenCode and Codex daemon-mode panes don't, since their shell
+  commands run in a shared server. The variable is scrubbed with
+  `RLORD_SESSION_ID` from everything shared between sessions
+  (`agents::PANE_ENV`: the daemon drops it from its own environment at
+  start, every pane unsets what it isn't given, Codex's server, OpenCode's
+  shared server, commands rlord runs). The background ends
+  with a "Looking up more" section, once the token exists, naming the
+  tools and the CLI form with `--token-file` and `--socket` always
+  given, so it works from any shell.
+- **Bounds.** 30 calls a minute and 300 an hour per session (in memory,
+  per daemon; idle ids dropped),
+  answers at most 16,000 chars, no model, agent CLI or tmux.
+- Same trust model as the rest: a process running as the user can read
+  any token file. What the token gives is a read-only surface bound to
+  the worker that can't be steered into acting on other sessions.
 
 `create_session` and `propose_session` take the user's words (`prompt`)
 apart from the overlord's notes (`context`) and related sessions
@@ -1307,7 +1439,15 @@ wired to rlord's MCP server. There can be one per agent, with exactly one
 active ("One per agent, one active", below); what follows holds for each.
 A strong model at medium effort
 (`[overlord] model` / `effort`; the effort is a launch flag, per agent:
-`overlord::effort_args`): it does light work itself and sends the rest to
+`overlord::effort_args`). On Codex with no model set, the setup form and
+a newly created overlord take the best-priority "astra" model in Codex's
+catalog (`models_cache.json`; the `opus` equivalent: a slug ending
+`-astra` first, then a variant such as `-astra-mini`). With no match, or
+when the user's Codex `config.toml` sets `model`, it stays "" (Codex's
+own default), which is always a choice in the form. The form offers each
+model's `supported_reasoning_levels` and follows the Model row. It is resolved when the overlord is
+created and stored on its session, so a catalog update never changes a
+running overlord's model behind the user's back. It does light work itself and sends the rest to
 subagents and new sessions, which `overlord.md` states first. It lives in
 `<data>/overlord/` (an overlord that began as the "mastermind" of the
 former two-session design keeps `<data>/mastermind/`, so its conversation
@@ -1431,6 +1571,19 @@ are sent nothing. Only the user switches (`overlord::switch`, RPC
 overlord with that agent's defaults (`model_effort_for`), later ones find
 it as it was (started again if it had stopped). Nothing switches by itself,
 including when the active one hits a usage limit.
+
+- **Out of usage: offered, not done.** When the active overlord's row
+  carries a `limit` (the same transcript detection as any session,
+  `limits::annotate`), `overlord.get` adds `limit.switch_to` (installed
+  agents other than the active one whose overlord, if any, isn't limited
+  too) and `limit.offer` (`overlord::limit_offer`: plain data over the
+  roster, no tmux of its own; a limit without a reset time is not offered). The list opens a dialog on a refresh that
+  sees `offer` (keys in its first 800ms are dropped; `y` switches through `overlord.switch` and, like esc, records the limit as answered; esc calls
+  `overlord.answer_limit_offer`, which stores that limit's `resets_at`
+  in kv `overlord_limit_offer_answered`, so the same limit isn't asked
+  again but the next one is). Not offered once the limit has reset, or
+  with nowhere to go. The overlay's top row says "out of usage until …"
+  as before.
 
 - **In the DB** every overlord has role `overlord`, so `is_overlord_role`
   and every refusal built on it (rename, tags, notes, archive, stop from a
@@ -1576,15 +1729,39 @@ including when the active one hits a usage limit.
   session's lock, then the DB; never the session's lock while holding the
   DB. `TYPING` comes last.
 - **Passing work to a session** (`daemon/src/send.rs`, MCP
-  `send_to_session`, method `session.send`): the same paste into the
-  target's pinned agent pane, for any agent. Only a session whose turn is
-  over; working or needs-you is refused unless `when_idle`, which keeps one
-  pending message per session (kv `send_pending`, a newer one replaces it,
-  and a direct send drops it, logged as replaced) for a 2s tick to deliver
-  once the turn has been over 2s, re-read under the session's lock. Stopped, starting, error, archived and the
-  overlord itself are refused; a pending message is dropped when its
-  session stops or goes. Logged as `message_sent` / `message_queued` /
-  `message_held` / `message_delivered` / `message_dropped`. `overlord.new_session` formats the list's `n` form as a
+  `send_to_session`, method `session.send {ref, text, context,
+  when_idle}`): the user's `text` and the overlord's optional `context`
+  are framed by code (`send::framed` over `context::frame_message`: a
+  `[rlord]` line, the words, then the context labelled as the
+  overlord's). Delivery per agent:
+  - **OpenCode:** `POST /api/session/<id>/prompt` with `delivery:
+    "queue"` (`Service::queue_prompt`), mid-turn only with `when_idle` (as for every agent); its inbox runs
+    it once the current turn is over. Marked as rlord's first
+    (`own::mark`). Only a surely refused POST (no connection, a 4xx)
+    falls back to the pane; an unanswered one is logged `unknown` and
+    never sent again.
+  - **Claude and Codex, mid-turn** (`when_idle`): held; the session's own
+    live Stop hook claims it (`send::stop_claim`) and answers
+    `{"decision": "block", "reason": <framed text>}`, so the agent goes on
+    with it in the same turn. The Stop sets idle as usual; the ack sets it working again (a lost ack never leaves it working), and the idle paste leaves a claim alone for 10s. Limited, stopped, restarting or errored sessions are not claimed; a Stop is never a usage-limit reply (Claude ends such a turn with `StopFailure`). Codex the same in the pane only (`send::CODEX_STOP_CLAIM`; a daemon-mode session gets the idle paste until checked live), and not when its transcript's last `task_complete` carries an error (Codex has no `StopFailure`, so a limit or API error would otherwise be claimed into); checked live on 0.169.0: the TUI shows "Blocked by hook" with the reason and the agent answers it; the second Stop has `stop_hook_active: true`). It leaves the
+    queue on the hook client's ack (`hook.ack`, ack ids `send:<id>:<n>`;
+    unacknowledged, the next Stop or the idle paste carries it again: at
+    most one duplicate). At most `CLAIMS_MAX` (3) acknowledged claims in a row (kv
+    `stop_claims:<id>`, cleared by a prompt or a Stop that carries
+    nothing); then the turn ends and it is typed in. Not while its first
+    prompt is still on its way.
+  - **Idle:** pasted into the target's pinned agent pane.
+
+  Working or needs-you is refused unless `when_idle`. Waiting messages
+  add up (kv `send_pending`: `parts` in order, `text` all of them framed
+  as one); a direct send takes them with it, and each path removes only
+  the parts it carried (`send::take`), so one added meanwhile stays. A 2s
+  tick pastes them once the turn has been over 2s, re-read under the
+  session's lock. Stopped, starting, error, archived and the overlord
+  itself are refused; pending messages are dropped when their session
+  stops or goes. Logged as `message_sent` / `message_queued` /
+  `message_held` / `message_delivered` (with `via`) / `message_dropped`.
+  `overlord.new_session` formats the list's `n` form as a
   `[rlord new-session request]` message: `confirmed:`, the hints with
   whether each was picked or defaulted, then the description verbatim;
   `overlord.md` defines what the overlord does with one. On a contradiction
@@ -1629,12 +1806,21 @@ including when the active one hits a usage limit.
   on Claude, a narrow tool list).
 - **Import** (`core/src/import.rs`, `daemon/src/import.rs`): finds agent
   conversations rlord doesn't track, from the agents' own transcripts (Claude:
-  `~/.claude/projects/<cwd slug>/<uuid>.jsonl`), with no AI and nothing
+  `~/.claude/projects/<cwd slug>/<uuid>.jsonl`; Codex: rollouts under
+  `~/.codex/sessions/YYYY/MM/DD/` plus its `state_5.sqlite` thread index), with no AI and nothing
   specific to the tool that started them. `session.import_scan` pre-filters
   by file mtime, then measures activity by the last user/assistant message
   timestamp. The cwd must slugify to the transcript's folder, or
   `claude --resume` couldn't find it. It skips rlord's own folders, temp dirs,
-  headless (`sdk-*`) runs, and conversations with no typed prompt.
+  headless (`sdk-*`) runs, and conversations with no typed prompt. For
+  Codex it also skips `exec`/`mcp` runs and sub-agent threads (index
+  `thread_source`, else `session_meta.source`); the folder is the latest
+  `turn_context.cwd`. An imported Codex thread resumes in the pane
+  (`codex resume <id> --no-daemon`); a thread the index lists as an
+  app-server client's (`source` vscode) may be hosted by Codex's
+  background server; written in the last 10 minutes, or while a
+  `codex app-server` process runs, it is flagged
+  "may be held by Codex's app/server" (`maybe_held_by_codex_server`).
   `session.import` adds a stopped row with trust `hook` (the id is the
   transcript's file name, so restarts resume it) and no tmux name until it
   first runs. It can recreate a removed worktree from its branch, or import
@@ -1850,7 +2036,8 @@ moved.
 ### Session background
 
 `session.new` takes three inputs, kept apart: `prompt`, the user's words
-verbatim (the agent's first prompt; still on its argv); `context`, the
+verbatim (the agent's first prompt, kept off its argv: "First prompt off
+argv" above); `context`, the
 overlord's notes (facts and pointers, at most 8,000 chars); `related`,
 refs to sessions the work builds on (at most 8 per call, 16 per session,
 never an overlord). The notes and links are rows in `session_context`;
@@ -1999,7 +2186,7 @@ add`); reading and inserting under it, through `methods::start`, the tail
 | | Claude Code | Codex | OpenCode |
 |---|---|---|---|
 | How | `claude --resume <parent> --fork-session --session-id <new>` | `codex fork <parent> --no-alt-screen [--model m] -c tui.resume_cwd="current" --no-daemon [prompt]` (`codex::fork_argv`) | `POST /api/session/<parent>/fork` (`{}`) on its server, else `opencode api …` run in the parent's folder (60s each); then `opencode -s <fork>` |
-| New id | minted by rlord (`claude::FORK_MINTS_ID`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
+| New id | minted by rlord (`Agent::fork`) | Codex's: bound by hook, or from the thread index by `bind_fork` | the server's answer (`{data: {id}}`) |
 | Resumed at a restart once | its transcript is on disk (from its first message) | it is bound and its rollout is on disk | at once |
 | New worktree | yes (`--resume` finds the parent from another worktree of the repo, and from a subfolder of it) | yes (`tui.resume_cwd`: below) | no: the server gives a fork its parent's folder |
 
@@ -2121,7 +2308,7 @@ Checked live on Claude Code 2.1.326, codex-cli 0.169.0 and OpenCode
   prompt rule can't pick its thread. kv `bind_fork:<id>` holds the
   parent's thread: `discover::pick_thread` then takes only a thread whose
   rollout's first `session_meta` says `forked_from_id` is that one
-  (`codex::rollout_forked_from`; a candidate whose first line can't be
+  (`codex::rollout_first_line`; a candidate whose first line can't be
   read yet is skipped, never a reason to wait while another names the
   parent). Several forks of one parent waiting in one folder queue
   oldest first (`discover::place_of`, by their `bind_since`): each takes

@@ -61,13 +61,16 @@ fn unhooked(d: &Daemon) -> Result<Vec<Session>> {
     Ok(d.db()
         .running_sessions()?
         .into_iter()
-        .filter(|s| Agent::parse(&s.agent).is_some_and(|a| !a.mints_id()))
-        .filter(|s| {
-            s.agent_session.is_none()
-                || s.agent_session_trust != "hook"
-                || s.status == Status::Starting
-        })
+        .filter(is_unhooked)
         .collect())
+}
+
+/// Whether a live session is one `unhooked` follows here.
+pub(crate) fn is_unhooked(s: &Session) -> bool {
+    Agent::parse(&s.agent).is_some_and(|a| !a.mints_id())
+        && (s.agent_session.is_none()
+            || s.agent_session_trust != "hook"
+            || s.status == Status::Starting)
 }
 
 /// Live sessions on Codex's daemon that the hooks follow (not `unhooked`):
@@ -180,6 +183,8 @@ pub(crate) fn stop_from_pane(db: &Db, s: &Session) -> Result<bool> {
     db.set_status(&s.id, Status::Stopped, now)?;
     db.insert_event(&s.id, now, "session_end", r#"{"from":"pane"}"#)?;
     db.kv_delete(&format!("pane_gone_turn:{}", s.id))?;
+    // Nobody waits in a stopped session.
+    db.kv_delete(&methods::needs_you_key(&s.id))?;
     // (Its thread leaves the gate: a stopped session's hooks are dropped.)
     crate::codex_daemon::sync_gate(db);
     Ok(true)
@@ -225,6 +230,7 @@ fn first_prompt_due(d: &Daemon, s: &Session) -> Result<bool> {
         return Ok(false);
     }
     db.set_status(&s.id, Status::Idle, now)?;
+    // (No reason to keep: a start, which `set_status` cleared it for.)
     db.insert_event(
         &s.id,
         now,
@@ -695,15 +701,37 @@ fn follow(d: &Daemon, s: &Session) -> Result<bool> {
         // only that a turn is open was read, so by time).
         Status::Working => crate::own::prompt(&db, &s.id, None, now, crate::own::Via::Transcript)?,
         _ => {
-            if s.status == Status::Working {
+            // A turn ended: from working, or one that opened and closed
+            // since a start (`working_since` saw it).
+            if s.status == Status::Working || working.is_some() {
                 db.touch_last_agent_msg(&s.id, now)?;
             }
             ("agent_stopped", None)
         }
     };
+    crate::reason::record(
+        &db,
+        &cur,
+        reason_kind(s.status, working, kind),
+        next,
+        false,
+        false,
+    )?;
     let detail = crate::own::with_source(json!({"from": "transcript"}), source);
     db.insert_event(&s.id, now, kind, &detail.to_string())?;
     Ok(true)
+}
+
+/// The kind `reason::record` reads for a status the transcript set: a
+/// start settling to idle with no turn in the transcript (`working` None)
+/// is no turn's end (`finished` would be wrong): read as the start it is.
+/// A turn that opened and closed since the start is a real end.
+fn reason_kind(from: Status, working: Option<bool>, kind: &str) -> &str {
+    if from == Status::Starting && working.is_none() && kind == "agent_stopped" {
+        "session_start"
+    } else {
+        kind
+    }
 }
 
 /// The status a transcript implies, if it differs: `working` is whether
@@ -750,6 +778,47 @@ mod tests {
     }
 
     #[test]
+    fn a_start_that_settles_is_no_turns_end() {
+        use Status::*;
+        assert_eq!(
+            reason_kind(Starting, None, "agent_stopped"),
+            "session_start"
+        );
+        // A turn opened and closed since the start: a real end.
+        assert_eq!(
+            reason_kind(Starting, Some(false), "agent_stopped"),
+            "agent_stopped"
+        );
+        assert_eq!(
+            reason_kind(Working, Some(false), "agent_stopped"),
+            "agent_stopped"
+        );
+        assert_eq!(
+            reason_kind(Starting, Some(true), "prompt_submitted"),
+            "prompt_submitted"
+        );
+        let s: Session = serde_json::from_value(json!({
+            "id": "s", "name": "s", "name_locked": false, "agent": "codex",
+            "agent_session": "t", "agent_session_trust": "minted", "project_path": "/tmp",
+            "tmux_session": null, "status": "starting", "group_path": "", "pinned": false,
+            "created_at": 1, "archived_at": null, "last_user_msg_at": null,
+            "last_agent_msg_at": null, "last_state_change_at": null, "repo_path": null,
+            "workspace_path": null, "branch": null, "model": null}))
+        .unwrap();
+        assert_eq!(
+            crate::reason::after(
+                &s,
+                reason_kind(Starting, None, "agent_stopped"),
+                Idle,
+                false,
+                false
+            ),
+            Some(None),
+            "no reason, not finished"
+        );
+    }
+
+    #[test]
     fn status_follows_the_open_turn() {
         use Status::*;
         assert_eq!(next_status(Starting, None), Some(Idle));
@@ -765,6 +834,57 @@ mod tests {
         // Not a state the transcript can speak to.
         assert_eq!(next_status(WaitingInput, Some(true)), None);
         assert_eq!(next_status(Stopped, Some(true)), None);
+    }
+
+    /// The transcript follower keeps why a session waits too: a turn it
+    /// finds ended is `finished`; one it finds begun clears it.
+    #[test]
+    fn following_the_transcript_keeps_the_reason() {
+        use rlord_core::config::Config;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir
+            .path()
+            .join("rollout-2026-11-20T10-00-00-0000cafe.jsonl");
+        let ev = |ts: &str, kind: &str| {
+            format!(
+                "{}\n",
+                json!({"timestamp": ts, "type": "event_msg", "payload": {"type": kind}})
+            )
+        };
+        std::fs::write(&p, ev("2026-11-20T10:00:00.000Z", "task_started")).unwrap();
+        let d = Daemon::new(Db::open_in_memory().unwrap(), Config::default());
+        {
+            let db = d.db();
+            db.insert_session(&rlord_core::db::NewSession {
+                id: "cx",
+                name: "cx",
+                agent: "codex",
+                agent_session: Some("t-1"),
+                project_path: "/tmp",
+                tmux_session: None,
+                launch_spec: "{}",
+                created_at: 1,
+                repo_path: None,
+                workspace_path: None,
+                branch: None,
+                role: "",
+            })
+            .unwrap();
+            db.set_status("cx", Status::Idle, 2).unwrap();
+            db.set_attention_reason("cx", Some("finished")).unwrap();
+            db.upsert_transcript_source("cx", &p.to_string_lossy())
+                .unwrap();
+        }
+        let s = || d.db().resolve_ref("cx").unwrap();
+        assert!(follow(&d, &s()).unwrap());
+        assert_eq!((s().status, s().attention_reason), (Status::Working, None));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        use std::io::Write;
+        f.write_all(ev("2026-11-20T10:00:09.000Z", "task_complete").as_bytes())
+            .unwrap();
+        assert!(follow(&d, &s()).unwrap());
+        assert_eq!(s().status, Status::Idle);
+        assert_eq!(s().attention_reason.as_deref(), Some("finished"));
     }
 
     fn thread(id: &str, first: &str) -> codex::Thread {

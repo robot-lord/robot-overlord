@@ -81,9 +81,7 @@ pub fn run_agent(
         bail!("running {name}: no command");
     };
     let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env_remove("RLORD_SESSION_ID")
+    crate::agents::scrub_pane_env(cmd.args(args).current_dir(cwd))
         .env_remove("TMUX_PANE")
         .stderr(Stdio::null());
     run_to_file(cmd, out_dir, limit, stdin).with_context(|| format!("running {name}"))

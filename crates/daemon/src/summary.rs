@@ -207,7 +207,9 @@ fn make(d: &Daemon, id: &str, force: bool) -> Result<()> {
     let text = match full {
         Some(t) => t,
         None => {
-            let excerpt = excerpt(&path)?;
+            // (The DB lock is let go before the transcript is read.)
+            let words = crate::first_prompt::launch_words(&d.db(), &s.id);
+            let excerpt = excerpt(&path, &s.id, words)?;
             let dir = paths::data_dir().join("summaries");
             std::fs::create_dir_all(&dir)?;
             let prompt = format!("{ask}\n\nThe conversation (excerpts):\n\n{excerpt}");
@@ -266,7 +268,7 @@ fn opencode_summary(
             }
         }
     }
-    let excerpt = excerpt(path)?;
+    let excerpt = excerpt(path, &s.id, None)?;
     let dir = paths::data_dir().join("summaries");
     std::fs::create_dir_all(&dir)?;
     let prompt = format!("{ask}\n\nThe conversation (excerpts):\n\n{excerpt}");
@@ -336,8 +338,12 @@ pub use transcript::context_tokens;
 
 /// The start of the conversation and its last messages, as plain text,
 /// about 14k characters at most.
-fn excerpt(path: &Path) -> Result<String> {
-    let first = transcript::transcript_excerpts(path).first_prompt;
+fn excerpt(path: &Path, id: &str, words: Option<String>) -> Result<String> {
+    let first = crate::first_prompt::task(
+        id,
+        transcript::transcript_excerpts(path).first_prompt,
+        words,
+    );
     let last = history::read(path, None, 80, 0, 12_000)?;
     let mut out = String::new();
     if let Some(f) = first {

@@ -54,6 +54,25 @@ use transcript::Format;
 /// (`opencode::overlord_config`).
 pub const MCP_ENV: &[&str] = &["RLORD_SESSION_ID"];
 
+/// What marks a process as one rlord session's: its id and its look-up
+/// token file. Scrubbed from anything shared between sessions (the
+/// daemon, agent servers, commands rlord runs), wherever one is.
+pub const PANE_ENV: &[&str] = &["RLORD_SESSION_ID", TOKEN_ENV];
+
+/// The pane env var naming a session's look-up token file (a path, never
+/// the token). Its name has no `KEY`, `SECRET` or `TOKEN` in it: Codex's
+/// default `shell_environment_policy` drops such variables from the
+/// commands it runs, which would hide it from `rlord context`.
+pub const TOKEN_ENV: &str = "RLORD_SESSION_LOOKUP_FILE";
+
+/// `cmd` without `PANE_ENV`.
+pub fn scrub_pane_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for k in PANE_ENV {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 /// rlord's MCP tools that type into sessions (now or later): with
 /// `[overlord] confirm_sends` each asks the user first, on every agent.
 pub const SEND_TOOLS: &[&str] = &["send_to_session", "resume_after_limit"];
@@ -268,7 +287,13 @@ impl Agent {
     ) -> Fork {
         match self {
             Agent::Claude => {
-                let id = claude::FORK_MINTS_ID.then(claude::mint_session_id);
+                // rlord picks the fork's id: `--resume <parent>
+                // --fork-session --session-id <new>` starts it on `<new>`,
+                // its hooks report `<new>`, and its transcript is written
+                // under `<new>` from its first message on (not before:
+                // until then a restart forks again, `daemon::fork::pending`).
+                // Live check F1, Claude Code 2.1.326.
+                let id = Some(claude::mint_session_id());
                 Fork::Native(Launch {
                     argv: claude::fork_argv(parent, id.as_deref(), prompt, model, extra),
                     transcript: id.as_deref().map(|i| claude::transcript_path(project, i)),
@@ -314,7 +339,13 @@ impl Agent {
     /// of the same repo (live check F2).
     pub fn forks_elsewhere(self) -> bool {
         match self {
-            Agent::Claude => claude::FORK_ELSEWHERE,
+            // `--resume <parent>` from another worktree (its top, or the
+            // parent's subfolder of it) still finds the parent's
+            // conversation; the fork's transcript goes under the new
+            // folder, and a new worktree of a repo Claude already trusted
+            // starts without its folder-trust question (live checks F2,
+            // F2b, Claude Code 2.1.326).
+            Agent::Claude => true,
             Agent::Codex => true,
             Agent::OpenCode => false,
         }
@@ -552,7 +583,7 @@ impl Agent {
 
     /// Can rlord import its conversations started outside rlord.
     pub fn importable(self) -> bool {
-        matches!(self, Agent::Claude)
+        matches!(self, Agent::Claude | Agent::Codex)
     }
 
     // ---- its screen ----
@@ -770,6 +801,15 @@ mod tests {
         let mut argv = codex::launch_argv(None, None, &[]);
         Agent::Codex.add_first_prompt(&mut argv, "read it");
         assert_eq!(argv, codex::launch_argv(Some("read it"), None, &[]));
+    }
+
+    #[test]
+    fn pane_env_survives_codexs_default_filter() {
+        for k in PANE_ENV {
+            for word in ["KEY", "SECRET", "TOKEN"] {
+                assert!(!k.to_uppercase().contains(word), "{k}");
+            }
+        }
     }
 
     #[test]

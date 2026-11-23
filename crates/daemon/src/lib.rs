@@ -1,11 +1,15 @@
 pub mod ask;
+pub mod attention;
+pub mod attention_report;
 pub mod autostart;
 pub mod background;
 pub mod codex_daemon;
 pub mod context;
 pub mod discover;
+pub mod first_prompt;
 pub mod fork;
 pub mod import;
+mod import_offer;
 pub mod limits;
 pub mod locks;
 pub mod mcp;
@@ -14,7 +18,9 @@ pub mod opencode;
 pub mod overlord;
 pub mod own;
 pub mod profile;
+pub mod reason;
 pub mod recall;
+pub mod recheck;
 pub mod relay;
 pub mod remote;
 pub mod repo_latest;
@@ -22,6 +28,7 @@ mod repo_scan;
 pub mod rpc;
 pub mod search;
 pub mod send;
+pub mod session_tools;
 pub mod setup;
 pub mod summary;
 pub mod triage;
@@ -52,6 +59,8 @@ pub struct Daemon {
     config: std::sync::RwLock<Arc<Config>>,
     /// The repo finder's background disk scan (`repo_scan.rs`).
     repo_scan: repo_scan::Scanner,
+    /// Sessions' look-up calls, rate-limited (`session_tools`).
+    pub(crate) session_calls: session_tools::Limiter,
     /// This daemon, for work that outlives a call (a late fetch result).
     pub(crate) me: std::sync::Weak<Daemon>,
     /// `repo_latest`: fetches, per-repo locks (`repo_latest.rs`).
@@ -123,6 +132,11 @@ pub struct Daemon {
     /// Open `web.subscribe` streams (the plugin's; a restarted plugin's
     /// may overlap the old one's briefly). The pages go with the last.
     web_subscribers: AtomicUsize,
+    /// The attention queue's watcher (attention.rs).
+    pub(crate) attention: attention::Watch,
+    /// Live OpenCode sessions can't be followed (no server reached): their
+    /// "needs you" can't be seen (`opencode.rs` keeps it).
+    pub(crate) opencode_blind: std::sync::atomic::AtomicBool,
 }
 
 impl Daemon {
@@ -133,6 +147,7 @@ impl Daemon {
             db: Mutex::new(db),
             config: std::sync::RwLock::new(Arc::new(config)),
             repo_scan: repo_scan::Scanner::default(),
+            session_calls: session_tools::Limiter::default(),
             latest: Default::default(),
             notify,
             ui_view: Mutex::new(Value::Null),
@@ -158,11 +173,20 @@ impl Daemon {
             web_ui: Default::default(),
             proposals: Default::default(),
             web_subscribers: AtomicUsize::new(0),
+            attention: Default::default(),
+            opencode_blind: Default::default(),
         })
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Db> {
-        self.db.lock().expect("db mutex poisoned")
+        // A panic while it was held (a watcher thread's, caught): the DB
+        // itself is fine; carry on rather than fail every call after.
+        self.db.lock().unwrap_or_else(|e| {
+            tracing::warn!("the DB lock was poisoned by a panic: carrying on");
+            // (Once: later takers get it as usual.)
+            self.db.clear_poison();
+            e.into_inner()
+        })
     }
 
     /// `overlord::roster`, reused while its rows are unchanged and it is
@@ -380,6 +404,16 @@ impl Daemon {
             tracing::warn!(key = %cfg.tmux.overlord_switch, bound_to = verb,
                 "[tmux] overlord_switch is also another rlord key, so the overlay's switch key is off: change one in config.toml");
         }
+        // Terminals moving or changing focus tell the attention queue.
+        // (Never from tests: they must not touch rlord's own server.)
+        let hooks = if cfg!(test) {
+            Ok(())
+        } else {
+            tmux::set_presence_hooks(&methods::rlord_bin())
+        };
+        if let Err(e) = hooks {
+            tracing::debug!(error = %e, "presence hooks not set (no tmux server yet?)");
+        }
         match tmux::bind_nav_keys(&methods::rlord_bin(), &bindings, cfg.tmux.mouse) {
             Ok(conflicts) => {
                 for c in conflicts {
@@ -399,7 +433,7 @@ impl Daemon {
         if let Some(why) = self.config().session.base_problem() {
             tracing::warn!("{why}: change it in config.toml");
         }
-        let db = self.db.lock().expect("db mutex poisoned");
+        let db = self.db();
         // Read positions saved by the last run: transcripts are read forward
         // from there, not from the start.
         {
@@ -674,6 +708,11 @@ impl Daemon {
     }
 
     fn call(&self, method: &str, params: Value) -> std::result::Result<Value, MethodError> {
+        // (A terminal may move to another session: the attention queue
+        // looks at who is looking again.)
+        if method.starts_with("ui.") {
+            self.attention.poke();
+        }
         if method == "ping" {
             return Ok(json!({"pong": true, "version": env!("CARGO_PKG_VERSION"),
                              "build": build_id(), "exe": exe_id()}));
@@ -707,6 +746,21 @@ impl Daemon {
         // server: the server runs first, started by rlord (codex_daemon.rs).
         if self.starts_on_codex_daemon(method, &params) {
             codex_daemon::ensure_running();
+        }
+        // Read-only, and nothing to sync after: who waits on the user.
+        match method {
+            "attention.list" => {
+                return attention::list(self, &params).map_err(MethodError::Internal)
+            }
+            "attention.report" => {
+                return attention_report::rpc(self, &params).map_err(MethodError::Internal)
+            }
+            // A terminal moved or changed focus (tmux's client hooks).
+            "attention.poke" => {
+                self.attention.poke();
+                return Ok(json!({"ok": true}));
+            }
+            _ => {}
         }
         if let Some(r) = self.call_ui(method, &params) {
             if r.is_ok() {
@@ -801,7 +855,17 @@ impl Daemon {
             let found = self.scanned_repos(&cfg, &roots);
             (found, roots, cfg)
         });
-        let db = self.db.lock().expect("db mutex poisoned");
+        // A hook that may wake an idle session: its transcript is read
+        // here, not under the DB lock (`methods::turn_open_for`). Only a
+        // Claude tool hook can; the session is looked up only for one.
+        let mut turn_open = None;
+        if method == "hook.emit" && methods::wake_candidate(&params) {
+            let s = params["instance"]
+                .as_str()
+                .and_then(|i| self.db().resolve_ref(i).ok());
+            turn_open = s.and_then(|s| methods::turn_open_for(&s, &params));
+        }
+        let db = self.db();
         let r = match method {
             "session.list" => methods::session_list(&db, &params),
             "session.new" => {
@@ -824,7 +888,7 @@ impl Daemon {
             "session.unarchive" => methods::session_unarchive(&db, &params),
             "session.rename" => methods::session_rename(&db, &params),
             "session.tag" => methods::session_tag(&db, &params),
-            "tag.list" => methods::tag_list(&db),
+            "tag.list" => methods::tag_list(&db, &params),
             "overlord.mark_reviewed" => triage::mark_reviewed(&db, &params),
             "tag.rename" => methods::tag_rename(&db, &params),
             "tag.order" => methods::tag_order(&db, &params),
@@ -838,7 +902,7 @@ impl Daemon {
             "session.group" => methods::session_group(&db, &params),
             "session.log" => methods::session_log(&db, &params),
             "hook.emit" => {
-                let r = methods::hook_emit(&db, &params);
+                let r = methods::hook_emit_turn(&db, &params, turn_open);
                 methods::save_cursors(&db);
                 r
             }
@@ -973,9 +1037,44 @@ impl Daemon {
                     // so (the user may switch to another agent's).
                     let mut rows = [v];
                     annotate_status(self, &mut rows, false);
-                    let [v] = rows;
+                    let [mut v] = rows;
+                    // Out of usage: offer the other agents' overlords (the
+                    // list asks; the user decides).
+                    if !v["limit"].is_null() {
+                        let declined = self
+                            .db()
+                            .kv_get(overlord::LIMIT_OFFER_ANSWERED)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse().ok());
+                        let o = overlord::limit_offer(
+                            &v["overlords"],
+                            &v["limit"],
+                            &limits::limited(self),
+                            declined,
+                        );
+                        v["limit"]["switch_to"] = o["switch_to"].clone();
+                        v["limit"]["offer"] = o["offer"].clone();
+                    }
                     v
                 })
+            }
+            // "Not now" to switching away from an overlord out of usage:
+            // not asked again for this limit (`resets_at`, ms).
+            "overlord.answer_limit_offer" => {
+                let Some(at) = params["resets_at"].as_i64() else {
+                    return Some(Err(anyhow::anyhow!(
+                        "resets_at (ms, an integer) is required"
+                    )));
+                };
+                let r = self
+                    .db()
+                    .kv_set(overlord::LIMIT_OFFER_ANSWERED, &at.to_string())
+                    .map(|_| json!({"declined": true}));
+                if r.is_ok() {
+                    self.changed();
+                }
+                r
             }
             // Make another agent's overlord the active one (starting or
             // creating it). Not while something is being pasted into the
@@ -1122,6 +1221,8 @@ impl Daemon {
             "setup.status" => setup::status(self),
             "setup.suggest" => setup::suggest(self, params),
             "setup.apply" => setup::apply(self, params),
+            "setup.import_offer" => import_offer::offer(self),
+            "setup.import_answer" => import_offer::answer(self, params),
             "ui.confirm_setup" => setup::confirm(self, params),
             "overlord.setup_request" => ask::setup_request(self, params),
             "keys.list" => ui::keys_list(self),
@@ -1151,6 +1252,19 @@ impl Daemon {
                 )
             }
             "ui.propose_session" => ui::propose_session(self, params),
+            // A session's own read-only look-ups (`rlord mcp --session`,
+            // `rlord context`): by token only, a dispatch of their own (no
+            // overlord tool is reachable through it).
+            "sctx.tools" => {
+                session_tools::resolve(&self.db(), params["token"].as_str().unwrap_or(""))
+                    .map(|_| session_tools::tools())
+            }
+            "sctx.call" => session_tools::call(
+                self,
+                params["token"].as_str().unwrap_or(""),
+                params["name"].as_str().unwrap_or(""),
+                &params.get("arguments").cloned().unwrap_or(json!({})),
+            ),
             // Without `overlord: true` (`rlord mcp --overlord`) the server
             // is read-only: only `mcp::READ_ONLY_TOOLS`, listed and callable.
             // The web plugin (web.rs). Never reachable from MCP or from a
@@ -1218,6 +1332,14 @@ enum Push {
     /// `web.subscribe`: coalesced `changed` with the `rev`, and the UI
     /// commands addressed to web pages.
     Web,
+}
+
+/// Drop `agents::PANE_ENV` from this process's environment (the daemon,
+/// at start, before any thread): what it starts inherits none of it.
+pub fn scrub_own_env() {
+    for k in rlord_core::agents::PANE_ENV {
+        std::env::remove_var(k);
+    }
 }
 
 enum MethodError {
@@ -1344,6 +1466,10 @@ pub fn slim_hook_payload(raw: &str) -> Value {
                 }
             }
             if let Some(prompt) = v.get("prompt").and_then(Value::as_str) {
+                // Claude's prompt for a background task that finished.
+                if prompt.trim_start().starts_with("<task-notification>") {
+                    out.insert("prompt_wake".to_string(), json!(true));
+                }
                 let mark = rlord_core::types::PromptMark::of(prompt);
                 out.insert("prompt_hash".to_string(), json!(mark.hash));
                 if mark.pasted {
@@ -2667,6 +2793,66 @@ mod tests {
             .contains("PR is #12"));
     }
 
+    /// A session's own Stop hook carries a held message on: its answer
+    /// blocks the stop with the framed text; the ack sets it working again
+    /// and takes the message off the queue.
+    #[test]
+    fn a_stop_hook_carries_a_held_message_on() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01st",
+            name: "web-footer",
+            agent: "claude",
+            agent_session: Some("u-1"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01st_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        let emit = |event: &str| {
+            methods::hook_emit(
+                &db,
+                &json!({"instance": "01st", "agent": "claude", "event": event,
+                        "payload": {"session_id": "u-1", "hook_event_name": event}}),
+            )
+            .unwrap()
+        };
+        emit("UserPromptSubmit");
+        // Nothing held: the turn ends as usual.
+        assert!(emit("Stop")["reply"].is_null());
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+        emit("UserPromptSubmit");
+        crate::send::queue(&db, "01st", &json!({"text": "also the footer"})).unwrap();
+        let r = emit("Stop");
+        assert_eq!(r["reply"]["decision"], "block", "{r}");
+        assert!(r["reply"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("also the footer"));
+        // Idle as usual until the ack: a lost one leaves nothing stuck.
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+        let ack = r["reply_ack"].as_str().unwrap();
+        assert_eq!(
+            methods::hook_ack(&db, &json!({"ack": ack})).unwrap(),
+            json!({"acked": true})
+        );
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Working);
+        assert!(db
+            .kv_map(crate::send::PENDING_KEY)
+            .unwrap()
+            .get("01st")
+            .is_none());
+        // Its next Stop ends the turn.
+        assert!(emit("Stop")["reply"].is_null());
+        assert_eq!(db.resolve_ref("01st").unwrap().status, Status::Idle);
+    }
+
     /// "Needs you" is a block mid-turn, cleared when the agent moves on;
     /// Claude's idle reminder leaves a finished session "your turn".
     #[test]
@@ -2798,9 +2984,168 @@ mod tests {
         assert_eq!(after.status, Status::Idle);
         assert_eq!(after.last_state_change_at, s.last_state_change_at);
         assert_eq!(db.list_events("01cl", 100).unwrap().len(), events);
-        // A tool finishing while it's your turn changes nothing either.
-        assert_eq!(emit("PostToolUse", json!({}))["unchanged"], true);
+        // A sub-agent's tool finishing while it's your turn (background
+        // work) changes nothing either.
+        assert_eq!(
+            emit("PostToolUse", json!({"agent_id": "agent-bg"}))["unchanged"],
+            true
+        );
         assert_eq!(status(), Status::Idle);
+        // Replayed from the spool: old news.
+        methods::hook_replay(
+            &db,
+            &json!({"instance": "01cl", "agent": "claude", "event": "PostToolUse",
+                    "payload": {"session_id": "u-1", "hook_event_name": "PostToolUse"}}),
+        )
+        .unwrap();
+        assert_eq!(status(), Status::Idle);
+        // The main agent's own tool call while it's your turn: it works
+        // again with no prompt hook (a queued prompt, after a `!` command)
+        // — when the hook ran after the turn's end, not before it (a slow
+        // one from the turn that ended), and when the client says when.
+        // (The session's transcript: its last turn ended.)
+        let dir = tempfile::tempdir().unwrap();
+        let tp = dir.path().join("u-1.jsonl");
+        let line = |v: Value| format!("{v}\n");
+        std::fs::write(
+            &tp,
+            line(
+                json!({"type": "assistant", "timestamp": "2000-01-01T00:00:00Z",
+                        "message": {"stop_reason": "end_turn", "content": []}}),
+            ),
+        )
+        .unwrap();
+        let tool = |at: Option<i64>| {
+            let mut p = json!({"instance": "01cl", "agent": "claude", "event": "PostToolUse",
+                               "payload": {"session_id": "u-1", "hook_event_name": "PostToolUse",
+                                           "tool_name": "Bash",
+                                           "transcript_path": tp.to_string_lossy()}});
+            if let Some(at) = at {
+                p["at"] = json!(at);
+            }
+            // (As `Daemon::call` does before the DB lock: the transcript
+            // read, only past the cheap checks.)
+            let s = db.resolve_ref("01cl").unwrap();
+            let open = methods::turn_open_for(&s, &p);
+            methods::hook_emit_turn(&db, &p, open).unwrap()
+        };
+        let stopped_at = db.resolve_ref("01cl").unwrap().last_agent_msg_at.unwrap();
+        // A client can't claim a turn open: only the typed argument counts.
+        let claimed = json!({"instance": "01cl", "agent": "claude", "event": "PostToolUse",
+                             "at": stopped_at + 1, "turn_open": true,
+                             "payload": {"session_id": "u-1", "hook_event_name": "PostToolUse",
+                                         "transcript_path": tp.to_string_lossy()}});
+        assert_eq!(
+            methods::hook_emit(&db, &claimed).unwrap()["unchanged"],
+            true
+        );
+        assert_eq!(status(), Status::Idle);
+        assert_eq!(tool(None)["unchanged"], true);
+        assert_eq!(tool(Some(stopped_at - 5))["unchanged"], true);
+        assert_eq!(status(), Status::Idle);
+        // A stray tool hook with no turn begun since (the transcript ends
+        // on the last turn's reply): stays idle.
+        assert_eq!(tool(Some(stopped_at + 1))["unchanged"], true);
+        assert_eq!(status(), Status::Idle);
+        // A queued prompt's turn: begun after the Stop, a tool call open.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tp).unwrap();
+        use std::io::Write;
+        f.write_all(
+            (line(json!({"type": "user", "timestamp": "2099-01-01T00:00:00Z",
+                         "message": {"role": "user", "content": "and then this"}}))
+                + &line(
+                    json!({"type": "assistant", "timestamp": "2099-01-01T00:00:01Z",
+                               "message": {"stop_reason": "tool_use", "content": []}}),
+                ))
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.resolve_ref("01cl").unwrap().attention_reason.as_deref(),
+            Some("finished")
+        );
+        tool(Some(stopped_at + 2));
+        assert_eq!(status(), Status::Working);
+        // A turn began: the last turn's end is no longer why it waits.
+        assert_eq!(db.resolve_ref("01cl").unwrap().attention_reason, None);
+        let woke = db.list_events("01cl", 1).unwrap();
+        assert_eq!(
+            (woke[0].kind.as_str(), &woke[0].payload["woke"]),
+            ("tool", &json!(true))
+        );
+        emit("Stop", json!({}));
+        assert_eq!(status(), Status::Idle);
+    }
+
+    /// Why a session waits, kept for the attention queue: a question wins
+    /// over the permission request fired with it; a turn's end says
+    /// whether it failed; a prompt clears it.
+    #[test]
+    fn the_reason_a_session_waits_is_kept() {
+        use rlord_core::types::Status;
+        let db = Db::open_in_memory().unwrap();
+        db.insert_session(&rlord_core::db::NewSession {
+            id: "01rs",
+            name: "r",
+            agent: "claude",
+            agent_session: Some("u-2"),
+            project_path: "/tmp",
+            tmux_session: Some("rlord_01rs_absent"),
+            launch_spec: "{}",
+            created_at: 1,
+            repo_path: None,
+            workspace_path: None,
+            branch: None,
+            role: "",
+        })
+        .unwrap();
+        db.set_status("01rs", Status::Starting, 1).unwrap();
+        let emit = |event: &str, extra: Value| {
+            let mut payload = json!({"session_id": "u-2", "hook_event_name": event});
+            for (k, v) in extra.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            methods::hook_emit(
+                &db,
+                &json!({"instance": "01rs", "agent": "claude", "event": event, "payload": payload}),
+            )
+            .unwrap();
+        };
+        let reason = || db.resolve_ref("01rs").unwrap().attention_reason;
+        emit("UserPromptSubmit", json!({}));
+        assert_eq!(reason(), None);
+        // Both fire for one question, in either order.
+        emit("PermissionRequest", json!({"tool_name": "AskUserQuestion"}));
+        assert_eq!(reason().as_deref(), Some("question"));
+        emit("PreToolUse", json!({"tool_name": "AskUserQuestion"}));
+        emit(
+            "Notification",
+            json!({"notification_type": "permission_prompt"}),
+        );
+        assert_eq!(reason().as_deref(), Some("question"));
+        emit("PostToolUse", json!({"tool_name": "AskUserQuestion"}));
+        emit("PermissionRequest", json!({"tool_name": "Bash"}));
+        assert_eq!(reason().as_deref(), Some("permission"));
+        emit("PostToolUse", json!({"tool_name": "Bash"}));
+        emit(
+            "Notification",
+            json!({"notification_type": "elicitation_dialog"}),
+        );
+        assert_eq!(reason().as_deref(), Some("question"));
+        emit("Stop", json!({}));
+        assert_eq!(reason().as_deref(), Some("finished"));
+        emit("UserPromptSubmit", json!({}));
+        assert_eq!(reason(), None);
+        emit("StopFailure", json!({}));
+        assert_eq!(reason().as_deref(), Some("failed"));
+        // A background task's finish arrives as a prompt: marked so.
+        let p = slim_hook_payload(
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>b1</task-id>"}"#,
+        );
+        assert_eq!(p["prompt_wake"], true);
+        assert!(slim_hook_payload(r#"{"prompt":"fix it"}"#)
+            .get("prompt_wake")
+            .is_none());
     }
 
     /// A user's `/clear` in the overlord: recorded as a fresh conversation

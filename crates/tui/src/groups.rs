@@ -36,7 +36,7 @@ impl Tab {
     }
 }
 
-pub(crate) use rlord_core::groups::{group_label, group_list, in_group, UNTAGGED};
+pub(crate) use rlord_core::groups::{group_label, group_list, in_group, tags_of, UNTAGGED};
 
 impl App {
     /// Rebuild the groups column from `all` and show the selected group's

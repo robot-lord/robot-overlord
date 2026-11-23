@@ -150,6 +150,11 @@ export interface SessionBase {
   codex_daemon: boolean;
   forked_from: string | null;
   forked_from_name: string | null;
+  /** When a person's terminal last showed it (the attention queue). */
+  last_viewed_at: number | null;
+  /** Why it waits: "permission" or "question" (needs you), "finished" or
+   * "failed" (your turn); null when not known. */
+  attention_reason: string | null;
   fork_count: number;
   live_fork_count: number;
   /** Subagents still running after the turn ended (status idle), else null. */

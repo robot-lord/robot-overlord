@@ -124,6 +124,13 @@ fn dir_for(db: &Db, agent: Agent) -> Result<PathBuf> {
 
 /// Every folder an overlord has run in or may: its conversations there
 /// are its own (full of searches), never search results.
+/// An overlord (`role`), or a session that ran in an overlord's folder
+/// (the retired front desk): never a worker's related session, never
+/// given look-ups. The one test (`search`, `session_tools`).
+pub fn overlords_at(role: &str, folder: &str) -> bool {
+    is_overlord_role(role) || dirs().iter().any(|d| d.to_string_lossy() == folder)
+}
+
 pub fn dirs() -> Vec<PathBuf> {
     let mut v = vec![default_dir(), paths::data_dir().join(OLD_MASTERMIND)];
     v.extend(Agent::ALL.into_iter().map(agent_dir));
@@ -195,9 +202,16 @@ pub fn effort_args(agent: Agent, effort: &str) -> Vec<String> {
 
 /// The overlord's (model, effort) on `agent`: the configured ones when that
 /// is the configured agent (they are meant for it), else that agent's
-/// defaults.
+/// defaults. Codex with no model set: the top of its own catalog
+/// (`codex_top_model`). Used where an overlord is set up or created, so the
+/// slug is shown in the form and stored on the session then; later starts
+/// keep it.
 fn model_effort_for(cfg: &Config, agent: Agent) -> (String, String) {
-    if cfg.overlord.agent.trim() == agent.name() {
+    model_effort_in(cfg, agent, &codex::home())
+}
+
+fn model_effort_in(cfg: &Config, agent: Agent, codex_home: &Path) -> (String, String) {
+    let (m, e) = if cfg.overlord.agent.trim() == agent.name() {
         (
             cfg.overlord.model.trim().to_string(),
             cfg.overlord.effort.trim().to_string(),
@@ -205,6 +219,75 @@ fn model_effort_for(cfg: &Config, agent: Agent) -> (String, String) {
     } else {
         let (m, e) = rlord_core::config::OverlordConfig::defaults_for(agent.name());
         (m.to_string(), e.to_string())
+    };
+    // (The user's own Codex `model` wins: keep "" so Codex uses it.)
+    if agent == Agent::Codex && m.is_empty() && codex::configured_model(codex_home).is_none() {
+        return (codex_top_model(codex_home), e);
+    }
+    (m, e)
+}
+
+/// Codex's strongest current model, mirroring Claude's `opus` alias: the
+/// best-priority listed catalog model of the "astra" family (Codex's most
+/// capable line; its priority-1 entry is the fast everyday one). A slug
+/// ending in `-astra` first; a variant (`-astra-mini`) only when there is
+/// no plain one. If the family is renamed and nothing matches, "" (Codex's
+/// own default), never a pinned slug that may be the fast model.
+fn codex_top_model(home: &Path) -> String {
+    let listed = codex::models(home);
+    let segment = |m: &&String| m.split('-').any(|p| p == "astra");
+    listed
+        .iter()
+        .find(|m| m.ends_with("-astra"))
+        .or_else(|| listed.iter().find(segment))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The setup form's model choices for `agent`: Codex's catalog with ""
+/// (Codex's own default) kept as a choice.
+fn models_in(cfg: &Config, agent: Agent, codex_home: &Path) -> Vec<String> {
+    let mut m = match agent {
+        Agent::Codex => codex::models(codex_home),
+        _ => cfg.session.models_for(agent),
+    };
+    if agent == Agent::Codex && !m.iter().any(String::is_empty) {
+        m.push(String::new());
+    }
+    m
+}
+
+/// Each Codex catalog model's efforts, for the form to switch the effort
+/// row when the model changes (`efforts_in`). Empty for other agents.
+fn efforts_by_model(agent: Agent, codex_home: &Path) -> Value {
+    if agent != Agent::Codex {
+        return json!({});
+    }
+    let mut out = serde_json::Map::new();
+    for m in codex::models(codex_home) {
+        out.insert(m.clone(), json!(efforts_in(agent, &m, codex_home)));
+    }
+    out.insert(String::new(), json!(efforts_in(agent, "", codex_home)));
+    Value::Object(out)
+}
+
+/// The efforts the setup form offers for `agent` on `model`: Codex's from
+/// its catalog for that model, else the fixed list.
+fn efforts_in(agent: Agent, model: &str, codex_home: &Path) -> Vec<String> {
+    let fixed = || {
+        rlord_core::config::OverlordConfig::efforts_for(agent.name())
+            .iter()
+            .map(|e| e.to_string())
+            .collect()
+    };
+    if agent != Agent::Codex || model.is_empty() {
+        return fixed();
+    }
+    let e = codex::efforts(codex_home, model);
+    if e.is_empty() {
+        fixed()
+    } else {
+        e
     }
 }
 
@@ -516,6 +599,41 @@ pub fn roster((all, active): (Vec<Session>, Option<String>)) -> Value {
             })
         })
         .collect()
+}
+
+/// kv key: the reset time (ms) of the limit whose switch offer the user
+/// turned down. One limit, one offer: a later limit (another reset time)
+/// is offered again.
+pub const LIMIT_OFFER_ANSWERED: &str = "overlord_limit_offer_answered";
+
+/// What the list offers when the active overlord is out of usage (`limit`:
+/// its row's `limits::annotate` value): the agents to switch it to, from
+/// `roster`. Each is installed, isn't the active one, and has no overlord
+/// stopped on a limit itself (`limited`: `limits::limited`'s ids). `offer`
+/// says whether to ask now: not once the limit has reset, not with nowhere
+/// to go, and not again for a limit the user said no to (`declined`: its
+/// reset time). Plain data, no tmux: the caller has the roster already.
+/// Only ever an offer: the user switches (`overlord.switch`).
+pub fn limit_offer(
+    roster: &Value,
+    limit: &Value,
+    limited: &std::collections::HashMap<String, i64>,
+    declined: Option<i64>,
+) -> Value {
+    let switch_to: Vec<Value> = roster
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["installed"] == true && a["active"] != true)
+        .filter(|a| a["id"].as_str().is_none_or(|id| !limited.contains_key(id)))
+        .map(|a| json!({"agent": a["agent"], "label": a["label"], "exists": a["exists"]}))
+        .collect();
+    let resets_at = limit["resets_at"].as_i64();
+    let offer = !limit.is_null()
+        && limit["reset"] != true
+        && !switch_to.is_empty()
+        && resets_at.is_some_and(|t| Some(t) != declined);
+    json!({"switch_to": switch_to, "offer": offer})
 }
 
 /// What `roster` needs from the DB: every overlord, and the active one's id.
@@ -841,16 +959,18 @@ pub fn status(db: &Db, cfg: &Config) -> Result<Value> {
         out["exists"] = json!(false);
         // The agents it can run on (installed ones), each with what the
         // dialog offers: its default model and effort, and the choices.
+        let home = codex::home();
         let agents: Vec<Value> = Agent::ALL
             .into_iter()
             .filter(|a| rlord_core::agents::install::missing(*a).is_none())
             .map(|a| {
-                let (model, effort) = model_effort_for(cfg, a);
+                let (model, effort) = model_effort_in(cfg, a, &home);
                 json!({
                     "name": a.name(), "label": a.label(),
                     "model": model, "effort": effort,
-                    "models": cfg.session.models_for(a),
-                    "efforts": rlord_core::config::OverlordConfig::efforts_for(a.name()),
+                    "models": models_in(cfg, a, &home),
+                    "efforts": efforts_in(a, &model, &home),
+                    "efforts_by_model": efforts_by_model(a, &home),
                     "remote_control": a.has_remote_control(),
                     "catalog": catalog(a.name()),
                 })
@@ -1060,6 +1180,139 @@ const GENERATED_NOTE: &str = "<!-- Generated by rlord on every overlord start; e
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Codex overlord set up with no model gets the catalog's astra model,
+    /// else Codex's own default
+    /// (a fixture, never `~/.codex`) and that model's efforts; without a
+    /// catalog, Codex's own default and the fixed efforts. Claude and a
+    /// configured Codex model are left alone.
+    #[test]
+    fn codex_overlord_defaults_to_the_catalogs_top_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("models_cache.json"),
+            r#"{"models": [
+              {"slug": "gpt-old", "priority": 5, "visibility": "list",
+               "supported_reasoning_levels": [{"effort": "low"}]},
+              {"slug": "gpt-hidden", "priority": 0, "visibility": "hide"},
+              {"slug": "gpt-new", "priority": 1, "visibility": "list",
+               "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"},
+                 {"effort": "high"}, {"effort": "xhigh"}]}]}"#,
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let (m, e) = model_effort_in(&cfg, Agent::Codex, tmp.path());
+        // No astra here: Codex's own default, not the priority-1 slug.
+        assert_eq!((m.as_str(), e.as_str()), ("", "medium"));
+        assert_eq!(
+            efforts_in(Agent::Codex, "gpt-new", tmp.path()),
+            ["low", "medium", "high", "xhigh"]
+        );
+        let (m, _) = model_effort_in(&cfg, Agent::Claude, tmp.path());
+        assert_eq!(m, "opus");
+        let mut set = Config::default();
+        set.overlord.agent = "codex".into();
+        set.overlord.model = "gpt-old".into();
+        assert_eq!(model_effort_in(&set, Agent::Codex, tmp.path()).0, "gpt-old");
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(model_effort_in(&cfg, Agent::Codex, empty.path()).0, "");
+        // The astra family wins over priority 1; its newest sorts first.
+        let astra = tempfile::tempdir().unwrap();
+        std::fs::write(
+            astra.path().join("models_cache.json"),
+            r#"{"models": [
+              {"slug": "gpt-6.2-sol", "priority": 1, "visibility": "list"},
+              {"slug": "gpt-6.3-astra-mini", "priority": 2, "visibility": "list"},
+              {"slug": "gpt-6.2-astrality", "priority": 2, "visibility": "list"},
+              {"slug": "gpt-6.1-astra", "priority": 4, "visibility": "list"},
+              {"slug": "gpt-6.2-astra", "priority": 3, "visibility": "list"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_effort_in(&cfg, Agent::Codex, astra.path()).0,
+            "gpt-6.2-astra"
+        );
+        // Every model's efforts, and "" kept as a model choice.
+        let by = efforts_by_model(Agent::Codex, tmp.path());
+        assert_eq!(by["gpt-new"], json!(["low", "medium", "high", "xhigh"]));
+        assert_eq!(by[""], json!(["low", "medium", "high"]));
+        assert_eq!(
+            models_in(&cfg, Agent::Codex, tmp.path()),
+            ["gpt-new", "gpt-old", ""]
+        );
+        // The user's own Codex model wins: "" so Codex uses it.
+        std::fs::write(astra.path().join("config.toml"), "model = \"gpt-mine\"\n").unwrap();
+        assert_eq!(model_effort_in(&cfg, Agent::Codex, astra.path()).0, "");
+        // Only a variant: that, over the fast model.
+        let mini = tempfile::tempdir().unwrap();
+        std::fs::write(
+            mini.path().join("models_cache.json"),
+            r#"{"models": [
+              {"slug": "gpt-6.2-sol", "priority": 1, "visibility": "list"},
+              {"slug": "gpt-6.3-astra-mini", "priority": 2, "visibility": "list"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_effort_in(&cfg, Agent::Codex, mini.path()).0,
+            "gpt-6.3-astra-mini"
+        );
+        assert_eq!(
+            efforts_in(Agent::Codex, "gpt-new", empty.path()),
+            ["low", "medium", "high"]
+        );
+    }
+
+    /// Out of usage: the other installed agents are offered, never one
+    /// whose overlord is limited too, and a declined or reset limit asks
+    /// nothing.
+    #[test]
+    fn a_limited_overlord_offers_the_other_agents() {
+        let roster = json!([
+            {"agent": "claude", "label": "Claude Code", "installed": true, "active": true, "exists": true, "id": "a"},
+            {"agent": "codex", "label": "Codex", "installed": true, "active": false, "exists": true, "id": "b"},
+            {"agent": "opencode", "label": "OpenCode", "installed": true, "active": false, "exists": false, "id": null},
+        ]);
+        let limit = json!({"resets_at": 1000, "reset": false});
+        let none = std::collections::HashMap::new();
+        let o = limit_offer(&roster, &limit, &none, None);
+        assert_eq!(o["offer"], true);
+        let agents: Vec<_> = o["switch_to"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["agent"].as_str().unwrap())
+            .collect();
+        assert_eq!(agents, ["codex", "opencode"]);
+
+        // Codex's overlord is out of usage too: only OpenCode.
+        let limited = std::collections::HashMap::from([("b".to_string(), 2000)]);
+        let o = limit_offer(&roster, &limit, &limited, None);
+        assert_eq!(o["switch_to"].as_array().unwrap().len(), 1);
+        assert_eq!(o["switch_to"][0]["agent"], "opencode");
+
+        // Said no to this limit: listed, not asked. A later limit asks again.
+        assert_eq!(
+            limit_offer(&roster, &limit, &none, Some(1000))["offer"],
+            false
+        );
+        assert_eq!(
+            limit_offer(&roster, &limit, &none, Some(500))["offer"],
+            true
+        );
+        // Reset already, or not limited: nothing to ask.
+        let reset = json!({"resets_at": 1000, "reset": true});
+        assert_eq!(limit_offer(&roster, &reset, &none, None)["offer"], false);
+        assert_eq!(
+            limit_offer(&roster, &Value::Null, &none, None)["offer"],
+            false
+        );
+        // Nothing else installed: nowhere to go.
+        let alone = json!([roster[0].clone(),
+            {"agent": "codex", "label": "Codex", "installed": false, "active": false, "exists": false, "id": null}]);
+        let o = limit_offer(&alone, &limit, &none, None);
+        assert_eq!(o["offer"], false);
+        assert!(o["switch_to"].as_array().unwrap().is_empty());
+    }
 
     /// Every MCP tool must be explained in the overlord's instructions or its
     /// subagents' (see the repo's CLAUDE.md): a tool it isn't told about goes

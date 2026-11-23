@@ -141,10 +141,10 @@ fn spawn_detached() -> Result<Child> {
     cmd.arg("daemon")
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)
-        .stderr(out)
-        // A client running inside an agent pane must not leak that pane's
-        // identity into the daemon (and from there into every pane it opens).
-        .env_remove("RLORD_SESSION_ID")
+        .stderr(out);
+    // A client running inside an agent pane must not leak that pane's
+    // identity into the daemon (and from there into every pane it opens).
+    rlord_core::agents::scrub_pane_env(&mut cmd)
         .env_remove("TMUX")
         .env_remove("TMUX_PANE");
     // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.

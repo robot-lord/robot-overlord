@@ -1137,6 +1137,18 @@ Decided 2026-11-17 (user):
   - The CLI's pairing flow against a live daemon has no end-to-end test
     (the CLI autostarts a real daemon); its logic is unit-tested and the
     same daemon commands are exercised by `web/tests/remote.rs`.
+- Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
+  - The attention queue (main's `attention.rs`) counts only terminals as
+    "looking": `tmux::list_clients` leaves web views out, so a session
+    shown in a browser isn't stamped `last_viewed_at` and a focused
+    browser doesn't count as presence. Decide whether a web view (and a
+    device) should count, and how its focus is known.
+  - Main's new daemon methods aren't on `web::OPS`: `attention.list`,
+    `attention.report`, `attention.poke`, `overlord.answer_limit_offer`,
+    `setup.import_offer` / `setup.import_answer`, `sctx.tools` /
+    `sctx.call`. The page doesn't use `attention_reason` or
+    `last_viewed_at` yet (in `proto.ts`, not drawn). Add any the page
+    needs, each with a test.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
