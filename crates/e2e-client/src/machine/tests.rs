@@ -27,6 +27,10 @@ struct FakeHost {
     answer: bool,
     rev: String,
     api: Option<u64>,
+    /// What its hello says of the device's mailbox.
+    hello_mailbox: HelloMailbox,
+    /// Kind-3 message 1s answered (mailboxes keyed).
+    keyings: usize,
     /// A pairing offer the host shows.
     qr: Option<QrPayload>,
     /// The pairing's short code, at the host.
@@ -54,6 +58,16 @@ impl FakeHost {
         p.extend(m.encrypt(&f[0]).unwrap());
         p
     }
+}
+
+/// The `mailbox` field of the fake host's hello.
+enum HelloMailbox {
+    /// Its mailbox's id, or null for none (the host today).
+    Current,
+    /// No field (an older host).
+    Absent,
+    /// This value.
+    Fixed(Value),
 }
 
 struct World {
@@ -150,6 +164,8 @@ impl World {
                 answer: true,
                 rev: "r1".into(),
                 api: Some(1),
+                hello_mailbox: HelloMailbox::Current,
+                keyings: 0,
                 qr: None,
                 code: None,
             },
@@ -281,6 +297,13 @@ impl World {
                 if let Some(a) = self.host.api {
                     h["api"] = json!(a);
                 }
+                match &self.host.hello_mailbox {
+                    HelloMailbox::Current => {
+                        h["mailbox"] = json!(self.host.mailbox.as_ref().map(|m| b64(&m.id())))
+                    }
+                    HelloMailbox::Absent => {}
+                    HelloMailbox::Fixed(v) => h["mailbox"] = v.clone(),
+                }
                 Some((link, self.host.encrypt(&h)))
             }
             Some("mailbox_key") => {
@@ -294,6 +317,7 @@ impl World {
                 )
                 .unwrap();
                 self.host.mailbox = Some(est.into_mailbox().unwrap());
+                self.host.keyings += 1;
                 let ans = json!({"event": "mailbox_key", "msg": b64(&m2)});
                 Some((link, self.host.encrypt(&ans)))
             }
@@ -455,6 +479,16 @@ impl World {
             .filter(|v| v.get("op").is_some())
             .cloned()
             .collect()
+    }
+
+    /// The link closes; the next dial reaches `ready` with the host
+    /// online (a fresh session and hello).
+    fn reconnect(&mut self) {
+        self.closed(1006);
+        let d = self.m.dial_at.unwrap() - self.now.mono;
+        self.advance(d);
+        self.link_up(HostState::Online);
+        assert!(self.m.live(), "live again");
     }
 
     fn ask(&mut self, page_id: u64, text: &str) {
@@ -1702,4 +1736,134 @@ fn a_relay_changing_boot_every_time_gets_one_resend_per_link() {
     // One mailbox frame per link, and the links themselves backed off.
     assert_eq!(w.host.mb_got.len(), 6);
     assert_eq!(w.dials.len(), 6);
+}
+
+// ---- the host's mailbox in its hello ----
+
+#[test]
+fn a_hello_naming_another_mailbox_keys_a_new_one() {
+    // The same id: nothing changes.
+    let mut w = World::live();
+    assert_eq!(w.host.keyings, 1);
+    let old = w.m.mailbox.as_ref().unwrap().id();
+    w.reconnect();
+    assert_eq!(w.host.keyings, 1);
+    assert_eq!(w.m.mailbox.as_ref().unwrap().id(), old);
+    assert!(
+        w.page_events("hello")
+            .iter()
+            .all(|h| h.get("mailbox").is_none()),
+        "the page's hello is a local page's"
+    );
+    // Another id: ours is discarded and a new one keyed, saved, and the
+    // host's.
+    w.host.hello_mailbox = HelloMailbox::Fixed(json!(b64(&[7; 8])));
+    w.reconnect();
+    assert_eq!(w.host.keyings, 2);
+    let new = w.m.mailbox.as_ref().unwrap().id();
+    assert_ne!(new, old);
+    assert_eq!(w.host.mailbox.as_ref().unwrap().id(), new);
+    let saved = MailboxSession::import(&unb64(&w.saved().mailbox.unwrap()).unwrap()).unwrap();
+    assert_eq!(saved.id(), new);
+    // None at the host (null): the same.
+    w.host.hello_mailbox = HelloMailbox::Current;
+    w.host.mailbox = None;
+    w.reconnect();
+    assert_eq!(w.host.keyings, 3);
+    assert_ne!(w.m.mailbox.as_ref().unwrap().id(), new);
+}
+
+#[test]
+fn an_older_host_without_the_field_keeps_todays_behaviour() {
+    let mut w = World::live();
+    let old = w.m.mailbox.as_ref().unwrap().id();
+    // The host lost it but doesn't say: the device can't know.
+    w.host.hello_mailbox = HelloMailbox::Absent;
+    w.host.mailbox = None;
+    w.reconnect();
+    assert_eq!(w.host.keyings, 1);
+    assert_eq!(w.m.mailbox.as_ref().unwrap().id(), old);
+}
+
+#[test]
+fn a_request_sent_under_a_discarded_mailbox_is_neither_lost_nor_answered_twice() {
+    let mut w = offline_with_mailbox();
+    w.ask(1, "q");
+    let rid = w.host.mb_got[0]["id"].clone();
+    w.relay_says(FromRelay::Queued {
+        seq: 1,
+        device: None,
+    });
+    // The host loses the mailbox before it opens the frame (its state was
+    // lost): the frame is dropped there.
+    w.host.mailbox = None;
+    w.host.session = None;
+    w.relay_says(FromRelay::Host {
+        state: HostState::Online,
+    });
+    assert!(w.m.live());
+    assert_eq!(w.host.keyings, 2, "keyed anew");
+    let live: Vec<Value> = w.requests();
+    assert_eq!(live.len(), 1, "resent live by id");
+    assert_eq!(live[0]["id"], rid);
+    // The host goes again before answering: it goes by the new mailbox.
+    w.relay_says(FromRelay::Host {
+        state: HostState::Offline,
+    });
+    assert_eq!(w.host.mb_got.len(), 2);
+    assert_eq!(w.host.mb_got[1]["id"], rid);
+    w.relay_says(FromRelay::Queued {
+        seq: 2,
+        device: None,
+    });
+    // Its answer by mailbox, then the same again (from the live resend):
+    // the page hears once.
+    for seq in [1, 2] {
+        let ans = w.host.mailbox_frame(&json!({"id": rid, "ok": {"n": seq}}));
+        w.input(Input::Binary {
+            link: w.link,
+            bytes: ToDevice::Mailbox { seq, payload: ans }.encode(),
+        });
+    }
+    assert_eq!(w.page.iter().filter(|v| v["id"] == 1).count(), 1);
+    assert_eq!(w.reply(1).unwrap()["ok"]["n"], 1);
+    assert!(w.saved().outbox.is_empty());
+}
+
+#[test]
+fn a_frame_queued_or_refused_under_a_discarded_mailbox_goes_again() {
+    // Refused `full` under the old mailbox, then the host says it has
+    // another: the refused bytes are not offered again; the request is
+    // sealed afresh under the new mailbox.
+    let mut w = offline_with_mailbox();
+    w.ask(1, "q");
+    let rid = w.host.mb_got[0]["id"].clone();
+    w.relay_says(FromRelay::Refused {
+        code: "full".into(),
+        device: None,
+    });
+    w.host.mailbox = None;
+    w.host.session = None;
+    w.relay_says(FromRelay::Host {
+        state: HostState::Online,
+    });
+    assert_eq!(w.host.keyings, 2);
+    w.relay_says(FromRelay::Host {
+        state: HostState::Offline,
+    });
+    let new = w.m.mailbox.as_ref().unwrap().id();
+    let last = w.mb_raw.last().unwrap();
+    assert_eq!(last[..8], new, "sealed under the new mailbox");
+    assert_eq!(w.host.mb_got.last().unwrap()["id"], rid);
+    // A frame in flight when the mailbox went: its `queued` doesn't mark
+    // the request as queued (the host drops the frame), so it goes again.
+    let mut w = offline_with_mailbox();
+    w.ask(1, "q");
+    w.host.mailbox = None;
+    w.m.discard_mailbox();
+    w.relay_says(FromRelay::Queued {
+        seq: 1,
+        device: None,
+    });
+    assert_eq!(w.saved().outbox.entries[0].queued_boot, None);
 }
