@@ -27,6 +27,7 @@ pub mod store;
 use std::path::PathBuf;
 
 pub use engine::Engine;
+pub use machine::Tuning;
 
 /// What a platform call reports when it fails (a keystore refused, a
 /// vault couldn't open a file). One string: the engine only logs it and

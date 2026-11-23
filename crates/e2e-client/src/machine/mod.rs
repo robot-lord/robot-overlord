@@ -62,6 +62,23 @@ pub const LEAVE_MS: u64 = 5_000;
 /// Device names are clipped to this many characters.
 pub const NAME_MAX: usize = 40;
 
+/// Timings a test may shorten (the integration tests' stalled links).
+/// The defaults are the protocol's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuning {
+    pub ping_ms: u64,
+    pub silence_ms: u64,
+}
+
+impl Default for Tuning {
+    fn default() -> Tuning {
+        Tuning {
+            ping_ms: PING_MS,
+            silence_ms: SILENCE_MS,
+        }
+    }
+}
+
 /// The time, as the driver read it: a monotonic clock and the wall clock,
 /// both in milliseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -304,6 +321,7 @@ struct Bg {
 
 pub struct Machine {
     signers: Arc<dyn Signers>,
+    tuning: Tuning,
     rng: u64,
     now: Now,
     last_tick: Option<Now>,
@@ -361,6 +379,7 @@ impl Machine {
     pub fn new(signers: Arc<dyn Signers>, saved: Vec<Record>, seed: u64) -> Machine {
         let mut m = Machine {
             signers,
+            tuning: Tuning::default(),
             rng: seed | 1,
             now: Now::default(),
             last_tick: None,
@@ -429,6 +448,10 @@ impl Machine {
         self.last_rev = r.rev.clone();
         self.rec = Some(r);
         true
+    }
+
+    pub fn set_tuning(&mut self, t: Tuning) {
+        self.tuning = t;
     }
 
     /// The next action for the driver, oldest first.
@@ -1920,7 +1943,7 @@ impl Machine {
             self.replaced = false;
             self.attempt = 0;
             let silent = match &self.link {
-                Link::Up(up) => self.now.mono.saturating_sub(up.last_rx) >= PING_MS,
+                Link::Up(up) => self.now.mono.saturating_sub(up.last_rx) >= self.tuning.ping_ms,
                 _ => false,
             };
             if silent {
@@ -2145,13 +2168,13 @@ impl Machine {
         let mut hs_failed = false;
         let mut ping = None;
         if let Link::Up(up) = &mut self.link {
-            if mono.saturating_sub(up.last_rx) >= SILENCE_MS {
+            if mono.saturating_sub(up.last_rx) >= self.tuning.silence_ms {
                 give_up = true;
             } else {
                 if mono.saturating_sub(up.since) >= STABLE_MS && !self.replaced {
                     self.attempt = 0;
                 }
-                if mono.saturating_sub(up.last_ping) >= PING_MS {
+                if mono.saturating_sub(up.last_ping) >= self.tuning.ping_ms {
                     up.last_ping = mono;
                     ping = Some(up.id);
                 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::driver::{self, Cmd, Driver};
-use crate::machine::{Input, Machine};
+use crate::machine::{Input, Machine, Tuning};
 use crate::{BackgroundOutcome, Config, Listener, PlatformError, Signers, Vault};
 
 pub struct Engine {
@@ -27,13 +27,25 @@ impl Engine {
         signers: Arc<dyn Signers>,
         listener: Arc<dyn Listener>,
     ) -> Result<Engine, PlatformError> {
+        Engine::with_tuning(cfg, vault, signers, listener, Tuning::default())
+    }
+
+    /// [`Engine::new`] with shorter timings (tests only; not in the FFI).
+    pub fn with_tuning(
+        cfg: Config,
+        vault: Arc<dyn Vault>,
+        signers: Arc<dyn Signers>,
+        listener: Arc<dyn Listener>,
+        tuning: Tuning,
+    ) -> Result<Engine, PlatformError> {
         std::fs::create_dir_all(&cfg.dir)
             .map_err(|e| PlatformError::new(format!("{}: {e}", cfg.dir.display())))?;
         let tls = Arc::new(link_tls(cfg.ca_pem.as_deref())?);
         let saved = driver::load(&cfg.dir, vault.as_ref());
         let mut seed = [0u8; 8];
         getrandom::fill(&mut seed).map_err(|e| PlatformError::new(e.to_string()))?;
-        let machine = Machine::new(signers.clone(), saved, u64::from_le_bytes(seed));
+        let mut machine = Machine::new(signers.clone(), saved, u64::from_le_bytes(seed));
+        machine.set_tuning(tuning);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("rlord-engine")
