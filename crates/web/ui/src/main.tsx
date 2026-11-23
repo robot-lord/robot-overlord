@@ -3,13 +3,14 @@
 
 import { effect } from "@preact/signals";
 import { render } from "preact";
-import { Control, takeToken, wsUrl } from "./api";
+import { LocalTransport, takeToken, wsUrl } from "./api";
 import { FormHost } from "./components/FormHost";
 import { Toast } from "./components/Toast";
 import { tick } from "./components/time";
 import type { UiCmd } from "./proto";
 import { followHash, href, parse, route } from "./route";
 import { listView, Store } from "./store";
+import { LOCAL_CAPS, menu } from "./transport";
 import { decide, Reporter } from "./ui";
 import { List, open as openForm } from "./views/List";
 import { Overlord } from "./views/Overlord";
@@ -65,7 +66,7 @@ const reporter = new Reporter((args) => {
 });
 
 const control = token
-  ? new Control(wsUrl("/ws"), token, {
+  ? new LocalTransport(wsUrl("/ws"), token, {
       state: (s) => {
         store.conn.value = s;
       },
@@ -138,6 +139,8 @@ const words: Record<string, string> = {
   no_token: "no token: open the link `rlord web` prints",
 };
 
+const caps = control?.caps ?? LOCAL_CAPS;
+
 function App() {
   const r = route.value;
   const conn = store.conn.value;
@@ -153,13 +156,15 @@ function App() {
         {store.error.value && conn === "open" && <span class="err">{store.error.value}</span>}
         {conn === "open" && (
           <span class="menu">
-            <button type="button" class="dim" onClick={() => openForm(store, "setup")}>
-              Code folder
-            </button>
-            <button type="button" class="dim" onClick={() => openForm(store, "keys")}>
-              Keys
-            </button>
-            <DevicesButton />
+            {menu(caps).map((m) =>
+              m === "devices" ? (
+                <DevicesButton />
+              ) : (
+                <button type="button" class="dim" onClick={() => openForm(store, m)}>
+                  {m === "setup" ? "Code folder" : "Keys"}
+                </button>
+              ),
+            )}
           </span>
         )}
       </header>

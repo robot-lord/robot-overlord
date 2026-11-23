@@ -502,3 +502,14 @@ export interface OverlordMessages {
   /** Earlier ones are left. */
   more: boolean;
 }
+
+// ---------------------------------------------------------------------
+// The phone app (slice 4): ops beyond `OPS`, and the messages between the
+// page and the app's native side (docs/working/web-ui-remote.md, "The
+// bridge and RemoteTransport"). Kept in this block, apart from the rest.
+
+/**
+ * Every op the page may send: `OPS`, plus ops the daemon is gaining in
+ * this slice (in `OPS` once its list has them; the union stays valid).
+ */
+export type PageOp = Op | "session.messages";

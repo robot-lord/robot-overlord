@@ -1,18 +1,14 @@
-// The control socket: the token, its first-frame auth, reconnecting, and
-// requests matched to answers by id.
+// The local page's transport: the control socket, its token and
+// first-frame auth, reconnecting, and requests matched to answers by id.
 //
 // The token comes in the URL fragment (`#t=<token>`, never sent to the
 // server), is kept in localStorage (per origin, so per port) and taken out
 // of the address bar.
 
-import {
-  CLOSE_UNAUTHORIZED,
-  type ControlMessage,
-  type ErrorCode,
-  type Hello,
-  type Op,
-  type UiCmd,
-} from "./proto";
+import { CLOSE_UNAUTHORIZED, type ControlMessage, type PageOp } from "./proto";
+import { ApiError, type Caps, LOCAL_CAPS, type Transport, type TransportEvents } from "./transport";
+
+export { ApiError, type ConnState } from "./transport";
 
 /** What the page needs of a WebSocket (a fake in tests). */
 export interface Sock {
@@ -70,25 +66,6 @@ export function takeToken(
   }
 }
 
-/** A failed request. `code` is the plugin's, or `disconnected`. */
-export class ApiError extends Error {
-  readonly code: ErrorCode | "disconnected";
-  constructor(code: ErrorCode | "disconnected", message: string) {
-    super(message);
-    this.code = code;
-  }
-}
-
-export type ConnState = "connecting" | "open" | "closed" | "unauthorized";
-
-export interface ControlEvents {
-  state(s: ConnState): void;
-  hello(h: Hello): void;
-  changed(rev: string): void;
-  /** A UI command from the overlord, for this page. */
-  ui?(cmd: UiCmd): void;
-}
-
 /** Retry waits: from FIRST, doubling up to LAST. */
 export const BACKOFF_FIRST = 250;
 export const BACKOFF_LAST = 5000;
@@ -102,7 +79,10 @@ interface Pending {
  * The control socket. Connects at once and keeps reconnecting (backoff
  * reset by each hello) until `stop`, or until the token is refused.
  */
-export class Control {
+export class LocalTransport implements Transport {
+  /** (The phone page's bundle check fails if this string is in it.) */
+  static readonly marker = "rlord-local-transport";
+  readonly caps: Caps = LOCAL_CAPS;
   private sock: Sock | null = null;
   private authed = false;
   private nextId = 1;
@@ -113,10 +93,10 @@ export class Control {
 
   private readonly url: string;
   private readonly token: string;
-  private readonly on: ControlEvents;
+  private readonly on: TransportEvents;
   private readonly open: OpenSock;
 
-  constructor(url: string, token: string, on: ControlEvents, open: OpenSock = openWebSocket) {
+  constructor(url: string, token: string, on: TransportEvents, open: OpenSock = openWebSocket) {
     this.url = url;
     this.token = token;
     this.on = on;
@@ -125,7 +105,7 @@ export class Control {
   }
 
   /** Ask the daemon (an op on its allow-list). */
-  request<T = unknown>(op: Op, args: object = {}): Promise<T> {
+  request<T = unknown>(op: PageOp, args: object = {}): Promise<T> {
     const s = this.sock;
     if (!s || !this.authed || s.readyState !== OPEN) {
       return Promise.reject(new ApiError("disconnected", "not connected"));
