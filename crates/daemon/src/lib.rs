@@ -955,6 +955,7 @@ impl Daemon {
             }
             "overlord.ask" => ask::ask(self, params),
             "session.send" => send::send(self, params),
+            "session.stash_dismiss" => stash::dismiss(self, params),
             "limits.resume" => limits::resume(self, params),
             "limits.auto_resume" => limits::set_auto_resume(self, params),
             "overlord.triage" => triage::triage(self, params),

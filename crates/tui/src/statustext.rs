@@ -61,7 +61,7 @@ pub fn legend() -> Vec<(String, &'static str)> {
     ));
     v.push((
         "⎘".into(),
-        "a draft rlord stashed wasn't restored: Ctrl+S in the session",
+        "a draft rlord stashed wasn't restored: Ctrl+S in the session, or rlord stash-dismiss",
     ));
     v.push(("⋯".into(), "still loading its sub-agent counts"));
     v
@@ -311,7 +311,7 @@ fn mail_marks(s: &Value) -> Vec<Item> {
         v.push(Item {
             label: "stash",
             mark: Span::styled("⎘", Style::default().fg(theme::red())),
-            text: "draft stashed: Ctrl+S in the session to restore it (rlord couldn't).".into(),
+            text: "draft stashed: Ctrl+S in the session to restore it (rlord couldn't), or `rlord stash-dismiss`. rlord stashes nothing more there until then.".into(),
             shown: true,
         });
     }

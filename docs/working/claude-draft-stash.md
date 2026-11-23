@@ -52,11 +52,37 @@ Live (coordinator): "draft stashed" stayed up ~13s across a turn; C-s on
 an empty box with nothing stashed appears to be a no-op;
 "draft stashed · ✔ Update installed" rendered right above the top rule.
 
+## Review round 2 + live test (applied)
+
+Rule: never lose a draft; a held message is fine.
+
+- Live (2.1.331, scenarios A-C passed): Claude Code restores the stashed
+  draft by itself ~2s after the delivered turn; rlord's press never ran
+  (`draft_restored by: other`). The 2.1.327 "draft restored · draft
+  stashed" with an empty box was a manual C-s re-stashing after that
+  auto-restore. So the restore presses only on an empty box whose latest
+  status is "draft stashed", after idle + a few seconds, with a fresh
+  look right before; no indicator and not our draft = dropped quietly
+  (round 1's "press once without the indicator" removed).
+- After the stash's C-s, the screen is polled (~2s): box empty = stashed
+  (recorded, then paste + Enter in the same call). Text still there =
+  10 min in-memory back-off, message held. RecordOnly-without-typing
+  removed (only an unreadable screen records without typing).
+- Failed records block new stashes again (round 1 change reverted);
+  lifted when the draft shows back or `rlord stash-dismiss`
+  (`session.stash_dismiss`). Reason shown in the hold text.
+- Whole-first-line match; cancel_mode before restore's C-s; tick runs
+  prune + restore even when a delivery errors; `held_logged` separate
+  from the reason, `d.changed()` on lift; chords starting with ctrl+s
+  mean no stash; `settled_since_typed`/`typing()` in type_into,
+  `agent_pane` shared, keybindings read only after the age check.
+
 ## Owed / open
 
-- Review item 10: the pane / settled helpers are duplicated between
-  `send.rs` (`agent_pane`, `settled` closure) and `stash.rs` (`restore`
-  looks up the pane and settled state itself). Fold into shared helpers.
+- No unit test reaches `type_into`'s tmux sequence: the back-off call on
+  Untouched, record-before-paste ordering, and whole-box hashing are
+  covered only through pure functions. Same for `cancel_mode` before the
+  restore press and tick continuing past a delivery error.
 - The `type_into` stash path (C-s, `after_stash`, record before paste,
   whole-box age) has pure-logic tests only; the tmux sequence itself is
   untested.

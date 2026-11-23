@@ -1451,29 +1451,35 @@ including when the active one hits a usage limit.
   hashed) has sat unchanged for `DRAFT_IDLE` (tracked in memory; reset
   when the box is seen empty, when someone used a terminal on it, and
   when the session leaves "your turn"), Ctrl+S is `chat:stash` and the
-  only key for it (`keybindings.json` under Claude's config dir, read
-  only), and nothing is stashed: no "draft stashed" on the status lines
-  (below the box's bottom rule, or a line right above its top rule that
-  starts with the notice; transcript text never counts; an unrecognised
-  box means don't stash) and no live record of rlord's (a failed one
-  doesn't block). After Ctrl+S, an empty box is recorded at once (kv
-  `draft_stash`, before any paste, so the restore runs whatever happens
-  next); the message is pasted only when "draft stashed" also shows
-  (`after_stash`). The stash is one slot (stashing again loses the
-  first: checked live), so each of those conditions guards it. The
-  restore runs on `send`'s tick: Ctrl+S only with the box empty, the
-  screen at its prompt, the session idle a few seconds, `SETTLE` since
-  the paste and no one typing, whether or not the indicator still shows
-  (Ctrl+S with nothing stashed appeared to do nothing, live). The draft's
-  first line back: `draft_restored`. Still stashed: retried with
-  backoff, and after a few presses or 30 minutes `draft_restore_failed`
-  (row mark `⎘`, row field `draft_stash: "failed"`, kept up to 2h).
-  Nothing back and nothing stashed: `draft_restore_unknown`, dropped
-  without a mark. Ctrl+S a second after Enter didn't restore in a live
-  check ("draft restored · draft stashed" with the box empty), hence the
-  wait for the turn to end. A hold's kind (`Why::draft`) is stored with
-  its reason (`held_draft`), and a hold lifts when the session leaves
-  "your turn".
+  only key for it, with no chord starting with Ctrl+S
+  (`keybindings.json` under Claude's config dir, read only, and only
+  once everything else says yes), and nothing is stashed: no "draft
+  stashed" on the status lines (below the box's bottom rule, or a line
+  right above its top rule that starts with the notice; transcript text
+  never counts; an unrecognised box means don't stash), no record of
+  rlord's in kv `draft_stash` (a failed one blocks too: rlord can't see
+  what the stash holds; it lifts when rlord sees the draft back or on
+  `rlord stash-dismiss`, RPC `session.stash_dismiss`), and no back-off.
+  After Ctrl+S the screen is polled (`poll_stash`, up to ~2s): the box
+  going empty proves the stash, whatever the indicator shows, and it is
+  recorded before the paste and Enter in the same call. Text still there
+  means it didn't take: no stash in that session for 10 minutes (in
+  memory), the message held. No readable screen: recorded, not typed.
+  The stash is one slot (stashing again loses the first: checked live),
+  so each of those conditions guards it. Claude Code restores the draft
+  by itself about 2s after the delivered turn (seen live, 2.1.331), so
+  the restore on `send`'s tick (session idle a few seconds, `SETTLE`
+  since the paste, no one typing, at its prompt) mostly just sees it
+  back (`draft_restored` by other). It presses Ctrl+S (after
+  `cancel_mode`, with a fresh look right before) only with the box empty
+  and the latest status "draft stashed": a press after the auto-restore
+  would stash the draft again. No indicator and the draft not in the box
+  means it was dealt with: `draft_restore_unknown`, dropped quietly.
+  Still stashed after a press: retried with backoff, and after a few
+  presses or 30 minutes `draft_restore_failed` (row mark `⎘`, row field
+  `draft_stash: "failed"`). A hold's kind (`Why::draft`) is stored with
+  its reason (`held_draft`); a hold lifts when the session leaves "your
+  turn", and `held_logged` keeps it logged once per message.
 - **Per-session lock** (`daemon/src/locks.rs`): taken by sends,
   deliveries and asks around the final re-read and the paste, and by
   restart, stop, archive, fresh restarts and `overlord.continue` (and the
