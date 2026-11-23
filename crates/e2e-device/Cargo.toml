@@ -1,6 +1,7 @@
 # rlord's test device (`rlord-device`): a library the remote-access tests
-# drive (pairing, live sessions, the mailbox, and a hostile relay for the
-# adversarial tests), and a small CLI for pairing by hand. Never released
+# drive (pairing, live sessions, the mailbox step by step; the device
+# engine with software keys; hostile relays for the adversarial tests),
+# and a small CLI on the engine for pairing by hand. Never released
 # or packaged.
 [package]
 name = "robot-overlord-e2e-device"
@@ -22,6 +23,8 @@ path = "src/main.rs"
 [dependencies]
 rlord-e2e = { package = "robot-overlord-e2e", path = "../e2e" }
 rlord-relay-proto = { package = "robot-overlord-relay-proto", path = "../relay-proto" }
+# The device engine the phone runs: the CLI and the engine tests drive it.
+rlord-e2e-client = { package = "robot-overlord-e2e-client", path = "../e2e-client" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

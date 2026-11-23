@@ -9,6 +9,7 @@ members = [
     "crates/e2e",
     "crates/e2e-wasm",
     "crates/relay-proto",
+    "crates/e2e-client",
     "crates/e2e-device",
     "crates/relay",
     "crates/e2e-ffi",

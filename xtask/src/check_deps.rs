@@ -28,8 +28,11 @@
 //!
 //! The phone app (docs/working/web-ui-remote.md, "Slice 4 plan") adds:
 //!
-//! 6. `rlord` names neither the app's engine library nor UniFFI.
-//! 7. The app's own sources (`apps/`) name no network API: the engine's
+//! 6. `rlord` names neither the device engine (`crates/e2e-client`), the
+//!    app's FFI library nor UniFFI.
+//! 7. The engine's own tree names no part of rlord and not the relay (it
+//!    is the device's side only; the phone app links it).
+//! 8. The app's own sources (`apps/`) name no network API: the engine's
 //!    relay link is the app's only network path. Observing the network
 //!    (`NWPathMonitor`, `ConnectivityManager`) is allowed.
 
@@ -60,6 +63,7 @@ pub const DENIED: &[&str] = &[
     "robot-overlord-relay",
     "robot-overlord-relay-proto",
     "robot-overlord-e2e-device",
+    "robot-overlord-e2e-client",
     "robot-overlord-e2e-ffi",
     "uniffi",
     "snow",
@@ -128,6 +132,16 @@ pub const E2E_DENIED: &[&str] = &[
     "socket2",
 ];
 
+/// The device engine's package, and what it must never depend on: rlord
+/// itself and the relay.
+const CLIENT: &str = "robot-overlord-e2e-client";
+pub const CLIENT_DENIED: &[&str] = &[
+    "robot-overlord-core",
+    "robot-overlord-daemon",
+    "robot-overlord-relay",
+    "robot-overlord-web",
+];
+
 /// The one file of the web plugin that may name a TCP listener.
 const WEB_SRC: &str = "crates/web/src";
 const WEB_LISTENER: &str = "main.rs";
@@ -149,6 +163,7 @@ const LOOPBACK_CRATES: &[&str] = &[
     "crates/web",
     "crates/e2e",
     "crates/e2e-wasm",
+    "crates/e2e-client",
     "crates/e2e-device",
     "crates/relay-proto",
 ];
@@ -204,6 +219,14 @@ pub fn check() -> Result<()> {
             e2e.join(", ")
         );
     }
+    let client = denied_in_tree(&tree(CLIENT)?, CLIENT_DENIED);
+    if !client.is_empty() {
+        bail!(
+            "the device engine (rlord_e2e_client) depends on {} (it is the device's \
+             side only: no part of rlord, not the relay)",
+            client.join(", ")
+        );
+    }
     let mut found = listeners_in_web(Path::new(WEB_SRC))?;
     for dir in LOOPBACK_CRATES {
         found.extend(any_address_binds(Path::new(dir))?);
@@ -225,7 +248,8 @@ pub fn check() -> Result<()> {
     }
     println!(
         "check-deps: rlord has no network dependency; rlord-relay no content crypto; \
-         rlord_e2e no IO; the phone app no network API"
+         rlord_e2e no IO; the device engine no rlord and no relay; the phone app no \
+         network API"
     );
     Ok(())
 }
@@ -490,6 +514,33 @@ mod tests {
         assert!(denied_in_tree(clean, E2E_DENIED).is_empty());
         let planted = format!("{clean}tokio v1.48.0\nmio v1.0.0\n");
         assert_eq!(denied_in_tree(&planted, E2E_DENIED), ["mio", "tokio"]);
+    }
+
+    #[test]
+    fn rlord_or_the_relay_planted_in_the_device_engine_is_caught() {
+        let clean = "robot-overlord-e2e-client v1.3.0 (/x/crates/e2e-client)\n\
+                     robot-overlord-e2e v1.3.0 (/x/crates/e2e)\n\
+                     robot-overlord-relay-proto v1.3.0 (/x/crates/relay-proto)\n\
+                     tokio v1.48.0\nrustls v0.23.46\n";
+        assert!(denied_in_tree(clean, CLIENT_DENIED).is_empty());
+        let planted = format!(
+            "{clean}robot-overlord-relay v1.3.0 (/x)\nrobot-overlord-core v1.3.0 (/x)\n\
+             robot-overlord-daemon v1.3.0 (/x)\n"
+        );
+        assert_eq!(
+            denied_in_tree(&planted, CLIENT_DENIED),
+            [
+                "robot-overlord-core",
+                "robot-overlord-daemon",
+                "robot-overlord-relay"
+            ]
+        );
+        // And rlord never names the engine.
+        let engine = "robot-overlord-e2e-client v1.3.0 (/x/crates/e2e-client)\n";
+        assert_eq!(
+            denied_in_tree(engine, DENIED),
+            ["robot-overlord-e2e-client"]
+        );
     }
 
     #[test]

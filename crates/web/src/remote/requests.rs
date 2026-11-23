@@ -127,6 +127,9 @@ impl Actor {
                 let (d, tx) = (self.d.clone(), self.tx_clone());
                 let device = device.to_string();
                 tokio::spawn(async move {
+                    if let Some(ms) = slow_op(&op) {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
                     let r = d
                         .call(
                             "web.call",
@@ -224,4 +227,16 @@ impl Actor {
             Waiter::Mailbox => self.mailbox_answer(device, answer),
         }
     }
+}
+
+/// Debug builds: `RLORD_WEB_TEST_SLOW=<op>:<ms>` makes that op take `ms`
+/// longer, so a test can act while it runs (a resend gets `in_progress`;
+/// a plugin stopped meanwhile leaves it `interrupted`).
+fn slow_op(op: &str) -> Option<u64> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = std::env::var("RLORD_WEB_TEST_SLOW").ok()?;
+    let (o, ms) = v.split_once(':')?;
+    (o == op).then(|| ms.parse().ok()).flatten()
 }

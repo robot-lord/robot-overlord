@@ -1,11 +1,13 @@
 //! `rlord-device`: pair a test device by hand and talk to the host through
-//! the relay, without a phone. Its state (keys and the paired host) is a
-//! JSON file; never use it for anything but testing.
+//! the relay, without a phone. It runs the phone's own device engine
+//! (`rlord_e2e_client`) with software keys kept in a folder (`--state`);
+//! never use it for anything but testing.
 //!
-//! - `rlord-device pair <RLORD1:…> --state FILE [--name NAME]`
-//! - `rlord-device check --state FILE`: the cheap "anything for me?"
-//! - `rlord-device snapshot --state FILE`
-//! - `rlord-device ask <text> --state FILE`
+//! - `rlord-device pair <RLORD1:…> --state DIR [--name NAME]`
+//! - `rlord-device check --state DIR`: the background check ("anything
+//!   for me?": no handshake when nothing waits)
+//! - `rlord-device snapshot --state DIR`
+//! - `rlord-device ask <text> --state DIR`
 //! - `rlord-device interop-host`: a native host core on stdin/stdout, one
 //!   JSON object per line, for the WASM interop test (`cargo xtask e2e
 //!   test-wasm`): it prints a QR, answers a pairing and a reconnect, and
@@ -18,13 +20,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use rlord_e2e::StaticKey;
-use rlord_e2e_device::{b64, unb64, Device, Host};
-use rlord_relay_proto::address::{b64_fingerprint, fingerprint_from_b64};
-use rlord_relay_proto::{Identity, RelayAddress};
+use rlord_e2e_device::{b64, unb64, Phone};
 
-const USAGE: &str = "usage: rlord-device pair <RLORD1:…> --state FILE [--name NAME]
-       rlord-device check|snapshot --state FILE
-       rlord-device ask <text> --state FILE";
+const USAGE: &str = "usage: rlord-device pair <RLORD1:…> --state DIR [--name NAME]
+       rlord-device check|snapshot --state DIR
+       rlord-device ask <text> --state DIR";
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
@@ -38,51 +38,6 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
-}
-
-fn save(path: &PathBuf, d: &Device) -> Result<()> {
-    let h = d.host.as_ref();
-    let v = json!({
-        "name": d.name,
-        "static": b64(d.static_key.private()),
-        "relay_key": b64(&d.relay_key.to_bytes()),
-        "host": h.map(|h| json!({
-            "static": b64(&h.static_key),
-            "pin": h.pin.to_string(),
-            "fp": b64_fingerprint(&h.fp),
-            "name": h.name,
-        })),
-    });
-    std::fs::write(path, serde_json::to_vec_pretty(&v)?)?;
-    Ok(())
-}
-
-fn load(path: &PathBuf) -> Result<Device> {
-    let v: Value = serde_json::from_slice(&std::fs::read(path).context("reading the state")?)?;
-    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-    let static_key = StaticKey::from_private(
-        unb64(&s("static"))?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("bad static key"))?,
-    );
-    let relay_key =
-        Identity::from_bytes(&unb64(&s("relay_key"))?).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut d = Device::new(&s("name"))?;
-    d.static_key = static_key;
-    d.relay_key = relay_key;
-    let h = &v["host"];
-    if h.is_object() {
-        let hs = |k: &str| h[k].as_str().unwrap_or("").to_string();
-        d.host = Some(Host {
-            static_key: unb64(&hs("static"))?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("bad host key"))?,
-            pin: RelayAddress::parse(&hs("pin")).map_err(|e| anyhow::anyhow!("{e}"))?,
-            fp: fingerprint_from_b64(&hs("fp")).map_err(|e| anyhow::anyhow!("{e}"))?,
-            name: hs("name"),
-        });
-    }
-    Ok(d)
 }
 
 /// The native half of the WASM interop test.
@@ -133,44 +88,47 @@ async fn run(args: Vec<String>) -> Result<()> {
         return interop_host();
     }
     let state = PathBuf::from(flag(&args, "--state").context(USAGE)?);
+    let mut phone = Phone::open(&state)?;
+    let r = command(&mut phone, &args).await;
+    phone.engine.shutdown();
+    r
+}
+
+async fn command(phone: &mut Phone, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("pair") => {
             let qr = args.get(1).context(USAGE)?;
-            let name = flag(&args, "--name").unwrap_or_else(|| "rlord-device".into());
-            let mut d = Device::new(&name)?;
-            let run = d.start_pairing(qr).await?;
-            println!("code {} (the host shows {})", run.code, run.host_code);
-            println!("waiting for the host to confirm…");
-            let host = run.outcome(&mut d, Duration::from_secs(130)).await?;
-            save(&state, &d)?;
-            println!("paired with {} (device {})", host.name, d.id());
-        }
-        Some("check") => {
-            let d = load(&state)?;
-            let c = d.connect().await?;
+            let name = flag(args, "--name").unwrap_or_else(|| "rlord-device".into());
+            let code = phone.start_pairing(qr, &name).await?;
+            println!("code {code}: check that the computer shows the same, and confirm there");
+            phone.pairing_outcome(Duration::from_secs(130)).await?;
+            let s = phone.status().await?;
             println!(
-                "boot {} host {:?} signal {:?} queued {:?}",
-                c.ready.boot, c.ready.host, c.ready.signal, c.ready.queued
+                "paired with {} (device {})",
+                s["host"].as_str().unwrap_or("?"),
+                s["device_id"].as_str().unwrap_or("?")
             );
         }
+        Some("check") => {
+            println!("{:?}", phone.background_check(20_000).await);
+        }
         Some("snapshot") => {
-            let d = load(&state)?;
-            let mut c = d.connect().await?;
-            let mut live = d.live(&mut c).await?;
-            let a = live.request(&mut c, "snapshot", json!({})).await?;
+            let a = live_request(phone, "snapshot", json!({})).await?;
             println!("{}", serde_json::to_string_pretty(&a)?);
         }
         Some("ask") => {
             let text = args.get(1).context(USAGE)?;
-            let d = load(&state)?;
-            let mut c = d.connect().await?;
-            let mut live = d.live(&mut c).await?;
-            let a = live
-                .request(&mut c, "overlord.ask", json!({"text": text}))
-                .await?;
+            let a = live_request(phone, "overlord.ask", json!({"text": text})).await?;
             println!("{a}");
         }
         _ => bail!(USAGE),
     }
     Ok(())
+}
+
+/// In the foreground until live, then one request.
+async fn live_request(phone: &mut Phone, op: &str, args: Value) -> Result<Value> {
+    phone.engine.lifecycle(true);
+    phone.conn("live", Duration::from_secs(20)).await?;
+    phone.request(op, args, Duration::from_secs(30)).await
 }

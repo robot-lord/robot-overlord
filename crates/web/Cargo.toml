@@ -44,5 +44,6 @@ base64 = "0.22"
 # The remote end-to-end tests: the real relay in process, and the test device.
 rlord-relay = { package = "robot-overlord-relay", path = "../relay" }
 rlord-e2e-device = { package = "robot-overlord-e2e-device", path = "../e2e-device" }
+rlord-e2e-client = { package = "robot-overlord-e2e-client", path = "../e2e-client" }
 rlord-daemon = { package = "robot-overlord-daemon", path = "../daemon" }
 tempfile = "3"

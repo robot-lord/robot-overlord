@@ -15,7 +15,7 @@ pub mod frame;
 pub mod msg;
 
 pub use address::RelayAddress;
-pub use auth::Identity;
+pub use auth::{Identity, TranscriptSigner};
 pub use msg::{FromRelay, Role, ToRelay, B64};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
