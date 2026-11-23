@@ -1149,8 +1149,9 @@ Decided 2026-11-17 (user):
   and `RemoteTransport`; QR pairing; the reconnect loop with every
   requirement owed above; no push yet (background refresh and local
   notifications); the phone as a third surface; local installs only.
-  Nothing built. Found while planning: this Mac has no Xcode and no
-  Android SDK. Sixteen open questions wait for the user; the first
+  Nothing built. Xcode 27.2 is installed (`xcode-select` points at the
+  command line tools, so tasks set `DEVELOPER_DIR`); no Android SDK yet.
+  Sixteen open questions wait for the user; the first
   (engine in the shell, not WASM in the page) changes an earlier answer.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
@@ -3435,10 +3436,12 @@ implementer):
   has no `page`, is not a surface and gets no `ui` commands (`ui::target`
   knows the terminal and web pages only). `overlord.messages` exists for
   a chat view.
-- **This Mac has no Xcode (command line tools only) and no Android SDK or
-  NDK.** Rust has no iOS or Android target installed. Step 1 can't start
-  until the user installs Xcode (and, for Android, lets a task install
-  the SDK).
+- **Xcode 27.2 is at `/Applications/Xcode.app`, but `xcode-select`
+  points at the command line tools.** `cargo xtask app …` sets
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` itself (or
+  the user runs `sudo xcode-select -s` once). iOS 27.2 simulator runtimes
+  are installed. No Android SDK or NDK, and no iOS or Android Rust
+  targets yet (`rustup target add` in step 1).
 
 ### Decisions
 
