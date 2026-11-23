@@ -377,8 +377,149 @@ fn test_ios(root: &Path, args: &[String]) -> Result<()> {
     let mut c = xcodebuild(root, &["test"], &format!("id={udid}"), false)?;
     if unit_only {
         c.arg("-only-testing:rlordTests");
+        return run(&mut c);
     }
-    run(&mut c)
+    // The UI test pairs with a real host: the loopback stack, which the
+    // simulator reaches on the Mac's 127.0.0.1. Its pairing code and
+    // control folder reach the test runner as TEST_RUNNER_ variables.
+    let mut stack = Stack::start(root, true)?;
+    let qr = stack.pairing_code()?;
+    c.env("TEST_RUNNER_RLORD_QR", &qr)
+        .env("TEST_RUNNER_RLORD_CONTROL", &stack.control);
+    let result = run(&mut c);
+    stack.quit();
+    result
+}
+
+/// The loopback host (`crates/web/examples/remote_stack.rs`): a daemon
+/// with fixture sessions, the real plugin and the real relay on 127.0.0.1.
+pub struct Stack {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    events: std::sync::mpsc::Receiver<serde_json::Value>,
+    /// Where `<name>.cmd` files drive it.
+    pub control: String,
+    pub relay: String,
+    _dir: cmd::TempDir,
+}
+
+const STACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl Stack {
+    pub fn start(root: &Path, auto_confirm: bool) -> Result<Stack> {
+        run(cmd::cargo().args([
+            "build",
+            "-p",
+            "robot-overlord-web",
+            "--bin",
+            "rlord-web",
+            "--example",
+            "remote_stack",
+        ]))?;
+        let dir = cmd::TempDir::new_in(&root.join("target"), "app-stack")?;
+        let mut c = Command::new(root.join("target/debug/examples/remote_stack"));
+        c.arg("--dir")
+            .arg(dir.path())
+            .env("RLORD_WEB_BIN", root.join("target/debug/rlord-web"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        if auto_confirm {
+            c.arg("--auto-confirm");
+        }
+        let mut child = c.spawn().context("starting remote_stack")?;
+        let stdin = child.stdin.take().context("stack stdin")?;
+        let stdout = child.stdout.take().context("stack stdout")?;
+        let (tx, events) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                match parse_event(&line) {
+                    Some(v) => {
+                        if v["event"] == "confirmed" || v["event"] == "error" {
+                            eprintln!("stack: {line}");
+                        }
+                        if tx.send(v).is_err() {
+                            break;
+                        }
+                    }
+                    None => eprintln!("stack: {line}"),
+                }
+            }
+        });
+        let mut stack = Stack {
+            child,
+            stdin,
+            events,
+            control: String::new(),
+            relay: String::new(),
+            _dir: dir,
+        };
+        let ready = stack.wait("ready")?;
+        stack.control = ready["control"].as_str().unwrap_or_default().to_string();
+        stack.relay = ready["relay"].as_str().unwrap_or_default().to_string();
+        println!("host stack ready: relay {}", stack.relay);
+        Ok(stack)
+    }
+
+    pub fn send(&mut self, command: &str) -> Result<()> {
+        use std::io::Write;
+        writeln!(self.stdin, "{command}")?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    /// The next event named `name` (others are skipped).
+    pub fn wait(&mut self, name: &str) -> Result<serde_json::Value> {
+        let until = std::time::Instant::now() + STACK_WAIT;
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            let v = self
+                .events
+                .recv_timeout(left)
+                .with_context(|| format!("the host stack never said {name}"))?;
+            if v["event"] == name {
+                return Ok(v);
+            }
+        }
+    }
+
+    pub fn pairing_code(&mut self) -> Result<String> {
+        self.send("pair")?;
+        let v = self.wait("qr")?;
+        v["qr"]
+            .as_str()
+            .map(str::to_string)
+            .context("no qr in the stack's answer")
+    }
+
+    pub fn quit(&mut self) {
+        let _ = self.send("quit");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < until {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// One event line of the stack; anything else is its log.
+fn parse_event(line: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    v["event"].is_string().then_some(v)
 }
 
 /// The simulator to use: the one named (or with that UDID), else the first
@@ -501,6 +642,16 @@ mod tests {
         assert!(pick_simulator(json, Some("nope")).is_err());
         let old = r#"{"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-25-0":[{"name":"iPhone 16","udid":"OLD"}]}}"#;
         assert!(pick_simulator(old, None).is_err());
+    }
+
+    #[test]
+    fn stack_events() {
+        assert_eq!(
+            parse_event(r#"{"event":"qr","qr":"RLORD1:x"}"#).unwrap()["qr"],
+            "RLORD1:x"
+        );
+        assert!(parse_event("2026-11-23 INFO something").is_none());
+        assert!(parse_event(r#"{"no":"event"}"#).is_none());
     }
 
     #[test]
