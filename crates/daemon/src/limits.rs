@@ -686,11 +686,11 @@ fn cancel(d: &Daemon, params: &Value) -> Result<Value> {
     Ok(json!({"cancelled": cancelled, "skipped": skipped}))
 }
 
-/// What to do with a job now.
 /// Why a job gives up on a limit that keeps hitting (the only drop that
 /// marks the newer limit handled).
 const KEPT_HITTING: &str = "the limit kept hitting";
 
+/// What to do with a job now.
 #[derive(Debug, PartialEq)]
 enum Step {
     Wait,
