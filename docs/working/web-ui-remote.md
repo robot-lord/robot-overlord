@@ -1328,6 +1328,16 @@ Decided 2026-11-17 (user):
       `restart-relay`, `stop-plugin`, `start-plugin`, `status`, by stdin
       or `<dir>/control/*.cmd` files so the simulator's test runner can
       drive it; `--auto-confirm`). `xtask` drives it (`app::Stack`).
+  - Gap closed (agent branch `s4-mailbox`): a device never learned that
+    its host had discarded its mailbox (a failure there, or the saved
+    state losing it), so its mailbox frames were dropped by id and
+    answers never came. The host's device `hello` now carries `mailbox`
+    (the id it holds for the device, or null); the engine discards and
+    keys a new one when it differs. Additive, `api` stays 1
+    (`e2e-protocol.md` §3, step 4). The engine also no longer offers a
+    refused frame, or marks one `queued`, that was sealed under a
+    mailbox it has since discarded: the request goes again under the
+    new one.
 - Owed from merging main 1.15.3 into `feature/web` (1.16.0-dev.1):
   - The attention queue (main's `attention.rs`) counts only terminals as
     "looking": `tmux::list_clients` leaves web views out, so a session
@@ -3961,7 +3971,7 @@ The rest of the device's side, decided here:
   engine closes the socket and redials. An unknown text message is
   skipped; a binary frame it can't parse closes the link.
 - **The mailbox.** Keyed on the first live session and again whenever
-  there is none. Advance, seal and save before a frame leaves; on
+  there is none or the host's `hello` names another. Advance, seal and save before a frame leaves; on
   receipt: check `(boot, seq)`, the mailbox id, decrypt (a failure
   discards the mailbox), record the answer, save, then `ack`. A
   discarded mailbox is keyed again on the next live session and the

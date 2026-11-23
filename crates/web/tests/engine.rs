@@ -118,6 +118,57 @@ async fn the_relay_restarted_queued_requests_are_resent_and_run_once() {
     assert_eq!(asks(&id), 1, "ran once");
 }
 
+/// The host discards the device's mailbox while the device isn't linked
+/// (here its saved state loses the mailbox key while the plugin is down).
+/// The host's next `hello` names no mailbox; the engine, holding one, keys
+/// a new one, so a request it later sends by mailbox reaches the host and
+/// is answered, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mailbox_the_host_discarded_is_keyed_again() {
+    let _g = LOCK.lock().await;
+    let w = world(1).await;
+    let (mut phone, _dir) = pair("rekey").await;
+    let id = device_id(&mut phone).await;
+    keyed(&id, 1).await;
+    host_away(&w, &mut phone).await;
+    // (The supervisor settles after a stop before the next start.)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let path = rlord_core::plugin::remote_dir().join(format!("mailbox-{id}.json"));
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved["state"].is_string(), "{saved}");
+    saved["state"] = serde_json::Value::Null;
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    phone.mark();
+    start_plugin(&w, &[]);
+    let hello = phone
+        .wait("hello", LONG, |v| v["event"] == "hello")
+        .await
+        .unwrap();
+    assert!(hello.get("mailbox").is_none(), "the page's hello: {hello}");
+    keyed(&id, 2).await;
+    // Away again: the ask goes by the new mailbox, is taken from the relay
+    // when the host is back, and is answered once.
+    host_away(&w, &mut phone).await;
+    let ask = phone.send("overlord.ask", json!({"text": "after the rekey"}));
+    let t = Instant::now();
+    while phone.outbox().first().map(|i| i["state"].clone()) != Some(json!("sent")) {
+        assert!(t.elapsed() < WAIT, "{:?}", phone.outbox());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    start_plugin(&w, &[]);
+    let a = phone.reply(ask, LONG).await.unwrap();
+    assert_eq!(a["id"], ask);
+    assert_ne!(a["error"]["code"], "interrupted", "{a}");
+    audit_until(&format!("{id} mailbox op overlord.ask"), 1).await;
+    assert_eq!(asks(&id), 1, "ran once");
+    phone.conn("live", LONG).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    phone.drain();
+    assert_eq!(phone.log.iter().filter(|v| v["id"] == ask).count(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_restarted_mid_request() {
     let _g = LOCK.lock().await;

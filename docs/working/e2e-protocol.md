@@ -281,9 +281,11 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    whose fingerprint is not one of its devices (`drop`) and answers with
    the device's stored static key, so a revoked or swapped device fails.
 2. The device's first frame: `{"event":"hello"}`. The host answers
-   `{"event":"hello","version","api","rev","page":"<id>","device":"<id>"}`
-   (`api`: the remote API level; `page`: the device's id, the one its
-   `page.report`s are kept under), and after that
+   `{"event":"hello","version","api","rev","page":"<id>","device":"<id>",
+   "mailbox":"<id>"|null}` (`api`: the remote API level; `page`: the
+   device's id, the one its `page.report`s are kept under; `mailbox`: the
+   base64url 8-byte id of the mailbox the host holds for this device, null
+   when it holds none; see step 4), and after that
    `{"event":"changed","rev"}` on every change of the daemon's state, and
    `{"event":"ui","cmd"}` for each overlord UI command that lands on this
    device (§5).
@@ -299,7 +301,18 @@ The device id is `device_id(static)`: 16 hex characters of a labelled hash.
    2>"}`; the device makes its mailbox, saves it, and sends
    `{"event":"mailbox_ready","frame":"<its first mailbox frame>"}`; when
    that decrypts the host saves the mailbox (replacing any older one).
-   A device keys a mailbox when it has none.
+   A device keys a mailbox when it has none, and when the host's `hello`
+   names another one or none (`mailbox`): the host discarded the device's
+   (it failed there, or its saved state lost it), so frames sealed under
+   it would be dropped by id and their answers never come. The device
+   then discards its own first (the same as a failure on its end: a
+   refused frame sealed under it is not offered again, and every
+   unanswered request goes again by id, live on this session and by the
+   new mailbox when the host is next away; the host's request store
+   answers a repeat once). A `hello` without the field (an older host)
+   changes nothing, and an older device ignores it; the field is additive,
+   so `api` stays 1 (the API level is the ops, the snapshot and the `ui`
+   commands; this is the protocol beneath them).
 5. While a device has no live session and the daemon's `rev` moves, the
    host sends the relay `signal` for it, at most once per 30 s; a move
    inside that window is owed one more, sent when the window ends (unless
@@ -384,7 +397,8 @@ never outlives a lost frame, so nothing may be lost quietly.
   reconnect on 4205, on a network change and on coming to the
   foreground; run `KKpsk2` each time its host comes online; compare the
   snapshot's `rev` and fetch on a difference; resend unanswered requests
-  by id; when the relay's `boot` changes, resend every mailbox request it
+  by id; key a new mailbox when the `hello`'s `mailbox` isn't the one it
+  holds (§3, step 4); when the relay's `boot` changes, resend every mailbox request it
   has no answer to (the queue is gone); drop mailbox frames by `(boot,
   seq)` and answers by request id it already has.
 

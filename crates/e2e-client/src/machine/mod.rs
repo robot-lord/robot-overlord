@@ -1032,12 +1032,15 @@ impl Machine {
             FromRelay::Signal => self.signal_pending = true,
             FromRelay::Queued { .. } => {
                 let boot = up.boot.clone();
-                if let Some((id, _, _)) = up.mb_inflight.take() {
+                if let Some((id, bytes, _)) = up.mb_inflight.take() {
                     if self.refused.as_ref().is_some_and(|(r, _, _)| *r == id) {
                         self.refused = None;
                     }
+                    // Queued under a mailbox discarded since: the host drops
+                    // it, so it goes again under the new one.
+                    let current = self.under_current_mailbox(&bytes);
                     if let Some(e) = self.rec.as_mut().and_then(|r| r.outbox.get_mut(&id)) {
-                        e.queued_boot = Some(boot);
+                        e.queued_boot = current.then_some(boot);
                         if e.state == State::Waiting {
                             e.state = State::Sent;
                         }
@@ -1053,7 +1056,13 @@ impl Machine {
                 // Offered on this link: the next try is in 30 s.
                 up.refused_tried = true;
                 match c.as_str() {
-                    code::FULL => self.refused = Some((id, bytes, self.now.mono)),
+                    // Kept to be offered again, the same bytes, unless its
+                    // mailbox was discarded meanwhile (then it is sealed
+                    // afresh under the new one).
+                    code::FULL if self.under_current_mailbox(&bytes) => {
+                        self.refused = Some((id, bytes, self.now.mono))
+                    }
+                    code::FULL => self.refused = None,
                     code::NO_QUEUE => {
                         if self.refused.as_ref().is_some_and(|(r, _, _)| *r == id) {
                             self.refused = None;
@@ -1260,6 +1269,18 @@ impl Machine {
         if v.get("page").is_none() {
             v["page"] = v["device"].clone();
         }
+        // The host's mailbox for this device (base64url id, null for none;
+        // absent from an older host, which keeps today's behaviour). Not
+        // the one we hold: the host discarded ours (it failed there, or its
+        // state was lost), so frames sealed under it would be dropped and
+        // answers never come. Discard it too and key a new one below; what
+        // was sent under it goes again by id.
+        if let Some(theirs) = v.as_object_mut().and_then(|o| o.remove("mailbox")) {
+            let ours = self.mailbox.as_ref().map(|m| b64(&m.id()));
+            if ours.is_some() && theirs.as_str() != ours.as_deref() {
+                self.discard_mailbox();
+            }
+        }
         let rev = v["rev"].as_str().map(str::to_string);
         self.last_hello = Some(v.clone());
         if self.bg.is_none() || self.foreground {
@@ -1450,6 +1471,8 @@ impl Machine {
 
     fn discard_mailbox(&mut self) {
         self.mailbox = None;
+        // A refused frame was sealed under it: the host would drop it.
+        self.refused = None;
         if let Some(r) = &mut self.rec {
             r.mailbox = None;
             r.mailbox_seen = None;
@@ -1458,6 +1481,13 @@ impl Machine {
             }
         }
         self.save();
+    }
+
+    /// Was this lane-2 payload sealed under the mailbox we hold now?
+    fn under_current_mailbox(&self, payload: &[u8]) -> bool {
+        self.mailbox
+            .as_ref()
+            .is_some_and(|m| payload.len() >= 8 && payload[..8] == m.id())
     }
 
     /// Send what may go by mailbox: one frame at a time, a refused one
