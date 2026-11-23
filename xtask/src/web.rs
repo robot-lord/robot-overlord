@@ -88,7 +88,7 @@ fn install(ui: &Path) -> Result<()> {
 }
 
 /// Install first when `node_modules` is missing or older than the lockfile.
-fn ensure_installed(ui: &Path) -> Result<()> {
+pub(crate) fn ensure_installed(ui: &Path) -> Result<()> {
     let modified = |p: PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let lock = modified(ui.join("package-lock.json"));
     let installed = modified(ui.join("node_modules/.package-lock.json"));
@@ -100,6 +100,11 @@ fn ensure_installed(ui: &Path) -> Result<()> {
 
 /// A tool from `node_modules/.bin`, run in `ui`.
 fn run(ui: &Path, tool: &str, args: &[&str]) -> Result<()> {
+    cmd::run(self::tool(ui, tool)?.args(args))
+}
+
+/// A command for a tool from `node_modules/.bin`, to run in `ui`.
+pub(crate) fn tool(ui: &Path, tool: &str) -> Result<Command> {
     let bin = ui.join("node_modules/.bin").join(tool);
     if !bin.exists() {
         bail!(
@@ -110,7 +115,9 @@ fn run(ui: &Path, tool: &str, args: &[&str]) -> Result<()> {
     let bin = bin
         .canonicalize()
         .with_context(|| format!("resolving {}", bin.display()))?;
-    cmd::run(Command::new(bin).args(args).current_dir(ui))
+    let mut c = Command::new(bin);
+    c.current_dir(ui);
+    Ok(c)
 }
 
 /// Node's major version must be `.node-version`'s; another patch or minor

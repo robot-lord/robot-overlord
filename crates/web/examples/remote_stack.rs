@@ -17,7 +17,17 @@
 //! - `quit` (or the end of stdin).
 //!
 //! With `--auto-confirm` a pending pairing is confirmed as soon as it
-//! shows (`{"event":"confirmed","name","code"}`).
+//! shows (`{"event":"confirmed","name","code"}`). A command from a file is
+//! answered in its `.done` file with the event it said (`status`'s
+//! `relay.status` among them).
+//!
+//! **A fake overlord.** When tmux is installed, the overlord is this same
+//! program in a pane of the scratch tmux server (`remote_stack
+//! fake-overlord`): `overlord.ask` types into it as into a real one, and it
+//! answers each line in a Claude Code transcript that `overlord.messages`
+//! reads. Should rlord ever start an agent here (a restart), `claude`,
+//! `codex` and `opencode` on this stack's PATH are this program too, and
+//! the login shell is never asked: no real agent can run.
 //!
 //! Usage: `RLORD_WEB_BIN=… remote_stack --dir DIR [--sessions N] [--auto-confirm]`.
 
@@ -32,6 +42,8 @@ use serde_json::{json, Value};
 use rlord_core::config::Config;
 use rlord_core::db::{Db, NewSession};
 use rlord_core::paths;
+use rlord_core::tmux;
+use rlord_core::types::{now_ms, Status};
 use rlord_daemon::Daemon;
 
 struct Args {
@@ -64,10 +76,11 @@ fn args() -> Result<Args> {
     Ok(a)
 }
 
-fn say(v: Value) {
+fn say(v: Value) -> Value {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{v}");
     let _ = out.flush();
+    v
 }
 
 /// One user command over the daemon's socket, as the CLI sends it.
@@ -100,6 +113,20 @@ fn environment(dir: &Path) -> Result<tempfile::TempDir> {
         format!("rlord-app-stack-{}", std::process::id()),
     );
     std::env::set_var("RLORD_NO_LOGIN_SHELL", "1");
+    // The agents' names are the fake overlord (never a real agent).
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let me = std::env::current_exe()?;
+    for agent in AGENTS {
+        let link = bin.join(agent);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&me, &link)?;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![bin];
+    dirs.extend(std::env::split_paths(&path));
+    std::env::set_var("PATH", std::env::join_paths(dirs)?);
+    std::env::set_var(TRANSCRIPT_VAR, dir.join("overlord").join(TRANSCRIPT));
     let cfg = paths::config_path();
     std::fs::create_dir_all(cfg.parent().context("config folder")?)?;
     std::fs::write(&cfg, "[web]\nport = 0\n")?;
@@ -163,35 +190,53 @@ impl Relay {
     }
 }
 
-async fn command(line: &str, daemon: &Arc<Daemon>, relay: &mut Relay) -> Result<bool> {
-    match line.trim() {
-        "" => {}
+/// One command: the event it said (None: quit).
+async fn command(line: &str, daemon: &Arc<Daemon>, relay: &mut Relay) -> Result<Option<Value>> {
+    Ok(Some(match line.trim() {
+        "" => json!({}),
         "pair" => {
             let p = tokio::task::spawn_blocking(|| rpc("relay.pair", json!({}))).await??;
-            say(json!({"event": "qr", "qr": p["qr"]}));
+            // The code works once the plugin is linked to the relay (its
+            // rendezvous is open there): only then is it handed out.
+            connected().await?;
+            say(json!({"event": "qr", "qr": p["qr"]}))
         }
         "restart-relay" => {
             relay.restart().await?;
-            say(json!({"event": "relay", "boot": relay.get().boot()}));
+            say(json!({"event": "relay", "boot": relay.get().boot()}))
         }
         "stop-plugin" => {
             let d = daemon.clone();
             tokio::task::spawn_blocking(move || d.web().stop()).await?;
-            say(json!({"event": "plugin", "running": false}));
+            say(json!({"event": "plugin", "running": false}))
         }
         "start-plugin" => {
             let d = daemon.clone();
             tokio::task::spawn_blocking(move || d.web().start(false)).await??;
-            say(json!({"event": "plugin", "running": true}));
+            say(json!({"event": "plugin", "running": true}))
         }
         "status" => {
             let s = tokio::task::spawn_blocking(|| rpc("relay.status", json!({}))).await??;
-            say(json!({"event": "status", "status": s}));
+            say(json!({"event": "status", "status": s}))
         }
-        "quit" => return Ok(false),
+        "quit" => return Ok(None),
         other => say(json!({"event": "error", "message": format!("unknown command {other}")})),
+    }))
+}
+
+/// Waits (at most 30 s) until the plugin is linked to the relay.
+async fn connected() -> Result<()> {
+    let until = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let s = tokio::task::spawn_blocking(|| rpc("relay.status", json!({}))).await??;
+        if s["connected"] == true {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > until {
+            bail!("the plugin never linked to the relay: {s}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(true)
 }
 
 /// Confirms a pending pairing as soon as it shows.
@@ -251,12 +296,29 @@ fn commands(control: PathBuf) -> tokio::sync::mpsc::Receiver<(String, Option<Pat
 }
 
 fn main() -> Result<()> {
+    // The fake overlord: by name (an agent's, on this stack's PATH) or
+    // by its own command.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    let called = Path::new(&argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if AGENTS.contains(&called) || std::env::args().nth(1).as_deref() == Some("fake-overlord") {
+        return fake_overlord();
+    }
     let a = args()?;
     let _run = environment(&a.dir)?;
     let control = a.dir.join("control");
     std::fs::create_dir_all(&control)?;
     let db = Db::open_in_memory()?;
     fixtures(&db, a.sessions)?;
+    let overlord = match start_overlord(&db, &a.dir) {
+        Ok(()) => true,
+        Err(e) => {
+            say(json!({"event": "error", "message": format!("no fake overlord: {e:#}")}));
+            false
+        }
+    };
     let daemon = Daemon::new(db, Config::load()?);
     // A debug plugin built from this checkout: no compiled-in hash.
     daemon.web().set_expected_hash(None);
@@ -285,23 +347,22 @@ fn main() -> Result<()> {
             "relay": relay.get().origin(),
             "control": control,
             "sessions": a.sessions,
+            "overlord": overlord,
         }));
         if a.auto_confirm {
             tokio::spawn(auto_confirm());
         }
         let mut rx = commands(control);
         while let Some((line, done)) = rx.recv().await {
-            let go_on = match command(&line, &daemon, &mut relay).await {
-                Ok(go_on) => go_on,
-                Err(e) => {
-                    say(json!({"event": "error", "message": e.to_string()}));
-                    true
-                }
+            let said = match command(&line, &daemon, &mut relay).await {
+                Ok(said) => said,
+                Err(e) => Some(say(json!({"event": "error", "message": e.to_string()}))),
             };
             if let Some(done) = done {
-                let _ = std::fs::write(done, "");
+                let text = said.as_ref().map(Value::to_string).unwrap_or_default();
+                let _ = std::fs::write(done, text);
             }
-            if !go_on {
+            if said.is_none() {
                 break;
             }
         }
@@ -313,5 +374,106 @@ fn main() -> Result<()> {
         anyhow::Ok(())
     })?;
     rt.shutdown_background();
+    // The scratch tmux server (`RLORD_TMUX_SOCKET`), the fake overlord's,
+    // and its socket file.
+    let socket = std::process::Command::new("tmux")
+        .args(["-L", &tmux::socket_name(), "display-message", "-p"])
+        .arg("#{socket_path}")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|p| !p.is_empty());
+    let _ = tmux::kill_server();
+    if let Some(p) = socket {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
+/// The names rlord starts agents by.
+const AGENTS: [&str; 3] = ["claude", "codex", "opencode"];
+/// Where the fake overlord writes its transcript (set by `environment`).
+const TRANSCRIPT_VAR: &str = "RLORD_STACK_TRANSCRIPT";
+const TRANSCRIPT: &str = "fake-overlord.jsonl";
+const OVERLORD_ID: &str = "fake-overlord";
+const OVERLORD_TMUX: &str = "rlord-fake-overlord";
+
+/// The fake overlord's row (active, idle, its transcript known) and its
+/// pane on the scratch tmux server.
+fn start_overlord(db: &Db, dir: &Path) -> Result<()> {
+    let tmux_there = std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !tmux_there {
+        bail!("tmux isn't installed");
+    }
+    let home = dir.join("overlord");
+    std::fs::create_dir_all(&home)?;
+    let transcript = home.join(TRANSCRIPT);
+    std::fs::write(
+        &transcript,
+        transcript_line("assistant", "Fake overlord here: ask me anything.") + "\n",
+    )?;
+    let home_s = home.to_string_lossy().to_string();
+    db.insert_session(&NewSession {
+        id: OVERLORD_ID,
+        name: "overlord",
+        agent: "claude",
+        agent_session: Some(OVERLORD_ID),
+        project_path: &home_s,
+        tmux_session: Some(OVERLORD_TMUX),
+        launch_spec: "{}",
+        created_at: 1,
+        repo_path: None,
+        workspace_path: None,
+        branch: None,
+        role: "overlord",
+    })?;
+    db.upsert_transcript_source(OVERLORD_ID, &transcript.to_string_lossy())?;
+    db.set_active_overlord(OVERLORD_ID)?;
+    let me = std::env::current_exe()?;
+    let cmd = format!("{} fake-overlord", tmux::shell_quote(&me.to_string_lossy()));
+    tmux::new_session(OVERLORD_TMUX, &home_s, &cmd)?;
+    db.set_status(OVERLORD_ID, Status::Idle, now_ms())?;
+    Ok(())
+}
+
+/// A Claude Code transcript line (what `overlord.messages` reads).
+fn transcript_line(kind: &str, text: &str) -> String {
+    let content = if kind == "user" {
+        json!(text)
+    } else {
+        json!([{"type": "text", "text": text}])
+    };
+    let at = rlord_core::agents::opencode::iso_ms(now_ms());
+    json!({"type": kind, "timestamp": at, "message": {"role": kind, "content": content}})
+        .to_string()
+}
+
+/// The fake overlord, in its pane: each line typed is a user message, and
+/// its answer follows, both in the transcript.
+fn fake_overlord() -> Result<()> {
+    let path = std::env::var_os(TRANSCRIPT_VAR).context("no transcript for the fake overlord")?;
+    let mut out = std::io::stdout();
+    writeln!(out, "fake overlord (rlord's app stack): no agent runs here")?;
+    write!(out, "> ")?;
+    out.flush()?;
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        let text = line.trim();
+        if !text.is_empty() {
+            let answer = format!("Fake overlord here: you said \"{text}\".");
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)?;
+            writeln!(f, "{}", transcript_line("user", text))?;
+            writeln!(f, "{}", transcript_line("assistant", &answer))?;
+            writeln!(out, "{answer}")?;
+        }
+        write!(out, "> ")?;
+        out.flush()?;
+    }
     Ok(())
 }

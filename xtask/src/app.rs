@@ -3,6 +3,8 @@
 //! and the engine's xcframework); the Xcode build never calls them. iOS
 //! needs full Xcode: if `xcode-select` points at the command line tools,
 //! the tasks set `DEVELOPER_DIR` to `/Applications/Xcode.app` themselves.
+//! `app dev` and `app test-e2e` (`app_dev.rs`) need neither Xcode nor a
+//! simulator: the phone page runs in a desktop browser or in Node.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,7 +22,14 @@ usage: cargo xtask app <task>
                         page, bindings, engine, a Debug build; install and launch
                         (the simulator by default)
   test-ios [--sim NAME|UDID] [--unit]
-                        the app's XCTest and XCUITest on a simulator (--unit: XCTest only)";
+                        the app's XCTest and XCUITest on a simulator (--unit: XCTest only)
+  dev [--port N]        the phone page in a desktop browser: a loopback host (fixture
+                        sessions, a fake overlord, the real relay and plugin), the
+                        engine behind `rlord-device bridge`, paired, and the page served
+                        on 127.0.0.1 (rebuilt on change); prints its URL
+  test-e2e              the phone page's store and RemoteTransport in Node over the
+                        bridge against that host: pair, list, ask, the relay and the
+                        plugin restarted, unpair (no simulator, no Xcode)";
 
 /// The FFI crate and its library name.
 const FFI_PACKAGE: &str = "robot-overlord-e2e-ffi";
@@ -40,6 +49,8 @@ pub fn main(args: &[String]) -> Result<()> {
         Some("core-ios") => core_ios(&root),
         Some("ios") => ios(&root, &args[1..]),
         Some("test-ios") => test_ios(&root, &args[1..]),
+        Some("dev") => crate::app_dev::dev(&root, &args[1..]),
+        Some("test-e2e") => crate::app_dev::test_e2e(&root, &args[1..]),
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
             Ok(())
@@ -48,7 +59,7 @@ pub fn main(args: &[String]) -> Result<()> {
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives in the workspace")
@@ -407,6 +418,8 @@ pub struct Stack {
     /// Where `<name>.cmd` files drive it.
     pub control: String,
     pub relay: String,
+    /// Whether its fake overlord runs (it needs tmux).
+    pub overlord: bool,
     _dir: cmd::TempDir,
 }
 
@@ -460,11 +473,13 @@ impl Stack {
             events,
             control: String::new(),
             relay: String::new(),
+            overlord: false,
             _dir: dir,
         };
         let ready = stack.wait("ready")?;
         stack.control = ready["control"].as_str().unwrap_or_default().to_string();
         stack.relay = ready["relay"].as_str().unwrap_or_default().to_string();
+        stack.overlord = ready["overlord"] == true;
         println!("host stack ready: relay {}", stack.relay);
         Ok(stack)
     }
