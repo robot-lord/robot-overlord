@@ -1,4 +1,4 @@
-**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is planned at the end of this doc and waits for the user's answers, nothing of it built. The feature branch stays dark: no releases until the final merge to `main`)
+**Status:** in progress (slices 1 to 3, the local web UI, the web as a UI target, and the e2e core and the relay, are built and merged into `feature/web`; slice 4, the phone app, is built for iOS on `feat/web-ui-4` (local commits) with Android deferred. The feature branch stays dark: no releases, TestFlight or store builds until the final merge to `main`; the app is built and installed locally only)
 
 # rlord web UI and end-to-end encrypted relay
 
