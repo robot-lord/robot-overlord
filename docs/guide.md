@@ -11,7 +11,9 @@ Contents: [The overlord](#the-overlord) · [Creating sessions](#creating-session
 [The right-hand side](#the-right-hand-side-preview--details) ·
 [Bringing in existing sessions](#bringing-in-existing-sessions) ·
 [Archived sessions and past work](#archived-sessions-and-past-work) ·
-[Remote Control](#remote-control-from-your-phone) · [rlord's tmux](#rlords-tmux) ·
+[Remote Control](#remote-control-from-your-phone) ·
+[Remote access through a relay](#remote-access-through-a-relay) ·
+[The phone app](#the-phone-app) · [rlord's tmux](#rlords-tmux) ·
 [Sessions and groups](#sessions-and-groups) · [Themes](#themes) ·
 [Navigation and keys](#navigation-and-keys) · [Updating](#updating) ·
 [The daemon](#the-daemon)
@@ -783,9 +785,9 @@ anywhere, end-to-end encrypted, through a relay you choose: one you run
 yourself (`docs/relay.md`) or one someone runs for you. This isn't
 Claude's Remote Control (above): it covers rlord's list and overlord, on
 any agent. Your machine never accepts a connection: it dials out to the
-relay, and so does the device. The phone app that uses it is still to
-come; for now the device is `rlord-device`, a test client. The protocol
-hasn't been reviewed yet: use it with your own relay only.
+relay, and so does the device: the phone app ([below](#the-phone-app)),
+or `rlord-device`, a test client. The protocol hasn't been reviewed yet:
+use it with your own relay only.
 
 ```sh
 rlord relay setup https://relay.example.com#k=…   # the address the relay's owner gives you
@@ -832,6 +834,69 @@ relay_key = ""         # the relay's key fingerprint (set by setup)
 ca_file = ""           # an extra root certificate (PEM) for a relay with a private CA
 device_expiry_days = 90  # 0: devices never expire
 ```
+
+## The phone app
+
+An iPhone app that pairs with this machine through your relay and shows
+the session list, the overlord's chat and each session's recent
+conversation. **It isn't released yet:** it lives on a development branch
+and you build and install it yourself (below). Android comes later.
+
+What it does:
+
+- **Pair:** on the Mac run `rlord relay pair` (or open Devices), tap Scan
+  in the app, name the phone, then check that both show the same six
+  digits and confirm on the Mac (`rlord relay confirm`). The app
+  remembers one computer.
+- **Use:** the list, the overlord chat (a message typed while the
+  computer is unreachable waits, visibly, and is sent when it's back; the
+  app gives up after 24 hours), a session's notes and its recent
+  messages (read only: answer a session through the overlord; the live
+  terminal isn't available remotely yet), and the forms the overlord
+  opens. The overlord can open a form on the phone when it's the screen
+  you used last; the code-folder form and the key screen never go there.
+- **Recover:** it reconnects by itself after a lost network, a change
+  from wifi to cellular, the relay or the computer restarting, or coming
+  back to the front. The status screen (`⋯`) says what it's waiting for.
+- **Lock:** after 5 minutes away the app asks for Face ID or the
+  passcode (on by default; the phone must have a passcode). Turn it off
+  on the status screen.
+- **Notifications:** off by default. Turned on, the app checks when iOS
+  grants it a background refresh (iOS decides when; there's no push yet)
+  and says how many sessions need you, never their names.
+- **Unpair:** on the status screen, which also removes the phone from the
+  computer. A lost phone: `rlord relay revoke <name>` on the computer.
+
+The phone keeps its relay key in the Secure Enclave and its files sealed
+with another enclave key, in a folder left out of backups. It keeps
+nothing of the computer's but its public key and the relay's pin. The
+relay needs a certificate from a public authority: the app doesn't trust
+`ca_file` or a private CA yet.
+
+### Installing it yourself
+
+You need a Mac with Xcode (`xcode-select -p` naming Xcode, not the
+command line tools), the Rust toolchain this repo pins, Node for the
+page, an iPhone on iOS 26 or later, and an Apple developer account. In
+Xcode → Settings → Accounts, sign in with an account in the team the
+build signs with (`apps/ios/Config/Base.xcconfig`; another team or
+bundle id goes in `apps/ios/Local.xcconfig`, copied from
+`Local.xcconfig.example`).
+
+1. On the iPhone: Settings → Privacy & Security → Developer Mode on
+   (it restarts). Connect it to the Mac by cable, unlock it and tap
+   Trust.
+2. Find its id: `xcrun devicectl list devices`.
+3. From a checkout of the branch: `cargo xtask app ios --device <id>`.
+   It builds the page, the engine for iOS and the app, signs it with
+   automatic signing (Xcode makes a development certificate the first
+   time) and installs and launches it.
+4. If iOS says the developer isn't trusted: Settings → General → VPN &
+   Device Management → the developer → Trust.
+5. Pair it as above. Rebuild and install the same way after pulling.
+
+The app is signed for development: it runs on phones registered to the
+team, and a build from a free Apple ID stops opening after 7 days.
 
 ## rlord's tmux
 

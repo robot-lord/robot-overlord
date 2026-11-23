@@ -61,6 +61,29 @@ cargo build -p robot-overlord-web && rlord web   # a checkout's rlord runs the r
 beside another). `cargo xtask check-deps` keeps network crates out of
 `rlord`; see "Web UI" in docs/architecture.md.
 
+### The phone app
+
+The iOS app (`apps/ios`) is a thin SwiftUI shell around the phone build
+of the page and the device engine (`crates/e2e-client`, through UniFFI in
+`crates/e2e-ffi`); see "The phone app" in docs/architecture.md. It needs
+Xcode (selected with `xcode-select`, or the tasks set `DEVELOPER_DIR`) and
+the iOS Rust targets in `rust-toolchain.toml`. Everything is built
+locally; nothing is released from the feature branch.
+
+```sh
+cargo xtask app ios                 # build, install and launch on a simulator (--sim NAME)
+cargo xtask app ios --device ID     # on your phone (xcrun devicectl list devices); signs with the team
+cargo xtask app test-ios            # XCTest, then the XCUITest against a loopback host stack
+cargo xtask app test-ios --unit     # XCTest only
+cargo xtask app dev                 # the phone page in a desktop browser, over rlord-device bridge
+cargo xtask app test-e2e            # the page's store and RemoteTransport over the bridge (no simulator; CI)
+cargo xtask app bindings            # regenerate the Swift bindings (the build tasks do this)
+```
+
+The generated bindings, the xcframework and the copied page are
+git-ignored. `cargo xtask check-deps` fails if `apps/` names a network
+API.
+
 ## Demo and screenshots
 
 `scripts/demo/demo.sh` starts a throwaway rlord full of made-up sessions

@@ -1287,7 +1287,7 @@ user runs it before a review); the relay itself is `docs/relay.md`.
 | Party | Crates | Holds |
 | --- | --- | --- |
 | Host (`rlord-web`, `crates/web/src/remote/`) | `rlord_e2e`, `rlord_relay_proto` | `<data dir>/remote/`: X25519 static key, P-256 relay key, the pin, `devices.json`, one mailbox state and request store per device; `remote.log` (audit) |
-| Device (the phone app, next; `rlord-device` for tests, `crates/e2e-device`) | `rlord_e2e` (natively or as WASM, `crates/e2e-wasm`), `rlord_relay_proto` | its keys, the host's static key and the pin |
+| Device (the phone app, `apps/ios`; `rlord-device` for tests and the bridge, `crates/e2e-device`), both on the device engine `rlord_e2e_client` (`crates/e2e-client`) | `rlord_e2e`, `rlord_relay_proto` (`crates/e2e-wasm` keeps a WASM build for a later browser device) | per host: its relay key (platform keystore), its X25519 key, the host's static key, the pin, the mailbox state and the outbox, sealed by the platform's vault |
 | Relay (`rlord-relay`, `crates/relay`) | `rlord_relay_proto` only | its key, registrations; queues in memory |
 
 `rlord_e2e` is sans-IO (`check-deps` holds its tree free of tokio,
@@ -1394,6 +1394,81 @@ confirmation. `rlord_core::qr` draws the pairing code (the `rlord`
 binary only ever draws a string the plugin gave it). `start_if_enabled`
 also starts the plugin for `[remote] enabled`. The page's Devices view
 is a modal (form kind `devices`).
+
+### The phone app
+
+Built on the feature branch only, and dark: no release, TestFlight or
+store build until the final merge to `main`; it is built and installed
+locally (`cargo xtask app …`, CONTRIBUTING.md). iOS first; Android's shell
+is still to come and needs nothing new from the engine or the page.
+
+**Three layers, one network path.**
+
+- *The engine* (`crates/e2e-client`, `rlord_e2e_client`) is the device's
+  whole side of the protocol, natively: the relay link (tokio,
+  tokio-tungstenite, rustls with ring and `webpki-roots`), the pin check,
+  the Noise sessions, the mailbox, the outbox and the reconnect loop.
+  `machine` is sans-IO (every rule of the loop and the outbox, unit
+  tested with a scripted link and a fake clock); `driver` runs it on a
+  small runtime the engine owns; `Engine` is the facade
+  (`page_message`, `scanned`, `lifecycle`, `network`,
+  `background_check`, `wipe`, `shutdown`). The platform gives it three
+  traits: `Signers` (the relay key per host, Secure Enclave on iOS; DER
+  or `r || s`, high S accepted), `Vault` (seals every file at rest) and
+  `Listener` (`to_page`, `notify`). `check-deps` keeps rlord and the
+  relay out of its tree, and it out of `rlord`'s. It starts as if in the
+  background: the shell says `lifecycle(true)` when the app is in front.
+- *The FFI* (`crates/e2e-ffi`) is UniFFI over the engine, proc-macro
+  only. It stays small on purpose: a page feature travels as JSON
+  through `page_message` and `to_page`, so it needs no binding change.
+  The vault's `open` is `unseal` there (UniFFI 0.32.2 escapes Swift's
+  `open` into the C header).
+- *The shell* (`apps/ios`, SwiftUI) starts the engine, passes JSON
+  between it and the page, serves the scanner and its own settings,
+  reports scene phase and `NWPathMonitor` changes, locks the app after 5
+  minutes away, and runs the OS's background refresh. It has no logic
+  the engine or the page can hold.
+- *The page* is the phone build of the local page (`cargo xtask web
+  build --app`, `dist-app/`): the same store and views behind
+  `RemoteTransport`, which posts to the shell
+  (`webkit.messageHandlers.rlord`) and is answered through
+  `window.__rlord_recv`. The WebView loads it from the bundle through a
+  scheme handler (`rlord-app://page/`) under `connect-src 'none'` and
+  Trusted Types, with a content rule list that blocks every other URL:
+  the page can't reach the network at all. The engine's relay link is
+  the app's only connection; `check-deps` fails if `apps/` names a
+  network API.
+
+**The bridge contract.** Page to engine: requests `{id, op, args}` as on
+a local page, and `app` messages (`ready`, which replays `conn`,
+`pairing`, `outbox` and the last `hello` so a reload restores
+everything; `pair_continue`, `pair_cancel`, `unpair`, `cancel`,
+`status`). The shell answers `scan` and `settings` itself. Engine to
+page: answers by id and events (`conn` with its state, `pairing`,
+`outbox`, `hello`, `changed`, `ui`, `status`). A page feature that a
+phone should have is an op with `remote: true` (Remote access, above)
+and, when the page draws it, a `caps` check in `transport.ts`; nothing in
+the engine or the shell changes for it. The page reads `api` from the
+host's `hello` and says "update the app" or "update rlord" across a
+level it doesn't speak.
+
+**What the phone keeps.** Per paired host (one in this slice), in the
+app's own folder, out of backups, sealed by the vault (an enclave key,
+`AfterFirstUnlockThisDeviceOnly`): the device's X25519 key, the host's
+public key, the pin, the mailbox state, the outbox (at most 16 entries;
+an ask waits up to 24 hours) and the last `rev`. The relay key never
+leaves the enclave. Nothing of the host's but its public key and the
+pin. A debug build on a Mac without an enclave falls back to software
+keys; a release build refuses to start.
+
+**Background.** Going to the background, the engine sends what is
+queued and closes the link (no socket is held). The OS's refresh
+(`BGAppRefreshTask`, `com.robot-lord.rlord.refresh`, asked for each time
+the app leaves the front) calls `background_check` with a 20 s budget:
+it dials, and only if the relay says something waits does it make a
+session, take the state and call `notify` with the count of sessions
+newly waiting. The notification is a count, made on the phone. No push
+yet: a refresh is the OS's choice of time.
 
 ## rlord's private tmux server (2026-11-10)
 

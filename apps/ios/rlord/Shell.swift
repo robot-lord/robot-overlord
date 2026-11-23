@@ -114,6 +114,11 @@ final class Shell: ObservableObject {
             return
         }
         #if DEBUG
+        // UI tests start from nothing (`-rlordReset YES`): the engine
+        // forgets its host, keys and files before anything else runs.
+        if UserDefaults.standard.bool(forKey: "rlordReset") {
+            engine?.wipe()
+        }
         // Simulators have no camera: a pairing code can come as a launch
         // argument (`-rlordQR RLORD1:…`), debug builds only.
         if let qr = UserDefaults.standard.string(forKey: "rlordQR"), qr.hasPrefix("RLORD1:") {
