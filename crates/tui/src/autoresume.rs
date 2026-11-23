@@ -6,14 +6,10 @@
 //! setup form asks the same (`setupform`).
 
 use super::*;
-use ratatui::widgets::Clear;
-use std::time::Instant;
+use timed::Shown;
 
 /// The dialog's width, borders included.
 const WIDTH: u16 = 72;
-
-/// Keys pressed this soon after it opens are dropped.
-const GRACE: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Whether to ask now: not chosen yet (`auto_resume` unset) and a session
 /// other than an overlord in `rows` is stopped on a usage limit.
@@ -38,12 +34,12 @@ pub(crate) fn resume_text(cfg: &Config) -> String {
 }
 
 impl App {
-    /// Open the question if it applies, once a run, when nothing else is
-    /// open. The daemon's config is asked first: another rlord window may
-    /// have answered it already.
+    /// Ask the question if it applies, once a run: it opens once nothing
+    /// else is (`poll_auto_resume`). The daemon's config is asked first:
+    /// another rlord window may have answered it already.
     pub(crate) fn offer_auto_resume(&mut self) {
         if self.auto_resume_asked
-            || !matches!(self.mode, Mode::Normal)
+            || self.auto_resume_pending
             || !wants_ask(self.config.limits.auto_resume, &self.all)
         {
             return;
@@ -67,14 +63,26 @@ impl App {
             return;
         }
         self.auto_resume_error = None;
-        self.mode = Mode::AutoResume(Instant::now());
+        self.auto_resume_pending = true;
     }
 
-    pub(crate) fn handle_auto_resume(&mut self, k: KeyEvent, opened: Instant) {
+    /// Open a pending question once nothing else is open. Not from inside
+    /// `refresh`: a refresh right before an attach would open it while
+    /// the terminal goes to tmux. True when the screen changed.
+    pub(crate) fn poll_auto_resume(&mut self) -> bool {
+        if !self.auto_resume_pending || !matches!(self.mode, Mode::Normal) {
+            return false;
+        }
+        self.auto_resume_pending = false;
+        self.mode = Mode::AutoResume(Shown::default());
+        true
+    }
+
+    pub(crate) fn handle_auto_resume(&mut self, k: KeyEvent, shown: Shown) {
         // It opens on a background refresh, maybe mid-typing: keys pressed
         // before the user could have seen it are dropped.
-        if opened.elapsed() < GRACE {
-            self.mode = Mode::AutoResume(opened);
+        if !shown.ready() {
+            self.mode = Mode::AutoResume(shown);
             return;
         }
         // Quitting is never trapped; staying brings the question back
@@ -94,7 +102,7 @@ impl App {
                 return;
             }
             _ => {
-                self.mode = Mode::AutoResume(opened);
+                self.mode = Mode::AutoResume(shown);
                 return;
             }
         };
@@ -116,12 +124,12 @@ impl App {
             // Not saved: the question stays, with why.
             Err(e) => {
                 self.auto_resume_error = Some(format!("not saved: {e:#}"));
-                self.mode = Mode::AutoResume(opened);
+                self.mode = Mode::AutoResume(shown);
             }
         }
     }
 
-    pub(crate) fn draw_auto_resume(&self, f: &mut Frame) {
+    pub(crate) fn draw_auto_resume(&self, f: &mut Frame, shown: &Shown) {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -164,19 +172,7 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
-        let rows: usize = lines
-            .iter()
-            .map(|l| l.width().div_ceil(usize::from(WIDTH - 2)).max(1))
-            .sum();
-        let area = newform::centered(f.area(), WIDTH, u16::try_from(rows + 2).unwrap_or(u16::MAX));
-        f.render_widget(Clear, area);
-        self.modal_hits(f.area(), area, &lines);
-        f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(theme::modal("Auto-resume after limits")),
-            area,
-        );
+        self.draw_timed(f, shown, WIDTH, "Auto-resume after limits", lines);
     }
 }
 
@@ -191,13 +187,76 @@ mod tests {
         let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
         let mut app = App::new(rx, Config::default(), keys);
         app.auto_resume_asked = true;
-        let opened = Instant::now() - std::time::Duration::from_secs(2);
         app.handle_auto_resume(
             KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
-            opened,
+            Shown::seen_long_ago(),
         );
         assert!(matches!(app.mode, Mode::ConfirmQuit));
         assert!(!app.auto_resume_asked, "asked again once back in the list");
+    }
+
+    fn app() -> App {
+        let (_tx, rx) = mpsc::channel();
+        let keys = KeyMap::from_config(&rlord_core::config::Keys::default()).unwrap();
+        App::new(rx, Config::default(), keys)
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// Asked during a refresh right before an attach: it doesn't open
+    /// then, and once open, a key before it was drawn doesn't answer it
+    /// however long it has been open.
+    #[test]
+    fn a_key_before_the_dialog_is_drawn_doesnt_answer_it() {
+        let mut app = app();
+        app.auto_resume_pending = true;
+        app.mode = Mode::Filter(String::new());
+        assert!(!app.poll_auto_resume(), "not over another mode");
+        app.mode = Mode::Normal;
+        assert!(app.poll_auto_resume());
+        assert!(!app.auto_resume_pending);
+        let Mode::AutoResume(shown) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+            panic!("not opened");
+        };
+        app.handle_auto_resume(key('y'), shown);
+        assert!(matches!(app.mode, Mode::AutoResume(_)), "y dropped");
+        assert_eq!(app.config.limits.auto_resume, None);
+    }
+
+    /// A form the overlord pushes over the question doesn't lose it: it
+    /// opens again once the list is back.
+    #[test]
+    fn a_pushed_form_keeps_the_question_pending() {
+        let mut app = app();
+        app.mode = Mode::AutoResume(Shown::default());
+        app.handle_ui_cmd(json!({"cmd": "new_session", "prefill": {}}));
+        assert!(!matches!(app.mode, Mode::AutoResume(_)));
+        assert!(app.auto_resume_pending);
+        app.mode = Mode::Normal;
+        assert!(app.poll_auto_resume());
+        assert!(matches!(app.mode, Mode::AutoResume(_)));
+    }
+
+    /// On a narrow terminal the dialog is tall enough for its wrapped
+    /// lines: the key lines still show.
+    #[test]
+    fn the_keys_show_on_a_narrow_terminal() {
+        let app = app();
+        let backend = ratatui::backend::TestBackend::new(40, 40);
+        let mut t = ratatui::Terminal::new(backend).unwrap();
+        let shown = Shown::default();
+        t.draw(|f| app.draw_auto_resume(f, &shown)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("later"), "esc line clipped");
+        assert!(!shown.ready(), "grace starts at the draw");
     }
 
     #[test]

@@ -5,14 +5,10 @@
 //! its import flow (the user approves the list there); `d` is remembered.
 
 use super::*;
-use ratatui::widgets::Clear;
-use std::time::Instant;
+use timed::Shown;
 
 /// The dialog's width, borders included.
 const WIDTH: u16 = 74;
-
-/// Keys pressed this soon after it opens are dropped.
-const GRACE: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Where you can do it later, said on `d`/Esc and in the dialog.
 pub(crate) const LATER: &str = "ask the overlord \"import my sessions\" any time";
@@ -93,15 +89,15 @@ impl App {
             return changed;
         }
         self.import_offer_ready = false;
-        self.mode = Mode::ImportOffer(Instant::now());
+        self.mode = Mode::ImportOffer(Shown::default());
         true
     }
 
-    pub(crate) fn handle_import_offer(&mut self, k: KeyEvent, opened: Instant) {
+    pub(crate) fn handle_import_offer(&mut self, k: KeyEvent, shown: Shown) {
         // It can open while the user is typing in the list: keys pressed
         // before they could have seen it are dropped.
-        if opened.elapsed() < GRACE {
-            self.mode = Mode::ImportOffer(opened);
+        if !shown.ready() {
+            self.mode = Mode::ImportOffer(shown);
             return;
         }
         // Quitting is never trapped; staying brings the offer back.
@@ -154,7 +150,7 @@ impl App {
                 self.status_line = format!("asks again next start · or {LATER}");
                 self.overlay_after_offer();
             }
-            _ => self.mode = Mode::ImportOffer(opened),
+            _ => self.mode = Mode::ImportOffer(shown),
         }
     }
 
@@ -176,7 +172,7 @@ impl App {
         }
     }
 
-    pub(crate) fn draw_import_offer(&self, f: &mut Frame) {
+    pub(crate) fn draw_import_offer(&self, f: &mut Frame, shown: &Shown) {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -217,19 +213,6 @@ impl App {
                 Style::default().fg(theme::red()),
             )));
         }
-        // Tall enough for every line as wrapped, so the keys never clip.
-        let rows: usize = lines
-            .iter()
-            .map(|l| l.width().div_ceil(usize::from(WIDTH - 2)).max(1))
-            .sum();
-        let area = newform::centered(f.area(), WIDTH, u16::try_from(rows + 2).unwrap_or(u16::MAX));
-        f.render_widget(Clear, area);
-        self.modal_hits(f.area(), area, &lines);
-        f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(theme::modal("Import your sessions")),
-            area,
-        );
+        self.draw_timed(f, shown, WIDTH, "Import your sessions", lines);
     }
 }
