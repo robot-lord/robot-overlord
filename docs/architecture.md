@@ -537,12 +537,14 @@ hooks and `discover` keep the stored status to themselves.
   menu), **or automatic** with `[limits] auto_resume = true`
   (`limits::auto_schedule`, on the same tick): each limit of a session
   other than an overlord gets the same job, once per limit (kv
-  `limit_auto`: `{id: limit at}`; a limit that has any job, asked for or
-  rescheduled onto, is marked too), so a cancelled or given-up job isn't
+  `limit_auto`: `{id: limit at}`, written whenever a job is made or
+  rescheduled, whatever the setting, so turning it on later doesn't
+  revive a cancelled resume), so a cancelled or given-up job isn't
   remade, and an automatic job never replaces one made meanwhile
-  (checked under the session's lock). Unset is off; the TUI asks once (the first-run
-  setup form's row, `setup.apply {auto_resume}`, or a dialog when a
-  listed session is limited) and `limits.auto_resume {on}` writes the
+  (checked under the session's lock). Unset is off; the first-run setup
+  form offers it as an optional hint ("ask me later" by default;
+  `setup.apply {auto_resume}`, one config write with the folder), and a
+  dialog asks when a listed session is limited and `limits.auto_resume {on}` writes the
   answer to rlord's `config.toml` and takes it without a restart.
   `limits::native_auto_resume` is the per-agent stand-down slot: true
   for an agent that resumes by itself, and then rlord neither schedules

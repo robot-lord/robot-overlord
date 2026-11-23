@@ -475,15 +475,14 @@ fn parse_jsonc(text: &str) -> Option<Value> {
 /// finds the box), never the transcript above it or the input inside it,
 /// so a reply or a draft with these words doesn't count. No prompt box on
 /// screen: no.
+/// `screen` without attributes (as `at_prompt` gets it).
 pub fn retrying(screen: &str) -> bool {
-    let lines: Vec<String> = screen
-        .lines()
-        .map(|l| super::strip_ansi(l).to_lowercase())
-        .collect();
-    let Some(close) = lines.iter().rposition(|l| l.trim().starts_with('╹')) else {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(close) = prompt_box_close(&lines) else {
         return false;
     };
     lines[close..].iter().any(|l| {
+        let l = l.to_lowercase();
         l.match_indices("retrying in ").any(|(i, m)| {
             l[i + m.len()..]
                 .trim_start()
@@ -537,6 +536,14 @@ fn dialog_line(line: &str) -> bool {
         || has("⇆ select", "enter confirm")
 }
 
+/// The line closing OpenCode's prompt box (the lowest `╹` line), with or
+/// without attributes.
+fn prompt_box_close(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|l| super::strip_ansi(l).trim().starts_with('╹'))
+}
+
 /// What is typed in OpenCode's prompt box (`screen` captured with
 /// attributes, `capture-pane -e`), if anything. The box is the lowest run
 /// of `┃` lines closed by a `╹` line; its last line is the agent and model
@@ -548,7 +555,7 @@ fn dialog_line(line: &str) -> bool {
 pub fn draft(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
     let plain = |l: &str| super::strip_ansi(l).trim().to_string();
-    let close = lines.iter().rposition(|l| plain(l).starts_with('╹'))?;
+    let close = prompt_box_close(&lines)?;
     let top = lines[..close]
         .iter()
         .rposition(|l| !plain(l).starts_with('┃'))

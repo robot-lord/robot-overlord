@@ -435,11 +435,13 @@ fn apply_with(
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir}"))?;
         created = true;
     }
-    let file = Config::set_code_dir_at(path, &contract_tilde(&dir), roots)?;
-    // The form's one-time question, answered there: rlord's own config.
-    if let Some(on) = params["auto_resume"].as_bool() {
-        Config::set_auto_resume_at(&file, on)?;
-    }
+    // With the form's auto-resume answer, if picked: one write.
+    let file = Config::set_setup_at(
+        path,
+        &contract_tilde(&dir),
+        roots,
+        params["auto_resume"].as_bool(),
+    )?;
     d.db().kv_set(KV, &format!("done:{}", now_ms()))?;
     let cfg = Config::load_at(&file)?;
     let effective: Vec<String> = cfg

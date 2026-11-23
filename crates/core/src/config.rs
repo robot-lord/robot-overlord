@@ -838,12 +838,27 @@ impl Config {
         code_dir: &str,
         roots: RootsEdit,
     ) -> Result<std::path::PathBuf> {
+        Self::set_setup_at(path, code_dir, roots, None)
+    }
+
+    /// `set_code_dir_at`, and `[limits] auto_resume` when given (the setup
+    /// form's answer), in one edit and one write.
+    pub fn set_setup_at(
+        path: &std::path::Path,
+        code_dir: &str,
+        roots: RootsEdit,
+        auto_resume: Option<bool>,
+    ) -> Result<std::path::PathBuf> {
         let text = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        write_config(path, &set_code_dir_in(&text, code_dir, &roots)?)?;
+        let mut out = set_code_dir_in(&text, code_dir, &roots)?;
+        if let Some(on) = auto_resume {
+            out = auto_resume_in(&out, on)?;
+        }
+        write_config(path, &out)?;
         Ok(path.to_path_buf())
     }
 
@@ -857,18 +872,23 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let out = set_item_in(&text, "limits", "auto_resume", toml_edit::Value::from(on))?;
-        let c = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
-        if c.limits.auto_resume != Some(on) {
-            anyhow::bail!("auto_resume didn't take in config.toml");
-        }
-        write_config(path, &out)
+        write_config(path, &auto_resume_in(&text, on)?)
     }
 
     /// Commented template written by `rlord config init`; equals the defaults.
     pub fn default_toml() -> String {
         DEFAULT_TOML.to_string()
     }
+}
+
+/// `text` with `[limits] auto_resume = on`, checked to load with it.
+fn auto_resume_in(text: &str, on: bool) -> Result<String> {
+    let out = set_item_in(text, "limits", "auto_resume", toml_edit::Value::from(on))?;
+    let c = toml::from_str::<Config>(&out).context("the edited config doesn't load")?;
+    if c.limits.auto_resume != Some(on) {
+        anyhow::bail!("auto_resume didn't take in config.toml");
+    }
+    Ok(out)
 }
 
 /// Write the config file's new text (already checked to load).

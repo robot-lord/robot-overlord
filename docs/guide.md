@@ -541,9 +541,10 @@ Or have rlord do this for every limited session by itself:
 `[limits] auto_resume = true` in `config.toml`. Each session stopped on a
 limit then gets a scheduled resume as above, except the overlords (switch
 agents instead); cancel one and it stays cancelled for that limit.
-`false` never resumes on its own. Until you choose, it is off, and rlord
-asks you once: in the first-run setup form, or in a dialog the first time
-a session hits a limit (`y` on, `n` off, Esc asks again next start). The
+`false` never resumes on its own. Until you choose, it is off. The first-run
+setup form offers it as an optional row ("ask me later" by default), and
+the first time a session hits a limit a dialog asks (`y` on, `n` off, Esc
+asks again next start). The
 answer goes in your `config.toml`; change it there any time. None of the
 agents picks itself up when a limit resets (Claude Code's
 "auto-continue" is in its Desktop app only), so rlord does it. An

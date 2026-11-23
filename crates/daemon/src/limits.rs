@@ -63,8 +63,10 @@ pub const LIMITS_KEY: &str = "limits";
 /// sent_at?, attempts, sent_hit?}}`. `sent_hit`: the key of the limit
 /// record it was sent on (still the old limit, however it reads later).
 pub const JOBS_KEY: &str = "limit_resume";
-/// kv: the limit `auto_schedule` last handled per session, `{id: limit
-/// at}`: each limit is scheduled once, whatever became of its job.
+/// kv: the limit last handled per session, `{id: limit at}`: every limit
+/// a resume job was made or rescheduled for (asked for or automatic,
+/// whatever the setting), so `auto_schedule` makes at most one job per
+/// limit, whatever became of it (cancelled, given up).
 pub const AUTO_KEY: &str = "limit_auto";
 
 const TICK: Duration = Duration::from_secs(15);
@@ -444,6 +446,7 @@ fn schedule(
     }
     jobs.insert(id.to_string(), job.clone());
     db.kv_set_map(JOBS_KEY, &jobs)?;
+    mark_handled(&db, id, &l["at"])?;
     db.insert_event(id, now, "limit_resume_scheduled", &job.to_string())?;
     Ok(true)
 }
@@ -466,11 +469,22 @@ pub(crate) fn native_auto_resume(s: &Session) -> bool {
     }
 }
 
+/// Record that session `id`'s limit `at` had a resume job (kv
+/// `limit_auto`), whatever `auto_resume` says: turned on later, it
+/// doesn't bring back a resume the user cancelled.
+fn mark_handled(db: &Db, id: &str, at: &Value) -> Result<()> {
+    let mut done = db.kv_map(AUTO_KEY)?;
+    if done.get(id) != Some(at) {
+        done.insert(id.to_string(), at.clone());
+        db.kv_set_map(AUTO_KEY, &done)?;
+    }
+    Ok(())
+}
+
 /// Which of the limits now (`limits`) `auto_schedule` gives a job: not
 /// handled before for this limit (`done`, kv `limit_auto`) and no job
-/// (`jobs`). A limit with a job (asked for, or one that rescheduled onto
-/// it) is marked handled in `done`: once that job ends (cancelled, given
-/// up after the limit kept hitting), it isn't made again.
+/// (`jobs`). A job waiting on this very limit (its `limit_at`) marks it
+/// handled in `done`; one on an older limit doesn't.
 fn auto_due(
     limits: &Map<String, Value>,
     jobs: &Map<String, Value>,
@@ -481,10 +495,12 @@ fn auto_due(
         if done.get(id) == Some(&l["at"]) {
             continue;
         }
-        if jobs.contains_key(id) {
-            done.insert(id.clone(), l["at"].clone());
-        } else {
-            due.push(id.clone());
+        match jobs.get(id) {
+            Some(j) if j["limit_at"] == l["at"] => {
+                done.insert(id.clone(), l["at"].clone());
+            }
+            Some(_) => {}
+            None => due.push(id.clone()),
         }
     }
     due
@@ -540,7 +556,14 @@ fn auto_schedule(d: &Daemon) -> Result<()> {
         }
         tracing::info!(session = %s.name, "resume scheduled by itself (auto_resume)");
     }
-    d.db().kv_set_map(AUTO_KEY, &done)?;
+    {
+        // (Over what `schedule` recorded meanwhile.)
+        let db = d.db();
+        let mut now_done = db.kv_map(AUTO_KEY)?;
+        now_done.extend(done);
+        now_done.retain(|id, _| limits.contains_key(id));
+        db.kv_set_map(AUTO_KEY, &now_done)?;
+    }
     d.changed();
     Ok(())
 }
@@ -772,6 +795,7 @@ fn run_job(d: &Daemon, id: &str) -> Result<()> {
                     job.remove("sent_at");
                 }
             })?;
+            mark_handled(&d.db(), id, &json!(limit_at))?;
             log(
                 "limit_resume_rescheduled",
                 json!({"resets_at": resets_at, "why": "the limit hit again"}),
@@ -1263,16 +1287,41 @@ mod tests {
     #[test]
     fn a_limit_with_a_job_is_not_auto_scheduled_again() {
         let limits = Map::from_iter([("s1".to_string(), json!({"at": 5}))]);
-        let jobs = Map::from_iter([("s1".to_string(), json!({}))]);
+        let on = |at: i64| Map::from_iter([("s1".to_string(), json!({"limit_at": at}))]);
         let mut done = Map::new();
-        assert!(auto_due(&limits, &jobs, &mut done).is_empty());
+        assert!(auto_due(&limits, &on(5), &mut done).is_empty());
         assert_eq!(done["s1"], 5);
         assert!(auto_due(&limits, &Map::new(), &mut done).is_empty());
-        // The limit kept hitting and the job gave up: the latest limit was
-        // marked while the job sat on it, so no fresh job.
+        // The job rescheduled onto the newer limit and then gave up: that
+        // limit was marked while the job sat on it, so no fresh job.
         let later = Map::from_iter([("s1".to_string(), json!({"at": 9}))]);
-        assert!(auto_due(&later, &jobs, &mut done).is_empty());
+        assert!(auto_due(&later, &on(9), &mut done).is_empty());
         assert!(auto_due(&later, &Map::new(), &mut done).is_empty());
+    }
+
+    /// A job still waiting on an older limit doesn't mark the newer one:
+    /// once it ends, the newer limit gets its own.
+    #[test]
+    fn a_job_on_an_older_limit_doesnt_mark_the_new_one() {
+        let limits = Map::from_iter([("s1".to_string(), json!({"at": 9}))]);
+        let old = Map::from_iter([("s1".to_string(), json!({"limit_at": 5}))]);
+        let mut done = Map::new();
+        assert!(auto_due(&limits, &old, &mut done).is_empty());
+        assert!(!done.contains_key("s1"));
+        assert_eq!(auto_due(&limits, &Map::new(), &mut done), ["s1"]);
+    }
+
+    /// Cancelled while auto-resume was off, then turned on: the
+    /// cancelled resume isn't brought back.
+    #[test]
+    fn turning_auto_resume_on_later_keeps_a_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = limited_daemon(dir.path(), None);
+        resume(&d, &json!({"sessions": ["s1"]})).unwrap();
+        resume(&d, &json!({"cancel": true})).unwrap();
+        d.update_config(|c| c.limits.auto_resume = Some(true));
+        auto_schedule(&d).unwrap();
+        assert!(d.db().kv_map(JOBS_KEY).unwrap().is_empty());
     }
 
     /// Asked for, then cancelled, with auto-resume on: stays cancelled.

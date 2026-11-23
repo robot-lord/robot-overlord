@@ -24,6 +24,20 @@ pub(crate) fn wants_ask(auto_resume: Option<bool>, rows: &[Value]) -> bool {
             .any(|s| !s["limit"].is_null() && !is_overlord_role(s))
 }
 
+/// The daemon couldn't be reached at all (the socket: an I/O error), as
+/// opposed to answering with an error. Only then is it asked again on a
+/// later refresh; an error answer would only repeat on every one.
+pub(crate) fn unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<std::io::Error>())
+}
+
+/// The message a resume types, as the dialog says it (`[limits]
+/// resume_message`, "continue" when blank, as the daemon sends).
+pub(crate) fn resume_text(cfg: &Config) -> String {
+    let m = cfg.limits.resume_message.trim();
+    if m.is_empty() { "continue" } else { m }.to_string()
+}
+
 impl App {
     /// Open the question if it applies, once a run, when nothing else is
     /// open. The daemon's config is asked first: another rlord window may
@@ -40,10 +54,14 @@ impl App {
         if cfg!(test) {
             return;
         }
-        let Ok(v) = client_call(&paths::socket_path(), "limits.auto_resume", json!({})) else {
-            // Not reached: asked again on a later refresh.
-            self.auto_resume_asked = false;
-            return;
+        let v = match client_call(&paths::socket_path(), "limits.auto_resume", json!({})) {
+            Ok(v) => v,
+            Err(e) => {
+                // Not reached: asked again on a later refresh. Any other
+                // error: not again this run.
+                self.auto_resume_asked = !unreachable(&e);
+                return;
+            }
         };
         if let Some(on) = v["auto_resume"].as_bool() {
             self.config.limits.auto_resume = Some(on);
@@ -114,7 +132,10 @@ impl App {
                 theme::muted(),
             )),
             Line::from(Span::styled(
-                "  rlord types \"continue\" (`[limits] resume_message`) a minute after",
+                format!(
+                    "  rlord types \"{}\" ([limits] resume_message) a minute after",
+                    resume_text(&self.config)
+                ),
                 theme::muted(),
             )),
             Line::from(Span::styled(
@@ -161,6 +182,27 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dialog_names_the_configured_message() {
+        let mut cfg = Config::default();
+        assert_eq!(resume_text(&cfg), "continue");
+        cfg.limits.resume_message = "  keep going ".into();
+        assert_eq!(resume_text(&cfg), "keep going");
+        cfg.limits.resume_message = " ".into();
+        assert_eq!(resume_text(&cfg), "continue");
+    }
+
+    /// Only a daemon that couldn't be reached is asked again.
+    #[test]
+    fn only_an_unreachable_daemon_is_asked_again() {
+        let io = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            .context("connecting to daemon");
+        assert!(unreachable(&io));
+        assert!(!unreachable(&anyhow::anyhow!(
+            "unknown method limits.auto_resume"
+        )));
+    }
 
     #[test]
     fn asked_only_while_unset_and_a_session_is_limited() {

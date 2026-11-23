@@ -11,10 +11,11 @@
 //! Opened on first run (after the overlord's own dialog), by `:setup`, and
 //! by the overlord.
 //!
-//! While `[limits] auto_resume` is unset it also asks that, once (the
-//! Auto-resume row: on or off must be picked before saving), saved with
-//! the folder (`setup.apply`'s `auto_resume`), or at once
-//! (`limits.auto_resume`) when the form goes to the overlord.
+//! While `[limits] auto_resume` is unset it also offers that as an
+//! optional hint (the Auto-resume row, default "ask me later": left unset,
+//! and the list asks at the first limit). On or off picked there is saved
+//! with the folder (`setup.apply`'s `auto_resume`), or (`limits.auto_resume`)
+//! once the form is on its way to the overlord.
 
 use super::*;
 use ratatui::widgets::Clear;
@@ -111,7 +112,7 @@ pub(crate) struct SetupForm {
     hint: String,
     /// `[limits] auto_resume` isn't chosen yet: the Auto-resume row asks.
     auto_resume_row: bool,
-    /// The user's pick on that row (None: not picked yet).
+    /// The user's pick on that row (None: the default, "ask me later").
     pub(crate) auto_resume: Option<bool>,
 }
 
@@ -425,20 +426,20 @@ impl SetupForm {
         self.choices.iter().find(|c| c.path == self.code_dir)
     }
 
-    /// The Auto-resume row is shown and nothing is picked on it yet.
-    pub(crate) fn auto_resume_missing(&self) -> bool {
-        self.auto_resume_row && self.auto_resume.is_none()
-    }
-
-    /// Saving or sending stops on the unpicked Auto-resume row (an empty
-    /// folder with no description says so first).
-    fn auto_resume_unpicked(&self) -> bool {
-        self.auto_resume_missing() && (self.describing() || !self.code_dir.trim().is_empty())
-    }
-
-    /// ←/→/space on the Auto-resume row: on, then off, then on.
+    /// ←/→/space on the Auto-resume row: ask me later (the default), on,
+    /// off, and round again.
     fn toggle_auto_resume(&mut self) {
-        self.auto_resume = Some(self.auto_resume != Some(true));
+        self.auto_resume = match self.auto_resume {
+            None => Some(true),
+            Some(true) => Some(false),
+            Some(false) => None,
+        };
+    }
+
+    /// What the Auto-resume row picked, if it is shown and not left at
+    /// "ask me later".
+    pub(crate) fn auto_resume_pick(&self) -> Option<bool> {
+        self.auto_resume.filter(|_| self.auto_resume_row)
     }
 
     /// What Save does, or why it can't. `exists`: whether a folder is
@@ -448,9 +449,6 @@ impl SetupForm {
         exists: &dyn Fn(&str) -> Option<bool>,
     ) -> std::result::Result<SaveCall, String> {
         let dir = self.code_dir.trim();
-        if self.auto_resume_unpicked() {
-            return Err("pick auto-resume on or off (←/→ on its row)".into());
-        }
         if self.describing() && !self.confirmed {
             let source = if dir.is_empty() {
                 "not set"
@@ -510,7 +508,7 @@ impl SetupForm {
             "create": create,
             "allow_home": home,
         });
-        if let Some(on) = self.auto_resume.filter(|_| self.auto_resume_row) {
+        if let Some(on) = self.auto_resume_pick() {
             p["auto_resume"] = json!(on);
         }
         Ok(SaveCall::Apply(p))
@@ -891,12 +889,7 @@ impl App {
             }
             Err(e) => {
                 f.error = Some(e);
-                let at = if f.auto_resume_unpicked() {
-                    Row::AutoResume
-                } else {
-                    Row::Folder
-                };
-                f.row = f.rows().iter().position(|r| *r == at).unwrap_or(0);
+                f.row = f.rows().iter().position(|r| *r == Row::Folder).unwrap_or(0);
                 self.mode = Mode::Setup(f);
             }
             Ok(SaveCall::Apply(p)) => match client_call(&paths::socket_path(), "setup.apply", p) {
@@ -950,14 +943,6 @@ impl App {
                 }
             },
             Ok(SaveCall::Request(p)) => {
-                // The overlord's reopened form doesn't carry the
-                // auto-resume pick: saved now.
-                if let Some(on) = f.auto_resume.filter(|_| f.auto_resume_row) {
-                    if self.call("limits.auto_resume", json!({"on": on})).is_some() {
-                        self.config.limits.auto_resume = Some(on);
-                        f.auto_resume_row = false;
-                    }
-                }
                 let exists = self
                     .call("overlord.status", Value::Null)
                     .is_some_and(|st| st["exists"] == true);
@@ -966,6 +951,14 @@ impl App {
                         Some("no overlord yet: clear the description to save as shown".into());
                     self.mode = Mode::Setup(f);
                     return;
+                }
+                // The overlord's reopened form doesn't carry the
+                // auto-resume pick: saved now it is going.
+                if let Some(on) = f.auto_resume_pick() {
+                    if self.call("limits.auto_resume", json!({"on": on})).is_some() {
+                        self.config.limits.auto_resume = Some(on);
+                        f.auto_resume_row = false;
+                    }
                 }
                 // In the background: a stopped overlord can take a while.
                 // The form is kept until it's delivered (`poll_setup_send`).
@@ -1145,12 +1138,12 @@ impl App {
                 Row::AutoResume => {
                     let mut spans = label(focused, "Auto-resume");
                     let value = match s.auto_resume {
-                        None => "pick on or off",
+                        None => "ask me later (when a session first hits a limit)",
                         Some(true) => "on: limited sessions carry on when the limit resets",
                         Some(false) => "off: resume one from its menu",
                     };
                     let style = if s.auto_resume.is_none() {
-                        Style::default().fg(theme::yellow())
+                        theme::faint()
                     } else {
                         Style::default().fg(theme::text())
                     };
@@ -1165,7 +1158,7 @@ impl App {
                     lines.push(Line::from(spans));
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "{:21}after a usage limit (not the overlord's) · [limits] auto_resume",
+                            "{:21}(optional) after a usage limit, not the overlord's · [limits] auto_resume",
                             ""
                         ),
                         muted,
@@ -1317,22 +1310,26 @@ mod tests {
         assert!(f.save_call(&|_| Some(true)).is_err());
     }
 
-    /// `[limits] auto_resume` unset: the form asks, and won't save until
-    /// on or off is picked; set, the row isn't there.
+    /// `[limits] auto_resume` unset: an optional hint, "ask me later" by
+    /// default, which never blocks saving or sending; on or off picked is
+    /// sent. Set: the row isn't there.
     #[test]
-    fn auto_resume_must_be_picked_while_unset() {
+    fn auto_resume_is_an_optional_hint_while_unset() {
         let status = json!({"code_dir": "/elsewhere/ko", "repo_roots": [],
                             "roots_default": "leave", "auto_resume": null});
         let mut f = SetupForm::loading(false, true, &status);
         assert_eq!(f.rows(), [Row::Folder, Row::AutoResume, Row::Save]);
-        let err = f.save_call(&|_| Some(true)).unwrap_err();
-        assert!(err.contains("auto-resume"), "{err}");
-        // Going to the overlord too.
+        let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
+            panic!("expected a save");
+        };
+        assert!(p.get("auto_resume").is_none(), "left unset: {p}");
         f.describe = Some("work in ~/ko".into());
-        assert!(f.save_call(&|_| Some(true)).is_err());
+        assert!(matches!(
+            f.save_call(&|_| Some(true)).unwrap(),
+            SaveCall::Request(_)
+        ));
         f.describe = None;
         f.toggle_auto_resume();
-        assert_eq!(f.auto_resume, Some(true));
         let SaveCall::Apply(p) = f.save_call(&|_| Some(true)).unwrap() else {
             panic!("expected a save");
         };
@@ -1342,6 +1339,8 @@ mod tests {
             panic!("expected a save");
         };
         assert_eq!(p["auto_resume"], false);
+        f.toggle_auto_resume();
+        assert_eq!(f.auto_resume_pick(), None, "back to ask me later");
         for set in [json!(true), json!(false)] {
             let mut st = status.clone();
             st["auto_resume"] = set;
