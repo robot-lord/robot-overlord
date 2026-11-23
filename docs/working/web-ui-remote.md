@@ -1153,6 +1153,44 @@ Decided 2026-11-17 (user):
   command line tools, so tasks set `DEVELOPER_DIR`); no Android SDK yet.
   Sixteen open questions wait for the user; the first
   (engine in the shell, not WASM in the page) changes an earlier answer.
+- Slice 4 build (Opus implementer, 2026-11-23, `feat/web-ui-4`,
+  1.3.0-dev.5). Answers: native engine, iOS first, team `PL2X8AJK8A`,
+  bundle id `com.robot-lord.rlord`, defaults for the rest. iOS is built
+  in this pass; the Android shell and SDK wait for a later PR.
+  - Step 1 gates (scratch code, not kept). All iOS gates pass; Android's
+    wait for the SDK and NDK.
+    - (a) `rlord_e2e`, `relay-proto` and `rlord_e2e_device` (tokio,
+      tokio-tungstenite, rustls with ring, webpki-roots) build for
+      `aarch64-apple-ios` and `aarch64-apple-ios-sim`.
+      `aarch64-linux-android` is added to the toolchain but not built:
+      ring needs the NDK's C compiler.
+    - (b) UniFFI 0.32.2: bindgen in process (`uniffi_bindgen::bindings::
+      generate`, a library call, Swift and Kotlin from a debug dylib);
+      a Rust object made from Swift, and a foreign trait (`with_foreign`)
+      called back from a tokio worker thread, run on the iOS 27.2
+      simulator (a Swift binary linked to the static library, started by
+      `simctl spawn`). Kotlin generated, not run.
+    - (c) Signatures from `SecKeyCreateSignature` with
+      `ecdsaSignatureMessageX962SHA256` (software key) and from the
+      Mac's own Secure Enclave (CryptoKit `SecureEnclave.P256`), DER
+      converted to `r || s`, all pass `relay_proto::auth::verify`,
+      including the high-S ones (20 and 23 of 40): p256's verifier
+      takes high S, so the engine converts DER and does not normalise.
+      The phone's own enclave stays in the by-hand list.
+    - (d) A built Preact page (Vite, module script and stylesheet) loads
+      in `WKWebView` from a `WKURLSchemeHandler` on `rlord-app://page/`
+      under the planned policy as a response header and a `<meta>`:
+      `'self'` matches the custom scheme, no `'unsafe-inline'` is needed
+      (Preact's style objects go through CSSOM), Trusted Types are
+      enforced (`innerHTML` throws `TypeError`), `fetch` and `WebSocket`
+      are blocked by `connect-src 'none'`. The bridge round-trips: page
+      to shell by `messageHandlers.rlord.postMessage` (main frame,
+      `rlord-app` origin checked), shell to page by
+      `callAsyncJavaScript` with the text as an argument. Found: the iOS
+      27 SDK refuses a UIKit app without the scene life cycle; the shell
+      is a SwiftUI `App`.
+    - (e) A binary in the iOS simulator reaches a listener on the Mac's
+      `127.0.0.1`.
 
 ## Slice 1 plan: local web UI, as an opt-in plugin
 
