@@ -1446,26 +1446,34 @@ including when the active one hits a usage limit.
   reason stays in the pending entry's `held`; the row's `mail`
   annotation, `✉` / `✉ draft` in the list).
 - **Claude drafts: the prompt stash** (`daemon/src/stash.rs`). In a
-  Claude session a draft doesn't hold a message indefinitely: when the
-  draft (first line, `remote::input_text`) has sat unchanged for
-  `DRAFT_IDLE` (tracked in memory per session from first sight),
-  `chat:stash` is on Ctrl+S (`keybindings.json` under Claude's config
-  dir, read only; `ctrl+s` bound in `Chat`/`Global` to anything else or
-  null means no), and nothing is stashed (no "draft stashed" below the
-  box, no restore of rlord's pending), `type_into` presses Ctrl+S,
-  checks the box is empty and "draft stashed" shows, then pastes. The
-  stash is one slot (stashing again loses the first: checked live), so
-  each of those conditions guards it. The restore runs on `send`'s tick
-  (kv `draft_stash`): Ctrl+S only with the box empty, "draft stashed"
-  showing, the screen at its prompt, the session idle a few seconds,
-  `SETTLE` since the paste and no one typing; verified by the draft's
-  first line coming back. Ctrl+S a second after Enter didn't restore in
-  a live check ("draft restored · draft stashed" with the box empty), so
-  it waits for the turn to be over and retries with backoff. It gives up
-  (`draft_restore_failed`, row mark `⎘`, row field `draft_stash:
-  "failed"`) after a few presses, after 30 minutes, or when the
-  indicator is gone with the box empty. Events: `draft_stashed`,
-  `draft_restored` (`by`: rlord or other), `draft_restore_failed`.
+  Claude session a draft doesn't hold a message indefinitely. It is
+  stashed when the whole input box (every line between its rules,
+  hashed) has sat unchanged for `DRAFT_IDLE` (tracked in memory; reset
+  when the box is seen empty, when someone used a terminal on it, and
+  when the session leaves "your turn"), Ctrl+S is `chat:stash` and the
+  only key for it (`keybindings.json` under Claude's config dir, read
+  only), and nothing is stashed: no "draft stashed" on the status lines
+  (below the box's bottom rule, or a line right above its top rule that
+  starts with the notice; transcript text never counts; an unrecognised
+  box means don't stash) and no live record of rlord's (a failed one
+  doesn't block). After Ctrl+S, an empty box is recorded at once (kv
+  `draft_stash`, before any paste, so the restore runs whatever happens
+  next); the message is pasted only when "draft stashed" also shows
+  (`after_stash`). The stash is one slot (stashing again loses the
+  first: checked live), so each of those conditions guards it. The
+  restore runs on `send`'s tick: Ctrl+S only with the box empty, the
+  screen at its prompt, the session idle a few seconds, `SETTLE` since
+  the paste and no one typing, whether or not the indicator still shows
+  (Ctrl+S with nothing stashed appeared to do nothing, live). The draft's
+  first line back: `draft_restored`. Still stashed: retried with
+  backoff, and after a few presses or 30 minutes `draft_restore_failed`
+  (row mark `⎘`, row field `draft_stash: "failed"`, kept up to 2h).
+  Nothing back and nothing stashed: `draft_restore_unknown`, dropped
+  without a mark. Ctrl+S a second after Enter didn't restore in a live
+  check ("draft restored · draft stashed" with the box empty), hence the
+  wait for the turn to end. A hold's kind (`Why::draft`) is stored with
+  its reason (`held_draft`), and a hold lifts when the session leaves
+  "your turn".
 - **Per-session lock** (`daemon/src/locks.rs`): taken by sends,
   deliveries and asks around the final re-read and the paste, and by
   restart, stop, archive, fresh restarts and `overlord.continue` (and the

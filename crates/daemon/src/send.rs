@@ -157,7 +157,42 @@ pub enum Typed {
     Done,
     /// Not typed: now is the wrong moment (why), though it may be fine
     /// later.
-    NotNow(String),
+    NotNow(Why),
+}
+
+/// Why a message wasn't typed now.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Why {
+    pub text: String,
+    /// Held by a draft in the session's input (the row shows `✉ draft`).
+    pub draft: bool,
+}
+
+impl Why {
+    fn draft(text: impl Into<String>) -> Self {
+        Why {
+            text: text.into(),
+            draft: true,
+        }
+    }
+}
+
+impl From<String> for Why {
+    fn from(text: String) -> Self {
+        Why { text, draft: false }
+    }
+}
+
+impl From<&str> for Why {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 /// Type `text` into `pane` (a pane id, `%n`: the session's pinned agent
@@ -192,6 +227,8 @@ pub fn type_into(
     if let Some(t) = checks.attached {
         let now_s = now_ms() / 1000;
         if user_active(&tmux::list_clients(), t, checks.overlay, now_s) {
+            // Someone at it: a draft there may be in the making.
+            crate::stash::forget_draft(session);
             return Ok(Typed::NotNow(
                 "someone is typing in it (a terminal showing it was just used)".into(),
             ));
@@ -213,19 +250,20 @@ pub fn type_into(
     let mut stash: Option<String> = None;
     if checks.draft {
         match draft(checks.agent, &ansi) {
-            Some(text) if checks.agent == Agent::Claude => {
-                let age = crate::stash::draft_age(session, &text);
+            Some(first_line) if checks.agent == Agent::Claude => {
+                // Aged by the whole box, not just its first line.
+                let whole = crate::stash::input_region(&plain).unwrap_or_default();
+                let age = crate::stash::draft_age(session, &whole);
                 let pending = crate::stash::pending(d, session);
                 match crate::stash::plan(&plain, crate::stash::stash_key_ok(), pending, age) {
-                    crate::stash::Plan::Hold(why) => return Ok(Typed::NotNow(why)),
-                    crate::stash::Plan::Stash => stash = Some(text),
+                    crate::stash::Plan::Hold(why) => return Ok(Typed::NotNow(Why::draft(why))),
+                    crate::stash::Plan::Stash => stash = Some(first_line),
                 }
             }
             Some(_) => {
-                return Ok(Typed::NotNow(
-                    "its input holds unsent text (a draft; the message would be added to it)"
-                        .into(),
-                ))
+                return Ok(Typed::NotNow(Why::draft(
+                    "its input holds unsent text (a draft; the message would be added to it)",
+                )))
             }
             None => crate::stash::forget_draft(session),
         }
@@ -244,49 +282,56 @@ pub fn type_into(
         },
         None => None,
     };
-    let mut typed = TYPING.lock().unwrap_or_else(|e| e.into_inner());
-    let last = typed.get_or_insert_with(HashMap::new);
-    let _ = tmux::cancel_mode(pane);
-    if stash.is_some() {
-        // Ctrl+S, then the box must be empty and the stash showing.
-        let set_aside = tmux::send_keys(pane, &["C-s"]).and_then(|()| {
-            std::thread::sleep(crate::stash::REDRAW);
-            tmux::capture_pane_id_ansi(pane)
-        });
-        let ok = set_aside.as_ref().is_ok_and(|after| {
-            crate::remote::input_text(after).is_none()
-                && crate::stash::stash_shown(&strip_ansi(after))
-        });
-        if !ok {
-            drop(typed);
-            if let Some(at) = marked {
-                let _ = own::unmark(&d.db(), session, at);
+    let unmark = || {
+        if let Some(at) = marked {
+            let _ = own::unmark(&d.db(), session, at);
+        }
+    };
+    if let Some(first_line) = &stash {
+        // Ctrl+S, then a look. (`TYPING` only around the keys: recording
+        // the stash takes the DB.)
+        let after = {
+            let _typing = typing();
+            let _ = tmux::cancel_mode(pane);
+            tmux::send_keys(pane, &["C-s"]).and_then(|()| {
+                std::thread::sleep(crate::stash::REDRAW);
+                tmux::capture_pane_id_ansi(pane)
+            })
+        };
+        let step = crate::stash::after_stash(after.as_ref().ok().map(String::as_str));
+        // Recorded before anything is typed: whatever happens next, the
+        // restore looks for it.
+        if step != crate::stash::AfterStash::Untouched {
+            if let Err(e) = crate::stash::stashed(d, session, first_line) {
+                tracing::warn!(session, error = %e, "recording a stashed draft");
             }
-            tracing::warn!(session, "Claude's prompt stash didn't take the draft");
-            return Ok(Typed::NotNow(
-                "its input holds a draft, and Claude Code's prompt stash (Ctrl+S) didn't take it"
-                    .into(),
-            ));
+        }
+        if step != crate::stash::AfterStash::Paste {
+            unmark();
+            tracing::warn!(
+                session,
+                ?step,
+                "Claude's prompt stash: not typing this time"
+            );
+            return Ok(Typed::NotNow(Why::draft(
+                "its input held a draft, and Claude Code's prompt stash (Ctrl+S) didn't clearly \
+                 take it: tried again later",
+            )));
         }
     }
+    let mut typed = typing();
+    let last = typed.get_or_insert_with(HashMap::new);
+    let _ = tmux::cancel_mode(pane);
     let pasted = tmux::paste(pane, text).and_then(|()| {
         std::thread::sleep(Duration::from_millis(150));
         tmux::send_keys(pane, &["Enter"])
     });
     if let Err(e) = pasted {
         drop(typed);
-        if let Some(at) = marked {
-            let _ = own::unmark(&d.db(), session, at);
-        }
+        unmark();
         return Err(e);
     }
     last.insert(session.to_string(), Instant::now());
-    drop(typed);
-    if let Some(draft) = stash {
-        if let Err(e) = crate::stash::stashed(d, session, &draft) {
-            tracing::warn!(session, error = %e, "recording a stashed draft");
-        }
-    }
     Ok(Typed::Done)
 }
 
@@ -400,16 +445,15 @@ pub(crate) fn type_message(
     // Its first prompt goes before anything rlord types (`source`); the
     // first prompt itself (None) is exempt.
     if source.is_some() && first_waiting(&d.db(), &s.id)? {
-        return Ok(Typed::NotNow(format!(
-            "{}'s first prompt hasn't gone in yet",
-            s.name
-        )));
+        return Ok(Typed::NotNow(
+            format!("{}'s first prompt hasn't gone in yet", s.name).into(),
+        ));
     }
     let pane = agent_pane(s)?;
     // On Codex's daemon another client may have started a turn rlord's
     // status doesn't show: the daemon says.
     if let Some(why) = crate::codex_daemon::busy_for_send(s) {
-        return Ok(Typed::NotNow(why));
+        return Ok(Typed::NotNow(why.into()));
     }
     let overlay = d
         .overlay
@@ -942,16 +986,26 @@ pub fn annotate(d: &Daemon, rows: &mut [Value]) {
         row["mail"] = match m.get(id).filter(|e| !parts_of(e).is_empty()) {
             Some(e) => {
                 let why = e["held"].as_str();
-                json!({"held": why, "draft": why.is_some_and(held_by_draft)})
+                json!({"held": why, "draft": why.is_some() && e["held_draft"] == true})
             }
             None => Value::Null,
         };
     }
 }
 
-/// Whether a hold's reason is a draft in the session's input.
-fn held_by_draft(why: &str) -> bool {
-    why.contains("(a draft")
+/// A hold lifts when its session leaves "your turn" (a turn started:
+/// whatever held it, the next look decides afresh). Returns whether
+/// `entry` changed.
+fn lift_hold(entry: &mut Value, s: Option<&Session>) -> bool {
+    let busy = s.is_some_and(|s| s.status != Status::Idle);
+    match entry.as_object_mut() {
+        Some(e) if busy && e.contains_key("held") => {
+            e.remove("held");
+            e.remove("held_draft");
+            true
+        }
+        _ => false,
+    }
 }
 
 fn tick(d: &Daemon) -> Result<()> {
@@ -962,11 +1016,15 @@ fn tick(d: &Daemon) -> Result<()> {
         for key in [FIRST_KEY, PENDING_KEY] {
             let mut m = db.kv_map(key)?;
             let now = now_ms();
-            let mut dropped = false;
+            let mut dirty = false;
             for id in m.keys().cloned().collect::<Vec<_>>() {
                 let s = db.resolve_ref(&id).ok();
                 match next(s.as_ref(), limited.get(&id).copied(), now) {
-                    Next::Wait => {}
+                    Next::Wait => {
+                        if let Some(entry) = m.get_mut(&id) {
+                            dirty |= lift_hold(entry, s.as_ref());
+                        }
+                    }
                     Next::Deliver => due.push((id, key)),
                     // A first prompt of a session that stopped waits
                     // for its restart; only archived or gone drops it.
@@ -975,7 +1033,7 @@ fn tick(d: &Daemon) -> Result<()> {
                             && s.as_ref().is_some_and(|s| s.archived_at.is_none()) => {}
                     Next::Drop(why) => {
                         m.remove(&id);
-                        dropped = true;
+                        dirty = true;
                         if s.is_some() {
                             db.insert_event(
                                 &id,
@@ -987,13 +1045,23 @@ fn tick(d: &Daemon) -> Result<()> {
                     }
                 }
             }
-            if dropped {
+            if dirty {
                 db.kv_set_map(key, &m)?;
             }
         }
     }
     for (id, key) in due {
         deliver(d, &id, key)?;
+    }
+    // A draft's age starts again once its session has left "your turn".
+    {
+        let db = d.db();
+        crate::stash::prune_drafts(|id| {
+            db.session_by_id(id)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.status == Status::Idle)
+        });
     }
     crate::stash::tick(d)
 }
@@ -1115,20 +1183,23 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
 /// Log, once per queued message, why it wasn't delivered yet (its entry
 /// keeps the latest reason in `held`, for the row; a newer message
 /// starts unmarked).
-fn held(d: &Daemon, id: &str, text: &str, why: &str, key: &str) -> Result<()> {
+fn held(d: &Daemon, id: &str, text: &str, why: &Why, key: &str) -> Result<()> {
+    let (why, draft) = (why.text.as_str(), why.draft);
     let db = d.db();
     let mut m = db.kv_map(key)?;
     let Some(entry) = m.get_mut(id).and_then(Value::as_object_mut) else {
         return Ok(());
     };
     if entry.get("text").and_then(Value::as_str) != Some(text)
-        || entry.get("held").and_then(Value::as_str) == Some(why)
+        || (entry.get("held").and_then(Value::as_str) == Some(why)
+            && entry.get("held_draft").and_then(Value::as_bool) == Some(draft))
     {
         return Ok(());
     }
     // The latest reason is kept for the row (`annotate`); logged once.
     let first = !entry.contains_key("held");
     entry.insert("held".into(), json!(why));
+    entry.insert("held_draft".into(), json!(draft));
     if !first {
         db.kv_set_map(key, &m)?;
         drop(db);
@@ -1325,7 +1396,7 @@ mod tests {
             rlord_core::config::Config::default(),
         );
         let r = type_into(&d, id, "%no-such-pane", "hi", &checks).unwrap();
-        assert!(matches!(r, Typed::NotNow(why) if why.contains("moments ago")));
+        assert!(matches!(r, Typed::NotNow(why) if why.text.contains("moments ago")));
     }
 
     #[test]
@@ -1384,19 +1455,67 @@ mod tests {
             let log = d.db().list_events(&id, 20).unwrap();
             log.iter().filter(|e| e.kind == "message_held").count()
         };
-        held(&d, &id, &first, "a dialog is up", PENDING_KEY).unwrap();
-        held(&d, &id, &first, "a dialog is up", PENDING_KEY).unwrap();
+        held(&d, &id, &first, &"a dialog is up".into(), PENDING_KEY).unwrap();
+        held(&d, &id, &first, &"a dialog is up".into(), PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
         // (Not this message's text: nothing.)
-        held(&d, &id, "other", "x", PENDING_KEY).unwrap();
+        held(&d, &id, "other", &"x".into(), PENDING_KEY).unwrap();
         assert_eq!(held_count(), 1);
         queue(&d.db(), &id, &msg("second")).unwrap();
         let both = pending_text(&d.db(), &id);
-        held(&d, &id, &both, "a draft", PENDING_KEY).unwrap();
+        held(&d, &id, &both, &Why::draft("a draft"), PENDING_KEY).unwrap();
         assert_eq!(held_count(), 2);
         let log = d.db().list_events(&id, 20).unwrap();
         let e = log.iter().find(|e| e.kind == "message_held").unwrap();
         assert!(e.payload["reason"].as_str().is_some(), "{}", e.payload);
+    }
+
+    /// The row's `✉ draft` comes from the hold's kind, not its wording;
+    /// a hold lifts once the session leaves "your turn".
+    #[test]
+    fn a_hold_is_shown_by_kind_and_lifts() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        queue(&db, &id, &msg("first")).unwrap();
+        let first = pending_text(&db, &id);
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        let row = || {
+            let mut rows = vec![json!({"id": id})];
+            annotate(&d, &mut rows);
+            rows[0]["mail"].clone()
+        };
+        assert_eq!(row(), json!({"held": null, "draft": false}));
+        // Worded like a draft, but not one.
+        held(&d, &id, &first, &"(a draft) lookalike".into(), PENDING_KEY).unwrap();
+        assert_eq!(row()["draft"], false);
+        held(&d, &id, &first, &Why::draft("unsent text"), PENDING_KEY).unwrap();
+        assert_eq!(row()["draft"], true);
+        // Still "your turn": the hold stays.
+        let mut m = d.db().kv_map(PENDING_KEY).unwrap();
+        let s = d.db().resolve_ref(&id).unwrap();
+        let mut idle = s.clone();
+        idle.status = Status::Idle;
+        assert!(!lift_hold(m.get_mut(&id).unwrap(), Some(&idle)));
+        let mut busy = s;
+        busy.status = Status::Working;
+        assert!(lift_hold(m.get_mut(&id).unwrap(), Some(&busy)));
+        assert!(m[&id].get("held").is_none() && m[&id].get("held_draft").is_none());
+    }
+
+    /// A failed restore's record doesn't block a new stash; a live one
+    /// does.
+    #[test]
+    fn only_a_live_stash_record_blocks() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        assert!(!crate::stash::pending(&d, &id));
+        crate::stash::stashed(&d, &id, "half a thought").unwrap();
+        assert!(crate::stash::pending(&d, &id));
+        let mut m = d.db().kv_map(crate::stash::STASH_KEY).unwrap();
+        m.get_mut(&id).unwrap()["failed"] = json!(true);
+        d.db().kv_set_map(crate::stash::STASH_KEY, &m).unwrap();
+        assert!(!crate::stash::pending(&d, &id));
     }
 
     #[test]

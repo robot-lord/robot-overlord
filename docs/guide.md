@@ -161,9 +161,10 @@ runs a command.
   holds one draft, so rlord never stashes while one is already stashed,
   and never presses Ctrl+S while the box has text in it. If it can't put
   the draft back, the row shows `⎘`: press Ctrl+S in the session
-  yourself. If you moved `chat:stash` off Ctrl+S in
-  `~/.claude/keybindings.json` (rlord only reads it), a draft holds
-  messages as before. Codex and OpenCode have no stash: a draft holds.
+  yourself. If `~/.claude/keybindings.json` (rlord only reads it) binds
+  Ctrl+S to anything else, or binds `chat:stash` to any other key, rlord
+  leaves the stash alone and a draft holds messages as before. Codex and
+  OpenCode have no stash: a draft holds.
 - `rlord overlord ask` (and the list's `n` form) won't type into the
   overlord while it waits on you, or while its screen shows a dialog: its
   Enter would answer it. Answer it first.

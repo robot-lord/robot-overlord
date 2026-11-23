@@ -37,7 +37,31 @@ so delivery isn't blocked by a draft. Codex and OpenCode unchanged.
 Constants: `DRAFT_IDLE` 30s, restore needs 3s idle + `SETTLE`, 6 presses,
 30 min bound, failed mark kept 2h or until the draft shows back.
 
+## Review round 1 (applied)
+
+Stash recorded right after the C-s check (before paste); an empty box
+without the indicator is recorded and not typed; restore presses on an
+empty box even without the indicator, and a press that brings nothing
+back drops quietly (`draft_restore_unknown`); failed records don't block
+new stashes; indicator read only on status lines; draft age by the whole
+box, reset by user activity and leaving idle; `held` lifts when the
+session leaves idle; hold kind carried as `Why::draft` / `held_draft`;
+`chat:stash` on any other key means no stash.
+
+Live (coordinator): "draft stashed" stayed up ~13s across a turn; C-s on
+an empty box with nothing stashed appears to be a no-op;
+"draft stashed · ✔ Update installed" rendered right above the top rule.
+
 ## Owed / open
+
+- Review item 10: the pane / settled helpers are duplicated between
+  `send.rs` (`agent_pane`, `settled` closure) and `stash.rs` (`restore`
+  looks up the pane and settled state itself). Fold into shared helpers.
+- The `type_into` stash path (C-s, `after_stash`, record before paste,
+  whole-box age) has pure-logic tests only; the tmux sequence itself is
+  untested.
+- A user's own stash made while the indicator isn't visible could be
+  overwritten by rlord's stash (it can only see the indicator).
 
 - Untested live: the whole rlord flow end to end against a real Claude
   pane; restore while Claude is mid-turn (we never try it: we wait for
