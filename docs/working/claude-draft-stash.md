@@ -40,11 +40,22 @@ removed in round 3.
 
 ## Owed / open
 
+- Review 4 item 5: a user's own stash whose "draft stashed" notice has
+  faded can be overwritten by rlord's stash (rlord can only see the
+  indicator).
+- Review 4 item 7: the first direct send (no `when_idle`) to a session
+  with a draft is always refused, because the draft's age starts at
+  rlord's first look. With `when_idle` it is queued and goes once the
+  draft has sat 30s.
 - Not unit-tested (tmux path of `type_into`): the `back_off` call on
   Untouched, record-before-paste order, `stash::sent` after Enter,
-  whole-box hashing at the call site, `TYPING` held only around the key.
-- A user's own stash made while the indicator isn't visible could be
-  overwritten (rlord can only see the indicator).
+  `mark_stale` after a failed paste, no record when Ctrl+S's send_keys
+  fails, whole-box hashing at the call site, `TYPING` held only around
+  the key.
+- Cleanups: `after_press` takes a `pressed` flag the caller always
+  passes as true (its false arm is the early return in `type_into`);
+  `Why` and `Kind` could live in their own module; the mutation checks
+  were run by hand with a scratch script, not kept in the repo.
 - Only the first visual row is stored; a draft whose first row is
   identical to unrelated later text could read as "back".
 - This head is not yet live-tested end to end.

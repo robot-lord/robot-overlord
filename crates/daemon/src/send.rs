@@ -323,22 +323,37 @@ pub fn type_into(
             let _ = tmux::cancel_mode(pane);
             tmux::send_keys(pane, &["C-s"])
         };
-        // (Looks without `TYPING`: other sessions' pastes go on.)
-        let step = match pressed {
-            Ok(()) => crate::stash::poll_stash(|| {
-                std::thread::sleep(crate::stash::REDRAW);
-                tmux::capture_pane_id_ansi(pane).ok()
-            }),
-            Err(_) => crate::stash::AfterStash::Unclear,
-        };
         use crate::stash::AfterStash;
-        if step == AfterStash::Untouched {
+        if pressed.is_err() {
+            // The key never went: nothing stashed, nothing recorded.
+            unmark();
+            return Ok(Typed::NotNow(Why::draft(
+                "its input holds a draft, and rlord couldn't send Claude Code's prompt stash \
+                 key (Ctrl+S) to it",
+            )));
+        }
+        // (Looks without `TYPING`: other sessions' pastes go on.)
+        let step = crate::stash::poll_stash(|| {
+            std::thread::sleep(crate::stash::REDRAW);
+            tmux::capture_pane_id_ansi(pane).ok()
+        });
+        let next = crate::stash::after_press(true, step);
+        if next.back_off {
             // Not pressed again here for a while.
             crate::stash::back_off(session);
-        } else {
+        }
+        if next.record {
             // Recorded before anything is typed: whatever happens next,
-            // the restore looks for it. Unrecorded, nothing is typed.
-            if let Err(e) = crate::stash::stashed(d, session, first_line) {
+            // rlord holds messages until it is dealt with. Unrecorded,
+            // nothing is typed.
+            let recorded = crate::stash::stashed(d, session, first_line).and_then(|()| {
+                if next.stale {
+                    crate::stash::mark_stale(d, session)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = recorded {
                 tracing::warn!(session, error = %e, "recording a stashed draft");
                 unmark();
                 return Ok(Typed::NotNow(Why::draft(
@@ -347,7 +362,7 @@ pub fn type_into(
                 )));
             }
         }
-        if step != AfterStash::Stashed {
+        if !next.paste {
             unmark();
             tracing::warn!(session, ?step, "Claude's prompt stash: not typing");
             return Ok(Typed::NotNow(Why::draft(match step {
@@ -373,6 +388,11 @@ pub fn type_into(
     if let Err(e) = pasted {
         drop(typed);
         unmark();
+        if stash.is_some() {
+            // Stashed, but nothing went in: no turn will end to restore
+            // it. `⎘` now.
+            let _ = crate::stash::mark_stale(d, session);
+        }
         return Err(e);
     }
     last.insert(session.to_string(), Instant::now());
@@ -1206,6 +1226,13 @@ fn deliver(d: &Daemon, id: &str, key: &str) -> Result<()> {
         // A later tick; said once, so a stuck queue is visible.
         return held(d, id, &text, why, key);
     }
+    // Failed with a stash of the user's draft on record (the paste after
+    // it may be what failed): kept, never dropped; it goes once the
+    // draft is dealt with.
+    if let (Err(e), Some(why)) = (&r, crate::stash::held_by_record(d, id)) {
+        tracing::warn!(session = %id, error = %format!("{e:#}"), "typing past a stash failed: kept");
+        return held(d, id, &text, &Why::stash(why), key);
+    }
     let db = d.db();
     let mut m = db.kv_map(key)?;
     // A first prompt that failed to type: tried again at a later tick, up
@@ -1579,6 +1606,36 @@ mod tests {
         busy.status = Status::Working;
         assert!(lift_hold(m.get_mut(&id).unwrap(), Some(&busy)));
         assert!(m[&id].get("held").is_none() && m[&id].get("held_kind").is_none());
+    }
+
+    /// A delivery that fails with a stash on record keeps its message
+    /// (the paste after the stash may be what failed).
+    #[test]
+    fn a_failed_delivery_past_a_stash_keeps_the_message() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        db.set_status(&id, Status::Idle, 1).unwrap();
+        queue(&db, &id, &msg("hello")).unwrap();
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        crate::stash::stashed(&d, &id, "half a thought").unwrap();
+        // No live pane: typing fails.
+        deliver(&d, &id, PENDING_KEY).unwrap();
+        assert!(d.db().kv_map(PENDING_KEY).unwrap().contains_key(&id));
+        let log = d.db().list_events(&id, 20).unwrap();
+        assert!(!log.iter().any(|e| e.kind == "message_dropped"));
+    }
+
+    /// A stash that nothing followed shows `⎘` at once.
+    #[test]
+    fn a_stash_nothing_followed_is_stale_at_once() {
+        let db = Db::open_in_memory().unwrap();
+        let id = insert(&db);
+        let d = Daemon::new(db, rlord_core::config::Config::default());
+        crate::stash::stashed(&d, &id, "half a thought").unwrap();
+        crate::stash::mark_stale(&d, &id).unwrap();
+        let mut rows = vec![json!({"id": id})];
+        crate::stash::annotate(&d, &mut rows);
+        assert_eq!(rows[0]["draft_stash"], "stale");
     }
 
     /// A first prompt that waits shows on the row too.

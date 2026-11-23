@@ -321,6 +321,63 @@ fn look_after_stash(screen: Option<&str>) -> (Option<AfterStash>, AfterStash) {
 /// Captures after the press, `REDRAW` apart.
 pub(crate) const POLLS: usize = 5;
 
+/// What `type_into` does after the stash's Ctrl+S.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AfterPress {
+    /// Record the stash (before anything is typed).
+    pub record: bool,
+    /// Mark it stale at once (`⎘`): nothing will be typed, so no turn
+    /// will end to restore it.
+    pub stale: bool,
+    /// Type the message.
+    pub paste: bool,
+    /// Back off stashing in that session.
+    pub back_off: bool,
+}
+
+/// `pressed`: the Ctrl+S key went to tmux. `step`: what the polling saw
+/// (only when pressed).
+pub(crate) fn after_press(pressed: bool, step: AfterStash) -> AfterPress {
+    let no = AfterPress {
+        record: false,
+        stale: false,
+        paste: false,
+        back_off: false,
+    };
+    match (pressed, step) {
+        // The key never went: nothing was stashed.
+        (false, _) => no,
+        (true, AfterStash::Untouched) => AfterPress {
+            back_off: true,
+            ..no
+        },
+        (true, AfterStash::Unclear) => AfterPress {
+            record: true,
+            stale: true,
+            ..no
+        },
+        (true, AfterStash::Stashed) => AfterPress {
+            record: true,
+            paste: true,
+            ..no
+        },
+    }
+}
+
+/// Mark session `id`'s record stale now (`⎘`): the message after the
+/// stash didn't go in, so Claude has no turn's end to restore it at.
+pub(crate) fn mark_stale(d: &Daemon, id: &str) -> Result<()> {
+    let db = d.db();
+    let mut m = db.kv_map(STASH_KEY)?;
+    if let Some(e) = m.get_mut(id).and_then(Value::as_object_mut) {
+        e.insert("stale".into(), json!(true));
+        db.kv_set_map(STASH_KEY, &m)?;
+    }
+    drop(db);
+    d.changed();
+    Ok(())
+}
+
 /// Read the screen after the stash's Ctrl+S, up to `POLLS` captures
 /// (`capture`: the next screen with attributes, None when unreadable),
 /// until it is definite. Otherwise the last look decides.
@@ -377,7 +434,12 @@ pub(crate) enum Check {
 /// the draft is seen back (`back`), at `now`.
 pub(crate) fn check(entry: &Value, s: Option<&Session>, back: bool, now: i64) -> Check {
     let Some(s) = s.filter(|s| {
-        s.archived_at.is_none() && !matches!(s.status, Status::Stopped | Status::Error)
+        let restarted = s.status == Status::Starting
+            && s.last_state_change_at
+                .is_some_and(|t| t >= entry["at"].as_i64().unwrap_or(0));
+        s.archived_at.is_none()
+            && !restarted
+            && !matches!(s.status, Status::Stopped | Status::Error)
     }) else {
         return Check::Lost;
     };
@@ -388,7 +450,9 @@ pub(crate) fn check(entry: &Value, s: Option<&Session>, back: bool, now: i64) ->
         .as_i64()
         .or(entry["at"].as_i64())
         .unwrap_or(0);
-    if s.last_user_msg_at.is_some_and(|t| t > sent) {
+    if s.last_user_msg_at
+        .is_some_and(|t| t > sent + crate::limits::OWN_PROMPT_MS)
+    {
         return Check::Cleared("user_prompt");
     }
     let ended = s.status == Status::Idle
@@ -814,7 +878,11 @@ mod tests {
         let e = json!({"first_line": "x", "at": 1_000, "sent_at": 2_000});
         let idle = session(Status::Idle, 3_000, None);
         assert_eq!(check(&e, Some(&idle), true, 4_000), Check::Cleared("seen"));
-        let typed = session(Status::Working, 3_000, Some(2_500));
+        let typed = session(
+            Status::Working,
+            3_000,
+            Some(2_000 + crate::limits::OWN_PROMPT_MS + 1),
+        );
         assert_eq!(
             check(&e, Some(&typed), false, 4_000),
             Check::Cleared("user_prompt")
@@ -822,6 +890,9 @@ mod tests {
         // A prompt before rlord's message doesn't count.
         let before = session(Status::Idle, 3_000, Some(1_500));
         assert_eq!(check(&e, Some(&before), false, 4_000), Check::Keep);
+        // rlord's own message read back as a prompt (within OWN_PROMPT_MS): not the user's.
+        let echo = session(Status::Working, 3_000, Some(2_500));
+        assert_eq!(check(&e, Some(&echo), false, 4_000), Check::Keep);
         // A minute after the turn ended: the mark, nothing else.
         assert_eq!(
             check(&e, Some(&idle), false, 3_000 + STALE_AFTER_MS),
@@ -840,5 +911,27 @@ mod tests {
         assert_eq!(check(&e, Some(&stopped), false, 4_000), Check::Lost);
         let errored = session(Status::Error, 3_000, None);
         assert_eq!(check(&e, Some(&errored), true, 4_000), Check::Lost);
+        // Restarted after the stash: the process (and its stash) is gone.
+        let restarted = session(Status::Starting, 3_000, None);
+        assert_eq!(check(&e, Some(&restarted), false, 4_000), Check::Lost);
+        // Starting from before the stash: not a restart since.
+        let early = session(Status::Starting, 500, None);
+        assert_eq!(check(&e, Some(&early), false, 4_000), Check::Keep);
+    }
+
+    /// Rules 1, 2 and 8: what follows the stash's Ctrl+S.
+    #[test]
+    fn after_the_press() {
+        let p = |pressed, step| after_press(pressed, step);
+        // The key never went: no record, nothing typed.
+        let none = p(false, AfterStash::Stashed);
+        assert!(!none.record && !none.paste && !none.stale);
+        let ok = p(true, AfterStash::Stashed);
+        assert!(ok.record && ok.paste && !ok.stale);
+        // Unclear: recorded and `⎘` at once, nothing typed.
+        let unclear = p(true, AfterStash::Unclear);
+        assert!(unclear.record && unclear.stale && !unclear.paste);
+        let untouched = p(true, AfterStash::Untouched);
+        assert!(untouched.back_off && !untouched.record && !untouched.paste);
     }
 }

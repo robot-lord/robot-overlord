@@ -60,8 +60,12 @@ pub fn legend() -> Vec<(String, &'static str)> {
         "a message from the overlord waits (✉ draft: held by unsent text)",
     ));
     v.push((
+        "✉ stash".into(),
+        "waiting for Claude to restore a stashed draft",
+    ));
+    v.push((
         "⎘".into(),
-        "a draft rlord stashed may still be stashed: Ctrl+S in the session, or rlord stash-dismiss",
+        "a draft rlord stashed may still be stashed: with the box empty, press Ctrl+S to restore (Ctrl+S with text in the box overwrites the stash), or rlord stash-dismiss",
     ));
     v.push(("⋯".into(), "still loading its sub-agent counts"));
     v
@@ -296,6 +300,10 @@ fn mail_marks(s: &Value) -> Vec<Item> {
     let m = &s["mail"];
     if m.is_object() {
         let (mark, text) = match m["held"].as_str() {
+            Some(why) if m["kind"] == "stash" => (
+                "✉ stash",
+                format!("waiting for Claude to restore a stashed draft: {why}."),
+            ),
             Some(why) if m["draft"] == true => ("✉ draft", format!("a message is held: {why}.")),
             Some(why) => ("✉", format!("a message is held: {why}.")),
             None if m["first"] == true => ("✉", "its first prompt waits to go in.".to_string()),
@@ -312,7 +320,7 @@ fn mail_marks(s: &Value) -> Vec<Item> {
         v.push(Item {
             label: "stash",
             mark: Span::styled("⎘", Style::default().fg(theme::red())),
-            text: "draft may still be stashed: Ctrl+S in the session to restore it, or `rlord stash-dismiss`. Messages to it wait until then.".into(),
+            text: "draft may still be stashed: with the box empty, press Ctrl+S to restore (Ctrl+S with text in the box overwrites the stash), or `rlord stash-dismiss`. Messages to it wait until then.".into(),
             shown: true,
         });
     }
@@ -610,9 +618,15 @@ mod tests {
             "mail": {"held": "its input holds unsent text (a draft)", "draft": true}});
         assert!(marks(&draft)[0].starts_with("✉ draft — a message is held: its input"));
         let failed = json!({"status": "idle", "draft_stash": "stale"});
-        assert!(marks(&failed)[0].starts_with("⎘ — draft may still be stashed: Ctrl+S"));
+        assert!(marks(&failed)[0].starts_with("⎘ — draft may still be stashed"));
         let first = json!({"status": "idle", "mail": {"held": null, "first": true}});
         assert_eq!(marks(&first), ["✉ — its first prompt waits to go in."]);
+        let stash =
+            json!({"status": "idle", "mail": {"held": "x", "draft": true, "kind": "stash"}});
+        assert!(
+            marks(&stash)[0].starts_with("✉ stash — waiting for Claude to restore a stashed draft")
+        );
+        assert!(marks(&failed)[0].contains("with the box empty, press Ctrl+S"));
         assert!(marks(&json!({"status": "idle", "draft_stash": "pending"})).is_empty());
     }
 }

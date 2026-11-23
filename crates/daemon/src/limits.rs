@@ -79,7 +79,7 @@ const GIVE_UP_MS: i64 = 60 * 60_000;
 /// A user prompt this soon after the job's send is taken as the job's
 /// own message, should its marker have missed (`own.rs`), not as the
 /// user taking over.
-const OWN_PROMPT_MS: i64 = 5_000;
+pub(crate) const OWN_PROMPT_MS: i64 = 5_000;
 /// Sends per job, however often the limit hits again.
 const MAX_ATTEMPTS: u64 = 5;
 
